@@ -10,7 +10,15 @@ import {
 } from "./render_agent_activity.ts";
 import { agentActivitySummary } from "./agent_activity.ts";
 import { runCanBeCancelled, runSurfaceActive } from "./run_control.ts";
-import type { ConfigFieldProjection, DesktopWebState, FileChangeRow, ProjectRow, SessionRow, TranscriptRow } from "./types.ts";
+import type {
+  ConfigFieldProjection,
+  DesktopViewState,
+  DesktopWebState,
+  FileChangeRow,
+  ProjectRow,
+  SessionRow,
+  TranscriptRow,
+} from "./types.ts";
 import type { ArtifactPaneMode } from "./ui_state.ts";
 import { displayAccessLabel, escapeHtml, fileName, goalSlashCommandHint, shortenPath } from "./utils.ts";
 import { providerCapabilities } from "./view_state.ts";
@@ -335,7 +343,7 @@ export function renderSidebar(state: DesktopWebState): string {
   `;
 }
 
-export function renderTopbar(state: DesktopWebState): string {
+export function renderTopbar(state: DesktopViewState): string {
   const workspaceLabel = state.selected_project_index >= 0 ? shortenPath(state.workspace_path) : "プロジェクトなし";
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
   const exportDisabled = !state.history_export_enabled || !navigationIsIdle(state);
@@ -368,7 +376,7 @@ export function renderTopbar(state: DesktopWebState): string {
           <button data-action="show-provider" title="${escapeHtml(state.provider_label)}">
             <span>${escapeHtml(state.model_label)}</span><small>${escapeHtml(state.provider_label)}</small>
           </button>
-          <button data-action="toggle-access" title="アクセス権限" aria-disabled="${state.access_mode_mutation_enabled ? "false" : "true"}" ${state.access_mode_mutation_enabled ? "" : "disabled"}>${escapeHtml(displayAccessLabel(state.access_label))}</button>
+           <button data-action="toggle-access" title="アクセス権限" aria-disabled="${state.config_draft.access_mode_mutation_enabled ? "false" : "true"}" ${state.config_draft.access_mode_mutation_enabled ? "" : "disabled"}>${escapeHtml(displayAccessLabel(state.access_label))}</button>
           ${
             turnPageVisible
               ? `<span class="turn-page-chip">${turnPageStart}-${turnPageEnd}/${state.turn_page_total}</span>
@@ -772,7 +780,7 @@ export function renderArtifactPane(state: DesktopWebState): string {
   `;
 }
 
-export function renderOverlay(state: DesktopWebState): string {
+export function renderOverlay(state: DesktopViewState): string {
   if (state.overlay === "provider") return renderProviderOverlay(state);
   if (state.overlay === "config") return renderConfigOverlay(state);
   if (state.overlay === "workspace") return renderWorkspaceOverlay(state);
@@ -798,7 +806,7 @@ export function renderOverlay(state: DesktopWebState): string {
   return "";
 }
 
-function renderProviderOverlay(state: DesktopWebState): string {
+function renderProviderOverlay(state: DesktopViewState): string {
   const selectedSummary = state.provider_selected_model_summary.length > 0 ? state.provider_selected_model_summary : ["モデル metadata は未取得です。"];
   const providerStatus = providerStatusView(state);
   const setupRequired = startupSetupRequired(state);
@@ -932,7 +940,7 @@ function renderConfigOverlay(state: DesktopWebState): string {
                 ${renderConfigTextField(state, "model.model", "Model")}
               </div>
               ${renderConfigEnumField(state, "model.provider_metadata_mode", "Provider mode", {
-                lm_studio_native_required: "LM Studio native",
+                lm_studio_native_required: "LM Studio metadata API",
                 openai_compatible_only: "OpenAI compatible",
               })}
             </section>
@@ -955,7 +963,6 @@ function renderConfigOverlay(state: DesktopWebState): string {
               <h3>Permissions</h3>
               ${renderConfigEnumField(state, "permissions.access_mode", "Access mode", {
                 default: "標準",
-                auto_review: "自動レビュー",
                 full_access: "フルアクセス",
               })}
             </section>
@@ -1038,7 +1045,6 @@ function renderConfigOverlay(state: DesktopWebState): string {
                     .join("")}
                 </div>
               </details>
-              <pre class="feedback">${escapeHtml(state.config_feedback_text)}</pre>
             </section>
           </div>
         </div>
@@ -1168,7 +1174,7 @@ function renderPromptReviewOverlay(state: DesktopWebState): string {
   `;
 }
 
-function renderCommandPalette(state: DesktopWebState): string {
+function renderCommandPalette(state: DesktopViewState): string {
   const actions = paletteActions(state, configDirty && !configMutationInFlight);
   return `
     <div class="modal-backdrop" data-action="close-overlay">

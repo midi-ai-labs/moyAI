@@ -54,20 +54,23 @@ impl ManagedProcess {
         hide_window: bool,
         max_output_bytes: usize,
     ) -> Result<Self, io::Error> {
-        configure_process_group(&mut command, hide_window);
+        configure_process_group(&mut command, hide_window, true);
         command.kill_on_drop(true);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
         let mut child = command.spawn()?;
-        #[cfg(windows)]
-        let (job, job_error) = match WindowsJob::assign(&child) {
-            Ok(job) => (Some(job), None),
-            Err(error) => (None, Some(error)),
-        };
         let pid = child
             .id()
             .ok_or_else(|| io::Error::other("spawned process has no process id"))?;
+        #[cfg(windows)]
+        let (job, startup_error) = match WindowsJob::assign(&child) {
+            Ok(job) => match resume_windows_process(pid) {
+                Ok(()) => (Some(job), None),
+                Err(error) => (Some(job), Some(error)),
+            },
+            Err(error) => (None, Some(error)),
+        };
         let stdout = child
             .stdout
             .take()
@@ -88,14 +91,14 @@ impl ManagedProcess {
             job,
         };
         #[cfg(windows)]
-        if let Some(job_error) = job_error {
+        if let Some(startup_error) = startup_error {
             let cleanup = process.terminate().await;
             let cleanup_suffix = cleanup
                 .cleanup_error()
                 .map(|error| format!("; fallback cleanup failed: {error}"))
                 .unwrap_or_default();
             return Err(io::Error::other(format!(
-                "failed to assign subprocess to a Windows Job Object: {job_error}{cleanup_suffix}"
+                "failed to establish suspended Windows Job ownership before subprocess execution: {startup_error}{cleanup_suffix}"
             )));
         }
         Ok(process)
@@ -263,7 +266,7 @@ async fn run_cleanup_helper(
     hide_window: bool,
     label: &str,
 ) -> Result<(), io::Error> {
-    configure_process_group(&mut command, hide_window);
+    configure_process_group(&mut command, hide_window, false);
     command.kill_on_drop(true);
     let mut child = command.spawn().map_err(|error| {
         io::Error::new(
@@ -272,7 +275,7 @@ async fn run_cleanup_helper(
         )
     })?;
     match timeout(CLEANUP_HELPER_TIMEOUT, child.wait()).await {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(status)) => cleanup_helper_status(status, label),
         Ok(Err(error)) => Err(io::Error::new(
             error.kind(),
             format!("failed to wait for {label} cleanup helper: {error}"),
@@ -301,6 +304,15 @@ async fn run_cleanup_helper(
             }
         }
     }
+}
+
+fn cleanup_helper_status(status: ExitStatus, label: &str) -> Result<(), io::Error> {
+    if status.success() {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "{label} cleanup helper exited unsuccessfully with {status}"
+    )))
 }
 
 fn combine_cleanup_results(
@@ -378,6 +390,51 @@ impl WindowsJob {
 }
 
 #[cfg(windows)]
+fn resume_windows_process(pid: u32) -> Result<(), io::Error> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let mut entry = THREADENTRY32 {
+        dwSize: size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    let result = loop {
+        if !has_entry {
+            break Err(io::Error::other(format!(
+                "suspended subprocess {pid} has no resumable primary thread"
+            )));
+        }
+        if entry.th32OwnerProcessID == pid {
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if thread.is_null() {
+                break Err(io::Error::last_os_error());
+            }
+            let resume_result = unsafe { ResumeThread(thread) };
+            unsafe {
+                CloseHandle(thread);
+            }
+            if resume_result == u32::MAX {
+                break Err(io::Error::last_os_error());
+            }
+            break Ok(());
+        }
+        has_entry = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    };
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    result
+}
+
+#[cfg(windows)]
 impl Drop for WindowsJob {
     fn drop(&mut self) {
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -411,37 +468,41 @@ pub(crate) fn process_tree_termination_plan() -> Vec<ProcessTerminationStep> {
 }
 
 #[cfg(unix)]
-fn configure_process_group(command: &mut Command, _hide_window: bool) {
+fn configure_process_group(command: &mut Command, _hide_window: bool, _start_suspended: bool) {
     use std::os::unix::process::CommandExt;
 
     command.process_group(0);
 }
 
 #[cfg(windows)]
-fn configure_process_group(command: &mut Command, hide_window: bool) {
+fn configure_process_group(command: &mut Command, hide_window: bool, start_suspended: bool) {
+    command.creation_flags(windows_creation_flags(hide_window, start_suspended));
+}
+
+#[cfg(windows)]
+fn windows_creation_flags(hide_window: bool, start_suspended: bool) -> u32 {
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut flags = CREATE_NEW_PROCESS_GROUP;
-    if hide_window {
-        flags |= CREATE_NO_WINDOW;
-    }
-    command.creation_flags(flags);
+    CREATE_NEW_PROCESS_GROUP
+        | if hide_window { CREATE_NO_WINDOW } else { 0 }
+        | if start_suspended { CREATE_SUSPENDED } else { 0 }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn configure_process_group(_command: &mut Command, _hide_window: bool) {}
+fn configure_process_group(_command: &mut Command, _hide_window: bool, _start_suspended: bool) {}
 
 #[cfg(unix)]
 async fn kill_process_tree(pid: u32, _hide_window: bool) -> Result<(), io::Error> {
     let process_group = format!("-{pid}");
-    let mut terminate = Command::new("kill");
+    let mut terminate = Command::new("/bin/kill");
     terminate
         .args(["-TERM", &process_group])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let terminate_result = run_cleanup_helper(terminate, false, "process-group TERM").await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut kill = Command::new("kill");
+    let mut kill = Command::new("/bin/kill");
     kill.args(["-KILL", &process_group])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -451,7 +512,8 @@ async fn kill_process_tree(pid: u32, _hide_window: bool) -> Result<(), io::Error
 
 #[cfg(windows)]
 async fn kill_windows_process_tree(pid: u32, hide_window: bool) -> Result<(), io::Error> {
-    let mut command = Command::new("taskkill");
+    let taskkill = windows_system_executable("taskkill.exe")?;
+    let mut command = Command::new(taskkill);
     command
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdout(Stdio::null())
@@ -459,7 +521,64 @@ async fn kill_windows_process_tree(pid: u32, hide_window: bool) -> Result<(), io
     run_cleanup_helper(command, hide_window, "taskkill /T").await
 }
 
+#[cfg(windows)]
+fn windows_system_executable(name: &str) -> Result<std::path::PathBuf, io::Error> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0u16; 260];
+    loop {
+        let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+        if length == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (length as usize) < buffer.len() {
+            buffer.truncate(length as usize);
+            return Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer)).join(name));
+        }
+        buffer.resize(length as usize + 1, 0);
+    }
+}
+
 #[cfg(not(any(unix, windows)))]
 async fn kill_process_tree(_pid: u32, _hide_window: bool) -> Result<(), io::Error> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cleanup_helper_status;
+
+    #[cfg(windows)]
+    #[test]
+    fn managed_child_is_suspended_but_cleanup_helper_is_not() {
+        const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+        assert_ne!(
+            super::windows_creation_flags(true, true) & CREATE_SUSPENDED,
+            0
+        );
+        assert_eq!(
+            super::windows_creation_flags(true, false) & CREATE_SUSPENDED,
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_helper_rejects_nonzero_unix_exit_status() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(7 << 8);
+        assert!(cleanup_helper_status(status, "test").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_helper_rejects_nonzero_windows_exit_status() {
+        use std::os::windows::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(7);
+        assert!(cleanup_helper_status(status, "test").is_err());
+    }
 }

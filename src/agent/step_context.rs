@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::agent::turn_context::TurnContext;
-use crate::config::ResolvedConfig;
 use crate::context::world_state::WorldState;
 use crate::skill::SkillsSnapshot;
 use crate::workspace::Workspace;
@@ -24,29 +23,29 @@ impl StepContext {
     pub fn capture(
         turn: Arc<TurnContext>,
         workspace: &Workspace,
-        config: &ResolvedConfig,
         skills: SkillsSnapshot,
         tool_names: &[String],
     ) -> Self {
-        let world_state =
-            WorldState::build_at(workspace, config, tool_names, turn.current_time.clone());
+        let (world_state, external_tools) = {
+            let config = turn.resolved_config().runtime_config();
+            (
+                WorldState::build_at(workspace, config, tool_names, turn.current_time.clone()),
+                ExternalToolSnapshot {
+                    docling_enabled: config.docling.enabled,
+                    mcp: config.mcp.enabled.then(|| config.mcp.clone()),
+                },
+            )
+        };
         Self {
             turn,
             world_state,
             skills: Arc::new(skills),
-            external_tools: ExternalToolSnapshot {
-                docling_enabled: config.docling.enabled,
-                mcp: config.mcp.enabled.then(|| config.mcp.clone()),
-            },
+            external_tools,
         }
     }
 
-    pub fn refresh_world_state(
-        &mut self,
-        workspace: &Workspace,
-        config: &ResolvedConfig,
-        tool_names: &[String],
-    ) {
+    pub fn refresh_world_state(&mut self, workspace: &Workspace, tool_names: &[String]) {
+        let config = self.turn.resolved_config().runtime_config();
         self.world_state = WorldState::build_at(
             workspace,
             config,
@@ -65,6 +64,7 @@ mod tests {
     use super::*;
     use crate::agent::mode::{CollaborationMode, ModeKind};
     use crate::agent::turn_context::TurnContext;
+    use crate::config::ResolvedConfig;
     use crate::context::current_time::CurrentTimeSnapshot;
     use crate::llm::model_policy::{ModelPolicy, ProviderCapabilities, ResolvedTurnPolicy};
     use crate::protocol::TurnId;
@@ -75,7 +75,7 @@ mod tests {
     fn step_refresh_keeps_turn_start_time_while_meaningful_world_state_can_change() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
-        let config = ResolvedConfig::default();
+        let mut config = ResolvedConfig::default();
         let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
         let mode = CollaborationMode::resolve(ModeKind::Default);
         let policy = Arc::new(
@@ -95,16 +95,21 @@ mod tests {
         };
         let turn = Arc::new(TurnContext {
             turn_id: TurnId::new(),
-            admission_id: "admission".to_string(),
+            admission_id: crate::session::AdmissionId::new(),
             mode,
             policy,
-            multi_agent_mode: None,
+            config: Arc::new(
+                crate::config::ResolvedTurnConfig::capture(config.clone())
+                    .expect("valid provider endpoint"),
+            ),
+            goal: None,
             current_time: current_time.clone(),
         });
+        config.docling.enabled = true;
+        config.mcp.enabled = true;
         let mut step = StepContext::capture(
             turn,
             &workspace,
-            &config,
             SkillsSnapshot {
                 workspace_root: root,
                 roots: Vec::new(),
@@ -112,17 +117,15 @@ mod tests {
             },
             &["read".to_string()],
         );
+        assert!(!step.external_tools.docling_enabled);
+        assert!(step.external_tools.mcp.is_none());
         let expected_time = serde_json::json!({ "snapshot": current_time });
         assert_eq!(
             step.world_state.snapshot.sections.get("current_time"),
             Some(&expected_time)
         );
 
-        step.refresh_world_state(
-            &workspace,
-            &config,
-            &["read".to_string(), "write".to_string()],
-        );
+        step.refresh_world_state(&workspace, &["read".to_string(), "write".to_string()]);
 
         assert_eq!(
             step.world_state.snapshot.sections.get("current_time"),

@@ -22,10 +22,15 @@ pub use projection::{
     project_sub_agent_activity, project_turn_item_for_run_event,
 };
 pub use recording::ProtocolRecordingSink;
-pub use store::{ProtocolEventStore, SqliteProtocolEventStore};
+pub use store::{
+    ActiveHistoryPage, ActiveHistorySnapshot, CanonicalProtocolFence, CanonicalProtocolSnapshot,
+    MAX_PROTOCOL_PAGE_LIMIT, ProtocolEventStore, ProtocolPage, ProtocolPageRequest,
+    SqliteProtocolEventStore,
+};
 pub(crate) use store::{
-    fork_canonical_items_in_transaction, insert_session_owned_event_bundle_in_transaction,
-    latest_protocol_turn_ids_in_transaction, latest_turn_position_for_session,
+    canonical_protocol_snapshot_from_connection, fork_canonical_items_in_transaction,
+    insert_idle_inter_agent_history_in_transaction,
+    insert_session_owned_event_bundle_in_transaction, latest_protocol_turn_ids_in_transaction,
 };
 
 macro_rules! protocol_id {
@@ -272,13 +277,58 @@ pub enum TurnInterruptionCause {
 }
 
 impl TurnInterruptionCause {
-    /// Stable fallback text for older consumers that only understand `reason`.
-    pub const fn legacy_reason(self) -> &'static str {
+    pub const fn summary(self) -> &'static str {
         match self {
             Self::ApprovalAborted => "permission approval aborted by user",
             Self::UserStop => "run stopped by user",
             Self::AgentInterrupted => "agent interrupted",
             Self::TreeStopped => "agent tree stopped",
+        }
+    }
+}
+
+/// The sole durable owner of a turn's terminal classification and payload.
+///
+/// Session status, finish reason, interruption cause, and terminal display text
+/// are projections of this discriminant. They must never be persisted beside it
+/// as independently mutable fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TurnTerminalOutcome {
+    Completed,
+    Interrupted { cause: TurnInterruptionCause },
+    Failed { error: String },
+}
+
+impl TurnTerminalOutcome {
+    pub const fn session_status(&self) -> SessionStatus {
+        match self {
+            Self::Completed => SessionStatus::Completed,
+            Self::Interrupted { .. } => SessionStatus::Cancelled,
+            Self::Failed { .. } => SessionStatus::Failed,
+        }
+    }
+
+    pub const fn finish_reason(&self) -> crate::session::FinishReason {
+        match self {
+            Self::Completed => crate::session::FinishReason::Stop,
+            Self::Interrupted { .. } => crate::session::FinishReason::Cancelled,
+            Self::Failed { .. } => crate::session::FinishReason::Error,
+        }
+    }
+
+    pub const fn interruption_cause(&self) -> Option<TurnInterruptionCause> {
+        match self {
+            Self::Interrupted { cause } => Some(*cause),
+            Self::Completed | Self::Failed { .. } => None,
+        }
+    }
+
+    pub fn summary(&self) -> &str {
+        match self {
+            Self::Completed => "completed",
+            Self::Interrupted { cause } => cause.summary(),
+            Self::Failed { error } => error,
         }
     }
 }
@@ -316,9 +366,9 @@ pub struct InterAgentCommunication {
 }
 
 impl RuntimeEvent {
-    pub fn terminal_status(&self) -> Option<TurnTerminalStatus> {
+    pub fn terminal_outcome(&self) -> Option<&TurnTerminalOutcome> {
         match &self.msg {
-            RuntimeEventMsg::TurnTerminal { terminal } => Some(terminal.status),
+            RuntimeEventMsg::TurnTerminal { terminal } => Some(&terminal.outcome),
             _ => None,
         }
     }
@@ -328,17 +378,13 @@ impl RuntimeEvent {
     }
 
     pub fn is_terminal(&self) -> bool {
-        self.terminal_status().is_some()
+        self.terminal_outcome().is_some()
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RuntimeEventMsg {
-    ThreadConfigured {
-        model: String,
-        base_url: String,
-    },
     UserInputAccepted {
         item_count: usize,
     },
@@ -356,27 +402,15 @@ pub enum RuntimeEventMsg {
         agent_path: String,
         activity_kind: SubAgentActivityKind,
     },
-    AssistantTextDelta {
-        response_id: ModelResponseId,
-        delta: String,
-    },
     AssistantMessageCommitted {
         response_id: ModelResponseId,
         text: String,
-    },
-    /// Provider-confirmed reasoning summary streamed to clients only.
-    ReasoningSummaryDelta {
-        response_id: ModelResponseId,
-        delta: String,
     },
     ModelRequestPrepared {
         diagnostics: RequestDiagnosticsPart,
     },
     WorldStateUpdated {
         snapshot: crate::context::WorldStateSnapshot,
-    },
-    HistoryItemRecorded {
-        item_id: HistoryItemId,
     },
     ToolLifecycle {
         envelope: ToolLifecycleEnvelope,
@@ -403,30 +437,30 @@ pub enum RuntimeEventMsg {
     Warning {
         message: String,
     },
-    RetryScheduled {
-        attempt: u8,
-        message: String,
-        next_retry_at_ms: i64,
-    },
     TurnTerminal {
         terminal: Box<crate::session::model::DurableTurnTerminal>,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnTerminalStatus {
-    Completed,
-    Failed,
-    Interrupted,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HistoryScope {
+    Turn { turn_id: TurnId },
+    Session,
 }
 
-impl TurnTerminalStatus {
-    pub fn as_session_status(self) -> SessionStatus {
+impl HistoryScope {
+    pub const fn turn_id(self) -> Option<TurnId> {
         match self {
-            Self::Completed => SessionStatus::Completed,
-            Self::Interrupted => SessionStatus::Cancelled,
-            Self::Failed => SessionStatus::Failed,
+            Self::Turn { turn_id } => Some(turn_id),
+            Self::Session => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Turn { .. } => "turn",
+            Self::Session => "session",
         }
     }
 }
@@ -435,15 +469,15 @@ impl TurnTerminalStatus {
 pub struct HistoryItem {
     pub id: HistoryItemId,
     pub session_id: SessionId,
-    pub turn_id: TurnId,
+    pub scope: HistoryScope,
     pub sequence_no: i64,
     pub created_at_ms: i64,
     pub payload: HistoryItemPayload,
 }
 
 impl HistoryItem {
-    pub fn ordering_key(&self) -> (SessionId, TurnId, i64, HistoryItemId) {
-        (self.session_id, self.turn_id, self.sequence_no, self.id)
+    pub const fn turn_id(&self) -> Option<TurnId> {
+        self.scope.turn_id()
     }
 }
 
@@ -540,11 +574,6 @@ pub enum HistoryItemPayload {
     ApprovalDecision {
         call_id: ToolCallId,
         decision: PermissionDecision,
-    },
-    RetryDecision {
-        attempt: u8,
-        message: String,
-        next_retry_at_ms: i64,
     },
     Compaction {
         mode: CompactionMode,
@@ -668,10 +697,7 @@ pub enum TurnItemPayload {
         message: String,
     },
     Terminal {
-        status: TurnTerminalStatus,
-        summary: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cause: Option<TurnInterruptionCause>,
+        outcome: TurnTerminalOutcome,
     },
 }
 
@@ -746,9 +772,7 @@ pub fn turn_item_internal_projection_roles_are_not_primary_display_fixture_passe
             summary: "compaction".to_string(),
         },
         TurnItemPayload::Terminal {
-            status: TurnTerminalStatus::Completed,
-            summary: "done".to_string(),
-            cause: None,
+            outcome: TurnTerminalOutcome::Completed,
         },
     ];
 

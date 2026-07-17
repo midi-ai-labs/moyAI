@@ -441,6 +441,7 @@ fn json_result(title: &str, output: Value, metadata: Value) -> Result<ToolResult
         truncated_output_path: None,
         recorded_changes: Vec::new(),
         change_summaries: Vec::new(),
+        _internal_file_lease: None,
     })
 }
 

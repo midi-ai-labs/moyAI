@@ -27,6 +27,7 @@ export interface UiDraftState {
   imageRevision: number;
   workspaceRevision: number;
   reviewRevision: number;
+  reviewSyncedRevision: number;
   providerRevision: number;
   pendingRunSubmission: {
     owner: string;
@@ -56,9 +57,9 @@ export interface UiLocalState {
   configDraftValues: Map<string, string>;
   configDraftBaselineValues: Map<string, string>;
   configDraftTarget: ConfigMutationTarget | null;
-  configDraftRevision: number;
-  nextConfigMutationGeneration: number;
-  activeConfigMutationGeneration: number | null;
+  configDraftRevision: bigint;
+  nextConfigMutationGeneration: bigint;
+  activeConfigMutationGeneration: bigint | null;
   lastFocusedOverlay: string;
   focusPromptAfterRender: boolean;
   initialPromptFocusDone: boolean;
@@ -101,6 +102,7 @@ export function createUiLocalState(): UiLocalState {
       imageRevision: 0,
       workspaceRevision: 0,
       reviewRevision: 0,
+      reviewSyncedRevision: 0,
       providerRevision: 0,
       pendingRunSubmission: null,
     },
@@ -111,8 +113,8 @@ export function createUiLocalState(): UiLocalState {
     configDraftValues: new Map(),
     configDraftBaselineValues: new Map(),
     configDraftTarget: null,
-    configDraftRevision: 0,
-    nextConfigMutationGeneration: 1,
+    configDraftRevision: 0n,
+    nextConfigMutationGeneration: 1n,
     activeConfigMutationGeneration: null,
     lastFocusedOverlay: "none",
     focusPromptAfterRender: false,

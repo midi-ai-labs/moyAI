@@ -13,8 +13,8 @@ pub const DEFAULT_MODEL_MAX_OUTPUT_TOKENS: u32 = 8_192;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessMode {
+    #[serde(alias = "auto_review", alias = "auto-review")]
     Default,
-    AutoReview,
     FullAccess,
 }
 
@@ -22,7 +22,7 @@ impl AccessMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim() {
             "default" => Some(Self::Default),
-            "auto_review" => Some(Self::AutoReview),
+            "auto_review" | "auto-review" => Some(Self::Default),
             "full_access" => Some(Self::FullAccess),
             _ => None,
         }
@@ -31,7 +31,6 @@ impl AccessMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
-            Self::AutoReview => "auto_review",
             Self::FullAccess => "full_access",
         }
     }
@@ -39,15 +38,13 @@ impl AccessMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Default => "Default",
-            Self::AutoReview => "Auto Review",
             Self::FullAccess => "Full Access",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
-            Self::Default => Self::AutoReview,
-            Self::AutoReview => Self::FullAccess,
+            Self::Default => Self::FullAccess,
             Self::FullAccess => Self::Default,
         }
     }
@@ -89,25 +86,10 @@ pub enum ProviderMetadataMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderApiMode {
-    #[default]
-    Auto,
     ChatCompletions,
+    #[default]
+    #[serde(alias = "auto")]
     Responses,
-}
-
-impl ProviderApiMode {
-    pub const fn resolved_for_provider_metadata_mode(
-        self,
-        provider_metadata_mode: ProviderMetadataMode,
-    ) -> Self {
-        match self {
-            Self::Auto => match provider_metadata_mode {
-                ProviderMetadataMode::LmStudioNativeRequired => Self::Responses,
-                ProviderMetadataMode::OpenAiCompatibleOnly => Self::ChatCompletions,
-            },
-            explicit => explicit,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,7 +243,7 @@ pub struct FormatterRule {
     pub command: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub base_url: String,
     pub model: String,
@@ -291,6 +273,45 @@ pub struct ModelConfig {
     pub parallel_tool_calls: bool,
     pub max_parallel_predictions: u32,
     pub extra_body_json: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for ModelConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModelConfig")
+            .field("base_url", &"<redacted provider endpoint>")
+            .field("model", &self.model)
+            .field("provider_metadata_mode", &self.provider_metadata_mode)
+            .field("provider_api_mode", &self.provider_api_mode)
+            .field(
+                "chat_completions_reasoning_parameters",
+                &self.chat_completions_reasoning_parameters,
+            )
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("reasoning_summary", &self.reasoning_summary)
+            .field("api_key_env", &self.api_key_env)
+            .field("extra_header_count", &self.extra_headers.len())
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("stream_idle_timeout_ms", &self.stream_idle_timeout_ms)
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("max_retries", &self.max_retries)
+            .field("context_window", &self.context_window)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("top_k", &self.top_k)
+            .field("presence_penalty", &self.presence_penalty)
+            .field("frequency_penalty", &self.frequency_penalty)
+            .field("seed", &self.seed)
+            .field("stop_sequence_count", &self.stop_sequences.len())
+            .field("supports_tools", &self.supports_tools)
+            .field("supports_reasoning", &self.supports_reasoning)
+            .field("supports_images", &self.supports_images)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("max_parallel_predictions", &self.max_parallel_predictions)
+            .field("extra_body_present", &self.extra_body_json.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,11 +499,11 @@ impl Default for ResolvedConfig {
                 base_url: DEFAULT_MODEL_BASE_URL.to_string(),
                 model: DEFAULT_MODEL_NAME.to_string(),
                 provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
-                provider_api_mode: ProviderApiMode::Auto,
+                provider_api_mode: ProviderApiMode::Responses,
                 chat_completions_reasoning_parameters: None,
                 reasoning_effort: None,
                 reasoning_summary: ReasoningSummary::None,
-                api_key_env: Some("OPENAI_API_KEY".to_string()),
+                api_key_env: None,
                 extra_headers: BTreeMap::new(),
                 request_timeout_ms: 300_000,
                 stream_idle_timeout_ms: 300_000,
@@ -576,7 +597,7 @@ impl Default for ResolvedConfig {
                 enabled: false,
                 base_url: "http://127.0.0.1:8123".to_string(),
                 timeout_ms: 120_000,
-                api_key_env: Some("DOCLING_API_KEY".to_string()),
+                api_key_env: None,
                 headers: BTreeMap::new(),
             },
             mcp: McpConfig {
@@ -604,111 +625,6 @@ impl Default for ResolvedConfig {
     }
 }
 
-pub fn config_default_provider_profile_lm_studio_fixture_passes() -> bool {
-    let config = ResolvedConfig::default();
-    config.model.base_url == "http://127.0.0.1:1234"
-        && config.model.model == "qwen/qwen3.6-35b-a3b"
-        && config.model.provider_metadata_mode == ProviderMetadataMode::LmStudioNativeRequired
-        && config.model.context_window == 131_072
-        && config.model.max_output_tokens == 8_192
-        && config.model.extra_body_json
-            == Some(serde_json::json!({
-                "num_ctx": 131072
-            }))
-}
-
-pub fn provider_metadata_mode_default_lm_studio_fixture_passes() -> bool {
-    ProviderMetadataMode::default() == ProviderMetadataMode::LmStudioNativeRequired
-        && ResolvedConfig::default().model.provider_metadata_mode == ProviderMetadataMode::default()
-}
-
-pub fn full_effective_override(config: &ResolvedConfig) -> PartialResolvedConfig {
-    PartialResolvedConfig {
-        model: Some(PartialModelConfig {
-            base_url: Some(config.model.base_url.clone()),
-            model: Some(config.model.model.clone()),
-            provider_metadata_mode: Some(config.model.provider_metadata_mode),
-            provider_api_mode: Some(config.model.provider_api_mode),
-            chat_completions_reasoning_parameters: config
-                .model
-                .chat_completions_reasoning_parameters,
-            reasoning_effort: config.model.reasoning_effort.clone(),
-            reasoning_summary: Some(config.model.reasoning_summary),
-            api_key_env: None,
-            extra_headers: Some(config.model.extra_headers.clone()),
-            request_timeout_ms: Some(config.model.request_timeout_ms),
-            stream_idle_timeout_ms: Some(config.model.stream_idle_timeout_ms),
-            connect_timeout_ms: Some(config.model.connect_timeout_ms),
-            max_retries: Some(config.model.max_retries),
-            context_window: Some(config.model.context_window),
-            max_output_tokens: Some(config.model.max_output_tokens),
-            temperature: config.model.temperature,
-            top_p: config.model.top_p,
-            top_k: config.model.top_k,
-            presence_penalty: config.model.presence_penalty,
-            frequency_penalty: config.model.frequency_penalty,
-            seed: config.model.seed,
-            stop_sequences: Some(config.model.stop_sequences.clone()),
-            supports_tools: Some(config.model.supports_tools),
-            supports_reasoning: Some(config.model.supports_reasoning),
-            supports_images: Some(config.model.supports_images),
-            parallel_tool_calls: Some(config.model.parallel_tool_calls),
-            max_parallel_predictions: Some(config.model.max_parallel_predictions),
-            extra_body_json: config.model.extra_body_json.clone(),
-        }),
-        session: None,
-        multi_agent: Some(PartialMultiAgentConfig {
-            enabled: Some(config.multi_agent.enabled),
-            mode: Some(config.multi_agent.mode),
-            max_concurrent_agents: Some(config.multi_agent.max_concurrent_agents),
-            max_concurrent_model_requests: Some(config.multi_agent.max_concurrent_model_requests),
-        }),
-        inspection: Some(PartialInspectionConfig {
-            default_max_depth: Some(config.inspection.default_max_depth),
-            default_max_entries_per_dir: Some(config.inspection.default_max_entries_per_dir),
-            max_extensions_reported: Some(config.inspection.max_extensions_reported),
-            include_hidden_by_default: Some(config.inspection.include_hidden_by_default),
-        }),
-        file_guard: Some(PartialFileGuardConfig {
-            max_inline_read_bytes: Some(config.file_guard.max_inline_read_bytes),
-            large_file_warning_bytes: Some(config.file_guard.large_file_warning_bytes),
-            blocked_read_extensions: Some(config.file_guard.blocked_read_extensions.clone()),
-            structured_document_extensions: Some(
-                config.file_guard.structured_document_extensions.clone(),
-            ),
-        }),
-        docling: Some(PartialDoclingConfig {
-            enabled: Some(config.docling.enabled),
-            base_url: Some(config.docling.base_url.clone()),
-            timeout_ms: Some(config.docling.timeout_ms),
-            api_key_env: Some(config.docling.api_key_env.clone()),
-            headers: Some(config.docling.headers.clone()),
-        }),
-        mcp: Some(PartialMcpConfig {
-            enabled: Some(config.mcp.enabled),
-            servers: Some(config.mcp.servers.clone()),
-        }),
-        permissions: Some(PartialPermissionsConfig {
-            access_mode: Some(config.permissions.access_mode),
-            additional_read_roots: Some(config.permissions.additional_read_roots.clone()),
-            additional_write_roots: Some(config.permissions.additional_write_roots.clone()),
-        }),
-        shell: Some(PartialShellConfig {
-            program: config.shell.program.clone().map(Some),
-            family: config.shell.family.map(Some),
-            default_timeout_ms: Some(config.shell.default_timeout_ms),
-            max_timeout_ms: Some(config.shell.max_timeout_ms),
-            env_allowlist: Some(config.shell.env_allowlist.clone()),
-            hide_windows: Some(config.shell.hide_windows),
-        }),
-        format: None,
-        instructions: None,
-        workspace: None,
-        tool_output: None,
-        logging: None,
-    }
-}
-
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartialResolvedConfig {
@@ -728,7 +644,7 @@ pub struct PartialResolvedConfig {
     pub logging: Option<PartialLoggingConfig>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartialModelConfig {
     pub base_url: Option<String>,
@@ -759,6 +675,60 @@ pub struct PartialModelConfig {
     pub parallel_tool_calls: Option<bool>,
     pub max_parallel_predictions: Option<u32>,
     pub extra_body_json: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for PartialModelConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PartialModelConfig")
+            .field(
+                "base_url",
+                &self
+                    .base_url
+                    .as_ref()
+                    .map(|_| "<redacted provider endpoint>"),
+            )
+            .field("model", &self.model)
+            .field("provider_metadata_mode", &self.provider_metadata_mode)
+            .field("provider_api_mode", &self.provider_api_mode)
+            .field(
+                "chat_completions_reasoning_parameters",
+                &self.chat_completions_reasoning_parameters,
+            )
+            .field("reasoning_effort", &self.reasoning_effort)
+            .field("reasoning_summary", &self.reasoning_summary)
+            .field("api_key_env", &self.api_key_env)
+            .field(
+                "extra_headers",
+                &self
+                    .extra_headers
+                    .as_ref()
+                    .map(|headers| format!("<redacted; {} entries>", headers.len())),
+            )
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("stream_idle_timeout_ms", &self.stream_idle_timeout_ms)
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("max_retries", &self.max_retries)
+            .field("context_window", &self.context_window)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("top_k", &self.top_k)
+            .field("presence_penalty", &self.presence_penalty)
+            .field("frequency_penalty", &self.frequency_penalty)
+            .field("seed", &self.seed)
+            .field(
+                "stop_sequence_count",
+                &self.stop_sequences.as_ref().map(Vec::len),
+            )
+            .field("supports_tools", &self.supports_tools)
+            .field("supports_reasoning", &self.supports_reasoning)
+            .field("supports_images", &self.supports_images)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("max_parallel_predictions", &self.max_parallel_predictions)
+            .field("extra_body_present", &self.extra_body_json.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -868,30 +838,33 @@ pub struct PartialLoggingConfig {
 
 #[cfg(test)]
 mod config_contract_tests {
-    use super::{McpServerConfig, PartialResolvedConfig, ResolvedConfig, full_effective_override};
+    use super::{McpServerConfig, PartialModelConfig, PartialResolvedConfig, ResolvedConfig};
     use crate::tool::ToolEffectClass;
 
     #[test]
-    fn effective_override_has_no_empty_session_patch() {
-        let patch = full_effective_override(&ResolvedConfig::default());
+    fn provider_config_debug_omits_endpoint_and_header_secrets() {
+        let mut config = ResolvedConfig::default();
+        config.model.base_url =
+            "https://user:endpoint-secret@provider.example/v1?api_key=query-secret".to_string();
+        config.model.extra_headers.insert(
+            "authorization".to_string(),
+            "Bearer header-secret".to_string(),
+        );
+        let partial = PartialModelConfig {
+            base_url: Some(config.model.base_url.clone()),
+            extra_headers: Some(config.model.extra_headers.clone()),
+            ..PartialModelConfig::default()
+        };
 
-        assert!(patch.session.is_none());
+        for debug in [format!("{:?}", config.model), format!("{partial:?}")] {
+            assert!(!debug.contains("endpoint-secret"));
+            assert!(!debug.contains("query-secret"));
+            assert!(!debug.contains("header-secret"));
+        }
     }
 
     #[test]
-    fn current_effective_and_session_overrides_round_trip_strictly() {
-        let patch = full_effective_override(&ResolvedConfig::default());
-        let encoded = toml::to_string(&patch).expect("serialize current effective override");
-        let decoded = toml::from_str::<PartialResolvedConfig>(&encoded)
-            .expect("current effective override is accepted");
-        assert_eq!(
-            decoded
-                .model
-                .as_ref()
-                .and_then(|model| model.model.as_deref()),
-            Some("qwen/qwen3.6-35b-a3b")
-        );
-
+    fn current_session_override_round_trips_strictly() {
         let session =
             toml::from_str::<PartialResolvedConfig>("[session]\noverflow_margin_tokens = 2048\n")
                 .expect("current session override is accepted");
@@ -1000,31 +973,15 @@ mod reasoning_contract_tests {
     }
 
     #[test]
-    fn provider_api_mode_auto_resolves_from_the_typed_provider_contract() {
-        assert_eq!(ProviderApiMode::default(), ProviderApiMode::Auto);
+    fn provider_api_mode_is_explicit_and_legacy_auto_normalizes_one_way() {
+        assert_eq!(ProviderApiMode::default(), ProviderApiMode::Responses);
         assert_eq!(
-            ProviderApiMode::Auto.resolved_for_provider_metadata_mode(
-                super::ProviderMetadataMode::LmStudioNativeRequired,
-            ),
+            serde_json::from_str::<ProviderApiMode>("\"auto\"").expect("legacy auto normalization"),
             ProviderApiMode::Responses
         );
         assert_eq!(
-            ProviderApiMode::Auto.resolved_for_provider_metadata_mode(
-                super::ProviderMetadataMode::OpenAiCompatibleOnly,
-            ),
-            ProviderApiMode::ChatCompletions
-        );
-        assert_eq!(
-            ProviderApiMode::ChatCompletions.resolved_for_provider_metadata_mode(
-                super::ProviderMetadataMode::LmStudioNativeRequired,
-            ),
-            ProviderApiMode::ChatCompletions
-        );
-        assert_eq!(
-            ProviderApiMode::Responses.resolved_for_provider_metadata_mode(
-                super::ProviderMetadataMode::OpenAiCompatibleOnly,
-            ),
-            ProviderApiMode::Responses
+            serde_json::to_string(&ProviderApiMode::Responses).expect("explicit wire mode"),
+            "\"responses\""
         );
     }
 
@@ -1074,7 +1031,7 @@ mod reasoning_contract_tests {
     fn model_reasoning_defaults_preserve_provider_defaults_and_output_capability() {
         let model = super::ResolvedConfig::default().model;
 
-        assert_eq!(model.provider_api_mode, ProviderApiMode::Auto);
+        assert_eq!(model.provider_api_mode, ProviderApiMode::Responses);
         assert_eq!(model.chat_completions_reasoning_parameters, None);
         assert_eq!(model.reasoning_effort, None);
         assert_eq!(model.reasoning_summary, ReasoningSummary::None);

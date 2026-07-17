@@ -8,7 +8,7 @@ use crate::cli::{CliCommand, RunArgs};
 use crate::config::{ConfigLoader, ResolvedConfig};
 use crate::edit::{ChangeTracker, EditSafety, Formatter};
 use crate::error::AppBootstrapError;
-use crate::llm::OpenAiCompatClient;
+use crate::llm::{OpenAiCompatClient, resolve_api_key_from_env};
 use crate::runtime::SessionRuntimeEventHub;
 use crate::session::ProjectRepository;
 use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
@@ -120,16 +120,8 @@ impl AppBootstrap {
             skills: crate::skill::SkillsService::new(),
         };
         let registry = ToolRegistry::core_agent_for_config(&config);
-        let api_key = config
-            .model
-            .api_key_env
-            .as_ref()
-            .and_then(|value| std::env::var(value).ok());
-        let llm = Arc::new(OpenAiCompatClient::new(
-            config.model.connect_timeout_ms,
-            config.model.max_retries,
-            api_key,
-        )?);
+        let api_key = resolve_api_key_from_env(config.model.api_key_env.as_deref())?;
+        let llm = Arc::new(OpenAiCompatClient::new(api_key));
         let agent_loop = AgentLoop::new(llm, registry, store.clone(), PromptBuilder, tool_services);
         let session_event_hub = SessionRuntimeEventHub::new(1024);
         let run_service = RunService::new(

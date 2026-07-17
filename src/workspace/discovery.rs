@@ -16,6 +16,8 @@ pub struct Workspace {
     pub ignore: IgnorePlan,
     pub protected_paths: Vec<Utf8PathBuf>,
     pub path_policy: PathPolicy,
+    #[serde(skip, default)]
+    pub traversal_registry: crate::workspace::traversal::TraversalRegistry,
 }
 
 pub struct WorkspaceDiscovery;
@@ -82,6 +84,7 @@ fn workspace_from_cwd_and_root(
         ignore,
         protected_paths,
         path_policy,
+        traversal_registry: crate::workspace::traversal::TraversalRegistry::default(),
     }
 }
 

@@ -4,13 +4,15 @@ use super::models::{
     DesktopArtifactRow, DesktopCommandRow, DesktopFileChangeRow, DesktopProjectRow,
     DesktopSessionRow, DesktopTranscriptRow,
 };
+use super::query::desktop_run_phase_label;
 use super::startup::{DesktopStartupCheckStatus, DesktopStartupStatus};
 use super::state::{DesktopOverlay, DesktopState, DesktopStatusCode};
 use crate::app::AgentActivityRecord;
 use crate::config::{AccessMode, ProviderMetadataMode};
+use crate::llm::ProviderModelLoadState;
 use crate::runtime::AgentStatus;
 use crate::tool::PermissionRequest;
-use crate::tui::config_editor::{ConfigField, ConfigFieldState};
+use crate::tui::config_editor::{ConfigEditorState, ConfigField, ConfigFieldState};
 use crate::tui::state::{PromptReviewPhase, RunStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,12 +162,42 @@ fn composer_admission_is_open(
     !busy && !navigation_loading && !background_mutation_pending && !runtime.blocks_new_request()
 }
 
+fn composer_steer_admission_is_open(
+    runtime: &DesktopRuntimeProjection,
+    state_busy: bool,
+    navigation_loading: bool,
+    background_mutation_pending: bool,
+) -> bool {
+    state_busy
+        && !runtime.root_run_finalizing
+        && !navigation_loading
+        && !background_mutation_pending
+}
+
+fn config_draft_capability_projection(
+    dirty: bool,
+    edit_admission_open: bool,
+    commit_admission_open: bool,
+    initial_setup_required: bool,
+    external_owner_admission_open: bool,
+    access_mode_admission_open: bool,
+) -> DesktopConfigDraftCapabilityProjection {
+    DesktopConfigDraftCapabilityProjection {
+        dirty,
+        edit_enabled: edit_admission_open,
+        discard_enabled: dirty && edit_admission_open,
+        commit_enabled: commit_admission_open && (dirty || initial_setup_required),
+        external_owner_mutation_open: !dirty && external_owner_admission_open,
+        access_mode_mutation_enabled: !dirty && access_mode_admission_open,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopConfigMutationTargetProjection {
     pub workspace_path: String,
     pub session_id: Option<String>,
-    pub config_generation: u64,
+    pub config_generation: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,10 +205,25 @@ pub struct DesktopConfigMutationTargetProjection {
 pub struct DesktopAccessModeMutationTargetProjection {
     pub workspace_path: String,
     pub session_id: Option<String>,
-    pub config_generation: u64,
+    pub config_generation: String,
     pub access_mode: AccessMode,
     pub runtime_owner_token: String,
-    pub config_owner_mutation_open: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopConfigDraftCapabilityProjection {
+    pub dirty: bool,
+    pub edit_enabled: bool,
+    pub discard_enabled: bool,
+    pub commit_enabled: bool,
+    pub external_owner_mutation_open: bool,
+    pub access_mode_mutation_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopConfigDraftCapabilitiesProjection {
+    pub clean: DesktopConfigDraftCapabilityProjection,
+    pub dirty: DesktopConfigDraftCapabilityProjection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,6 +231,15 @@ pub struct DesktopAccessModeMutationTargetProjection {
 pub struct DesktopDraftActionTargetProjection {
     pub workspace_path: String,
     pub session_id: Option<String>,
+    pub owner_generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopRunMutationTargetProjection {
+    pub workspace_path: String,
+    pub session_id: Option<String>,
+    pub runtime_owner_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,11 +250,7 @@ pub struct DesktopWebState {
     pub model_label: String,
     pub access_label: String,
     pub access_target: DesktopAccessModeMutationTargetProjection,
-    pub access_mode_mutation_enabled: bool,
-    pub config_owner_mutation_open: bool,
-    pub config_draft_dirty: bool,
-    pub config_draft_discard_enabled: bool,
-    pub config_draft_commit_enabled: bool,
+    pub config_draft_capabilities: DesktopConfigDraftCapabilitiesProjection,
     pub current_session_label: String,
     pub selected_session_title: String,
     pub status_message: String,
@@ -227,6 +279,7 @@ pub struct DesktopWebState {
     pub attached_images: Vec<String>,
     pub can_submit: bool,
     pub can_cancel_run: bool,
+    pub run_target: DesktopRunMutationTargetProjection,
     pub busy: bool,
     pub async_polling_required: bool,
     pub pending_async_operations: Vec<String>,
@@ -273,11 +326,6 @@ pub struct DesktopWebState {
     pub provider_loading: bool,
     pub provider_apply_enabled: bool,
     pub config_fields: Vec<DesktopConfigFieldProjection>,
-    pub config_items: Vec<String>,
-    pub selected_config_index: i32,
-    pub config_field_title: String,
-    pub config_value_text: String,
-    pub config_feedback_text: String,
     pub config_target: DesktopConfigMutationTargetProjection,
     pub workspace_input: String,
     pub review_raw_text: String,
@@ -309,13 +357,7 @@ pub(crate) fn desktop_web_state_with_permission(
     let busy = state_busy || root_run_active;
     let pre_admission_active = runtime.pre_admission_active(state_busy);
     let detail = state.selected_detail();
-    let config_items = state
-        .provider_config
-        .config_editor
-        .fields
-        .iter()
-        .map(config_item_label)
-        .collect::<Vec<_>>();
+    let config_editor = ConfigEditorState::from_config(&state.provider_config.effective_config);
     let (review_raw_text, review_status_text, send_enhanced_enabled, send_raw_enabled) =
         if let Some(review) = &state.app_state.prompt_review {
             let status = match review.phase {
@@ -340,14 +382,21 @@ pub(crate) fn desktop_web_state_with_permission(
                 false,
             )
         };
-    let image_input_enabled =
-        desktop_image_input_delegates_capability_to_runtime(state) && !root_run_active;
-    let composer_admission_open = composer_admission_is_open(
+    let new_request_admission_open = composer_admission_is_open(
         runtime,
         busy,
         state.navigation_loading(),
         state.background_mutation_pending(),
     );
+    let steer_admission_open = composer_steer_admission_is_open(
+        runtime,
+        state_busy,
+        state.navigation_loading(),
+        state.background_mutation_pending(),
+    );
+    let composer_admission_open = new_request_admission_open || steer_admission_open;
+    let image_input_enabled =
+        desktop_image_input_delegates_capability_to_runtime(state) && composer_admission_open;
     let navigation_admission_open = navigation_admission_blocker(
         busy,
         state.background_mutation_pending(),
@@ -380,6 +429,34 @@ pub(crate) fn desktop_web_state_with_permission(
         state.app_state.latest_context_window.as_ref(),
         state.provider_config.effective_config.model.context_window,
     );
+    let startup = startup_projection(state);
+    let config_draft_edit_open = !state.background_mutation_pending();
+    let config_draft_commit_open = !busy
+        && !runtime.blocks_new_request()
+        && !state.navigation_loading()
+        && !state.background_mutation_pending();
+    let external_config_owner_mutation_open = !state.background_mutation_pending();
+    let access_mode_mutation_open = !state.navigation_loading()
+        && !state.background_mutation_pending()
+        && access_runtime_allows_mutation(runtime.root_run_generation, runtime.agent_tree_active);
+    let config_draft_capabilities = DesktopConfigDraftCapabilitiesProjection {
+        clean: config_draft_capability_projection(
+            false,
+            config_draft_edit_open,
+            config_draft_commit_open,
+            startup.initial_setup_required,
+            external_config_owner_mutation_open,
+            access_mode_mutation_open,
+        ),
+        dirty: config_draft_capability_projection(
+            true,
+            config_draft_edit_open,
+            config_draft_commit_open,
+            startup.initial_setup_required,
+            external_config_owner_mutation_open,
+            access_mode_mutation_open,
+        ),
+    };
     DesktopWebState {
         projection_revision: "0".to_string(),
         workspace_path: state.snapshot.workspace_path.clone(),
@@ -404,7 +481,7 @@ pub(crate) fn desktop_web_state_with_permission(
                 .app_state
                 .current_session_id
                 .map(|session_id| session_id.to_string()),
-            config_generation: state.provider_config.config_generation,
+            config_generation: state.provider_config.config_generation.to_string(),
             access_mode: state
                 .provider_config
                 .effective_config
@@ -415,18 +492,8 @@ pub(crate) fn desktop_web_state_with_permission(
                 runtime.agent_tree_active,
                 runtime.last_root_run_epoch,
             ),
-            config_owner_mutation_open: true,
         },
-        access_mode_mutation_enabled: !state.navigation_loading()
-            && !state.background_mutation_pending()
-            && access_runtime_allows_mutation(
-                runtime.root_run_generation,
-                runtime.agent_tree_active,
-            ),
-        config_owner_mutation_open: true,
-        config_draft_dirty: false,
-        config_draft_discard_enabled: false,
-        config_draft_commit_enabled: false,
+        config_draft_capabilities,
         current_session_label: state.current_session_label(),
         selected_session_title: state.selected_session_title(),
         status_message,
@@ -449,7 +516,7 @@ pub(crate) fn desktop_web_state_with_permission(
         run_phase: if pre_admission_active {
             "実行準備".to_string()
         } else {
-            display_run_phase(&state.app_state.progress.current_phase)
+            desktop_run_phase_label(state.app_state.progress.current_phase).to_string()
         },
         run_active_step: if pre_admission_active {
             "durable run admissionを確定しています".to_string()
@@ -491,7 +558,7 @@ pub(crate) fn desktop_web_state_with_permission(
             agent_path: permission.agent_path.clone(),
             agent_task_name: permission.agent_task_name.clone(),
         }),
-        startup: startup_projection(state),
+        startup,
         composer_commit_generation: runtime.composer_commit_generation.to_string(),
         draft_prompt: state.composer.draft_prompt.clone(),
         draft_target: DesktopDraftActionTargetProjection {
@@ -500,6 +567,7 @@ pub(crate) fn desktop_web_state_with_permission(
                 .app_state
                 .current_session_id
                 .map(|session_id| session_id.to_string()),
+            owner_generation: state.composer.owner_generation(),
         },
         image_input: state.composer.image_attachment_input.clone(),
         attached_images: state
@@ -510,6 +578,18 @@ pub(crate) fn desktop_web_state_with_permission(
             .collect(),
         can_submit: composer_admission_open,
         can_cancel_run: busy || pending_permission.is_some() || runtime.agent_tree_active,
+        run_target: DesktopRunMutationTargetProjection {
+            workspace_path: state.snapshot.workspace_path.clone(),
+            session_id: state
+                .app_state
+                .current_session_id
+                .map(|session_id| session_id.to_string()),
+            runtime_owner_token: access_runtime_owner_token(
+                runtime.root_run_generation,
+                runtime.agent_tree_active,
+                runtime.last_root_run_epoch,
+            ),
+        },
         busy,
         async_polling_required: state.async_polling_required()
             || root_run_active
@@ -576,46 +656,27 @@ pub(crate) fn desktop_web_state_with_permission(
         provider_selected_model_summary: provider_selected_model_summary(state),
         provider_loading: state.provider_config.provider_loading,
         provider_apply_enabled: state.can_apply_provider_selection(),
-        config_fields: state
-            .provider_config
-            .config_editor
+        config_fields: config_editor
             .fields
             .iter()
             .map(config_field_projection)
             .collect(),
-        config_items,
-        selected_config_index: state.provider_config.config_editor.selected as i32,
-        config_field_title: state
-            .provider_config
-            .config_editor
-            .selected_field()
-            .key
-            .label()
-            .to_string(),
-        config_value_text: state.provider_config.config_value_text.clone(),
-        config_feedback_text: state
-            .provider_config
-            .config_editor
-            .feedback
-            .clone()
-            .unwrap_or_else(|| {
-                config_feedback_text(state.provider_config.config_editor.selected_field().key)
-            }),
         config_target: DesktopConfigMutationTargetProjection {
             workspace_path: state.snapshot.workspace_path.clone(),
             session_id: state
-                .selected_session_id()
+                .app_state
+                .current_session_id
                 .map(|session_id| session_id.to_string()),
-            config_generation: state.provider_config.config_generation,
+            config_generation: state.provider_config.config_generation.to_string(),
         },
         workspace_input: state.workspace_input.clone(),
         review_raw_text,
         review_draft_text: state.composer.review_draft_text.clone(),
         review_status_text,
-        send_enhanced_enabled: send_enhanced_enabled && composer_admission_open,
-        send_raw_enabled: send_raw_enabled && composer_admission_open,
+        send_enhanced_enabled: send_enhanced_enabled && new_request_admission_open,
+        send_raw_enabled: send_raw_enabled && new_request_admission_open,
         history_export_enabled: state.can_export_history() && !root_run_active,
-        enhance_enabled: composer_admission_open,
+        enhance_enabled: new_request_admission_open,
         image_input_enabled,
         window_opacity_percent: state.view.window_opacity_percent,
     }
@@ -647,7 +708,7 @@ struct ConfigFieldMetadata {
 fn config_field_metadata(field: ConfigField) -> ConfigFieldMetadata {
     const NONE: &[&str] = &[];
     const PROVIDER_MODES: &[&str] = &["lm_studio_native_required", "openai_compatible_only"];
-    const ACCESS_MODES: &[&str] = &["default", "auto_review", "full_access"];
+    const ACCESS_MODES: &[&str] = &["default", "full_access"];
     const MULTI_AGENT_MODES: &[&str] = &["explicit_request_only", "proactive"];
 
     let (value_type, min_value, max_value, options) = match field {
@@ -740,7 +801,6 @@ fn agent_status_key(status: &AgentStatus) -> &'static str {
         AgentStatus::Completed(_) => "completed",
         AgentStatus::Errored(_) => "errored",
         AgentStatus::Shutdown => "shutdown",
-        AgentStatus::NotFound => "not_found",
     }
 }
 
@@ -804,7 +864,6 @@ fn run_status_key(status: RunStatus) -> &'static str {
 fn access_mode_key(access: AccessMode) -> &'static str {
     match access {
         AccessMode::Default => "default",
-        AccessMode::AutoReview => "auto_review",
         AccessMode::FullAccess => "full_access",
     }
 }
@@ -824,21 +883,6 @@ fn overlay_key(overlay: DesktopOverlay) -> &'static str {
         DesktopOverlay::CommandPalette => "command_palette",
         DesktopOverlay::KeyboardShortcuts => "shortcuts",
     }
-}
-
-fn config_item_label(field: &ConfigFieldState) -> String {
-    let env_badge = field
-        .key
-        .env_override()
-        .filter(|name| std::env::var(name).is_ok())
-        .map(|_| " [ENV]")
-        .unwrap_or("");
-    format!(
-        "{} = {}{}",
-        field.key.label(),
-        truncate_middle(&field.value, 30),
-        env_badge
-    )
 }
 
 fn provider_model_labels(state: &DesktopState) -> Vec<String> {
@@ -878,7 +922,7 @@ fn provider_status_details(state: &DesktopState) -> String {
             "Provider mode: LM Studio native metadata required."
         }
         ProviderMetadataMode::OpenAiCompatibleOnly => {
-            "Provider mode: OpenAI-compatible only. The language / no-thinking system policy is active."
+            "Provider mode: OpenAI-compatible model catalog only."
         }
     };
     let limits = format!(
@@ -904,7 +948,14 @@ fn provider_selected_model_summary(state: &DesktopState) -> Vec<String> {
     let mut lines = vec![
         format!("Model: {}", info.id),
         format!("Metadata source: {}", info.source),
-        format!("Loaded: {}", if info.loaded { "yes" } else { "unknown/no" }),
+        format!(
+            "Load state: {}",
+            match info.load_state {
+                ProviderModelLoadState::Loaded => "loaded",
+                ProviderModelLoadState::NotLoaded => "not loaded",
+                ProviderModelLoadState::Unknown => "unknown",
+            }
+        ),
         format!(
             "Context: {}",
             info.context_window
@@ -946,16 +997,6 @@ fn metadata_capability_label(value: Option<bool>) -> &'static str {
         Some(false) => "not reported as supported",
         None => "not reported",
     }
-}
-
-fn config_feedback_text(key: ConfigField) -> String {
-    let env_text = key
-        .env_override()
-        .filter(|name| std::env::var(name).is_ok())
-        .unwrap_or("none");
-    format!(
-        "空欄は継承または削除を意味します。\nセッション適用は現在の起動中だけ有効です。\n環境変数の上書き: {env_text}"
-    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1129,21 +1170,6 @@ fn format_permission_confirmation_text(permission: &PermissionRequest) -> String
     )
 }
 
-fn display_run_phase(phase: &str) -> String {
-    match phase.trim().to_ascii_lowercase().as_str() {
-        "" => "待機".to_string(),
-        "model" => "モデル応答".to_string(),
-        "permission" => "確認".to_string(),
-        "tool" => "ツール実行".to_string(),
-        "verify" | "verification" => "検証".to_string(),
-        "compact" | "compaction" => "圧縮".to_string(),
-        "completed" => "完了".to_string(),
-        "failed" => "失敗".to_string(),
-        "cancelled" | "canceled" => "停止".to_string(),
-        other => other.to_string(),
-    }
-}
-
 fn display_run_step(step: &str) -> String {
     let trimmed = step.trim();
     if trimmed.is_empty() {
@@ -1180,31 +1206,10 @@ fn display_tool_summary(summary: &str) -> String {
     trimmed.to_string()
 }
 
-fn truncate_middle(value: &str, max_chars: usize) -> String {
-    let count = value.chars().count();
-    if count <= max_chars {
-        return value.to_string();
-    }
-    if max_chars <= 3 {
-        return value.chars().take(max_chars).collect();
-    }
-    let head = (max_chars - 1) / 2;
-    let tail = max_chars - head - 1;
-    let prefix = value.chars().take(head).collect::<String>();
-    let suffix = value
-        .chars()
-        .rev()
-        .take(tail)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
-    format!("{prefix}…{suffix}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::state::RunProgressPhase;
 
     #[test]
     fn unknown_free_form_status_with_error_keywords_is_not_reclassified() {
@@ -1247,6 +1252,33 @@ mod tests {
     }
 
     #[test]
+    fn provider_metadata_mode_status_does_not_claim_a_hidden_system_policy() {
+        let mut state = DesktopState::new(
+            super::super::models::DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            crate::config::ResolvedConfig::default(),
+        );
+        state.provider_config.provider_metadata_mode_input =
+            ProviderMetadataMode::OpenAiCompatibleOnly;
+
+        let details = provider_status_details(&state);
+
+        assert!(details.contains("OpenAI-compatible model catalog only"));
+        assert!(!details.contains("language"));
+        assert!(!details.contains("no-thinking"));
+    }
+
+    #[test]
     fn config_field_metadata_matches_rust_parser_shapes_and_bounds() {
         let agents = config_field_metadata(ConfigField::MultiAgentMaxAgents);
         assert_eq!(agents.value_type, "integer");
@@ -1274,6 +1306,34 @@ mod tests {
             false,
             false,
             false,
+        ));
+        assert!(composer_steer_admission_is_open(
+            &DesktopRuntimeProjection {
+                root_run_generation: Some(7),
+                ..DesktopRuntimeProjection::default()
+            },
+            true,
+            false,
+            false,
+        ));
+        assert!(!composer_steer_admission_is_open(
+            &DesktopRuntimeProjection {
+                root_run_generation: Some(7),
+                root_run_finalizing: true,
+                ..DesktopRuntimeProjection::default()
+            },
+            true,
+            false,
+            false,
+        ));
+        assert!(!composer_steer_admission_is_open(
+            &DesktopRuntimeProjection {
+                root_run_generation: Some(7),
+                ..DesktopRuntimeProjection::default()
+            },
+            true,
+            false,
+            true,
         ));
         assert!(!composer_admission_is_open(
             &DesktopRuntimeProjection {
@@ -1374,6 +1434,8 @@ mod tests {
         let operation_id = state.begin_project_delete_mutation();
         assert!(
             !desktop_web_state(&state, &DesktopRuntimeProjection::default())
+                .config_draft_capabilities
+                .clean
                 .access_mode_mutation_enabled
         );
         assert!(state.finish_project_delete_mutation(operation_id));
@@ -1385,7 +1447,12 @@ mod tests {
                 ..DesktopRuntimeProjection::default()
             },
         );
-        assert!(!child_only.access_mode_mutation_enabled);
+        assert!(
+            !child_only
+                .config_draft_capabilities
+                .clean
+                .access_mode_mutation_enabled
+        );
         assert_eq!(child_only.access_target.runtime_owner_token, "tree:8");
         let root_with_children = desktop_web_state(
             &state,
@@ -1396,13 +1463,18 @@ mod tests {
                 ..DesktopRuntimeProjection::default()
             },
         );
-        assert!(root_with_children.access_mode_mutation_enabled);
+        assert!(
+            root_with_children
+                .config_draft_capabilities
+                .clean
+                .access_mode_mutation_enabled
+        );
         assert_eq!(
             root_with_children.access_target.runtime_owner_token,
             "root:8"
         );
 
-        state.begin_prompt_enhance(1, "raw review");
+        state.begin_prompt_enhance(1, "raw review", tokio_util::sync::CancellationToken::new());
         assert!(state.finish_prompt_enhance(1, "edited review".to_string()));
         let idle_review = desktop_web_state(&state, &DesktopRuntimeProjection::default());
         assert!(idle_review.send_enhanced_enabled);
@@ -1432,7 +1504,7 @@ mod tests {
         );
         state.app_state.run_status = crate::tui::state::RunStatus::Completed;
         state.app_state.status_message = Some("run completed".to_string());
-        state.app_state.progress.current_phase = "completed".to_string();
+        state.app_state.progress.current_phase = RunProgressPhase::Terminal;
         state.app_state.progress.active_step = "previous run completed".to_string();
 
         let projection = desktop_web_state(
@@ -1456,6 +1528,135 @@ mod tests {
         assert!(projection.async_polling_required);
         assert!(projection.can_cancel_run);
         assert_eq!(projection.access_target.runtime_owner_token, "root:9");
+    }
+
+    #[test]
+    fn rust_projects_clean_and_dirty_config_capabilities_without_owning_the_draft() {
+        let state = DesktopState::new(
+            super::super::models::DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            crate::config::ResolvedConfig::default(),
+        );
+        let idle = desktop_web_state(&state, &DesktopRuntimeProjection::default());
+        assert!(!idle.config_draft_capabilities.clean.dirty);
+        assert!(!idle.config_draft_capabilities.clean.discard_enabled);
+        assert!(!idle.config_draft_capabilities.clean.commit_enabled);
+        assert!(
+            idle.config_draft_capabilities
+                .clean
+                .external_owner_mutation_open
+        );
+        assert!(idle.config_draft_capabilities.dirty.dirty);
+        assert!(idle.config_draft_capabilities.dirty.discard_enabled);
+        assert!(idle.config_draft_capabilities.dirty.commit_enabled);
+        assert!(
+            !idle
+                .config_draft_capabilities
+                .dirty
+                .external_owner_mutation_open
+        );
+
+        for runtime in [
+            DesktopRuntimeProjection {
+                root_run_generation: Some(4),
+                last_root_run_epoch: 4,
+                ..DesktopRuntimeProjection::default()
+            },
+            DesktopRuntimeProjection {
+                agent_tree_active: true,
+                last_root_run_epoch: 5,
+                ..DesktopRuntimeProjection::default()
+            },
+            DesktopRuntimeProjection {
+                root_run_finalizing: true,
+                last_root_run_epoch: 6,
+                ..DesktopRuntimeProjection::default()
+            },
+        ] {
+            assert!(
+                !desktop_web_state(&state, &runtime)
+                    .config_draft_capabilities
+                    .dirty
+                    .commit_enabled,
+                "run and tree ownership must close config commit"
+            );
+        }
+    }
+
+    #[test]
+    fn config_target_uses_the_effective_runtime_session_not_list_selection() {
+        let session_id = crate::session::SessionId::new();
+        let mut state = DesktopState::new(
+            super::super::models::DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            crate::config::ResolvedConfig::default(),
+        );
+        state.app_state.current_session_id = Some(session_id);
+
+        let projection = desktop_web_state(&state, &DesktopRuntimeProjection::default());
+
+        assert_eq!(
+            projection.config_target.session_id,
+            Some(session_id.to_string())
+        );
+    }
+
+    #[test]
+    fn running_root_accepts_one_steer_without_reopening_new_run_actions() {
+        let session_id = crate::session::SessionId::new();
+        let mut state = DesktopState::new(
+            super::super::models::DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            crate::config::ResolvedConfig::default(),
+        );
+        state.app_state.current_session_id = Some(session_id);
+        state.app_state.run_status = crate::tui::state::RunStatus::Running;
+        let runtime = DesktopRuntimeProjection {
+            root_run_generation: Some(8),
+            last_root_run_epoch: 8,
+            ..DesktopRuntimeProjection::default()
+        };
+
+        let running = desktop_web_state(&state, &runtime);
+        assert!(running.can_submit);
+        assert!(!running.enhance_enabled);
+        assert!(!running.send_enhanced_enabled);
+
+        let operation_id = state.begin_steer_submission();
+        let pending = desktop_web_state(&state, &runtime);
+        assert!(!pending.can_submit);
+        assert!(pending.background_mutation_pending);
+        assert!(state.finish_steer_submission(operation_id));
     }
 
     #[test]
@@ -1565,7 +1766,6 @@ mod tests {
             (AgentStatus::Completed(None), "completed"),
             (AgentStatus::Errored("failed".to_string()), "errored"),
             (AgentStatus::Shutdown, "shutdown"),
-            (AgentStatus::NotFound, "not_found"),
         ];
 
         for (status, expected) in cases {
@@ -1624,5 +1824,69 @@ mod tests {
 
         assert_eq!(projection.level, "critical");
         assert!(projection.label.ends_with("上限"));
+    }
+
+    #[test]
+    fn provider_phase_projection_labels_every_current_transport_boundary() {
+        let current = [
+            (
+                crate::llm::ProviderPhase::AttemptStarted,
+                "Provider要求開始",
+            ),
+            (
+                crate::llm::ProviderPhase::RequestInFlight,
+                "Provider要求処理中",
+            ),
+            (
+                crate::llm::ProviderPhase::HeadersReceived,
+                "Provider応答ヘッダー受信",
+            ),
+            (
+                crate::llm::ProviderPhase::FirstProgress,
+                "Provider応答受信中",
+            ),
+            (
+                crate::llm::ProviderPhase::LastProgress,
+                "Provider最終応答受信",
+            ),
+            (crate::llm::ProviderPhase::ProviderTerminal, "Provider完了"),
+        ];
+
+        for (phase, expected) in current {
+            assert_eq!(
+                desktop_run_phase_label(RunProgressPhase::Provider(phase)),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn provider_phase_projection_never_exposes_the_wire_key_in_desktop_progress() {
+        let mut state = DesktopState::new(
+            super::super::models::DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            crate::config::ResolvedConfig::default(),
+        );
+        state.app_state.current_session_id = Some(crate::session::SessionId::new());
+        state.app_state.run_status = RunStatus::Running;
+        state.app_state.progress.current_phase =
+            RunProgressPhase::Provider(crate::llm::ProviderPhase::RequestInFlight);
+
+        let projection = desktop_web_state(&state, &DesktopRuntimeProjection::default());
+
+        assert_eq!(projection.run_phase, "Provider要求処理中");
+        assert!(projection.progress_text.contains("Provider要求処理中"));
+        assert!(!projection.run_phase.contains("request_in_flight"));
+        assert!(!projection.progress_text.contains("request_in_flight"));
     }
 }

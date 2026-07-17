@@ -218,6 +218,7 @@ fn goal_tool_result(
         truncated_output_path: None,
         recorded_changes: Vec::new(),
         change_summaries: Vec::new(),
+        _internal_file_lease: None,
     })
 }
 

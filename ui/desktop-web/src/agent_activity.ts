@@ -24,7 +24,7 @@ const AGENT_VISUALS: AgentVisual[] = [
 ];
 
 const ACTIVE_STATUSES = new Set<AgentStatus>(["pending_init", "running"]);
-const ATTENTION_STATUSES = new Set<AgentStatus>(["interrupted", "errored", "not_found"]);
+const ATTENTION_STATUSES = new Set<AgentStatus>(["interrupted", "errored"]);
 
 export function orderedAgentActivityRows(rows: readonly AgentActivityRow[]): AgentActivityRow[] {
   return [...rows].sort((left, right) => {
@@ -79,8 +79,6 @@ export function agentStatusLabel(status: AgentStatus): string {
       return "エラー";
     case "shutdown":
       return "停止";
-    case "not_found":
-      return "不明";
   }
 }
 

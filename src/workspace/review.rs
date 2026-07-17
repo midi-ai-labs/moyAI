@@ -1,4 +1,7 @@
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
@@ -6,6 +9,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::WorkspaceError;
 
 use super::{VcsKind, Workspace};
+
+const GIT_REVIEW_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_REVIEW_STDOUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const GIT_REVIEW_STDERR_LIMIT_BYTES: usize = 256 * 1024;
+const GIT_REVIEW_PATH_LIMIT: usize = 50_000;
+const GIT_REVIEW_WAIT_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,38 +147,138 @@ fn run_git(workspace: &Workspace, args: &[&str]) -> Result<String, WorkspaceErro
 }
 
 fn run_git_bytes(workspace: &Workspace, args: &[&str]) -> Result<Vec<u8>, WorkspaceError> {
-    let output = Command::new("git")
+    let mut child = Command::new("git")
         .args(args)
         .current_dir(workspace.root.as_std_path())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| {
             WorkspaceError::Message(format!("failed to run git {}: {error}", args.join(" ")))
         })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stdout = child.stdout.take().ok_or_else(|| {
+        WorkspaceError::Message("failed to capture git review stdout".to_string())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        WorkspaceError::Message("failed to capture git review stderr".to_string())
+    })?;
+    let stdout_reader =
+        thread::spawn(move || read_bounded_stream(stdout, GIT_REVIEW_STDOUT_LIMIT_BYTES));
+    let stderr_reader =
+        thread::spawn(move || read_bounded_stream(stderr, GIT_REVIEW_STDERR_LIMIT_BYTES));
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < GIT_REVIEW_OPERATION_TIMEOUT => {
+                thread::sleep(GIT_REVIEW_WAIT_POLL);
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_bounded_reader(stdout_reader, "stdout");
+                let _ = join_bounded_reader(stderr_reader, "stderr");
+                return Err(WorkspaceError::Message(format!(
+                    "git {} exceeded the {} second review-operation deadline",
+                    args.join(" "),
+                    GIT_REVIEW_OPERATION_TIMEOUT.as_secs()
+                )));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_bounded_reader(stdout_reader, "stdout");
+                let _ = join_bounded_reader(stderr_reader, "stderr");
+                return Err(WorkspaceError::Message(format!(
+                    "failed while waiting for git {}: {error}",
+                    args.join(" ")
+                )));
+            }
+        }
+    };
+    let stdout = join_bounded_reader(stdout_reader, "stdout")?;
+    let stderr = join_bounded_reader(stderr_reader, "stderr")?;
+    if stdout.overflowed {
+        return Err(WorkspaceError::Message(format!(
+            "git {} exceeded the bounded review stdout limit of {} bytes",
+            args.join(" "),
+            GIT_REVIEW_STDOUT_LIMIT_BYTES
+        )));
+    }
+    if stderr.overflowed {
+        return Err(WorkspaceError::Message(format!(
+            "git {} exceeded the bounded review stderr limit of {} bytes",
+            args.join(" "),
+            GIT_REVIEW_STDERR_LIMIT_BYTES
+        )));
+    }
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr.bytes).trim().to_string();
+        let stdout = String::from_utf8_lossy(&stdout.bytes).trim().to_string();
         let detail = if !stderr.is_empty() { stderr } else { stdout };
         return Err(WorkspaceError::Message(format!(
             "git {} failed: {}",
             args.join(" "),
             if detail.is_empty() {
-                output.status.to_string()
+                status.to_string()
             } else {
                 detail
             }
         )));
     }
-    Ok(output.stdout)
+    Ok(stdout.bytes)
+}
+
+struct BoundedStreamCapture {
+    bytes: Vec<u8>,
+    overflowed: bool,
+}
+
+fn read_bounded_stream(
+    mut stream: impl Read,
+    limit: usize,
+) -> std::io::Result<BoundedStreamCapture> {
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    let mut overflowed = false;
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        let retained = limit.saturating_sub(bytes.len()).min(read);
+        bytes.extend_from_slice(&chunk[..retained]);
+        overflowed |= retained < read;
+    }
+    Ok(BoundedStreamCapture { bytes, overflowed })
+}
+
+fn join_bounded_reader(
+    reader: thread::JoinHandle<std::io::Result<BoundedStreamCapture>>,
+    stream_name: &str,
+) -> Result<BoundedStreamCapture, WorkspaceError> {
+    reader
+        .join()
+        .map_err(|_| WorkspaceError::Message(format!("git review {stream_name} reader panicked")))?
+        .map_err(|error| {
+            WorkspaceError::Message(format!(
+                "failed to read bounded git review {stream_name}: {error}"
+            ))
+        })
 }
 
 fn parse_status_entries(status: &[u8]) -> Result<Vec<(String, Utf8PathBuf)>, WorkspaceError> {
-    let records = status.split(|byte| *byte == 0).collect::<Vec<_>>();
+    parse_status_entries_with_limit(status, GIT_REVIEW_PATH_LIMIT)
+}
+
+fn parse_status_entries_with_limit(
+    status: &[u8],
+    path_limit: usize,
+) -> Result<Vec<(String, Utf8PathBuf)>, WorkspaceError> {
     let mut entries = Vec::new();
-    let mut index = 0;
-    while index < records.len() {
-        let record = records[index];
+    let mut records = status.split(|byte| *byte == 0);
+    while let Some(record) = records.next() {
         if record.is_empty() {
-            index += 1;
             continue;
         }
         if record.len() < 4 || record[2] != b' ' {
@@ -184,15 +293,23 @@ fn parse_status_entries(status: &[u8]) -> Result<Vec<(String, Utf8PathBuf)>, Wor
             WorkspaceError::Message(format!("git status path is not valid UTF-8: {error}"))
         })?;
         if !path.is_empty() {
+            if entries.len() >= path_limit {
+                return Err(WorkspaceError::Message(format!(
+                    "git review changed-path count exceeded the limit of {path_limit}"
+                )));
+            }
             entries.push((code.clone(), Utf8PathBuf::from(path)));
         }
-        index += 1;
         if code
             .as_bytes()
             .iter()
             .any(|code| matches!(*code, b'R' | b'C'))
         {
-            index += 1;
+            records.next().ok_or_else(|| {
+                WorkspaceError::Message(
+                    "git status rename record is missing its source path".to_string(),
+                )
+            })?;
         }
     }
     entries.sort_by(|left, right| left.1.cmp(&right.1));
@@ -201,17 +318,31 @@ fn parse_status_entries(status: &[u8]) -> Result<Vec<(String, Utf8PathBuf)>, Wor
 }
 
 fn parse_nul_paths(bytes: &[u8]) -> Result<Vec<Utf8PathBuf>, WorkspaceError> {
-    let mut paths = bytes
+    parse_nul_paths_with_limit(bytes, GIT_REVIEW_PATH_LIMIT)
+}
+
+fn parse_nul_paths_with_limit(
+    bytes: &[u8],
+    path_limit: usize,
+) -> Result<Vec<Utf8PathBuf>, WorkspaceError> {
+    let mut paths = Vec::new();
+    for record in bytes
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
-        .map(|record| {
+    {
+        if paths.len() >= path_limit {
+            return Err(WorkspaceError::Message(format!(
+                "git review changed-path count exceeded the limit of {path_limit}"
+            )));
+        }
+        paths.push(
             std::str::from_utf8(record)
                 .map(Utf8PathBuf::from)
                 .map_err(|error| {
                     WorkspaceError::Message(format!("git path is not valid UTF-8: {error}"))
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+                })?,
+        );
+    }
     paths.sort();
     paths.dedup();
     Ok(paths)
@@ -219,6 +350,8 @@ fn parse_nul_paths(bytes: &[u8]) -> Result<Vec<Utf8PathBuf>, WorkspaceError> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
 
     #[test]
@@ -234,5 +367,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["odd -> name.txt", "src/new name.rs", "src/日本語.rs"]
         );
+    }
+
+    #[test]
+    fn bounded_git_capture_drains_but_retains_only_the_limit() {
+        let capture =
+            read_bounded_stream(Cursor::new(vec![b'x'; 64]), 12).expect("bounded stream capture");
+
+        assert_eq!(capture.bytes, vec![b'x'; 12]);
+        assert!(capture.overflowed);
+    }
+
+    #[test]
+    fn changed_path_parsers_fail_instead_of_returning_partial_scope() {
+        let status = b" M a.txt\0 M b.txt\0 M c.txt\0";
+        let status_error = parse_status_entries_with_limit(status, 2)
+            .expect_err("status path limit must fail closed");
+        assert!(status_error.to_string().contains("exceeded"));
+
+        let names = b"a.txt\0b.txt\0c.txt\0";
+        let names_error =
+            parse_nul_paths_with_limit(names, 2).expect_err("name path limit must fail closed");
+        assert!(names_error.to_string().contains("exceeded"));
     }
 }

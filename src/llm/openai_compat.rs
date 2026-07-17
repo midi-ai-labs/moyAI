@@ -1,17 +1,17 @@
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use eventsource_stream::Eventsource;
-use futures_util::StreamExt;
+use eventsource_stream::{EventStreamError, Eventsource};
+use futures_util::{Stream, StreamExt};
 use reqwest::StatusCode;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::ProviderMetadataMode;
 use crate::config::model::{ProviderApiMode, ProviderReasoningCapability};
-use crate::error::LlmError;
+use crate::error::{LlmError, ProviderStreamLimit};
 use crate::llm::contract::{ReasoningRequest, validate_chat_completions_reasoning_request};
 use crate::llm::dto::{
     OpenAiChatChunk, OpenAiChatRequest, OpenAiContent, OpenAiContentPart, OpenAiErrorPayload,
@@ -23,7 +23,9 @@ use crate::llm::responses::{
 };
 use crate::llm::{
     ChatRequest, LlmClient, LlmEvent, LlmEventSink, LlmResponseSummary, ModelMessage,
-    ProviderToolChoice, ToolSchema, tool_surface_scoped_parallel_tool_calls_projection,
+    ProviderFailure, ProviderFailureKind, ProviderPhase, ProviderPhaseEvent, ProviderRequestId,
+    ProviderTerminalStatus, ProviderToolChoice, ToolSchema,
+    tool_surface_scoped_parallel_tool_calls_projection,
 };
 use crate::session::{FinishReason, TokenUsage};
 use crate::tool::truncate::clip_text_with_ellipsis;
@@ -31,28 +33,29 @@ use crate::tool::truncate::clip_text_with_ellipsis;
 const RETRY_INITIAL_DELAY_MS: u64 = 2_000;
 const RETRY_BACKOFF_FACTOR: u64 = 2;
 const RETRY_MAX_DELAY_MS: u64 = 30_000;
+const PROVIDER_FAILURE_BODY_LIMIT_BYTES: usize = 64 * 1024;
+const PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES: usize = 243;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiCompatClient {
-    client: reqwest::Client,
-    max_retries: u8,
     api_key: Option<String>,
 }
 
 impl OpenAiCompatClient {
-    pub fn new(
-        connect_timeout_ms: u64,
-        max_retries: u8,
-        api_key: Option<String>,
-    ) -> Result<Self, LlmError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_millis(connect_timeout_ms))
-            .build()?;
-        Ok(Self {
-            client,
-            max_retries,
-            api_key,
-        })
+    pub fn new(api_key: Option<String>) -> Self {
+        Self { api_key }
+    }
+}
+
+impl fmt::Debug for OpenAiCompatClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpenAiCompatClient")
+            .field(
+                "api_key",
+                &self.api_key.as_ref().map(|_| "<redacted secret>"),
+            )
+            .finish()
     }
 }
 
@@ -64,21 +67,31 @@ impl LlmClient for OpenAiCompatClient {
         cancel: CancellationToken,
         sink: &mut dyn LlmEventSink,
     ) -> Result<LlmResponseSummary, LlmError> {
-        match request.provider_api_mode {
+        let mut trace = ProviderTraceSink::new(&request, sink);
+        let result = self.stream_chat_traced(request, cancel, &mut trace).await;
+        trace.finish(result)
+    }
+}
+
+impl OpenAiCompatClient {
+    async fn stream_chat_traced(
+        &self,
+        request: ChatRequest,
+        cancel: CancellationToken,
+        sink: &mut ProviderTraceSink<'_>,
+    ) -> Result<LlmResponseSummary, LlmError> {
+        request.validate_provider_lifecycle()?;
+        match request.provider_target().api_mode() {
             ProviderApiMode::Responses => {
                 return self.stream_responses(request, cancel, sink).await;
             }
             ProviderApiMode::ChatCompletions => {}
-            ProviderApiMode::Auto => {
-                return Err(LlmError::Message(
-                    "provider_api_mode must be resolved before transport dispatch".to_string(),
-                ));
-            }
         }
         let body = to_openai_request(&request)?;
+        let body = bytes::Bytes::from(request.serialize_wire_body(&body)?);
 
         let Some(response) = self
-            .send_request(&request, "v1/chat/completions", &body, &cancel)
+            .send_request(&request, "v1/chat/completions", body, &cancel, sink)
             .await?
         else {
             return Ok(LlmResponseSummary {
@@ -88,7 +101,10 @@ impl LlmClient for OpenAiCompatClient {
             });
         };
 
-        let mut stream = response.bytes_stream().eventsource();
+        let stream_limits = request.provider_target().stream_limits();
+        let mut stream =
+            bounded_response_bytes(response, stream_limits.max_raw_bytes).eventsource();
+        let mut stream_budget = ProviderStreamBudget::new(stream_limits);
         let mut usage = None;
         let mut finish_reason = None;
         let mut saw_terminal_signal = false;
@@ -96,39 +112,37 @@ impl LlmClient for OpenAiCompatClient {
         let mut tool_calls: HashMap<usize, PartialToolCall> = HashMap::new();
 
         loop {
-            let next_event =
-                if let Some(timeout) = stream_idle_timeout(request.stream_idle_timeout_ms) {
-                    tokio::select! {
-                        _ = cancel.cancelled() => {
-                            return Ok(LlmResponseSummary {
-                                finish_reason: FinishReason::Cancelled,
-                                usage,
-                                response_id: None,
-                            });
-                        }
-                        result = tokio::time::timeout(timeout, stream.next()) => {
-                            match result {
-                                Ok(event) => event,
-                                Err(_) => {
-                                    return Err(stream_idle_timeout_error(
-                                        request.stream_idle_timeout_ms,
-                                    ));
-                                }
+            let idle_timeout_ms = request.provider_target().deadlines().stream_idle_timeout_ms;
+            let next_event = if let Some(timeout) = stream_budget.wait_timeout(idle_timeout_ms) {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        return Ok(LlmResponseSummary {
+                            finish_reason: FinishReason::Cancelled,
+                            usage,
+                            response_id: None,
+                        });
+                    }
+                    result = tokio::time::timeout(timeout, stream.next()) => {
+                        match result {
+                            Ok(event) => event,
+                            Err(_) => {
+                                return Err(stream_budget.timeout_error(idle_timeout_ms));
                             }
                         }
                     }
-                } else {
-                    tokio::select! {
-                        _ = cancel.cancelled() => {
-                            return Ok(LlmResponseSummary {
-                                finish_reason: FinishReason::Cancelled,
-                                usage,
-                                response_id: None,
-                            });
-                        }
-                        result = stream.next() => result,
+                }
+            } else {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        return Ok(LlmResponseSummary {
+                            finish_reason: FinishReason::Cancelled,
+                            usage,
+                            response_id: None,
+                        });
                     }
-                };
+                    result = stream.next() => result,
+                }
+            };
 
             let Some(event) = next_event else {
                 ended_by_eof = true;
@@ -137,10 +151,13 @@ impl LlmClient for OpenAiCompatClient {
 
             let event = match event {
                 Ok(event) => event,
+                Err(EventStreamError::Transport(error)) => return Err(error),
                 Err(error) => {
                     return Err(LlmError::Message(format!("SSE stream error: {error}")));
                 }
             };
+            stream_budget.record_event()?;
+            sink.record_progress()?;
             if event.data == "[DONE]" {
                 saw_terminal_signal = true;
                 break;
@@ -173,6 +190,7 @@ impl LlmClient for OpenAiCompatClient {
                 if let Some(deltas) = choice.delta.tool_calls {
                     for delta in deltas {
                         let delta_index = delta.index;
+                        stream_budget.record_tool_call(format!("chat:{delta_index}"))?;
                         let entry = tool_calls.entry(delta_index).or_default();
                         if let Some(id) = delta.id {
                             entry.record_call_id(id, delta_index)?;
@@ -183,6 +201,10 @@ impl LlmClient for OpenAiCompatClient {
                             }
                             if let Some(arguments) = function.arguments {
                                 entry.saw_arguments_field = true;
+                                stream_budget.record_tool_arguments(
+                                    &format!("chat:{delta_index}"),
+                                    arguments.len() as u64,
+                                )?;
                                 entry.arguments.push_str(&arguments);
                             }
                         }
@@ -231,11 +253,12 @@ impl OpenAiCompatClient {
         &self,
         request: ChatRequest,
         cancel: CancellationToken,
-        sink: &mut dyn LlmEventSink,
+        sink: &mut ProviderTraceSink<'_>,
     ) -> Result<LlmResponseSummary, LlmError> {
         let body = to_responses_request(&request, ResponsesRequestOptions::from_request(&request))?;
+        let body = bytes::Bytes::from(request.serialize_wire_body(&body)?);
         let Some(response) = self
-            .send_request(&request, "v1/responses", &body, &cancel)
+            .send_request(&request, "v1/responses", body, &cancel, sink)
             .await?
         else {
             return Ok(LlmResponseSummary {
@@ -245,43 +268,44 @@ impl OpenAiCompatClient {
             });
         };
 
-        let mut stream = response.bytes_stream().eventsource();
+        let stream_limits = request.provider_target().stream_limits();
+        let mut stream =
+            bounded_response_bytes(response, stream_limits.max_raw_bytes).eventsource();
+        let mut stream_budget = ProviderStreamBudget::new(stream_limits);
         let mut accumulator = ResponsesStreamAccumulator::default();
 
         loop {
-            let next_event =
-                if let Some(timeout) = stream_idle_timeout(request.stream_idle_timeout_ms) {
-                    tokio::select! {
-                        _ = cancel.cancelled() => {
-                            return Ok(LlmResponseSummary {
-                                finish_reason: FinishReason::Cancelled,
-                                usage: None,
-                                response_id: None,
-                            });
-                        }
-                        result = tokio::time::timeout(timeout, stream.next()) => {
-                            match result {
-                                Ok(event) => event,
-                                Err(_) => {
-                                    return Err(stream_idle_timeout_error(
-                                        request.stream_idle_timeout_ms,
-                                    ));
-                                }
+            let idle_timeout_ms = request.provider_target().deadlines().stream_idle_timeout_ms;
+            let next_event = if let Some(timeout) = stream_budget.wait_timeout(idle_timeout_ms) {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        return Ok(LlmResponseSummary {
+                            finish_reason: FinishReason::Cancelled,
+                            usage: None,
+                            response_id: None,
+                        });
+                    }
+                    result = tokio::time::timeout(timeout, stream.next()) => {
+                        match result {
+                            Ok(event) => event,
+                            Err(_) => {
+                                return Err(stream_budget.timeout_error(idle_timeout_ms));
                             }
                         }
                     }
-                } else {
-                    tokio::select! {
-                        _ = cancel.cancelled() => {
-                            return Ok(LlmResponseSummary {
-                                finish_reason: FinishReason::Cancelled,
-                                usage: None,
-                                response_id: None,
-                            });
-                        }
-                        result = stream.next() => result,
+                }
+            } else {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        return Ok(LlmResponseSummary {
+                            finish_reason: FinishReason::Cancelled,
+                            usage: None,
+                            response_id: None,
+                        });
                     }
-                };
+                    result = stream.next() => result,
+                }
+            };
 
             let Some(event) = next_event else {
                 return Err(LlmError::Message(
@@ -290,12 +314,15 @@ impl OpenAiCompatClient {
             };
             let event = match event {
                 Ok(event) => event,
+                Err(EventStreamError::Transport(error)) => return Err(error),
                 Err(error) => {
                     return Err(LlmError::Message(format!(
                         "Responses SSE stream error: {error}"
                     )));
                 }
             };
+            stream_budget.record_event()?;
+            sink.record_progress()?;
 
             if event.data == "[DONE]" {
                 return Err(LlmError::Message(
@@ -309,6 +336,7 @@ impl OpenAiCompatClient {
                     summarize_stream_chunk(&event.data)
                 ))
             })?;
+            stream_budget.record_projected_events(&update.events)?;
             match update.terminal {
                 Some(ResponsesTerminal::Completed {
                     response_id,
@@ -348,11 +376,27 @@ impl OpenAiCompatClient {
         &self,
         request: &ChatRequest,
         endpoint_path: &str,
-        body: &Value,
+        body: bytes::Bytes,
         cancel: &CancellationToken,
+        trace: &mut ProviderTraceSink<'_>,
     ) -> Result<Option<reqwest::Response>, LlmError> {
-        let mut attempt = 0u8;
+        let deadlines = request.provider_target().deadlines();
+        let deadline = OperationDeadline::new(deadlines.response_start_timeout_ms);
+        let client_builder = reqwest::Client::builder();
+        let client_builder = if deadlines.connect_timeout_ms > 0 {
+            client_builder.connect_timeout(Duration::from_millis(deadlines.connect_timeout_ms))
+        } else {
+            client_builder
+        };
+        let client = client_builder.build()?;
+        let endpoint_url = request
+            .provider_target()
+            .endpoint()
+            .join_api_path(endpoint_path)
+            .map_err(|error| LlmError::Message(error.to_string()))?;
+        let mut attempt = 1u16;
         loop {
+            trace.begin_attempt(attempt)?;
             let mut headers = HeaderMap::new();
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
             if let Some(api_key) = &self.api_key {
@@ -362,29 +406,25 @@ impl OpenAiCompatClient {
                     })?;
                 headers.insert(AUTHORIZATION, value);
             }
-            apply_extra_headers(&mut headers, &request.extra_headers)?;
+            apply_extra_headers(&mut headers, request.extra_headers())?;
 
-            let request_builder = self
-                .client
-                .post(format!(
-                    "{}/{}",
-                    request.base_url.trim_end_matches('/'),
-                    endpoint_path.trim_start_matches('/')
-                ))
+            let request_builder = client
+                .post(endpoint_url.clone())
                 .headers(headers)
-                .json(body);
+                .body(body.clone());
 
-            let result = if let Some(timeout) = request_header_timeout(request.timeout_ms) {
+            trace.phase(ProviderPhase::RequestInFlight)?;
+
+            let result = if let Some(timeout) = deadline.remaining() {
                 match tokio::select! {
                     _ = cancel.cancelled() => return Ok(None),
                     result = tokio::time::timeout(timeout, request_builder.send()) => result,
                 } {
                     Ok(result) => result,
                     Err(_) => {
-                        return Err(LlmError::Message(format!(
-                            "provider request timeout after {}ms before response headers",
-                            request.timeout_ms
-                        )));
+                        return Err(LlmError::ProviderResponseStartTimeout {
+                            timeout_ms: deadlines.response_start_timeout_ms,
+                        });
                     }
                 }
             } else {
@@ -395,29 +435,16 @@ impl OpenAiCompatClient {
             };
 
             match result {
-                Ok(response) if response.status().is_success() => return Ok(Some(response)),
+                Ok(response) if response.status().is_success() => {
+                    trace.phase(ProviderPhase::HeadersReceived)?;
+                    return Ok(Some(response));
+                }
                 Ok(response) => {
-                    let Some(failure) = parse_response_failure_until_cancelled(
-                        response,
-                        cancel,
-                        request.timeout_ms,
-                    )
-                    .await?
+                    let Some(failure) =
+                        parse_response_failure_until_cancelled(response, cancel, &deadline).await?
                     else {
                         return Ok(None);
                     };
-                    if failure.retryable && attempt < self.max_retries {
-                        attempt += 1;
-                        if !sleep_retry_delay(
-                            retry_delay_ms(attempt, failure.retry_after_ms),
-                            cancel,
-                        )
-                        .await
-                        {
-                            return Ok(None);
-                        }
-                        continue;
-                    }
                     return Err(LlmError::ProviderRejected {
                         status: Some(failure.status.as_u16()),
                         code: failure.code,
@@ -426,16 +453,217 @@ impl OpenAiCompatClient {
                     });
                 }
                 Err(error)
-                    if should_retry_transport_error(&error) && attempt < self.max_retries =>
+                    if should_retry_transport_error(&error)
+                        && attempt <= u16::from(deadlines.max_connect_retries) =>
                 {
-                    attempt += 1;
-                    if !sleep_retry_delay(retry_delay_ms(attempt, None), cancel).await {
-                        return Ok(None);
+                    let delay = retry_delay_ms(attempt.min(u16::from(u8::MAX)) as u8, None);
+                    if !sleep_retry_delay_until_deadline(delay, cancel, &deadline).await {
+                        if cancel.is_cancelled() {
+                            return Ok(None);
+                        }
+                        return Err(LlmError::ProviderResponseStartTimeout {
+                            timeout_ms: deadlines.response_start_timeout_ms,
+                        });
                     }
+                    attempt += 1;
                 }
-                Err(error) => return Err(LlmError::Http(error)),
+                Err(error) => return Err(LlmError::Http(error.without_url())),
             }
         }
+    }
+}
+
+struct ProviderTraceSink<'a> {
+    inner: &'a mut dyn LlmEventSink,
+    request_id: ProviderRequestId,
+    endpoint: String,
+    started_at: Instant,
+    attempt: u16,
+    current_phase: ProviderPhase,
+    first_progress_seen: bool,
+    last_progress_elapsed_ms: Option<u64>,
+}
+
+impl<'a> ProviderTraceSink<'a> {
+    fn new(request: &ChatRequest, inner: &'a mut dyn LlmEventSink) -> Self {
+        Self {
+            inner,
+            request_id: ProviderRequestId::new(),
+            endpoint: request.provider_target().sanitized_endpoint().to_string(),
+            started_at: Instant::now(),
+            attempt: 0,
+            current_phase: ProviderPhase::AttemptStarted,
+            first_progress_seen: false,
+            last_progress_elapsed_ms: None,
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64
+    }
+
+    fn begin_attempt(&mut self, attempt: u16) -> Result<(), LlmError> {
+        self.attempt = attempt;
+        self.phase(ProviderPhase::AttemptStarted)
+    }
+
+    fn phase(&mut self, phase: ProviderPhase) -> Result<(), LlmError> {
+        self.current_phase = phase;
+        self.inner.provider_phase(ProviderPhaseEvent {
+            request_id: self.request_id.clone(),
+            endpoint: self.endpoint.clone(),
+            phase,
+            attempt: self.attempt,
+            elapsed_ms: self.elapsed_ms(),
+            terminal_status: None,
+            failure: None,
+        })
+    }
+
+    fn record_progress(&mut self) -> Result<(), LlmError> {
+        self.last_progress_elapsed_ms = Some(self.elapsed_ms());
+        if self.first_progress_seen {
+            return Ok(());
+        }
+        self.first_progress_seen = true;
+        self.phase(ProviderPhase::FirstProgress)
+    }
+
+    fn finish(
+        &mut self,
+        result: Result<LlmResponseSummary, LlmError>,
+    ) -> Result<LlmResponseSummary, LlmError> {
+        if let Some(elapsed_ms) = self.last_progress_elapsed_ms {
+            self.current_phase = ProviderPhase::LastProgress;
+            self.inner.provider_phase(ProviderPhaseEvent {
+                request_id: self.request_id.clone(),
+                endpoint: self.endpoint.clone(),
+                phase: ProviderPhase::LastProgress,
+                attempt: self.attempt,
+                elapsed_ms,
+                terminal_status: None,
+                failure: None,
+            })?;
+        }
+
+        match result {
+            Ok(summary) => {
+                let terminal_status = if summary.finish_reason == FinishReason::Cancelled {
+                    ProviderTerminalStatus::Cancelled
+                } else {
+                    ProviderTerminalStatus::Completed
+                };
+                self.current_phase = ProviderPhase::ProviderTerminal;
+                self.inner.provider_phase(ProviderPhaseEvent {
+                    request_id: self.request_id.clone(),
+                    endpoint: self.endpoint.clone(),
+                    phase: ProviderPhase::ProviderTerminal,
+                    attempt: self.attempt,
+                    elapsed_ms: self.elapsed_ms(),
+                    terminal_status: Some(terminal_status),
+                    failure: None,
+                })?;
+                Ok(summary)
+            }
+            Err(source) => {
+                if matches!(
+                    &source,
+                    LlmError::ProviderRequestLimitExceeded { .. }
+                        | LlmError::ProviderRequestImage(_)
+                ) {
+                    return Err(source);
+                }
+                if matches!(source, LlmError::ProviderFailure { .. }) {
+                    return Err(source);
+                }
+                let failure = self.failure_for(&source);
+                self.inner.provider_phase(ProviderPhaseEvent {
+                    request_id: self.request_id.clone(),
+                    endpoint: self.endpoint.clone(),
+                    phase: ProviderPhase::ProviderTerminal,
+                    attempt: self.attempt,
+                    elapsed_ms: self.elapsed_ms(),
+                    terminal_status: Some(ProviderTerminalStatus::Failed),
+                    failure: Some(failure.clone()),
+                })?;
+                Err(LlmError::ProviderFailure {
+                    failure,
+                    source: Box::new(source),
+                })
+            }
+        }
+    }
+
+    fn failure_for(&self, source: &LlmError) -> ProviderFailure {
+        let (kind, status, code) = match source {
+            LlmError::Http(error) if error.is_connect() => {
+                (ProviderFailureKind::Connect, None, None)
+            }
+            LlmError::ProviderResponseStartTimeout { .. } => {
+                (ProviderFailureKind::ResponseStartTimeout, None, None)
+            }
+            LlmError::ProviderStreamIdleTimeout { .. } => {
+                (ProviderFailureKind::StreamIdleTimeout, None, None)
+            }
+            LlmError::ProviderStreamLimitExceeded { .. } => {
+                (ProviderFailureKind::Protocol, None, None)
+            }
+            LlmError::ProviderRejected { status, code, .. } => {
+                (ProviderFailureKind::HttpStatus, *status, code.clone())
+            }
+            LlmError::Json(_) => (ProviderFailureKind::Decode, None, None),
+            LlmError::Message(_) if self.current_phase == ProviderPhase::FirstProgress => {
+                (ProviderFailureKind::Protocol, None, None)
+            }
+            LlmError::Message(_) if self.current_phase == ProviderPhase::HeadersReceived => {
+                (ProviderFailureKind::Protocol, None, None)
+            }
+            _ => (ProviderFailureKind::Other, None, None),
+        };
+        ProviderFailure {
+            request_id: self.request_id.clone(),
+            endpoint: self.endpoint.clone(),
+            phase: self.current_phase,
+            attempt: self.attempt,
+            elapsed_ms: self.elapsed_ms(),
+            kind,
+            status,
+            code,
+            message: source.to_string(),
+        }
+    }
+}
+
+impl LlmEventSink for ProviderTraceSink<'_> {
+    fn push(&mut self, event: LlmEvent) -> Result<(), LlmError> {
+        self.inner.push(event)
+    }
+
+    fn provider_phase(&mut self, event: ProviderPhaseEvent) -> Result<(), LlmError> {
+        self.inner.provider_phase(event)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OperationDeadline {
+    deadline: Option<Instant>,
+    response_start_timeout_ms: u64,
+}
+
+impl OperationDeadline {
+    fn new(timeout_ms: u64) -> Self {
+        Self {
+            deadline: (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms)),
+            response_start_timeout_ms: timeout_ms,
+        }
+    }
+
+    fn remaining(self) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
     }
 }
 
@@ -445,14 +673,12 @@ struct ResponseFailure {
     code: Option<String>,
     param: Option<String>,
     message: String,
-    retryable: bool,
-    retry_after_ms: Option<u64>,
 }
 
 async fn parse_response_failure(response: reqwest::Response) -> Result<ResponseFailure, LlmError> {
     let status = response.status();
-    let headers = response.headers().clone();
-    let body = response.text().await.unwrap_or_default();
+    let (body, body_was_truncated) = read_provider_failure_body_bounded(response).await?;
+    let body = String::from_utf8_lossy(&body);
     let parsed = serde_json::from_str::<Value>(&body).ok();
     let error = parsed.as_ref().and_then(|value| value.get("error"));
     let code = error
@@ -467,32 +693,50 @@ async fn parse_response_failure(response: reqwest::Response) -> Result<ResponseF
         .and_then(|value| value.get("message"))
         .and_then(Value::as_str)
         .map(str::to_string)
-        .unwrap_or_else(|| summarize_failure_body(&body));
+        .unwrap_or_else(|| summarize_failure_body(&body, body_was_truncated));
     Ok(ResponseFailure {
         status,
         code,
         param,
         message,
-        retryable: is_retryable_status(status),
-        retry_after_ms: retry_after_ms(&headers),
     })
+}
+
+async fn read_provider_failure_body_bounded(
+    response: reqwest::Response,
+) -> Result<(Vec<u8>, bool), LlmError> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::with_capacity(PROVIDER_FAILURE_BODY_LIMIT_BYTES.min(8 * 1024));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| LlmError::Http(error.without_url()))?;
+        let remaining = PROVIDER_FAILURE_BODY_LIMIT_BYTES.saturating_sub(body.len());
+        if remaining == 0 {
+            return Ok((body, true));
+        }
+        let retained = remaining.min(chunk.len());
+        body.extend_from_slice(&chunk[..retained]);
+        if retained < chunk.len() {
+            return Ok((body, true));
+        }
+    }
+    Ok((body, false))
 }
 
 async fn parse_response_failure_until_cancelled(
     response: reqwest::Response,
     cancel: &CancellationToken,
-    timeout_ms: u64,
+    deadline: &OperationDeadline,
 ) -> Result<Option<ResponseFailure>, LlmError> {
     let parse = parse_response_failure(response);
     tokio::pin!(parse);
-    if let Some(timeout) = request_header_timeout(timeout_ms) {
+    if let Some(timeout) = deadline.remaining() {
         tokio::select! {
             _ = cancel.cancelled() => Ok(None),
             result = tokio::time::timeout(timeout, &mut parse) => match result {
                 Ok(result) => result.map(Some),
-                Err(_) => Err(LlmError::Message(format!(
-                    "provider error response body timeout after {timeout_ms}ms"
-                ))),
+                Err(_) => Err(LlmError::ProviderResponseStartTimeout {
+                    timeout_ms: deadline.response_start_timeout_ms,
+                }),
             },
         }
     } else {
@@ -503,14 +747,144 @@ async fn parse_response_failure_until_cancelled(
     }
 }
 
-fn stream_idle_timeout(timeout_ms: u64) -> Option<Duration> {
-    (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms))
+fn stream_idle_timeout_error(timeout_ms: u64) -> LlmError {
+    LlmError::ProviderStreamIdleTimeout { timeout_ms }
 }
 
-fn stream_idle_timeout_error(timeout_ms: u64) -> LlmError {
-    LlmError::Message(format!(
-        "provider stream idle timeout after {timeout_ms}ms without an SSE event"
-    ))
+fn bounded_response_bytes(
+    response: reqwest::Response,
+    maximum: u64,
+) -> impl Stream<Item = Result<bytes::Bytes, LlmError>> {
+    let mut observed = 0_u64;
+    response.bytes_stream().map(move |chunk| {
+        let chunk = chunk.map_err(|error| LlmError::Http(error.without_url()))?;
+        observed = observed.saturating_add(chunk.len() as u64);
+        if observed > maximum {
+            return Err(LlmError::ProviderStreamLimitExceeded {
+                surface: ProviderStreamLimit::RawBytes,
+                actual: observed,
+                maximum,
+            });
+        }
+        Ok(chunk)
+    })
+}
+
+struct ProviderStreamBudget {
+    limits: crate::config::ProviderStreamLimits,
+    started_at: Instant,
+    event_count: u64,
+    tool_calls: HashSet<String>,
+    tool_argument_bytes: HashMap<String, u64>,
+}
+
+impl ProviderStreamBudget {
+    fn new(limits: crate::config::ProviderStreamLimits) -> Self {
+        Self {
+            limits,
+            started_at: Instant::now(),
+            event_count: 0,
+            tool_calls: HashSet::new(),
+            tool_argument_bytes: HashMap::new(),
+        }
+    }
+
+    fn wait_timeout(&self, idle_timeout_ms: u64) -> Option<Duration> {
+        let idle = (idle_timeout_ms > 0).then(|| Duration::from_millis(idle_timeout_ms));
+        let absolute = (self.limits.max_duration_ms > 0).then(|| {
+            Duration::from_millis(self.limits.max_duration_ms)
+                .saturating_sub(self.started_at.elapsed())
+        });
+        match (idle, absolute) {
+            (Some(idle), Some(absolute)) => Some(idle.min(absolute)),
+            (Some(idle), None) => Some(idle),
+            (None, Some(absolute)) => Some(absolute),
+            (None, None) => None,
+        }
+    }
+
+    fn timeout_error(&self, idle_timeout_ms: u64) -> LlmError {
+        let elapsed_ms = self
+            .started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        if self.limits.max_duration_ms > 0 && elapsed_ms >= self.limits.max_duration_ms {
+            LlmError::ProviderStreamLimitExceeded {
+                surface: ProviderStreamLimit::DurationMs,
+                actual: elapsed_ms,
+                maximum: self.limits.max_duration_ms,
+            }
+        } else {
+            stream_idle_timeout_error(idle_timeout_ms)
+        }
+    }
+
+    fn record_event(&mut self) -> Result<(), LlmError> {
+        self.event_count = self.event_count.saturating_add(1);
+        ensure_stream_limit(
+            ProviderStreamLimit::EventCount,
+            self.event_count,
+            self.limits.max_events,
+        )
+    }
+
+    fn record_tool_call(&mut self, key: impl Into<String>) -> Result<(), LlmError> {
+        let key = key.into();
+        if self.tool_calls.insert(key) {
+            ensure_stream_limit(
+                ProviderStreamLimit::ToolCallCount,
+                self.tool_calls.len() as u64,
+                self.limits.max_tool_calls,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn record_tool_arguments(&mut self, key: &str, delta_bytes: u64) -> Result<(), LlmError> {
+        let total = self.tool_argument_bytes.entry(key.to_string()).or_default();
+        *total = total.saturating_add(delta_bytes);
+        ensure_stream_limit(
+            ProviderStreamLimit::ToolCallArgumentBytes,
+            *total,
+            self.limits.max_tool_call_argument_bytes,
+        )
+    }
+
+    fn record_projected_events(&mut self, events: &[LlmEvent]) -> Result<(), LlmError> {
+        for event in events {
+            match event {
+                LlmEvent::ToolCallStart { call_id, .. } => {
+                    self.record_tool_call(format!("responses:{call_id}"))?;
+                }
+                LlmEvent::ToolCallArgsDelta { call_id, delta } => {
+                    self.record_tool_arguments(
+                        &format!("responses:{call_id}"),
+                        delta.len() as u64,
+                    )?;
+                }
+                LlmEvent::TextDelta(_)
+                | LlmEvent::ReasoningSummaryDelta(_)
+                | LlmEvent::Finished { .. } => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+fn ensure_stream_limit(
+    surface: ProviderStreamLimit,
+    actual: u64,
+    maximum: u64,
+) -> Result<(), LlmError> {
+    if actual > maximum {
+        return Err(LlmError::ProviderStreamLimitExceeded {
+            surface,
+            actual,
+            maximum,
+        });
+    }
+    Ok(())
 }
 
 fn stream_missing_terminal_signal_error() -> LlmError {
@@ -577,77 +951,63 @@ fn stream_missing_tool_name_error(delta_index: usize) -> LlmError {
     ))
 }
 
-async fn sleep_retry_delay(delay_ms: u64, cancel: &CancellationToken) -> bool {
+async fn sleep_retry_delay_until_deadline(
+    delay_ms: u64,
+    cancel: &CancellationToken,
+    deadline: &OperationDeadline,
+) -> bool {
+    let delay = Duration::from_millis(delay_ms);
+    let sleep_for = deadline
+        .remaining()
+        .map_or(delay, |remaining| remaining.min(delay));
+    if sleep_for.is_zero() {
+        return false;
+    }
     tokio::select! {
         _ = cancel.cancelled() => false,
-        _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => true,
+        _ = tokio::time::sleep(sleep_for) => deadline.deadline.is_none_or(|end| Instant::now() < end),
     }
 }
 
-fn summarize_failure_body(body: &str) -> String {
-    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+fn summarize_failure_body(body: &str, source_was_truncated: bool) -> String {
+    let content_limit = PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES.saturating_sub(3);
+    let mut compact = String::with_capacity(PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES);
+    let mut was_truncated = source_was_truncated;
+    for segment in body.split_whitespace() {
+        let separator_len = usize::from(!compact.is_empty());
+        let remaining = content_limit.saturating_sub(compact.len());
+        if remaining <= separator_len {
+            was_truncated = true;
+            break;
+        }
+        if separator_len > 0 {
+            compact.push(' ');
+        }
+        let remaining = content_limit.saturating_sub(compact.len());
+        if segment.len() <= remaining {
+            compact.push_str(segment);
+            continue;
+        }
+        let mut end = remaining;
+        while end > 0 && !segment.is_char_boundary(end) {
+            end -= 1;
+        }
+        compact.push_str(&segment[..end]);
+        was_truncated = true;
+        break;
+    }
     if compact.is_empty() {
         "request failed without a response body".to_string()
-    } else if compact.len() > 240 {
-        clip_text_with_ellipsis(&compact, 243)
     } else {
+        if was_truncated {
+            compact.push_str("...");
+        }
         compact
     }
 }
 
-fn is_retryable_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
-}
-
 fn should_retry_transport_error(error: &reqwest::Error) -> bool {
     error.is_connect()
-}
-
-fn request_header_timeout(timeout_ms: u64) -> Option<Duration> {
-    if timeout_ms == 0 {
-        None
-    } else {
-        Some(Duration::from_millis(timeout_ms))
-    }
-}
-
-fn retry_after_ms(headers: &HeaderMap) -> Option<u64> {
-    if let Some(value) = headers
-        .get("retry-after-ms")
-        .and_then(|value| value.to_str().ok())
-    {
-        if let Some(parsed) = parse_ms_header(value) {
-            return Some(parsed.min(RETRY_MAX_DELAY_MS));
-        }
-    }
-
-    let value = headers.get(RETRY_AFTER)?.to_str().ok()?;
-    if let Some(parsed_seconds) = parse_seconds_header(value) {
-        return Some(parsed_seconds.saturating_mul(1_000).min(RETRY_MAX_DELAY_MS));
-    }
-    let retry_at = httpdate::parse_http_date(value).ok()?;
-    let delta = retry_at
-        .duration_since(std::time::SystemTime::now())
-        .ok()?
-        .as_millis()
-        .min(u128::from(RETRY_MAX_DELAY_MS)) as u64;
-    Some(delta)
-}
-
-fn parse_ms_header(value: &str) -> Option<u64> {
-    let parsed = value.trim().parse::<f64>().ok()?;
-    if parsed.is_sign_negative() {
-        return None;
-    }
-    Some(parsed.ceil() as u64)
-}
-
-fn parse_seconds_header(value: &str) -> Option<u64> {
-    let parsed = value.trim().parse::<f64>().ok()?;
-    if parsed.is_sign_negative() {
-        return None;
-    }
-    Some(parsed.ceil() as u64)
 }
 
 fn retry_delay_ms(attempt: u8, header_delay_ms: Option<u64>) -> u64 {
@@ -739,7 +1099,7 @@ pub fn streaming_tool_call_late_name_preserves_typed_tool_identity_fixture_passe
 }
 
 fn to_openai_request(request: &ChatRequest) -> Result<Value, LlmError> {
-    if request.provider_api_mode != ProviderApiMode::ChatCompletions {
+    if request.provider_target().api_mode() != ProviderApiMode::ChatCompletions {
         return Err(LlmError::Message(
             "Chat Completions request serialization requires provider_api_mode=chat_completions"
                 .to_string(),
@@ -761,7 +1121,7 @@ pub(crate) fn to_openai_request_with_reasoning(
     let reasoning =
         validate_chat_completions_reasoning_request(reasoning_request, reasoning_capability)?;
     let mut messages = Vec::with_capacity(request.messages.len() + 1);
-    let mut system_segments = vec![request.provider_system_prompt()];
+    let mut system_segments = vec![request.system_prompt.clone()];
     let mut non_system_messages = Vec::with_capacity(request.messages.len());
     for message in &request.messages {
         match message {
@@ -891,10 +1251,7 @@ pub(crate) fn to_openai_request_with_reasoning(
             );
         }
     }
-    if let Some(tool_choice) = request
-        .tool_choice
-        .as_ref()
-        .map(|choice| provider_tool_choice_json(choice, request.model.provider_metadata_mode))
+    if let Some(tool_choice) = request.tool_choice.as_ref().map(provider_tool_choice_json)
         && let Value::Object(base_map) = &mut body
     {
         base_map.insert("tool_choice".to_string(), tool_choice);
@@ -902,21 +1259,15 @@ pub(crate) fn to_openai_request_with_reasoning(
     Ok(body)
 }
 
-pub(crate) fn provider_tool_choice_json(
-    tool_choice: &ProviderToolChoice,
-    provider_metadata_mode: ProviderMetadataMode,
-) -> Value {
+pub(crate) fn provider_tool_choice_json(tool_choice: &ProviderToolChoice) -> Value {
     match tool_choice {
         ProviderToolChoice::Required => serde_json::json!("required"),
-        ProviderToolChoice::Named { name } => match provider_metadata_mode {
-            ProviderMetadataMode::LmStudioNativeRequired => serde_json::json!("required"),
-            ProviderMetadataMode::OpenAiCompatibleOnly => serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": name
-                }
-            }),
-        },
+        ProviderToolChoice::Named { name } => serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": name
+            }
+        }),
     }
 }
 
@@ -927,13 +1278,8 @@ fn openai_tool_schema(tool: &ToolSchema) -> OpenAiToolSchema {
             name: tool.name.clone(),
             description: tool.description.clone(),
             parameters: tool.input_schema.clone(),
-            strict: tool.strict.then_some(true),
         },
     }
-}
-
-pub(crate) fn openai_tool_schema_json(tool: &ToolSchema) -> Result<Value, LlmError> {
-    Ok(serde_json::to_value(openai_tool_schema(tool))?)
 }
 
 fn apply_extra_headers(
@@ -1065,86 +1411,141 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        OpenAiCompatClient, PartialToolCall, is_retryable_status, parse_finish_reason,
-        resolve_finish_reason, retry_delay_ms, to_openai_request, to_openai_request_with_reasoning,
+        OpenAiCompatClient, PartialToolCall, parse_finish_reason, resolve_finish_reason,
+        retry_delay_ms, to_openai_request, to_openai_request_with_reasoning,
         validate_streamed_tool_calls,
     };
-    use crate::config::ProviderMetadataMode;
     use crate::config::model::{
         ChatCompletionsReasoningParameters, ProviderApiMode, ProviderReasoningCapability,
         ReasoningEffort, ReasoningSummary,
     };
-    use crate::llm::contract::{OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY, ReasoningRequest};
+    use crate::config::{
+        ProviderDeadlines, ProviderMetadataMode, ProviderRequestLimits, ProviderStreamLimits,
+        ProviderTarget,
+    };
+    use crate::error::{LlmError, ProviderRequestLimit, ProviderStreamLimit};
+    use crate::llm::contract::ReasoningRequest;
     use crate::llm::{
         ChatRequest, LlmClient, LlmEvent, LlmEventSink, ModelCapabilities, ModelMessage,
-        ModelProfile, ModelToolCall, ProviderToolChoice, ResponsesContinuation, ToolSchema,
+        ModelProfile, ModelToolCall, ProviderFailureKind, ProviderPhase, ProviderPhaseEvent,
+        ProviderTerminalStatus, ProviderToolChoice, ResponsesContinuation, ToolSchema,
     };
     use crate::session::{FinishReason, TokenUsage};
 
+    fn provider_target(
+        endpoint: &str,
+        model: &str,
+        metadata_mode: ProviderMetadataMode,
+        api_mode: ProviderApiMode,
+        deadlines: ProviderDeadlines,
+    ) -> ProviderTarget {
+        ProviderTarget::new(endpoint, model, metadata_mode, api_mode, deadlines)
+            .expect("provider target")
+    }
+
+    fn replace_provider_endpoint(request: &mut ChatRequest, endpoint: &str) {
+        let model = request.provider_target().model().to_string();
+        let metadata_mode = request.provider_target().metadata_mode();
+        let api_mode = request.provider_target().api_mode();
+        let deadlines = request.provider_target().deadlines();
+        request.replace_provider_target(provider_target(
+            endpoint,
+            &model,
+            metadata_mode,
+            api_mode,
+            deadlines,
+        ));
+    }
+
+    fn replace_provider_deadlines(request: &mut ChatRequest, deadlines: ProviderDeadlines) {
+        let endpoint = request.provider_target().sanitized_endpoint().to_string();
+        let model = request.provider_target().model().to_string();
+        let metadata_mode = request.provider_target().metadata_mode();
+        let api_mode = request.provider_target().api_mode();
+        request.replace_provider_target(provider_target(
+            &endpoint,
+            &model,
+            metadata_mode,
+            api_mode,
+            deadlines,
+        ));
+    }
+
     #[test]
-    fn openai_compatible_only_payload_sends_language_policy_as_system_prompt() {
-        let request = ChatRequest {
-            model: ModelProfile {
-                name: "openai-compatible-fixture-model".to_string(),
-                context_window: 131_072,
-                max_output_tokens: 8_192,
-                provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
-                capabilities: ModelCapabilities {
-                    supports_tools: true,
-                    supports_reasoning: false,
-                    supports_images: false,
-                },
+    fn transport_preserves_the_caller_owned_system_prompt() {
+        let model = ModelProfile {
+            name: "openai-compatible-fixture-model".to_string(),
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            capabilities: ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: false,
+                supports_images: false,
             },
-            base_url: "http://openai-compatible.fixture.invalid".to_string(),
-            system_prompt: "Base coding prompt".to_string(),
-            messages: Vec::new(),
-            tools: Vec::new(),
-            provider_api_mode: ProviderApiMode::ChatCompletions,
-            reasoning: None,
-            reasoning_capability: ProviderReasoningCapability::Unsupported,
-            responses_continuation: None,
-            tool_choice: None,
-            parallel_tool_calls: false,
-            timeout_ms: 30_000,
-            stream_idle_timeout_ms: 300_000,
-            extra_headers: BTreeMap::new(),
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            seed: None,
-            stop_sequences: Vec::new(),
-            extra_body: None,
         };
+        let provider = provider_target(
+            "http://openai-compatible.fixture.invalid",
+            &model.name,
+            model.provider_metadata_mode,
+            ProviderApiMode::ChatCompletions,
+            ProviderDeadlines {
+                response_start_timeout_ms: 30_000,
+                stream_idle_timeout_ms: 300_000,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 0,
+            },
+        );
+        let request = ChatRequest::new(
+            provider,
+            model,
+            "Base coding prompt".to_string(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            ProviderReasoningCapability::Unsupported,
+            BTreeMap::new(),
+        );
 
         let body = to_openai_request(&request).expect("request serialization succeeds");
         let system_prompt = first_system_prompt(&body);
 
-        assert!(system_prompt.starts_with(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY));
-        assert!(system_prompt.ends_with("\n\nBase coding prompt"));
+        assert_eq!(system_prompt, "Base coding prompt");
     }
 
     #[test]
     fn tool_enabled_payload_uses_configured_output_budget() {
-        let mut request = ChatRequest {
-            model: ModelProfile {
-                name: "openai-compatible-fixture-model".to_string(),
-                context_window: 131_072,
-                max_output_tokens: 131_072,
-                provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
-                capabilities: ModelCapabilities {
-                    supports_tools: true,
-                    supports_reasoning: false,
-                    supports_images: false,
-                },
+        let model = ModelProfile {
+            name: "openai-compatible-fixture-model".to_string(),
+            context_window: 131_072,
+            max_output_tokens: 131_072,
+            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            capabilities: ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: false,
+                supports_images: false,
             },
-            base_url: "http://openai-compatible.fixture.invalid".to_string(),
-            system_prompt: "Base coding prompt".to_string(),
-            messages: vec![ModelMessage::User {
+        };
+        let provider = provider_target(
+            "http://openai-compatible.fixture.invalid",
+            &model.name,
+            model.provider_metadata_mode,
+            ProviderApiMode::ChatCompletions,
+            ProviderDeadlines {
+                response_start_timeout_ms: 30_000,
+                stream_idle_timeout_ms: 300_000,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 0,
+            },
+        );
+        let mut request = ChatRequest::new(
+            provider,
+            model,
+            "Base coding prompt".to_string(),
+            vec![ModelMessage::User {
                 content: "Create src/workflow.rs".to_string(),
             }],
-            tools: vec![ToolSchema {
+            vec![ToolSchema {
                 name: "write".to_string(),
                 description: "write a file".to_string(),
                 input_schema: serde_json::json!({
@@ -1155,26 +1556,13 @@ mod tests {
                         "content": {"type": "string"}
                     }
                 }),
-                strict: false,
             }],
-            provider_api_mode: ProviderApiMode::ChatCompletions,
-            reasoning: None,
-            reasoning_capability: ProviderReasoningCapability::Unsupported,
-            responses_continuation: None,
-            tool_choice: Some(ProviderToolChoice::Required),
-            parallel_tool_calls: true,
-            timeout_ms: 30_000,
-            stream_idle_timeout_ms: 300_000,
-            extra_headers: BTreeMap::new(),
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            seed: None,
-            stop_sequences: Vec::new(),
-            extra_body: None,
-        };
+            None,
+            ProviderReasoningCapability::Unsupported,
+            BTreeMap::new(),
+        );
+        request.tool_choice = Some(ProviderToolChoice::Required);
+        request.parallel_tool_calls = true;
 
         let tool_body = to_openai_request(&request).expect("request serialization succeeds");
         request.tools.clear();
@@ -1185,6 +1573,10 @@ mod tests {
 
         assert_eq!(tool_body["max_tokens"].as_u64(), Some(131_072));
         assert_eq!(no_tool_body["max_tokens"].as_u64(), Some(131_072));
+        assert!(
+            tool_body["tools"][0]["function"].get("strict").is_none(),
+            "Chat Completions tool schemas must not contain an unsupported strict field"
+        );
     }
 
     #[test]
@@ -1370,15 +1762,140 @@ mod tests {
     }
 
     #[test]
-    fn retry_classification_is_limited_to_rate_limits_and_server_failures() {
-        assert!(is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
-        assert!(is_retryable_status(
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR
-        ));
-        assert!(!is_retryable_status(reqwest::StatusCode::REQUEST_TIMEOUT));
-        assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
-        assert_eq!(retry_delay_ms(1, Some(u64::MAX)), 30_000);
+    fn connect_retry_backoff_is_bounded() {
+        assert_eq!(retry_delay_ms(1, None), 2_000);
+        assert_eq!(retry_delay_ms(2, None), 4_000);
         assert_eq!(retry_delay_ms(u8::MAX, None), 30_000);
+    }
+
+    #[test]
+    fn client_debug_redacts_the_api_key() {
+        let client = OpenAiCompatClient::new(Some("provider-api-key-secret".to_string()));
+
+        let debug = format!("{client:?}");
+
+        assert!(!debug.contains("provider-api-key-secret"));
+        assert!(debug.contains("redacted"));
+    }
+
+    #[test]
+    fn lm_studio_v1_base_url_is_joined_without_a_duplicate_version_segment() {
+        for base_url in [
+            "http://127.0.0.1:1234",
+            "http://127.0.0.1:1234/",
+            "http://127.0.0.1:1234/v1",
+            "http://127.0.0.1:1234/v1/",
+        ] {
+            let endpoint = crate::config::ProviderEndpoint::parse(base_url)
+                .expect("LM Studio provider endpoint");
+            let responses = endpoint
+                .join_api_path("v1/responses")
+                .expect("LM Studio Responses endpoint");
+            let chat_completions = endpoint
+                .join_api_path("v1/chat/completions")
+                .expect("LM Studio Chat Completions endpoint");
+
+            assert_eq!(responses.path(), "/v1/responses");
+            assert_eq!(chat_completions.path(), "/v1/chat/completions");
+        }
+
+        let proxied =
+            crate::config::ProviderEndpoint::parse("https://provider.example/proxy/openai/v1")
+                .expect("proxied provider endpoint")
+                .join_api_path("v1/responses")
+                .expect("proxied LM Studio endpoint");
+        assert_eq!(proxied.path(), "/proxy/openai/v1/responses");
+        assert_eq!(proxied.query(), None);
+    }
+
+    #[test]
+    fn provider_failure_summary_is_bounded_without_materializing_split_segments() {
+        let body = format!(
+            "provider failure {}",
+            "oversized-segment".repeat(super::PROVIDER_FAILURE_BODY_LIMIT_BYTES)
+        );
+
+        let summary = super::summarize_failure_body(&body, true);
+
+        assert!(summary.len() <= super::PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES);
+        assert!(summary.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn connection_failure_does_not_project_header_or_client_secrets() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve closed fixture address");
+        let address = listener.local_addr().expect("fixture address");
+        drop(listener);
+
+        let mut request = responses_fixture_request(
+            &format!("http://{address}/v1"),
+            vec![ModelMessage::User {
+                content: "Exercise a redacted connection failure".to_string(),
+            }],
+        );
+        replace_provider_deadlines(
+            &mut request,
+            ProviderDeadlines {
+                response_start_timeout_ms: 500,
+                stream_idle_timeout_ms: 5_000,
+                connect_timeout_ms: 200,
+                max_connect_retries: 0,
+            },
+        );
+        request.replace_extra_headers(BTreeMap::from([(
+            "x-provider-key".to_string(),
+            "header-secret".to_string(),
+        )]));
+        let client = OpenAiCompatClient::new(Some("client-api-key-secret".to_string()));
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("closed endpoint must fail");
+        let rendered = format!("{error:?}\n{error}");
+
+        for secret in ["header-secret", "client-api-key-secret"] {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_exact_wire_body_is_rejected_before_any_provider_post() {
+        let (base_url, requests, server) = start_responses_fixture(Vec::new()).await;
+        let mut request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "x".repeat(4_096),
+            }],
+        );
+        let mut provider = request.provider_target().clone();
+        let mut limits = ProviderRequestLimits::product_default();
+        limits.max_serialized_body_bytes = 256;
+        provider.replace_request_limits(limits);
+        request.replace_provider_target(provider);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("oversized wire body must fail before transport");
+        server.abort();
+
+        assert!(matches!(
+            error,
+            LlmError::ProviderRequestLimitExceeded {
+                surface: ProviderRequestLimit::SerializedBodyBytes,
+                maximum: 256,
+                ..
+            }
+        ));
+        assert!(requests.lock().expect("request capture").is_empty());
+        assert!(sink.phases.is_empty());
+        assert!(sink.events.is_empty());
     }
 
     #[tokio::test]
@@ -1409,8 +1926,8 @@ mod tests {
         .concat();
         let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
         let mut request = reasoning_fixture_request();
-        request.base_url = base_url;
-        let client = OpenAiCompatClient::new(1_000, 0, None).expect("fixture client");
+        replace_provider_endpoint(&mut request, &base_url);
+        let client = OpenAiCompatClient::new(None);
         let mut sink = RecordingLlmEventSink::default();
 
         let summary = client
@@ -1473,7 +1990,7 @@ mod tests {
             effort: Some(ReasoningEffort::High),
             summary: ReasoningSummary::Detailed,
         });
-        let client = OpenAiCompatClient::new(1_000, 0, None).expect("fixture client");
+        let client = OpenAiCompatClient::new(None);
         let mut sink = RecordingLlmEventSink::default();
 
         let summary = client
@@ -1509,6 +2026,29 @@ mod tests {
                 },
             ] if reasoning == "Inspected the repository" && text == "The change is ready."
         ));
+        assert_eq!(
+            sink.phases
+                .iter()
+                .map(|event| event.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                ProviderPhase::AttemptStarted,
+                ProviderPhase::RequestInFlight,
+                ProviderPhase::HeadersReceived,
+                ProviderPhase::FirstProgress,
+                ProviderPhase::LastProgress,
+                ProviderPhase::ProviderTerminal,
+            ]
+        );
+        assert!(
+            sink.phases
+                .windows(2)
+                .all(|events| events[0].request_id == events[1].request_id)
+        );
+        assert_eq!(
+            sink.phases.last().and_then(|event| event.terminal_status),
+            Some(ProviderTerminalStatus::Completed)
+        );
 
         let captured = requests.lock().expect("Responses request capture");
         assert_eq!(captured.len(), 1);
@@ -1585,11 +2125,10 @@ mod tests {
                 "properties": { "path": { "type": "string" } },
                 "required": ["path"]
             }),
-            strict: true,
         }];
         first_request.tool_choice = Some(ProviderToolChoice::Required);
         first_request.extra_body = Some(json!({ "num_ctx": 131_072 }));
-        let client = OpenAiCompatClient::new(1_000, 0, None).expect("fixture client");
+        let client = OpenAiCompatClient::new(None);
         let mut first_sink = RecordingLlmEventSink::default();
 
         let first_summary = client
@@ -1712,13 +2251,16 @@ mod tests {
             }),
         ]);
         let (base_url, requests, server) = start_responses_fixture(vec![failed, completed]).await;
-        let request = responses_fixture_request(
+        let mut request = responses_fixture_request(
             &base_url,
             vec![ModelMessage::User {
                 content: "Retry transient failure".to_string(),
             }],
         );
-        let client = OpenAiCompatClient::new(1_000, 1, None).expect("fixture client");
+        let mut deadlines = request.provider_target().deadlines();
+        deadlines.max_connect_retries = 1;
+        replace_provider_deadlines(&mut request, deadlines);
+        let client = OpenAiCompatClient::new(None);
         let mut sink = RecordingLlmEventSink::default();
 
         let error = client
@@ -1730,6 +2272,34 @@ mod tests {
         assert!(error.to_string().contains("try again"));
         assert_eq!(requests.lock().expect("request capture").len(), 1);
         assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_status_response_is_not_retried() {
+        let (base_url, requests, server) = start_responses_fixture(Vec::new()).await;
+        let mut request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "Do not retry an HTTP response".to_string(),
+            }],
+        );
+        let mut deadlines = request.provider_target().deadlines();
+        deadlines.max_connect_retries = 3;
+        replace_provider_deadlines(&mut request, deadlines);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("HTTP status must terminate the generation request");
+        server.abort();
+
+        let failure = error.provider_failure().expect("typed provider failure");
+        assert_eq!(failure.kind, ProviderFailureKind::HttpStatus);
+        assert!(failure.message.len() < 1_024);
+        assert!(failure.message.ends_with("..."));
+        assert_eq!(requests.lock().expect("request capture").len(), 1);
     }
 
     #[tokio::test]
@@ -1746,9 +2316,16 @@ mod tests {
                 content: "Do not retry a timed out generation".to_string(),
             }],
         );
-        request.timeout_ms = 30;
-        request.stream_idle_timeout_ms = 1_000;
-        let client = OpenAiCompatClient::new(1_000, 2, None).expect("fixture client");
+        replace_provider_deadlines(
+            &mut request,
+            ProviderDeadlines {
+                response_start_timeout_ms: 30,
+                stream_idle_timeout_ms: 1_000,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 2,
+            },
+        );
+        let client = OpenAiCompatClient::new(None);
         let mut sink = RecordingLlmEventSink::default();
 
         let error = client
@@ -1757,9 +2334,27 @@ mod tests {
             .expect_err("header timeout must terminate the generation request");
         server.abort();
 
-        assert!(error.to_string().contains("before response headers"));
+        assert_eq!(
+            error.provider_failure().map(|failure| failure.kind),
+            Some(ProviderFailureKind::ResponseStartTimeout)
+        );
+        assert_eq!(
+            error.provider_failure().map(|failure| failure.phase),
+            Some(ProviderPhase::RequestInFlight)
+        );
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert!(sink.events.is_empty());
+        assert_eq!(
+            sink.phases
+                .iter()
+                .map(|event| event.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                ProviderPhase::AttemptStarted,
+                ProviderPhase::RequestInFlight,
+                ProviderPhase::ProviderTerminal,
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1776,9 +2371,16 @@ mod tests {
                 content: "Do not retry an idle generation stream".to_string(),
             }],
         );
-        request.timeout_ms = 1_000;
-        request.stream_idle_timeout_ms = 30;
-        let client = OpenAiCompatClient::new(1_000, 2, None).expect("fixture client");
+        replace_provider_deadlines(
+            &mut request,
+            ProviderDeadlines {
+                response_start_timeout_ms: 1_000,
+                stream_idle_timeout_ms: 30,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 2,
+            },
+        );
+        let client = OpenAiCompatClient::new(None);
         let mut sink = RecordingLlmEventSink::default();
 
         let error = client
@@ -1787,7 +2389,157 @@ mod tests {
             .expect_err("stream idle timeout must terminate the generation request");
         server.abort();
 
-        assert!(error.to_string().contains("stream idle timeout"));
+        assert_eq!(
+            error.provider_failure().map(|failure| failure.kind),
+            Some(ProviderFailureKind::StreamIdleTimeout)
+        );
+        assert_eq!(
+            error.provider_failure().map(|failure| failure.phase),
+            Some(ProviderPhase::HeadersReceived)
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert!(sink.events.is_empty());
+        assert_eq!(
+            sink.phases
+                .iter()
+                .map(|event| event.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                ProviderPhase::AttemptStarted,
+                ProviderPhase::RequestInFlight,
+                ProviderPhase::HeadersReceived,
+                ProviderPhase::ProviderTerminal,
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_budget_bounds_events_tool_calls_and_per_call_arguments() {
+        let mut limits = ProviderStreamLimits::product_default();
+        limits.max_events = 1;
+        limits.max_tool_calls = 1;
+        limits.max_tool_call_argument_bytes = 4;
+        let mut budget = super::ProviderStreamBudget::new(limits);
+
+        budget.record_event().expect("first event");
+        assert!(matches!(
+            budget.record_event(),
+            Err(LlmError::ProviderStreamLimitExceeded {
+                surface: ProviderStreamLimit::EventCount,
+                ..
+            })
+        ));
+        budget.record_tool_call("call_1").expect("first tool");
+        assert!(matches!(
+            budget.record_tool_call("call_2"),
+            Err(LlmError::ProviderStreamLimitExceeded {
+                surface: ProviderStreamLimit::ToolCallCount,
+                ..
+            })
+        ));
+        budget
+            .record_tool_arguments("call_1", 4)
+            .expect("argument boundary");
+        assert!(matches!(
+            budget.record_tool_arguments("call_1", 1),
+            Err(LlmError::ProviderStreamLimitExceeded {
+                surface: ProviderStreamLimit::ToolCallArgumentBytes,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn raw_stream_byte_limit_terminates_once_without_reposting() {
+        let response = responses_sse([json!({
+            "type": "response.output_text.delta",
+            "item_id": "large_event",
+            "delta": "x".repeat(4_096)
+        })]);
+        let (base_url, requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "bound the stream".to_string(),
+            }],
+        );
+        let mut provider = request.provider_target().clone();
+        let mut limits = ProviderStreamLimits::product_default();
+        limits.max_raw_bytes = 128;
+        provider.replace_stream_limits(limits);
+        request.replace_provider_target(provider);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("raw stream must be bounded");
+        server.abort();
+
+        assert!(matches!(
+            error,
+            LlmError::ProviderFailure { source, .. }
+                if matches!(
+                    *source,
+                    LlmError::ProviderStreamLimitExceeded {
+                        surface: ProviderStreamLimit::RawBytes,
+                        ..
+                    }
+                )
+        ));
+        assert_eq!(requests.lock().expect("request capture").len(), 1);
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn absolute_stream_duration_terminates_active_operation_without_reposting() {
+        let response = responses_sse([json!({
+            "type": "response.completed",
+            "response": { "id": "too_late" }
+        })]);
+        let (base_url, request_count, server) =
+            start_delayed_fixture(response, Duration::from_millis(200), false).await;
+        let mut request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "bound duration".to_string(),
+            }],
+        );
+        replace_provider_deadlines(
+            &mut request,
+            ProviderDeadlines {
+                response_start_timeout_ms: 1_000,
+                stream_idle_timeout_ms: 1_000,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 2,
+            },
+        );
+        let mut provider = request.provider_target().clone();
+        let mut limits = ProviderStreamLimits::product_default();
+        limits.max_duration_ms = 30;
+        provider.replace_stream_limits(limits);
+        request.replace_provider_target(provider);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("absolute stream duration must be bounded");
+        server.abort();
+
+        assert!(matches!(
+            error,
+            LlmError::ProviderFailure { source, .. }
+                if matches!(
+                    *source,
+                    LlmError::ProviderStreamLimitExceeded {
+                        surface: ProviderStreamLimit::DurationMs,
+                        ..
+                    }
+                )
+        ));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert!(sink.events.is_empty());
     }
@@ -1826,7 +2578,7 @@ mod tests {
                 content: "Run the failure fixture".to_string(),
             }],
         );
-        let client = OpenAiCompatClient::new(1_000, 0, None).expect("fixture client");
+        let client = OpenAiCompatClient::new(None);
 
         for (index, expected) in [
             "provider rejected the request (server_error): unavailable",
@@ -1888,11 +2640,20 @@ mod tests {
     #[derive(Default)]
     struct RecordingLlmEventSink {
         events: Vec<LlmEvent>,
+        phases: Vec<ProviderPhaseEvent>,
     }
 
     impl LlmEventSink for RecordingLlmEventSink {
         fn push(&mut self, event: LlmEvent) -> Result<(), crate::error::LlmError> {
             self.events.push(event);
+            Ok(())
+        }
+
+        fn provider_phase(
+            &mut self,
+            event: ProviderPhaseEvent,
+        ) -> Result<(), crate::error::LlmError> {
+            self.phases.push(event);
             Ok(())
         }
     }
@@ -1933,12 +2694,14 @@ mod tests {
             .push(request);
         let response_index = state.next_response.fetch_add(1, Ordering::SeqCst);
         let Some(response) = state.responses.get(response_index) else {
+            let oversized_body = format!(
+                "unexpected Responses fixture request {} {}",
+                response_index + 1,
+                "x".repeat(super::PROVIDER_FAILURE_BODY_LIMIT_BYTES * 2)
+            );
             return Response::builder()
                 .status(500)
-                .body(Body::from(format!(
-                    "unexpected Responses fixture request {}",
-                    response_index + 1
-                )))
+                .body(Body::from(oversized_body))
                 .expect("fixture overflow response");
         };
 
@@ -2010,82 +2773,80 @@ mod tests {
     }
 
     fn responses_fixture_request(base_url: &str, messages: Vec<ModelMessage>) -> ChatRequest {
-        ChatRequest {
-            model: ModelProfile {
-                name: "responses-fixture-model".to_string(),
-                context_window: 128_000,
-                max_output_tokens: 4_096,
-                provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
-                capabilities: ModelCapabilities {
-                    supports_tools: true,
-                    supports_reasoning: true,
-                    supports_images: true,
-                },
+        let model = ModelProfile {
+            name: "responses-fixture-model".to_string(),
+            context_window: 128_000,
+            max_output_tokens: 4_096,
+            provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+            capabilities: ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: true,
+                supports_images: true,
             },
-            base_url: base_url.to_string(),
-            system_prompt: "Responses fixture instructions".to_string(),
+        };
+        let provider = provider_target(
+            base_url,
+            &model.name,
+            model.provider_metadata_mode,
+            ProviderApiMode::Responses,
+            ProviderDeadlines {
+                response_start_timeout_ms: 5_000,
+                stream_idle_timeout_ms: 5_000,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 0,
+            },
+        );
+        ChatRequest::new(
+            provider,
+            model,
+            "Responses fixture instructions".to_string(),
             messages,
-            tools: Vec::new(),
-            provider_api_mode: ProviderApiMode::Responses,
-            reasoning: None,
-            reasoning_capability: ProviderReasoningCapability::Responses {
+            Vec::new(),
+            None,
+            ProviderReasoningCapability::Responses {
                 supports_summary: true,
                 supports_previous_response_id: true,
             },
-            responses_continuation: None,
-            tool_choice: None,
-            parallel_tool_calls: false,
-            timeout_ms: 5_000,
-            stream_idle_timeout_ms: 5_000,
-            extra_headers: BTreeMap::new(),
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            seed: None,
-            stop_sequences: Vec::new(),
-            extra_body: None,
-        }
+            BTreeMap::new(),
+        )
     }
 
     fn reasoning_fixture_request() -> ChatRequest {
-        ChatRequest {
-            model: ModelProfile {
-                name: "reasoning-chat-completions-fixture-model".to_string(),
-                context_window: 131_072,
-                max_output_tokens: 8_192,
-                provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
-                capabilities: ModelCapabilities {
-                    supports_tools: true,
-                    supports_reasoning: true,
-                    supports_images: false,
-                },
+        let model = ModelProfile {
+            name: "reasoning-chat-completions-fixture-model".to_string(),
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            capabilities: ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: true,
+                supports_images: false,
             },
-            base_url: "http://openai-compatible.fixture.invalid".to_string(),
-            system_prompt: "Base coding prompt".to_string(),
-            messages: vec![ModelMessage::User {
+        };
+        let provider = provider_target(
+            "http://openai-compatible.fixture.invalid",
+            &model.name,
+            model.provider_metadata_mode,
+            ProviderApiMode::ChatCompletions,
+            ProviderDeadlines {
+                response_start_timeout_ms: 30_000,
+                stream_idle_timeout_ms: 300_000,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 0,
+            },
+        );
+        ChatRequest::new(
+            provider,
+            model,
+            "Base coding prompt".to_string(),
+            vec![ModelMessage::User {
                 content: "Plan a repository change".to_string(),
             }],
-            tools: Vec::new(),
-            provider_api_mode: ProviderApiMode::ChatCompletions,
-            reasoning: None,
-            reasoning_capability: ProviderReasoningCapability::Unsupported,
-            responses_continuation: None,
-            tool_choice: None,
-            parallel_tool_calls: false,
-            timeout_ms: 30_000,
-            stream_idle_timeout_ms: 300_000,
-            extra_headers: BTreeMap::new(),
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            seed: None,
-            stop_sequences: Vec::new(),
-            extra_body: None,
-        }
+            Vec::new(),
+            None,
+            ProviderReasoningCapability::Unsupported,
+            BTreeMap::new(),
+        )
     }
 
     fn first_system_prompt(body: &Value) -> &str {

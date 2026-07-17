@@ -25,15 +25,19 @@ import { globalShortcutAction } from "./keyboard_shortcut";
 import { navigationIsIdle } from "./navigation_state";
 import { rowMutationArgs } from "./row_target";
 import { TitlebarDragGesture, windowControlKeyboardActivation } from "./titlebar_interaction";
-import type { ConfigFieldProjection, ConfigMutationTarget, DesktopWebState, RowMutationTarget } from "./types";
+import type {
+  ConfigFieldProjection,
+  ConfigMutationTarget,
+  DesktopViewState,
+  DesktopWebState,
+  RowMutationTarget,
+} from "./types";
 import type { UiLocalState } from "./ui_state";
 import { goalSlashCommandHint, validateConfigInput } from "./utils";
 import {
   deriveUiCapabilities,
+  activeConfigDraftProjection,
   configDraftEditOpen,
-  configDraftCommitOpen,
-  configDraftDiscardOpen,
-  configOwnerMutationOpen,
   draftMutationTarget,
   localSearchOwner,
   sessionSearchMutationTarget,
@@ -107,7 +111,7 @@ export function installGlobalKeyboardShortcuts(context: ActionContext): void {
   });
 }
 
-export function wireEvents(state: DesktopWebState, context: ActionContext): void {
+export function wireEvents(state: DesktopViewState, context: ActionContext): void {
   installDelegatedActionEvents(context);
   const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
   if (prompt) {
@@ -166,14 +170,14 @@ export function wireEvents(state: DesktopWebState, context: ActionContext): void
   settingsControls.forEach((control) => {
     const update = () => {
       if (!updateSettingsControlDraft(control, context)) return;
-      updateDirtyBadges(context.uiState);
-      validateSettingsForm(context.uiState, state.config_fields, false);
+      updateDirtyBadges(context);
+      validateSettingsForm(context, state.config_fields, false);
     };
     control.addEventListener("input", update);
     control.addEventListener("change", update);
   });
   if (settingsControls.length > 0) {
-    validateSettingsForm(context.uiState, state.config_fields, false);
+    validateSettingsForm(context, state.config_fields, false);
   }
   document.querySelector<HTMLInputElement>("#workspace-input")?.addEventListener("input", (event) => {
     context.uiState.drafts.workspaceInput = (event.currentTarget as HTMLInputElement).value;
@@ -418,38 +422,37 @@ function scheduleTextMutation(
 async function flushTextMutation(key: string, context: ActionContext): Promise<void> {
   const entry = pendingTextMutations.get(key);
   if (!entry) return;
-  if (entry.timer !== null) {
-    window.clearTimeout(entry.timer);
-    entry.timer = null;
+  // The invocation that owns the current request also drains the latest queued
+  // value. Timer callbacks that arrive meanwhile must not build an await chain.
+  if (entry.inFlight) return;
+  while (entry.args !== null) {
+    if (entry.timer !== null) {
+      window.clearTimeout(entry.timer);
+      entry.timer = null;
+    }
+    const name = entry.name;
+    const args = entry.args;
+    const renderResult = entry.renderResult;
+    const target = entry.target;
+    const generation = entry.generation;
+    entry.args = null;
+    const request = command<DesktopWebState>(name, args)
+      .then((state) => {
+        if (entry.args === null && entry.generation === generation && searchTargetStillMatches(key, target, context)) {
+          context.acceptProjection(state, renderResult);
+        }
+      })
+      .catch((error) => {
+        if (!context.recoverCommandConflict(error)) context.reportError(error);
+      });
+    entry.inFlight = request;
+    try {
+      await request;
+    } finally {
+      if (entry.inFlight === request) entry.inFlight = null;
+    }
   }
-  if (entry.inFlight) {
-    await entry.inFlight;
-  }
-  if (!entry.args) {
-    return;
-  }
-  const name = entry.name;
-  const args = entry.args;
-  const renderResult = entry.renderResult;
-  const target = entry.target;
-  const generation = entry.generation;
-  entry.args = null;
-  entry.inFlight = command<DesktopWebState>(name, args)
-    .then((state) => {
-      if (entry.args === null && entry.generation === generation && searchTargetStillMatches(key, target, context)) {
-        context.acceptProjection(state, renderResult);
-      }
-    })
-    .catch((error) => {
-      if (!context.recoverCommandConflict(error)) context.reportError(error);
-    })
-    .finally(() => {
-      entry.inFlight = null;
-    });
-  await entry.inFlight;
-  if (entry.args !== null) {
-    await flushTextMutation(key, context);
-  } else {
+  if (pendingTextMutations.get(key) === entry && entry.timer === null && entry.inFlight === null) {
     pendingTextMutations.delete(key);
   }
 }
@@ -492,12 +495,20 @@ export function prepareConfigMutation(
   reconcileConfigDraftTarget(context.uiState, target);
   const currentState = context.getViewState();
   if (!currentState) return null;
-  const values = configMutationValues(context.uiState, target)
-    ?? (currentState.overlay === "config"
-      ? currentState.config_fields.map((field) => ({ key: field.key, text: field.value }))
-      : null);
+  const values = prepareConfigSnapshot(context, target);
   if (!values || !validateConfigValues(values, currentState.config_fields, true)) return null;
   return values;
+}
+
+export function prepareConfigSnapshot(
+  context: ActionContext,
+  target: ConfigMutationTarget,
+): ConfigValueInput[] | null {
+  reconcileConfigDraftTarget(context.uiState, target);
+  const currentState = context.getViewState();
+  if (!currentState) return null;
+  return configMutationValues(context.uiState, target)
+    ?? currentState.config_fields.map((field) => ({ key: field.key, text: field.value }));
 }
 
 function collectSettingsControls(): SettingsControl[] {
@@ -530,7 +541,7 @@ function updateSettingsControlDraft(control: SettingsControl, context: ActionCon
 }
 
 function validateSettingsForm(
-  uiState: UiLocalState,
+  context: ActionContext,
   fields: ConfigFieldProjection[],
   focusInvalid: boolean,
 ): boolean {
@@ -548,19 +559,19 @@ function validateSettingsForm(
         validation.classList.toggle("ok", false);
         validation.classList.toggle("error", true);
       }
-      updateDirtyBadges(uiState);
+      updateDirtyBadges(context);
       if (focusInvalid) control.focus();
       return false;
     }
   }
   if (validation && controls.length > 0) {
-    validation.textContent = uiState.configDirty
+    validation.textContent = context.uiState.configDirty
       ? "未保存の設定があります。Apply、保存、または変更を破棄するまで別画面からの設定変更は停止します。"
       : "入力形式は問題ありません。";
     validation.classList.toggle("ok", true);
     validation.classList.toggle("error", false);
   }
-  updateDirtyBadges(uiState);
+  updateDirtyBadges(context);
   return true;
 }
 
@@ -584,7 +595,10 @@ function validateConfigValues(
   return true;
 }
 
-function updateDirtyBadges(uiState: UiLocalState): void {
+function updateDirtyBadges(context: ActionContext): void {
+  const uiState = context.uiState;
+  const projection = context.getProjection();
+  const capability = projection ? activeConfigDraftProjection(projection, uiState) : null;
   document.querySelectorAll<HTMLElement>(".dirty-badge").forEach((node) => {
     node.classList.toggle("visible", uiState.configDirty);
   });
@@ -592,11 +606,10 @@ function updateDirtyBadges(uiState: UiLocalState): void {
     .querySelectorAll<HTMLButtonElement>(".settings-modal [data-action='discard-config-draft']")
     .forEach((button) => {
       button.hidden = !uiState.configDirty;
-      button.disabled = !configDraftDiscardOpen(uiState);
+      button.disabled = capability ? !capability.discard_enabled : true;
       button.setAttribute("aria-disabled", String(button.disabled));
     });
-  const setupRequired = document.querySelector(".settings-modal.setup-modal") !== null;
-  const commitEnabled = configDraftCommitOpen(uiState, setupRequired);
+  const commitEnabled = capability?.commit_enabled === true;
   document
     .querySelectorAll<HTMLButtonElement>(
       ".settings-modal [data-action='apply-session-config'], .settings-modal [data-action='save-global-config']",
@@ -637,7 +650,7 @@ async function flushOpacityPreview(context: ActionContext): Promise<void> {
   }
 }
 
-async function dispatchAction(action: string, index: number, value: string, state: DesktopWebState, context: ActionContext): Promise<void> {
+async function dispatchAction(action: string, index: number, value: string, state: DesktopViewState, context: ActionContext): Promise<void> {
   if (await dispatchRegisteredAction(action, state, context, { index, value })) return;
   switch (action) {
     case "toggle-attachment-tray":
@@ -722,8 +735,7 @@ async function dispatchAction(action: string, index: number, value: string, stat
       return;
     case "import-config-toml":
       {
-        const ownerMutationOpen = configOwnerMutationOpen(context.uiState);
-        if (!ownerMutationOpen) return;
+        if (!state.config_draft.external_owner_mutation_open) return;
         context.uiState.externalConfigMutationPending = true;
         try {
           context.rerender();
@@ -732,18 +744,30 @@ async function dispatchAction(action: string, index: number, value: string, stat
           let imported: boolean;
           try {
             [nextState, imported] = await command<[DesktopWebState, boolean]>("import_global_config_toml", {
+              draftValues: context.prepareConfigSnapshot(state.config_target) ?? [],
               expectedTarget: request.target,
-              configOwnerMutationOpen: ownerMutationOpen,
             });
           } catch (error) {
-            const finished = finishConfigMutation(context.uiState, request, false, context.getViewState()?.config_target ?? null);
+            const finished = finishConfigMutation(
+              context.uiState,
+              request,
+              false,
+              request.target,
+              context.getViewState()?.config_target ?? null,
+            );
             if (context.recoverCommandConflict(error)) return;
             if (!finished) return;
             context.rerender();
             context.reportError(error);
             return;
           }
-          if (!finishConfigMutation(context.uiState, request, imported, context.getViewState()?.config_target ?? null)) return;
+          if (!finishConfigMutation(
+            context.uiState,
+            request,
+            imported,
+            nextState.config_target,
+            context.getViewState()?.config_target ?? null,
+          )) return;
           context.acceptProjection(nextState);
         } finally {
           context.uiState.externalConfigMutationPending = false;

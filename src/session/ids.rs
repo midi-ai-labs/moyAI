@@ -35,6 +35,7 @@ macro_rules! typed_id {
 
 typed_id!(ProjectId);
 typed_id!(SessionId);
+typed_id!(AdmissionId);
 typed_id!(ToolCallId);
 typed_id!(ChangeId);
 

@@ -2,7 +2,7 @@ use crate::protocol::{HistoryItem, HistoryItemPayload, TurnInterruptionCause};
 use crate::session::{
     CanonicalSessionRead, ProjectId, PromptDispatchPart, SessionId, SessionStatus,
 };
-use crate::tui::state::{AppState, RunStatus};
+use crate::tui::state::{AppState, RunProgressPhase, RunStatus};
 
 use super::async_ops::{
     DesktopAsyncOperationId, DesktopAsyncOperationKind, DesktopAsyncOperationRegistry,
@@ -17,7 +17,8 @@ use super::startup::DesktopStartupState;
 use super::view_state::DesktopViewState;
 use crate::config::ProviderMetadataMode;
 use crate::config::ResolvedConfig;
-use crate::llm::{ProviderModelInfo, normalize_provider_base_url};
+use crate::llm::{ProviderModelInfo, ProviderModelLoadState, normalize_provider_base_url};
+use tokio_util::sync::CancellationToken;
 
 pub const MIN_WINDOW_OPACITY_PERCENT: i32 = 50;
 pub const MAX_WINDOW_OPACITY_PERCENT: i32 = 100;
@@ -83,6 +84,7 @@ pub struct DesktopState {
     pub view: DesktopViewState,
     pub startup: DesktopStartupState,
     pub status_code: DesktopStatusCode,
+    prompt_enhance_cancellation: Option<(u64, CancellationToken)>,
 }
 
 impl DesktopState {
@@ -99,6 +101,7 @@ impl DesktopState {
             view: DesktopViewState::default(),
             startup: DesktopStartupState::ready(),
             status_code: DesktopStatusCode::Plain,
+            prompt_enhance_cancellation: None,
         }
         .with_provider_fields()
     }
@@ -358,6 +361,12 @@ impl DesktopState {
             .begin_unique(DesktopAsyncOperationKind::SnapshotRefresh);
     }
 
+    pub fn snapshot_refresh_pending(&self) -> bool {
+        self.view
+            .async_operations
+            .is_pending(DesktopAsyncOperationKind::SnapshotRefresh)
+    }
+
     pub fn finish_snapshot_refresh(&mut self) {
         self.view
             .async_operations
@@ -457,6 +466,22 @@ impl DesktopState {
             .begin_unique(DesktopAsyncOperationKind::AccessModePersistence)
     }
 
+    pub fn begin_steer_submission(&mut self) -> DesktopAsyncOperationId {
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::SteerSubmission)
+    }
+
+    pub fn finish_steer_submission(&mut self, operation_id: DesktopAsyncOperationId) -> bool {
+        self.view.async_operations.finish(operation_id)
+    }
+
+    pub fn steer_submission_pending(&self) -> bool {
+        self.view
+            .async_operations
+            .is_pending(DesktopAsyncOperationKind::SteerSubmission)
+    }
+
     pub fn finish_access_mode_persistence(
         &mut self,
         operation_id: DesktopAsyncOperationId,
@@ -525,6 +550,10 @@ impl DesktopState {
                 .view
                 .async_operations
                 .is_pending(DesktopAsyncOperationKind::AccessModePersistence)
+            || self
+                .view
+                .async_operations
+                .is_pending(DesktopAsyncOperationKind::SteerSubmission)
     }
 
     pub fn begin_history_export(&mut self) {
@@ -826,7 +855,7 @@ impl DesktopState {
         self.app_state.apply_run_event(event);
         self.status_code = match event {
             crate::session::RunEvent::TurnTerminal { terminal, .. } => terminal
-                .interruption_cause
+                .interruption_cause()
                 .map(DesktopStatusCode::from_interruption)
                 .unwrap_or(DesktopStatusCode::Plain),
             _ => DesktopStatusCode::Plain,
@@ -843,7 +872,7 @@ impl DesktopState {
                 session_id,
                 terminal,
             } => {
-                self.update_session_row_status(*session_id, terminal.status.as_session_status());
+                self.update_session_row_status(*session_id, terminal.session_status());
             }
             _ => {}
         }
@@ -875,26 +904,17 @@ impl DesktopState {
         }
     }
 
-    pub fn mark_run_cancellation_requested(&mut self, reason: &str, status_message: &str) {
-        self.app_state.run_status = RunStatus::Cancelled;
-        self.app_state.status_message = Some(status_message.to_string());
-        self.app_state.interruption_cause = Some(TurnInterruptionCause::UserStop);
-        self.status_code = DesktopStatusCode::UserStopped;
-        self.app_state.progress.status = "Cancelled".to_string();
-        self.app_state.progress.current_phase = "terminal".to_string();
-        self.app_state.progress.active_step = reason.to_string();
-        if let Some(session_id) = self.app_state.current_session_id {
-            for row in self
-                .snapshot
-                .session_rows
-                .iter_mut()
-                .chain(self.snapshot.chat_session_rows.iter_mut())
-            {
-                if row.session_id == session_id {
-                    row.set_status(SessionStatus::Cancelled);
-                }
-            }
+    pub fn mark_run_stop_requested(&mut self, reason: &str, status_message: &str) {
+        // Dispatching Stop is not the durable terminal. Keep the run active until the matching
+        // TurnTerminal projection arrives so navigation and new admission remain closed while the
+        // worker settles cancellation.
+        if !matches!(self.app_state.run_status, RunStatus::Running) {
+            return;
         }
+        self.app_state.status_message = Some(status_message.to_string());
+        self.app_state.progress.status = "Stopping".to_string();
+        self.app_state.progress.current_phase = RunProgressPhase::StopRequested;
+        self.app_state.progress.active_step = reason.to_string();
     }
 
     pub fn apply_durable_prompt_dispatch(&mut self, prompt_dispatch: &PromptDispatchPart) {
@@ -902,7 +922,14 @@ impl DesktopState {
             .apply_durable_prompt_dispatch(prompt_dispatch);
     }
 
-    pub fn begin_prompt_enhance(&mut self, request_id: u64, raw_prompt: &str) {
+    pub fn begin_prompt_enhance(
+        &mut self,
+        request_id: u64,
+        raw_prompt: &str,
+        cancellation: CancellationToken,
+    ) {
+        self.cancel_prompt_enhance_transport();
+        self.prompt_enhance_cancellation = Some((request_id, cancellation));
         self.view
             .async_operations
             .begin_unique(DesktopAsyncOperationKind::PromptEnhance);
@@ -916,6 +943,7 @@ impl DesktopState {
             .app_state
             .finish_prompt_enhance(request_id, draft.clone());
         if finished {
+            self.finish_prompt_enhance_transport(request_id);
             self.view
                 .async_operations
                 .finish_kind(DesktopAsyncOperationKind::PromptEnhance);
@@ -947,6 +975,7 @@ impl DesktopState {
     }
 
     pub fn cancel_prompt_review(&mut self) {
+        self.cancel_prompt_enhance_transport();
         self.view
             .async_operations
             .finish_kind(DesktopAsyncOperationKind::PromptEnhance);
@@ -985,7 +1014,9 @@ impl DesktopState {
             return;
         }
         self.snapshot.selected_session_index = self.snapshot.session_rows.len();
-        self.rebind_composer_owner(None);
+        self.cancel_prompt_review();
+        self.composer
+            .reset_owner(&self.snapshot.workspace_path, None);
         self.app_state = AppState::default();
         self.open_session = None;
         self.view.artifact_selected_index = 0;
@@ -993,17 +1024,27 @@ impl DesktopState {
         self.set_status_message("new chat ready");
     }
 
+    fn finish_prompt_enhance_transport(&mut self, request_id: u64) {
+        if self
+            .prompt_enhance_cancellation
+            .as_ref()
+            .is_some_and(|(active_request_id, _)| *active_request_id == request_id)
+        {
+            self.prompt_enhance_cancellation = None;
+        }
+    }
+
+    fn cancel_prompt_enhance_transport(&mut self) {
+        if let Some((_, cancellation)) = self.prompt_enhance_cancellation.take() {
+            cancellation.cancel();
+        }
+    }
+
     pub fn reset_effective_config(&mut self, config: ResolvedConfig) {
         self.provider_config.replace_effective_config(config);
     }
 
     pub fn show_config_editor(&mut self) {
-        self.provider_config.config_value_text = self
-            .provider_config
-            .config_editor
-            .selected_field()
-            .value
-            .clone();
         self.view.startup_overlay_forced = false;
         self.view.overlay = DesktopOverlay::ConfigEditor;
     }
@@ -1096,63 +1137,6 @@ impl DesktopState {
 
     fn startup_requires_overlay(&self, overlay: DesktopOverlay) -> bool {
         self.startup.requires_initial_setup() && self.startup.action_overlay == Some(overlay)
-    }
-
-    pub fn set_config_selection(&mut self, index: usize) {
-        if index < self.provider_config.config_editor.fields.len() {
-            self.provider_config.config_editor.selected = index;
-            self.provider_config.config_value_text = self
-                .provider_config
-                .config_editor
-                .selected_field()
-                .value
-                .clone();
-        }
-    }
-
-    pub fn set_config_value(&mut self, value: String) {
-        self.provider_config.config_value_text = value.clone();
-        if let Some(field) = self
-            .provider_config
-            .config_editor
-            .fields
-            .get_mut(self.provider_config.config_editor.selected)
-        {
-            field.value = value;
-        }
-    }
-
-    pub fn set_config_values_by_key(
-        &mut self,
-        values: Vec<(String, String)>,
-    ) -> Result<(), String> {
-        let mut seen = std::collections::HashSet::new();
-        let mut updates = Vec::with_capacity(values.len());
-        for (key, value) in values {
-            if !seen.insert(key.clone()) {
-                return Err(format!("duplicate config field key: {key}"));
-            }
-            let index = self
-                .provider_config
-                .config_editor
-                .fields
-                .iter()
-                .position(|field| field.key.label() == key)
-                .ok_or_else(|| format!("unknown config field key: {key}"))?;
-            updates.push((index, value));
-        }
-        for (index, value) in updates {
-            let field = &mut self.provider_config.config_editor.fields[index];
-            field.dirty |= field.value != value;
-            field.value = value;
-        }
-        self.provider_config.config_value_text = self
-            .provider_config
-            .config_editor
-            .selected_field()
-            .value
-            .clone();
-        Ok(())
     }
 
     pub fn begin_provider_model_load(&mut self, normalized_base_url: String) {
@@ -1524,7 +1508,7 @@ fn provider_info_from_config(config: &ResolvedConfig) -> ProviderModelInfo {
         supports_tools: Some(config.model.supports_tools),
         supports_reasoning: Some(config.model.supports_reasoning),
         max_parallel_predictions: Some(config.model.max_parallel_predictions),
-        loaded: false,
+        load_state: ProviderModelLoadState::Unknown,
         source: "config".to_string(),
     }
 }
@@ -1654,18 +1638,13 @@ mod tests {
 
     fn terminal_event(
         session_id: SessionId,
-        status: crate::protocol::TurnTerminalStatus,
-        summary: &str,
-        cause: Option<crate::protocol::TurnInterruptionCause>,
+        outcome: crate::protocol::TurnTerminalOutcome,
     ) -> crate::session::RunEvent {
         crate::session::RunEvent::TurnTerminal {
             session_id,
             terminal: Box::new(crate::session::DurableTurnTerminal {
-                status,
-                finish_reason: None,
-                interruption_cause: cause,
+                outcome,
                 final_response_id: None,
-                summary: summary.to_string(),
                 tool_call_count: 0,
                 failed_tool_count: 0,
                 change_count: 0,
@@ -1681,7 +1660,9 @@ mod tests {
         HistoryItem {
             id: crate::protocol::HistoryItemId::new(),
             session_id: session.id,
-            turn_id: crate::protocol::TurnId::new(),
+            scope: crate::protocol::HistoryScope::Turn {
+                turn_id: crate::protocol::TurnId::new(),
+            },
             sequence_no: 1,
             created_at_ms: 1,
             payload: HistoryItemPayload::RequestDiagnostics {
@@ -1824,6 +1805,13 @@ mod tests {
         state.finish_provider_model_load(initial_provider_model_infos(&config));
         assert!(state.can_apply_provider_selection());
         assert_eq!(
+            state
+                .selected_provider_model_info()
+                .expect("config-derived provider model")
+                .load_state,
+            ProviderModelLoadState::Unknown
+        );
+        assert_eq!(
             state.startup.status,
             super::super::startup::DesktopStartupStatus::Ready
         );
@@ -1863,7 +1851,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_terminal_status_matches_between_live_event_and_rehydrate() {
+    fn typed_terminal_outcome_matches_between_live_event_and_rehydrate() {
         for cause in [
             crate::protocol::TurnInterruptionCause::ApprovalAborted,
             crate::protocol::TurnInterruptionCause::UserStop,
@@ -1886,9 +1874,7 @@ mod tests {
             live.app_state.current_session_id = Some(session_id);
             live.apply_run_event(&terminal_event(
                 session_id,
-                crate::protocol::TurnTerminalStatus::Interrupted,
-                "opaque live interruption",
-                Some(cause),
+                crate::protocol::TurnTerminalOutcome::Interrupted { cause },
             ));
 
             let terminal = crate::protocol::TurnItem {
@@ -1898,9 +1884,7 @@ mod tests {
                 source_item_id: None,
                 sequence_no: 1,
                 payload: crate::protocol::TurnItemPayload::Terminal {
-                    status: crate::protocol::TurnTerminalStatus::Interrupted,
-                    summary: "unrelated persisted summary".to_string(),
-                    cause: Some(cause),
+                    outcome: crate::protocol::TurnTerminalOutcome::Interrupted { cause },
                 },
             };
             let read = canonical_read(&session, Vec::new(), vec![terminal]);
@@ -2112,7 +2096,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_request_terminalizes_busy_projection_and_row_label() {
+    fn stop_request_stays_non_terminal_until_turn_terminal_arrives() {
         let session_id = SessionId::new();
         let mut state = DesktopState::new(
             snapshot(
@@ -2124,14 +2108,20 @@ mod tests {
         state.app_state.current_session_id = Some(session_id);
         state.app_state.run_status = RunStatus::Running;
 
-        state.mark_run_cancellation_requested("run cancelled by user", "停止しました。");
+        state.mark_run_stop_requested("run cancellation requested", "停止を要求しました。");
 
-        assert!(!state.is_busy());
-        assert_eq!(state.app_state.run_status, RunStatus::Cancelled);
+        assert!(state.is_busy());
+        assert_eq!(state.app_state.run_status, RunStatus::Running);
+        assert_eq!(state.app_state.interruption_cause, None);
+        assert_eq!(state.status_code, DesktopStatusCode::Plain);
+        assert_eq!(
+            state.app_state.progress.current_phase,
+            RunProgressPhase::StopRequested
+        );
         let short_id = session_id.to_string().chars().take(8).collect::<String>();
         assert_eq!(
             state.snapshot.session_rows[0].label,
-            format!("Long task [停止済み] {short_id}")
+            format!("Long task [実行中] {short_id}")
         );
     }
 
@@ -2155,9 +2145,7 @@ mod tests {
 
         state.apply_run_event(&terminal_event(
             session_id,
-            crate::protocol::TurnTerminalStatus::Completed,
-            "run completed",
-            None,
+            crate::protocol::TurnTerminalOutcome::Completed,
         ));
 
         assert_eq!(state.app_state.run_status, RunStatus::Completed);
@@ -2238,6 +2226,13 @@ mod tests {
 
         assert!(!state.finish_project_delete_mutation(project_delete_id));
         assert!(!state.background_mutation_pending());
+
+        let steer_id = state.begin_steer_submission();
+        assert!(state.steer_submission_pending());
+        assert!(state.background_mutation_pending());
+        assert!(state.finish_steer_submission(steer_id));
+        assert!(!state.steer_submission_pending());
+        assert!(!state.background_mutation_pending());
     }
 
     #[test]
@@ -2265,7 +2260,9 @@ mod tests {
     fn snapshot_and_turn_page_operations_keep_async_polling_alive() {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
 
+        assert!(!state.snapshot_refresh_pending());
         state.begin_snapshot_refresh();
+        assert!(state.snapshot_refresh_pending());
         assert!(state.async_polling_required());
         assert!(
             state
@@ -2273,6 +2270,7 @@ mod tests {
                 .contains(&"snapshot_refresh".to_string())
         );
         state.finish_snapshot_refresh();
+        assert!(!state.snapshot_refresh_pending());
 
         state.begin_turn_page_load();
         assert!(state.async_polling_required());
@@ -2331,9 +2329,9 @@ mod tests {
     fn stale_prompt_enhance_result_does_not_clear_new_operation() {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
 
-        state.begin_prompt_enhance(1, "first");
+        state.begin_prompt_enhance(1, "first", CancellationToken::new());
         assert!(state.prompt_enhance_pending());
-        state.begin_prompt_enhance(2, "second");
+        state.begin_prompt_enhance(2, "second", CancellationToken::new());
 
         assert!(!state.finish_prompt_enhance(1, "old draft".to_string()));
         assert!(
@@ -2355,6 +2353,22 @@ mod tests {
                 .contains(&"prompt_enhance".to_string())
         );
         assert!(!state.prompt_enhance_pending());
+    }
+
+    #[test]
+    fn same_owner_new_chat_cancels_prompt_enhance_and_advances_owner() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        let cancellation = CancellationToken::new();
+        let generation = state.composer.owner_generation();
+        state.begin_prompt_enhance(3, "stale", cancellation.clone());
+
+        state.start_new_chat();
+
+        assert!(cancellation.is_cancelled());
+        assert!(!state.prompt_enhance_pending());
+        assert!(state.app_state.prompt_review.is_none());
+        assert!(state.composer.owner_generation() > generation);
+        assert!(!state.finish_prompt_enhance(3, "late".to_string()));
     }
 
     #[test]
@@ -2388,7 +2402,7 @@ mod tests {
     #[test]
     fn closing_prompt_review_is_terminal_and_late_result_cannot_reopen_it() {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
-        state.begin_prompt_enhance(7, "draft me");
+        state.begin_prompt_enhance(7, "draft me", CancellationToken::new());
         assert_eq!(state.view.overlay, DesktopOverlay::PromptReview);
 
         state.hide_overlay();
@@ -2408,7 +2422,7 @@ mod tests {
     #[test]
     fn closed_prompt_review_does_not_leak_async_owner_across_navigation() {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
-        state.begin_prompt_enhance(9, "draft before navigation");
+        state.begin_prompt_enhance(9, "draft before navigation", CancellationToken::new());
         state.hide_overlay();
         let session_id = SessionId::new();
         let navigation_id = state.begin_session_load(session_id);
@@ -2422,55 +2436,6 @@ mod tests {
                 .contains(&"prompt_enhance".to_string())
         );
         assert_eq!(state.view.overlay, DesktopOverlay::None);
-    }
-
-    #[test]
-    fn config_values_use_stable_keys_and_reject_invalid_batch_atomically() {
-        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
-        let original_model = state
-            .provider_config
-            .config_editor
-            .fields
-            .iter()
-            .find(|field| field.key.label() == "model.model")
-            .expect("model field")
-            .value
-            .clone();
-
-        let error = state
-            .set_config_values_by_key(vec![
-                ("model.model".to_string(), "changed-model".to_string()),
-                ("unknown.field".to_string(), "invalid".to_string()),
-            ])
-            .expect_err("unknown field must reject the full batch");
-        assert!(error.contains("unknown config field key"));
-        assert_eq!(
-            state
-                .provider_config
-                .config_editor
-                .fields
-                .iter()
-                .find(|field| field.key.label() == "model.model")
-                .expect("model field")
-                .value,
-            original_model
-        );
-
-        state
-            .set_config_values_by_key(vec![(
-                "model.model".to_string(),
-                "changed-model".to_string(),
-            )])
-            .expect("known stable key");
-        let model = state
-            .provider_config
-            .config_editor
-            .fields
-            .iter()
-            .find(|field| field.key.label() == "model.model")
-            .expect("model field");
-        assert_eq!(model.value, "changed-model");
-        assert!(model.dirty);
     }
 
     #[test]

@@ -228,6 +228,10 @@ pub struct ToolResult {
     pub truncated_output_path: Option<Utf8PathBuf>,
     pub recorded_changes: Vec<ChangeId>,
     pub change_summaries: Vec<ChangeSummary>,
+    /// Keeps a newly-created internal file fenced against orphan cleanup until
+    /// the caller has committed `truncated_output_path` to durable storage.
+    #[serde(skip)]
+    pub(crate) _internal_file_lease: Option<crate::storage::InternalFileProducerLease>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +239,8 @@ pub struct TruncatedToolOutput {
     pub preview_text: String,
     pub truncated_output_path: Option<Utf8PathBuf>,
     pub truncated: bool,
+    #[serde(skip)]
+    pub(crate) internal_file_lease: Option<crate::storage::InternalFileProducerLease>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

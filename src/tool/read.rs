@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
@@ -11,8 +12,7 @@ use crate::runtime::SystemClock;
 use crate::tool::context::ToolContext;
 use crate::tool::registry::Tool;
 use crate::tool::{ToolName, ToolResult, ToolSpec};
-use crate::tool::{structured_document_guidance, structured_document_suggested_tools};
-use crate::workspace::{AccessKind, instruction_file_names};
+use crate::workspace::{AccessKind, PathGuard, instruction_file_names};
 
 #[derive(Debug, Deserialize)]
 pub struct ReadInput {
@@ -30,7 +30,7 @@ impl Tool for ReadTool {
         ToolSpec {
             name: ToolName::Read,
             effect: crate::tool::ToolEffectPolicy::read(),
-            description: "Read a UTF-8 or Shift_JIS text file with line numbers. Directories, binary files, large files, checkpoints, and structured documents are redirected to safer workflows. A write baseline is recorded only for UTF-8 files when one read shows every line from the beginning and its tool output is not truncated.",
+            description: "Read a bounded UTF-8 or Shift_JIS text range with line numbers. A write baseline is recorded only when a UTF-8 read exposes the complete file without output truncation.",
             input_schema: json!({
                 "type": "object",
                 "required": ["path"],
@@ -61,24 +61,18 @@ impl Tool for ReadTool {
         .await?
         .admit()?;
 
+        PathGuard::revalidate(&guarded)?;
+
         if guarded.absolute.is_dir() {
-            return Ok(corrective_result(
-                "Read redirected to directory inspection",
-                &format!(
-                    "`{}` is a directory. Use `inspect_directory` for a metadata-first tree and extension summary, or `list` when you only need a flat entry list.",
-                    guarded.absolute
-                ),
-                json!({
-                    "corrective_result": true,
-                    "path": guarded.absolute,
-                    "blocked_reason": "directory",
-                    "suggested_tools": ["inspect_directory", "list"],
-                    "edit_baseline": EditBaselineDecision::not_recorded("not_read_inline").metadata(),
-                }),
-            ));
+            return Err(ToolError::Message(format!(
+                "path `{}` is a directory",
+                guarded.absolute
+            )));
         }
 
-        let metadata = fs::metadata(&guarded.absolute)?;
+        let mut file = File::open(&guarded.absolute)?;
+        PathGuard::validate_open_file(&guarded, &file)?;
+        let metadata = file.metadata()?;
         let size_bytes = metadata.len();
         let extension = normalized_extension(&guarded.absolute);
         let blocked_extensions =
@@ -91,10 +85,8 @@ impl Tool for ReadTool {
                 &guarded.absolute,
                 size_bytes,
                 "checkpoint_or_binary_artifact",
-                "This file matches the configured blocked extension list for large artifacts such as model checkpoints. Do not read it inline. Use `inspect_directory` to keep working from metadata only.",
                 json!({
                     "extension": extension,
-                    "suggested_tools": ["inspect_directory"],
                 }),
             ));
         }
@@ -103,18 +95,12 @@ impl Tool for ReadTool {
             .iter()
             .any(|value| value == &extension)
         {
-            let suggested_tools = structured_document_suggested_tools(ctx.config);
             return Ok(read_blocked_result(
                 &guarded.absolute,
                 size_bytes,
                 "structured_document",
-                &format!(
-                    "This file is a structured document. Do not read it inline. {}",
-                    structured_document_guidance(ctx.config)
-                ),
                 json!({
                     "extension": extension,
-                    "suggested_tools": suggested_tools,
                 }),
             ));
         }
@@ -124,39 +110,39 @@ impl Tool for ReadTool {
                 &guarded.absolute,
                 size_bytes,
                 "large_file",
-                "This file exceeds the inline read limit. Do not keep retrying `read`. Use `inspect_directory` to stay metadata-first, or use a more specialized tool path if the user explicitly needs processing.",
                 json!({
                     "max_inline_read_bytes": ctx.config.file_guard.max_inline_read_bytes,
-                    "suggested_tools": ["inspect_directory"],
                 }),
             ));
         }
 
-        let bytes = fs::read(&guarded.absolute)?;
+        let (bytes, exceeded_limit) =
+            read_up_to_limit(&mut file, ctx.config.file_guard.max_inline_read_bytes)?;
+        if exceeded_limit {
+            return Ok(read_blocked_result(
+                &guarded.absolute,
+                size_bytes.max(bytes.len() as u64),
+                "large_file",
+                json!({
+                    "max_inline_read_bytes": ctx.config.file_guard.max_inline_read_bytes,
+                    "size_is_lower_bound": true,
+                }),
+            ));
+        }
         if content_inspector::inspect(&bytes).is_binary() {
-            let suggested_tools = structured_document_suggested_tools(ctx.config);
             return Ok(read_blocked_result(
                 &guarded.absolute,
                 size_bytes,
                 "binary_content",
-                &format!(
-                    "This file is binary. Do not read it inline. {}",
-                    structured_document_guidance(ctx.config)
-                ),
                 json!({
                     "extension": extension,
-                    "suggested_tools": suggested_tools,
                 }),
             ));
         }
 
         let content_sha256 = crate::harness::artifact::hash_bytes(&bytes);
-        let decoded = crate::tool::text_encoding::decode_text(bytes).map_err(|_| {
-            ToolError::Message(
-                "file is neither valid UTF-8 nor valid Shift_JIS text after guard checks"
-                    .to_string(),
-            )
-        })?;
+        let decoded = crate::tool::text_encoding::decode_text(bytes)
+            .map_err(|_| ToolError::Message("file has no supported text encoding".to_string()))?;
         let source_encoding = decoded.encoding;
         let text = decoded.text;
         let lines = text.lines().collect::<Vec<_>>();
@@ -220,19 +206,27 @@ impl Tool for ReadTool {
             truncated_output_path: preview.truncated_output_path,
             recorded_changes: Vec::new(),
             change_summaries: Vec::new(),
+            _internal_file_lease: preview.internal_file_lease,
         })
     }
+}
+
+fn read_up_to_limit(reader: &mut impl Read, max_bytes: u64) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut bytes = Vec::new();
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let exceeded_limit = bytes.len() as u64 > max_bytes;
+    Ok((bytes, exceeded_limit))
 }
 
 fn read_blocked_result(
     path: &Utf8Path,
     size_bytes: u64,
     blocked_reason: &str,
-    message: &str,
     extra_metadata: serde_json::Value,
 ) -> ToolResult {
     let mut metadata = json!({
-        "corrective_result": true,
         "path": path,
         "size_bytes": size_bytes,
         "blocked_reason": blocked_reason,
@@ -243,11 +237,15 @@ fn read_blocked_result(
             target.insert(key.clone(), value.clone());
         }
     }
-    corrective_result(
-        &format!("Read blocked: {blocked_reason}"),
-        &format!("`{path}` was not read inline.\n{message}"),
+    ToolResult {
+        title: format!("Read blocked: {blocked_reason}"),
+        output_text: format!("`{path}` was not read inline: {blocked_reason}."),
         metadata,
-    )
+        truncated_output_path: None,
+        recorded_changes: Vec::new(),
+        change_summaries: Vec::new(),
+        _internal_file_lease: None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,17 +308,6 @@ fn record_edit_baseline_if_eligible(
     Ok(())
 }
 
-fn corrective_result(title: &str, output_text: &str, metadata: serde_json::Value) -> ToolResult {
-    ToolResult {
-        title: title.to_string(),
-        output_text: output_text.to_string(),
-        metadata,
-        truncated_output_path: None,
-        recorded_changes: Vec::new(),
-        change_summaries: Vec::new(),
-    }
-}
-
 fn normalized_extension(path: &Utf8Path) -> String {
     path.extension()
         .map(|value| value.trim_start_matches('.').to_ascii_lowercase())
@@ -360,7 +347,17 @@ mod tests {
     use crate::edit::{EditSafety, FileReadStamp, read_file_with_identity};
     use crate::session::SessionId;
 
-    use super::{edit_baseline_decision, record_edit_baseline_if_eligible};
+    use super::{edit_baseline_decision, read_up_to_limit, record_edit_baseline_if_eligible};
+
+    #[test]
+    fn bounded_reader_never_materializes_more_than_limit_plus_one() {
+        let mut input = std::io::Cursor::new(vec![b'x'; 4 * 1024]);
+
+        let (bytes, exceeded_limit) = read_up_to_limit(&mut input, 32).expect("bounded read");
+
+        assert!(exceeded_limit);
+        assert_eq!(bytes.len(), 33);
+    }
 
     fn stamp_for(path: &camino::Utf8Path) -> (FileReadStamp, crate::edit::FileContentIdentity) {
         let (_, identity) = read_file_with_identity(path).expect("read identity");
@@ -397,7 +394,7 @@ mod tests {
                 .assert_fresh_write(session_id, &path, &identity)
                 .expect_err("write after partial read must be rejected")
                 .to_string()
-                .contains("was not read in this session")
+                .contains("no edit baseline exists")
         );
     }
 
@@ -423,7 +420,7 @@ mod tests {
                 .assert_fresh_write(session_id, &path, &identity)
                 .expect_err("write after preview-truncated read must be rejected")
                 .to_string()
-                .contains("was not read in this session")
+                .contains("no edit baseline exists")
         );
     }
 

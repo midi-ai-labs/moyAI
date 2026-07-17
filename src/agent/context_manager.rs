@@ -19,6 +19,18 @@ impl HistoryRevision {
 pub struct ContextManager {
     history_items: Vec<HistoryItem>,
     revision: HistoryRevision,
+    append_cursor: Option<i64>,
+    canonical_count: usize,
+    steer_count: usize,
+    agent_communication_count: usize,
+}
+
+/// Transient owner used while storage streams one fenced active-history view.
+/// Pages move directly into the final ContextManager allocation; callers never
+/// need a second whole-history buffer.
+#[derive(Debug, Default)]
+pub(crate) struct ActiveHistoryContextBuilder {
+    history_items: Vec<HistoryItem>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,57 +38,147 @@ pub enum HistoryChange {
     Unchanged,
     Appended,
     Compacted,
-    Rewritten,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextDelta {
+    pub change: HistoryChange,
+    pub steer_item_ids: Vec<HistoryItemId>,
+    pub agent_communication_item_ids: Vec<HistoryItemId>,
 }
 
 impl ContextManager {
-    pub fn rehydrate(history_items: Vec<HistoryItem>) -> Self {
+    pub(crate) fn active_history_builder() -> ActiveHistoryContextBuilder {
+        ActiveHistoryContextBuilder::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rehydrate(history_items: Vec<HistoryItem>) -> Self {
+        let mut context = Self::from_active_history(Vec::new(), None, 0, 0, 0);
+        let _ = context.ingest_committed_delta(history_items, None);
+        context
+    }
+
+    pub fn from_active_history(
+        history_items: Vec<HistoryItem>,
+        append_cursor: Option<i64>,
+        canonical_count: usize,
+        steer_count: usize,
+        agent_communication_count: usize,
+    ) -> Self {
         let revision = revision_for(&history_items);
         Self {
             history_items,
             revision,
+            append_cursor,
+            canonical_count,
+            steer_count,
+            agent_communication_count,
         }
     }
 
-    pub fn replace_committed_history(&mut self, history_items: Vec<HistoryItem>) -> HistoryChange {
-        let revision = revision_for(&history_items);
-        let change = if revision == self.revision {
-            HistoryChange::Unchanged
-        } else if history_items.len() >= self.history_items.len()
-            && self
-                .history_items
-                .iter()
-                .zip(&history_items)
-                .all(|(before, after)| canonical_item_eq(before, after))
-        {
-            if history_items[self.history_items.len()..]
-                .iter()
-                .any(|item| matches!(item.payload, HistoryItemPayload::Compaction { .. }))
+    /// Applies rows read strictly after [`Self::append_cursor`].
+    ///
+    /// The durable stream remains append-only. A compaction append updates the
+    /// active in-memory view by removing its replacement IDs and inserting the
+    /// summary at their earliest model position; replaced raw content is never
+    /// reloaded merely to detect this change.
+    pub fn ingest_committed_delta(
+        &mut self,
+        history_items: Vec<HistoryItem>,
+        next_cursor: Option<i64>,
+    ) -> ContextDelta {
+        if history_items.is_empty() {
+            return ContextDelta {
+                change: HistoryChange::Unchanged,
+                steer_item_ids: Vec::new(),
+                agent_communication_item_ids: Vec::new(),
+            };
+        }
+
+        let mut compacted = false;
+        let delta_len = history_items.len();
+        let mut steer_item_ids = Vec::new();
+        let mut agent_communication_item_ids = Vec::new();
+        for item in history_items {
+            match &item.payload {
+                HistoryItemPayload::SteerTurn { .. } => steer_item_ids.push(item.id),
+                HistoryItemPayload::InterAgentCommunication { .. } => {
+                    agent_communication_item_ids.push(item.id);
+                }
+                _ => {}
+            }
+            if let HistoryItemPayload::Compaction {
+                replacement_item_ids,
+                ..
+            } = &item.payload
             {
+                compacted = true;
+                let replaced = replacement_item_ids.iter().copied().collect::<HashSet<_>>();
+                let insertion_index = self
+                    .history_items
+                    .iter()
+                    .position(|existing| replaced.contains(&existing.id))
+                    .unwrap_or(self.history_items.len());
+                self.history_items
+                    .retain(|existing| !replaced.contains(&existing.id));
+                let insertion_index = insertion_index.min(self.history_items.len());
+                self.history_items.insert(insertion_index, item);
+            } else {
+                self.history_items.push(item);
+            }
+        }
+        // Canonical count follows append identities rather than active-view
+        // length; compaction may shrink the latter.
+        self.canonical_count = self.canonical_count.saturating_add(delta_len);
+        self.steer_count = self.steer_count.saturating_add(steer_item_ids.len());
+        self.agent_communication_count = self
+            .agent_communication_count
+            .saturating_add(agent_communication_item_ids.len());
+        self.append_cursor = next_cursor.or(self.append_cursor);
+        self.revision = revision_for(&self.history_items);
+        ContextDelta {
+            change: if compacted {
                 HistoryChange::Compacted
             } else {
                 HistoryChange::Appended
-            }
-        } else {
-            HistoryChange::Rewritten
-        };
-        self.history_items = history_items;
-        self.revision = revision;
-        change
+            },
+            steer_item_ids,
+            agent_communication_item_ids,
+        }
     }
 
     pub fn revision(&self) -> &HistoryRevision {
         &self.revision
     }
 
+    pub fn append_cursor(&self) -> Option<i64> {
+        self.append_cursor
+    }
+
+    pub fn canonical_count(&self) -> usize {
+        self.canonical_count
+    }
+
+    pub fn steer_count(&self) -> usize {
+        self.steer_count
+    }
+
+    pub fn agent_communication_count(&self) -> usize {
+        self.agent_communication_count
+    }
+
     pub fn history_items(&self) -> &[HistoryItem] {
         &self.history_items
     }
 
-    pub fn has_user_turn(&self) -> bool {
-        self.history_items
-            .iter()
-            .any(|item| matches!(item.payload, HistoryItemPayload::UserTurn { .. }))
+    pub fn has_model_context(&self) -> bool {
+        self.history_items.iter().any(|item| {
+            matches!(
+                item.payload,
+                HistoryItemPayload::UserTurn { .. } | HistoryItemPayload::Compaction { .. }
+            )
+        })
     }
 
     pub fn model_messages(&self, supports_images: bool) -> Vec<ModelMessage> {
@@ -232,6 +334,28 @@ impl ContextManager {
     }
 }
 
+impl ActiveHistoryContextBuilder {
+    pub(crate) fn ingest_page(&mut self, history_items: Vec<HistoryItem>) {
+        self.history_items.extend(history_items);
+    }
+
+    pub(crate) fn finish(
+        self,
+        append_cursor: Option<i64>,
+        canonical_count: usize,
+        steer_count: usize,
+        agent_communication_count: usize,
+    ) -> ContextManager {
+        ContextManager::from_active_history(
+            self.history_items,
+            append_cursor,
+            canonical_count,
+            steer_count,
+            agent_communication_count,
+        )
+    }
+}
+
 fn render_model_message_for_compaction(message: &ModelMessage) -> String {
     match message {
         ModelMessage::System { content } => format!("[system]\n{content}"),
@@ -286,20 +410,14 @@ fn render_model_message_for_compaction(message: &ModelMessage) -> String {
     }
 }
 
-fn canonical_item_eq(before: &HistoryItem, after: &HistoryItem) -> bool {
-    before.id == after.id
-        && before.session_id == after.session_id
-        && before.turn_id == after.turn_id
-        && before.sequence_no == after.sequence_no
-        && before.created_at_ms == after.created_at_ms
-        && serde_json::to_value(&before.payload).ok() == serde_json::to_value(&after.payload).ok()
-}
-
 fn revision_for(items: &[HistoryItem]) -> HistoryRevision {
     let mut hash = Sha256::new();
     for item in items {
         hash.update(item.id.to_string().as_bytes());
-        hash.update(item.turn_id.to_string().as_bytes());
+        hash.update(item.scope.as_str().as_bytes());
+        if let Some(turn_id) = item.turn_id() {
+            hash.update(turn_id.to_string().as_bytes());
+        }
         hash.update(item.sequence_no.to_le_bytes());
         if let Ok(payload) = serde_json::to_vec(&item.payload) {
             hash.update(payload);
@@ -450,18 +568,9 @@ fn project_model_messages(
                     },
                 ));
             }
-            HistoryItemPayload::InterAgentCommunication { communication } => projected.push((
-                index,
-                1,
-                ModelMessage::Assistant {
-                    content: serde_json::to_string(communication).unwrap_or_else(|_| {
-                        format!(
-                            "Message from {} to {}: {}",
-                            communication.author, communication.recipient, communication.content
-                        )
-                    }),
-                },
-            )),
+            HistoryItemPayload::InterAgentCommunication { communication } => {
+                projected.push((index, 1, inter_agent_input_message(communication)))
+            }
             HistoryItemPayload::ToolCall { .. } => {}
             HistoryItemPayload::ToolOutput {
                 call_id,
@@ -557,6 +666,28 @@ fn user_message_from_content(content: &[ContentPart], supports_images: bool) -> 
     }
 }
 
+fn inter_agent_input_message(
+    communication: &crate::protocol::InterAgentCommunication,
+) -> ModelMessage {
+    ModelMessage::User {
+        content: format!(
+            "<inter_agent_message author=\"{}\" recipient=\"{}\">\n{}\n</inter_agent_message>",
+            escape_model_envelope_text(&communication.author.to_string()),
+            escape_model_envelope_text(&communication.recipient.to_string()),
+            escape_model_envelope_text(&communication.content),
+        ),
+    }
+}
+
+fn escape_model_envelope_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 fn content_text(content: &[ContentPart]) -> String {
     content
         .iter()
@@ -571,7 +702,7 @@ fn content_text(content: &[ContentPart]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ModelResponseId, ToolLifecycleStatus, TurnId};
+    use crate::protocol::{HistoryScope, ModelResponseId, ToolLifecycleStatus, TurnId};
     use crate::session::{SessionId, ToolCallId};
 
     fn user_item(text: &str) -> HistoryItem {
@@ -579,7 +710,9 @@ mod tests {
         HistoryItem {
             id: HistoryItemId::new(),
             session_id,
-            turn_id: TurnId::new(),
+            scope: HistoryScope::Turn {
+                turn_id: TurnId::new(),
+            },
             sequence_no: 1,
             created_at_ms: 1,
             payload: HistoryItemPayload::UserTurn {
@@ -595,26 +728,161 @@ mod tests {
     #[test]
     fn revision_changes_only_with_canonical_history() {
         let first = user_item("one");
-        let mut context = ContextManager::rehydrate(vec![first.clone()]);
+        let mut context = ContextManager::from_active_history(vec![first], Some(1), 1, 0, 0);
         let revision = context.revision().clone();
         assert_eq!(
-            context.replace_committed_history(vec![first]),
-            HistoryChange::Unchanged
+            context.ingest_committed_delta(Vec::new(), None).change,
+            HistoryChange::Unchanged,
         );
         assert_eq!(context.revision(), &revision);
+        let second = user_item("two");
         assert_eq!(
-            context.replace_committed_history(vec![user_item("two")]),
-            HistoryChange::Rewritten
+            context.ingest_committed_delta(vec![second], Some(2)).change,
+            HistoryChange::Appended,
         );
+        assert_ne!(context.revision(), &revision);
+        assert_eq!(context.append_cursor(), Some(2));
+        assert_eq!(context.canonical_count(), 2);
+    }
+
+    #[test]
+    fn active_history_builder_moves_bounded_pages_into_one_context_owner() {
+        let first = user_item("first page");
+        let mut second = user_item("second page");
+        second.session_id = first.session_id;
+        second.scope = first.scope;
+        second.sequence_no = 1;
+        let expected_revision = revision_for(&[first.clone(), second.clone()]);
+        let mut builder = ContextManager::active_history_builder();
+
+        builder.ingest_page(vec![first.clone()]);
+        builder.ingest_page(vec![second.clone()]);
+        let context = builder.finish(Some(9), 7, 2, 1);
+
+        assert_eq!(context.revision(), &expected_revision);
+        assert_eq!(context.append_cursor(), Some(9));
+        assert_eq!(context.canonical_count(), 7);
+        assert_eq!(context.steer_count(), 2);
+        assert_eq!(context.agent_communication_count(), 1);
+        assert_eq!(
+            context
+                .history_items()
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![first.id, second.id]
+        );
+    }
+
+    #[test]
+    fn compaction_delta_replaces_active_raw_items_without_full_rehydrate() {
+        let first = user_item("first");
+        let mut second = user_item("second");
+        second.session_id = first.session_id;
+        second.scope = first.scope;
+        second.sequence_no = 2;
+        let mut tail = user_item("tail");
+        tail.session_id = first.session_id;
+        tail.scope = first.scope;
+        tail.sequence_no = 3;
+        let mut context = ContextManager::from_active_history(
+            vec![first.clone(), second.clone(), tail.clone()],
+            Some(3),
+            3,
+            0,
+            0,
+        );
+        let summary = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: first.session_id,
+            scope: first.scope,
+            sequence_no: 4,
+            created_at_ms: 4,
+            payload: HistoryItemPayload::Compaction {
+                mode: crate::protocol::CompactionMode::Automatic,
+                summary: "first and second summarized".to_string(),
+                replacement_item_ids: vec![first.id, second.id],
+            },
+        };
+
+        let delta = context.ingest_committed_delta(vec![summary.clone()], Some(4));
+
+        assert_eq!(delta.change, HistoryChange::Compacted);
+        assert_eq!(context.append_cursor(), Some(4));
+        assert_eq!(context.canonical_count(), 4);
+        assert_eq!(
+            context
+                .history_items()
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![summary.id, tail.id]
+        );
+        assert!(matches!(
+            context.model_messages(false).as_slice(),
+            [ModelMessage::System { content }, ModelMessage::User { content: tail_text }]
+                if content.contains("first and second summarized") && tail_text == "tail"
+        ));
     }
 
     #[test]
     fn context_manager_is_the_message_projection_owner() {
         let context = ContextManager::rehydrate(vec![user_item("inspect")]);
-        assert!(context.has_user_turn());
+        assert!(context.has_model_context());
         assert!(matches!(
             context.model_messages(true).as_slice(),
             [ModelMessage::User { content }] if content == "inspect"
+        ));
+    }
+
+    #[test]
+    fn inter_agent_communications_replay_as_provenanced_external_input() {
+        let session_id = SessionId::new();
+        let communications = [
+            ("/root", "/root/child", "Inspect <state> & report."),
+            ("/root/child", "/root", "Finished the requested review."),
+        ];
+        let items = communications
+            .into_iter()
+            .enumerate()
+            .map(|(index, (author, recipient, content))| HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                scope: HistoryScope::Session,
+                sequence_no: index as i64,
+                created_at_ms: index as i64,
+                payload: HistoryItemPayload::InterAgentCommunication {
+                    communication: crate::protocol::InterAgentCommunication {
+                        author: author.to_string(),
+                        recipient: recipient.to_string(),
+                        content: content.to_string(),
+                        trigger_turn: true,
+                    },
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let projected = ContextManager::rehydrate(items).model_messages(false);
+
+        assert_eq!(projected.len(), 2);
+        assert!(
+            projected
+                .iter()
+                .all(|message| matches!(message, ModelMessage::User { .. }))
+        );
+        assert!(matches!(
+            &projected[0],
+            ModelMessage::User { content }
+                if content.contains("author=\"/root\"")
+                    && content.contains("recipient=\"/root/child\"")
+                    && content.contains("&lt;state&gt; &amp; report.")
+        ));
+        assert!(matches!(
+            &projected[1],
+            ModelMessage::User { content }
+                if content.contains("author=\"/root/child\"")
+                    && content.contains("recipient=\"/root\"")
+                    && content.contains("Finished the requested review.")
         ));
     }
 
@@ -628,7 +896,7 @@ mod tests {
         let mut items = vec![HistoryItem {
             id: HistoryItemId::new(),
             session_id,
-            turn_id,
+            scope: HistoryScope::Turn { turn_id },
             sequence_no: 0,
             created_at_ms: 1,
             payload: HistoryItemPayload::AssistantMessage {
@@ -645,7 +913,7 @@ mod tests {
             items.push(HistoryItem {
                 id: HistoryItemId::new(),
                 session_id,
-                turn_id,
+                scope: HistoryScope::Turn { turn_id },
                 sequence_no,
                 created_at_ms: sequence_no,
                 payload: HistoryItemPayload::ToolCall {
@@ -659,7 +927,7 @@ mod tests {
             items.push(HistoryItem {
                 id: HistoryItemId::new(),
                 session_id,
-                turn_id,
+                scope: HistoryScope::Turn { turn_id },
                 sequence_no: sequence_no + 1,
                 created_at_ms: sequence_no + 1,
                 payload: HistoryItemPayload::ToolOutput {
@@ -698,7 +966,7 @@ mod tests {
             HistoryItem {
                 id: HistoryItemId::new(),
                 session_id,
-                turn_id,
+                scope: HistoryScope::Turn { turn_id },
                 sequence_no: 0,
                 created_at_ms: 1,
                 payload: HistoryItemPayload::ToolCall {
@@ -712,7 +980,7 @@ mod tests {
             HistoryItem {
                 id: HistoryItemId::new(),
                 session_id,
-                turn_id,
+                scope: HistoryScope::Turn { turn_id },
                 sequence_no: 1,
                 created_at_ms: 2,
                 payload: HistoryItemPayload::ToolOutput {
@@ -750,7 +1018,7 @@ mod tests {
         let user = HistoryItem {
             id: HistoryItemId::new(),
             session_id,
-            turn_id,
+            scope: HistoryScope::Turn { turn_id },
             sequence_no: 0,
             created_at_ms: 1,
             payload: HistoryItemPayload::UserTurn {
@@ -764,7 +1032,7 @@ mod tests {
         let assistant = HistoryItem {
             id: HistoryItemId::new(),
             session_id,
-            turn_id,
+            scope: HistoryScope::Turn { turn_id },
             sequence_no: 1,
             created_at_ms: 2,
             payload: HistoryItemPayload::AssistantMessage {
@@ -777,7 +1045,7 @@ mod tests {
         let call = HistoryItem {
             id: HistoryItemId::new(),
             session_id,
-            turn_id,
+            scope: HistoryScope::Turn { turn_id },
             sequence_no: 2,
             created_at_ms: 3,
             payload: HistoryItemPayload::ToolCall {
@@ -791,7 +1059,7 @@ mod tests {
         let output = HistoryItem {
             id: HistoryItemId::new(),
             session_id,
-            turn_id,
+            scope: HistoryScope::Turn { turn_id },
             sequence_no: 3,
             created_at_ms: 4,
             payload: HistoryItemPayload::ToolOutput {
@@ -806,7 +1074,7 @@ mod tests {
         let state_only = HistoryItem {
             id: HistoryItemId::new(),
             session_id,
-            turn_id,
+            scope: HistoryScope::Session,
             sequence_no: 4,
             created_at_ms: 5,
             payload: HistoryItemPayload::CollaborationModeInstruction {
@@ -838,7 +1106,7 @@ mod tests {
         let pending_call = HistoryItem {
             id: HistoryItemId::new(),
             session_id,
-            turn_id,
+            scope: HistoryScope::Turn { turn_id },
             sequence_no: 1,
             created_at_ms: 2,
             payload: HistoryItemPayload::ToolCall {
@@ -852,7 +1120,7 @@ mod tests {
         let later = HistoryItem {
             id: HistoryItemId::new(),
             session_id,
-            turn_id,
+            scope: HistoryScope::Turn { turn_id },
             sequence_no: 2,
             created_at_ms: 3,
             payload: HistoryItemPayload::UserTurn {

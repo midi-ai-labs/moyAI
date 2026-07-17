@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
+use std::fmt;
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{AccessMode, ShellFamily};
 use crate::protocol::{
-    HistoryItem, ModelResponseId, TurnId, TurnInterruptionCause, TurnItem, TurnTerminalStatus,
+    HistoryItem, ModelResponseId, TurnId, TurnInterruptionCause, TurnItem, TurnTerminalOutcome,
 };
 use crate::tool::ToolName;
 
@@ -92,7 +93,7 @@ pub struct DispatchTransform {
     pub label: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: SessionId,
     pub project_id: ProjectId,
@@ -107,6 +108,26 @@ pub struct SessionRecord {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub completed_at_ms: Option<i64>,
+}
+
+impl fmt::Debug for SessionRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionRecord")
+            .field("id", &self.id)
+            .field("project_id", &self.project_id)
+            .field("title", &self.title)
+            .field("status", &self.status)
+            .field("cwd", &self.cwd)
+            .field("model", &self.model)
+            .field("base_url", &"<redacted provider endpoint>")
+            .field("access_mode", &self.access_mode)
+            .field("model_parameters", &self.model_parameters)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("updated_at_ms", &self.updated_at_ms)
+            .field("completed_at_ms", &self.completed_at_ms)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,7 +161,7 @@ impl SessionModelParameters {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<Utf8PathBuf>,
@@ -160,6 +181,29 @@ pub struct SessionSettingsPatch {
     pub top_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+}
+
+impl fmt::Debug for SessionSettingsPatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionSettingsPatch")
+            .field("cwd", &self.cwd)
+            .field("model", &self.model)
+            .field(
+                "base_url",
+                &self
+                    .base_url
+                    .as_ref()
+                    .map(|_| "<redacted provider endpoint>"),
+            )
+            .field("access_mode", &self.access_mode)
+            .field("reset_model_parameters", &self.reset_model_parameters)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("top_k", &self.top_k)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .finish()
+    }
 }
 
 impl SessionSettingsPatch {
@@ -484,8 +528,6 @@ pub struct RequestToolSchemaDiagnostic {
     pub name: String,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub description_chars: usize,
-    #[serde(default)]
-    pub strict: bool,
     pub input_schema: serde_json::Value,
 }
 
@@ -595,6 +637,21 @@ pub struct CanonicalSessionRead {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalSessionFence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub append_position: Option<i64>,
+    pub history_count: usize,
+    pub turn_count: usize,
+    pub runtime_event_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalSessionSnapshot {
+    pub read: CanonicalSessionRead,
+    pub fence: CanonicalSessionFence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadedSessionStatus {
     NotLoaded,
@@ -643,7 +700,7 @@ pub struct RunningSessionRejoin {
     pub read: CanonicalSessionRead,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NewSession {
     pub project_id: ProjectId,
     pub title: String,
@@ -653,6 +710,20 @@ pub struct NewSession {
     pub access_mode: AccessMode,
 }
 
+impl fmt::Debug for NewSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewSession")
+            .field("project_id", &self.project_id)
+            .field("title", &self.title)
+            .field("cwd", &self.cwd)
+            .field("model", &self.model)
+            .field("base_url", &"<redacted provider endpoint>")
+            .field("access_mode", &self.access_mode)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionSelector {
     New,
@@ -660,7 +731,7 @@ pub enum SessionSelector {
     Latest,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SessionStartRequest {
     pub selector: SessionSelector,
     pub title: Option<String>,
@@ -668,6 +739,20 @@ pub struct SessionStartRequest {
     pub model: String,
     pub base_url: String,
     pub access_mode: AccessMode,
+}
+
+impl fmt::Debug for SessionStartRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionStartRequest")
+            .field("selector", &self.selector)
+            .field("title", &self.title)
+            .field("cwd", &self.cwd)
+            .field("model", &self.model)
+            .field("base_url", &"<redacted provider endpoint>")
+            .field("access_mode", &self.access_mode)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -678,20 +763,71 @@ pub struct SessionContext {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSummary {
-    pub session_id: SessionId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_id: Option<TurnId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub final_response_id: Option<ModelResponseId>,
-    pub status: SessionStatus,
-    pub finish_reason: Option<FinishReason>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interruption_cause: Option<TurnInterruptionCause>,
-    pub tool_call_count: usize,
-    pub failed_tool_count: usize,
-    pub change_count: usize,
-    #[serde(default)]
-    pub metrics: RunMetrics,
+    session_id: SessionId,
+    turn_id: TurnId,
+    terminal: DurableTurnTerminal,
+}
+
+impl RunSummary {
+    pub fn from_terminal(
+        session_id: SessionId,
+        turn_id: TurnId,
+        terminal: DurableTurnTerminal,
+    ) -> Self {
+        Self {
+            session_id,
+            turn_id,
+            terminal,
+        }
+    }
+
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub const fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    pub const fn terminal(&self) -> &DurableTurnTerminal {
+        &self.terminal
+    }
+
+    pub fn into_terminal(self) -> DurableTurnTerminal {
+        self.terminal
+    }
+
+    pub const fn status(&self) -> SessionStatus {
+        self.terminal.session_status()
+    }
+
+    pub const fn finish_reason(&self) -> FinishReason {
+        self.terminal.finish_reason()
+    }
+
+    pub const fn interruption_cause(&self) -> Option<TurnInterruptionCause> {
+        self.terminal.interruption_cause()
+    }
+
+    pub const fn final_response_id(&self) -> Option<ModelResponseId> {
+        self.terminal.final_response_id
+    }
+
+    pub const fn tool_call_count(&self) -> usize {
+        self.terminal.tool_call_count
+    }
+
+    pub const fn failed_tool_count(&self) -> usize {
+        self.terminal.failed_tool_count
+    }
+
+    pub const fn change_count(&self) -> usize {
+        self.terminal.change_count
+    }
+
+    pub const fn metrics(&self) -> &RunMetrics {
+        &self.terminal.metrics
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -711,15 +847,11 @@ pub struct RunMetrics {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DurableTurnTerminal {
-    pub status: TurnTerminalStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub finish_reason: Option<FinishReason>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interruption_cause: Option<TurnInterruptionCause>,
+    pub outcome: TurnTerminalOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_response_id: Option<ModelResponseId>,
-    pub summary: String,
     #[serde(default)]
     pub tool_call_count: usize,
     #[serde(default)]
@@ -730,11 +862,40 @@ pub struct DurableTurnTerminal {
     pub metrics: RunMetrics,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl DurableTurnTerminal {
+    pub const fn session_status(&self) -> SessionStatus {
+        self.outcome.session_status()
+    }
+
+    pub const fn finish_reason(&self) -> FinishReason {
+        self.outcome.finish_reason()
+    }
+
+    pub const fn interruption_cause(&self) -> Option<TurnInterruptionCause> {
+        self.outcome.interruption_cause()
+    }
+
+    pub fn summary(&self) -> &str {
+        self.outcome.summary()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RunConfigSnapshot {
     pub model: String,
     pub base_url: String,
-    pub access_mode: String,
+    pub access_mode: AccessMode,
+}
+
+impl fmt::Debug for RunConfigSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RunConfigSnapshot")
+            .field("model", &self.model)
+            .field("base_url", &"<redacted provider endpoint>")
+            .field("access_mode", &self.access_mode)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -763,6 +924,12 @@ pub enum RunEvent {
     ModelRequestPrepared {
         session_id: SessionId,
         diagnostics: RequestDiagnosticsPart,
+    },
+    /// Typed, low-volume provider lifecycle telemetry. This is emitted only
+    /// through the runtime event path and is never canonical conversation history.
+    ProviderPhase {
+        response_id: ModelResponseId,
+        event: crate::llm::ProviderPhaseEvent,
     },
     WorldStateUpdated {
         session_id: SessionId,
@@ -838,12 +1005,6 @@ pub enum RunEvent {
         tool: ToolName,
         approved: bool,
     },
-    RetryScheduled {
-        session_id: SessionId,
-        attempt: u8,
-        message: String,
-        next_retry_at_ms: i64,
-    },
     RecoverableRuntimeFeedback {
         session_id: SessionId,
         message: String,
@@ -862,10 +1023,10 @@ impl RunEvent {
             | Self::UserTurnStored { session_id, .. }
             | Self::ModelRequestPrepared { session_id, .. }
             | Self::WorldStateUpdated { session_id, .. }
-            | Self::RetryScheduled { session_id, .. }
             | Self::RecoverableRuntimeFeedback { session_id, .. }
             | Self::TurnTerminal { session_id, .. } => Some(*session_id),
             Self::TextDelta { .. }
+            | Self::ProviderPhase { .. }
             | Self::AssistantMessageCommitted { .. }
             | Self::ReasoningSummaryDelta { .. }
             | Self::ToolCallPending { .. }

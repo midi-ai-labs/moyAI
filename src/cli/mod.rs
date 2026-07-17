@@ -1,6 +1,7 @@
 pub mod parse;
 pub mod prompt;
 pub mod render;
+mod terminal;
 
 pub use crate::protocol::ReviewDecision;
 pub use parse::{

@@ -1,5 +1,3 @@
-BEGIN IMMEDIATE;
-
 CREATE TABLE tool_calls_v33 (
     id TEXT PRIMARY KEY,
     history_item_id TEXT NOT NULL UNIQUE
@@ -127,5 +125,3 @@ DROP TABLE IF EXISTS session_state;
 
 INSERT OR IGNORE INTO moyai_schema_migrations (version, name)
 VALUES (33, 'canonical_protocol_storage');
-
-COMMIT;

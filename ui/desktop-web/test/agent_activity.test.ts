@@ -31,7 +31,6 @@ test("agent rows retain spawn order and derive all counts from status", () => {
     agentRow("/root/pending", 3, "pending_init"),
     agentRow("/root/error", 4, "errored"),
     agentRow("/root/interrupted", 5, "interrupted"),
-    agentRow("/root/missing", 6, "not_found"),
     agentRow("/root/stopped", 7, "shutdown"),
   ];
   const originalOrder = rows.map((row) => row.agent_path);
@@ -44,20 +43,19 @@ test("agent rows retain spawn order and derive all counts from status", () => {
       "/root/pending",
       "/root/error",
       "/root/interrupted",
-      "/root/missing",
       "/root/stopped",
     ],
   );
   assert.deepEqual(rows.map((row) => row.agent_path), originalOrder, "projection rows are not mutated");
   assert.deepEqual(agentActivityCounts(rows), {
-    total: 7,
+    total: 6,
     active: 2,
     completed: 1,
-    attention: 3,
+    attention: 2,
     stopped: 1,
     updated: 1,
   });
-  assert.equal(agentActivitySummary(rows, true), "2件作業中 · 1件完了 · 3件要確認 · 1件停止");
+  assert.equal(agentActivitySummary(rows, true), "2件作業中 · 1件完了 · 2件要確認 · 1件停止");
   assert.equal(agentActivitySummary([], true), "Sub Agentを準備中");
 });
 
@@ -173,7 +171,7 @@ test("agent pane selection is frontend-local and resets at owner or row boundari
   const active = agentRow("/root/active", 2, "running");
   const state = {
     workspace_path: "C:/workspace",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session" },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: 1 },
     agent_activity_rows: [first, active],
   } as DesktopWebState;
   const ui = createUiLocalState();
@@ -216,7 +214,7 @@ test("agent pane selection is frontend-local and resets at owner or row boundari
   openAgentPane(ui, state, "/root/first");
   reconcileAgentPaneState(ui, {
     ...state,
-    draft_target: { workspacePath: "C:/workspace", sessionId: "other-root-session" },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "other-root-session", ownerGeneration: 2 },
   });
   assert.equal(ui.artifactPaneMode, "output");
   assert.equal(ui.selectedAgentPath, null);
@@ -317,11 +315,31 @@ test("permission actions send typed approve and abort decisions", async () => {
   assert.deepEqual(decisions, ["approved", "abort"]);
 });
 
-test("run cancellation remains available while only the child agent tree is active", () => {
+test("run cancellation remains available while only the child agent tree is active and carries its owner", async () => {
   assert.equal(runCanBeCancelled({ can_cancel_run: false }), false);
   assert.equal(runCanBeCancelled({ can_cancel_run: true }), true);
   assert.equal(runSurfaceActive({ busy: false, agent_tree_active: true }), true);
   assert.equal(runSurfaceActive({ busy: false, agent_tree_active: false }), false);
+
+  const expectedTarget = {
+    workspacePath: "C:/workspace",
+    sessionId: "root-session",
+    runtimeOwnerToken: "tree:17",
+  };
+  let dispatched: { name: string; args?: Record<string, unknown> } | null = null;
+  await actionById("cancel-run")?.run(
+    { can_cancel_run: true, run_target: expectedTarget } as DesktopWebState,
+    {
+      mutate: async (name: string, args?: Record<string, unknown>) => {
+        dispatched = { name, args };
+      },
+    } as unknown as ActionContext,
+    { index: -1, value: "" },
+  );
+  assert.deepEqual(dispatched, {
+    name: "cancel_run",
+    args: { expectedTarget },
+  });
 });
 
 function agentRow(

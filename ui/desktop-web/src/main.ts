@@ -6,6 +6,7 @@ import type { ActionContext } from "./actions";
 import {
   installGlobalKeyboardShortcuts,
   prepareConfigMutation,
+  prepareConfigSnapshot,
   wireEvents,
 } from "./events";
 import {
@@ -22,7 +23,7 @@ import {
   renderTopbar,
   setRenderContext,
 } from "./render";
-import type { DesktopWebState } from "./types";
+import type { DesktopViewState, DesktopWebState } from "./types";
 import { createUiLocalState, reconcileAgentPaneState } from "./ui_state";
 import {
   InteractionLifecycle,
@@ -57,10 +58,6 @@ import { rowMutationTargetStillMatches } from "./row_target";
 import {
   acknowledgeDraftMutation,
   captureDraftMutation,
-  configDraftEditOpen,
-  configDraftCommitOpen,
-  configDraftDiscardOpen,
-  configOwnerMutationOpen,
   type DraftMutationSnapshot,
   mutationAdmissionOpen,
   mutationChangesConfigOwner,
@@ -75,7 +72,7 @@ import "./styles.css";
 const app = document.querySelector<HTMLDivElement>("#app");
 const desktopWindow = getCurrentWindow();
 let currentState: DesktopWebState | null = null;
-let lastRenderedState: DesktopWebState | null = null;
+let lastRenderedState: DesktopViewState | null = null;
 let polling = false;
 let previousSessionKey = "";
 let lastRenderedLocalConfirmationPending = false;
@@ -84,7 +81,11 @@ let splashTimer: number | null = null;
 const splashStartedAt = performance.now();
 const SPLASH_MIN_VISIBLE_MS = 5000;
 const THREAD_END_THRESHOLD_PX = 96;
-const INTERACTION_INACTIVITY_RECOVERY_MS = 5 * 60_000;
+// This timer is only a lost-event recovery path. Active pointer movement, key events,
+// and IME updates continuously re-arm it, so a genuinely live interaction is not
+// interrupted while a missing pointerup/keyup/compositionend cannot hide a terminal
+// or permission projection for minutes.
+const INTERACTION_INACTIVITY_RECOVERY_MS = 10_000;
 const uiState = createUiLocalState();
 
 interface StateUpdate {
@@ -129,6 +130,7 @@ const eventContext: ActionContext = {
   recoverCommandConflict,
   reportError,
   prepareConfigMutation: (target) => prepareConfigMutation(eventContext, target),
+  prepareConfigSnapshot: (target) => prepareConfigSnapshot(eventContext, target),
   submitPermissionDecision,
   setWindowMaximized,
 };
@@ -280,10 +282,10 @@ function requiresRenderForStateChange(previous: DesktopWebState, state: DesktopW
     previous.provider_selected_model_summary.join("\u0000") !== state.provider_selected_model_summary.join("\u0000") ||
     previous.provider_model_ids.join("\u0000") !== state.provider_model_ids.join("\u0000") ||
     previous.provider_apply_enabled !== state.provider_apply_enabled ||
+    JSON.stringify(previous.config_draft_capabilities) !== JSON.stringify(state.config_draft_capabilities) ||
     previous.config_target.workspacePath !== state.config_target.workspacePath ||
     previous.config_target.sessionId !== state.config_target.sessionId ||
     previous.config_target.configGeneration !== state.config_target.configGeneration ||
-    previous.config_feedback_text !== state.config_feedback_text ||
     previous.review_status_text !== state.review_status_text ||
     previous.send_enhanced_enabled !== state.send_enhanced_enabled ||
     previous.send_raw_enabled !== state.send_raw_enabled ||
@@ -355,7 +357,7 @@ function applyStateUpdate(update: StateUpdate): void {
   }
 }
 
-function renderCommitted(state: DesktopWebState, mutationName: string | null): void {
+function renderCommitted(state: DesktopViewState, mutationName: string | null): void {
   const elapsedSplashMs = performance.now() - splashStartedAt;
   if (!splashDismissed && shouldShowSplash(elapsedSplashMs)) {
     appRoot.innerHTML = renderStartupSplash(state, elapsedSplashMs, SPLASH_MIN_VISIBLE_MS);
@@ -421,10 +423,10 @@ function renderCommitted(state: DesktopWebState, mutationName: string | null): v
     attachmentTrayOpen: uiState.attachmentTrayOpen,
     configDirty: configDraftAppliesTo(uiState, state.config_target),
     configMutationPending: configMutationPending(uiState),
-    configOwnerMutationOpen: configOwnerMutationOpen(uiState),
-    configDraftEditOpen: configDraftEditOpen(uiState),
-    configDraftDiscardOpen: configDraftDiscardOpen(uiState),
-    configDraftCommitOpen: configDraftCommitOpen(uiState, state.startup.initial_setup_required),
+    configOwnerMutationOpen: state.config_draft.external_owner_mutation_open,
+    configDraftEditOpen: state.config_draft.edit_enabled,
+    configDraftDiscardOpen: state.config_draft.discard_enabled,
+    configDraftCommitOpen: state.config_draft.commit_enabled,
   });
   const preservedTitlebar = document.querySelector<HTMLElement>(".app-titlebar");
   preservedTitlebar?.remove();

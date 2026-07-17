@@ -1,14 +1,19 @@
 use std::collections::BTreeMap;
+use std::fmt;
+use std::io::Write;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::ProviderMetadataMode;
 use crate::config::model::ProviderApiMode;
 use crate::config::model::{ProviderReasoningCapability, ReasoningEffort, ReasoningSummary};
-use crate::error::LlmError;
+use crate::config::{ProviderMetadataMode, ProviderTarget};
+use crate::error::{LlmError, ProviderRequestLimit};
 use crate::session::{FinishReason, TokenUsage};
+
+use super::provider::ProviderPhaseEvent;
+use super::validate_image_payload;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCapabilities {
@@ -80,8 +85,6 @@ pub struct ToolSchema {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
-    #[serde(default)]
-    pub strict: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,36 +103,62 @@ impl ProviderToolChoice {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A fully prepared, transport-only generation request.
+///
+/// This type deliberately has no generic serialization contract. Provider wire
+/// DTOs are built explicitly by each transport, and its manual `Debug`
+/// projection omits endpoint, header, prompt, message, and extra-body contents.
+#[derive(Clone)]
 pub struct ChatRequest {
-    pub model: ModelProfile,
-    pub base_url: String,
-    pub system_prompt: String,
-    pub messages: Vec<ModelMessage>,
-    pub tools: Vec<ToolSchema>,
-    #[serde(default)]
-    pub provider_api_mode: ProviderApiMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<ReasoningRequest>,
-    #[serde(default)]
-    pub reasoning_capability: ProviderReasoningCapability,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub responses_continuation: Option<ResponsesContinuation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<ProviderToolChoice>,
-    #[serde(default)]
-    pub parallel_tool_calls: bool,
-    pub timeout_ms: u64,
-    pub stream_idle_timeout_ms: u64,
-    pub extra_headers: BTreeMap<String, String>,
-    pub temperature: Option<f64>,
-    pub top_p: Option<f64>,
-    pub top_k: Option<u32>,
-    pub presence_penalty: Option<f64>,
-    pub frequency_penalty: Option<f64>,
-    pub seed: Option<u64>,
-    pub stop_sequences: Vec<String>,
-    pub extra_body: Option<serde_json::Value>,
+    provider: ProviderTarget,
+    pub(crate) model: ModelProfile,
+    pub(crate) system_prompt: String,
+    pub(crate) messages: Vec<ModelMessage>,
+    pub(crate) tools: Vec<ToolSchema>,
+    pub(crate) reasoning: Option<ReasoningRequest>,
+    pub(crate) reasoning_capability: ProviderReasoningCapability,
+    pub(crate) responses_continuation: Option<ResponsesContinuation>,
+    pub(crate) tool_choice: Option<ProviderToolChoice>,
+    pub(crate) parallel_tool_calls: bool,
+    extra_headers: BTreeMap<String, String>,
+    pub(crate) temperature: Option<f64>,
+    pub(crate) top_p: Option<f64>,
+    pub(crate) top_k: Option<u32>,
+    pub(crate) presence_penalty: Option<f64>,
+    pub(crate) frequency_penalty: Option<f64>,
+    pub(crate) seed: Option<u64>,
+    pub(crate) stop_sequences: Vec<String>,
+    pub(crate) extra_body: Option<serde_json::Value>,
+}
+
+impl fmt::Debug for ChatRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChatRequest")
+            .field("model", &self.model)
+            .field("provider", &self.provider)
+            .field("system_prompt_chars", &self.system_prompt.chars().count())
+            .field("message_count", &self.messages.len())
+            .field("tool_count", &self.tools.len())
+            .field("reasoning", &self.reasoning)
+            .field("reasoning_capability", &self.reasoning_capability)
+            .field(
+                "responses_continuation_present",
+                &self.responses_continuation.is_some(),
+            )
+            .field("tool_choice", &self.tool_choice)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("extra_headers", &"<redacted>")
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("top_k", &self.top_k)
+            .field("presence_penalty", &self.presence_penalty)
+            .field("frequency_penalty", &self.frequency_penalty)
+            .field("seed", &self.seed)
+            .field("stop_sequence_count", &self.stop_sequences.len())
+            .field("extra_body_present", &self.extra_body.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,20 +262,57 @@ pub(crate) fn validate_responses_reasoning_request(
     }
 }
 
-pub const OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY: &str = "Respond in the user's language. Do not emit hidden reasoning or `<think>` blocks; return only user-facing content and normal tool calls.";
-
-const CURRENT_PROVIDER_MODEL: &str = "qwen/qwen3.6-35b-a3b";
-const CURRENT_PROVIDER_BASE_URL: &str = "http://127.0.0.1:1234";
-const CURRENT_PROVIDER_CONTEXT_WINDOW: u32 = 131_072;
-const CURRENT_PROVIDER_MAX_OUTPUT_TOKENS: u32 = 8_192;
-
 impl ChatRequest {
-    pub fn provider_system_prompt(&self) -> String {
-        system_prompt_with_provider_policy(
-            &self.system_prompt,
-            self.model.provider_metadata_mode,
-            !self.tools.is_empty(),
-        )
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        provider: ProviderTarget,
+        model: ModelProfile,
+        system_prompt: String,
+        messages: Vec<ModelMessage>,
+        tools: Vec<ToolSchema>,
+        reasoning: Option<ReasoningRequest>,
+        reasoning_capability: ProviderReasoningCapability,
+        extra_headers: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            provider,
+            model,
+            system_prompt,
+            messages,
+            tools,
+            reasoning,
+            reasoning_capability,
+            responses_continuation: None,
+            tool_choice: None,
+            parallel_tool_calls: false,
+            extra_headers,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            extra_body: None,
+        }
+    }
+
+    pub(crate) fn provider_target(&self) -> &ProviderTarget {
+        &self.provider
+    }
+
+    pub(crate) fn extra_headers(&self) -> &BTreeMap<String, String> {
+        &self.extra_headers
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_provider_target(&mut self, provider: ProviderTarget) {
+        self.provider = provider;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_extra_headers(&mut self, headers: BTreeMap<String, String>) {
+        self.extra_headers = headers;
     }
 
     pub fn effective_max_output_tokens(&self) -> u32 {
@@ -258,23 +324,28 @@ impl ChatRequest {
     }
 
     pub fn validate_provider_lifecycle(&self) -> Result<(), LlmError> {
-        if self.provider_api_mode == ProviderApiMode::Auto {
-            return Err(LlmError::Message(
-                "ChatRequest provider_api_mode must be resolved before transport dispatch"
-                    .to_string(),
-            ));
-        }
+        self.validate_request_envelope_shape()?;
         if let Some(capability_api_mode) = self.reasoning_capability.api_mode()
-            && capability_api_mode != self.provider_api_mode
+            && capability_api_mode != self.provider.api_mode()
         {
             return Err(LlmError::Message(format!(
                 "reasoning capability for {capability_api_mode:?} cannot be used with {:?}",
-                self.provider_api_mode
+                self.provider.api_mode()
             )));
         }
         if !self.model.capabilities.supports_tools && !self.tools.is_empty() {
             return Err(LlmError::Message(
                 "ChatRequest provider tools require a tool-capable model profile".to_string(),
+            ));
+        }
+        if !self.model.capabilities.supports_reasoning
+            && self
+                .reasoning
+                .as_ref()
+                .is_some_and(|reasoning| !reasoning.is_disabled())
+        {
+            return Err(LlmError::Message(
+                "ChatRequest reasoning requires a reasoning-capable model profile".to_string(),
             ));
         }
         if self.tool_choice.is_some() && self.tools.is_empty() {
@@ -301,7 +372,7 @@ impl ChatRequest {
             ));
         }
         if let Some(continuation) = &self.responses_continuation {
-            if self.provider_api_mode != ProviderApiMode::Responses {
+            if self.provider.api_mode() != ProviderApiMode::Responses {
                 return Err(LlmError::Message(
                     "previous_response_id continuation requires the Responses API".to_string(),
                 ));
@@ -337,6 +408,108 @@ impl ChatRequest {
         }
         Ok(())
     }
+
+    fn validate_request_envelope_shape(&self) -> Result<(), LlmError> {
+        let limits = self.provider.request_limits();
+        ensure_request_limit(
+            ProviderRequestLimit::MessageCount,
+            self.messages.len() as u64,
+            limits.max_messages as u64,
+        )?;
+        ensure_request_limit(
+            ProviderRequestLimit::ToolCount,
+            self.tools.len() as u64,
+            limits.max_tools as u64,
+        )?;
+        ensure_request_limit(
+            ProviderRequestLimit::ToolSchemaBytes,
+            serialized_json_len(&self.tools)?,
+            limits.max_tool_schema_bytes,
+        )?;
+        if let Some(extra_body) = &self.extra_body {
+            ensure_request_limit(
+                ProviderRequestLimit::ExtraBodyBytes,
+                serialized_json_len(extra_body)?,
+                limits.max_extra_body_bytes,
+            )?;
+        }
+        ensure_request_limit(
+            ProviderRequestLimit::StopSequenceCount,
+            self.stop_sequences.len() as u64,
+            limits.max_stop_sequences as u64,
+        )?;
+        let stop_sequence_bytes = self.stop_sequences.iter().try_fold(0_u64, |total, value| {
+            total
+                .checked_add(value.len() as u64)
+                .ok_or(LlmError::ProviderRequestLimitExceeded {
+                    surface: ProviderRequestLimit::StopSequenceBytes,
+                    actual: u64::MAX,
+                    maximum: limits.max_stop_sequence_bytes,
+                })
+        })?;
+        ensure_request_limit(
+            ProviderRequestLimit::StopSequenceBytes,
+            stop_sequence_bytes,
+            limits.max_stop_sequence_bytes,
+        )?;
+
+        let mut image_count = 0_u64;
+        let mut total_base64_chars = 0_u64;
+        let mut total_decoded_bytes = 0_u64;
+        let per_image_base64_chars =
+            4_u64.saturating_mul(limits.max_single_image_decoded_bytes.saturating_add(2) / 3);
+        for part in self.messages.iter().flat_map(message_content_parts) {
+            let ModelContentPart::Image {
+                mime_type,
+                data_base64,
+            } = part
+            else {
+                continue;
+            };
+            image_count = image_count.saturating_add(1);
+            ensure_request_limit(
+                ProviderRequestLimit::ImageCount,
+                image_count,
+                limits.max_images as u64,
+            )?;
+            ensure_request_limit(
+                ProviderRequestLimit::ImageBase64Chars,
+                data_base64.len() as u64,
+                per_image_base64_chars,
+            )?;
+            total_base64_chars = total_base64_chars.saturating_add(data_base64.len() as u64);
+            ensure_request_limit(
+                ProviderRequestLimit::ImageBase64Chars,
+                total_base64_chars,
+                limits.max_total_image_base64_chars,
+            )?;
+            let metadata = validate_image_payload(mime_type, data_base64, limits)?;
+            total_decoded_bytes = total_decoded_bytes.saturating_add(metadata.decoded_bytes);
+            ensure_request_limit(
+                ProviderRequestLimit::ImageDecodedBytes,
+                total_decoded_bytes,
+                limits.max_total_image_decoded_bytes,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Serializes the exact provider DTO into a bounded buffer before the POST is constructed.
+    /// A rejected body therefore cannot reach the provider or allocate beyond the admitted limit.
+    pub(crate) fn serialize_wire_body<T: Serialize>(&self, body: &T) -> Result<Vec<u8>, LlmError> {
+        let maximum = self.provider.request_limits().max_serialized_body_bytes;
+        let mut writer = BoundedJsonBuffer::new(maximum);
+        let result = serde_json::to_writer(&mut writer, body);
+        if writer.exceeded {
+            return Err(LlmError::ProviderRequestLimitExceeded {
+                surface: ProviderRequestLimit::SerializedBodyBytes,
+                actual: writer.attempted_bytes,
+                maximum,
+            });
+        }
+        result?;
+        Ok(writer.bytes)
+    }
 }
 
 fn message_has_image(message: &ModelMessage) -> bool {
@@ -347,6 +520,86 @@ fn message_has_image(message: &ModelMessage) -> bool {
                 .iter()
                 .any(|part| matches!(part, ModelContentPart::Image { .. }))
     )
+}
+
+fn message_content_parts(message: &ModelMessage) -> &[ModelContentPart] {
+    match message {
+        ModelMessage::UserParts { parts } => parts,
+        _ => &[],
+    }
+}
+
+fn ensure_request_limit(
+    surface: ProviderRequestLimit,
+    actual: u64,
+    maximum: u64,
+) -> Result<(), LlmError> {
+    if actual > maximum {
+        return Err(LlmError::ProviderRequestLimitExceeded {
+            surface,
+            actual,
+            maximum,
+        });
+    }
+    Ok(())
+}
+
+fn serialized_json_len<T: Serialize>(value: &T) -> Result<u64, LlmError> {
+    let mut writer = JsonByteCounter::default();
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.bytes)
+}
+
+#[derive(Default)]
+struct JsonByteCounter {
+    bytes: u64,
+}
+
+impl Write for JsonByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(buffer.len() as u64);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct BoundedJsonBuffer {
+    bytes: Vec<u8>,
+    maximum: u64,
+    attempted_bytes: u64,
+    exceeded: bool,
+}
+
+impl BoundedJsonBuffer {
+    fn new(maximum: u64) -> Self {
+        Self {
+            bytes: Vec::new(),
+            maximum,
+            attempted_bytes: 0,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedJsonBuffer {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.attempted_bytes = self.attempted_bytes.saturating_add(buffer.len() as u64);
+        if self.attempted_bytes > self.maximum {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "provider request exceeded its admitted serialized-body limit",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub fn effective_max_output_tokens_for_request(request: &ChatRequest) -> (u32, &'static str) {
@@ -378,159 +631,6 @@ pub fn tool_surface_scoped_parallel_tool_calls_projection(
     effective_parallel_tool_calls: bool,
 ) -> Option<bool> {
     (tool_surface_len > 0).then_some(effective_parallel_tool_calls)
-}
-
-pub fn system_prompt_with_provider_policy(
-    system_prompt: &str,
-    provider_metadata_mode: ProviderMetadataMode,
-    tool_calls_available: bool,
-) -> String {
-    if provider_metadata_mode != ProviderMetadataMode::OpenAiCompatibleOnly {
-        return system_prompt.to_string();
-    }
-
-    let provider_policy = openai_compatible_only_provider_policy(tool_calls_available);
-    let body = strip_openai_compatible_provider_policy(system_prompt);
-    if body.trim().is_empty() {
-        provider_policy
-    } else {
-        format!("{provider_policy}\n\n{body}")
-    }
-}
-
-fn openai_compatible_only_provider_policy(tool_calls_available: bool) -> String {
-    let _ = tool_calls_available;
-    OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY.to_string()
-}
-
-fn strip_openai_compatible_provider_policy(system_prompt: &str) -> &str {
-    if let Some(rest) = system_prompt.strip_prefix(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY) {
-        return rest.strip_prefix("\n\n").unwrap_or(rest);
-    }
-    system_prompt
-}
-
-pub fn openai_compatible_only_tool_policy_fixture_passes() -> bool {
-    let no_tool_prompt = system_prompt_with_provider_policy(
-        "Base coding prompt",
-        ProviderMetadataMode::OpenAiCompatibleOnly,
-        false,
-    );
-    let tool_prompt = system_prompt_with_provider_policy(
-        "Base coding prompt",
-        ProviderMetadataMode::OpenAiCompatibleOnly,
-        true,
-    );
-
-    no_tool_prompt.starts_with(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY)
-        && no_tool_prompt.ends_with("\n\nBase coding prompt")
-        && tool_prompt.starts_with(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY)
-        && tool_prompt == no_tool_prompt
-        && tool_prompt.ends_with("\n\nBase coding prompt")
-}
-
-pub fn provider_policy_tool_lifecycle_upgrade_fixture_passes() -> bool {
-    let no_tool_prompt = system_prompt_with_provider_policy(
-        "Base coding prompt",
-        ProviderMetadataMode::OpenAiCompatibleOnly,
-        false,
-    );
-    let upgraded_tool_prompt = system_prompt_with_provider_policy(
-        &no_tool_prompt,
-        ProviderMetadataMode::OpenAiCompatibleOnly,
-        true,
-    );
-
-    no_tool_prompt.starts_with(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY)
-        && upgraded_tool_prompt.starts_with(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY)
-        && upgraded_tool_prompt == no_tool_prompt
-        && upgraded_tool_prompt.ends_with("\n\nBase coding prompt")
-}
-
-pub fn tool_call_turn_uses_configured_output_budget_fixture_passes() -> bool {
-    let tool_request = output_budget_fixture_chat_request();
-    let no_tool_request = ChatRequest {
-        tools: Vec::new(),
-        tool_choice: None,
-        extra_body: None,
-        ..tool_request.clone()
-    };
-
-    tool_request.model.max_output_tokens == CURRENT_PROVIDER_MAX_OUTPUT_TOKENS
-        && tool_request.effective_max_output_tokens() == CURRENT_PROVIDER_MAX_OUTPUT_TOKENS
-        && tool_request.output_budget_reason() == "configured_model_limit"
-        && no_tool_request.effective_max_output_tokens() == CURRENT_PROVIDER_MAX_OUTPUT_TOKENS
-        && no_tool_request.output_budget_reason() == "configured_model_limit"
-}
-
-pub fn llm_contract_current_provider_profile_fixture_passes() -> bool {
-    let request = output_budget_fixture_chat_request();
-
-    request.model.name == CURRENT_PROVIDER_MODEL
-        && request.base_url == CURRENT_PROVIDER_BASE_URL
-        && request.model.context_window == CURRENT_PROVIDER_CONTEXT_WINDOW
-        && request.model.max_output_tokens == CURRENT_PROVIDER_MAX_OUTPUT_TOKENS
-        && request.model.provider_metadata_mode == ProviderMetadataMode::LmStudioNativeRequired
-        && request.model.capabilities.supports_tools
-        && !request.model.capabilities.supports_reasoning
-        && !request.model.capabilities.supports_images
-}
-
-fn output_budget_fixture_chat_request() -> ChatRequest {
-    let model = ModelProfile {
-        name: CURRENT_PROVIDER_MODEL.to_string(),
-        context_window: CURRENT_PROVIDER_CONTEXT_WINDOW,
-        max_output_tokens: CURRENT_PROVIDER_MAX_OUTPUT_TOKENS,
-        provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
-        capabilities: ModelCapabilities {
-            supports_tools: true,
-            supports_reasoning: false,
-            supports_images: false,
-        },
-    };
-    ChatRequest {
-        model: model.clone(),
-        base_url: CURRENT_PROVIDER_BASE_URL.to_string(),
-        system_prompt: "Use tools for open work.".to_string(),
-        messages: vec![ModelMessage::User {
-            content:
-                "Create src/workflow.rs for workflow-output-budget-contract (llm_contract_fixture_language_neutral)"
-                    .to_string(),
-        }],
-        tools: vec![ToolSchema {
-            name: "write".to_string(),
-            description: "write a file".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "required": ["path", "content"],
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"}
-                }
-            }),
-            strict: false,
-        }],
-        provider_api_mode: ProviderApiMode::Responses,
-        reasoning: None,
-        reasoning_capability: ProviderReasoningCapability::Responses {
-            supports_summary: true,
-            supports_previous_response_id: true,
-        },
-        responses_continuation: None,
-        tool_choice: Some(ProviderToolChoice::Required),
-        parallel_tool_calls: true,
-        timeout_ms: 600_000,
-        stream_idle_timeout_ms: 300_000,
-        extra_headers: BTreeMap::new(),
-        temperature: None,
-        top_p: None,
-        top_k: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        seed: None,
-        stop_sequences: Vec::new(),
-        extra_body: None,
-    }
 }
 
 pub fn chat_request_tool_choice_is_provider_neutral_typed_fixture_passes() -> bool {
@@ -611,6 +711,13 @@ pub enum LlmEvent {
 
 pub trait LlmEventSink {
     fn push(&mut self, event: LlmEvent) -> Result<(), LlmError>;
+
+    /// Low-volume typed transport lifecycle channel. It is deliberately
+    /// separate from model output deltas so consumers that only collect model
+    /// content do not need to reinterpret diagnostics as assistant output.
+    fn provider_phase(&mut self, _event: ProviderPhaseEvent) -> Result<(), LlmError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -655,76 +762,142 @@ pub trait LlmClient: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        LlmResponseSummary, OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY, ReasoningRequest,
-        openai_compatible_only_tool_policy_fixture_passes, system_prompt_with_provider_policy,
-        tool_call_turn_uses_configured_output_budget_fixture_passes,
-        validate_chat_completions_reasoning_request, validate_responses_reasoning_request,
-        validate_toolless_text_response,
+        ChatRequest, LlmResponseSummary, ModelCapabilities, ModelMessage, ModelProfile,
+        ReasoningRequest, ToolSchema, validate_chat_completions_reasoning_request,
+        validate_responses_reasoning_request, validate_toolless_text_response,
     };
-    use crate::config::ProviderMetadataMode;
     use crate::config::model::{
-        ChatCompletionsReasoningParameters, ProviderReasoningCapability, ReasoningEffort,
-        ReasoningSummary,
+        ChatCompletionsReasoningParameters, ProviderApiMode, ProviderReasoningCapability,
+        ReasoningEffort, ReasoningSummary,
     };
-    use crate::error::LlmError;
+    use crate::config::{
+        ProviderDeadlines, ProviderMetadataMode, ProviderRequestLimits, ProviderTarget,
+    };
+    use crate::error::{LlmError, ProviderRequestLimit};
     use crate::session::FinishReason;
 
     #[test]
-    fn openai_compatible_only_policy_is_prefixed_to_system_prompt() {
-        let prompt = system_prompt_with_provider_policy(
-            "Base coding prompt",
+    fn prepared_request_debug_uses_the_typed_target_and_omits_raw_payload_secrets() {
+        let provider = ProviderTarget::new(
+            "http://lm-studio.local:1234/v1",
+            "fixture-model",
             ProviderMetadataMode::OpenAiCompatibleOnly,
-            false,
+            ProviderApiMode::Responses,
+            ProviderDeadlines {
+                response_start_timeout_ms: 10_000,
+                stream_idle_timeout_ms: 10_000,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 0,
+            },
+        )
+        .expect("typed provider target");
+        let mut request = ChatRequest::new(
+            provider,
+            ModelProfile {
+                name: "fixture-model".to_string(),
+                context_window: 16_384,
+                max_output_tokens: 1_024,
+                provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+                capabilities: ModelCapabilities {
+                    supports_tools: true,
+                    supports_reasoning: true,
+                    supports_images: false,
+                },
+            },
+            "system-super-secret".to_string(),
+            vec![ModelMessage::User {
+                content: "message-super-secret".to_string(),
+            }],
+            Vec::new(),
+            None,
+            ProviderReasoningCapability::Responses {
+                supports_summary: true,
+                supports_previous_response_id: true,
+            },
+            std::collections::BTreeMap::from([(
+                "Authorization".to_string(),
+                "Bearer header-super-secret".to_string(),
+            )]),
         );
+        request.extra_body = Some(serde_json::json!({"api_key": "body-super-secret"}));
 
-        assert!(prompt.starts_with(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY));
-        assert!(prompt.ends_with("\n\nBase coding prompt"));
-        assert_eq!(
-            prompt
-                .matches(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY)
-                .count(),
-            1
-        );
+        let debug = format!("{request:?}");
+
+        assert!(debug.contains("ProviderTarget"));
+        assert!(debug.contains("http://lm-studio.local:1234/v1"));
+        for secret in [
+            "system-super-secret",
+            "message-super-secret",
+            "header-super-secret",
+            "body-super-secret",
+        ] {
+            assert!(!debug.contains(secret));
+        }
     }
 
     #[test]
-    fn lm_studio_native_mode_keeps_system_prompt_unchanged() {
-        assert_eq!(
-            system_prompt_with_provider_policy(
-                "Base coding prompt",
-                ProviderMetadataMode::LmStudioNativeRequired,
-                true,
-            ),
-            "Base coding prompt"
-        );
-    }
-
-    #[test]
-    fn openai_compatible_only_tool_request_keeps_policy_minimal() {
-        let prompt = system_prompt_with_provider_policy(
-            "Base coding prompt",
+    fn admitted_envelope_rejects_schema_and_exact_wire_bytes_before_transport() {
+        let mut provider = ProviderTarget::new(
+            "http://lm-studio.local:1234/v1",
+            "fixture-model",
             ProviderMetadataMode::OpenAiCompatibleOnly,
-            true,
+            ProviderApiMode::ChatCompletions,
+            ProviderDeadlines {
+                response_start_timeout_ms: 10_000,
+                stream_idle_timeout_ms: 10_000,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 0,
+            },
+        )
+        .expect("typed provider target");
+        let mut limits = ProviderRequestLimits::product_default();
+        limits.max_tool_schema_bytes = 32;
+        limits.max_serialized_body_bytes = 64;
+        provider.replace_request_limits(limits);
+        let mut request = ChatRequest::new(
+            provider,
+            ModelProfile {
+                name: "fixture-model".to_string(),
+                context_window: 16_384,
+                max_output_tokens: 1_024,
+                provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+                capabilities: ModelCapabilities {
+                    supports_tools: true,
+                    supports_reasoning: false,
+                    supports_images: false,
+                },
+            },
+            "system".to_string(),
+            vec![ModelMessage::User {
+                content: "request".to_string(),
+            }],
+            vec![ToolSchema {
+                name: "oversized".to_string(),
+                description: "x".repeat(64),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            None,
+            ProviderReasoningCapability::Unsupported,
+            std::collections::BTreeMap::new(),
         );
 
-        assert!(prompt.starts_with(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY));
-        assert_eq!(
-            prompt
-                .matches(OPENAI_COMPATIBLE_ONLY_SYSTEM_PROMPT_POLICY)
-                .count(),
-            1
-        );
-        assert!(openai_compatible_only_tool_policy_fixture_passes());
-    }
+        assert!(matches!(
+            request.validate_provider_lifecycle(),
+            Err(LlmError::ProviderRequestLimitExceeded {
+                surface: ProviderRequestLimit::ToolSchemaBytes,
+                ..
+            })
+        ));
 
-    #[test]
-    fn openai_compatible_only_policy_upgrade_is_idempotent() {
-        assert!(super::provider_policy_tool_lifecycle_upgrade_fixture_passes());
-    }
-
-    #[test]
-    fn tool_call_request_uses_configured_output_budget() {
-        assert!(tool_call_turn_uses_configured_output_budget_fixture_passes());
+        request.tools.clear();
+        assert!(matches!(
+            request.serialize_wire_body(&serde_json::json!({"input": "x".repeat(128)})),
+            Err(LlmError::ProviderRequestLimitExceeded {
+                surface: ProviderRequestLimit::SerializedBodyBytes,
+                maximum: 64,
+                ..
+            })
+        ));
     }
 
     #[test]

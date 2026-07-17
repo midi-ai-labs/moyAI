@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`RippleFish` repository を調査し、long-context 下でも focus を保って実装根拠のある文書3点へ収束できることを確認する。operator が legacy compaction item を含む既存sessionを明示的に再開する場合だけ互換readerの continuity evidence を観測し、旧 `docs_route` internal state を合格条件にしない。
+`RippleFish` repository を調査し、long-context 下でも focus を保って実装根拠のある文書3点へ収束できることを確認する。prepared request が current compaction threshold に到達した場合は、canonical semantic compaction 後も同じ目的と作業根拠を保持して収束することを確認する。
 
 ## Setup
 
@@ -61,7 +61,8 @@ Step4:
 - implementation-derived facts と不明点が区別され、具体的 path を伴う。
 - backend / frontend / examples / tests / data を必要十分に扱う。
 - source/config/tests と workspace 外を変更しない。
-- long-context 下でも同じ deliverables へ収束する。current runtime は新しいsemantic compactionを生成しないため、compaction発生を要求または期待しない。
+- long-context 下でも同じ deliverables へ収束する。
+- request diagnostics が current compaction threshold 到達を示した場合、canonical compaction item と lineage が記録され、置換済み raw context が後続 request に復活せず、compaction 後の prepared request が縮小し、3文書の作業を継続できる。
 
 ## Evidence
 
@@ -70,6 +71,6 @@ Step4:
 - generated documents
 - before/after workspace diff
 - factual spot-check notes
-- operator が legacy compaction item を含むsessionを明示的に与えた場合だけ、その表示 / replay continuity evidence
+- request diagnostics、canonical compaction item、compaction lineage、前後の prepared-request token evidence（threshold 到達時）
 
-failure 時は context loss、focus drift、factuality、unintended code change、provider/environment を分ける。互換保存された内部stateをcurrent oracleにせず、task-local `RESULTS.md` に観測結果を記録する。親orchestration workspaceにworklogがある場合だけ判断概要も追記する。
+failure 時は context loss、focus drift、factuality、unintended code change、compaction contract、provider/environment を分ける。task-local `RESULTS.md` に観測結果を記録する。親orchestration workspaceにworklogがある場合だけ判断概要も追記する。

@@ -20,13 +20,6 @@ pub enum RunCancelOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunContinuationOutcome {
-    Admitted,
-    Blocked,
-    Invalid,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunCancelDeferral {
     pub primary: RunReservationKind,
     pub secondary: Option<RunReservationKind>,
@@ -96,7 +89,6 @@ enum RunClassification {
     Open,
     SuccessCommitting {
         pending_cause: Option<RunCancellationCause>,
-        continuation_blocked: bool,
     },
     EffectAdmitting {
         pending_cause: Option<RunCancellationCause>,
@@ -107,9 +99,7 @@ enum RunClassification {
     ToolSettling {
         pending_cause: Option<RunCancellationCause>,
     },
-    SuccessSealed {
-        continuation_blocked: bool,
-    },
+    SuccessSealed,
     Cancelled(RunCancellationCause),
 }
 
@@ -183,7 +173,7 @@ impl RunControl {
             | RunClassification::EffectAdmitting { .. }
             | RunClassification::EffectCommitting { .. }
             | RunClassification::ToolSettling { .. }
-            | RunClassification::SuccessSealed { .. } => None,
+            | RunClassification::SuccessSealed => None,
         }
     }
 
@@ -347,7 +337,6 @@ impl RunControl {
         }
         *classification = RunClassification::SuccessCommitting {
             pending_cause: None,
-            continuation_blocked: false,
         };
         Some(SuccessCommitReservation {
             control: self.clone(),
@@ -362,9 +351,7 @@ impl RunControl {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if matches!(*classification, RunClassification::Open) {
-            *classification = RunClassification::SuccessSealed {
-                continuation_blocked: false,
-            };
+            *classification = RunClassification::SuccessSealed;
             true
         } else {
             false
@@ -378,34 +365,8 @@ impl RunControl {
                 .classification
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            RunClassification::SuccessSealed { .. }
+            RunClassification::SuccessSealed
         )
-    }
-
-    /// Reuses this surface-owned handle for a newly admitted continuation turn.
-    ///
-    /// A sealed success is terminal for the turn that produced it, but an automatic idle
-    /// continuation is a distinct turn. Callers may reopen the handle only after that success is
-    /// durable and immediately before admitting the continuation. Other states still have a live
-    /// or competing terminal owner and cannot be reset.
-    pub fn begin_next_turn_after_success(&self) -> RunContinuationOutcome {
-        let mut classification = self
-            .inner
-            .classification
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match &*classification {
-            RunClassification::SuccessSealed {
-                continuation_blocked: true,
-            } => RunContinuationOutcome::Blocked,
-            RunClassification::SuccessSealed {
-                continuation_blocked: false,
-            } => {
-                *classification = RunClassification::Open;
-                RunContinuationOutcome::Admitted
-            }
-            _ => RunContinuationOutcome::Invalid,
-        }
     }
 
     /// Records the first terminal cause and wakes all token-based consumers.
@@ -443,7 +404,6 @@ impl RunControl {
     /// terminal router. AgentControl uses this only while it is already classifying the whole
     /// tree, which prevents recursive routing back into `fail_tree`.
     pub(crate) fn request_cancel_local(&self, cause: RunCancellationCause) -> RunCancelOutcome {
-        let blocks_continuation = matches!(&cause, RunCancellationCause::Interruption(_));
         let mut classification = self
             .inner
             .classification
@@ -456,24 +416,18 @@ impl RunControl {
                 self.inner.wake.cancel();
                 RunCancelOutcome::Applied
             }
-            RunClassification::SuccessCommitting {
-                pending_cause,
-                continuation_blocked,
-            } => {
-                *continuation_blocked |= blocks_continuation;
-                match pending_cause {
-                    None => {
-                        *pending_cause = Some(cause);
-                        RunCancelOutcome::Deferred(RunCancelDeferral::single(
-                            RunReservationKind::SuccessCommit,
-                        ))
-                    }
-                    Some(pending) if pending == &cause => RunCancelOutcome::Deferred(
-                        RunCancelDeferral::single(RunReservationKind::SuccessCommit),
-                    ),
-                    Some(_) => RunCancelOutcome::Rejected,
+            RunClassification::SuccessCommitting { pending_cause } => match pending_cause {
+                None => {
+                    *pending_cause = Some(cause);
+                    RunCancelOutcome::Deferred(RunCancelDeferral::single(
+                        RunReservationKind::SuccessCommit,
+                    ))
                 }
-            }
+                Some(pending) if pending == &cause => RunCancelOutcome::Deferred(
+                    RunCancelDeferral::single(RunReservationKind::SuccessCommit),
+                ),
+                Some(_) => RunCancelOutcome::Rejected,
+            },
             RunClassification::EffectAdmitting { pending_cause } => match pending_cause {
                 None => {
                     *pending_cause = Some(cause);
@@ -510,35 +464,8 @@ impl RunControl {
                 ),
                 Some(_) => RunCancelOutcome::Rejected,
             },
-            RunClassification::SuccessSealed {
-                continuation_blocked,
-            } => {
-                *continuation_blocked |= blocks_continuation;
-                RunCancelOutcome::Rejected
-            }
+            RunClassification::SuccessSealed => RunCancelOutcome::Rejected,
             RunClassification::Cancelled(_) => RunCancelOutcome::Rejected,
-        }
-    }
-
-    pub(crate) fn block_continuation_local(&self) {
-        let mut classification = self
-            .inner
-            .classification
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match &mut *classification {
-            RunClassification::SuccessCommitting {
-                continuation_blocked,
-                ..
-            }
-            | RunClassification::SuccessSealed {
-                continuation_blocked,
-            } => *continuation_blocked = true,
-            RunClassification::Open
-            | RunClassification::EffectAdmitting { .. }
-            | RunClassification::EffectCommitting { .. }
-            | RunClassification::ToolSettling { .. }
-            | RunClassification::Cancelled(_) => {}
         }
     }
 
@@ -577,17 +504,10 @@ impl RunControl {
             .classification
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let RunClassification::SuccessCommitting {
-            continuation_blocked,
-            ..
-        } = &*classification
-        else {
+        let RunClassification::SuccessCommitting { .. } = &*classification else {
             return false;
         };
-        let continuation_blocked = *continuation_blocked;
-        *classification = RunClassification::SuccessSealed {
-            continuation_blocked,
-        };
+        *classification = RunClassification::SuccessSealed;
         true
     }
 
@@ -744,7 +664,7 @@ fn cancellation_plan(classification: &RunClassification) -> Option<CancellationP
             None => Some(CancellationPlan::Defer(RunReservationKind::ToolSettlement)),
             Some(_) => None,
         },
-        RunClassification::SuccessSealed { .. } | RunClassification::Cancelled(_) => None,
+        RunClassification::SuccessSealed | RunClassification::Cancelled(_) => None,
     }
 }
 
@@ -753,7 +673,6 @@ fn apply_cancellation_plan(
     cause: RunCancellationCause,
     plan: CancellationPlan,
 ) -> bool {
-    let blocks_continuation = matches!(&cause, RunCancellationCause::Interruption(_));
     match plan {
         CancellationPlan::Apply => {
             *classification = RunClassification::Cancelled(cause);
@@ -761,13 +680,9 @@ fn apply_cancellation_plan(
         }
         CancellationPlan::Defer(_) => {
             match classification {
-                RunClassification::SuccessCommitting {
-                    pending_cause,
-                    continuation_blocked,
-                } => {
+                RunClassification::SuccessCommitting { pending_cause } => {
                     debug_assert!(pending_cause.is_none());
                     *pending_cause = Some(cause);
-                    *continuation_blocked |= blocks_continuation;
                 }
                 RunClassification::EffectAdmitting { pending_cause }
                 | RunClassification::EffectCommitting { pending_cause }
@@ -966,98 +881,17 @@ mod tests {
     }
 
     #[test]
-    fn only_a_sealed_success_can_open_the_same_surface_handle_for_a_new_turn() {
-        let open = RunControl::new();
-        assert_eq!(
-            open.begin_next_turn_after_success(),
-            RunContinuationOutcome::Invalid
-        );
+    fn sealed_success_is_permanent_for_one_turn_and_does_not_change_a_fresh_turn() {
+        let completed_turn = RunControl::new();
+        assert!(completed_turn.seal_success());
+        assert!(!completed_turn.interrupt(TurnInterruptionCause::UserStop));
+        assert!(completed_turn.success_is_sealed());
 
-        let committing = RunControl::new();
-        let reservation = committing.begin_success_commit().expect("reserve success");
-        assert_eq!(
-            committing.begin_next_turn_after_success(),
-            RunContinuationOutcome::Invalid
-        );
-        reservation.release();
-
-        let cancelled = RunControl::new();
-        assert!(cancelled.interrupt(TurnInterruptionCause::UserStop));
-        assert_eq!(
-            cancelled.begin_next_turn_after_success(),
-            RunContinuationOutcome::Invalid
-        );
-
-        let completed = RunControl::new();
-        assert!(completed.seal_success());
-        assert_eq!(
-            completed.begin_next_turn_after_success(),
-            RunContinuationOutcome::Admitted
-        );
-        assert!(!completed.success_is_sealed());
-        assert_eq!(completed.cause(), None);
-        assert!(!completed.is_cancelled());
-        let next_turn = completed
-            .begin_success_commit()
-            .expect("the continuation has its own success commit");
-        assert!(next_turn.seal());
-        assert!(completed.success_is_sealed());
-
-        let stoppable = RunControl::new();
-        assert!(stoppable.seal_success());
-        assert_eq!(
-            stoppable.begin_next_turn_after_success(),
-            RunContinuationOutcome::Admitted
-        );
-        assert!(stoppable.interrupt(TurnInterruptionCause::UserStop));
-    }
-
-    #[test]
-    fn explicit_stop_before_continuation_claim_preserves_success_and_blocks_reopen() {
-        for stop_during_commit in [true, false] {
-            let control = RunControl::new();
-            if stop_during_commit {
-                let success = control.begin_success_commit().expect("success commit");
-                assert!(matches!(
-                    control.request_cancel(RunCancellationCause::Interruption(
-                        TurnInterruptionCause::UserStop,
-                    )),
-                    RunCancelOutcome::Deferred(_)
-                ));
-                assert!(success.seal());
-            } else {
-                assert!(control.seal_success());
-                assert_eq!(
-                    control.request_cancel(RunCancellationCause::Interruption(
-                        TurnInterruptionCause::UserStop,
-                    )),
-                    RunCancelOutcome::Rejected
-                );
-            }
-
-            assert_eq!(
-                control.begin_next_turn_after_success(),
-                RunContinuationOutcome::Blocked
-            );
-            assert!(control.success_is_sealed());
-            assert_eq!(control.cause(), None);
-        }
-    }
-
-    #[test]
-    fn late_failure_and_supersession_do_not_block_a_durable_success_continuation() {
-        for cause in [
-            RunCancellationCause::Failure("late failure".to_string()),
-            RunCancellationCause::Superseded,
-        ] {
-            let control = RunControl::new();
-            assert!(control.seal_success());
-            assert_eq!(control.request_cancel(cause), RunCancelOutcome::Rejected);
-            assert_eq!(
-                control.begin_next_turn_after_success(),
-                RunContinuationOutcome::Admitted
-            );
-        }
+        let next_turn = RunControl::new();
+        assert!(!next_turn.same_owner(&completed_turn));
+        assert!(!next_turn.success_is_sealed());
+        assert_eq!(next_turn.cause(), None);
+        assert!(!next_turn.is_cancelled());
     }
 
     #[test]

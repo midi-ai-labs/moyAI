@@ -1,15 +1,16 @@
-use std::cmp::Reverse;
 use std::fs;
 use std::io::Read as _;
 use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use camino::{Utf8Path, Utf8PathBuf};
 use globset::{Glob, GlobSetBuilder};
-use ignore::WalkBuilder;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::config::model::FileGuardConfig;
 use crate::error::ToolError;
@@ -17,6 +18,7 @@ use crate::tool::context::ToolContext;
 use crate::tool::registry::Tool;
 use crate::tool::truncate::clip_text_with_ellipsis;
 use crate::tool::{ToolName, ToolResult, ToolSpec};
+use crate::workspace::traversal::{TraversalEntry, TraversalOptions, walk_page};
 use crate::workspace::{AccessKind, PathGuard};
 
 #[derive(Debug, Deserialize)]
@@ -24,6 +26,8 @@ pub struct ListInput {
     pub path: Option<Utf8PathBuf>,
     pub limit: Option<usize>,
     pub include_hidden: Option<bool>,
+    pub max_depth: Option<usize>,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +35,7 @@ pub struct GlobInput {
     pub pattern: String,
     pub path: Option<Utf8PathBuf>,
     pub limit: Option<usize>,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,6 +45,7 @@ pub struct GrepInput {
     pub include_glob: Option<String>,
     pub case_sensitive: Option<bool>,
     pub limit: Option<usize>,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -54,6 +60,8 @@ pub struct GrepTool;
 const GREP_BINARY_SAMPLE_BYTES: u64 = 8 * 1024;
 const GREP_MAX_SKIP_DETAILS: usize = 64;
 const GREP_MAX_SKIP_DETAIL_BYTES: usize = 16 * 1024;
+const MAX_DISCOVERY_CANDIDATES: usize = 4_096;
+const MIN_DISCOVERY_VISITS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GrepSkipReason {
@@ -101,7 +109,6 @@ impl GrepSkipSummary {
     fn record(&mut self, path: Utf8PathBuf, reason: GrepSkipReason) {
         self.total = self.total.saturating_add(1);
         self.reason_counts[reason.index()] = self.reason_counts[reason.index()].saturating_add(1);
-
         let rendered_bytes = path
             .as_str()
             .len()
@@ -130,13 +137,15 @@ impl Tool for ListTool {
         ToolSpec {
             name: ToolName::List,
             effect: crate::tool::ToolEffectPolicy::read(),
-            description: "List files and directories under a path",
+            description: "List one bounded page of files and directories under a path.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "limit": { "type": "integer" },
-                    "include_hidden": { "type": "boolean" }
+                    "limit": { "type": "integer", "minimum": 1 },
+                    "include_hidden": { "type": "boolean" },
+                    "max_depth": { "type": "integer", "minimum": 1 },
+                    "cursor": { "type": "string", "description": "Continuation returned by a previous list call with the same path and options." }
                 }
             }),
         }
@@ -159,82 +168,52 @@ impl Tool for ListTool {
         )
         .await?
         .admit()?;
-        if !guarded.absolute.exists() {
-            return Ok(missing_directory_result(&guarded.absolute));
-        }
-        if guarded.absolute.is_file() {
-            return Ok(file_listing_redirect_result(&guarded.absolute));
-        }
-        if !guarded.absolute.is_dir() {
-            return Err(ToolError::Message(format!(
-                "`{}` is not a directory",
-                guarded.absolute
-            )));
-        }
+        PathGuard::revalidate(&guarded)?;
+        require_directory(&guarded.absolute)?;
 
         let limit = bounded_result_limit(input.limit, ctx.config.tool_output.max_results);
-        let entries = collect_entries(
+        let page = walk_page(
             &guarded.absolute,
             ctx.workspace,
-            input.include_hidden.unwrap_or(false),
+            input.cursor.as_deref(),
+            TraversalOptions {
+                include_hidden: input.include_hidden.unwrap_or(false),
+                max_depth: input.max_depth,
+                include_files: true,
+                include_directories: true,
+                result_limit: limit,
+                visit_limit: discovery_visit_limit(limit),
+            },
         )?;
-        let mut lines = Vec::new();
-        for entry in entries.iter().take(limit) {
-            lines.push(entry.clone());
-        }
-        let output_text = lines.join("\n");
-        let preview = ctx.services.truncator.preview(
-            output_text,
-            &ctx.config.tool_output,
-            &ctx.services.storage_paths,
-        )?;
+        let rendered = render_entries_bounded(
+            &page.entries,
+            ctx.config.tool_output.max_lines,
+            ctx.config.tool_output.max_bytes,
+            |entry| {
+                let mut label = entry.relative_path.as_str().replace('\\', "/");
+                if entry.is_directory {
+                    label.push('/');
+                }
+                label
+            },
+        );
+        let continuation = rendered.continuation.or(page.continuation);
 
         Ok(ToolResult {
             title: format!("Listed {}", guarded.absolute),
-            output_text: preview.preview_text,
+            output_text: rendered.output_text,
             metadata: json!({
                 "root": guarded.absolute,
-                "entry_count": entries.len(),
-                "truncated": preview.truncated
+                "entry_count": rendered.rendered_count,
+                "visited_entries": page.visited_entries,
+                "continuation": continuation,
+                "truncated": continuation.is_some(),
             }),
-            truncated_output_path: preview.truncated_output_path,
+            truncated_output_path: None,
             recorded_changes: Vec::new(),
             change_summaries: Vec::new(),
+            _internal_file_lease: None,
         })
-    }
-}
-
-fn missing_directory_result(path: &Utf8Path) -> ToolResult {
-    ToolResult {
-        title: format!("Directory `{path}` does not exist yet"),
-        output_text: format!(
-            "`{path}` does not exist yet. Do not keep retrying `list` on the same missing path. If the user already named a file under this path, create it directly with `write`; the `write` tool creates missing parent directories automatically. If you need discovery first, list the nearest existing parent directory instead."
-        ),
-        metadata: json!({
-            "corrective_result": true,
-            "missing_directory": true,
-            "path": path,
-        }),
-        truncated_output_path: None,
-        recorded_changes: Vec::new(),
-        change_summaries: Vec::new(),
-    }
-}
-
-fn file_listing_redirect_result(path: &Utf8Path) -> ToolResult {
-    ToolResult {
-        title: format!("`{path}` is a file"),
-        output_text: format!(
-            "`{path}` is a file, not a directory. Use `read` to inspect its contents, or list its parent directory if you need surrounding files."
-        ),
-        metadata: json!({
-            "corrective_result": true,
-            "path_is_file": true,
-            "path": path,
-        }),
-        truncated_output_path: None,
-        recorded_changes: Vec::new(),
-        change_summaries: Vec::new(),
     }
 }
 
@@ -244,14 +223,15 @@ impl Tool for GlobTool {
         ToolSpec {
             name: ToolName::Glob,
             effect: crate::tool::ToolEffectPolicy::read(),
-            description: "Find files by glob pattern",
+            description: "Find one bounded page of files by glob pattern.",
             input_schema: json!({
                 "type": "object",
                 "required": ["pattern"],
                 "properties": {
                     "pattern": { "type": "string" },
                     "path": { "type": "string" },
-                    "limit": { "type": "integer" }
+                    "limit": { "type": "integer", "minimum": 1 },
+                    "cursor": { "type": "string", "description": "Continuation returned by a previous glob call with the same pattern, path, and options." }
                 }
             }),
         }
@@ -274,6 +254,8 @@ impl Tool for GlobTool {
         )
         .await?
         .admit()?;
+        PathGuard::revalidate(&guarded)?;
+        require_directory(&guarded.absolute)?;
 
         let mut builder = GlobSetBuilder::new();
         builder.add(
@@ -283,34 +265,66 @@ impl Tool for GlobTool {
         let matcher = builder.build().map_err(|error| {
             ToolError::Message(format!("failed to compile glob pattern: {error}"))
         })?;
-        let mut matches = collect_file_metadata(&guarded.absolute, ctx.workspace)?;
-        matches.retain(|(path, _)| {
-            let path = Utf8Path::new(path);
-            glob_matches_path(&matcher, path, &guarded.absolute, &ctx.workspace.root)
-        });
-        matches.sort_by_key(|(_, modified)| Reverse(*modified));
+        let query_digest = search_query_digest("glob-v1", &[input.pattern.as_str()]);
+        let walk_cursor = decode_glob_cursor(input.cursor.as_deref(), &query_digest)?;
         let limit = bounded_result_limit(input.limit, ctx.config.tool_output.max_results);
-        let lines = matches
-            .iter()
-            .take(limit)
-            .map(|(path, _)| glob_output_label(path, &ctx.workspace.root))
-            .collect::<Vec<_>>();
-        let preview = ctx.services.truncator.preview(
-            lines.join("\n"),
-            &ctx.config.tool_output,
-            &ctx.services.storage_paths,
+        let candidate_limit = discovery_candidate_limit(limit);
+        let page = walk_page(
+            &guarded.absolute,
+            ctx.workspace,
+            walk_cursor.as_deref(),
+            TraversalOptions {
+                include_hidden: false,
+                max_depth: None,
+                include_files: true,
+                include_directories: false,
+                result_limit: candidate_limit,
+                visit_limit: discovery_visit_limit(candidate_limit),
+            },
         )?;
+        let matching = page
+            .entries
+            .iter()
+            .filter(|entry| {
+                glob_matches_path(
+                    &matcher,
+                    &entry.path,
+                    &guarded.absolute,
+                    &ctx.workspace.root,
+                )
+            })
+            .take(limit.saturating_add(1))
+            .cloned()
+            .collect::<Vec<_>>();
+        let visible = matching.iter().take(limit).cloned().collect::<Vec<_>>();
+        let rendered = render_entries_bounded(
+            &visible,
+            ctx.config.tool_output.max_lines,
+            ctx.config.tool_output.max_bytes,
+            |entry| glob_output_label(&entry.path, &ctx.workspace.root),
+        );
+        let limit_continuation = matching.get(limit).map(|entry| entry.cursor.clone());
+        let continuation = rendered
+            .continuation
+            .or(limit_continuation)
+            .or(page.continuation)
+            .map(|cursor| encode_glob_cursor(&cursor, &query_digest))
+            .transpose()?;
 
         Ok(ToolResult {
             title: format!("Glob {}", input.pattern),
-            output_text: preview.preview_text,
+            output_text: rendered.output_text,
             metadata: json!({
-                "match_count": matches.len(),
-                "truncated": preview.truncated
+                "match_count": rendered.rendered_count,
+                "candidate_count": page.entries.len(),
+                "visited_entries": page.visited_entries,
+                "continuation": continuation,
+                "truncated": continuation.is_some(),
             }),
-            truncated_output_path: preview.truncated_output_path,
+            truncated_output_path: None,
             recorded_changes: Vec::new(),
             change_summaries: Vec::new(),
+            _internal_file_lease: None,
         })
     }
 }
@@ -332,11 +346,11 @@ fn glob_matches_path(
             .is_some_and(|relative| matcher.is_match(relative.as_str()))
 }
 
-fn glob_output_label(path: &str, workspace_root: &Utf8Path) -> String {
-    let path = Utf8Path::new(path);
+fn glob_output_label(path: &Utf8Path, workspace_root: &Utf8Path) -> String {
     path.strip_prefix(workspace_root)
         .unwrap_or(path)
-        .to_string()
+        .as_str()
+        .replace('\\', "/")
 }
 
 #[async_trait(?Send)]
@@ -345,7 +359,7 @@ impl Tool for GrepTool {
         ToolSpec {
             name: ToolName::Grep,
             effect: crate::tool::ToolEffectPolicy::read(),
-            description: "Search file contents with a regex pattern",
+            description: "Search one bounded page of text files with a regex pattern.",
             input_schema: json!({
                 "type": "object",
                 "required": ["pattern"],
@@ -354,7 +368,8 @@ impl Tool for GrepTool {
                     "path": { "type": "string" },
                     "include_glob": { "type": "string" },
                     "case_sensitive": { "type": "boolean" },
-                    "limit": { "type": "integer" }
+                    "limit": { "type": "integer", "minimum": 1 },
+                    "cursor": { "type": "string", "description": "Continuation returned by a previous grep call with the same query." }
                 }
             }),
         }
@@ -380,7 +395,27 @@ impl Tool for GrepTool {
         .await?
         .admit()?;
 
-        let pattern = if input.case_sensitive.unwrap_or(false) {
+        PathGuard::revalidate(&guarded)?;
+
+        let case_sensitive = input.case_sensitive.unwrap_or(false);
+        let query_digest = search_query_digest(
+            "grep-v3",
+            &[
+                input.pattern.as_str(),
+                if case_sensitive {
+                    "case-sensitive"
+                } else {
+                    "case-insensitive"
+                },
+                if input.include_glob.is_some() {
+                    "include-glob"
+                } else {
+                    "no-include-glob"
+                },
+                input.include_glob.as_deref().unwrap_or(""),
+            ],
+        );
+        let pattern = if case_sensitive {
             input.pattern.clone()
         } else {
             format!("(?i:{})", input.pattern)
@@ -392,58 +427,109 @@ impl Tool for GrepTool {
             .as_deref()
             .map(compile_include_glob)
             .transpose()?;
+        let (walk_cursor, first_line_offset) =
+            decode_grep_cursor(input.cursor.as_deref(), &query_digest)?;
+        let limit = bounded_result_limit(input.limit, ctx.config.tool_output.max_results)
+            .min(ctx.config.tool_output.max_lines.max(1));
+        let candidate_limit = discovery_candidate_limit(limit);
 
-        let mut files = collect_file_metadata(&guarded.absolute, ctx.workspace)?;
-        files.sort_by_key(|(_, modified)| Reverse(*modified));
-        let limit = bounded_result_limit(input.limit, ctx.config.tool_output.max_results);
+        let page = if guarded.absolute.is_file() {
+            single_file_page(&guarded.absolute, walk_cursor.as_deref())?
+        } else {
+            require_directory(&guarded.absolute)?;
+            walk_page(
+                &guarded.absolute,
+                ctx.workspace,
+                walk_cursor.as_deref(),
+                TraversalOptions {
+                    include_hidden: false,
+                    max_depth: None,
+                    include_files: true,
+                    include_directories: false,
+                    result_limit: candidate_limit,
+                    visit_limit: discovery_visit_limit(candidate_limit),
+                },
+            )?
+        };
+
         let mut matches = Vec::new();
+        let mut matches_bytes = 0usize;
         let mut skipped = GrepSkipSummary::default();
-        for (path, _) in files {
-            if matches.len() >= limit {
-                break;
-            }
-            if include_glob
+        let mut continuation = None;
+        let mut scanned_files = 0usize;
+        let output_byte_limit = ctx.config.tool_output.max_bytes.max(1);
+
+        'files: for (file_index, entry) in page.entries.iter().enumerate() {
+            if !include_glob
                 .as_ref()
-                .map(|glob| glob.is_match(path.as_str()))
+                .map(|glob| glob.is_match(entry.path.as_str()))
                 .unwrap_or(true)
             {
-                let path = Utf8PathBuf::from(path);
-                match read_grep_candidate(path.as_path(), &ctx.config.file_guard)? {
-                    Ok(text) => {
-                        for (line_index, line) in text.lines().enumerate() {
-                            if regex.is_match(line) {
-                                matches.push(format!(
-                                    "{}:{}: {}",
-                                    path,
-                                    line_index + 1,
-                                    truncate_line(line)
-                                ));
-                                if matches.len() >= limit {
-                                    break;
-                                }
-                            }
+                continue;
+            }
+            scanned_files = scanned_files.saturating_add(1);
+            match read_grep_candidate(&entry.path, &ctx.config.file_guard)? {
+                Ok(text) => {
+                    let line_offset = if file_index == 0 {
+                        first_line_offset
+                    } else {
+                        0
+                    };
+                    for (line_index, line) in text.lines().enumerate().skip(line_offset) {
+                        if !regex.is_match(line) {
+                            continue;
+                        }
+                        let mut rendered =
+                            format!("{}:{}: {}", entry.path, line_index + 1, truncate_line(line));
+                        if rendered.len() > output_byte_limit {
+                            rendered = clip_text_with_ellipsis(&rendered, output_byte_limit);
+                        }
+                        let separator = usize::from(!matches.is_empty());
+                        if matches.len() >= limit
+                            || matches_bytes
+                                .saturating_add(separator)
+                                .saturating_add(rendered.len())
+                                > output_byte_limit
+                        {
+                            continuation = Some(encode_grep_cursor(
+                                &entry.cursor,
+                                line_index,
+                                &query_digest,
+                            )?);
+                            break 'files;
+                        }
+                        matches_bytes = matches_bytes
+                            .saturating_add(separator)
+                            .saturating_add(rendered.len());
+                        matches.push(rendered);
+                        if matches.len() >= limit {
+                            continuation = Some(encode_grep_cursor(
+                                &entry.cursor,
+                                line_index.saturating_add(1),
+                                &query_digest,
+                            )?);
+                            break 'files;
                         }
                     }
-                    Err(reason) => skipped.record(path, reason),
                 }
-            }
-            if matches.len() >= limit {
-                break;
+                Err(reason) => skipped.record(entry.path.clone(), reason),
             }
         }
-
-        let output_text = render_grep_output(&matches, &skipped);
-        let preview = ctx.services.truncator.preview(
-            output_text,
-            &ctx.config.tool_output,
-            &ctx.services.storage_paths,
-        )?;
+        if continuation.is_none() {
+            continuation = page
+                .continuation
+                .as_deref()
+                .map(|cursor| encode_grep_cursor(cursor, 0, &query_digest))
+                .transpose()?;
+        }
 
         Ok(ToolResult {
             title: format!("Grep {}", input.pattern),
-            output_text: preview.preview_text,
+            output_text: matches.join("\n"),
             metadata: json!({
-                "total_matches": matches.len(),
+                "match_count": matches.len(),
+                "scanned_file_count": scanned_files,
+                "visited_entries": page.visited_entries,
                 "skipped_file_count": skipped.total,
                 "skipped_file_detail_count": skipped.details.len(),
                 "skipped_file_details_omitted": skipped.omitted_count(),
@@ -457,13 +543,158 @@ impl Tool for GrepTool {
                     "path": candidate.path,
                     "reason": candidate.reason.as_str(),
                 })).collect::<Vec<_>>(),
-                "truncated": preview.truncated
+                "continuation": continuation,
+                "truncated": continuation.is_some(),
             }),
-            truncated_output_path: preview.truncated_output_path,
+            truncated_output_path: None,
             recorded_changes: Vec::new(),
             change_summaries: Vec::new(),
+            _internal_file_lease: None,
         })
     }
+}
+
+fn single_file_page(
+    path: &Utf8Path,
+    cursor: Option<&str>,
+) -> Result<crate::workspace::traversal::TraversalPage, ToolError> {
+    let expected_cursor = single_file_cursor(path)?;
+    if cursor.is_some_and(|cursor| cursor != expected_cursor) {
+        return Err(ToolError::Message(
+            "grep cursor does not identify the requested file".to_string(),
+        ));
+    }
+    let entries = if cursor.is_none() || cursor == Some(expected_cursor.as_str()) {
+        vec![TraversalEntry {
+            path: path.to_path_buf(),
+            relative_path: Utf8PathBuf::from(path.file_name().unwrap_or(path.as_str())),
+            is_directory: false,
+            depth: 1,
+            cursor: expected_cursor,
+        }]
+    } else {
+        Vec::new()
+    };
+    Ok(crate::workspace::traversal::TraversalPage {
+        entries,
+        continuation: None,
+        truncated: false,
+        visited_entries: 1,
+    })
+}
+
+fn single_file_cursor(path: &Utf8Path) -> Result<String, ToolError> {
+    let metadata = fs::metadata(path)?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos())
+        .ok_or_else(|| {
+            ToolError::Message(format!(
+                "filesystem does not expose a grep continuation fence for `{path}`"
+            ))
+        })?;
+    let mut hasher = Sha256::new();
+    hasher.update(path.as_str().as_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    hasher.update(modified_nanos.to_le_bytes());
+    Ok(format!("single-file-v1:{:x}", hasher.finalize()))
+}
+
+fn search_query_digest(domain: &str, values: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for value in std::iter::once(domain).chain(values.iter().copied()) {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn decode_glob_cursor(
+    cursor: Option<&str>,
+    query_digest: &str,
+) -> Result<Option<String>, ToolError> {
+    let Some(cursor) = cursor.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let payload = cursor
+        .strip_prefix("glob-v1:")
+        .ok_or_else(|| ToolError::Message("invalid glob cursor version".to_string()))?;
+    let (cursor_digest, encoded_cursor) = payload
+        .split_once(':')
+        .ok_or_else(|| ToolError::Message("invalid glob cursor payload".to_string()))?;
+    if cursor_digest != query_digest {
+        return Err(ToolError::Message(
+            "glob cursor query does not match the requested pattern".to_string(),
+        ));
+    }
+    let walk_cursor = URL_SAFE_NO_PAD
+        .decode(encoded_cursor)
+        .map_err(|_| ToolError::Message("invalid glob cursor payload".to_string()))?;
+    String::from_utf8(walk_cursor)
+        .map(Some)
+        .map_err(|_| ToolError::Message("glob cursor payload is not UTF-8".to_string()))
+}
+
+fn encode_glob_cursor(cursor: &str, query_digest: &str) -> Result<String, ToolError> {
+    if cursor.trim().is_empty() {
+        return Err(ToolError::Message(
+            "glob cursor cannot contain an empty traversal cursor".to_string(),
+        ));
+    }
+    Ok(format!(
+        "glob-v1:{query_digest}:{}",
+        URL_SAFE_NO_PAD.encode(cursor.as_bytes())
+    ))
+}
+
+fn decode_grep_cursor(
+    cursor: Option<&str>,
+    query_digest: &str,
+) -> Result<(Option<String>, usize), ToolError> {
+    let Some(cursor) = cursor.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok((None, 0));
+    };
+    let payload = cursor
+        .strip_prefix("grep-v3:")
+        .ok_or_else(|| ToolError::Message("invalid grep cursor version".to_string()))?;
+    let (cursor_digest, payload) = payload
+        .split_once(':')
+        .ok_or_else(|| ToolError::Message("invalid grep cursor payload".to_string()))?;
+    if cursor_digest != query_digest {
+        return Err(ToolError::Message(
+            "grep cursor query does not match the requested pattern or options".to_string(),
+        ));
+    }
+    let (encoded_cursor, line_offset) = payload
+        .rsplit_once(':')
+        .ok_or_else(|| ToolError::Message("invalid grep cursor payload".to_string()))?;
+    let line_offset = line_offset
+        .parse::<usize>()
+        .map_err(|_| ToolError::Message("invalid grep cursor line offset".to_string()))?;
+    let walk_cursor = URL_SAFE_NO_PAD
+        .decode(encoded_cursor)
+        .map_err(|_| ToolError::Message("invalid grep cursor payload".to_string()))?;
+    let walk_cursor = String::from_utf8(walk_cursor)
+        .map_err(|_| ToolError::Message("grep cursor payload is not UTF-8".to_string()))?;
+    Ok((Some(walk_cursor), line_offset))
+}
+
+fn encode_grep_cursor(
+    cursor: &str,
+    line_offset: usize,
+    query_digest: &str,
+) -> Result<String, ToolError> {
+    if cursor.trim().is_empty() {
+        return Err(ToolError::Message(
+            "grep cursor cannot contain an empty traversal cursor".to_string(),
+        ));
+    }
+    Ok(format!(
+        "grep-v3:{query_digest}:{}:{line_offset}",
+        URL_SAFE_NO_PAD.encode(cursor.as_bytes())
+    ))
 }
 
 fn compile_include_glob(value: &str) -> Result<globset::GlobSet, ToolError> {
@@ -477,7 +708,75 @@ fn compile_include_glob(value: &str) -> Result<globset::GlobSet, ToolError> {
 }
 
 fn bounded_result_limit(requested: Option<usize>, configured_max: usize) -> usize {
-    requested.unwrap_or(configured_max).min(configured_max)
+    requested
+        .unwrap_or(configured_max.max(1))
+        .max(1)
+        .min(configured_max.max(1))
+}
+
+fn discovery_candidate_limit(result_limit: usize) -> usize {
+    result_limit
+        .saturating_mul(8)
+        .max(MIN_DISCOVERY_VISITS)
+        .min(MAX_DISCOVERY_CANDIDATES)
+}
+
+fn discovery_visit_limit(candidate_limit: usize) -> usize {
+    candidate_limit
+        .saturating_mul(8)
+        .max(MIN_DISCOVERY_VISITS)
+        .min(MAX_DISCOVERY_CANDIDATES)
+}
+
+fn require_directory(path: &Utf8Path) -> Result<(), ToolError> {
+    if !path.exists() {
+        return Err(ToolError::Message(format!("path `{path}` does not exist")));
+    }
+    if !path.is_dir() {
+        return Err(ToolError::Message(format!(
+            "path `{path}` is not a directory"
+        )));
+    }
+    Ok(())
+}
+
+struct RenderedEntryPage {
+    output_text: String,
+    rendered_count: usize,
+    continuation: Option<String>,
+}
+
+fn render_entries_bounded(
+    entries: &[TraversalEntry],
+    max_lines: usize,
+    max_bytes: usize,
+    mut render: impl FnMut(&TraversalEntry) -> String,
+) -> RenderedEntryPage {
+    let max_lines = max_lines.max(1);
+    let max_bytes = max_bytes.max(1);
+    let mut lines = Vec::new();
+    let mut bytes = 0usize;
+    let mut continuation = None;
+    for entry in entries {
+        let mut line = render(entry);
+        if line.len() > max_bytes {
+            line = clip_text_with_ellipsis(&line, max_bytes);
+        }
+        let separator = usize::from(!lines.is_empty());
+        if lines.len() >= max_lines
+            || bytes.saturating_add(separator).saturating_add(line.len()) > max_bytes
+        {
+            continuation = Some(entry.cursor.clone());
+            break;
+        }
+        bytes = bytes.saturating_add(separator).saturating_add(line.len());
+        lines.push(line);
+    }
+    RenderedEntryPage {
+        output_text: lines.join("\n"),
+        rendered_count: lines.len(),
+        continuation,
+    }
 }
 
 fn read_grep_candidate(
@@ -524,42 +823,8 @@ fn read_grep_candidate(
     crate::tool::text_encoding::decode_text(bytes)
         .map(|decoded| Ok(decoded.text))
         .map_err(|_| {
-            ToolError::Message("grep candidate is neither UTF-8 nor Shift_JIS".to_string())
+            ToolError::Message("grep candidate has no supported text encoding".to_string())
         })
-}
-
-fn render_grep_output(matches: &[String], skipped: &GrepSkipSummary) -> String {
-    let mut sections = Vec::new();
-    if !matches.is_empty() {
-        sections.push(matches.join("\n"));
-    }
-    if skipped.total > 0 {
-        let mut lines = vec![format!(
-            "Skipped {} file(s) before full-text search because of file guards:",
-            skipped.total
-        )];
-        lines.push(format!(
-            "- reasons: blocked_extension={}, structured_document={}, large_file={}, binary_content={}",
-            skipped.reason_count(GrepSkipReason::BlockedExtension),
-            skipped.reason_count(GrepSkipReason::StructuredDocument),
-            skipped.reason_count(GrepSkipReason::LargeFile),
-            skipped.reason_count(GrepSkipReason::BinaryContent),
-        ));
-        lines.extend(
-            skipped
-                .details
-                .iter()
-                .map(|candidate| format!("- {} ({})", candidate.path, candidate.reason.as_str())),
-        );
-        if skipped.omitted_count() > 0 {
-            lines.push(format!(
-                "- {} additional skipped file detail(s) omitted by the bounded output policy",
-                skipped.omitted_count()
-            ));
-        }
-        sections.push(lines.join("\n"));
-    }
-    sections.join("\n\n")
 }
 
 fn normalized_extension(path: &Utf8Path) -> String {
@@ -574,96 +839,6 @@ fn normalized_extension_list(values: &[String]) -> Vec<String> {
         .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
         .filter(|value| !value.is_empty())
         .collect()
-}
-
-fn collect_entries(
-    root: &Utf8Path,
-    workspace: &crate::workspace::Workspace,
-    include_hidden: bool,
-) -> Result<Vec<String>, ToolError> {
-    let ignore = workspace.ignore.compile()?;
-    let mut builder = WalkBuilder::new(root);
-    builder.hidden(!include_hidden);
-    builder.git_ignore(workspace.ignore.use_gitignore);
-    let mut entries = Vec::new();
-    for entry in builder.build() {
-        let entry = entry.map_err(|error| ToolError::Message(error.to_string()))?;
-        let path = Utf8PathBuf::from_path_buf(entry.path().to_path_buf())
-            .map_err(|_| ToolError::Message("path is not valid UTF-8".to_string()))?;
-        if path == root {
-            continue;
-        }
-        if workspace
-            .protected_paths
-            .iter()
-            .any(|value| path.starts_with(value))
-        {
-            continue;
-        }
-        if workspace
-            .ignore
-            .matches_compiled(&ignore, &workspace.root, &path)
-        {
-            continue;
-        }
-        let label = if entry
-            .file_type()
-            .map(|value| value.is_dir())
-            .unwrap_or(false)
-        {
-            format!("{}/", path.strip_prefix(root).unwrap_or(&path))
-        } else {
-            path.strip_prefix(root).unwrap_or(&path).to_string()
-        };
-        entries.push(label);
-    }
-    entries.sort();
-    Ok(entries)
-}
-
-fn collect_file_metadata(
-    root: &Utf8Path,
-    workspace: &crate::workspace::Workspace,
-) -> Result<Vec<(String, i64)>, ToolError> {
-    let ignore = workspace.ignore.compile()?;
-    let mut builder = WalkBuilder::new(root);
-    builder.hidden(false);
-    builder.git_ignore(workspace.ignore.use_gitignore);
-    let mut entries = Vec::new();
-    for entry in builder.build() {
-        let entry = entry.map_err(|error| ToolError::Message(error.to_string()))?;
-        if !entry
-            .file_type()
-            .map(|value| value.is_file())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let path = Utf8PathBuf::from_path_buf(entry.path().to_path_buf())
-            .map_err(|_| ToolError::Message("path is not valid UTF-8".to_string()))?;
-        if workspace
-            .protected_paths
-            .iter()
-            .any(|value| path.starts_with(value))
-        {
-            continue;
-        }
-        if workspace
-            .ignore
-            .matches_compiled(&ignore, &workspace.root, &path)
-        {
-            continue;
-        }
-        let modified = entry
-            .metadata()
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-            .map(|value| value.as_secs() as i64)
-            .unwrap_or_default();
-        entries.push((path.to_string(), modified));
-    }
-    Ok(entries)
 }
 
 fn truncate_line(line: &str) -> String {
@@ -683,7 +858,8 @@ mod tests {
 
     use super::{
         GREP_MAX_SKIP_DETAIL_BYTES, GREP_MAX_SKIP_DETAILS, GrepSkipReason, GrepSkipSummary,
-        bounded_result_limit, compile_include_glob, read_grep_candidate, render_grep_output,
+        bounded_result_limit, compile_include_glob, decode_glob_cursor, decode_grep_cursor,
+        encode_glob_cursor, encode_grep_cursor, read_grep_candidate, search_query_digest,
     };
 
     #[test]
@@ -693,11 +869,43 @@ mod tests {
     }
 
     #[test]
-    fn requested_result_limit_cannot_exceed_the_configured_output_bound() {
+    fn requested_result_limit_is_positive_and_bounded() {
         assert_eq!(bounded_result_limit(Some(usize::MAX), 64), 64);
         assert_eq!(bounded_result_limit(Some(12), 64), 12);
         assert_eq!(bounded_result_limit(None, 64), 64);
-        assert_eq!(bounded_result_limit(Some(0), 64), 0);
+        assert_eq!(bounded_result_limit(Some(0), 64), 1);
+    }
+
+    #[test]
+    fn grep_cursor_round_trips_the_walker_and_line_positions() {
+        let digest = search_query_digest(
+            "grep-v3",
+            &["needle", "case-sensitive", "no-include-glob", ""],
+        );
+        let cursor = encode_grep_cursor("walk-v2:Zm9v", 9, &digest).expect("encode cursor");
+        assert_eq!(
+            decode_grep_cursor(Some(&cursor), &digest).expect("decode cursor"),
+            (Some("walk-v2:Zm9v".to_string()), 9)
+        );
+    }
+
+    #[test]
+    fn search_cursors_reject_a_different_semantic_query() {
+        let first_glob = search_query_digest("glob-v1", &["src/**/*.rs"]);
+        let other_glob = search_query_digest("glob-v1", &["tests/**/*.rs"]);
+        let cursor = encode_glob_cursor("walk-v2:Zm9v", &first_glob).expect("glob cursor");
+        assert!(decode_glob_cursor(Some(&cursor), &other_glob).is_err());
+
+        let first_grep = search_query_digest(
+            "grep-v3",
+            &["needle", "case-sensitive", "include-glob", "*.rs"],
+        );
+        let other_grep = search_query_digest(
+            "grep-v3",
+            &["needle", "case-insensitive", "include-glob", "*.rs"],
+        );
+        let cursor = encode_grep_cursor("walk-v2:Zm9v", 4, &first_grep).expect("grep cursor");
+        assert!(decode_grep_cursor(Some(&cursor), &other_grep).is_err());
     }
 
     #[test]
@@ -737,22 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn grep_candidate_decodes_shift_jis_text() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = Utf8PathBuf::from_path_buf(temp.path().join("sjis.txt")).expect("utf8 path");
-        let (bytes, _, had_errors) = encoding_rs::SHIFT_JIS.encode("検索対象です");
-        assert!(!had_errors);
-        fs::write(&path, bytes.as_ref()).expect("write Shift_JIS fixture");
-
-        assert_eq!(
-            read_grep_candidate(&path, &crate::config::ResolvedConfig::default().file_guard)
-                .expect("grep candidate"),
-            Ok("検索対象です".to_string())
-        );
-    }
-
-    #[test]
-    fn grep_skip_details_are_bounded_while_totals_and_reasons_remain_exact() {
+    fn grep_skip_details_are_bounded() {
         let mut skipped = GrepSkipSummary::default();
         for index in 0..(GREP_MAX_SKIP_DETAILS + 25) {
             skipped.record(
@@ -764,27 +957,6 @@ mod tests {
         assert_eq!(skipped.total, GREP_MAX_SKIP_DETAILS + 25);
         assert!(skipped.details.len() <= GREP_MAX_SKIP_DETAILS);
         assert!(skipped.detail_bytes <= GREP_MAX_SKIP_DETAIL_BYTES);
-        assert_eq!(
-            skipped.reason_count(GrepSkipReason::BinaryContent),
-            GREP_MAX_SKIP_DETAILS + 25
-        );
         assert_eq!(skipped.omitted_count(), 25);
-
-        let rendered = render_grep_output(&[], &skipped);
-        assert!(rendered.contains("additional skipped file detail(s) omitted"));
-        assert!(rendered.contains(&format!("binary_content={}", GREP_MAX_SKIP_DETAILS + 25)));
-    }
-
-    #[test]
-    fn grep_skip_detail_byte_budget_rejects_an_oversized_path() {
-        let mut skipped = GrepSkipSummary::default();
-        skipped.record(
-            Utf8PathBuf::from("x".repeat(GREP_MAX_SKIP_DETAIL_BYTES + 1)),
-            GrepSkipReason::LargeFile,
-        );
-
-        assert_eq!(skipped.total, 1);
-        assert!(skipped.details.is_empty());
-        assert_eq!(skipped.omitted_count(), 1);
     }
 }

@@ -65,7 +65,7 @@ export function renderAgentInspector(state: DesktopWebState, selectedAgentPath: 
   if (rows.length === 0) return renderAgentTreePending();
   const groups = [
     { key: "active", label: "作業中", rows: rows.filter((row) => agentIsActive(row.status)) },
-    { key: "attention", label: "要確認", rows: rows.filter((row) => ["interrupted", "errored", "not_found"].includes(row.status)) },
+    { key: "attention", label: "要確認", rows: rows.filter((row) => ["interrupted", "errored"].includes(row.status)) },
     { key: "completed", label: "完了", rows: rows.filter((row) => row.status === "completed") },
     { key: "stopped", label: "停止", rows: rows.filter((row) => row.status === "shutdown") },
   ].filter((group) => group.rows.length > 0);

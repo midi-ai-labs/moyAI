@@ -3,12 +3,12 @@ use std::process::ExitCode;
 
 use camino::Utf8PathBuf;
 use moyai::app::{
-    AppBootstrap, AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest,
-    SessionEventsRequest, SessionForkRequest, SessionGoalClearRequest, SessionGoalGetRequest,
-    SessionGoalSetRequest, SessionHistoryRequest, SessionInterruptRequest, SessionListRequest,
-    SessionLoadedRequest, SessionReadRequest, SessionRejoinRequest, SessionRollbackRequest,
-    SessionSearchRequest, SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest,
-    SessionTitleUpdateRequest, SessionTurnsRequest,
+    AppBootstrap, AppCommand, AppCommandOutcome, ReviewRequest, RunConfigInput, RunRequest,
+    SessionArchiveRequest, SessionEventsRequest, SessionForkRequest, SessionGoalClearRequest,
+    SessionGoalGetRequest, SessionGoalSetRequest, SessionHistoryRequest, SessionInterruptRequest,
+    SessionListRequest, SessionLoadedRequest, SessionReadRequest, SessionRejoinRequest,
+    SessionRollbackRequest, SessionSearchRequest, SessionSettingsUpdateRequest, SessionShowRequest,
+    SessionSteerRequest, SessionTitleUpdateRequest, SessionTurnsRequest,
 };
 use moyai::cli::parse::parse as parse_cli;
 use moyai::cli::{
@@ -192,23 +192,28 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
     install_cli_interrupt_handler(&app_command);
     let output_mode = command_output_mode(&command);
     let mut renderer = build_renderer(output_mode);
-    let summary = app
+    let outcome = app
         .run_service
         .execute(app_command, renderer.as_mut(), &mut prompt)
         .await
         .map_err(|error| (4, error.to_string()))?;
-    if wait_for_agent_tree {
-        app.run_service
-            .wait_for_agent_tree_quiescence(summary.session_id)
-            .await
-            .map_err(|error| (4, error.to_string()))?;
+    match outcome {
+        AppCommandOutcome::ControlCompleted => Ok(()),
+        AppCommandOutcome::Turn(summary) if wait_for_agent_tree => {
+            app.run_service
+                .wait_for_agent_tree_quiescence(summary.session_id())
+                .await
+                .map_err(|error| (4, error.to_string()))?;
+            if let Some(exit) = terminal_run_exit(summary.status(), summary.interruption_cause()) {
+                return Err(exit);
+            }
+            Ok(())
+        }
+        AppCommandOutcome::Turn(_) => Err((
+            4,
+            "a control command unexpectedly returned an admitted turn".to_string(),
+        )),
     }
-    if wait_for_agent_tree
-        && let Some(exit) = terminal_run_exit(summary.status, summary.interruption_cause)
-    {
-        return Err(exit);
-    }
-    Ok(())
 }
 
 fn terminal_run_exit(
@@ -299,9 +304,11 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
             continue_last: args.continue_last,
             title: args.title.clone(),
             cwd: app.workspace.cwd.clone(),
-            model: args.model_override.clone().unwrap_or_default(),
-            base_url: args.base_url_override.clone().unwrap_or_default(),
-            config_override: None,
+            config: RunConfigInput::Layered {
+                model: args.model_override.clone().unwrap_or_default(),
+                base_url: args.base_url_override.clone().unwrap_or_default(),
+                config_override: None,
+            },
             output_mode: args.output_mode,
             show_reasoning_summary: args.show_reasoning_summary,
             prompt_dispatch: None,
@@ -327,7 +334,6 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
             },
             image_paths: args.image_paths.clone(),
             run_control: moyai::runtime::RunControl::new(),
-            live_config: None,
             agent_confirmation: None,
             agent_context: None,
         }),
@@ -373,7 +379,6 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
         CliCommand::SessionInterrupt(args) => {
             AppCommand::SessionInterrupt(SessionInterruptRequest {
                 session_id: args.session_id,
-                reason: args.reason.clone(),
             })
         }
         CliCommand::SessionGoalGet(args) => AppCommand::SessionGoalGet(SessionGoalGetRequest {

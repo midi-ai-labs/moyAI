@@ -1,10 +1,11 @@
 use std::fs;
+use std::io::Write as _;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::config::ToolOutputConfig;
 use crate::error::ToolError;
-use crate::storage::StoragePaths;
+use crate::storage::{InternalFileProducerLease, StoragePaths};
 use crate::tool::TruncatedToolOutput;
 
 #[derive(Debug, Clone, Default)]
@@ -49,46 +50,123 @@ impl ToolTruncator {
         limits: &ToolOutputConfig,
         paths: &StoragePaths,
     ) -> Result<TruncatedToolOutput, ToolError> {
-        let total_bytes = text.len();
-        let lines = text.lines().collect::<Vec<_>>();
-        let exceeds = total_bytes > limits.max_bytes || lines.len() > limits.max_lines;
-        if !exceeds {
+        self.preview_chunks(std::iter::once(text.as_str()), "", limits, paths)
+    }
+
+    pub fn preview_chunks<S>(
+        &self,
+        chunks: impl IntoIterator<Item = S>,
+        separator: &str,
+        limits: &ToolOutputConfig,
+        paths: &StoragePaths,
+    ) -> Result<TruncatedToolOutput, ToolError>
+    where
+        S: AsRef<str>,
+    {
+        let mut preview = String::new();
+        let mut newline_count = 0usize;
+        let mut spool: Option<(camino::Utf8PathBuf, fs::File, InternalFileProducerLease)> = None;
+        let mut first = true;
+
+        for chunk in chunks {
+            let chunk = chunk.as_ref();
+            if !first {
+                append_segment(
+                    separator,
+                    &mut preview,
+                    &mut newline_count,
+                    limits,
+                    paths,
+                    &mut spool,
+                )?;
+            }
+            first = false;
+            append_segment(
+                chunk,
+                &mut preview,
+                &mut newline_count,
+                limits,
+                paths,
+                &mut spool,
+            )?;
+        }
+
+        let Some((output_path, mut file, internal_file_lease)) = spool else {
             return Ok(TruncatedToolOutput {
-                preview_text: text,
+                preview_text: preview,
                 truncated_output_path: None,
                 truncated: false,
+                internal_file_lease: None,
             });
-        }
-
-        fs::create_dir_all(&paths.truncation_dir)?;
-        let file_name = format!("{}.txt", ulid::Ulid::new());
-        let output_path = paths.truncation_dir.join(file_name);
-        fs::write(&output_path, &text)?;
-
-        let mut preview_lines = lines
-            .into_iter()
-            .take(limits.max_lines)
-            .collect::<Vec<_>>()
-            .join("\n");
-        if preview_lines.len() > limits.max_bytes {
-            truncate_to_char_boundary(&mut preview_lines, limits.max_bytes);
-        }
-        preview_lines.push_str(&format!(
-            "\n[output truncated]\nFull output saved to: {}\n{}",
-            output_path,
-            truncation_followup_guidance()
+        };
+        file.flush()?;
+        preview.push_str(&format!(
+            "\n[output truncated]\nFull output saved to: {output_path}"
         ));
-
         Ok(TruncatedToolOutput {
-            preview_text: preview_lines,
+            preview_text: preview,
             truncated_output_path: Some(output_path),
             truncated: true,
+            internal_file_lease: Some(internal_file_lease),
         })
     }
 }
 
-fn truncation_followup_guidance() -> &'static str {
-    "Use `read` with `offset`/`limit`, or use registered `grep` with `path` set to that saved file, instead of rereading the full output."
+fn append_segment(
+    segment: &str,
+    preview: &mut String,
+    newline_count: &mut usize,
+    limits: &ToolOutputConfig,
+    paths: &StoragePaths,
+    spool: &mut Option<(camino::Utf8PathBuf, fs::File, InternalFileProducerLease)>,
+) -> Result<(), ToolError> {
+    if let Some((_, file, _)) = spool.as_mut() {
+        file.write_all(segment.as_bytes())?;
+        return Ok(());
+    }
+
+    let exact_prefix_len = preview.len();
+    if append_preview_bounded(preview, segment, newline_count, limits) {
+        return Ok(());
+    }
+
+    let internal_file_lease = InternalFileProducerLease::acquire(paths)?;
+    fs::create_dir_all(&paths.truncation_dir)?;
+    let output_path = paths
+        .truncation_dir
+        .join(format!("{}.txt", ulid::Ulid::new()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output_path)?;
+    file.write_all(preview[..exact_prefix_len].as_bytes())?;
+    file.write_all(segment.as_bytes())?;
+    *spool = Some((output_path, file, internal_file_lease));
+    Ok(())
+}
+
+fn append_preview_bounded(
+    preview: &mut String,
+    segment: &str,
+    newline_count: &mut usize,
+    limits: &ToolOutputConfig,
+) -> bool {
+    let max_bytes = limits.max_bytes.max(1);
+    let max_lines = limits.max_lines.max(1);
+    let mut complete = true;
+    for ch in segment.chars() {
+        if preview.len().saturating_add(ch.len_utf8()) > max_bytes
+            || (ch == '\n' && newline_count.saturating_add(1) >= max_lines)
+        {
+            complete = false;
+            break;
+        }
+        preview.push(ch);
+        if ch == '\n' {
+            *newline_count = newline_count.saturating_add(1);
+        }
+    }
+    complete
 }
 
 pub fn truncate_to_char_boundary(text: &mut String, max_bytes: usize) {
@@ -146,5 +224,35 @@ mod tests {
 
         assert_eq!(output.bytes, b"0123");
         assert!(output.truncated);
+    }
+
+    #[test]
+    fn chunked_preview_spools_without_joining_all_chunks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let truncation_dir =
+            camino::Utf8PathBuf::from_path_buf(temp.path().join("truncated")).expect("utf8 path");
+        let paths = crate::storage::StoragePaths {
+            data_dir: camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf())
+                .expect("utf8 path"),
+            database_path: camino::Utf8PathBuf::from_path_buf(temp.path().join("test.db"))
+                .expect("utf8 path"),
+            truncation_dir,
+        };
+        let limits = crate::config::ToolOutputConfig {
+            max_lines: 2,
+            max_bytes: 8,
+            max_results: 10,
+        };
+        let output = super::ToolTruncator
+            .preview_chunks(["abcd", "efgh", "ijkl"], "\n", &limits, &paths)
+            .expect("preview");
+
+        assert!(output.truncated);
+        assert!(output.internal_file_lease.is_some());
+        let stored =
+            std::fs::read_to_string(output.truncated_output_path.as_ref().expect("spool path"))
+                .expect("read spool");
+        assert_eq!(stored, "abcd\nefgh\nijkl");
+        assert!(!output.preview_text.contains("Use `read`"));
     }
 }

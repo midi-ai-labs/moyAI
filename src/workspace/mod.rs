@@ -4,6 +4,7 @@ pub mod path_guard;
 pub mod project;
 pub mod review;
 pub mod special_paths;
+pub mod traversal;
 
 pub use discovery::{Workspace, WorkspaceDiscovery};
 pub use ignore::IgnorePlan;

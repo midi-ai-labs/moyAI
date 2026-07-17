@@ -1,17 +1,15 @@
-use std::collections::HashSet;
-
 use crate::error::RuntimeError;
-use crate::protocol::{ProtocolEventStore, RuntimeEventId, TurnId, project_protocol_run_event};
+use crate::protocol::{ProtocolEventStore, TurnId, project_protocol_run_event};
 use crate::runtime::{RunEventSink, SessionRuntimeEventPublisher};
-use crate::session::{RunEvent, SessionId};
+use crate::session::{AdmissionId, RunEvent, SessionId};
 
 pub struct ProtocolRecordingSink<'a, S: RunEventSink + ?Sized> {
     store: crate::protocol::SqliteProtocolEventStore,
     fallback_session_id: Option<SessionId>,
     turn_id: TurnId,
-    admission_id: Option<String>,
+    admission_id: Option<AdmissionId>,
     next_sequence_no: i64,
-    published_runtime_event_ids: HashSet<RuntimeEventId>,
+    published_runtime_sequence_no: Option<i64>,
     runtime_event_publisher: Option<SessionRuntimeEventPublisher>,
     inner: &'a mut S,
 }
@@ -29,7 +27,7 @@ impl<'a, S: RunEventSink + ?Sized> ProtocolRecordingSink<'a, S> {
             turn_id,
             admission_id: None,
             next_sequence_no: 0,
-            published_runtime_event_ids: HashSet::new(),
+            published_runtime_sequence_no: None,
             runtime_event_publisher: None,
             inner,
         }
@@ -40,7 +38,7 @@ impl<'a, S: RunEventSink + ?Sized> ProtocolRecordingSink<'a, S> {
         self
     }
 
-    pub fn with_admission_id(mut self, admission_id: impl Into<String>) -> Self {
+    pub fn with_admission_id(mut self, admission_id: AdmissionId) -> Self {
         self.admission_id = Some(admission_id.into());
         self
     }
@@ -73,16 +71,31 @@ impl<'a, S: RunEventSink + ?Sized> ProtocolRecordingSink<'a, S> {
         let Some(session_id) = self.fallback_session_id else {
             return Ok(());
         };
-        let events = self
-            .store
-            .list_runtime_events(session_id, self.turn_id)
-            .map_err(runtime_error)?;
-        for event in events {
-            self.next_sequence_no = self
-                .next_sequence_no
-                .max(event.sequence_no.saturating_add(1));
-            if self.published_runtime_event_ids.insert(event.id) {
+        loop {
+            let events = self
+                .store
+                .runtime_event_page_for_turn_after_sequence(
+                    session_id,
+                    self.turn_id,
+                    self.published_runtime_sequence_no,
+                    crate::protocol::MAX_PROTOCOL_PAGE_LIMIT,
+                )
+                .map_err(runtime_error)?;
+            if events.is_empty() {
+                break;
+            }
+            let page_len = events.len();
+            for event in events {
+                let sequence_no = event.sequence_no;
+                self.next_sequence_no = self.next_sequence_no.max(sequence_no.saturating_add(1));
                 publisher.publish(event)?;
+                self.published_runtime_sequence_no = Some(
+                    self.published_runtime_sequence_no
+                        .map_or(sequence_no, |current| current.max(sequence_no)),
+                );
+            }
+            if page_len < crate::protocol::MAX_PROTOCOL_PAGE_LIMIT {
+                break;
             }
         }
         Ok(())
@@ -114,7 +127,7 @@ impl<S: RunEventSink + ?Sized> RunEventSink for ProtocolRecordingSink<'_, S> {
             let stored = if let Some(admission_id) = &self.admission_id {
                 self.store
                     .append_admitted_recording_projection_allocating(
-                        admission_id,
+                        *admission_id,
                         &projection.runtime_event,
                         projection.history_item.as_ref(),
                         projection.turn_item.as_ref(),
@@ -282,6 +295,17 @@ mod tests {
                 .expect("committed event")
                 .id,
             committed.id
+        );
+        sink.emit_committed(RunEvent::RecoverableRuntimeFeedback {
+            session_id,
+            message: "projection retry without a new durable row".to_string(),
+        })
+        .expect("retry committed projection");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), subscription.recv())
+                .await
+                .is_err(),
+            "an already published durable sequence must not be replayed"
         );
 
         sink.emit_runtime_only(RunEvent::TextDelta {

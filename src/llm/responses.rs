@@ -59,7 +59,7 @@ pub fn to_responses_request(
     options: ResponsesRequestOptions<'_>,
 ) -> Result<Value, LlmError> {
     request.validate_provider_lifecycle()?;
-    if request.provider_api_mode != ProviderApiMode::Responses {
+    if request.provider_target().api_mode() != ProviderApiMode::Responses {
         return Err(LlmError::Message(
             "Responses request serialization requires provider_api_mode=responses".to_string(),
         ));
@@ -100,7 +100,6 @@ pub fn to_responses_request(
                 "name": tool.name,
                 "description": tool.description,
                 "parameters": tool.input_schema,
-                "strict": tool.strict,
             })
         })
         .collect::<Vec<_>>();
@@ -275,7 +274,7 @@ fn instructions(request: &ChatRequest) -> String {
     // Responses does not carry prior `instructions` forward with
     // `previous_response_id`, so current system/compaction guidance is projected
     // on every request instead of becoming another incremental input item.
-    std::iter::once(request.provider_system_prompt())
+    std::iter::once(request.system_prompt.clone())
         .chain(request.messages.iter().filter_map(|message| match message {
             ModelMessage::System { content } => Some(content.clone()),
             _ => None,
@@ -916,29 +915,43 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::config::ProviderMetadataMode;
     use crate::config::model::{ProviderApiMode, ReasoningEffort};
+    use crate::config::{ProviderDeadlines, ProviderMetadataMode, ProviderTarget};
     use crate::llm::contract::{
         ModelCapabilities, ModelProfile, ModelToolCall, ResponsesContinuation, ToolSchema,
     };
 
     fn request(messages: Vec<ModelMessage>) -> ChatRequest {
-        ChatRequest {
-            model: ModelProfile {
-                name: "gpt-test".to_string(),
-                context_window: 128_000,
-                max_output_tokens: 4_096,
-                provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
-                capabilities: ModelCapabilities {
-                    supports_tools: true,
-                    supports_reasoning: true,
-                    supports_images: true,
-                },
+        let model = ModelProfile {
+            name: "gpt-test".to_string(),
+            context_window: 128_000,
+            max_output_tokens: 4_096,
+            provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+            capabilities: ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: true,
+                supports_images: true,
             },
-            base_url: "https://example.test/v1".to_string(),
-            system_prompt: "Base instructions".to_string(),
+        };
+        let provider = ProviderTarget::new(
+            "https://example.test/v1",
+            &model.name,
+            model.provider_metadata_mode,
+            ProviderApiMode::Responses,
+            ProviderDeadlines {
+                response_start_timeout_ms: 10_000,
+                stream_idle_timeout_ms: 10_000,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 0,
+            },
+        )
+        .expect("provider target");
+        let mut request = ChatRequest::new(
+            provider,
+            model,
+            "Base instructions".to_string(),
             messages,
-            tools: vec![ToolSchema {
+            vec![ToolSchema {
                 name: "read_file".to_string(),
                 description: "Read a file".to_string(),
                 input_schema: json!({
@@ -946,28 +959,16 @@ mod tests {
                     "properties": { "path": { "type": "string" } },
                     "required": ["path"]
                 }),
-                strict: true,
             }],
-            provider_api_mode: ProviderApiMode::Responses,
-            reasoning: None,
-            reasoning_capability: responses_capability(),
-            responses_continuation: None,
-            tool_choice: Some(ProviderToolChoice::Named {
-                name: "read_file".to_string(),
-            }),
-            parallel_tool_calls: true,
-            timeout_ms: 10_000,
-            stream_idle_timeout_ms: 10_000,
-            extra_headers: BTreeMap::new(),
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            seed: None,
-            stop_sequences: Vec::new(),
-            extra_body: None,
-        }
+            None,
+            responses_capability(),
+            BTreeMap::new(),
+        );
+        request.tool_choice = Some(ProviderToolChoice::Named {
+            name: "read_file".to_string(),
+        });
+        request.parallel_tool_calls = true;
+        request
     }
 
     fn responses_capability() -> ProviderReasoningCapability {
@@ -1036,6 +1037,7 @@ mod tests {
         );
         assert_eq!(wire["tools"][0]["type"], json!("function"));
         assert_eq!(wire["tools"][0]["parameters"]["type"], json!("object"));
+        assert!(wire["tools"][0].get("strict").is_none());
 
         let input = wire["input"].as_array().expect("input array");
         assert_eq!(input.len(), 3);
@@ -1112,7 +1114,7 @@ mod tests {
                 },
                 ModelContentPart::Image {
                     mime_type: "image/png".to_string(),
-                    data_base64: "AQID".to_string(),
+                    data_base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=".to_string(),
                 },
             ],
         }]);
@@ -1131,7 +1133,9 @@ mod tests {
         assert_eq!(wire["input"][0]["content"][0]["type"], json!("input_text"));
         assert_eq!(
             wire["input"][0]["content"][1]["image_url"],
-            json!("data:image/png;base64,AQID")
+            json!(
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            )
         );
     }
 

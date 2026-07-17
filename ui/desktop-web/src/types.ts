@@ -63,8 +63,7 @@ export type AgentStatus =
   | "interrupted"
   | "completed"
   | "errored"
-  | "shutdown"
-  | "not_found";
+  | "shutdown";
 
 export interface AgentActivityRow {
   agent_path: string;
@@ -121,18 +120,36 @@ export interface ConfigFieldProjection {
 export interface ConfigMutationTarget {
   workspacePath: string;
   sessionId: string | null;
-  configGeneration: number;
+  configGeneration: string;
 }
 
 export interface AccessModeMutationTarget extends ConfigMutationTarget {
-  accessMode: "default" | "auto_review" | "full_access";
+  accessMode: "default" | "full_access";
   runtimeOwnerToken: string;
-  configOwnerMutationOpen: boolean;
+}
+
+export interface ConfigDraftCapabilityProjection {
+  dirty: boolean;
+  edit_enabled: boolean;
+  discard_enabled: boolean;
+  commit_enabled: boolean;
+  external_owner_mutation_open: boolean;
+  access_mode_mutation_enabled: boolean;
+}
+
+export interface ConfigDraftCapabilitiesProjection {
+  clean: ConfigDraftCapabilityProjection;
+  dirty: ConfigDraftCapabilityProjection;
 }
 
 export interface DraftActionTarget {
   workspacePath: string;
   sessionId: string | null;
+  ownerGeneration: number;
+}
+
+export interface RunMutationTarget extends DraftActionTarget {
+  runtimeOwnerToken: string;
 }
 
 export interface SessionSearchTarget {
@@ -184,11 +201,7 @@ export interface DesktopWebState {
   model_label: string;
   access_label: string;
   access_target: AccessModeMutationTarget;
-  access_mode_mutation_enabled: boolean;
-  config_owner_mutation_open: boolean;
-  config_draft_dirty: boolean;
-  config_draft_discard_enabled: boolean;
-  config_draft_commit_enabled: boolean;
+  config_draft_capabilities: ConfigDraftCapabilitiesProjection;
   current_session_label: string;
   selected_session_title: string;
   status_message: string;
@@ -217,6 +230,7 @@ export interface DesktopWebState {
   attached_images: string[];
   can_submit: boolean;
   can_cancel_run: boolean;
+  run_target: RunMutationTarget;
   busy: boolean;
   async_polling_required: boolean;
   pending_async_operations: string[];
@@ -263,11 +277,6 @@ export interface DesktopWebState {
   provider_loading: boolean;
   provider_apply_enabled: boolean;
   config_fields: ConfigFieldProjection[];
-  config_items: string[];
-  selected_config_index: number;
-  config_field_title: string;
-  config_value_text: string;
-  config_feedback_text: string;
   config_target: ConfigMutationTarget;
   workspace_input: string;
   review_raw_text: string;
@@ -279,4 +288,8 @@ export interface DesktopWebState {
   enhance_enabled: boolean;
   image_input_enabled: boolean;
   window_opacity_percent: number;
+}
+
+export interface DesktopViewState extends DesktopWebState {
+  config_draft: ConfigDraftCapabilityProjection;
 }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
 use std::io::Read as _;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 
 use crate::error::EditError;
 use crate::session::SessionId;
+
+const MAX_EDIT_READ_BASELINES: usize = 4_096;
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileReadStamp {
@@ -29,10 +31,79 @@ pub struct FileContentIdentity {
     pub content_sha256: String,
 }
 
+#[derive(Debug, Clone)]
+struct CachedReadStamp {
+    stamp: FileReadStamp,
+    last_access: u64,
+}
+
+#[derive(Debug, Default)]
+struct ReadStampCache {
+    entries: HashMap<(SessionId, Utf8PathBuf), CachedReadStamp>,
+    access_clock: u64,
+}
+
+impl ReadStampCache {
+    fn next_access(&mut self) -> u64 {
+        self.access_clock = self.access_clock.saturating_add(1);
+        self.access_clock
+    }
+
+    fn insert(&mut self, session_id: SessionId, stamp: FileReadStamp) {
+        let key = (session_id, stamp.path.clone());
+        let last_access = self.next_access();
+        if !self.entries.contains_key(&key) && self.entries.len() >= MAX_EDIT_READ_BASELINES {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries
+            .insert(key, CachedReadStamp { stamp, last_access });
+    }
+
+    fn get(&mut self, session_id: SessionId, path: &Utf8Path) -> Option<FileReadStamp> {
+        let key = (session_id, path.to_path_buf());
+        let last_access = self.next_access();
+        let entry = self.entries.get_mut(&key)?;
+        entry.last_access = last_access;
+        Some(entry.stamp.clone())
+    }
+
+    fn remove(&mut self, session_id: SessionId, path: &Utf8Path) {
+        self.entries.remove(&(session_id, path.to_path_buf()));
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct EditSafety {
-    read_stamps: Arc<Mutex<HashMap<SessionId, HashMap<Utf8PathBuf, FileReadStamp>>>>,
-    file_locks: Arc<Mutex<HashMap<Utf8PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
+    read_stamps: Arc<Mutex<ReadStampCache>>,
+    file_locks: Arc<Mutex<HashMap<Utf8PathBuf, Weak<tokio::sync::Mutex<()>>>>>,
+}
+
+struct FileLockRegistryCleanup {
+    registry: Arc<Mutex<HashMap<Utf8PathBuf, Weak<tokio::sync::Mutex<()>>>>>,
+    paths: Vec<Utf8PathBuf>,
+}
+
+impl Drop for FileLockRegistryCleanup {
+    fn drop(&mut self) {
+        let Ok(mut registry) = self.registry.lock() else {
+            return;
+        };
+        for path in &self.paths {
+            if registry
+                .get(path)
+                .is_some_and(|lock| lock.strong_count() == 0)
+            {
+                registry.remove(path);
+            }
+        }
+    }
 }
 
 impl EditSafety {
@@ -42,10 +113,7 @@ impl EditSafety {
         stamp: FileReadStamp,
     ) -> Result<(), EditError> {
         let mut store = self.read_stamps.lock().expect("edit safety mutex poisoned");
-        store
-            .entry(session_id)
-            .or_default()
-            .insert(stamp.path.clone(), stamp);
+        store.insert(session_id, stamp);
         Ok(())
     }
 
@@ -90,15 +158,14 @@ impl EditSafety {
         session_id: SessionId,
         paths: &[Utf8PathBuf],
     ) -> Vec<(Utf8PathBuf, Option<FileReadStamp>)> {
-        let store = self.read_stamps.lock().expect("edit safety mutex poisoned");
-        let entries = store.get(&session_id);
         let mut unique_paths = paths.to_vec();
         unique_paths.sort();
         unique_paths.dedup();
+        let mut store = self.read_stamps.lock().expect("edit safety mutex poisoned");
         unique_paths
             .into_iter()
             .map(|path| {
-                let stamp = entries.and_then(|value| value.get(&path)).cloned();
+                let stamp = store.get(session_id, &path);
                 (path, stamp)
             })
             .collect()
@@ -110,23 +177,21 @@ impl EditSafety {
         snapshot: &[(Utf8PathBuf, Option<FileReadStamp>)],
     ) -> Result<(), EditError> {
         let mut store = self.read_stamps.lock().expect("edit safety mutex poisoned");
-        let entries = store.entry(session_id).or_default();
         for (path, stamp) in snapshot {
             if let Some(stamp) = stamp {
-                entries.insert(path.clone(), stamp.clone());
+                store.insert(session_id, stamp.clone());
             } else {
-                entries.remove(path);
+                store.remove(session_id, path);
             }
         }
         Ok(())
     }
 
     pub fn get_stamp(&self, session_id: SessionId, path: &Utf8Path) -> Option<FileReadStamp> {
-        let store = self.read_stamps.lock().expect("edit safety mutex poisoned");
-        store
-            .get(&session_id)
-            .and_then(|value| value.get(path))
-            .cloned()
+        self.read_stamps
+            .lock()
+            .expect("edit safety mutex poisoned")
+            .get(session_id, path)
     }
 
     pub fn assert_fresh_write(
@@ -137,7 +202,7 @@ impl EditSafety {
     ) -> Result<(), EditError> {
         let stamp = self.get_stamp(session_id, path).ok_or_else(|| {
             EditError::Message(format!(
-                "path `{path}` was not read in this session. Read the file with the `read` tool before the first replacement, update, or delete of an existing file in this session."
+                "no edit baseline exists for path `{path}` in this session"
             ))
         })?;
         if stamp.mtime_ms != current.mtime_ms
@@ -145,7 +210,7 @@ impl EditSafety {
             || stamp.content_sha256.as_deref() != Some(current.content_sha256.as_str())
         {
             return Err(EditError::Message(format!(
-                "path `{path}` changed since its last confirmed contents in this session. Read the current contents again before another replacement, update, or delete."
+                "the edit baseline for path `{path}` does not match its current contents"
             )));
         }
         Ok(())
@@ -160,19 +225,19 @@ impl EditSafety {
             Some(expected) => {
                 let (_, current) = read_file_with_identity(path).map_err(|error| {
                     EditError::Message(format!(
-                        "path `{path}` changed before commit and could not be revalidated: {error}"
+                        "path `{path}` could not be revalidated before commit: {error}"
                     ))
                 })?;
                 if &current != expected {
                     return Err(EditError::Message(format!(
-                        "path `{path}` changed while the edit was being prepared. The external contents were not overwritten; read the file again before retrying."
+                        "path `{path}` changed while the edit was being prepared; the commit was not applied"
                     )));
                 }
             }
             None => match fs::symlink_metadata(path) {
                 Ok(_) => {
                     return Err(EditError::Message(format!(
-                        "path `{path}` was created while the edit was being prepared. The external file was not overwritten; read it before retrying."
+                        "path `{path}` was created while the edit was being prepared; the commit was not applied"
                     )));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -186,12 +251,20 @@ impl EditSafety {
     where
         F: Future<Output = Result<T, E>>,
     {
+        let _cleanup = FileLockRegistryCleanup {
+            registry: Arc::clone(&self.file_locks),
+            paths: vec![path.to_path_buf()],
+        };
         let lock = {
             let mut locks = self.file_locks.lock().expect("edit safety mutex poisoned");
-            locks
-                .entry(path.to_path_buf())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
+            match locks.get(path).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
         };
         let _guard = lock.lock().await;
         op.await
@@ -204,15 +277,21 @@ impl EditSafety {
         let mut ordered_paths = paths.to_vec();
         ordered_paths.sort();
         ordered_paths.dedup();
+        let _cleanup = FileLockRegistryCleanup {
+            registry: Arc::clone(&self.file_locks),
+            paths: ordered_paths.clone(),
+        };
         let locks = {
             let mut store = self.file_locks.lock().expect("edit safety mutex poisoned");
             ordered_paths
                 .iter()
-                .map(|path| {
-                    store
-                        .entry(path.clone())
-                        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                        .clone()
+                .map(|path| match store.get(path).and_then(Weak::upgrade) {
+                    Some(lock) => lock,
+                    None => {
+                        let lock = Arc::new(tokio::sync::Mutex::new(()));
+                        store.insert(path.clone(), Arc::downgrade(&lock));
+                        lock
+                    }
                 })
                 .collect::<Vec<_>>()
         };
@@ -229,10 +308,8 @@ impl EditSafety {
         paths: &[Utf8PathBuf],
     ) -> Result<(), EditError> {
         let mut store = self.read_stamps.lock().expect("edit safety mutex poisoned");
-        if let Some(entries) = store.get_mut(&session_id) {
-            for path in paths {
-                entries.remove(path);
-            }
+        for path in paths {
+            store.remove(session_id, path);
         }
         Ok(())
     }
@@ -243,9 +320,17 @@ impl EditSafety {
         roots: &[Utf8PathBuf],
     ) -> Result<(), EditError> {
         let mut store = self.read_stamps.lock().expect("edit safety mutex poisoned");
-        if let Some(entries) = store.get_mut(&session_id) {
-            entries.retain(|path, _| !roots.iter().any(|root| path.starts_with(root)));
-        }
+        store.entries.retain(|(entry_session_id, path), _| {
+            *entry_session_id != session_id || !roots.iter().any(|root| path.starts_with(root))
+        });
+        Ok(())
+    }
+
+    pub fn invalidate_session(&self, session_id: SessionId) -> Result<(), EditError> {
+        let mut store = self.read_stamps.lock().expect("edit safety mutex poisoned");
+        store
+            .entries
+            .retain(|(entry_session_id, _), _| *entry_session_id != session_id);
         Ok(())
     }
 }
@@ -273,7 +358,7 @@ pub fn read_file_with_identity(
 mod tests {
     use camino::Utf8PathBuf;
 
-    use super::{EditSafety, read_file_with_identity};
+    use super::{EditSafety, FileReadStamp, MAX_EDIT_READ_BASELINES, read_file_with_identity};
 
     #[test]
     fn commit_revalidation_rejects_external_same_size_change() {
@@ -287,11 +372,7 @@ mod tests {
         let error = EditSafety::default()
             .assert_path_unchanged(&path, Some(&expected))
             .expect_err("same-size external rewrite must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("external contents were not overwritten")
-        );
+        assert!(error.to_string().contains("commit was not applied"));
         assert_eq!(std::fs::read_to_string(&path).expect("read file"), "bravo");
     }
 
@@ -336,5 +417,118 @@ mod tests {
 
         assert!(safety.get_stamp(session_id, &inside).is_none());
         assert!(safety.get_stamp(session_id, &outside).is_some());
+    }
+
+    #[test]
+    fn invalidating_a_session_removes_every_edit_baseline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = Utf8PathBuf::from_path_buf(temp.path().join("first.txt")).expect("utf8 path");
+        let second = Utf8PathBuf::from_path_buf(temp.path().join("second.txt")).expect("utf8 path");
+        std::fs::write(&first, "first").expect("write first");
+        std::fs::write(&second, "second").expect("write second");
+        let session_id = crate::session::SessionId::new();
+        let other_session_id = crate::session::SessionId::new();
+        let safety = EditSafety::default();
+        for path in [&first, &second] {
+            safety
+                .record_current_file_state(session_id, path)
+                .expect("record session baseline");
+        }
+        safety
+            .record_current_file_state(other_session_id, &first)
+            .expect("record other baseline");
+
+        safety
+            .invalidate_session(session_id)
+            .expect("invalidate session");
+
+        assert!(safety.get_stamp(session_id, &first).is_none());
+        assert!(safety.get_stamp(session_id, &second).is_none());
+        assert!(safety.get_stamp(other_session_id, &first).is_some());
+    }
+
+    #[test]
+    fn read_baseline_cache_is_globally_bounded_and_evicts_least_recently_used() {
+        let session_id = crate::session::SessionId::new();
+        let safety = EditSafety::default();
+        for index in 0..MAX_EDIT_READ_BASELINES {
+            safety
+                .record_read(
+                    session_id,
+                    FileReadStamp {
+                        path: Utf8PathBuf::from(format!("generated/{index}.txt")),
+                        read_at_ms: index as i64,
+                        mtime_ms: Some(index as i64),
+                        size_bytes: Some(index as u64),
+                        content_sha256: Some(format!("hash-{index}")),
+                    },
+                )
+                .expect("record baseline");
+        }
+        let retained = Utf8PathBuf::from("generated/0.txt");
+        assert!(safety.get_stamp(session_id, &retained).is_some());
+
+        safety
+            .record_read(
+                crate::session::SessionId::new(),
+                FileReadStamp {
+                    path: Utf8PathBuf::from("other/new.txt"),
+                    read_at_ms: 9_999,
+                    mtime_ms: Some(9_999),
+                    size_bytes: Some(1),
+                    content_sha256: Some("new".to_string()),
+                },
+            )
+            .expect("record over capacity");
+
+        let cache = safety.read_stamps.lock().expect("edit safety cache");
+        assert_eq!(cache.entries.len(), MAX_EDIT_READ_BASELINES);
+        assert!(cache.entries.contains_key(&(session_id, retained)));
+        assert!(
+            !cache
+                .entries
+                .contains_key(&(session_id, Utf8PathBuf::from("generated/1.txt")))
+        );
+    }
+
+    #[tokio::test]
+    async fn unique_file_lock_churn_does_not_grow_the_registry() {
+        let safety = EditSafety::default();
+        for index in 0..1_000 {
+            let path = Utf8PathBuf::from(format!("generated/{index}.txt"));
+            safety
+                .with_file_lock(&path, async { Ok::<_, ()>(()) })
+                .await
+                .expect("single lock operation");
+        }
+
+        assert!(
+            safety
+                .file_locks
+                .lock()
+                .expect("file lock registry")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_file_lock_cleanup_removes_only_expired_weak_entries() {
+        let safety = EditSafety::default();
+        let paths = vec![
+            Utf8PathBuf::from("generated/first.txt"),
+            Utf8PathBuf::from("generated/second.txt"),
+        ];
+        safety
+            .with_file_locks(&paths, async { Ok::<_, ()>(()) })
+            .await
+            .expect("multi lock operation");
+
+        assert!(
+            safety
+                .file_locks
+                .lock()
+                .expect("file lock registry")
+                .is_empty()
+        );
     }
 }

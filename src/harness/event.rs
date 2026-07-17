@@ -14,6 +14,9 @@ pub enum HarnessEventKind {
     StateSnapshotRecorded,
     ControlEnvelopePrepared,
     ModelProjectionBuilt,
+    ModelRequestPrepared,
+    /// Persisted compatibility for artifacts recorded before prepared and sent
+    /// were separated. New runtime projections never emit this variant.
     ModelRequestSent,
     ModelResponseReceived,
     ModelNoToolStop,

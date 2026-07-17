@@ -1,7 +1,7 @@
 //! Thin agent loop boundary shared by CLI, TUI, and Desktop surfaces.
 
 pub mod context_manager;
-mod goal_steering;
+pub(crate) mod goal_steering;
 pub mod mode;
 pub mod step_context;
 pub mod turn_context;
@@ -13,11 +13,11 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::Value;
-use tokio::sync::mpsc::UnboundedReceiver;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::ConfirmationPrompt;
-use crate::config::{AccessMode, MultiAgentMode, ResolvedConfig};
+use crate::config::MultiAgentMode;
 use crate::context::context_window::ContextWindowTokenStatus;
 use crate::context::world_state::WorldState;
 use crate::error::AgentError;
@@ -26,17 +26,17 @@ use crate::llm::{
     ModelMessage, ModelProfile, ModelToolCall, ToolSchema,
 };
 #[cfg(test)]
-use crate::protocol::{ContentPart, HistoryItem};
-use crate::protocol::{HistoryItemPayload, ModelResponseId, ProtocolEventStore, TurnId};
+use crate::protocol::{ContentPart, HistoryItem, HistoryItemPayload};
+use crate::protocol::{ModelResponseId, ProtocolEventStore, TurnId};
 use crate::runtime::{
-    ActiveSteerInput, LiveConfigOverrides, RunCancelOutcome, RunCancellationCause, RunControl,
-    RunEventSink, SuccessCommitReservation,
+    RunCancelOutcome, RunCancellationCause, RunControl, RunEventSink, SuccessCommitReservation,
 };
+#[cfg(test)]
+use crate::session::ThreadGoalStatus;
 use crate::session::{
     DurableTurnTerminal, FinishReason, RequestDiagnosticsPart, RequestMessageDiagnostic,
     RequestToolCallDiagnostic, RequestToolSchemaDiagnostic, RunConfigSnapshot, RunEvent,
-    RunMetrics, RunSummary, SessionContext, SessionStatus, ThreadGoal, ThreadGoalStatus,
-    TokenUsage, ToolCallId,
+    RunMetrics, RunSummary, SessionContext, SessionStatus, TokenUsage, ToolCallId,
 };
 use crate::storage::{
     StoreBundle,
@@ -78,7 +78,7 @@ impl PromptBuilder {
         if let Some(instructions) = turn.mode.developer_instructions {
             sections.insert(1, instructions.trim().to_string());
         }
-        if let Some(multi_agent_mode) = turn.multi_agent_mode {
+        if let Some(multi_agent_mode) = turn.multi_agent_mode() {
             sections.push(
                 match multi_agent_mode {
                     MultiAgentMode::ExplicitRequestOnly => {
@@ -107,10 +107,7 @@ pub struct AgentRunRequest {
     pub session: SessionContext,
     pub turn: Arc<turn_context::TurnContext>,
     pub context: context_manager::ContextManager,
-    pub config: ResolvedConfig,
     pub run_control: RunControl,
-    pub live_config: Option<LiveConfigOverrides>,
-    pub steer_rx: Option<UnboundedReceiver<ActiveSteerInput>>,
     pub agent_context: Option<crate::app::AgentRunContext>,
 }
 
@@ -119,15 +116,8 @@ impl AgentRunRequest {
         self.run_control.token()
     }
 
-    fn current_access_mode(&self) -> AccessMode {
-        self.live_config
-            .as_ref()
-            .map(LiveConfigOverrides::access_mode)
-            .unwrap_or(self.config.permissions.access_mode)
-    }
-
-    fn admission_id(&self) -> &str {
-        &self.turn.admission_id
+    fn admission_id(&self) -> crate::session::AdmissionId {
+        self.turn.admission_id
     }
 
     fn turn_id(&self) -> TurnId {
@@ -138,7 +128,7 @@ impl AgentRunRequest {
         self.turn
             .policy
             .model
-            .transport_profile(self.config.model.provider_metadata_mode)
+            .transport_profile(self.turn.provider_target().metadata_mode())
     }
 
     fn model_name(&self) -> &str {
@@ -191,26 +181,6 @@ impl AgentLoop {
         let repo = self.store.session_repo();
 
         let started_at = Instant::now();
-        let mut seen_steer_ids = request
-            .context
-            .history_items()
-            .iter()
-            .filter_map(|item| {
-                matches!(item.payload, HistoryItemPayload::SteerTurn { .. }).then_some(item.id)
-            })
-            .collect::<HashSet<_>>();
-        let mut seen_agent_message_ids = request
-            .context
-            .history_items()
-            .iter()
-            .filter_map(|item| {
-                matches!(
-                    item.payload,
-                    HistoryItemPayload::InterAgentCommunication { .. }
-                )
-                .then_some(item.id)
-            })
-            .collect::<HashSet<_>>();
         let mut tool_call_count = 0usize;
         let mut failed_tool_count = 0usize;
         let mut change_count = 0usize;
@@ -218,7 +188,10 @@ impl AgentLoop {
         let mut tool_calls_by_name = BTreeMap::<String, usize>::new();
         let mut failed_tool_calls_by_name = BTreeMap::<String, usize>::new();
         let mut latest_usage: Option<TokenUsage> = None;
-        let mut active_goal_id_for_turn: Option<String> = None;
+        let goal_snapshot = request.turn.goal().cloned();
+        let active_goal_id_for_turn = goal_snapshot
+            .as_ref()
+            .map(|goal| goal.goal_id().to_string());
         let mut last_model_response_id: Option<ModelResponseId> = None;
         let mut llm_turn =
             crate::llm::turn_session::LlmTurnSession::new(request.context.revision().as_str());
@@ -245,43 +218,21 @@ impl AgentLoop {
                 }
                 ensure_admission_active(&self.store, &request).await?;
 
-                drain_pending_steers(
+                drain_pending_agent_communications(&request)?;
+                let context_refresh = refresh_committed_context_page(
                     &self.store,
-                    &mut request,
-                    &mut seen_steer_ids,
-                )
-                .await?;
-                drain_pending_agent_communications(
-                    &self.store,
-                    &request,
-                    &mut seen_agent_message_ids,
+                    request.session.session.id,
+                    &mut request.context,
                 )?;
-
-                let committed_history = self
-                    .store
-                    .protocol_event_store()
-                    .list_history_items_for_session(request.session.session.id)?;
-                let history_change = request.context.replace_committed_history(committed_history);
                 llm_turn.update_history(
-                    match history_change {
-                        context_manager::HistoryChange::Unchanged => {
-                            crate::llm::turn_session::HistoryUpdateKind::Unchanged
-                        }
-                        context_manager::HistoryChange::Appended => {
-                            crate::llm::turn_session::HistoryUpdateKind::AppendOnly
-                        }
-                        context_manager::HistoryChange::Compacted => {
-                            crate::llm::turn_session::HistoryUpdateKind::Compacted
-                        }
-                        context_manager::HistoryChange::Rewritten => {
-                            crate::llm::turn_session::HistoryUpdateKind::Rewritten
-                        }
-                    },
+                    history_update_kind(context_refresh.delta.change),
                     request.context.revision().as_str(),
                 );
-                let mut step_config = request.config.clone();
-                step_config.permissions.access_mode = request.current_access_mode();
-                let step_registry = self.registry.with_config_overlays(&step_config);
+                if context_refresh.has_more {
+                    continue;
+                }
+                let step_config = request.turn.resolved_config().runtime_config();
+                let step_registry = self.registry.with_config_overlays(step_config);
                 let skills = self
                     .tool_services
                     .skills
@@ -289,15 +240,25 @@ impl AgentLoop {
                 let mut step = step_context::StepContext::capture(
                     Arc::clone(&request.turn),
                     &request.session.workspace,
-                    &step_config,
                     skills,
                     &step_registry.available_tool_names(),
                 );
-                let tool_plan =
-                    crate::tool::spec_plan::ToolSpecPlan::build(&step, &step_registry);
+                let agent_role = if request
+                    .agent_context
+                    .as_ref()
+                    .is_some_and(crate::app::AgentRunContext::is_sub_agent)
+                {
+                    crate::tool::spec_plan::AgentToolRole::Child
+                } else {
+                    crate::tool::spec_plan::AgentToolRole::Root
+                };
+                let tool_plan = crate::tool::spec_plan::ToolSpecPlan::build_for_agent(
+                    &step,
+                    &step_registry,
+                    agent_role,
+                );
                 step.refresh_world_state(
                     &request.session.workspace,
-                    &step_config,
                     &tool_plan.tool_names(),
                 );
                 let messages = request
@@ -315,33 +276,23 @@ impl AgentLoop {
                     agent.set_activity(format!("Preparing model request {}", model_request_count + 1));
                 }
 
-                let goal_for_request = self.goal_for_request(request.session.session.id).await?;
-                if let Some(goal_for_request) = &goal_for_request {
-                    active_goal_id_for_turn = Some(goal_for_request.goal_id.clone());
-                }
-                let (request_messages, has_transient_goal_steering) = messages_with_goal_steering(
-                    &messages,
-                    goal_for_request.as_ref().map(|goal| &goal.goal),
-                );
                 let mut prepared_request =
-                    self.chat_request(&request, &step, &request_messages, &tool_plan)?;
-                if has_transient_goal_steering {
-                    // Goal steering is a request-local item whose budget text can change every
-                    // round, so it never participates in persisted Responses cursor lineage.
-                    llm_turn.invalidate_cursor();
-                    prepared_request.chat_request.responses_continuation = None;
-                } else {
-                    llm_turn.prepare_request(
-                        &mut prepared_request.chat_request,
-                        request.context.revision().as_str(),
-                    )?;
-                }
+                    self.chat_request(&request, &step, &messages, &tool_plan, goal_snapshot.as_ref())?;
+                llm_turn.prepare_request(
+                    &mut prepared_request.chat_request,
+                    request.context.revision().as_str(),
+                )?;
                 let context_status = ContextWindowTokenStatus::for_request(
                     &prepared_request.chat_request,
-                    request.config.session.overflow_margin_tokens,
+                    request
+                        .turn
+                        .resolved_config()
+                        .runtime_config()
+                        .session
+                        .overflow_margin_tokens,
                 );
                 let should_compact = context_status.active_context_tokens
-                    >= request.turn.policy.model.auto_compact_token_limit;
+                    >= request.turn.policy.model.working_context_token_limit;
                 if should_compact {
                     match self
                         .compact_context(
@@ -382,7 +333,12 @@ impl AgentLoop {
                     session_id: request.session.session.id,
                     diagnostics: request_diagnostics(
                         &prepared_request.chat_request,
-                        request.config.session.overflow_margin_tokens,
+                        request
+                            .turn
+                            .resolved_config()
+                            .runtime_config()
+                            .session
+                            .overflow_margin_tokens,
                     ),
                 })?;
                 renew_admission_lease(&self.store, &request).await?;
@@ -415,7 +371,7 @@ impl AgentLoop {
                         )
                         .await;
                 };
-                if !has_transient_goal_steering && collector.is_empty() {
+                if collector.is_empty() {
                     if let Err(error) = &response_result {
                         if let Some(retry) =
                             llm_turn.full_history_retry_after_rejection(&sent_request, error)
@@ -425,7 +381,12 @@ impl AgentLoop {
                                 session_id: request.session.session.id,
                                 diagnostics: request_diagnostics(
                                     &sent_request,
-                                    request.config.session.overflow_margin_tokens,
+                                    request
+                                        .turn
+                                        .resolved_config()
+                                        .runtime_config()
+                                        .session
+                                        .overflow_margin_tokens,
                                 ),
                             })?;
                             renew_admission_lease(&self.store, &request).await?;
@@ -467,13 +428,13 @@ impl AgentLoop {
                     Err(error) => {
                         if let Some(usage) = error.token_usage().cloned() {
                             latest_usage = Some(usage.clone());
-                            if let Some(goal_for_request) = &goal_for_request {
+                            if let Some(goal) = &goal_snapshot {
                                 self.store
                                     .session_repo()
                                     .account_thread_goal_usage_for_goal(
                                         request.session.session.id,
                                         goal_token_delta(Some(&usage)),
-                                        Some(goal_for_request.goal_id.as_str()),
+                                        Some(goal.goal_id()),
                                     )
                                     .await?;
                             }
@@ -481,21 +442,19 @@ impl AgentLoop {
                         return Err(error.into());
                     }
                 };
-                if !has_transient_goal_steering {
-                    llm_turn.record_response(
-                        &sent_request,
-                        request.context.revision().as_str(),
-                        response.response_id.clone(),
-                    )?;
-                }
+                llm_turn.record_response(
+                    &sent_request,
+                    request.context.revision().as_str(),
+                    response.response_id.clone(),
+                )?;
                 latest_usage = response.usage.clone();
-                if let Some(goal_for_request) = &goal_for_request {
+                if let Some(goal) = &goal_snapshot {
                     self.store
                         .session_repo()
                         .account_thread_goal_usage_for_goal(
                             request.session.session.id,
                             goal_token_delta(response.usage.as_ref()),
-                            Some(goal_for_request.goal_id.as_str()),
+                            Some(goal.goal_id()),
                         )
                         .await?;
                 }
@@ -601,30 +560,28 @@ impl AgentLoop {
                     .collect::<Vec<_>>();
 
                 if prepared_tool_calls.is_empty() {
-                    if drain_pending_steers(
+                    drain_pending_agent_communications(&request)?;
+                    let context_refresh = refresh_committed_context_page(
                         &self.store,
-                        &mut request,
-                        &mut seen_steer_ids,
-                    )
-                    .await?
-                        > 0
-                    {
-                        continue;
-                    }
-                    if drain_pending_agent_communications(
-                        &self.store,
-                        &request,
-                        &mut seen_agent_message_ids,
-                    )? > 0
+                        request.session.session.id,
+                        &mut request.context,
+                    )?;
+                    llm_turn.update_history(
+                        history_update_kind(context_refresh.delta.change),
+                        request.context.revision().as_str(),
+                    );
+                    if context_refresh.has_more
+                        || !context_refresh.delta.steer_item_ids.is_empty()
+                        || !context_refresh
+                            .delta
+                            .agent_communication_item_ids
+                            .is_empty()
                     {
                         continue;
                     }
                     let terminal = DurableTurnTerminal {
-                        status: crate::protocol::TurnTerminalStatus::Completed,
-                        finish_reason: Some(response.finish_reason),
-                        interruption_cause: None,
+                        outcome: crate::protocol::TurnTerminalOutcome::Completed,
                         final_response_id: last_model_response_id,
-                        summary: collector.text.trim().to_string(),
                         tool_call_count,
                         failed_tool_count,
                         change_count,
@@ -666,8 +623,8 @@ impl AgentLoop {
                             &event,
                             request.turn_id(),
                             sink.reserve_protocol_sequence_no(),
-                            Some(seen_steer_ids.len()),
-                            Some(seen_agent_message_ids.len()),
+                            Some(request.context.steer_count()),
+                            Some(request.context.agent_communication_count()),
                             None,
                         )
                         .await
@@ -710,13 +667,19 @@ impl AgentLoop {
                         terminal_commit
                     {
                         success_commit.release();
-                        let drained = drain_pending_steers(
+                        drain_pending_agent_communications(&request)?;
+                        let context_refresh = refresh_committed_context_page(
                             &self.store,
-                            &mut request,
-                            &mut seen_steer_ids,
-                        )
-                        .await?;
-                        if drained > 0 {
+                            request.session.session.id,
+                            &mut request.context,
+                        )?;
+                        if context_refresh.has_more
+                            || !context_refresh.delta.steer_item_ids.is_empty()
+                        {
+                            llm_turn.update_history(
+                                history_update_kind(context_refresh.delta.change),
+                                request.context.revision().as_str(),
+                            );
                             continue;
                         }
                         return Err(AgentError::Message(format!(
@@ -730,12 +693,22 @@ impl AgentLoop {
                     } = terminal_commit
                     {
                         success_commit.release();
-                        let drained = drain_pending_agent_communications(
+                        drain_pending_agent_communications(&request)?;
+                        let context_refresh = refresh_committed_context_page(
                             &self.store,
-                            &request,
-                            &mut seen_agent_message_ids,
+                            request.session.session.id,
+                            &mut request.context,
                         )?;
-                        if drained > 0 {
+                        if context_refresh.has_more
+                            || !context_refresh
+                                .delta
+                                .agent_communication_item_ids
+                                .is_empty()
+                        {
+                            llm_turn.update_history(
+                                history_update_kind(context_refresh.delta.change),
+                                request.context.revision().as_str(),
+                            );
                             continue;
                         }
                         return Err(AgentError::Message(format!(
@@ -775,7 +748,10 @@ impl AgentLoop {
                         return Err(run_superseded_error(&request));
                     }
                     success_commit.seal();
-                    sink.emit_committed(event)?;
+                    // The repository transaction above is the terminal owner. Event delivery is
+                    // a recoverable projection path and must not turn durable success into a
+                    // synthetic supersession/failure.
+                    let _ = sink.emit_committed(event);
                     return Ok(run_summary_from_terminal(&request, terminal));
                 }
 
@@ -813,7 +789,6 @@ impl AgentLoop {
                             call.clone(),
                             prompt,
                             sink,
-                            &mut model_request_count,
                         )
                         .await?;
                     record_tool_dispatch_failure(
@@ -868,16 +843,16 @@ impl AgentLoop {
         match outcome {
             Ok(summary) => Ok(summary),
             Err(error) => {
+                if let Some(summary) = self.durable_terminal_summary(&request).await? {
+                    return Ok(summary);
+                }
                 if matches!(&error, AgentError::RunSuperseded { .. }) {
-                    if let Some(summary) = self.durable_terminal_summary(&request).await? {
-                        return Ok(summary);
-                    }
                     return Err(error);
                 }
                 let owned_status = repo
                     .admitted_run_status(
                         request.session.session.id,
-                        &request.turn.admission_id,
+                        request.turn.admission_id,
                         request.turn.turn_id,
                     )
                     .await?;
@@ -930,11 +905,10 @@ impl AgentLoop {
                     return Err(error);
                 }
                 let terminal = DurableTurnTerminal {
-                    status: crate::protocol::TurnTerminalStatus::Failed,
-                    finish_reason: Some(FinishReason::Error),
-                    interruption_cause: None,
+                    outcome: crate::protocol::TurnTerminalOutcome::Failed {
+                        error: failure_message,
+                    },
                     final_response_id: last_model_response_id,
-                    summary: failure_message,
                     tool_call_count,
                     failed_tool_count,
                     change_count,
@@ -1030,43 +1004,45 @@ impl AgentLoop {
         step: &step_context::StepContext,
         messages: &[ModelMessage],
         tool_plan: &crate::tool::spec_plan::ToolSpecPlan,
+        goal: Option<&goal_steering::GoalSnapshot>,
     ) -> Result<PreparedChatRequest, AgentError> {
-        let provider_api_mode = request.turn.policy.provider.api_mode;
         let reasoning = request.turn.policy.reasoning.clone();
         let reasoning_capability = request.turn.policy.provider.reasoning;
         let model = request.model_profile();
-        let chat_request = ChatRequest {
+        let resolved_model = &request.turn.resolved_config().runtime_config().model;
+        let provider_target = request.turn.provider_target();
+        let system_prompt = self.prompt_builder.build(
+            &step.world_state,
+            &step.skills,
+            &request.turn,
+            request
+                .agent_context
+                .as_ref()
+                .is_some_and(crate::app::AgentRunContext::is_sub_agent),
+        );
+        let mut request_messages = messages.to_vec();
+        if let Some(goal_message) = goal.and_then(goal_steering::steering_message_for_goal) {
+            request_messages.push(goal_message);
+        }
+        let mut chat_request = ChatRequest::new(
+            provider_target.clone(),
             model,
-            base_url: request.config.model.base_url.clone(),
-            system_prompt: self.prompt_builder.build(
-                &step.world_state,
-                &step.skills,
-                &request.turn,
-                request
-                    .agent_context
-                    .as_ref()
-                    .is_some_and(crate::app::AgentRunContext::is_sub_agent),
-            ),
-            messages: messages.to_vec(),
-            tools: tool_plan.model_visible_specs().to_vec(),
-            provider_api_mode,
+            system_prompt,
+            request_messages,
+            tool_plan.model_visible_specs().to_vec(),
             reasoning,
             reasoning_capability,
-            responses_continuation: None,
-            tool_choice: None,
-            parallel_tool_calls: tool_plan.parallel_tool_calls(),
-            timeout_ms: request.config.model.request_timeout_ms,
-            stream_idle_timeout_ms: request.config.model.stream_idle_timeout_ms,
-            extra_headers: request.config.model.extra_headers.clone(),
-            temperature: request.config.model.temperature,
-            top_p: request.config.model.top_p,
-            top_k: request.config.model.top_k,
-            presence_penalty: request.config.model.presence_penalty,
-            frequency_penalty: request.config.model.frequency_penalty,
-            seed: request.config.model.seed,
-            stop_sequences: request.config.model.stop_sequences.clone(),
-            extra_body: request.config.model.extra_body_json.clone(),
-        };
+            resolved_model.extra_headers.clone(),
+        );
+        chat_request.parallel_tool_calls = tool_plan.parallel_tool_calls();
+        chat_request.temperature = resolved_model.temperature;
+        chat_request.top_p = resolved_model.top_p;
+        chat_request.top_k = resolved_model.top_k;
+        chat_request.presence_penalty = resolved_model.presence_penalty;
+        chat_request.frequency_penalty = resolved_model.frequency_penalty;
+        chat_request.seed = resolved_model.seed;
+        chat_request.stop_sequences = resolved_model.stop_sequences.clone();
+        chat_request.extra_body = resolved_model.extra_body_json.clone();
         chat_request.validate_provider_lifecycle()?;
         Ok(PreparedChatRequest {
             chat_request,
@@ -1100,7 +1076,12 @@ impl AgentLoop {
         let active_ids = request.context.active_item_ids();
         let current_status = ContextWindowTokenStatus::for_request(
             request_template,
-            request.config.session.overflow_margin_tokens,
+            request
+                .turn
+                .resolved_config()
+                .runtime_config()
+                .session
+                .overflow_margin_tokens,
         );
         let mut selected_units = Vec::new();
         let mut replacement_item_ids = Vec::new();
@@ -1123,10 +1104,15 @@ impl AgentLoop {
             projected.messages.extend(transient_messages.clone());
             let projected_status = ContextWindowTokenStatus::for_request(
                 &projected,
-                request.config.session.overflow_margin_tokens,
+                request
+                    .turn
+                    .resolved_config()
+                    .runtime_config()
+                    .session
+                    .overflow_margin_tokens,
             );
             if projected_status.active_context_tokens
-                < request.turn.policy.model.auto_compact_token_limit
+                < request.turn.policy.model.working_context_token_limit
             {
                 break;
             }
@@ -1155,7 +1141,12 @@ impl AgentLoop {
         post_compaction.messages.extend(transient_messages);
         let post_status = ContextWindowTokenStatus::for_request(
             &post_compaction,
-            request.config.session.overflow_margin_tokens,
+            request
+                .turn
+                .resolved_config()
+                .runtime_config()
+                .session
+                .overflow_margin_tokens,
         );
         if post_status.active_context_tokens >= current_status.active_context_tokens {
             return Err(AgentError::Message(format!(
@@ -1163,11 +1154,25 @@ impl AgentLoop {
                 current_status.active_context_tokens, post_status.active_context_tokens
             )));
         }
-        sink.emit(RunEvent::CompactionCompleted {
+        let event = RunEvent::CompactionCompleted {
             summarized_messages: replacement_item_ids.len(),
             summary,
             replacement_item_ids,
-        })?;
+        };
+        self.store
+            .session_repo()
+            .commit_admitted_compaction_with_protocol_bundle(
+                request.session.session.id,
+                request.admission_id(),
+                &event,
+                request.turn_id(),
+                sink.reserve_protocol_sequence_no(),
+            )
+            .await?;
+        // Canonical compaction is committed by the repository transaction above. A failed
+        // publisher/UI projection cannot revoke it; the next loop iteration reloads the durable
+        // append through ContextManager.
+        let _ = sink.emit_committed(event);
         Ok(true)
     }
 
@@ -1184,7 +1189,12 @@ impl AgentLoop {
             let batches = build_compaction_batches(
                 request_template,
                 &segments,
-                request.config.session.overflow_margin_tokens,
+                request
+                    .turn
+                    .resolved_config()
+                    .runtime_config()
+                    .session
+                    .overflow_margin_tokens,
             )?;
             let mut summaries = Vec::with_capacity(batches.len());
             for batch in batches {
@@ -1233,7 +1243,12 @@ impl AgentLoop {
             session_id: request.session.session.id,
             diagnostics: request_diagnostics(
                 &compaction_request,
-                request.config.session.overflow_margin_tokens,
+                request
+                    .turn
+                    .resolved_config()
+                    .runtime_config()
+                    .session
+                    .overflow_margin_tokens,
             ),
         })?;
         renew_admission_lease(&self.store, request).await?;
@@ -1281,13 +1296,13 @@ impl AgentLoop {
                 "semantic compaction returned an empty summary".to_string(),
             ));
         }
-        if let Some(goal) = self.goal_for_request(request.session.session.id).await? {
+        if let Some(goal) = request.turn.goal() {
             self.store
                 .session_repo()
                 .account_thread_goal_usage_for_goal(
                     request.session.session.id,
                     goal_token_delta(response.usage.as_ref()),
-                    Some(goal.goal_id.as_str()),
+                    Some(goal.goal_id()),
                 )
                 .await?;
         }
@@ -1301,7 +1316,6 @@ impl AgentLoop {
         call: PreparedModelToolCall,
         prompt: &mut dyn ConfirmationPrompt,
         sink: &mut dyn RunEventSink,
-        model_request_count: &mut usize,
     ) -> Result<ToolDispatchOutcome, AgentError> {
         let repo = self.store.session_repo();
         let PreparedModelToolCall {
@@ -1348,36 +1362,23 @@ impl AgentLoop {
         }
 
         renew_admission_lease(&self.store, request).await?;
-        let permission_review_context = permission_review_context(request);
-        let model_request_gate = request
-            .agent_context
-            .as_ref()
-            .map(crate::app::AgentRunContext::model_request_gate)
-            .or_else(|| self.model_request_gate.clone());
-        let permission_reviewer_model = request.model_profile();
         let ctx = crate::tool::context::ToolContext {
             session: &request.session,
             workspace: &request.session.workspace,
-            config: &request.config,
-            live_config: request.live_config.clone(),
+            config: request.turn.resolved_config().runtime_config(),
             tool_call_id,
             cancel: request.cancel_token(),
             run_control: request.run_control.clone(),
             run_mutation_fence: RunMutationFence::new(
                 self.store.session_repo(),
                 request.session.session.id,
-                request.admission_id().to_string(),
+                request.admission_id(),
                 request.turn_id(),
                 request.run_control.clone(),
             ),
             prompt,
             services: &self.tool_services,
             agent: request.agent_context.as_ref(),
-            permission_reviewer_llm: self.llm.as_ref(),
-            permission_reviewer_model: &permission_reviewer_model,
-            permission_review_context: &permission_review_context,
-            model_request_gate,
-            model_request_count,
         };
         let mut cancellation_cleanup_diagnostic = None;
         let execution_result = {
@@ -1644,7 +1645,7 @@ impl AgentLoop {
                         tool_call_id,
                         tool_name,
                         crate::session::ToolCallStatus::Cancelled,
-                        interruption.legacy_reason(),
+                        interruption.summary(),
                         metadata,
                         request.turn_id(),
                         sink.reserve_protocol_sequence_no(),
@@ -1696,7 +1697,7 @@ impl AgentLoop {
         let (status, reason, interrupted) = match request.run_control.cause() {
             Some(RunCancellationCause::Interruption(interruption)) => (
                 crate::session::ToolCallStatus::Cancelled,
-                interruption.legacy_reason().to_string(),
+                interruption.summary().to_string(),
                 true,
             ),
             Some(RunCancellationCause::Failure(message)) => {
@@ -1790,11 +1791,8 @@ impl AgentLoop {
         match request.run_control.cause() {
             Some(RunCancellationCause::Interruption(cause)) => {
                 let terminal = DurableTurnTerminal {
-                    status: crate::protocol::TurnTerminalStatus::Interrupted,
-                    finish_reason: Some(FinishReason::Cancelled),
-                    interruption_cause: Some(cause),
+                    outcome: crate::protocol::TurnTerminalOutcome::Interrupted { cause },
                     final_response_id,
-                    summary: cause.legacy_reason().to_string(),
                     tool_call_count,
                     failed_tool_count,
                     change_count,
@@ -1826,11 +1824,8 @@ impl AgentLoop {
             }
             Some(RunCancellationCause::Failure(message)) => {
                 let terminal = DurableTurnTerminal {
-                    status: crate::protocol::TurnTerminalStatus::Failed,
-                    finish_reason: Some(FinishReason::Error),
-                    interruption_cause: None,
+                    outcome: crate::protocol::TurnTerminalOutcome::Failed { error: message },
                     final_response_id,
-                    summary: message,
                     tool_call_count,
                     failed_tool_count,
                     change_count,
@@ -1867,14 +1862,9 @@ impl AgentLoop {
     ) -> Result<Option<RunSummary>, AgentError> {
         let terminal = self
             .store
-            .protocol_event_store()
-            .list_runtime_events(request.session.session.id, request.turn_id())?
-            .into_iter()
-            .rev()
-            .find_map(|event| match event.msg {
-                crate::protocol::RuntimeEventMsg::TurnTerminal { terminal } => Some(*terminal),
-                _ => None,
-            });
+            .session_repo()
+            .durable_terminal_for_turn(request.session.session.id, request.turn_id())
+            .await?;
         Ok(terminal.map(|terminal| run_summary_from_terminal(request, terminal)))
     }
 
@@ -1904,28 +1894,11 @@ impl AgentLoop {
             )
             .await?;
         if terminal_commit == AdmittedTerminalCommit::Applied {
-            sink.emit_committed(event)?;
+            // Durable terminal state has already committed. Projection delivery is best effort
+            // and can be recovered from the canonical runtime-event stream.
+            let _ = sink.emit_committed(event);
         }
         Ok(terminal_commit)
-    }
-
-    async fn goal_for_request(
-        &self,
-        session_id: crate::session::SessionId,
-    ) -> Result<Option<AgentGoalForRequest>, AgentError> {
-        let goal = self
-            .store
-            .session_repo()
-            .get_thread_goal_with_id(session_id)
-            .await?;
-        Ok(goal
-            .filter(|(goal, _goal_id)| {
-                matches!(
-                    goal.status,
-                    ThreadGoalStatus::Active | ThreadGoalStatus::BudgetLimited
-                )
-            })
-            .map(|(goal, goal_id)| AgentGoalForRequest { goal, goal_id }))
     }
 }
 
@@ -1933,12 +1906,12 @@ fn resolve_success_commit_from_durable_summary(
     reservation: SuccessCommitReservation,
     summary: &RunSummary,
 ) {
-    match summary.status {
+    match summary.status() {
         SessionStatus::Completed => {
             reservation.seal();
         }
         SessionStatus::Cancelled => {
-            let cause = summary.interruption_cause.map_or(
+            let cause = summary.interruption_cause().map_or(
                 RunCancellationCause::Superseded,
                 RunCancellationCause::Interruption,
             );
@@ -1953,11 +1926,6 @@ fn resolve_success_commit_from_durable_summary(
             reservation.resolve_authoritative_cancellation(RunCancellationCause::Superseded);
         }
     }
-}
-
-struct AgentGoalForRequest {
-    goal: ThreadGoal,
-    goal_id: String,
 }
 
 struct PreparedChatRequest {
@@ -1989,11 +1957,11 @@ fn compaction_request_with_content(template: &ChatRequest, content: String) -> C
 
 fn compaction_content_fits(
     template: &ChatRequest,
-    content: String,
+    content: &str,
     overflow_margin_tokens: usize,
 ) -> bool {
     !ContextWindowTokenStatus::for_request(
-        &compaction_request_with_content(template, content),
+        &compaction_request_with_content(template, content.to_string()),
         overflow_margin_tokens,
     )
     .token_limit_reached
@@ -2004,7 +1972,7 @@ fn build_compaction_batches(
     segments: &[String],
     overflow_margin_tokens: usize,
 ) -> Result<Vec<String>, AgentError> {
-    if !compaction_content_fits(template, String::new(), overflow_margin_tokens) {
+    if !compaction_content_fits(template, "", overflow_margin_tokens) {
         return Err(AgentError::Message(
             "semantic compaction has no model input capacity after output and safety reservation; canonical history was left unchanged"
                 .to_string(),
@@ -2018,14 +1986,14 @@ fn build_compaction_batches(
         } else {
             format!("{current}\n\n---\n\n{segment}")
         };
-        if compaction_content_fits(template, candidate.clone(), overflow_margin_tokens) {
+        if compaction_content_fits(template, &candidate, overflow_margin_tokens) {
             current = candidate;
             continue;
         }
         if !current.is_empty() {
             batches.push(std::mem::take(&mut current));
         }
-        if compaction_content_fits(template, segment.clone(), overflow_margin_tokens) {
+        if compaction_content_fits(template, segment, overflow_margin_tokens) {
             current = segment.clone();
             continue;
         }
@@ -2051,21 +2019,38 @@ fn split_compaction_segment(
     segment: &str,
     overflow_margin_tokens: usize,
 ) -> Result<Vec<String>, AgentError> {
-    let characters = segment.chars().collect::<Vec<_>>();
-    let mut offset = 0;
+    let mut offset_bytes = 0;
     let mut chunks = Vec::new();
-    while offset < characters.len() {
+    while offset_bytes < segment.len() {
+        let remaining = &segment[offset_bytes..];
         let mut low = 1;
-        let mut high = characters.len() - offset;
+        let mut high = remaining.len();
         let mut best = 0;
         while low <= high {
             let mid = low + (high - low) / 2;
-            let candidate = characters[offset..offset + mid].iter().collect::<String>();
-            if compaction_content_fits(template, candidate, overflow_margin_tokens) {
-                best = mid;
-                low = mid + 1;
+            let mut candidate_end = mid;
+            while candidate_end > 0 && !remaining.is_char_boundary(candidate_end) {
+                candidate_end -= 1;
+            }
+            if candidate_end < low {
+                candidate_end = mid;
+                while candidate_end < remaining.len() && !remaining.is_char_boundary(candidate_end)
+                {
+                    candidate_end += 1;
+                }
+                if candidate_end > high {
+                    break;
+                }
+            }
+            if compaction_content_fits(
+                template,
+                &remaining[..candidate_end],
+                overflow_margin_tokens,
+            ) {
+                best = candidate_end;
+                low = candidate_end + 1;
             } else {
-                high = mid.saturating_sub(1);
+                high = candidate_end.saturating_sub(1);
             }
         }
         if best == 0 {
@@ -2074,8 +2059,8 @@ fn split_compaction_segment(
                     .to_string(),
             ));
         }
-        chunks.push(characters[offset..offset + best].iter().collect::<String>());
-        offset += best;
+        chunks.push(remaining[..best].to_string());
+        offset_bytes += best;
     }
     Ok(chunks)
 }
@@ -2091,21 +2076,6 @@ fn context_limit_error(status: &ContextWindowTokenStatus) -> AgentError {
     ))
 }
 
-fn messages_with_goal_steering(
-    messages: &[ModelMessage],
-    goal: Option<&ThreadGoal>,
-) -> (Vec<ModelMessage>, bool) {
-    let Some(goal) = goal else {
-        return (messages.to_vec(), false);
-    };
-    let Some(steering) = goal_steering::steering_message_for_goal(goal) else {
-        return (messages.to_vec(), false);
-    };
-    let mut request_messages = messages.to_vec();
-    request_messages.push(steering);
-    (request_messages, true)
-}
-
 async fn ensure_admission_active(
     store: &StoreBundle,
     request: &AgentRunRequest,
@@ -2114,7 +2084,7 @@ async fn ensure_admission_active(
         .session_repo()
         .admitted_run_status(
             request.session.session.id,
-            &request.turn.admission_id,
+            request.turn.admission_id,
             request.turn.turn_id,
         )
         .await?;
@@ -2133,22 +2103,24 @@ async fn renew_admission_lease(
         .session_repo()
         .renew_admitted_run_lease(
             request.session.session.id,
-            &request.turn.admission_id,
+            request.turn.admission_id,
             request.turn.turn_id,
         )
         .await?;
-    if renewed == RunAdmissionLeaseRenewalOutcome::Renewed {
-        Ok(())
-    } else {
-        request.run_control.supersede();
-        Err(run_superseded_error(request))
+    match renewed {
+        RunAdmissionLeaseRenewalOutcome::Renewed => Ok(()),
+        RunAdmissionLeaseRenewalOutcome::Terminal(_)
+        | RunAdmissionLeaseRenewalOutcome::SupersededOrExpired => {
+            request.run_control.supersede();
+            Err(run_superseded_error(request))
+        }
     }
 }
 
 fn run_superseded_error(request: &AgentRunRequest) -> AgentError {
     AgentError::RunSuperseded {
         session_id: request.session.session.id,
-        admission_id: request.admission_id().to_string(),
+        admission_id: request.admission_id(),
     }
 }
 
@@ -2168,73 +2140,78 @@ fn tool_terminal_race_outcome(
     }
 }
 
-async fn drain_pending_steers(
-    store: &StoreBundle,
-    request: &mut AgentRunRequest,
-    seen_steer_ids: &mut HashSet<crate::protocol::HistoryItemId>,
-) -> Result<usize, AgentError> {
-    ensure_admission_active(store, request).await?;
-    let mut drained = 0;
-    let turn_id = request.turn_id();
-    if let Some(receiver) = request.steer_rx.as_mut() {
-        while let Ok(input) = receiver.try_recv() {
-            if input.steer.expected_turn_id != turn_id {
-                request.run_control.supersede();
-                return Err(run_superseded_error(request));
-            }
-            if seen_steer_ids.insert(input.history_item_id) {
-                drained += 1;
-            }
-        }
-    }
-    let Some(stored_steers) = store
-        .session_repo()
-        .list_admitted_turn_steers(
-            request.session.session.id,
-            &request.turn.admission_id,
-            request.turn.turn_id,
-        )
-        .await?
-    else {
-        request.run_control.supersede();
-        return Err(run_superseded_error(request));
-    };
-    for item in stored_steers {
-        if let HistoryItemPayload::SteerTurn { content, .. } = item.payload {
-            if !seen_steer_ids.insert(item.id) {
-                continue;
-            }
-            let _ = content;
-            drained += 1;
-        }
-    }
-    Ok(drained)
-}
-
-fn drain_pending_agent_communications(
-    store: &StoreBundle,
-    request: &AgentRunRequest,
-    seen_message_ids: &mut HashSet<crate::protocol::HistoryItemId>,
-) -> Result<usize, AgentError> {
+fn drain_pending_agent_communications(request: &AgentRunRequest) -> Result<usize, AgentError> {
     let Some(agent) = request.agent_context.as_ref() else {
         return Ok(0);
     };
-    let _ = agent.drain_mailbox();
-    let history_items = store
+    agent
+        .drain_mailbox()
+        .map(|notices| notices.len())
+        .map_err(AgentError::Message)
+}
+
+struct CommittedContextRefreshPage {
+    delta: context_manager::ContextDelta,
+    has_more: bool,
+}
+
+/// Advances the sole durable model-context cursor by at most one bounded page.
+///
+/// Steer wake-ups intentionally carry no content or item identity. New input is
+/// observed exactly once through `ContextManager::append_cursor`, including
+/// after a process restart or a missed/coalesced wake-up.
+fn refresh_committed_context_page(
+    store: &StoreBundle,
+    session_id: crate::session::SessionId,
+    context: &mut context_manager::ContextManager,
+) -> Result<CommittedContextRefreshPage, AgentError> {
+    let previous_cursor = context.append_cursor();
+    let page = store
         .protocol_event_store()
-        .list_history_items_for_session(request.session.session.id)?;
-    let mut drained = 0;
-    for item in history_items {
-        let HistoryItemPayload::InterAgentCommunication { communication } = item.payload else {
-            continue;
-        };
-        if !seen_message_ids.insert(item.id) {
-            continue;
+        .history_item_cursor_page_for_session(
+            session_id,
+            previous_cursor,
+            crate::protocol::MAX_PROTOCOL_PAGE_LIMIT,
+        )?;
+    let has_more = page.has_more();
+    if page.items.is_empty() {
+        if has_more {
+            return Err(AgentError::Message(format!(
+                "canonical history cursor for session {session_id} made no progress after {previous_cursor:?}"
+            )));
         }
-        let _ = communication;
-        drained += 1;
+        return Ok(CommittedContextRefreshPage {
+            delta: context_manager::ContextDelta {
+                change: context_manager::HistoryChange::Unchanged,
+                steer_item_ids: Vec::new(),
+                agent_communication_item_ids: Vec::new(),
+            },
+            has_more: false,
+        });
     }
-    Ok(drained)
+    if page.next_cursor == previous_cursor {
+        return Err(AgentError::Message(format!(
+            "canonical history cursor for session {session_id} did not advance after {previous_cursor:?}"
+        )));
+    }
+    let delta = context.ingest_committed_delta(page.items, page.next_cursor);
+    Ok(CommittedContextRefreshPage { delta, has_more })
+}
+
+fn history_update_kind(
+    change: context_manager::HistoryChange,
+) -> crate::llm::turn_session::HistoryUpdateKind {
+    match change {
+        context_manager::HistoryChange::Unchanged => {
+            crate::llm::turn_session::HistoryUpdateKind::Unchanged
+        }
+        context_manager::HistoryChange::Appended => {
+            crate::llm::turn_session::HistoryUpdateKind::AppendOnly
+        }
+        context_manager::HistoryChange::Compacted => {
+            crate::llm::turn_session::HistoryUpdateKind::Compacted
+        }
+    }
 }
 
 fn validate_provider_response_terminal(
@@ -2325,15 +2302,21 @@ struct ResponseCollector {
     tool_call_order: Vec<String>,
     tool_call_args: HashMap<String, String>,
     tool_call_names: HashMap<String, String>,
+    provider_phases: Vec<crate::llm::ProviderPhaseEvent>,
 }
 
 impl LlmEventSink for ResponseCollector {
     fn push(&mut self, event: LlmEvent) -> Result<(), crate::error::LlmError> {
-        self.saw_event = true;
         match event {
-            LlmEvent::TextDelta(delta) => self.text.push_str(&delta),
-            LlmEvent::ReasoningSummaryDelta(_) => {}
+            LlmEvent::TextDelta(delta) => {
+                self.saw_event = true;
+                self.text.push_str(&delta);
+            }
+            LlmEvent::ReasoningSummaryDelta(_) => {
+                self.saw_event = true;
+            }
             LlmEvent::ToolCallStart { call_id, tool_name } => {
+                self.saw_event = true;
                 if !self.tool_call_order.iter().any(|seen| seen == &call_id) {
                     self.tool_call_order.push(call_id.clone());
                 }
@@ -2341,14 +2324,25 @@ impl LlmEventSink for ResponseCollector {
                 self.tool_call_args.entry(call_id).or_default();
             }
             LlmEvent::ToolCallArgsDelta { call_id, delta } => {
+                self.saw_event = true;
                 self.tool_call_args
                     .entry(call_id)
                     .or_default()
                     .push_str(&delta);
             }
-            LlmEvent::Finished { .. } => {}
+            LlmEvent::Finished { .. } => {
+                self.saw_event = true;
+            }
         }
         self.rebuild_tool_calls();
+        Ok(())
+    }
+
+    fn provider_phase(
+        &mut self,
+        event: crate::llm::ProviderPhaseEvent,
+    ) -> Result<(), crate::error::LlmError> {
+        self.provider_phases.push(event);
         Ok(())
     }
 }
@@ -2394,6 +2388,19 @@ impl LlmEventSink for StreamingResponseCollector<'_> {
         }
         self.inner.push(event)
     }
+
+    fn provider_phase(
+        &mut self,
+        event: crate::llm::ProviderPhaseEvent,
+    ) -> Result<(), crate::error::LlmError> {
+        self.sink
+            .emit_runtime_only(RunEvent::ProviderPhase {
+                response_id: self.response_id,
+                event: event.clone(),
+            })
+            .map_err(|error| crate::error::LlmError::Message(error.to_string()))?;
+        self.inner.provider_phase(event)
+    }
 }
 
 impl ResponseCollector {
@@ -2426,18 +2433,7 @@ fn run_summary_from_terminal(
     request: &AgentRunRequest,
     terminal: DurableTurnTerminal,
 ) -> RunSummary {
-    RunSummary {
-        session_id: request.session.session.id,
-        turn_id: Some(request.turn_id()),
-        final_response_id: terminal.final_response_id,
-        status: terminal.status.as_session_status(),
-        finish_reason: terminal.finish_reason,
-        interruption_cause: terminal.interruption_cause,
-        tool_call_count: terminal.tool_call_count,
-        failed_tool_count: terminal.failed_tool_count,
-        change_count: terminal.change_count,
-        metrics: terminal.metrics,
-    }
+    RunSummary::from_terminal(request.session.session.id, request.turn_id(), terminal)
 }
 
 fn run_metrics(
@@ -2456,8 +2452,17 @@ fn run_metrics(
         failed_tool_calls_by_name: failed_tool_calls_by_name.clone(),
         config: Some(RunConfigSnapshot {
             model: request.model_name().to_string(),
-            base_url: request.config.model.base_url.clone(),
-            access_mode: request.current_access_mode().as_str().to_string(),
+            base_url: request
+                .turn
+                .provider_target()
+                .sanitized_endpoint()
+                .to_string(),
+            access_mode: request
+                .turn
+                .resolved_config()
+                .runtime_config()
+                .permissions
+                .access_mode,
         }),
     }
 }
@@ -2470,9 +2475,12 @@ fn request_diagnostics(
     RequestDiagnosticsPart {
         provider: "openai_compat".to_string(),
         model_name: request.model.name.clone(),
-        base_url: request.base_url.clone(),
-        request_timeout_ms: request.timeout_ms,
-        stream_idle_timeout_ms: request.stream_idle_timeout_ms,
+        base_url: request.provider_target().sanitized_endpoint().to_string(),
+        request_timeout_ms: request
+            .provider_target()
+            .deadlines()
+            .response_start_timeout_ms,
+        stream_idle_timeout_ms: request.provider_target().deadlines().stream_idle_timeout_ms,
         configured_max_output_tokens: Some(request.model.max_output_tokens),
         effective_max_output_tokens: Some(request.effective_max_output_tokens()),
         output_budget_reason: Some(request.output_budget_reason().to_string()),
@@ -2500,7 +2508,6 @@ fn request_diagnostics(
             .map(|tool| RequestToolSchemaDiagnostic {
                 name: tool.name.clone(),
                 description_chars: tool.description.chars().count(),
-                strict: tool.strict,
                 input_schema: tool.input_schema.clone(),
             })
             .collect(),
@@ -2626,44 +2633,6 @@ fn content_markers(content: &str) -> Vec<String> {
     markers
 }
 
-fn permission_review_context(request: &AgentRunRequest) -> String {
-    const MAX_ITEMS: usize = 20;
-    const MAX_ITEM_CHARS: usize = 4_000;
-    const MAX_CONTEXT_CHARS: usize = 16_000;
-
-    let mut rendered = Vec::new();
-    let mut remaining = MAX_CONTEXT_CHARS;
-    for item in request.context.history_items().iter().rev().take(MAX_ITEMS) {
-        if remaining == 0 {
-            break;
-        }
-        let value = serde_json::to_string(&item.payload)
-            .unwrap_or_else(|error| format!("{{\"serialization_error\":\"{error}\"}}"));
-        let clipped = clip_chars(&value, MAX_ITEM_CHARS.min(remaining));
-        remaining = remaining.saturating_sub(clipped.chars().count());
-        rendered.push(clipped);
-    }
-    rendered.reverse();
-    if rendered.is_empty() {
-        "No prior task context is available.".to_string()
-    } else {
-        rendered.join("\n")
-    }
-}
-
-fn clip_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        value.to_string()
-    } else {
-        let mut clipped = value
-            .chars()
-            .take(max_chars.saturating_sub(1))
-            .collect::<String>();
-        clipped.push('…');
-        clipped
-    }
-}
-
 #[cfg(test)]
 fn messages_from_history(history_items: &[HistoryItem]) -> Vec<ModelMessage> {
     context_manager::ContextManager::rehydrate(history_items.to_vec()).model_messages(true)
@@ -2683,10 +2652,27 @@ fn content_text(content: &[ContentPart]) -> String {
 
 fn parse_tool_arguments(arguments_json: &str) -> Result<Value, AgentError> {
     serde_json::from_str(arguments_json).map_err(|error| {
+        let digest = Sha256::digest(arguments_json.as_bytes());
+        let preview = bounded_utf8_prefix(arguments_json, 512);
+        let preview = serde_json::to_string(preview).unwrap_or_else(|_| "\"<unavailable>\"".into());
         AgentError::Message(format!(
-            "invalid tool arguments JSON: {error}; input={arguments_json}"
+            "invalid tool arguments JSON at line {}, column {}; input_bytes={}; input_sha256={digest:x}; preview={preview}",
+            error.line(),
+            error.column(),
+            arguments_json.len(),
         ))
     })
+}
+
+fn bounded_utf8_prefix(input: &str, max_bytes: usize) -> &str {
+    if input.len() <= max_bytes {
+        return input;
+    }
+    let mut end = max_bytes.min(input.len());
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    &input[..end]
 }
 
 fn validate_shallow_schema(
@@ -2826,7 +2812,7 @@ mod tests {
     use crate::error::LlmError;
     use crate::llm::LlmResponseSummary;
     use crate::protocol::{
-        ContentPart, HistoryItem, ProtocolEventStore, ToolLifecycleStatus, TurnTerminalStatus,
+        ContentPart, HistoryItem, HistoryScope, ProtocolEventStore, SteerTurn, ToolLifecycleStatus,
         UserInputItem, UserTurn,
     };
     use crate::runtime::SystemClock;
@@ -2880,6 +2866,7 @@ mod tests {
     struct CapturingSink {
         events: Vec<RunEvent>,
         sequence_no: i64,
+        fail_committed_terminal_delivery: bool,
     }
 
     impl RunEventSink for CapturingSink {
@@ -2893,74 +2880,229 @@ mod tests {
             self.sequence_no += 1;
             Some(value)
         }
+
+        fn emit_committed(&mut self, event: RunEvent) -> Result<(), crate::error::RuntimeError> {
+            if self.fail_committed_terminal_delivery
+                && matches!(event, RunEvent::TurnTerminal { .. })
+            {
+                return Err(crate::error::RuntimeError::Message(
+                    "injected committed terminal delivery failure".to_string(),
+                ));
+            }
+            self.emit(event)
+        }
     }
 
-    fn has_terminal_status(event: &RunEvent, status: TurnTerminalStatus) -> bool {
+    struct RejectingProjectionSink;
+
+    impl RunEventSink for RejectingProjectionSink {
+        fn emit(&mut self, _event: RunEvent) -> Result<(), crate::error::RuntimeError> {
+            Err(crate::error::RuntimeError::Message(
+                "injected projection delivery failure".to_string(),
+            ))
+        }
+    }
+
+    fn has_terminal_status(event: &RunEvent, status: SessionStatus) -> bool {
         matches!(
             event,
-            RunEvent::TurnTerminal { terminal, .. } if terminal.status == status
+            RunEvent::TurnTerminal { terminal, .. } if terminal.session_status() == status
         )
+    }
+
+    fn compaction_batch_template() -> ChatRequest {
+        let model = ModelProfile {
+            name: "test".to_string(),
+            context_window: 1,
+            max_output_tokens: 32,
+            provider_metadata_mode: crate::config::ProviderMetadataMode::OpenAiCompatibleOnly,
+            capabilities: crate::llm::ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: false,
+                supports_images: false,
+            },
+        };
+        let provider = crate::config::ProviderTarget::new(
+            "http://localhost",
+            &model.name,
+            model.provider_metadata_mode,
+            crate::config::model::ProviderApiMode::ChatCompletions,
+            crate::config::ProviderDeadlines {
+                response_start_timeout_ms: 1,
+                stream_idle_timeout_ms: 1,
+                connect_timeout_ms: 1,
+                max_connect_retries: 0,
+            },
+        )
+        .expect("provider target");
+        ChatRequest::new(
+            provider,
+            model,
+            "runtime prompt".to_string(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            crate::config::model::ProviderReasoningCapability::Unsupported,
+            BTreeMap::new(),
+        )
+    }
+
+    fn set_compaction_input_capacity(
+        template: &mut ChatRequest,
+        overflow_margin_tokens: usize,
+        input_capacity_tokens: u32,
+    ) {
+        let empty_request = compaction_request_with_content(template, String::new());
+        let baseline = ContextWindowTokenStatus::for_request(&empty_request, 0);
+        template.model.context_window = baseline
+            .active_context_tokens
+            .saturating_add(template.model.max_output_tokens)
+            .saturating_add(overflow_margin_tokens.min(u32::MAX as usize) as u32)
+            .saturating_add(input_capacity_tokens);
     }
 
     #[test]
     fn compaction_batches_cover_one_giant_item_without_exceeding_the_model_window() {
-        let template = ChatRequest {
-            model: ModelProfile {
-                name: "test".to_string(),
-                context_window: 256,
-                max_output_tokens: 32,
-                provider_metadata_mode: crate::config::ProviderMetadataMode::OpenAiCompatibleOnly,
-                capabilities: crate::llm::ModelCapabilities {
-                    supports_tools: true,
-                    supports_reasoning: false,
-                    supports_images: false,
-                },
-            },
-            base_url: "http://localhost".to_string(),
-            system_prompt: "runtime prompt".to_string(),
-            messages: Vec::new(),
-            tools: Vec::new(),
-            provider_api_mode: crate::config::model::ProviderApiMode::ChatCompletions,
-            reasoning: None,
-            reasoning_capability: crate::config::model::ProviderReasoningCapability::Unsupported,
-            responses_continuation: None,
-            tool_choice: None,
-            parallel_tool_calls: false,
-            timeout_ms: 1,
-            stream_idle_timeout_ms: 1,
-            extra_headers: BTreeMap::new(),
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            seed: None,
-            stop_sequences: Vec::new(),
-            extra_body: None,
-        };
+        let overflow_margin_tokens = 8;
+        let mut template = compaction_batch_template();
+        set_compaction_input_capacity(&mut template, overflow_margin_tokens, 64);
+        assert!(compaction_content_fits(
+            &template,
+            "",
+            overflow_margin_tokens
+        ));
         let source = "巨大な単一入力".repeat(1_000);
 
-        let batches = build_compaction_batches(&template, std::slice::from_ref(&source), 8)
-            .expect("split giant compaction source");
+        let batches = build_compaction_batches(
+            &template,
+            std::slice::from_ref(&source),
+            overflow_margin_tokens,
+        )
+        .expect("split giant compaction source");
 
         assert!(batches.len() > 1);
         assert_eq!(batches.concat(), source);
-        assert!(
-            batches
-                .into_iter()
-                .all(|batch| compaction_content_fits(&template, batch, 8))
-        );
+        assert!(batches.into_iter().all(|batch| compaction_content_fits(
+            &template,
+            &batch,
+            overflow_margin_tokens
+        )));
+    }
+
+    #[test]
+    fn compaction_batches_reject_an_envelope_with_no_model_input_capacity() {
+        let overflow_margin_tokens = 8;
+        let mut template = compaction_batch_template();
+        set_compaction_input_capacity(&mut template, overflow_margin_tokens, 0);
+
+        assert!(!compaction_content_fits(
+            &template,
+            "",
+            overflow_margin_tokens
+        ));
+        let error = build_compaction_batches(
+            &template,
+            &["canonical source".to_string()],
+            overflow_margin_tokens,
+        )
+        .expect_err("an exhausted compaction envelope must fail closed");
+        assert!(matches!(
+            error,
+            AgentError::Message(message)
+                if message.contains("no model input capacity after output and safety reservation")
+        ));
+    }
+
+    #[tokio::test]
+    async fn compaction_is_durable_before_projection_delivery() {
+        let run = run_scripted(
+            ResolvedConfig::default(),
+            vec![ScriptedResponse {
+                events: vec![LlmEvent::TextDelta("done".to_string())],
+                finish_reason: FinishReason::Stop,
+            }],
+        )
+        .await
+        .expect("run setup");
+        run.summary.expect("first turn");
+        let replacement_item_id = run
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(run.session_id)
+            .expect("history")
+            .into_iter()
+            .find(|item| matches!(item.payload, HistoryItemPayload::UserTurn { .. }))
+            .expect("user history")
+            .id;
+        let turn_id = TurnId::new();
+        let admission = run
+            .store
+            .session_repo()
+            .admit_session_turn(run.session_id, turn_id)
+            .await
+            .expect("admission")
+            .expect("new turn admission");
+        let event = RunEvent::CompactionCompleted {
+            summarized_messages: 1,
+            summary: "the earlier user requested a file update".to_string(),
+            replacement_item_ids: vec![replacement_item_id],
+        };
+
+        run.store
+            .session_repo()
+            .commit_admitted_compaction_with_protocol_bundle(
+                run.session_id,
+                admission.admission_id,
+                &event,
+                turn_id,
+                None,
+            )
+            .await
+            .expect("canonical compaction commit");
+        let mut rejecting_sink = RejectingProjectionSink;
+        assert!(rejecting_sink.emit_committed(event).is_err());
+
+        let history = run
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(run.session_id)
+            .expect("history after projection failure");
+        assert!(history.iter().any(|item| {
+            matches!(
+                &item.payload,
+                HistoryItemPayload::Compaction {
+                    summary,
+                    replacement_item_ids,
+                    ..
+                } if summary == "the earlier user requested a file update"
+                    && replacement_item_ids == &[replacement_item_id]
+            )
+        }));
+    }
+
+    #[test]
+    fn malformed_tool_argument_diagnostic_is_bounded_and_identifies_raw_input() {
+        let arguments = format!("{{\"value\":\"{}", "sensitive-tail".repeat(200_000));
+
+        let error = parse_tool_arguments(&arguments).expect_err("arguments must be invalid");
+        let diagnostic = error.to_string();
+
+        assert!(diagnostic.len() < 1_024, "diagnostic was not bounded");
+        assert!(diagnostic.contains(&format!("input_bytes={}", arguments.len())));
+        assert!(diagnostic.contains("input_sha256="));
+        assert!(!diagnostic.contains("sensitive-tailsensitive-tail".repeat(100).as_str()));
     }
 
     fn has_terminal_cause(
         event: &RunEvent,
-        status: TurnTerminalStatus,
+        status: SessionStatus,
         cause: crate::protocol::TurnInterruptionCause,
     ) -> bool {
         matches!(
             event,
             RunEvent::TurnTerminal { terminal, .. }
-                if terminal.status == status && terminal.interruption_cause == Some(cause)
+                if terminal.session_status() == status
+                    && terminal.interruption_cause() == Some(cause)
         )
     }
 
@@ -3184,6 +3326,7 @@ mod tests {
                 truncated_output_path: None,
                 recorded_changes: Vec::new(),
                 change_summaries: Vec::new(),
+                _internal_file_lease: None,
             })
         }
     }
@@ -3331,6 +3474,7 @@ mod tests {
                             path_before: change.path_before,
                             path_after: change.path_after,
                         }],
+                        _internal_file_lease: None,
                     })
                 }
             }
@@ -3420,38 +3564,50 @@ mod tests {
         .expect("run");
         let summary = run.summary.expect("summary");
 
-        assert_eq!(summary.status, SessionStatus::Completed);
-        assert_eq!(summary.tool_call_count, 1);
+        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_eq!(summary.tool_call_count(), 1);
         assert_canonical_tool_statuses(
             &run.store,
             run.session_id,
             &[ToolLifecycleStatus::Completed],
         );
-        assert_eq!(summary.failed_tool_count, 0);
-        assert_eq!(summary.metrics.model_request_count, 2);
+        assert_eq!(summary.failed_tool_count(), 0);
+        assert_eq!(summary.metrics().model_request_count, 2);
         assert_eq!(
             summary
-                .metrics
+                .metrics()
                 .token_usage
                 .as_ref()
                 .map(|usage| usage.total_tokens),
             Some(15)
         );
-        assert_eq!(summary.metrics.tool_calls_by_name.get("write"), Some(&1));
-        assert_eq!(summary.metrics.failed_tool_calls_by_name.get("write"), None);
-        assert!(summary.metrics.elapsed_ms.is_some());
+        assert_eq!(summary.metrics().tool_calls_by_name.get("write"), Some(&1));
+        assert_eq!(
+            summary.metrics().failed_tool_calls_by_name.get("write"),
+            None
+        );
+        assert!(summary.metrics().elapsed_ms.is_some());
         assert_eq!(
             summary
-                .metrics
+                .metrics()
                 .config
                 .as_ref()
                 .map(|config| config.access_mode.as_str()),
             Some("full_access")
         );
         let summary_json = serde_json::to_value(&summary).expect("summary json");
-        assert_eq!(summary_json["metrics"]["model_request_count"], 2);
-        assert_eq!(summary_json["metrics"]["token_usage"]["total_tokens"], 15);
-        assert_eq!(summary_json["metrics"]["tool_calls_by_name"]["write"], 1);
+        assert_eq!(
+            summary_json["terminal"]["metrics"]["model_request_count"],
+            2
+        );
+        assert_eq!(
+            summary_json["terminal"]["metrics"]["token_usage"]["total_tokens"],
+            15
+        );
+        assert_eq!(
+            summary_json["terminal"]["metrics"]["tool_calls_by_name"]["write"],
+            1
+        );
         assert_eq!(
             std::fs::read_to_string(run.root.join("hello.txt"))
                 .expect("written")
@@ -3461,7 +3617,7 @@ mod tests {
         assert!(
             run.events
                 .iter()
-                .any(|event| has_terminal_status(event, TurnTerminalStatus::Completed))
+                .any(|event| has_terminal_status(event, SessionStatus::Completed))
         );
         assert!(
             run.events
@@ -3477,7 +3633,7 @@ mod tests {
         }));
         assert!(run.requests[0].system_prompt.contains("<world_state>"));
         assert!(run.requests[0].system_prompt.contains("<current_time"));
-        assert!(summary.final_response_id.is_some());
+        assert!(summary.final_response_id().is_some());
     }
 
     #[tokio::test]
@@ -3519,8 +3675,8 @@ mod tests {
             .await
             .expect(label);
             let summary = run.summary.expect(label);
-            assert_eq!(summary.status, SessionStatus::Completed, "case={label}");
-            assert_eq!(summary.failed_tool_count, 1, "case={label}");
+            assert_eq!(summary.status(), SessionStatus::Completed, "case={label}");
+            assert_eq!(summary.failed_tool_count(), 1, "case={label}");
 
             let history = run
                 .store
@@ -3594,7 +3750,6 @@ mod tests {
             }],
             None,
             None,
-            None,
             crate::cli::ReviewDecision::Abort,
         )
         .await
@@ -3607,11 +3762,11 @@ mod tests {
             .await
             .expect("session");
 
-        assert_eq!(summary.status, SessionStatus::Cancelled);
+        assert_eq!(summary.status(), SessionStatus::Cancelled);
         assert_eq!(session.status, SessionStatus::Cancelled);
-        assert_eq!(summary.tool_call_count, 1);
-        assert_eq!(summary.failed_tool_count, 0);
-        assert_eq!(summary.metrics.model_request_count, 1);
+        assert_eq!(summary.tool_call_count(), 1);
+        assert_eq!(summary.failed_tool_count(), 0);
+        assert_eq!(summary.metrics().model_request_count, 1);
         assert_eq!(run.requests.len(), 1);
         assert_eq!(run.confirmations.len(), 1);
         assert!(!run.root.join("first.txt").exists());
@@ -3627,14 +3782,14 @@ mod tests {
         assert!(run.events.iter().any(|event| {
             has_terminal_cause(
                 event,
-                TurnTerminalStatus::Interrupted,
+                SessionStatus::Cancelled,
                 crate::protocol::TurnInterruptionCause::ApprovalAborted,
             )
         }));
         assert!(
             !run.events
                 .iter()
-                .any(|event| has_terminal_status(event, TurnTerminalStatus::Completed))
+                .any(|event| has_terminal_status(event, SessionStatus::Completed))
         );
     }
 
@@ -3668,17 +3823,16 @@ mod tests {
             ],
             None,
             None,
-            None,
             crate::cli::ReviewDecision::Denied,
         )
         .await
         .expect("run setup");
         let summary = run.summary.expect("denied run summary");
 
-        assert_eq!(summary.status, SessionStatus::Completed);
-        assert_eq!(summary.tool_call_count, 1);
-        assert_eq!(summary.failed_tool_count, 0);
-        assert_eq!(summary.metrics.model_request_count, 2);
+        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_eq!(summary.tool_call_count(), 1);
+        assert_eq!(summary.failed_tool_count(), 0);
+        assert_eq!(summary.metrics().model_request_count, 2);
         assert_eq!(run.requests.len(), 2);
         assert_eq!(run.confirmations.len(), 1);
         assert!(!run.root.join("denied.txt").exists());
@@ -3697,7 +3851,7 @@ mod tests {
         assert!(
             !run.events
                 .iter()
-                .any(|event| has_terminal_status(event, TurnTerminalStatus::Interrupted))
+                .any(|event| has_terminal_status(event, SessionStatus::Cancelled))
         );
         assert_canonical_tool_statuses(
             &run.store,
@@ -3746,9 +3900,9 @@ mod tests {
             let (run, ()) = tokio::join!(run, classify);
             let run = run.expect("effect admission run");
             let summary = run.summary.expect("typed cancellation summary");
-            assert_eq!(summary.status, SessionStatus::Cancelled);
+            assert_eq!(summary.status(), SessionStatus::Cancelled);
             assert_eq!(
-                summary.interruption_cause,
+                summary.interruption_cause(),
                 Some(crate::protocol::TurnInterruptionCause::UserStop)
             );
             assert_eq!(side_effects.load(Ordering::SeqCst), expected_effects);
@@ -3760,7 +3914,7 @@ mod tests {
             assert!(
                 !run.events
                     .iter()
-                    .any(|event| has_terminal_status(event, TurnTerminalStatus::Completed))
+                    .any(|event| has_terminal_status(event, SessionStatus::Completed))
             );
         }
     }
@@ -3802,8 +3956,8 @@ mod tests {
             let (run, ()) = tokio::join!(run, classify);
             let run = run.expect("effect admission failure run");
             let summary = run.summary.as_ref().expect("typed failure summary");
-            assert_eq!(summary.status, SessionStatus::Failed);
-            assert_eq!(summary.interruption_cause, None);
+            assert_eq!(summary.status(), SessionStatus::Failed);
+            assert_eq!(summary.interruption_cause(), None);
             assert_eq!(
                 run.store
                     .session_repo()
@@ -3823,12 +3977,12 @@ mod tests {
             assert!(
                 run.events
                     .iter()
-                    .any(|event| has_terminal_status(event, TurnTerminalStatus::Failed))
+                    .any(|event| has_terminal_status(event, SessionStatus::Failed))
             );
             assert!(
                 !run.events
                     .iter()
-                    .any(|event| has_terminal_status(event, TurnTerminalStatus::Completed))
+                    .any(|event| has_terminal_status(event, SessionStatus::Completed))
             );
         }
     }
@@ -3884,7 +4038,7 @@ mod tests {
                 let (run, ()) = tokio::join!(run, classify);
                 let run = run.expect("denial settlement race run");
                 let terminal_status = match run.summary.as_ref() {
-                    Ok(summary) => summary.status,
+                    Ok(summary) => summary.status(),
                     Err(error) => {
                         assert!(matches!(
                             producer,
@@ -3910,10 +4064,10 @@ mod tests {
                     .position(|event| matches!(event, RunEvent::ToolCallDeclined { .. }));
                 let terminal_index = run.events.iter().position(|event| match producer {
                     DeniedSettlementTerminalProducer::Stop => {
-                        has_terminal_status(event, TurnTerminalStatus::Interrupted)
+                        has_terminal_status(event, SessionStatus::Cancelled)
                     }
                     DeniedSettlementTerminalProducer::Failure => {
-                        has_terminal_status(event, TurnTerminalStatus::Failed)
+                        has_terminal_status(event, SessionStatus::Failed)
                     }
                 });
                 let terminal_index = terminal_index.expect("typed session terminal event");
@@ -3958,7 +4112,7 @@ mod tests {
                 assert!(
                     !run.events
                         .iter()
-                        .any(|event| has_terminal_status(event, TurnTerminalStatus::Completed))
+                        .any(|event| has_terminal_status(event, SessionStatus::Completed))
                 );
             }
         }
@@ -3987,7 +4141,7 @@ mod tests {
         let (run, ()) = tokio::join!(run, cancel);
         let run = run.expect("cooperative cleanup run");
         let summary = run.summary.expect("cancelled summary");
-        assert_eq!(summary.status, SessionStatus::Cancelled);
+        assert_eq!(summary.status(), SessionStatus::Cancelled);
         assert!(cleanup_completed.load(Ordering::SeqCst));
         assert_eq!(run.requests.len(), 1);
         assert!(
@@ -4039,11 +4193,11 @@ mod tests {
         let observer = observer.expect("observer run setup");
 
         assert_eq!(
-            origin.summary.expect("origin summary").status,
+            origin.summary.expect("origin summary").status(),
             SessionStatus::Cancelled
         );
         assert_eq!(
-            observer.summary.expect("observer summary").status,
+            observer.summary.expect("observer summary").status(),
             SessionStatus::Cancelled
         );
         assert!(
@@ -4114,7 +4268,7 @@ mod tests {
             match behavior {
                 TerminalRaceToolBehavior::LateInterruptedResult => {
                     assert_eq!(
-                        run.summary.as_ref().expect("interrupted summary").status,
+                        run.summary.as_ref().expect("interrupted summary").status(),
                         SessionStatus::Cancelled
                     );
                     assert!(canonical_runtime_has_tool_status(
@@ -4125,9 +4279,9 @@ mod tests {
                 }
                 TerminalRaceToolBehavior::LateFailedResult => {
                     let summary = run.summary.as_ref().expect("typed failure summary");
-                    assert_eq!(summary.status, SessionStatus::Failed);
-                    assert_eq!(summary.finish_reason, Some(FinishReason::Error));
-                    assert_eq!(summary.interruption_cause, None);
+                    assert_eq!(summary.status(), SessionStatus::Failed);
+                    assert_eq!(summary.finish_reason(), FinishReason::Error);
+                    assert_eq!(summary.interruption_cause(), None);
                     assert!(
                         run.events
                             .iter()
@@ -4136,7 +4290,7 @@ mod tests {
                     assert!(
                         run.events
                             .iter()
-                            .any(|event| has_terminal_status(event, TurnTerminalStatus::Failed))
+                            .any(|event| has_terminal_status(event, SessionStatus::Failed))
                     );
                 }
                 _ => unreachable!(),
@@ -4161,124 +4315,6 @@ mod tests {
                 "expected file={expected_file}; canonical history={canonical_history:#?}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn auto_review_routes_detected_risk_through_independent_model_request() {
-        let mut config = ResolvedConfig::default();
-        config.permissions.access_mode = AccessMode::AutoReview;
-        let run = run_scripted(
-            config,
-            vec![
-                ScriptedResponse {
-                    events: vec![
-                        LlmEvent::ToolCallStart {
-                            call_id: "protected_write".to_string(),
-                            tool_name: "write".to_string(),
-                        },
-                        LlmEvent::ToolCallArgsDelta {
-                            call_id: "protected_write".to_string(),
-                            delta: r#"{"path":"AGENTS.md","content":"temporary test instruction\n"}"#
-                                .to_string(),
-                        },
-                    ],
-                    finish_reason: FinishReason::ToolCall,
-                },
-                ScriptedResponse {
-                    events: vec![LlmEvent::TextDelta(
-                        r#"{"risk_level":"medium","user_authorization":"high","outcome":"allow","rationale":"The requested scoped workspace write is relevant."}"#
-                            .to_string(),
-                    )],
-                    finish_reason: FinishReason::Stop,
-                },
-                ScriptedResponse {
-                    events: vec![LlmEvent::TextDelta("done".to_string())],
-                    finish_reason: FinishReason::Stop,
-                },
-            ],
-        )
-        .await
-        .expect("run");
-        let summary = run.summary.expect("summary");
-
-        assert_eq!(summary.status, SessionStatus::Completed);
-        assert_eq!(summary.tool_call_count, 1);
-        assert_eq!(summary.failed_tool_count, 0);
-        assert_eq!(summary.metrics.model_request_count, 3);
-        assert_eq!(run.requests.len(), 3);
-        assert!(!run.requests[0].tools.is_empty());
-        assert!(run.requests[1].tools.is_empty());
-        assert!(
-            run.requests[1]
-                .system_prompt
-                .contains("independent permission reviewer")
-        );
-        let ModelMessage::User { content } = &run.requests[1].messages[0] else {
-            panic!("expected reviewer context message");
-        };
-        assert!(content.contains("write hello.txt"));
-        assert!(content.contains("protected_workspace_authority"));
-        assert!(!run.requests[2].tools.is_empty());
-        assert!(run.confirmations.is_empty());
-        assert_eq!(
-            std::fs::read_to_string(run.root.join("AGENTS.md"))
-                .expect("reviewed write")
-                .replace("\r\n", "\n"),
-            "temporary test instruction\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn auto_review_denial_falls_back_to_human_confirmation_with_reason() {
-        let mut config = ResolvedConfig::default();
-        config.permissions.access_mode = AccessMode::AutoReview;
-        let run = run_scripted(
-            config,
-            vec![
-                ScriptedResponse {
-                    events: vec![
-                        LlmEvent::ToolCallStart {
-                            call_id: "protected_write".to_string(),
-                            tool_name: "write".to_string(),
-                        },
-                        LlmEvent::ToolCallArgsDelta {
-                            call_id: "protected_write".to_string(),
-                            delta: r#"{"path":"AGENTS.md","content":"human-approved\n"}"#.to_string(),
-                        },
-                    ],
-                    finish_reason: FinishReason::ToolCall,
-                },
-                ScriptedResponse {
-                    events: vec![LlmEvent::TextDelta(
-                        r#"{"risk_level":"high","user_authorization":"low","outcome":"deny","rationale":"The authority-file change needs explicit confirmation."}"#
-                            .to_string(),
-                    )],
-                    finish_reason: FinishReason::Stop,
-                },
-                ScriptedResponse {
-                    events: vec![LlmEvent::TextDelta("done".to_string())],
-                    finish_reason: FinishReason::Stop,
-                },
-            ],
-        )
-        .await
-        .expect("run");
-
-        assert_eq!(
-            run.summary.expect("summary").status,
-            SessionStatus::Completed
-        );
-        assert_eq!(run.confirmations.len(), 1);
-        assert!(run.confirmations[0].details.iter().any(|detail| {
-            detail.contains("AI reviewer denied this request (risk: high)")
-                && detail.contains("authority-file change")
-        }));
-        assert_eq!(
-            std::fs::read_to_string(run.root.join("AGENTS.md"))
-                .expect("human-approved write")
-                .replace("\r\n", "\n"),
-            "human-approved\n"
-        );
     }
 
     #[tokio::test]
@@ -4308,12 +4344,12 @@ mod tests {
         assert!(
             run.events
                 .iter()
-                .any(|event| has_terminal_status(event, TurnTerminalStatus::Failed))
+                .any(|event| has_terminal_status(event, SessionStatus::Failed))
         );
         assert!(
             !run.events
                 .iter()
-                .any(|event| has_terminal_status(event, TurnTerminalStatus::Interrupted))
+                .any(|event| has_terminal_status(event, SessionStatus::Cancelled))
         );
     }
 
@@ -4354,7 +4390,7 @@ mod tests {
             assert!(
                 run.events
                     .iter()
-                    .any(|event| has_terminal_status(event, TurnTerminalStatus::Failed))
+                    .any(|event| has_terminal_status(event, SessionStatus::Failed))
             );
             let terminal = run
                 .store
@@ -4375,7 +4411,7 @@ mod tests {
             assert!(
                 !run.events
                     .iter()
-                    .any(|event| has_terminal_status(event, TurnTerminalStatus::Completed))
+                    .any(|event| has_terminal_status(event, SessionStatus::Completed))
             );
         }
     }
@@ -4424,23 +4460,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_steer_is_drained_before_the_next_provider_request() {
+    async fn durable_steer_is_loaded_before_the_next_provider_request_without_a_mailbox_copy() {
         let config = ResolvedConfig::default();
-        let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
         let steer_text = "also verify the result";
-        steer_tx
-            .send(ActiveSteerInput {
-                history_item_id: crate::protocol::HistoryItemId::new(),
-                steer: crate::protocol::SteerTurn {
-                    expected_turn_id: TurnId::new(),
-                    items: vec![UserInputItem::Text {
-                        text: steer_text.to_string(),
-                    }],
-                    additional_context: Default::default(),
-                    client_user_message_id: Some("steer-test".to_string()),
-                },
-            })
-            .expect("queue steer");
+        let steer = SteerTurn {
+            expected_turn_id: TurnId::new(),
+            items: vec![UserInputItem::Text {
+                text: steer_text.to_string(),
+            }],
+            additional_context: Default::default(),
+            client_user_message_id: Some("steer-test".to_string()),
+        };
         let run = run_scripted_with_options(
             config,
             vec![ScriptedResponse {
@@ -4448,8 +4478,7 @@ mod tests {
                 finish_reason: FinishReason::Stop,
             }],
             None,
-            Some(steer_rx),
-            None,
+            Some(steer),
         )
         .await
         .expect("run");
@@ -4458,6 +4487,198 @@ mod tests {
         assert!(run.requests[0].messages.iter().any(
             |message| matches!(message, ModelMessage::User { content } if content == steer_text)
         ));
+    }
+
+    #[tokio::test]
+    async fn agent_loop_self_progresses_across_steer_pages_without_an_additional_wake() {
+        let steer_count = crate::protocol::MAX_PROTOCOL_PAGE_LIMIT + 3;
+        let expected_texts = (0..steer_count)
+            .map(|index| format!("batch-steer-{index:03}"))
+            .collect::<Vec<_>>();
+        let pending_steers = expected_texts
+            .iter()
+            .map(|text| SteerTurn {
+                expected_turn_id: TurnId::new(),
+                items: vec![UserInputItem::Text { text: text.clone() }],
+                additional_context: Default::default(),
+                client_user_message_id: Some(text.clone()),
+            })
+            .collect::<Vec<_>>();
+
+        let run = run_scripted_internal_with_pending_steers(
+            ResolvedConfig::default(),
+            vec![ScriptedResponse {
+                events: vec![LlmEvent::TextDelta("done".to_string())],
+                finish_reason: FinishReason::Stop,
+            }],
+            None,
+            pending_steers,
+            crate::cli::ReviewDecision::Approved,
+            RunControl::new(),
+            None,
+            false,
+        )
+        .await
+        .expect("run");
+        run.summary.expect("summary");
+
+        assert_eq!(run.requests.len(), 1);
+        let observed_texts = run.requests[0]
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ModelMessage::User { content } if content.starts_with("batch-steer-") => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observed_texts, expected_texts);
+    }
+
+    #[tokio::test]
+    async fn canonical_steer_cursor_is_bounded_ordered_and_exactly_once_across_late_arrival() {
+        let config = ResolvedConfig::default();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.keep()).expect("utf8 temp");
+        let storage_paths = StoragePaths {
+            data_dir: root.join(".moyai-data"),
+            database_path: root.join(".moyai-data/moyai.sqlite3"),
+            truncation_dir: root.join(".moyai-data/truncation"),
+        };
+        let sqlite = SqliteStore::open(&storage_paths).expect("store");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        store
+            .project_repo()
+            .upsert_project(workspace.project_id, &workspace.root, "test", "none")
+            .await
+            .expect("project");
+        let session_service = crate::session::SessionService::new(store.clone());
+        let session = session_service
+            .start_or_resume(
+                SessionStartRequest {
+                    selector: SessionSelector::New,
+                    title: Some("steer cursor".to_string()),
+                    cwd: root,
+                    model: "scripted".to_string(),
+                    base_url: "http://local".to_string(),
+                    access_mode: AccessMode::FullAccess,
+                },
+                workspace,
+            )
+            .await
+            .expect("session");
+        let session_id = session.session.id;
+        let turn_id = TurnId::new();
+        let admission_id = store
+            .session_repo()
+            .admit_session_turn(session_id, turn_id)
+            .await
+            .expect("admit turn")
+            .expect("turn owner")
+            .admission_id;
+        let user_turn = UserTurn {
+            turn_id,
+            items: vec![UserInputItem::Text {
+                text: "initial request".to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+        };
+        session_service
+            .store_user_turn_with_protocol_bundle(&session, admission_id, &user_turn, turn_id, 0)
+            .await
+            .expect("store user turn");
+        let mut context_builder = context_manager::ContextManager::active_history_builder();
+        let initial = store
+            .protocol_event_store()
+            .visit_active_history_pages_for_session(
+                session_id,
+                crate::protocol::MAX_PROTOCOL_PAGE_LIMIT,
+                &mut |page| {
+                    context_builder.ingest_page(page.items);
+                    Ok(())
+                },
+            )
+            .expect("initial history");
+        let mut context = context_builder.finish(
+            initial.append_fence,
+            initial.canonical_count,
+            initial.steer_count,
+            initial.agent_communication_count,
+        );
+
+        let steer_count = crate::protocol::MAX_PROTOCOL_PAGE_LIMIT + 3;
+        let mut expected_ids = Vec::with_capacity(steer_count);
+        for index in 0..steer_count {
+            expected_ids.push(
+                store
+                    .session_repo()
+                    .accept_active_turn_steer(
+                        session_id,
+                        &SteerTurn {
+                            expected_turn_id: turn_id,
+                            items: vec![UserInputItem::Text {
+                                text: format!("steer-{index:03}"),
+                            }],
+                            additional_context: Default::default(),
+                            client_user_message_id: Some(format!("steer-{index:03}")),
+                        },
+                    )
+                    .await
+                    .expect("persist steer"),
+            );
+        }
+
+        let first = refresh_committed_context_page(&store, session_id, &mut context)
+            .expect("first bounded page");
+        assert!(first.has_more);
+        assert_eq!(
+            first.delta.steer_item_ids,
+            expected_ids[..crate::protocol::MAX_PROTOCOL_PAGE_LIMIT]
+        );
+        let first_cursor = context.append_cursor();
+
+        let second = refresh_committed_context_page(&store, session_id, &mut context)
+            .expect("second bounded page");
+        assert!(!second.has_more);
+        assert_eq!(
+            second.delta.steer_item_ids,
+            expected_ids[crate::protocol::MAX_PROTOCOL_PAGE_LIMIT..]
+        );
+        let settled_cursor = context.append_cursor();
+        assert!(settled_cursor > first_cursor);
+        assert_eq!(context.steer_count(), steer_count);
+
+        let retry = refresh_committed_context_page(&store, session_id, &mut context)
+            .expect("idempotent retry");
+        assert!(!retry.has_more);
+        assert!(retry.delta.steer_item_ids.is_empty());
+        assert_eq!(context.append_cursor(), settled_cursor);
+        assert_eq!(context.steer_count(), steer_count);
+
+        let late_id = store
+            .session_repo()
+            .accept_active_turn_steer(
+                session_id,
+                &SteerTurn {
+                    expected_turn_id: turn_id,
+                    items: vec![UserInputItem::Text {
+                        text: "late-steer".to_string(),
+                    }],
+                    additional_context: Default::default(),
+                    client_user_message_id: Some("late-steer".to_string()),
+                },
+            )
+            .await
+            .expect("persist late steer");
+        let late =
+            refresh_committed_context_page(&store, session_id, &mut context).expect("late page");
+        assert!(!late.has_more);
+        assert_eq!(late.delta.steer_item_ids, vec![late_id]);
+        assert_eq!(context.steer_count(), steer_count + 1);
     }
 
     #[tokio::test]
@@ -4504,9 +4725,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_record_the_live_effective_access_mode() {
-        let config = ResolvedConfig::default();
-        let live = LiveConfigOverrides::new(AccessMode::AutoReview);
+    async fn metrics_record_the_admitted_turn_access_mode() {
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::FullAccess;
         let run = run_scripted_with_options(
             config,
             vec![ScriptedResponse {
@@ -4515,15 +4736,19 @@ mod tests {
             }],
             None,
             None,
-            Some(live),
         )
         .await
         .expect("run");
         let summary = run.summary.expect("summary");
 
         assert_eq!(
-            summary.metrics.config.expect("config").access_mode,
-            "auto_review"
+            summary
+                .metrics()
+                .config
+                .as_ref()
+                .expect("config")
+                .access_mode,
+            AccessMode::FullAccess
         );
     }
 
@@ -4576,12 +4801,51 @@ mod tests {
             .expect("canonical terminal");
 
         assert_eq!(session.status, SessionStatus::Failed);
-        assert_eq!(terminal.status, TurnTerminalStatus::Failed);
-        assert_eq!(terminal.finish_reason, Some(FinishReason::Error));
+        assert_eq!(terminal.session_status(), SessionStatus::Failed);
+        assert_eq!(terminal.finish_reason(), FinishReason::Error);
         assert!(
             run.events
                 .iter()
-                .any(|event| has_terminal_status(event, TurnTerminalStatus::Failed))
+                .any(|event| has_terminal_status(event, SessionStatus::Failed))
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_success_wins_when_committed_terminal_delivery_fails() {
+        let run = run_scripted_internal(
+            ResolvedConfig::default(),
+            vec![ScriptedResponse {
+                events: vec![LlmEvent::TextDelta("done".to_string())],
+                finish_reason: FinishReason::Stop,
+            }],
+            None,
+            None,
+            crate::cli::ReviewDecision::Approved,
+            RunControl::new(),
+            None,
+            true,
+        )
+        .await
+        .expect("run setup");
+
+        let summary = run.summary.expect("durable success must be returned");
+        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_eq!(
+            run.store
+                .session_repo()
+                .get_session(run.session_id)
+                .await
+                .expect("session")
+                .status,
+            SessionStatus::Completed
+        );
+        assert!(
+            run.store
+                .session_repo()
+                .durable_terminal_for_turn(run.session_id, summary.turn_id())
+                .await
+                .expect("terminal lookup")
+                .is_some()
         );
     }
 
@@ -4659,12 +4923,27 @@ mod tests {
         run.summary.expect("summary");
 
         assert_eq!(run.requests.len(), 1);
-        let Some(ModelMessage::User { content }) = run.requests[0].messages.last() else {
-            panic!("goal steering should be appended as a user message");
-        };
-        assert!(content.contains("Continue working toward the active thread goal."));
-        assert!(content.contains("deliver &lt;feature&gt; &amp; verify"));
-        assert!(content.contains("- Tokens remaining: 100"));
+        assert!(!run.requests[0].system_prompt.contains("deliver <feature>"));
+        assert!(
+            !run.requests[0]
+                .system_prompt
+                .contains("Continue working toward the active thread goal.")
+        );
+        let goal_messages = run.requests[0]
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ModelMessage::User { content }
+                    if content.contains("Continue working toward the active thread goal.") =>
+                {
+                    Some(content)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(goal_messages.len(), 1);
+        assert!(goal_messages[0].contains("deliver &lt;feature&gt; &amp; verify"));
+        assert!(goal_messages[0].contains("- Tokens remaining: 100"));
 
         let history = run
             .store
@@ -4700,7 +4979,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn budget_limited_goal_steering_is_used_after_budget_is_reached() {
+    async fn same_turn_goal_snapshot_does_not_change_after_usage_accounting() {
         let config = ResolvedConfig::default();
         let run = run_scripted_with_goal(
             config,
@@ -4724,13 +5003,27 @@ mod tests {
         run.summary.expect("summary");
 
         assert_eq!(run.requests.len(), 2);
-        let Some(ModelMessage::User { content }) = run.requests[1].messages.last() else {
-            panic!("budget limit steering should be appended as a user message");
-        };
-        assert!(content.contains("has reached its token budget"));
-        assert!(content.contains("do not start new substantive work"));
-        assert!(content.contains("- Tokens used: 15"));
-        assert!(!content.contains("{{"));
+        assert_eq!(
+            run.requests[0].system_prompt, run.requests[1].system_prompt,
+            "usage accounting must not mutate same-turn system instructions"
+        );
+        for request in &run.requests {
+            let goal_messages = request
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    ModelMessage::User { content }
+                        if content.contains("Continue working toward the active thread goal.") =>
+                    {
+                        Some(content)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(goal_messages.len(), 1);
+            assert!(goal_messages[0].contains("- Tokens remaining: 10"));
+            assert!(!goal_messages[0].contains("has reached its token budget"));
+        }
     }
 
     #[tokio::test]
@@ -4803,7 +5096,7 @@ mod tests {
             HistoryItem {
                 id: crate::protocol::HistoryItemId::new(),
                 session_id,
-                turn_id,
+                scope: HistoryScope::Turn { turn_id },
                 sequence_no: 0,
                 created_at_ms: SystemClock::now_ms(),
                 payload: HistoryItemPayload::UserTurn {
@@ -4817,7 +5110,7 @@ mod tests {
             HistoryItem {
                 id: crate::protocol::HistoryItemId::new(),
                 session_id,
-                turn_id,
+                scope: HistoryScope::Turn { turn_id },
                 sequence_no: 1,
                 created_at_ms: SystemClock::now_ms(),
                 payload: HistoryItemPayload::ToolCall {
@@ -4831,7 +5124,7 @@ mod tests {
             HistoryItem {
                 id: crate::protocol::HistoryItemId::new(),
                 session_id,
-                turn_id,
+                scope: HistoryScope::Turn { turn_id },
                 sequence_no: 2,
                 created_at_ms: SystemClock::now_ms(),
                 payload: HistoryItemPayload::ToolOutput {
@@ -4867,7 +5160,7 @@ mod tests {
                 HistoryItem {
                     id: crate::protocol::HistoryItemId::new(),
                     session_id,
-                    turn_id,
+                    scope: HistoryScope::Turn { turn_id },
                     sequence_no: 0,
                     created_at_ms: SystemClock::now_ms(),
                     payload: HistoryItemPayload::UserTurn {
@@ -4881,7 +5174,7 @@ mod tests {
                 HistoryItem {
                     id: crate::protocol::HistoryItemId::new(),
                     session_id,
-                    turn_id,
+                    scope: HistoryScope::Turn { turn_id },
                     sequence_no: 1,
                     created_at_ms: SystemClock::now_ms(),
                     payload: HistoryItemPayload::ToolCall {
@@ -4899,7 +5192,7 @@ mod tests {
                 HistoryItem {
                     id: crate::protocol::HistoryItemId::new(),
                     session_id,
-                    turn_id,
+                    scope: HistoryScope::Turn { turn_id },
                     sequence_no: 2,
                     created_at_ms: SystemClock::now_ms(),
                     payload: HistoryItemPayload::ToolOutput {
@@ -4929,7 +5222,9 @@ mod tests {
         let items = vec![HistoryItem {
             id: crate::protocol::HistoryItemId::new(),
             session_id: crate::session::SessionId::new(),
-            turn_id: TurnId::new(),
+            scope: HistoryScope::Turn {
+                turn_id: TurnId::new(),
+            },
             sequence_no: 0,
             created_at_ms: SystemClock::now_ms(),
             payload: HistoryItemPayload::Error {
@@ -4950,7 +5245,9 @@ mod tests {
             HistoryItem {
                 id: crate::protocol::HistoryItemId::new(),
                 session_id,
-                turn_id: first_turn,
+                scope: HistoryScope::Turn {
+                    turn_id: first_turn,
+                },
                 sequence_no: 10,
                 created_at_ms: 100,
                 payload: HistoryItemPayload::AssistantMessage {
@@ -4963,7 +5260,9 @@ mod tests {
             HistoryItem {
                 id: crate::protocol::HistoryItemId::new(),
                 session_id,
-                turn_id: second_turn,
+                scope: HistoryScope::Turn {
+                    turn_id: second_turn,
+                },
                 sequence_no: 1,
                 created_at_ms: 200,
                 payload: HistoryItemPayload::UserTurn {
@@ -4999,7 +5298,7 @@ mod tests {
             HistoryItem {
                 id: old_id,
                 session_id,
-                turn_id,
+                scope: HistoryScope::Turn { turn_id },
                 sequence_no: 0,
                 created_at_ms: 100,
                 payload: HistoryItemPayload::UserTurn {
@@ -5013,7 +5312,7 @@ mod tests {
             HistoryItem {
                 id: recent_id,
                 session_id,
-                turn_id,
+                scope: HistoryScope::Turn { turn_id },
                 sequence_no: 1,
                 created_at_ms: 200,
                 payload: HistoryItemPayload::UserTurn {
@@ -5027,7 +5326,7 @@ mod tests {
             HistoryItem {
                 id: compaction_id,
                 session_id,
-                turn_id,
+                scope: HistoryScope::Turn { turn_id },
                 sequence_no: 2,
                 created_at_ms: 300,
                 payload: HistoryItemPayload::Compaction {
@@ -5088,7 +5387,6 @@ mod tests {
                     }
                 }
             }),
-            strict: false,
         }];
 
         let missing = validate_shallow_schema("sample", serde_json::json!({"path": 1}), &schemas)
@@ -5159,22 +5457,20 @@ mod tests {
         responses: Vec<ScriptedResponse>,
         goal: Option<(&str, ThreadGoalStatus, Option<i64>)>,
     ) -> Result<ScriptedRun, AgentError> {
-        run_scripted_with_options(config, responses, goal, None, None).await
+        run_scripted_with_options(config, responses, goal, None).await
     }
 
     async fn run_scripted_with_options(
         config: ResolvedConfig,
         responses: Vec<ScriptedResponse>,
         goal: Option<(&str, ThreadGoalStatus, Option<i64>)>,
-        steer_rx: Option<UnboundedReceiver<ActiveSteerInput>>,
-        live_config: Option<LiveConfigOverrides>,
+        pending_steer: Option<SteerTurn>,
     ) -> Result<ScriptedRun, AgentError> {
         run_scripted_with_options_and_decision(
             config,
             responses,
             goal,
-            steer_rx,
-            live_config,
+            pending_steer,
             crate::cli::ReviewDecision::Approved,
         )
         .await
@@ -5184,19 +5480,18 @@ mod tests {
         config: ResolvedConfig,
         responses: Vec<ScriptedResponse>,
         goal: Option<(&str, ThreadGoalStatus, Option<i64>)>,
-        steer_rx: Option<UnboundedReceiver<ActiveSteerInput>>,
-        live_config: Option<LiveConfigOverrides>,
+        pending_steer: Option<SteerTurn>,
         review_decision: crate::cli::ReviewDecision,
     ) -> Result<ScriptedRun, AgentError> {
         run_scripted_internal(
             config,
             responses,
             goal,
-            steer_rx,
-            live_config,
+            pending_steer,
             review_decision,
             RunControl::new(),
             None,
+            false,
         )
         .await
     }
@@ -5212,10 +5507,10 @@ mod tests {
             responses,
             None,
             None,
-            None,
             crate::cli::ReviewDecision::Approved,
             run_control,
             Some(replacement_tool),
+            false,
         )
         .await
     }
@@ -5225,11 +5520,35 @@ mod tests {
         config: ResolvedConfig,
         responses: Vec<ScriptedResponse>,
         goal: Option<(&str, ThreadGoalStatus, Option<i64>)>,
-        steer_rx: Option<UnboundedReceiver<ActiveSteerInput>>,
-        live_config: Option<LiveConfigOverrides>,
+        pending_steer: Option<SteerTurn>,
         review_decision: crate::cli::ReviewDecision,
         run_control: RunControl,
         replacement_tool: Option<Arc<dyn crate::tool::registry::Tool>>,
+        fail_committed_terminal_delivery: bool,
+    ) -> Result<ScriptedRun, AgentError> {
+        run_scripted_internal_with_pending_steers(
+            config,
+            responses,
+            goal,
+            pending_steer.into_iter().collect(),
+            review_decision,
+            run_control,
+            replacement_tool,
+            fail_committed_terminal_delivery,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_scripted_internal_with_pending_steers(
+        config: ResolvedConfig,
+        responses: Vec<ScriptedResponse>,
+        goal: Option<(&str, ThreadGoalStatus, Option<i64>)>,
+        pending_steers: Vec<SteerTurn>,
+        review_decision: crate::cli::ReviewDecision,
+        run_control: RunControl,
+        replacement_tool: Option<Arc<dyn crate::tool::registry::Tool>>,
+        fail_committed_terminal_delivery: bool,
     ) -> Result<ScriptedRun, AgentError> {
         let run_control_observer = run_control.clone();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -5272,12 +5591,17 @@ mod tests {
                 .expect("store goal");
         }
         let turn_id = TurnId::new();
-        let admission_id = store
+        let admission = store
             .session_repo()
             .admit_session_turn(session_id, turn_id)
             .await
             .expect("admit scripted run")
             .expect("scripted run admission");
+        let goal_snapshot = admission
+            .goal
+            .as_ref()
+            .map(|goal| goal_steering::GoalSnapshot::capture(goal.goal_id.clone(), &goal.goal));
+        let admission_id = admission.admission_id;
         let user_turn = UserTurn {
             turn_id,
             items: vec![UserInputItem::Text {
@@ -5287,7 +5611,7 @@ mod tests {
             editor_context: None,
         };
         session_service
-            .store_user_turn_with_protocol_bundle(&session, &admission_id, &user_turn, turn_id, 0)
+            .store_user_turn_with_protocol_bundle(&session, admission_id, &user_turn, turn_id, 0)
             .await
             .expect("user turn");
         let context = context_manager::ContextManager::rehydrate(
@@ -5296,21 +5620,14 @@ mod tests {
                 .list_history_items_for_session(session.session.id)
                 .expect("history"),
         );
-        let (steer_sender_guard, steer_rx) = if let Some(mut queued) = steer_rx {
-            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-            while let Ok(mut input) = queued.try_recv() {
-                input.steer.expected_turn_id = turn_id;
-                input.history_item_id = store
-                    .session_repo()
-                    .accept_active_turn_steer(session_id, &input.steer)
-                    .await
-                    .expect("persist queued steer");
-                sender.send(input).expect("forward queued steer");
-            }
-            (Some(sender), Some(receiver))
-        } else {
-            (None, None)
-        };
+        for mut steer in pending_steers {
+            steer.expected_turn_id = turn_id;
+            store
+                .session_repo()
+                .accept_active_turn_steer(session_id, &steer)
+                .await
+                .expect("persist pending steer");
+        }
         let tool_services = test_tool_services(&config, &store, storage_paths);
         let mut registry = ToolRegistry::builtin(tool_services.clone());
         if let Some(tool) = replacement_tool {
@@ -5332,6 +5649,7 @@ mod tests {
         let mut sink = CapturingSink {
             events: Vec::new(),
             sequence_no: next_protocol_sequence_no,
+            fail_committed_terminal_delivery,
         };
         let mut prompt = DecisionPrompt {
             decision: review_decision,
@@ -5356,24 +5674,21 @@ mod tests {
                             )
                             .expect("turn policy"),
                         ),
-                        multi_agent_mode: config
-                            .multi_agent
-                            .enabled
-                            .then_some(config.multi_agent.mode),
+                        config: Arc::new(
+                            crate::config::ResolvedTurnConfig::capture(config.clone())
+                                .expect("valid provider endpoint"),
+                        ),
+                        goal: goal_snapshot,
                         current_time: crate::context::current_time::CurrentTimeSnapshot::now(),
                     }),
                     context,
-                    config: config.clone(),
                     run_control,
-                    live_config,
-                    steer_rx,
                     agent_context: None,
                 },
                 &mut prompt,
                 &mut sink,
             )
             .await;
-        drop(steer_sender_guard);
 
         Ok(ScriptedRun {
             summary,

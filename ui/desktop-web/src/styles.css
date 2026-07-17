@@ -2034,8 +2034,7 @@ select:focus-visible,
   color: #e2b964;
 }
 
-.agent-status-errored .agent-status-label,
-.agent-status-not_found .agent-status-label {
+.agent-status-errored .agent-status-label {
   color: var(--danger);
 }
 

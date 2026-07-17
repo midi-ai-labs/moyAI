@@ -28,12 +28,8 @@ pub(crate) async fn resolve_path(
             {
                 return Err(boundary_error.into());
             }
-            Ok(GuardedPath {
-                absolute: absolute.clone(),
-                relative_to_root: absolute,
-                inside_workspace: false,
-                trusted_external: true,
-            })
+            PathGuard::trusted_internal_path(&absolute, &ctx.services.storage_paths.truncation_dir)
+                .map_err(ToolError::from)
         }
     }
 }

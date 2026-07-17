@@ -14,18 +14,20 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::agent::{AgentLoop, PromptBuilder};
 use crate::cli::{ConfirmationPrompt, OutputMode, ReviewDecision};
-use crate::config::{AccessMode, MultiAgentMode, ProviderMetadataMode, ResolvedConfig};
+use crate::config::{
+    AccessMode, MultiAgentMode, ProviderApiMode, ProviderMetadataMode, ResolvedConfig,
+};
 use crate::error::{CliPromptError, LlmError};
 use crate::llm::{
     ChatRequest, LlmClient, LlmEvent, LlmEventSink, LlmResponseSummary, ModelMessage,
 };
 use crate::protocol::{
-    ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload, ModelResponseId,
-    ProtocolEventStore, SubAgentActivityKind, TurnId, TurnTerminalStatus,
+    ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload, HistoryScope, ModelResponseId,
+    ProtocolEventStore, SubAgentActivityKind, TurnId, TurnTerminalOutcome,
     project_sub_agent_activity,
 };
 use crate::runtime::{
-    AgentStatus, LiveConfigOverrides, RunCancelOutcome, RunCancellationCause, RunControl,
+    AgentStatus, InactiveAgentStatus, RunCancelOutcome, RunCancellationCause, RunControl,
     SessionRuntimeEventHub, SystemClock,
 };
 use crate::session::{
@@ -47,6 +49,29 @@ const ROOT_RESULT: &str = "integrated root result";
 const DETACHED_CHILD_ASSIGNMENT: &str = "Complete the detached goal subtask.";
 const DETACHED_CHILD_RESULT: &str = "detached child durable result";
 
+fn captured_turn_config(config: ResolvedConfig) -> Arc<crate::config::ResolvedTurnConfig> {
+    Arc::new(crate::config::ResolvedTurnConfig::capture(config).expect("valid test turn config"))
+}
+
+fn durable_mailbox_content(
+    context: &AgentRunContext,
+    notice: &crate::runtime::AgentMailboxNotice,
+) -> String {
+    let item = context
+        .runtime
+        .store
+        .protocol_event_store()
+        .history_items_by_id(context.root_session_id(), &[notice.history_item_id])
+        .expect("durable mailbox history")
+        .into_iter()
+        .next()
+        .expect("mailbox history item");
+    match item.payload {
+        HistoryItemPayload::InterAgentCommunication { communication } => communication.content,
+        payload => panic!("mailbox notice referenced non-communication payload: {payload:?}"),
+    }
+}
+
 #[test]
 fn suppressed_mail_delivery_is_not_acknowledged_as_queued() {
     let error = match scheduled_mail_delivery(AgentMailDeliveryOutcome::Suppressed) {
@@ -55,6 +80,23 @@ fn suppressed_mail_delivery_is_not_acknowledged_as_queued() {
     };
 
     assert_eq!(error, SUPPRESSED_MAIL_DELIVERY_ERROR);
+}
+
+#[test]
+fn suppressed_result_delivery_preserves_durable_child_terminal_status() {
+    for status in [
+        AgentStatus::Completed(Some("durable child result".to_string())),
+        AgentStatus::Errored("durable child failure".to_string()),
+    ] {
+        let completion = AgentTurnCompletion::new(status.clone())
+            .with_delivery_outcome(Ok(AgentMailDeliveryOutcome::Suppressed));
+
+        assert_eq!(completion.status, status);
+        assert_eq!(
+            completion.activity.as_deref(),
+            Some(SUPPRESSED_MAIL_DELIVERY_ERROR)
+        );
+    }
 }
 
 #[derive(Default)]
@@ -101,26 +143,6 @@ impl ConfirmationPrompt for AbortPrompt {
     }
 }
 
-struct AbortAfterTicketClassification(RunCancellationCause);
-
-impl ConfirmationPrompt for AbortAfterTicketClassification {
-    fn confirm(
-        &mut self,
-        _request: &crate::tool::PermissionRequest,
-    ) -> Result<ReviewDecision, CliPromptError> {
-        Ok(ReviewDecision::Abort)
-    }
-
-    fn confirm_with_control(
-        &mut self,
-        _request: &crate::tool::PermissionRequest,
-        control: &RunControl,
-    ) -> Result<crate::cli::ConfirmationOutcome, CliPromptError> {
-        control.cancel(self.0.clone());
-        Ok(crate::cli::ConfirmationOutcome::AbortRequested)
-    }
-}
-
 #[test]
 fn child_approval_abort_interrupts_root_and_sibling_before_prompt_returns() {
     let root_session_id = SessionId::new();
@@ -149,6 +171,7 @@ fn child_approval_abort_interrupts_root_and_sibling_before_prompt_returns() {
         control,
         confirmation: Mutex::new(None),
         model_request_gate: Mutex::new(Arc::new(tokio::sync::Semaphore::new(2))),
+        active_root_turn_owner: Mutex::new(None),
         metadata: Mutex::new(HashMap::new()),
     };
     let confirmation =
@@ -200,9 +223,10 @@ fn child_approval_abort_interrupts_root_and_sibling_before_prompt_returns() {
 fn child_approval_abort_reaches_the_tree_while_root_success_is_committing() {
     let root_session_id = SessionId::new();
     let root_control = RunControl::new();
-    let (control, _root_lease) =
+    let (control, root_lease) =
         AgentControl::with_root_control(root_session_id, 3, root_control.clone())
             .expect("root control");
+    let root_turn_control = root_lease.run_control();
     let (_, requesting_child) = control
         .register_child(
             &AgentPath::root(),
@@ -224,12 +248,13 @@ fn child_approval_abort_reaches_the_tree_while_root_success_is_committing() {
         control,
         confirmation: Mutex::new(None),
         model_request_gate: Mutex::new(Arc::new(tokio::sync::Semaphore::new(2))),
+        active_root_turn_owner: Mutex::new(None),
         metadata: Mutex::new(HashMap::new()),
     };
     let confirmation =
         SharedConfirmationPrompt::new_with_root_control(AbortPrompt, root_control.clone());
     tree.install_run_resources(confirmation, 2);
-    let success_commit = root_control
+    let success_commit = root_turn_control
         .begin_success_commit()
         .expect("reserve root success");
     let request = crate::tool::PermissionRequest {
@@ -249,8 +274,12 @@ fn child_approval_abort_reaches_the_tree_while_root_success_is_committing() {
         .expect("requesting child receives its abort");
 
     assert_eq!(outcome, crate::cli::ConfirmationOutcome::Aborted);
-    assert_eq!(root_control.cause(), None);
-    assert!(!root_control.is_cancelled());
+    assert_eq!(
+        root_control.cause(),
+        Some(RunCancellationCause::Interruption(
+            TurnInterruptionCause::ApprovalAborted
+        ))
+    );
     assert_eq!(
         requesting_child.run_control().cause(),
         Some(RunCancellationCause::Interruption(
@@ -265,20 +294,17 @@ fn child_approval_abort_reaches_the_tree_while_root_success_is_committing() {
     );
     assert!(tree.control.tree_is_cancelled());
     assert!(success_commit.seal());
-    assert!(root_control.success_is_sealed());
-    assert_eq!(
-        root_control.begin_next_turn_after_success(),
-        crate::runtime::RunContinuationOutcome::Blocked
-    );
+    assert!(root_turn_control.success_is_sealed());
 }
 
 #[test]
 fn detached_child_approval_abort_preserves_sealed_root_success_and_stops_the_tree() {
     let root_session_id = SessionId::new();
     let root_control = RunControl::new();
-    let (control, _root_lease) =
+    let (control, root_lease) =
         AgentControl::with_root_control(root_session_id, 3, root_control.clone())
             .expect("root control");
+    let root_turn_control = root_lease.run_control();
     let (_, requesting_child) = control
         .register_child(
             &AgentPath::root(),
@@ -300,9 +326,10 @@ fn detached_child_approval_abort_preserves_sealed_root_success_and_stops_the_tre
         control,
         confirmation: Mutex::new(None),
         model_request_gate: Mutex::new(Arc::new(tokio::sync::Semaphore::new(2))),
+        active_root_turn_owner: Mutex::new(None),
         metadata: Mutex::new(HashMap::new()),
     };
-    assert!(root_control.seal_success());
+    assert!(root_turn_control.seal_success());
     let confirmation =
         SharedConfirmationPrompt::new_with_root_control(AbortPrompt, root_control.clone());
     tree.install_run_resources(confirmation, 2);
@@ -323,12 +350,13 @@ fn detached_child_approval_abort_preserves_sealed_root_success_and_stops_the_tre
         .expect("detached child Abort");
 
     assert_eq!(outcome, crate::cli::ConfirmationOutcome::Aborted);
-    assert_eq!(root_control.cause(), None);
-    assert!(root_control.success_is_sealed());
     assert_eq!(
-        root_control.begin_next_turn_after_success(),
-        crate::runtime::RunContinuationOutcome::Blocked
+        root_control.cause(),
+        Some(RunCancellationCause::Interruption(
+            TurnInterruptionCause::ApprovalAborted
+        ))
     );
+    assert!(root_turn_control.success_is_sealed());
     assert_eq!(
         requesting_child.run_control().cause(),
         Some(RunCancellationCause::Interruption(
@@ -345,7 +373,7 @@ fn detached_child_approval_abort_preserves_sealed_root_success_and_stops_the_tre
 }
 
 #[test]
-fn child_approval_abort_does_not_override_or_fan_out_a_competing_root_terminal_cause() {
+fn child_approval_abort_does_not_override_a_competing_root_terminal_cause() {
     for existing_cause in [
         RunCancellationCause::Failure("provider transport failed".to_string()),
         RunCancellationCause::Interruption(TurnInterruptionCause::UserStop),
@@ -354,10 +382,10 @@ fn child_approval_abort_does_not_override_or_fan_out_a_competing_root_terminal_c
     ] {
         let root_session_id = SessionId::new();
         let root_control = RunControl::new();
-        assert!(root_control.cancel(existing_cause.clone()));
-        let (control, _root_lease) =
+        let (control, root_lease) =
             AgentControl::with_root_control(root_session_id, 3, root_control.clone())
                 .expect("root control");
+        let root_turn_control = root_lease.run_control();
         let (_, requesting_child) = control
             .register_child(
                 &AgentPath::root(),
@@ -379,8 +407,10 @@ fn child_approval_abort_does_not_override_or_fan_out_a_competing_root_terminal_c
             control,
             confirmation: Mutex::new(None),
             model_request_gate: Mutex::new(Arc::new(tokio::sync::Semaphore::new(2))),
+            active_root_turn_owner: Mutex::new(None),
             metadata: Mutex::new(HashMap::new()),
         };
+        assert!(root_turn_control.cancel(existing_cause.clone()));
         let confirmation =
             SharedConfirmationPrompt::new_with_root_control(AbortPrompt, root_control.clone());
         tree.install_run_resources(confirmation, 2);
@@ -402,75 +432,20 @@ fn child_approval_abort_does_not_override_or_fan_out_a_competing_root_terminal_c
 
         assert_eq!(outcome, crate::cli::ConfirmationOutcome::Interrupted);
         assert_eq!(root_control.cause(), Some(existing_cause.clone()));
-        assert_eq!(requesting_child.run_control().cause(), None);
-        assert_eq!(sibling.run_control().cause(), None);
-        assert!(!tree.control.tree_is_cancelled());
+        let descendant_cause = match existing_cause {
+            RunCancellationCause::Interruption(_) => {
+                RunCancellationCause::Interruption(TurnInterruptionCause::TreeStopped)
+            }
+            RunCancellationCause::Failure(message) => RunCancellationCause::Failure(message),
+            RunCancellationCause::Superseded => RunCancellationCause::Superseded,
+        };
+        assert_eq!(
+            requesting_child.run_control().cause(),
+            Some(descendant_cause.clone())
+        );
+        assert_eq!(sibling.run_control().cause(), Some(descendant_cause));
+        assert!(tree.control.tree_is_cancelled());
     }
-}
-
-#[test]
-fn raw_child_abort_cannot_reclassify_an_existing_root_abort_and_tree_stopped_ticket() {
-    let root_session_id = SessionId::new();
-    let root_control = RunControl::new();
-    assert!(root_control.interrupt(TurnInterruptionCause::ApprovalAborted));
-    let (control, _root_lease) =
-        AgentControl::with_root_control(root_session_id, 3, root_control.clone())
-            .expect("root control");
-    let (_, requesting_child) = control
-        .register_child(
-            &AgentPath::root(),
-            "requester",
-            SessionId::new(),
-            Some("waiting for approval".to_string()),
-        )
-        .expect("requesting child");
-    let (_, sibling) = control
-        .register_child(
-            &AgentPath::root(),
-            "sibling",
-            SessionId::new(),
-            Some("unrelated work".to_string()),
-        )
-        .expect("sibling child");
-    let tree = AgentTreeRuntime {
-        root_session_id,
-        control,
-        confirmation: Mutex::new(None),
-        model_request_gate: Mutex::new(Arc::new(tokio::sync::Semaphore::new(2))),
-        metadata: Mutex::new(HashMap::new()),
-    };
-    let tree_stopped = RunCancellationCause::Interruption(TurnInterruptionCause::TreeStopped);
-    let confirmation = SharedConfirmationPrompt::new_with_root_control(
-        AbortAfterTicketClassification(tree_stopped.clone()),
-        root_control.clone(),
-    );
-    tree.install_run_resources(confirmation, 2);
-    let request = crate::tool::PermissionRequest {
-        access: crate::workspace::AccessKind::Edit,
-        summary: "late raw abort".to_string(),
-        details: Vec::new(),
-        targets: Vec::new(),
-        outside_workspace: false,
-        risks: Vec::new(),
-        agent_path: Some("/root/requester".to_string()),
-        agent_task_name: Some("requester".to_string()),
-    };
-
-    let outcome = tree
-        .confirmation_prompt()
-        .confirm_with_control(&request, &requesting_child.run_control())
-        .expect("typed interruption");
-
-    assert_eq!(outcome, crate::cli::ConfirmationOutcome::Interrupted);
-    assert_eq!(
-        root_control.cause(),
-        Some(RunCancellationCause::Interruption(
-            TurnInterruptionCause::ApprovalAborted
-        ))
-    );
-    assert_eq!(requesting_child.run_control().cause(), Some(tree_stopped));
-    assert_eq!(sibling.run_control().cause(), None);
-    assert!(!tree.control.tree_is_cancelled());
 }
 
 async fn direct_runtime_fixture(
@@ -538,11 +513,11 @@ async fn child_finish_fixture(
     let root_execution = runtime
         .begin_root(
             &root_session,
-            config.clone(),
+            captured_turn_config(config.clone()),
             SharedConfirmationPrompt::new(AllowPrompt),
-            None,
             RunControl::new(),
         )
+        .await
         .expect("root execution");
     let tree = root_execution.context.tree.clone();
     let child = runtime
@@ -575,58 +550,48 @@ async fn child_finish_fixture(
         tree,
         path: child_path,
         session_id: child.session.id,
-        config,
+        execution: child_lease.scope(),
+        root_turn_owner: Arc::clone(&root_execution.context.root_turn_owner),
+        config: captured_turn_config(config),
         workspace: child.workspace.clone(),
-        live_config: None,
     };
     (runtime, root_execution, child_context, child_lease, child)
 }
 
-fn terminal_summary(
-    session_id: SessionId,
-    status: SessionStatus,
-    interruption_cause: Option<TurnInterruptionCause>,
-) -> RunSummary {
-    RunSummary {
+fn terminal_summary(session_id: SessionId, outcome: TurnTerminalOutcome) -> RunSummary {
+    RunSummary::from_terminal(
         session_id,
-        turn_id: None,
-        final_response_id: None,
-        status,
-        finish_reason: Some(match status {
-            SessionStatus::Completed => FinishReason::Stop,
-            SessionStatus::Cancelled => FinishReason::Cancelled,
-            SessionStatus::Failed | SessionStatus::Idle | SessionStatus::Running => {
-                FinishReason::Error
-            }
-        }),
-        interruption_cause,
-        tool_call_count: 0,
-        failed_tool_count: 0,
-        change_count: 0,
-        metrics: Default::default(),
+        TurnId::new(),
+        DurableTurnTerminal {
+            outcome,
+            final_response_id: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        },
+    )
+}
+
+fn admitted_turn(outcome: crate::app::AppCommandOutcome) -> RunSummary {
+    match outcome {
+        crate::app::AppCommandOutcome::Turn(summary) => summary,
+        crate::app::AppCommandOutcome::ControlCompleted => {
+            panic!("expected an admitted turn, got a control-only completion")
+        }
     }
 }
 
 fn terminal_event(
     session_id: SessionId,
-    status: TurnTerminalStatus,
+    outcome: TurnTerminalOutcome,
     final_response_id: Option<ModelResponseId>,
-    summary: impl Into<String>,
-    interruption_cause: Option<TurnInterruptionCause>,
 ) -> RunEvent {
-    let finish_reason = match status {
-        TurnTerminalStatus::Completed => Some(FinishReason::Stop),
-        TurnTerminalStatus::Failed => Some(FinishReason::Error),
-        TurnTerminalStatus::Interrupted => Some(FinishReason::Cancelled),
-    };
     RunEvent::TurnTerminal {
         session_id,
         terminal: Box::new(DurableTurnTerminal {
-            status,
-            finish_reason,
-            interruption_cause,
+            outcome,
             final_response_id,
-            summary: summary.into(),
             tool_call_count: 0,
             failed_tool_count: 0,
             change_count: 0,
@@ -648,13 +613,30 @@ async fn terminalize_test_session(
         .await
         .expect("admit terminal fixture")
         .expect("terminal fixture admission");
+    terminalize_admitted_test_session(
+        runtime,
+        session_id,
+        admission_id.admission_id,
+        turn_id,
+        event,
+    )
+    .await;
+}
+
+async fn terminalize_admitted_test_session(
+    runtime: &AgentRuntime,
+    session_id: SessionId,
+    admission_id: crate::session::AdmissionId,
+    turn_id: TurnId,
+    event: &RunEvent,
+) {
     assert!(
         runtime
             .store
             .session_repo()
             .terminalize_admitted_turn_with_protocol_event(
                 session_id,
-                &admission_id,
+                admission_id,
                 event,
                 turn_id,
                 None,
@@ -668,6 +650,21 @@ async fn terminalize_test_session(
     );
 }
 
+async fn bind_test_root_turn(runtime: &AgentRuntime, execution: &AgentRuntimeExecution) {
+    let turn_id = TurnId::new();
+    let admission = runtime
+        .store
+        .session_repo()
+        .admit_session_turn(execution.context.session_id(), turn_id)
+        .await
+        .expect("admit test root turn")
+        .expect("test root turn admission");
+    execution
+        .context
+        .bind_root_turn_owner(admission.admission_id, turn_id)
+        .expect("bind test root durable turn owner");
+}
+
 fn append_child_history(
     runtime: &AgentRuntime,
     session_id: SessionId,
@@ -679,7 +676,9 @@ fn append_child_history(
         .seed_history_item_for_test(&HistoryItem {
             id: HistoryItemId::new(),
             session_id,
-            turn_id: TurnId::new(),
+            scope: HistoryScope::Turn {
+                turn_id: TurnId::new(),
+            },
             sequence_no: 0,
             created_at_ms: SystemClock::now_ms(),
             payload,
@@ -706,18 +705,18 @@ async fn durable_child_tree_terminal_interruptions_suppress_mail_despite_stale_l
                 .await;
             let result = Ok(terminal_summary(
                 child.session.id,
-                SessionStatus::Cancelled,
-                Some(cause),
+                TurnTerminalOutcome::Interrupted { cause },
             ));
 
             let status = runtime
                 .finish_agent_turn(&context, &result, local_cause)
-                .await;
+                .await
+                .status;
 
             assert_eq!(status, AgentStatus::Interrupted);
             child.session.status = SessionStatus::Cancelled;
             assert_eq!(
-                rehydrated_agent_state(&child.session, None, Some(cause))
+                rehydrated_agent_state(child.session.id, child.session.status, None, Some(cause))
                     .expect("typed cancellation must rehydrate"),
                 status
             );
@@ -732,7 +731,11 @@ async fn durable_child_tree_terminal_interruptions_suppress_mail_despite_stale_l
             context
                 .tree
                 .control
-                .complete_execution(child_lease, status, None)
+                .complete_execution(
+                    child_lease,
+                    inactive_agent_status(status).expect("inactive child status"),
+                    None,
+                )
                 .expect("complete child");
             root_execution
                 .complete(AgentStatus::Completed(None))
@@ -747,11 +750,15 @@ async fn durable_child_agent_interruption_delivers_one_typed_parent_notification
         child_finish_fixture("durable-child-agent-interrupted").await;
     let result = Ok(terminal_summary(
         child.session.id,
-        SessionStatus::Cancelled,
-        Some(TurnInterruptionCause::AgentInterrupted),
+        TurnTerminalOutcome::Interrupted {
+            cause: TurnInterruptionCause::AgentInterrupted,
+        },
     ));
 
-    let status = runtime.finish_agent_turn(&context, &result, None).await;
+    let status = runtime
+        .finish_agent_turn(&context, &result, None)
+        .await
+        .status;
 
     assert_eq!(status, AgentStatus::Interrupted);
     let mail = context
@@ -760,11 +767,18 @@ async fn durable_child_agent_interruption_delivers_one_typed_parent_notification
         .drain_mailbox(&AgentPath::root())
         .expect("root mailbox");
     assert_eq!(mail.len(), 1);
-    assert_eq!(mail[0].content, "Agent interrupted.");
+    assert_eq!(
+        durable_mailbox_content(&context, &mail[0]),
+        "Agent interrupted."
+    );
     context
         .tree
         .control
-        .complete_execution(child_lease, status, None)
+        .complete_execution(
+            child_lease,
+            inactive_agent_status(status).expect("inactive child status"),
+            None,
+        )
         .expect("complete child");
     root_execution
         .complete(AgentStatus::Completed(None))
@@ -794,8 +808,9 @@ async fn durable_child_failure_uses_latest_error_despite_stale_local_stop() {
     );
     let result = Ok(terminal_summary(
         child.session.id,
-        SessionStatus::Failed,
-        None,
+        TurnTerminalOutcome::Failed {
+            error: "durable child failed".to_string(),
+        },
     ));
 
     let status = runtime
@@ -806,7 +821,8 @@ async fn durable_child_failure_uses_latest_error_despite_stale_local_stop() {
                 TurnInterruptionCause::UserStop,
             )),
         )
-        .await;
+        .await
+        .status;
 
     assert_eq!(
         status,
@@ -818,11 +834,18 @@ async fn durable_child_failure_uses_latest_error_despite_stale_local_stop() {
         .drain_mailbox(&AgentPath::root())
         .expect("root mailbox");
     assert_eq!(mail.len(), 1);
-    assert_eq!(mail[0].content, "durable final child failure");
+    assert_eq!(
+        durable_mailbox_content(&context, &mail[0]),
+        "durable final child failure"
+    );
     context
         .tree
         .control
-        .complete_execution(child_lease, status, None)
+        .complete_execution(
+            child_lease,
+            inactive_agent_status(status).expect("inactive child status"),
+            None,
+        )
         .expect("complete child");
     root_execution
         .complete(AgentStatus::Completed(None))
@@ -853,11 +876,15 @@ async fn durable_failed_child_live_and_restart_projections_are_identical() {
         }
         let result = Ok(terminal_summary(
             child.session.id,
-            SessionStatus::Failed,
-            None,
+            TurnTerminalOutcome::Failed {
+                error: "durable child failed".to_string(),
+            },
         ));
 
-        let live_status = runtime.finish_agent_turn(&context, &result, None).await;
+        let live_status = runtime
+            .finish_agent_turn(&context, &result, None)
+            .await
+            .status;
         let history = runtime
             .store
             .protocol_event_store()
@@ -865,7 +892,8 @@ async fn durable_failed_child_live_and_restart_projections_are_identical() {
             .expect("child history");
         child.session.status = SessionStatus::Failed;
         let restarted_status = rehydrated_agent_state(
-            &child.session,
+            child.session.id,
+            child.session.status,
             durable_child_result(SessionStatus::Failed, &history),
             None,
         )
@@ -878,11 +906,18 @@ async fn durable_failed_child_live_and_restart_projections_are_identical() {
             .drain_mailbox(&AgentPath::root())
             .expect("root mailbox");
         assert_eq!(mail.len(), 1);
-        assert_eq!(mail[0].content, agent_status_result(&restarted_status));
+        assert_eq!(
+            durable_mailbox_content(&context, &mail[0]),
+            agent_status_result(&restarted_status)
+        );
         context
             .tree
             .control
-            .complete_execution(child_lease, live_status, None)
+            .complete_execution(
+                child_lease,
+                inactive_agent_status(live_status).expect("inactive child status"),
+                None,
+            )
             .expect("complete child");
         root_execution
             .complete(AgentStatus::Completed(None))
@@ -916,8 +951,7 @@ async fn durable_child_success_matches_rehydrated_canonical_history() {
     );
     let result = Ok(terminal_summary(
         child.session.id,
-        SessionStatus::Completed,
-        None,
+        TurnTerminalOutcome::Completed,
     ));
 
     let status = runtime
@@ -928,7 +962,8 @@ async fn durable_child_success_matches_rehydrated_canonical_history() {
                 "stale local failure".to_string(),
             )),
         )
-        .await;
+        .await
+        .status;
 
     assert_eq!(status, AgentStatus::Completed(Some(content.clone())));
     let mail = context
@@ -937,11 +972,83 @@ async fn durable_child_success_matches_rehydrated_canonical_history() {
         .drain_mailbox(&AgentPath::root())
         .expect("root mailbox");
     assert_eq!(mail.len(), 1);
-    assert_eq!(mail[0].content, content);
+    assert_eq!(durable_mailbox_content(&context, &mail[0]), content);
     context
         .tree
         .control
-        .complete_execution(child_lease, status, None)
+        .complete_execution(
+            child_lease,
+            inactive_agent_status(status).expect("inactive child status"),
+            None,
+        )
+        .expect("complete child");
+    root_execution
+        .complete(AgentStatus::Completed(None))
+        .expect("complete root");
+}
+
+#[tokio::test]
+async fn completed_child_result_uses_terminal_response_identity_without_history_scan() {
+    let (runtime, root_execution, context, child_lease, child) =
+        child_finish_fixture("durable-child-terminal-response").await;
+    let final_response_id = ModelResponseId::new();
+    append_child_history(
+        &runtime,
+        child.session.id,
+        HistoryItemPayload::AssistantMessage {
+            response_id: final_response_id,
+            content: vec![ContentPart::Text {
+                text: "terminal response result".to_string(),
+            }],
+        },
+    );
+    append_child_history(
+        &runtime,
+        child.session.id,
+        HistoryItemPayload::AssistantMessage {
+            response_id: ModelResponseId::new(),
+            content: vec![ContentPart::Text {
+                text: "later non-terminal assistant text".to_string(),
+            }],
+        },
+    );
+    let result = Ok(RunSummary::from_terminal(
+        child.session.id,
+        TurnId::new(),
+        DurableTurnTerminal {
+            outcome: TurnTerminalOutcome::Completed,
+            final_response_id: Some(final_response_id),
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        },
+    ));
+
+    let completion = runtime.finish_agent_turn(&context, &result, None).await;
+
+    assert_eq!(
+        completion.status,
+        AgentStatus::Completed(Some("terminal response result".to_string()))
+    );
+    let mail = context
+        .tree
+        .control
+        .drain_mailbox(&AgentPath::root())
+        .expect("root mailbox");
+    assert_eq!(mail.len(), 1);
+    assert_eq!(
+        durable_mailbox_content(&context, &mail[0]),
+        "terminal response result"
+    );
+    context
+        .tree
+        .control
+        .complete_execution(
+            child_lease,
+            inactive_agent_status(completion.status).expect("inactive child status"),
+            completion.activity,
+        )
         .expect("complete child");
     root_execution
         .complete(AgentStatus::Completed(None))
@@ -953,28 +1060,28 @@ async fn child_result_delivery_survives_parent_durable_success_before_marker_rel
     let (runtime, root_execution, context, child_lease, child) =
         child_finish_fixture("child-result-parent-success-transition").await;
     let root_session_id = root_execution.context.session_id;
-    let root_turn_id = runtime
+    let _root_turn_id = runtime
         .store
         .session_repo()
-        .active_turn_for_session(root_session_id)
+        .fresh_running_turn_for_session(root_session_id)
         .await
         .expect("active root turn")
         .expect("root turn remains admitted");
+    let root_target = runtime
+        .store
+        .session_repo()
+        .captured_running_terminal_target(root_session_id)
+        .await
+        .expect("capture root target")
+        .expect("root running target");
     assert!(
         runtime
             .store
             .session_repo()
-            .terminalize_active_session_with_protocol_event(
+            .terminalize_captured_running_session_with_protocol_event(
                 root_session_id,
-                &terminal_event(
-                    root_session_id,
-                    TurnTerminalStatus::Completed,
-                    None,
-                    "root durable success before in-memory handoff",
-                    None,
-                ),
-                root_turn_id,
-                None,
+                &terminal_event(root_session_id, TurnTerminalOutcome::Completed, None,),
+                root_target,
             )
             .await
             .expect("terminalize durable root before marker release")
@@ -1006,11 +1113,13 @@ async fn child_result_delivery_survives_parent_durable_success_before_marker_rel
     );
     let result = Ok(terminal_summary(
         child.session.id,
-        SessionStatus::Completed,
-        None,
+        TurnTerminalOutcome::Completed,
     ));
 
-    let status = runtime.finish_agent_turn(&context, &result, None).await;
+    let status = runtime
+        .finish_agent_turn(&context, &result, None)
+        .await
+        .status;
 
     assert_eq!(status, AgentStatus::Completed(Some(content.clone())));
     let root_history = runtime
@@ -1031,60 +1140,15 @@ async fn child_result_delivery_survives_parent_durable_success_before_marker_rel
         .drain_mailbox(&AgentPath::root())
         .expect("root mailbox");
     assert_eq!(mail.len(), 1);
-    assert_eq!(mail[0].content, content);
+    assert_eq!(durable_mailbox_content(&context, &mail[0]), content);
     context
         .tree
         .control
-        .complete_execution(child_lease, status, None)
-        .expect("complete child");
-    root_execution
-        .complete(AgentStatus::Completed(None))
-        .expect("complete root");
-}
-
-#[tokio::test]
-async fn durable_child_cancel_without_typed_cause_fails_closed() {
-    let (runtime, root_execution, context, child_lease, mut child) =
-        child_finish_fixture("durable-child-missing-cause").await;
-    let result = Ok(terminal_summary(
-        child.session.id,
-        SessionStatus::Cancelled,
-        None,
-    ));
-
-    let status = runtime
-        .finish_agent_turn(
-            &context,
-            &result,
-            Some(RunCancellationCause::Interruption(
-                TurnInterruptionCause::UserStop,
-            )),
+        .complete_execution(
+            child_lease,
+            inactive_agent_status(status).expect("inactive child status"),
+            None,
         )
-        .await;
-
-    let AgentStatus::Errored(message) = &status else {
-        panic!("missing durable interruption cause must fail closed");
-    };
-    assert!(message.contains("without a typed interruption cause"));
-    child.session.status = SessionStatus::Cancelled;
-    let restarted_status = rehydrated_agent_state(&child.session, None, None)
-        .expect("untyped cancelled child must rehydrate fail-closed");
-    assert_eq!(status, restarted_status);
-    let mail = context
-        .tree
-        .control
-        .drain_mailbox(&AgentPath::root())
-        .expect("root mailbox");
-    assert_eq!(mail.len(), 1);
-    assert!(
-        mail[0]
-            .content
-            .contains("without a typed interruption cause")
-    );
-    context
-        .tree
-        .control
-        .complete_execution(child_lease, status, None)
         .expect("complete child");
     root_execution
         .complete(AgentStatus::Completed(None))
@@ -1092,8 +1156,9 @@ async fn durable_child_cancel_without_typed_cause_fails_closed() {
 }
 
 #[tokio::test]
-async fn existing_child_followup_materializes_live_access_and_updates_durable_session() {
-    let (runtime, root_session, config) = direct_runtime_fixture("followup-live-access", 3).await;
+async fn existing_child_followup_uses_the_newly_admitted_root_config() {
+    let (runtime, root_session, mut config) =
+        direct_runtime_fixture("followup-admitted-access", 3).await;
     let child_path = AgentPath::root().join("research").expect("child path");
     let child = runtime
         .session_service
@@ -1122,19 +1187,40 @@ async fn existing_child_followup_materializes_live_access_and_updates_durable_se
         )
         .await
         .expect("spawn edge");
-    let live = LiveConfigOverrides::new(AccessMode::Default);
+    terminalize_test_session(
+        &runtime,
+        child.session.id,
+        TurnId::new(),
+        &terminal_event(child.session.id, TurnTerminalOutcome::Completed, None),
+    )
+    .await;
+    config.permissions.access_mode = AccessMode::FullAccess;
     let root = runtime
         .begin_root(
             &root_session,
-            config,
+            captured_turn_config(config),
             SharedConfirmationPrompt::new(AllowPrompt),
-            Some(live.clone()),
             RunControl::new(),
         )
+        .await
         .expect("root execution");
-    live.set_access_mode(AccessMode::FullAccess);
+    bind_test_root_turn(&runtime, &root).await;
+    assert!(matches!(
+        root.context
+            .tree
+            .control
+            .status(&child_path)
+            .expect("rehydrated child status"),
+        AgentStatus::Completed(None)
+    ));
+    let child_lease = root
+        .context
+        .tree
+        .control
+        .try_acquire_execution(&child_path)
+        .expect("child execution");
     let child_context = runtime
-        .context_for_path(&root.context.tree, &child_path)
+        .context_for_execution(&root.context.tree, &child_lease)
         .expect("rehydrated child context");
 
     let materialized = runtime
@@ -1153,7 +1239,13 @@ async fn existing_child_followup_materializes_live_access_and_updates_durable_se
             .access_mode,
         AccessMode::FullAccess
     );
-    drop(root);
+    root.context
+        .tree
+        .control
+        .complete_execution(child_lease, InactiveAgentStatus::Completed(None), None)
+        .expect("complete config follow-up fixture");
+    root.complete(AgentStatus::Completed(None))
+        .expect("complete config root fixture");
 }
 
 #[tokio::test]
@@ -1206,11 +1298,11 @@ async fn root_resume_refreshes_limits_and_permission_broker_without_dropping_row
     let first = runtime
         .begin_root(
             &session,
-            config.clone(),
+            captured_turn_config(config.clone()),
             original.clone(),
-            None,
             RunControl::new(),
         )
+        .await
         .expect("first root turn");
     let first_context_broker = first.context.confirmation_prompt();
     let first_gate = first.context.model_request_gate();
@@ -1233,11 +1325,11 @@ async fn root_resume_refreshes_limits_and_permission_broker_without_dropping_row
     let resumed = runtime
         .begin_root(
             &session,
-            resumed_config,
+            captured_turn_config(resumed_config),
             replacement.clone(),
-            None,
             RunControl::new(),
         )
+        .await
         .expect("resumed root turn");
     let resumed_broker = resumed.context.confirmation_prompt();
     let resumed_gate = resumed.context.model_request_gate();
@@ -1296,9 +1388,7 @@ async fn process_restart_rehydrates_durable_child_for_listing_followup_and_name_
         turn_id,
         &terminal_event(
             child_session.session.id,
-            TurnTerminalStatus::Completed,
-            None,
-            "child completed",
+            TurnTerminalOutcome::Completed,
             None,
         ),
     )
@@ -1313,12 +1403,13 @@ async fn process_restart_rehydrates_durable_child_for_listing_followup_and_name_
     let execution = resumed_runtime
         .begin_root(
             &root_session,
-            config,
+            captured_turn_config(config),
             SharedConfirmationPrompt::new(AllowPrompt),
-            None,
             RunControl::new(),
         )
+        .await
         .expect("rehydrated root");
+    bind_test_root_turn(&resumed_runtime, &execution).await;
 
     let restored = execution
         .context
@@ -1361,19 +1452,50 @@ async fn process_restart_rehydrates_durable_child_for_listing_followup_and_name_
     );
     resumed_runtime.complete_root(
         execution,
-        &Ok(RunSummary {
-            session_id: root_session.session.id,
-            turn_id: None,
-            final_response_id: None,
-            status: SessionStatus::Completed,
-            finish_reason: Some(FinishReason::Stop),
-            tool_call_count: 0,
-            failed_tool_count: 0,
-            change_count: 0,
-            metrics: Default::default(),
-            interruption_cause: None,
-        }),
+        &Ok(terminal_summary(
+            root_session.session.id,
+            TurnTerminalOutcome::Completed,
+        )),
         None,
+    );
+}
+
+#[test]
+fn unlaunchable_scheduled_turn_consumes_trigger_before_failed_handoff() {
+    let (control, _root_execution) = AgentControl::new(SessionId::new(), 2).expect("agent tree");
+    let root = AgentPath::root();
+    let (child, child_execution) = control
+        .register_child(&root, "research", SessionId::new(), None)
+        .expect("child registration");
+    assert!(
+        control
+            .complete_execution(child_execution, InactiveAgentStatus::Completed(None), None,)
+            .expect("complete initial child turn")
+            .is_empty()
+    );
+    let delivery = control
+        .commit_and_enqueue_mail(&root, &child.path, true, || Ok(HistoryItemId::new()))
+        .expect("enqueue follow-up trigger");
+    let AgentMailDeliveryOutcome::Enqueued { mut scheduled, .. } = delivery else {
+        panic!("follow-up trigger must be scheduled");
+    };
+    assert_eq!(scheduled.len(), 1);
+
+    let additional = settle_unlaunchable_scheduled_execution(
+        &control,
+        scheduled.pop().expect("scheduled child lease"),
+        "child context could not be constructed".to_string(),
+    );
+
+    assert!(additional.is_empty());
+    assert!(
+        !control
+            .mailbox_has_trigger_turn(&child.path)
+            .expect("trigger state")
+    );
+    assert_eq!(
+        control.status(&child.path).expect("failed child status"),
+        AgentStatus::Errored("child context could not be constructed".to_string())
     );
 }
 
@@ -1415,6 +1537,14 @@ async fn durable_activity_projection_restores_three_completed_paths_tasks_and_re
             .expect("spawn edge");
 
         let turn_id = TurnId::new();
+        let admission_id = original_runtime
+            .store
+            .session_repo()
+            .admit_session_turn(child.session.id, turn_id)
+            .await
+            .expect("admit durable child fixture")
+            .expect("durable child fixture admitted")
+            .admission_id;
         let task = format!("durable task {task_name}");
         let result = format!("durable result {task_name}");
         let response_id = ModelResponseId::new();
@@ -1422,7 +1552,7 @@ async fn durable_activity_projection_restores_three_completed_paths_tasks_and_re
             .seed_history_item_for_test(&HistoryItem {
                 id: HistoryItemId::new(),
                 session_id: child.session.id,
-                turn_id,
+                scope: HistoryScope::Turn { turn_id },
                 sequence_no: 0,
                 created_at_ms: SystemClock::now_ms(),
                 payload: HistoryItemPayload::UserTurn {
@@ -1436,7 +1566,7 @@ async fn durable_activity_projection_restores_three_completed_paths_tasks_and_re
             .seed_history_item_for_test(&HistoryItem {
                 id: HistoryItemId::new(),
                 session_id: child.session.id,
-                turn_id,
+                scope: HistoryScope::Turn { turn_id },
                 sequence_no: 1,
                 created_at_ms: SystemClock::now_ms(),
                 payload: HistoryItemPayload::AssistantMessage {
@@ -1447,16 +1577,15 @@ async fn durable_activity_projection_restores_three_completed_paths_tasks_and_re
                 },
             })
             .expect("durable child result");
-        terminalize_test_session(
+        terminalize_admitted_test_session(
             &original_runtime,
             child.session.id,
+            admission_id,
             turn_id,
             &terminal_event(
                 child.session.id,
-                TurnTerminalStatus::Completed,
+                TurnTerminalOutcome::Completed,
                 Some(response_id),
-                "child completed",
-                None,
             ),
         )
         .await;
@@ -1507,7 +1636,12 @@ async fn durable_activity_projection_restores_three_completed_paths_tasks_and_re
         let mut running = session;
         running.status = SessionStatus::Running;
         assert!(matches!(
-            durable_projection_status(&running, Some("still running".to_string()), None),
+            durable_projection_status(
+                running.id,
+                running.status,
+                Some("still running".to_string()),
+                None,
+            ),
             AgentStatus::Running
         ));
     }
@@ -1553,10 +1687,8 @@ async fn durable_cancelled_projection_uses_the_canonical_typed_cause() {
             turn_id,
             &terminal_event(
                 child.session.id,
-                TurnTerminalStatus::Interrupted,
+                TurnTerminalOutcome::Interrupted { cause },
                 None,
-                cause.legacy_reason(),
-                Some(cause),
             ),
         )
         .await;
@@ -1581,7 +1713,7 @@ fn failed_durable_child_prefers_latest_error_over_partial_assistant_text() {
         HistoryItem {
             id: HistoryItemId::new(),
             session_id,
-            turn_id,
+            scope: HistoryScope::Turn { turn_id },
             sequence_no: 0,
             created_at_ms: SystemClock::now_ms(),
             payload: HistoryItemPayload::AssistantMessage {
@@ -1594,7 +1726,7 @@ fn failed_durable_child_prefers_latest_error_over_partial_assistant_text() {
         HistoryItem {
             id: HistoryItemId::new(),
             session_id,
-            turn_id,
+            scope: HistoryScope::Turn { turn_id },
             sequence_no: 1,
             created_at_ms: SystemClock::now_ms(),
             payload: HistoryItemPayload::Error {
@@ -1604,7 +1736,7 @@ fn failed_durable_child_prefers_latest_error_over_partial_assistant_text() {
         HistoryItem {
             id: HistoryItemId::new(),
             session_id,
-            turn_id,
+            scope: HistoryScope::Turn { turn_id },
             sequence_no: 2,
             created_at_ms: SystemClock::now_ms(),
             payload: HistoryItemPayload::Error {
@@ -1630,17 +1762,32 @@ async fn sub_agent_spawn_is_rejected_before_session_or_tree_side_effects() {
     let execution = runtime
         .begin_root(
             &session,
-            config.clone(),
+            captured_turn_config(config.clone()),
             SharedConfirmationPrompt::new(AllowPrompt),
-            None,
             RunControl::new(),
         )
+        .await
         .expect("root execution");
     let tree = execution.context.tree.clone();
     let child_path = crate::runtime::AgentPath::root()
         .join("child")
         .expect("child path");
-    let child_session_id = SessionId::new();
+    let child_session = runtime
+        .session_service
+        .start_or_resume(
+            SessionStartRequest {
+                selector: SessionSelector::New,
+                title: Some("spawn-depth-existing-child".to_string()),
+                cwd: session.workspace.cwd.clone(),
+                model: config.model.model.clone(),
+                base_url: config.model.base_url.clone(),
+                access_mode: config.permissions.access_mode,
+            },
+            session.workspace.clone(),
+        )
+        .await
+        .expect("existing child session");
+    let child_session_id = child_session.session.id;
     let (_, child_lease) = tree
         .control
         .register_child(
@@ -1655,11 +1802,18 @@ async fn sub_agent_spawn_is_rejected_before_session_or_tree_side_effects() {
         tree: tree.clone(),
         path: child_path,
         session_id: child_session_id,
-        config,
+        execution: child_lease.scope(),
+        root_turn_owner: Arc::clone(&execution.context.root_turn_owner),
+        config: captured_turn_config(config),
         workspace: session.workspace.clone(),
-        live_config: None,
     };
     let agents_before = tree.control.snapshot().expect("tree before").agents.len();
+    let sessions_before = runtime
+        .session_service
+        .list_sessions(session.session.project_id, 20)
+        .await
+        .expect("sessions before")
+        .len();
 
     let error = child_context
         .spawn_agent(
@@ -1692,15 +1846,22 @@ async fn sub_agent_spawn_is_rejected_before_session_or_tree_side_effects() {
             .await
             .expect("sessions")
             .len(),
-        1
+        sessions_before
     );
-    tree.control
-        .enqueue_mail(AgentMailboxMessage::new(
-            AgentPath::root(),
-            child_context.path.clone(),
-            "must not restart after durable terminalization",
-            true,
-        ))
+    let _ = tree
+        .control
+        .commit_and_enqueue_mail(&AgentPath::root(), &child_context.path, true, || {
+            runtime.append_communication(
+                child_context.session_id,
+                InterAgentCommunication {
+                    author: AgentPath::root().to_string(),
+                    recipient: child_context.path.to_string(),
+                    content: "must not restart after durable terminalization".to_string(),
+                    trigger_turn: true,
+                },
+                false,
+            )
+        })
         .expect("trigger mail");
     assert!(!tree.control.tree_is_cancelled());
     child_context
@@ -1715,28 +1876,20 @@ async fn sub_agent_spawn_is_rejected_before_session_or_tree_side_effects() {
     );
     assert!(!tree.control.tree_is_cancelled());
     tree.control
-        .complete_execution(child_lease, AgentStatus::Interrupted, None)
+        .complete_execution(child_lease, InactiveAgentStatus::Interrupted, None)
         .expect("complete child");
     runtime.complete_root(
         execution,
-        &Ok(RunSummary {
-            session_id: session.session.id,
-            turn_id: None,
-            final_response_id: None,
-            status: SessionStatus::Completed,
-            finish_reason: Some(FinishReason::Stop),
-            tool_call_count: 0,
-            failed_tool_count: 0,
-            change_count: 0,
-            metrics: Default::default(),
-            interruption_cause: None,
-        }),
+        &Ok(terminal_summary(
+            session.session.id,
+            TurnTerminalOutcome::Completed,
+        )),
         None,
     );
 }
 
 #[tokio::test]
-async fn completed_root_raw_interrupt_preserves_success_and_stops_active_children() {
+async fn completed_root_task_scope_stop_preserves_turn_success_and_stops_active_children() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 tempdir");
     let storage_paths = StoragePaths {
@@ -1781,12 +1934,13 @@ async fn completed_root_raw_interrupt_preserves_success_and_stops_active_childre
     let execution = runtime
         .begin_root(
             &session,
-            config,
+            captured_turn_config(config),
             SharedConfirmationPrompt::new(AllowPrompt),
-            None,
             root_control.clone(),
         )
+        .await
         .expect("root execution");
+    let root_turn_control = execution.run_control();
     let tree = execution.context.tree.clone();
     let (_, child_lease) = tree
         .control
@@ -1798,19 +1952,11 @@ async fn completed_root_raw_interrupt_preserves_success_and_stops_active_childre
         )
         .expect("detached child");
     let child_cancel = child_lease.cancel_token();
-    let summary = Ok(RunSummary {
-        session_id: session.session.id,
-        turn_id: None,
-        final_response_id: None,
-        status: SessionStatus::Completed,
-        finish_reason: Some(FinishReason::Stop),
-        tool_call_count: 0,
-        failed_tool_count: 0,
-        change_count: 0,
-        metrics: Default::default(),
-        interruption_cause: None,
-    });
-    assert!(root_control.seal_success());
+    let summary = Ok(terminal_summary(
+        session.session.id,
+        TurnTerminalOutcome::Completed,
+    ));
+    assert!(root_turn_control.seal_success());
     runtime.complete_root(execution, &summary, None);
     assert!(
         !child_cancel.is_cancelled(),
@@ -1833,11 +1979,11 @@ async fn completed_root_raw_interrupt_preserves_success_and_stops_active_childre
         .is_err(),
         "root completion must not make a tree with a detached child quiescent"
     );
-    assert!(!root_control.interrupt(TurnInterruptionCause::UserStop));
+    assert!(root_control.interrupt(TurnInterruptionCause::UserStop));
     assert!(!root_control.interrupt(TurnInterruptionCause::ApprovalAborted));
     tokio::time::timeout(Duration::from_secs(1), child_cancel.cancelled())
         .await
-        .expect("raw root Stop reached the active child while preserving sealed root success");
+        .expect("task-scope Stop reached the active child while preserving sealed turn success");
     assert!(tree.control.tree_is_cancelled());
     assert!(
         tokio::time::timeout(
@@ -1850,7 +1996,7 @@ async fn completed_root_raw_interrupt_preserves_success_and_stops_active_childre
     );
     assert!(!runtime.cancel_tree_for_session(session.session.id, TurnInterruptionCause::UserStop,));
     tree.control
-        .complete_execution(child_lease, AgentStatus::Interrupted, None)
+        .complete_execution(child_lease, InactiveAgentStatus::Interrupted, None)
         .expect("complete stopped detached child");
     tokio::time::timeout(
         Duration::from_secs(1),
@@ -1874,11 +2020,11 @@ async fn failed_root_cancels_detached_children_but_successful_root_does_not() {
     let execution = runtime
         .begin_root(
             &session,
-            config,
+            captured_turn_config(config),
             SharedConfirmationPrompt::new(AllowPrompt),
-            None,
             RunControl::new(),
         )
+        .await
         .expect("root execution");
     let tree = execution.context.tree.clone();
     let (_, child_lease) = tree
@@ -1901,7 +2047,7 @@ async fn failed_root_cancels_detached_children_but_successful_root_does_not() {
     assert!(tree.control.tree_is_cancelled());
     assert!(child_cancel.is_cancelled());
     tree.control
-        .complete_execution(child_lease, AgentStatus::Interrupted, None)
+        .complete_execution(child_lease, InactiveAgentStatus::Interrupted, None)
         .expect("complete cancelled child");
     runtime
         .wait_for_tree_quiescence(session.session.id)
@@ -1923,11 +2069,11 @@ async fn durable_failed_root_cancels_active_and_queued_children() {
     let execution = runtime
         .begin_root(
             &session,
-            config,
+            captured_turn_config(config),
             SharedConfirmationPrompt::new(AllowPrompt),
-            None,
             root_control.clone(),
         )
+        .await
         .expect("root execution");
     let tree = execution.context.tree.clone();
     let (_, active_child) = tree
@@ -1946,22 +2092,15 @@ async fn durable_failed_root_cancels_active_and_queued_children() {
             &AgentPath::root(),
             "queued",
             SessionId::new(),
-            AgentStatus::Completed(None),
+            InactiveAgentStatus::Completed(None),
             Some("queued follow-up".to_string()),
         )
         .expect("queued child row");
     let delivery = tree
         .control
-        .enqueue_mail_after_durable_commit(
-            AgentMailboxMessage::new(
-                AgentPath::root(),
-                queued_path.clone(),
-                "run another turn".to_string(),
-                true,
-            ),
-            true,
-            || Ok(()),
-        )
+        .commit_and_enqueue_mail(&AgentPath::root(), &queued_path, true, || {
+            Ok(HistoryItemId::new())
+        })
         .expect("queue follow-up while capacity is full");
     assert!(matches!(
         delivery,
@@ -1970,18 +2109,12 @@ async fn durable_failed_root_cancels_active_and_queued_children() {
 
     runtime.complete_root(
         execution,
-        &Ok(RunSummary {
-            session_id: session.session.id,
-            turn_id: None,
-            final_response_id: None,
-            status: SessionStatus::Failed,
-            finish_reason: Some(FinishReason::Error),
-            tool_call_count: 0,
-            failed_tool_count: 0,
-            change_count: 0,
-            metrics: Default::default(),
-            interruption_cause: None,
-        }),
+        &Ok(terminal_summary(
+            session.session.id,
+            TurnTerminalOutcome::Failed {
+                error: "root failed".to_string(),
+            },
+        )),
         None,
     );
 
@@ -2012,7 +2145,7 @@ async fn durable_failed_root_cancels_active_and_queued_children() {
     tree.control
         .complete_execution(
             active_child,
-            AgentStatus::Errored("root failed".to_string()),
+            InactiveAgentStatus::Errored("root failed".to_string()),
             None,
         )
         .expect("settle active child");
@@ -2025,11 +2158,11 @@ async fn durable_root_interruption_cause_wins_over_a_conflicting_local_cause() {
     let execution = runtime
         .begin_root(
             &session,
-            config,
+            captured_turn_config(config),
             SharedConfirmationPrompt::new(AllowPrompt),
-            None,
             root_control.clone(),
         )
+        .await
         .expect("root execution");
     let tree = execution.context.tree.clone();
     let (_, child) = tree
@@ -2046,18 +2179,12 @@ async fn durable_root_interruption_cause_wins_over_a_conflicting_local_cause() {
 
     runtime.complete_root(
         execution,
-        &Ok(RunSummary {
-            session_id: session.session.id,
-            turn_id: None,
-            final_response_id: None,
-            status: SessionStatus::Cancelled,
-            finish_reason: Some(FinishReason::Cancelled),
-            tool_call_count: 0,
-            failed_tool_count: 0,
-            change_count: 0,
-            metrics: Default::default(),
-            interruption_cause: Some(TurnInterruptionCause::UserStop),
-        }),
+        &Ok(terminal_summary(
+            session.session.id,
+            TurnTerminalOutcome::Interrupted {
+                cause: TurnInterruptionCause::UserStop,
+            },
+        )),
         Some(RunCancellationCause::Interruption(
             TurnInterruptionCause::ApprovalAborted,
         )),
@@ -2079,7 +2206,7 @@ async fn durable_root_interruption_cause_wins_over_a_conflicting_local_cause() {
         "the authoritative durable root stop must still close descendant work"
     );
     tree.control
-        .complete_execution(child, AgentStatus::Interrupted, None)
+        .complete_execution(child, InactiveAgentStatus::Interrupted, None)
         .expect("settle child");
 }
 
@@ -2090,12 +2217,13 @@ async fn durable_root_success_preserves_root_while_deferred_stop_closes_children
     let execution = runtime
         .begin_root(
             &session,
-            config,
+            captured_turn_config(config),
             SharedConfirmationPrompt::new(AllowPrompt),
-            None,
             root_control.clone(),
         )
+        .await
         .expect("root execution");
+    let root_turn_control = execution.run_control();
     let tree = execution.context.tree.clone();
     let (_, child_lease) = tree
         .control
@@ -2108,7 +2236,7 @@ async fn durable_root_success_preserves_root_while_deferred_stop_closes_children
         .expect("detached child");
     let child_cancel = child_lease.cancel_token();
 
-    let success_commit = root_control
+    let success_commit = root_turn_control
         .begin_success_commit()
         .expect("reserve durable success commit");
     assert!(matches!(
@@ -2126,21 +2254,14 @@ async fn durable_root_success_preserves_root_while_deferred_stop_closes_children
     assert!(child_cancel.is_cancelled());
     assert!(tree.control.tree_is_cancelled());
     assert!(success_commit.seal());
+    assert!(root_turn_control.success_is_sealed());
 
     runtime.complete_root(
         execution,
-        &Ok(RunSummary {
-            session_id: session.session.id,
-            turn_id: None,
-            final_response_id: None,
-            status: SessionStatus::Completed,
-            finish_reason: Some(FinishReason::Stop),
-            tool_call_count: 0,
-            failed_tool_count: 0,
-            change_count: 0,
-            metrics: Default::default(),
-            interruption_cause: None,
-        }),
+        &Ok(terminal_summary(
+            session.session.id,
+            TurnTerminalOutcome::Completed,
+        )),
         None,
     );
 
@@ -2156,7 +2277,7 @@ async fn durable_root_success_preserves_root_while_deferred_stop_closes_children
     assert!(tree.control.tree_is_cancelled());
     assert!(child_cancel.is_cancelled());
     tree.control
-        .complete_execution(child_lease, AgentStatus::Interrupted, None)
+        .complete_execution(child_lease, InactiveAgentStatus::Interrupted, None)
         .expect("complete detached child");
 }
 
@@ -2168,14 +2289,15 @@ async fn zero_child_stop_during_success_blocks_idle_root_continuation() {
     let execution = runtime
         .begin_root(
             &session,
-            config,
+            captured_turn_config(config),
             SharedConfirmationPrompt::new(AllowPrompt),
-            None,
             root_control.clone(),
         )
+        .await
         .expect("root execution");
+    let root_turn_control = execution.run_control();
     let tree = execution.context.tree.clone();
-    let success = root_control
+    let success = root_turn_control
         .begin_success_commit()
         .expect("reserve durable success commit");
 
@@ -2189,22 +2311,14 @@ async fn zero_child_stop_during_success_blocks_idle_root_continuation() {
     assert!(success.seal());
     runtime.complete_root(
         execution,
-        &Ok(RunSummary {
-            session_id: session.session.id,
-            turn_id: None,
-            final_response_id: None,
-            status: SessionStatus::Completed,
-            finish_reason: Some(FinishReason::Stop),
-            tool_call_count: 0,
-            failed_tool_count: 0,
-            change_count: 0,
-            metrics: Default::default(),
-            interruption_cause: None,
-        }),
+        &Ok(terminal_summary(
+            session.session.id,
+            TurnTerminalOutcome::Completed,
+        )),
         None,
     );
 
-    assert!(root_control.success_is_sealed());
+    assert!(root_turn_control.success_is_sealed());
     assert!(matches!(
         runtime
             .begin_root_continuation(
@@ -2218,6 +2332,62 @@ async fn zero_child_stop_during_success_blocks_idle_root_continuation() {
 }
 
 #[tokio::test]
+async fn inactive_goal_releases_preclaimed_continuation_without_failing_root_scope() {
+    let (runtime, session, config) =
+        direct_runtime_fixture("inactive-goal-continuation-release", 1).await;
+    let root_scope = RunControl::new();
+    let first_execution = runtime
+        .begin_root(
+            &session,
+            captured_turn_config(config),
+            SharedConfirmationPrompt::new(AllowPrompt),
+            root_scope.clone(),
+        )
+        .await
+        .expect("first root execution");
+    let tree = first_execution.context.tree.clone();
+    assert!(first_execution.run_control().seal_success());
+    runtime.complete_root(
+        first_execution,
+        &Ok(terminal_summary(
+            session.session.id,
+            TurnTerminalOutcome::Completed,
+        )),
+        None,
+    );
+
+    let continuation = match runtime
+        .begin_root_continuation(
+            session.session.id,
+            root_scope.clone(),
+            Some(SharedConfirmationPrompt::new(AllowPrompt)),
+        )
+        .expect("continuation claim")
+    {
+        AgentRuntimeContinuationOutcome::Admitted(execution) => execution,
+        AgentRuntimeContinuationOutcome::Blocked
+        | AgentRuntimeContinuationOutcome::NotReady
+        | AgentRuntimeContinuationOutcome::Invalid => panic!("continuation was not admitted"),
+    };
+    let unadmitted_turn = continuation.run_control();
+    runtime
+        .release_unadmitted_root_continuation(continuation)
+        .expect("release inactive-goal continuation");
+
+    assert!(!unadmitted_turn.success_is_sealed());
+    assert_eq!(unadmitted_turn.cause(), None);
+    assert_eq!(root_scope.cause(), None);
+    assert!(!tree.control.tree_is_cancelled());
+    assert!(tree.control.is_quiescent().expect("tree quiescence"));
+    assert!(matches!(
+        tree.control
+            .status(&AgentPath::root())
+            .expect("root status"),
+        AgentStatus::Completed(_)
+    ));
+}
+
+#[tokio::test]
 async fn root_continuation_claim_before_stop_reuses_and_cancels_the_retained_tree() {
     let (runtime, session, config) =
         direct_runtime_fixture("claimed-root-continuation-stop", 1).await;
@@ -2225,20 +2395,20 @@ async fn root_continuation_claim_before_stop_reuses_and_cancels_the_retained_tre
     let execution = runtime
         .begin_root(
             &session,
-            config,
+            captured_turn_config(config),
             SharedConfirmationPrompt::new(AllowPrompt),
-            None,
             root_control.clone(),
         )
+        .await
         .expect("root execution");
+    let first_turn_control = execution.run_control();
     let tree = execution.context.tree.clone();
-    assert!(root_control.seal_success());
+    assert!(first_turn_control.seal_success());
     runtime.complete_root(
         execution,
         &Ok(terminal_summary(
             session.session.id,
-            SessionStatus::Completed,
-            None,
+            TurnTerminalOutcome::Completed,
         )),
         None,
     );
@@ -2252,12 +2422,14 @@ async fn root_continuation_claim_before_stop_reuses_and_cancels_the_retained_tre
         .expect("continuation outcome")
     {
         AgentRuntimeContinuationOutcome::Admitted(execution) => execution,
-        AgentRuntimeContinuationOutcome::Unmanaged
-        | AgentRuntimeContinuationOutcome::Blocked
+        AgentRuntimeContinuationOutcome::Blocked
         | AgentRuntimeContinuationOutcome::NotReady
         | AgentRuntimeContinuationOutcome::Invalid => panic!("continuation was not admitted"),
     };
+    let continuation_control = continuation.run_control();
     assert!(Arc::ptr_eq(&tree, &continuation.context.tree));
+    assert!(!continuation_control.same_owner(&first_turn_control));
+    assert!(!continuation_control.same_owner(&root_control));
 
     assert_eq!(
         root_control.request_cancel(RunCancellationCause::Interruption(
@@ -2266,14 +2438,21 @@ async fn root_continuation_claim_before_stop_reuses_and_cancels_the_retained_tre
         RunCancelOutcome::Applied
     );
     assert!(tree.control.tree_is_cancelled());
+    assert_eq!(
+        continuation_control.cause(),
+        Some(RunCancellationCause::Interruption(
+            TurnInterruptionCause::UserStop
+        ))
+    );
     runtime.complete_root(
         continuation,
         &Ok(terminal_summary(
             session.session.id,
-            SessionStatus::Cancelled,
-            Some(TurnInterruptionCause::UserStop),
+            TurnTerminalOutcome::Interrupted {
+                cause: TurnInterruptionCause::UserStop,
+            },
         )),
-        root_control.cause(),
+        continuation_control.cause(),
     );
     assert!(tree.control.is_quiescent().expect("tree quiescence"));
 }
@@ -2285,20 +2464,20 @@ async fn preclaimed_root_early_error_classifies_tree_and_releases_lease() {
     let execution = runtime
         .begin_root(
             &session,
-            config,
+            captured_turn_config(config),
             SharedConfirmationPrompt::new(AllowPrompt),
-            None,
             root_control.clone(),
         )
+        .await
         .expect("root execution");
+    let first_turn_control = execution.run_control();
     let tree = execution.context.tree.clone();
-    assert!(root_control.seal_success());
+    assert!(first_turn_control.seal_success());
     runtime.complete_root(
         execution,
         &Ok(terminal_summary(
             session.session.id,
-            SessionStatus::Completed,
-            None,
+            TurnTerminalOutcome::Completed,
         )),
         None,
     );
@@ -2311,19 +2490,19 @@ async fn preclaimed_root_early_error_classifies_tree_and_releases_lease() {
         .expect("continuation outcome")
     {
         AgentRuntimeContinuationOutcome::Admitted(execution) => execution,
-        AgentRuntimeContinuationOutcome::Unmanaged
-        | AgentRuntimeContinuationOutcome::Blocked
+        AgentRuntimeContinuationOutcome::Blocked
         | AgentRuntimeContinuationOutcome::NotReady
         | AgentRuntimeContinuationOutcome::Invalid => panic!("continuation was not admitted"),
     };
+    let continuation_control = continuation.run_control();
     let result = Err(crate::error::AppRunError::Message(
         "continuation setup failed".to_string(),
     ));
     crate::app::run_service::classify_run_error(
-        &root_control,
+        &continuation_control,
         result.as_ref().expect_err("early error"),
     );
-    runtime.complete_root(continuation, &result, root_control.cause());
+    runtime.complete_root(continuation, &result, continuation_control.cause());
 
     assert_eq!(
         root_control.cause(),
@@ -2348,11 +2527,11 @@ async fn active_root_cancel_cascades_before_the_root_run_settles() {
     let execution = runtime
         .begin_root(
             &session,
-            config,
+            captured_turn_config(config),
             SharedConfirmationPrompt::new(AllowPrompt),
-            None,
             root_control.clone(),
         )
+        .await
         .expect("root execution");
     let tree = execution.context.tree.clone();
     let root_cancel = root_control.token();
@@ -2386,7 +2565,7 @@ async fn active_root_cancel_cascades_before_the_root_run_settles() {
     assert!(tree.control.tree_is_cancelled());
     assert!(child_cancel.is_cancelled());
     tree.control
-        .complete_execution(child_lease, AgentStatus::Interrupted, None)
+        .complete_execution(child_lease, InactiveAgentStatus::Interrupted, None)
         .expect("complete detached child");
 }
 
@@ -2397,11 +2576,11 @@ async fn root_context_durable_terminal_accessor_cancels_the_whole_tree() {
     let execution = runtime
         .begin_root(
             &session,
-            config,
+            captured_turn_config(config),
             SharedConfirmationPrompt::new(AllowPrompt),
-            None,
             root_control.clone(),
         )
+        .await
         .expect("root execution");
     let tree = execution.context.tree.clone();
     assert!(!tree.control.tree_is_cancelled());
@@ -2415,18 +2594,7 @@ async fn root_context_durable_terminal_accessor_cancels_the_whole_tree() {
 
     runtime.complete_root(
         execution,
-        &Ok(RunSummary {
-            session_id: session.session.id,
-            turn_id: None,
-            final_response_id: None,
-            status: SessionStatus::Cancelled,
-            finish_reason: Some(FinishReason::Cancelled),
-            tool_call_count: 0,
-            failed_tool_count: 0,
-            change_count: 0,
-            metrics: Default::default(),
-            interruption_cause: None,
-        }),
+        &Err(AppRunError::Message("root turn was superseded".to_string())),
         Some(RunCancellationCause::Superseded),
     );
 }
@@ -2519,7 +2687,9 @@ impl LlmClient for DetachedGoalScriptClient {
             }
             2 => {
                 let saw_child_result = request.messages.iter().any(|message| {
-                    matches!(message, ModelMessage::Assistant { content } if content.contains(DETACHED_CHILD_RESULT))
+                    matches!(message, ModelMessage::User { content }
+                        if content.contains("<inter_agent_message")
+                            && content.contains(DETACHED_CHILD_RESULT))
                 });
                 self.state
                     .continuation_saw_child_result
@@ -2602,7 +2772,9 @@ impl LlmClient for AgentScriptClient {
             }
             2 => {
                 let received_child_result = request.messages.iter().any(|message| {
-                    matches!(message, ModelMessage::Assistant { content } if content.contains(CHILD_RESULT))
+                    matches!(message, ModelMessage::User { content }
+                        if content.contains("<inter_agent_message")
+                            && content.contains(CHILD_RESULT))
                 });
                 if !received_child_result {
                     return Err(LlmError::Message(
@@ -2649,6 +2821,159 @@ fn response_summary(finish_reason: FinishReason) -> LlmResponseSummary {
     }
 }
 
+fn bind_agent_script_run_service(
+    runtime: &Arc<AgentRuntime>,
+    session: &SessionContext,
+    config: &ResolvedConfig,
+    script: Arc<AgentScriptState>,
+) -> Arc<RunService> {
+    let store = runtime.store.clone();
+    let session_service = runtime.session_service.clone();
+    let tool_services = ToolServices {
+        edit_safety: crate::edit::EditSafety::default(),
+        formatter: crate::edit::Formatter::new(config.format.clone()),
+        change_tracker: crate::edit::ChangeTracker::default(),
+        store: store.clone(),
+        storage_paths: store.paths().clone(),
+        truncator: ToolTruncator,
+        mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
+        skills: crate::skill::SkillsService::new(),
+    };
+    let registry = ToolRegistry::core_agent_for_config(config);
+    let llm = Arc::new(AgentScriptClient { state: script });
+    let agent_loop = AgentLoop::new(llm, registry, store.clone(), PromptBuilder, tool_services)
+        .with_model_request_concurrency(1);
+    let run_service = Arc::new(RunService::new(
+        store,
+        config.clone(),
+        session.workspace.clone(),
+        session_service,
+        agent_loop,
+        SessionRuntimeEventHub::new(32),
+        runtime.clone(),
+    ));
+    runtime
+        .bind_run_service(Arc::downgrade(&run_service))
+        .expect("bind agent run service");
+    run_service
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_child_is_hard_stopped_at_worker_activation_before_run_admission() {
+    let (runtime, root_session, config) =
+        direct_runtime_fixture("cancelled-child-worker-activation", 2).await;
+    let script = Arc::new(AgentScriptState::default());
+    let _run_service =
+        bind_agent_script_run_service(&runtime, &root_session, &config, script.clone());
+    let root_execution = runtime
+        .begin_root(
+            &root_session,
+            captured_turn_config(config.clone()),
+            SharedConfirmationPrompt::new(AllowPrompt),
+            RunControl::new(),
+        )
+        .await
+        .expect("root execution");
+    let tree = root_execution.context.tree.clone();
+    let child = runtime
+        .session_service
+        .start_or_resume(
+            SessionStartRequest {
+                selector: SessionSelector::New,
+                title: Some("cancelled child".to_string()),
+                cwd: root_session.workspace.cwd.clone(),
+                model: config.model.model.clone(),
+                base_url: config.model.base_url.clone(),
+                access_mode: config.permissions.access_mode,
+            },
+            root_session.workspace.clone(),
+        )
+        .await
+        .expect("child session");
+    let child_path = AgentPath::root()
+        .join("cancelled_child")
+        .expect("child path");
+    let (_, child_lease) = tree
+        .control
+        .register_child(
+            &AgentPath::root(),
+            "cancelled_child",
+            child.session.id,
+            Some("Waiting for worker activation".to_string()),
+        )
+        .expect("child registration");
+    let child_context = AgentRunContext {
+        runtime: runtime.clone(),
+        tree: tree.clone(),
+        path: child_path.clone(),
+        session_id: child.session.id,
+        execution: child_lease.scope(),
+        root_turn_owner: Arc::clone(&root_execution.context.root_turn_owner),
+        config: captured_turn_config(config),
+        workspace: child.workspace.clone(),
+    };
+
+    assert!(tree.control.interrupt_tree(TurnInterruptionCause::UserStop));
+    if let Err(failure) =
+        runtime.launch_agent_turn(child_context, child_lease, CHILD_ASSIGNMENT.to_string())
+    {
+        panic!("worker thread launch failed: {}", failure.message);
+    }
+
+    let child_snapshot = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = tree
+                .control
+                .list_agents(Some(&child_path))
+                .expect("child snapshot")
+                .into_iter()
+                .find(|agent| agent.path == child_path)
+                .expect("retained child");
+            if !snapshot.is_active {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cancelled child worker did not settle");
+
+    assert_eq!(child_snapshot.status, AgentStatus::Interrupted);
+    assert_ne!(
+        child_snapshot.last_activity.as_deref(),
+        Some("Running assigned task")
+    );
+    assert_eq!(script.child_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(script.root_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        script
+            .requests
+            .lock()
+            .expect("request capture mutex")
+            .is_empty()
+    );
+    assert!(
+        runtime
+            .store
+            .session_repo()
+            .fresh_running_turn_for_session(child.session.id)
+            .await
+            .expect("child active turn")
+            .is_none()
+    );
+    assert!(
+        runtime
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(child.session.id)
+            .expect("child history")
+            .is_empty()
+    );
+    root_execution
+        .complete(AgentStatus::Interrupted)
+        .expect("complete stopped root");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner() {
     let (base_url, provider_server) = start_probe_provider().await;
@@ -2665,6 +2990,7 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
     let mut config = ResolvedConfig::default();
     config.model.model = "scripted".to_string();
     config.model.base_url = base_url.clone();
+    config.model.provider_api_mode = ProviderApiMode::ChatCompletions;
     config.model.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
     config.model.supports_tools = true;
     config.model.connect_timeout_ms = 2_000;
@@ -2744,9 +3070,11 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
                 continue_last: false,
                 title: None,
                 cwd: root.clone(),
-                model: "scripted".to_string(),
-                base_url: base_url.clone(),
-                config_override: None,
+                config: crate::app::RunConfigInput::Layered {
+                    model: "scripted".to_string(),
+                    base_url: base_url.clone(),
+                    config_override: None,
+                },
                 output_mode: OutputMode::Human,
                 show_reasoning_summary: false,
                 prompt_dispatch: None,
@@ -2754,7 +3082,6 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
                 review_request: None,
                 image_paths: Vec::new(),
                 run_control: RunControl::new(),
-                live_config: None,
                 agent_confirmation: Some(shared_confirmation.clone()),
                 agent_context: None,
             }),
@@ -2793,9 +3120,11 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
                 continue_last: false,
                 title: None,
                 cwd: root,
-                model: "scripted".to_string(),
-                base_url,
-                config_override: None,
+                config: crate::app::RunConfigInput::Layered {
+                    model: "scripted".to_string(),
+                    base_url,
+                    config_override: None,
+                },
                 output_mode: OutputMode::Human,
                 show_reasoning_summary: false,
                 prompt_dispatch: None,
@@ -2803,7 +3132,6 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
                 review_request: None,
                 image_paths: Vec::new(),
                 run_control: RunControl::new(),
-                live_config: None,
                 agent_confirmation: Some(shared_confirmation),
                 agent_context: None,
             }),
@@ -2856,6 +3184,7 @@ async fn idle_goal_continuation_waits_for_detached_child_and_loads_its_result() 
     let mut config = ResolvedConfig::default();
     config.model.model = "scripted".to_string();
     config.model.base_url = base_url.clone();
+    config.model.provider_api_mode = ProviderApiMode::ChatCompletions;
     config.model.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
     config.model.supports_tools = true;
     config.model.connect_timeout_ms = 2_000;
@@ -2931,40 +3260,44 @@ async fn idle_goal_continuation_waits_for_detached_child_and_loads_its_result() 
     let shared_confirmation = SharedConfirmationPrompt::new(AllowPrompt);
     let mut prompt = shared_confirmation.clone();
     let mut renderer = AgentEventRenderer;
-    let summary = tokio::time::timeout(
-        Duration::from_secs(5),
-        run_service.execute(
-            AppCommand::Run(RunRequest {
-                prompt: "/goal Integrate the detached child result before completion".to_string(),
-                session_id: Some(root_session.session.id),
-                continue_last: false,
-                title: None,
-                cwd: root,
-                model: "scripted".to_string(),
-                base_url,
-                config_override: None,
-                output_mode: OutputMode::Human,
-                show_reasoning_summary: false,
-                prompt_dispatch: None,
-                editor_context: None,
-                review_request: None,
-                image_paths: Vec::new(),
-                run_control: RunControl::new(),
-                live_config: None,
-                agent_confirmation: Some(shared_confirmation),
-                agent_context: None,
-            }),
-            &mut renderer,
-            &mut prompt,
-        ),
-    )
-    .await
-    .expect("bounded goal continuation")
-    .expect("goal run");
+    let summary = admitted_turn(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_service.execute(
+                AppCommand::Run(RunRequest {
+                    prompt: "/goal Integrate the detached child result before completion"
+                        .to_string(),
+                    session_id: Some(root_session.session.id),
+                    continue_last: false,
+                    title: None,
+                    cwd: root,
+                    config: crate::app::RunConfigInput::Layered {
+                        model: "scripted".to_string(),
+                        base_url,
+                        config_override: None,
+                    },
+                    output_mode: OutputMode::Human,
+                    show_reasoning_summary: false,
+                    prompt_dispatch: None,
+                    editor_context: None,
+                    review_request: None,
+                    image_paths: Vec::new(),
+                    run_control: RunControl::new(),
+                    agent_confirmation: Some(shared_confirmation),
+                    agent_context: None,
+                }),
+                &mut renderer,
+                &mut prompt,
+            ),
+        )
+        .await
+        .expect("bounded goal continuation")
+        .expect("goal run"),
+    );
 
     let canonical_history = store
         .protocol_event_store()
-        .list_history_items_for_session(summary.session_id)
+        .list_history_items_for_session(summary.session_id())
         .expect("canonical root history");
     let durable_communications = canonical_history
         .iter()
@@ -2976,7 +3309,7 @@ async fn idle_goal_continuation_waits_for_detached_child_and_loads_its_result() 
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        summary.status,
+        summary.status(),
         SessionStatus::Completed,
         "summary={summary:#?}; root_calls={}; child_calls={}; child_finished={}; saw_child_result={}; durable_communications={durable_communications:#?}",
         script.root_calls.load(Ordering::SeqCst),
@@ -2991,7 +3324,7 @@ async fn idle_goal_continuation_waits_for_detached_child_and_loads_its_result() 
     assert_eq!(
         store
             .session_repo()
-            .get_thread_goal(summary.session_id)
+            .get_thread_goal(summary.session_id())
             .await
             .expect("goal read")
             .expect("goal")
@@ -3018,6 +3351,7 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
     let mut config = ResolvedConfig::default();
     config.model.model = "scripted".to_string();
     config.model.base_url = base_url.clone();
+    config.model.provider_api_mode = ProviderApiMode::ChatCompletions;
     config.model.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
     config.model.supports_tools = true;
     config.model.supports_reasoning = true;
@@ -3110,41 +3444,44 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
     let shared_confirmation = SharedConfirmationPrompt::new(AllowPrompt);
     let mut execute_prompt = shared_confirmation.clone();
     let mut renderer = AgentEventRenderer;
-    let summary = run_service
-        .execute(
-            AppCommand::Run(RunRequest {
-                prompt: ROOT_TASK.to_string(),
-                session_id: Some(root_session.session.id),
-                continue_last: false,
-                title: None,
-                cwd: root.clone(),
-                model: "scripted".to_string(),
-                base_url: base_url.clone(),
-                config_override: None,
-                output_mode: OutputMode::Human,
-                show_reasoning_summary: false,
-                prompt_dispatch: None,
-                editor_context: None,
-                review_request: None,
-                image_paths: Vec::new(),
-                run_control: RunControl::new(),
-                live_config: None,
-                agent_confirmation: Some(shared_confirmation),
-                agent_context: None,
-            }),
-            &mut renderer,
-            &mut execute_prompt,
-        )
-        .await
-        .expect("root run");
+    let summary = admitted_turn(
+        run_service
+            .execute(
+                AppCommand::Run(RunRequest {
+                    prompt: ROOT_TASK.to_string(),
+                    session_id: Some(root_session.session.id),
+                    continue_last: false,
+                    title: None,
+                    cwd: root.clone(),
+                    config: crate::app::RunConfigInput::Layered {
+                        model: "scripted".to_string(),
+                        base_url: base_url.clone(),
+                        config_override: None,
+                    },
+                    output_mode: OutputMode::Human,
+                    show_reasoning_summary: false,
+                    prompt_dispatch: None,
+                    editor_context: None,
+                    review_request: None,
+                    image_paths: Vec::new(),
+                    run_control: RunControl::new(),
+                    agent_confirmation: Some(shared_confirmation),
+                    agent_context: None,
+                }),
+                &mut renderer,
+                &mut execute_prompt,
+            )
+            .await
+            .expect("root run"),
+    );
 
-    assert_eq!(summary.status, SessionStatus::Completed);
-    assert_eq!(summary.session_id, root_session.session.id);
+    assert_eq!(summary.status(), SessionStatus::Completed);
+    assert_eq!(summary.session_id(), root_session.session.id);
     assert_eq!(script.root_calls.load(Ordering::SeqCst), 3);
     assert_eq!(script.child_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         session_service
-            .get_session(summary.session_id)
+            .get_session(summary.session_id())
             .await
             .expect("root session")
             .status,
@@ -3153,13 +3490,13 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
 
     let edges = store
         .session_repo()
-        .list_session_spawn_edges(summary.session_id)
+        .list_session_spawn_edges(summary.session_id())
         .await
         .expect("spawn edges");
     assert_eq!(edges.len(), 1);
     let edge = &edges[0];
-    assert_eq!(edge.root_session_id, summary.session_id);
-    assert_eq!(edge.parent_session_id, summary.session_id);
+    assert_eq!(edge.root_session_id, summary.session_id());
+    assert_eq!(edge.parent_session_id, summary.session_id());
     assert_eq!(edge.agent_path, "/root/worker");
     assert_eq!(edge.task_name, "worker");
     let child_session_id = edge.child_session_id;
@@ -3169,7 +3506,7 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
         .await
         .expect("normal session list");
     assert_eq!(visible_sessions.len(), 1);
-    assert_eq!(visible_sessions[0].id, summary.session_id);
+    assert_eq!(visible_sessions[0].id, summary.session_id());
     assert_eq!(
         session_service
             .get_session(child_session_id)
@@ -3182,7 +3519,7 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
     let deadline = Instant::now() + Duration::from_secs(5);
     let child_activity = loop {
         if let Some(activity) = agent_runtime
-            .activity_records(summary.session_id)
+            .activity_records(summary.session_id())
             .into_iter()
             .find(|activity| activity.agent_path == "/root/worker")
             .filter(|activity| matches!(activity.status, AgentStatus::Completed(_)))
@@ -3199,7 +3536,7 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
 
     let root_history = store
         .protocol_event_store()
-        .list_history_items_for_session(summary.session_id)
+        .list_history_items_for_session(summary.session_id())
         .expect("root history");
     assert!(root_history.iter().any(|item| matches!(
         &item.payload,
@@ -3276,8 +3613,11 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
+    assert!(
+        !tool_names.contains(&"spawn_agent"),
+        "a one-level child must not receive the root-only spawn_agent tool"
+    );
     for required in [
-        "spawn_agent",
         "send_message",
         "followup_task",
         "wait_agent",

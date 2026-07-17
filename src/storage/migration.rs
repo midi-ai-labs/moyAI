@@ -1,7 +1,8 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
+use ulid::Ulid;
 
 use crate::error::StorageError;
 
@@ -77,13 +78,34 @@ const V36_DROP_LEGACY_REASONING_ITEMS: &str =
     include_str!("../../migrations/V36__drop_legacy_reasoning_items.sql");
 const V37_RAW_TOOL_CALL_HISTORY: &str =
     include_str!("../../migrations/V37__raw_tool_call_history.sql");
+const V38_REMOVE_AUTO_REVIEW_ACCESS_MODE: &str =
+    include_str!("../../migrations/V38__remove_auto_review_access_mode.sql");
+const V39_TERMINAL_OUTCOME_CUTOVER: &str =
+    include_str!("../../migrations/V39__terminal_outcome_cutover.sql");
+const V40_FLATTEN_SESSION_SPAWN_EDGES: &str =
+    include_str!("../../migrations/V40__flatten_session_spawn_edges.sql");
+const V41_INDEXED_COLLABORATION_MODE_LOOKUP: &str =
+    include_str!("../../migrations/V41__indexed_collaboration_mode_lookup.sql");
+const V42_TYPED_HISTORY_SCOPE: &str = include_str!("../../migrations/V42__typed_history_scope.sql");
+const V43_INDEXED_INTERNAL_FILE_OWNERSHIP: &str =
+    include_str!("../../migrations/V43__indexed_internal_file_ownership.sql");
+const V44_UNIQUE_TURN_TERMINAL: &str =
+    include_str!("../../migrations/V44__unique_turn_terminal.sql");
 const LEGACY_PLANNER_CUTOVER_VERSION: i64 = 32;
 const CANONICAL_PROTOCOL_STORAGE_VERSION: i64 = 33;
 const DROP_SESSIONS_MEMORY_MODE_VERSION: i64 = 34;
 const DROP_SESSIONS_AWAITING_USER_STATUS_VERSION: i64 = 35;
 const DROP_LEGACY_REASONING_ITEMS_VERSION: i64 = 36;
 const RAW_TOOL_CALL_HISTORY_VERSION: i64 = 37;
+const REMOVE_AUTO_REVIEW_ACCESS_MODE_VERSION: i64 = 38;
+const TERMINAL_OUTCOME_CUTOVER_VERSION: i64 = 39;
+const FLATTEN_SESSION_SPAWN_EDGES_VERSION: i64 = 40;
+const INDEXED_COLLABORATION_MODE_LOOKUP_VERSION: i64 = 41;
+const TYPED_HISTORY_SCOPE_VERSION: i64 = 42;
+const INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION: i64 = 43;
+const UNIQUE_TURN_TERMINAL_VERSION: i64 = 44;
 const SESSION_STATUS_DOMAIN: &[&str] = &["idle", "running", "completed", "cancelled", "failed"];
+const SESSION_ACCESS_MODE_DOMAIN: &[&str] = &["default", "full_access"];
 const RELEASED_V18_SESSION_STATUS_DOMAIN: &[&str] = &[
     "idle",
     "running",
@@ -102,18 +124,88 @@ const TOOL_CALL_STATUS_DOMAIN: &[&str] = &[
 ];
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
+    if schema_migration_applied(connection, UNIQUE_TURN_TERMINAL_VERSION)? {
+        validate_canonical_protocol_schema(connection)?;
+        return Ok(());
+    }
+    if schema_migration_applied(connection, INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION)? {
+        run_unique_turn_terminal(connection)?;
+        validate_canonical_protocol_schema(connection)?;
+        return Ok(());
+    }
+    if schema_migration_applied(connection, TYPED_HISTORY_SCOPE_VERSION)? {
+        run_indexed_internal_file_ownership(connection)?;
+        run_unique_turn_terminal(connection)?;
+        validate_canonical_protocol_schema(connection)?;
+        return Ok(());
+    }
+    if schema_migration_applied(connection, INDEXED_COLLABORATION_MODE_LOOKUP_VERSION)? {
+        run_typed_history_scope(connection)?;
+        run_indexed_internal_file_ownership(connection)?;
+        run_unique_turn_terminal(connection)?;
+        validate_canonical_protocol_storage(connection)?;
+        return Ok(());
+    }
+    if schema_migration_applied(connection, FLATTEN_SESSION_SPAWN_EDGES_VERSION)? {
+        run_indexed_collaboration_mode_lookup(connection)?;
+        run_typed_history_scope(connection)?;
+        run_indexed_internal_file_ownership(connection)?;
+        run_unique_turn_terminal(connection)?;
+        validate_canonical_protocol_storage(connection)?;
+        return Ok(());
+    }
+    if schema_migration_applied(connection, TERMINAL_OUTCOME_CUTOVER_VERSION)? {
+        run_flatten_session_spawn_edges(connection)?;
+        run_indexed_collaboration_mode_lookup(connection)?;
+        run_typed_history_scope(connection)?;
+        run_indexed_internal_file_ownership(connection)?;
+        run_unique_turn_terminal(connection)?;
+        validate_canonical_protocol_storage(connection)?;
+        return Ok(());
+    }
+    if schema_migration_applied(connection, REMOVE_AUTO_REVIEW_ACCESS_MODE_VERSION)? {
+        run_terminal_outcome_cutover(connection)?;
+        run_flatten_session_spawn_edges(connection)?;
+        run_indexed_collaboration_mode_lookup(connection)?;
+        run_typed_history_scope(connection)?;
+        run_indexed_internal_file_ownership(connection)?;
+        run_unique_turn_terminal(connection)?;
+        validate_canonical_protocol_storage(connection)?;
+        return Ok(());
+    }
     if schema_migration_applied(connection, RAW_TOOL_CALL_HISTORY_VERSION)? {
+        run_remove_auto_review_access_mode(connection)?;
+        run_terminal_outcome_cutover(connection)?;
+        run_flatten_session_spawn_edges(connection)?;
+        run_indexed_collaboration_mode_lookup(connection)?;
+        run_typed_history_scope(connection)?;
+        run_indexed_internal_file_ownership(connection)?;
+        run_unique_turn_terminal(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
     if schema_migration_applied(connection, DROP_LEGACY_REASONING_ITEMS_VERSION)? {
         run_raw_tool_call_history_migration(connection)?;
+        run_remove_auto_review_access_mode(connection)?;
+        run_terminal_outcome_cutover(connection)?;
+        run_flatten_session_spawn_edges(connection)?;
+        run_indexed_collaboration_mode_lookup(connection)?;
+        run_typed_history_scope(connection)?;
+        run_indexed_internal_file_ownership(connection)?;
+        run_unique_turn_terminal(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
     if schema_migration_applied(connection, DROP_SESSIONS_AWAITING_USER_STATUS_VERSION)? {
         run_drop_legacy_reasoning_items(connection)?;
         run_raw_tool_call_history_migration(connection)?;
+        run_remove_auto_review_access_mode(connection)?;
+        run_terminal_outcome_cutover(connection)?;
+        run_flatten_session_spawn_edges(connection)?;
+        run_indexed_collaboration_mode_lookup(connection)?;
+        run_typed_history_scope(connection)?;
+        run_indexed_internal_file_ownership(connection)?;
+        run_unique_turn_terminal(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -121,6 +213,13 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_drop_sessions_awaiting_user_status(connection)?;
         run_drop_legacy_reasoning_items(connection)?;
         run_raw_tool_call_history_migration(connection)?;
+        run_remove_auto_review_access_mode(connection)?;
+        run_terminal_outcome_cutover(connection)?;
+        run_flatten_session_spawn_edges(connection)?;
+        run_indexed_collaboration_mode_lookup(connection)?;
+        run_typed_history_scope(connection)?;
+        run_indexed_internal_file_ownership(connection)?;
+        run_unique_turn_terminal(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -129,6 +228,13 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_drop_sessions_awaiting_user_status(connection)?;
         run_drop_legacy_reasoning_items(connection)?;
         run_raw_tool_call_history_migration(connection)?;
+        run_remove_auto_review_access_mode(connection)?;
+        run_terminal_outcome_cutover(connection)?;
+        run_flatten_session_spawn_edges(connection)?;
+        run_indexed_collaboration_mode_lookup(connection)?;
+        run_typed_history_scope(connection)?;
+        run_indexed_internal_file_ownership(connection)?;
+        run_unique_turn_terminal(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -144,8 +250,641 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
     run_drop_sessions_awaiting_user_status(connection)?;
     run_drop_legacy_reasoning_items(connection)?;
     run_raw_tool_call_history_migration(connection)?;
+    run_remove_auto_review_access_mode(connection)?;
+    run_terminal_outcome_cutover(connection)?;
+    run_flatten_session_spawn_edges(connection)?;
+    run_indexed_collaboration_mode_lookup(connection)?;
+    run_typed_history_scope(connection)?;
+    run_indexed_internal_file_ownership(connection)?;
+    run_unique_turn_terminal(connection)?;
     validate_canonical_protocol_storage(connection)?;
     Ok(())
+}
+
+fn run_indexed_collaboration_mode_lookup(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = connection
+        .execute_batch(V41_INDEXED_COLLABORATION_MODE_LOOKUP)
+        .map_err(StorageError::from);
+    match result {
+        Ok(()) => connection.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn run_indexed_internal_file_ownership(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = connection
+        .execute_batch(V43_INDEXED_INTERNAL_FILE_OWNERSHIP)
+        .map_err(StorageError::from);
+    match result {
+        Ok(()) => connection.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn run_unique_turn_terminal(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = connection
+        .execute_batch(V44_UNIQUE_TURN_TERMINAL)
+        .map_err(StorageError::from);
+    match result {
+        Ok(()) => connection.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn run_typed_history_scope(connection: &Connection) -> Result<(), StorageError> {
+    // V42 is the destructive owner cutover. Audit every durable payload before
+    // rebuilding the parent history table; subsequent opens use only bounded
+    // schema-shape validation.
+    validate_v39_history_json(connection)?;
+    validate_v42_pseudo_turn_projections(connection)?;
+    if legacy_reasoning_projection_row_count(connection)? != 0 {
+        return Err(StorageError::Message(
+            "V42 cannot type history scope while retired reasoning rows remain".to_string(),
+        ));
+    }
+    validate_flat_session_spawn_edge_data(connection)?;
+    validate_terminal_outcome_storage(connection)?;
+    validate_raw_tool_call_history(connection)?;
+
+    let foreign_keys_enabled =
+        connection.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))? != 0;
+    if foreign_keys_enabled {
+        connection.pragma_update(None, "foreign_keys", "OFF")?;
+    }
+
+    let migration_result = (|| {
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            connection.execute_batch(V42_TYPED_HISTORY_SCOPE)?;
+            let foreign_key_errors = connection.query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if foreign_key_errors != 0 {
+                return Err(StorageError::Message(format!(
+                    "V42 typed history-scope cutover produced {foreign_key_errors} foreign-key violation(s)"
+                )));
+            }
+            Ok::<_, StorageError>(())
+        })();
+        match result {
+            Ok(()) => connection
+                .execute_batch("COMMIT")
+                .map_err(StorageError::from),
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    })();
+
+    let restore_result = if foreign_keys_enabled {
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(StorageError::from)
+    } else {
+        Ok(())
+    };
+    migration_result?;
+    restore_result?;
+    Ok(())
+}
+
+fn validate_v42_pseudo_turn_projections(connection: &Connection) -> Result<(), StorageError> {
+    let invalid_mode_turns = connection.query_row(
+        "WITH session_only_turns AS (
+             SELECT session_id, turn_id,
+                    SUM(json_extract(payload_json, '$.kind') = 'collaboration_mode_instruction') AS mode_count,
+                    SUM(json_extract(payload_json, '$.kind') = 'inter_agent_communication') AS mail_count,
+                    SUM(json_extract(payload_json, '$.kind') NOT IN (
+                        'collaboration_mode_instruction', 'inter_agent_communication'
+                    )) AS other_count
+             FROM protocol_history_items
+             GROUP BY session_id, turn_id
+         )
+         SELECT COUNT(*)
+         FROM session_only_turns AS candidate
+         WHERE candidate.mode_count > 0
+           AND candidate.other_count = 0
+           AND (
+               candidate.mail_count > 0
+               OR EXISTS (
+                   SELECT 1 FROM protocol_runtime_events AS runtime_event
+                   WHERE runtime_event.session_id = candidate.session_id
+                     AND runtime_event.turn_id = candidate.turn_id
+               )
+               OR EXISTS (
+                   SELECT 1 FROM protocol_turn_items AS turn_item
+                   WHERE turn_item.session_id = candidate.session_id
+                     AND turn_item.turn_id = candidate.turn_id
+               )
+           )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_mode_turns != 0 {
+        return Err(StorageError::Message(format!(
+            "V42 refused to retire {invalid_mode_turns} collaboration-mode pseudo-turn(s) with unexpected mail, runtime, or turn projections"
+        )));
+    }
+
+    let invalid_mail_turns = connection.query_row(
+        "WITH mail_only_turns AS (
+             SELECT session_id, turn_id
+             FROM protocol_history_items
+             GROUP BY session_id, turn_id
+             HAVING COUNT(*) > 0
+                AND SUM(json_extract(payload_json, '$.kind') <> 'inter_agent_communication') = 0
+         )
+         SELECT COUNT(*)
+         FROM mail_only_turns AS candidate
+         WHERE NOT EXISTS (
+                   SELECT 1 FROM sessions AS session
+                   WHERE session.id = candidate.session_id
+                     AND session.active_turn_id = candidate.turn_id
+               )
+           AND NOT EXISTS (
+                   SELECT 1 FROM protocol_runtime_events AS terminal
+                   WHERE terminal.session_id = candidate.session_id
+                     AND terminal.turn_id = candidate.turn_id
+                     AND json_extract(terminal.msg_json, '$.kind') = 'turn_terminal'
+               )
+           AND NOT EXISTS (
+                   SELECT 1 FROM protocol_turn_items AS terminal
+                   WHERE terminal.session_id = candidate.session_id
+                     AND terminal.turn_id = candidate.turn_id
+                     AND json_extract(terminal.payload_json, '$.kind') = 'terminal'
+               )
+           AND (
+               EXISTS (
+                   SELECT 1 FROM protocol_runtime_events AS runtime_event
+                   WHERE runtime_event.session_id = candidate.session_id
+                     AND runtime_event.turn_id = candidate.turn_id
+                     AND json_extract(runtime_event.msg_json, '$.kind') <> 'inter_agent_communication_received'
+               )
+               OR EXISTS (
+                   SELECT 1 FROM protocol_turn_items AS turn_item
+                   WHERE turn_item.session_id = candidate.session_id
+                     AND turn_item.turn_id = candidate.turn_id
+                     AND json_extract(turn_item.payload_json, '$.kind') <> 'inter_agent_communication'
+               )
+           )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_mail_turns != 0 {
+        return Err(StorageError::Message(format!(
+            "V42 refused to retire {invalid_mail_turns} terminal-less mail-only pseudo-turn(s) with unknown projections"
+        )));
+    }
+    Ok(())
+}
+
+fn run_flatten_session_spawn_edges(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        validate_v40_detached_edges_are_inactive(connection)?;
+        connection.execute_batch(V40_FLATTEN_SESSION_SPAWN_EDGES)?;
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn validate_v40_detached_edges_are_inactive(connection: &Connection) -> Result<(), StorageError> {
+    let active_detachments = connection.query_row(
+        "WITH ranked AS (
+             SELECT edge.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY edge.root_session_id
+                        ORDER BY edge.created_at_ms ASC, edge.child_session_id ASC
+                    ) AS retained_order
+             FROM session_spawn_edges AS edge
+             WHERE edge.parent_session_id = edge.root_session_id
+               AND edge.child_session_id <> edge.root_session_id
+               AND edge.task_name <> ''
+               AND edge.task_name <> 'root'
+               AND edge.task_name NOT GLOB '*[^a-z0-9_]*'
+               AND edge.agent_path = '/root/' || edge.task_name
+         ), detached AS (
+             SELECT edge.*
+             FROM session_spawn_edges AS edge
+             LEFT JOIN ranked
+               ON ranked.child_session_id = edge.child_session_id
+             WHERE ranked.child_session_id IS NULL OR ranked.retained_order > 255
+         )
+         SELECT COUNT(*)
+         FROM detached
+         INNER JOIN sessions AS root ON root.id = detached.root_session_id
+         INNER JOIN sessions AS parent ON parent.id = detached.parent_session_id
+         INNER JOIN sessions AS child ON child.id = detached.child_session_id
+         WHERE root.status = 'running'
+            OR parent.status = 'running'
+            OR child.status = 'running'
+            OR root.active_run_id IS NOT NULL
+            OR parent.active_run_id IS NOT NULL
+            OR child.active_run_id IS NOT NULL
+            OR root.active_turn_id IS NOT NULL
+            OR parent.active_turn_id IS NOT NULL
+            OR child.active_turn_id IS NOT NULL",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if active_detachments != 0 {
+        return Err(StorageError::Message(format!(
+            "V40 cannot detach {active_detachments} non-flat or over-capacity agent edge(s) while the affected tree retains active run state"
+        )));
+    }
+    Ok(())
+}
+
+fn run_terminal_outcome_cutover(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        canonicalize_terminal_outcome_storage(connection)?;
+        connection.execute_batch(V39_TERMINAL_OUTCOME_CUTOVER)?;
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+type TerminalOwnerKey = (String, String, i64);
+
+fn canonicalize_terminal_outcome_storage(connection: &Connection) -> Result<(), StorageError> {
+    validate_v39_history_json(connection)?;
+    let runtime_outcomes = canonicalize_runtime_terminal_outcomes(connection)?;
+    canonicalize_turn_terminal_outcomes(connection, &runtime_outcomes)
+}
+
+fn validate_v39_history_json(connection: &Connection) -> Result<(), StorageError> {
+    let mut statement = connection
+        .prepare("SELECT id, payload_json FROM protocol_history_items ORDER BY id ASC")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, payload_json) = row?;
+        protocol_json_object(&payload_json, "history item", &id)?;
+    }
+    Ok(())
+}
+
+fn canonicalize_runtime_terminal_outcomes(
+    connection: &Connection,
+) -> Result<BTreeMap<TerminalOwnerKey, crate::protocol::TurnTerminalOutcome>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id, session_id, turn_id, sequence_no, msg_json
+         FROM protocol_runtime_events ORDER BY id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let stored = rows.collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    let mut outcomes = BTreeMap::new();
+    for (id, session_id, turn_id, sequence_no, msg_json) in stored {
+        let message = protocol_json_object(&msg_json, "runtime event", &id)?;
+        if json_kind(&message, "runtime event", &id)? != "turn_terminal" {
+            continue;
+        }
+        let terminal = message
+            .get("terminal")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                StorageError::Message(format!("V39 runtime terminal {id} has no terminal object"))
+            })?;
+        let outcome = terminal_outcome_from_runtime_object(terminal, &id)?;
+
+        let mut current_terminal = terminal.clone();
+        for retired in ["status", "finish_reason", "interruption_cause", "summary"] {
+            current_terminal.remove(retired);
+        }
+        current_terminal.insert("outcome".to_string(), serde_json::to_value(&outcome)?);
+        let durable = serde_json::from_value::<crate::session::DurableTurnTerminal>(
+            serde_json::Value::Object(current_terminal),
+        )
+        .map_err(|error| {
+            StorageError::Message(format!(
+                "V39 runtime terminal {id} cannot satisfy the current terminal contract: {error}"
+            ))
+        })?;
+        let canonical_json = serde_json::to_string(&serde_json::json!({
+            "kind": "turn_terminal",
+            "terminal": durable,
+        }))?;
+        connection.execute(
+            "UPDATE protocol_runtime_events
+             SET msg_json = ?1, payload_sha256 = ?2
+             WHERE id = ?3",
+            (&canonical_json, sha256_text(&canonical_json), &id),
+        )?;
+        outcomes.insert((session_id, turn_id, sequence_no), outcome);
+    }
+    Ok(outcomes)
+}
+
+fn canonicalize_turn_terminal_outcomes(
+    connection: &Connection,
+    runtime_outcomes: &BTreeMap<TerminalOwnerKey, crate::protocol::TurnTerminalOutcome>,
+) -> Result<(), StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id, session_id, turn_id, sequence_no, payload_json
+         FROM protocol_turn_items ORDER BY id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let stored = rows.collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    for (id, session_id, turn_id, sequence_no, payload_json) in stored {
+        let payload = protocol_json_object(&payload_json, "turn item", &id)?;
+        if json_kind(&payload, "turn item", &id)? != "terminal" {
+            continue;
+        }
+        let owner_key = (session_id, turn_id, sequence_no);
+        let outcome = match runtime_outcomes.get(&owner_key) {
+            Some(outcome) => outcome.clone(),
+            None => terminal_outcome_from_turn_object(&payload, &id)?,
+        };
+        let canonical_json = serde_json::to_string(&serde_json::json!({
+            "kind": "terminal",
+            "outcome": outcome,
+        }))?;
+        connection.execute(
+            "UPDATE protocol_turn_items
+             SET payload_json = ?1, payload_sha256 = ?2
+             WHERE id = ?3",
+            (&canonical_json, sha256_text(&canonical_json), &id),
+        )?;
+    }
+    Ok(())
+}
+
+fn terminal_outcome_from_runtime_object(
+    terminal: &serde_json::Map<String, serde_json::Value>,
+    id: &str,
+) -> Result<crate::protocol::TurnTerminalOutcome, StorageError> {
+    if let Some(value) = terminal.get("outcome") {
+        reject_mixed_terminal_contract(
+            terminal,
+            &["status", "finish_reason", "interruption_cause", "summary"],
+            "runtime terminal",
+            id,
+        )?;
+        return decode_current_terminal_outcome(value, "runtime terminal", id);
+    }
+    let status = required_terminal_string(terminal, "status", "runtime terminal", id)?;
+    let summary = required_terminal_string(terminal, "summary", "runtime terminal", id)?;
+    let finish_reason =
+        optional_terminal_string(terminal, "finish_reason", "runtime terminal", id)?;
+    let cause = optional_terminal_cause(terminal, "interruption_cause", "runtime terminal", id)?;
+    outcome_from_legacy_terminal(
+        status,
+        summary,
+        finish_reason,
+        true,
+        cause,
+        "runtime terminal",
+        id,
+    )
+}
+
+fn terminal_outcome_from_turn_object(
+    terminal: &serde_json::Map<String, serde_json::Value>,
+    id: &str,
+) -> Result<crate::protocol::TurnTerminalOutcome, StorageError> {
+    if let Some(value) = terminal.get("outcome") {
+        reject_mixed_terminal_contract(
+            terminal,
+            &["status", "summary", "cause"],
+            "turn terminal",
+            id,
+        )?;
+        return decode_current_terminal_outcome(value, "turn terminal", id);
+    }
+    let status = required_terminal_string(terminal, "status", "turn terminal", id)?;
+    let summary = required_terminal_string(terminal, "summary", "turn terminal", id)?;
+    let cause = optional_terminal_cause(terminal, "cause", "turn terminal", id)?;
+    outcome_from_legacy_terminal(status, summary, None, false, cause, "turn terminal", id)
+}
+
+fn outcome_from_legacy_terminal(
+    status: &str,
+    summary: &str,
+    finish_reason: Option<&str>,
+    requires_finish_reason: bool,
+    cause: Option<crate::protocol::TurnInterruptionCause>,
+    owner: &str,
+    id: &str,
+) -> Result<crate::protocol::TurnTerminalOutcome, StorageError> {
+    use crate::protocol::TurnTerminalOutcome;
+    let finish_reason_matches = |expected: &str, optional_for_completed: bool| {
+        if requires_finish_reason {
+            finish_reason == Some(expected) || (optional_for_completed && finish_reason.is_none())
+        } else {
+            true
+        }
+    };
+    match status {
+        "completed" if finish_reason_matches("stop", true) && cause.is_none() => {
+            Ok(TurnTerminalOutcome::Completed)
+        }
+        "failed" if finish_reason_matches("error", false) && cause.is_none() => {
+            Ok(TurnTerminalOutcome::Failed {
+                error: summary.to_string(),
+            })
+        }
+        "interrupted" if finish_reason_matches("cancelled", false) => {
+            let cause = cause
+                .or_else(|| legacy_interruption_cause(summary))
+                .ok_or_else(|| {
+                    StorageError::Message(format!(
+                        "V39 {owner} {id} is interrupted but has neither a typed cause nor a uniquely recognized legacy summary"
+                    ))
+                })?;
+            Ok(TurnTerminalOutcome::Interrupted { cause })
+        }
+        _ => Err(StorageError::Message(format!(
+            "V39 {owner} {id} has contradictory legacy terminal fields"
+        ))),
+    }
+}
+
+fn legacy_interruption_cause(summary: &str) -> Option<crate::protocol::TurnInterruptionCause> {
+    use crate::protocol::TurnInterruptionCause;
+    match summary {
+        "permission approval aborted by user" => Some(TurnInterruptionCause::ApprovalAborted),
+        "run stopped by user" => Some(TurnInterruptionCause::UserStop),
+        "agent interrupted" => Some(TurnInterruptionCause::AgentInterrupted),
+        "agent tree stopped" => Some(TurnInterruptionCause::TreeStopped),
+        _ => None,
+    }
+}
+
+fn decode_current_terminal_outcome(
+    value: &serde_json::Value,
+    owner: &str,
+    id: &str,
+) -> Result<crate::protocol::TurnTerminalOutcome, StorageError> {
+    let outcome = serde_json::from_value::<crate::protocol::TurnTerminalOutcome>(value.clone())
+        .map_err(|error| {
+            StorageError::Message(format!(
+                "V39 {owner} {id} has an invalid terminal outcome: {error}"
+            ))
+        })?;
+    if serde_json::to_value(&outcome)? != *value {
+        return Err(StorageError::Message(format!(
+            "V39 {owner} {id} has non-canonical terminal outcome fields"
+        )));
+    }
+    Ok(outcome)
+}
+
+fn reject_mixed_terminal_contract(
+    object: &serde_json::Map<String, serde_json::Value>,
+    retired_fields: &[&str],
+    owner: &str,
+    id: &str,
+) -> Result<(), StorageError> {
+    let mixed = retired_fields
+        .iter()
+        .filter(|field| object.contains_key(**field))
+        .copied()
+        .collect::<Vec<_>>();
+    if mixed.is_empty() {
+        Ok(())
+    } else {
+        Err(StorageError::Message(format!(
+            "V39 {owner} {id} mixes outcome with retired fields: {}",
+            mixed.join(", ")
+        )))
+    }
+}
+
+fn required_terminal_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    owner: &str,
+    id: &str,
+) -> Result<&'a str, StorageError> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| StorageError::Message(format!("V39 {owner} {id} has no string `{field}`")))
+}
+
+fn optional_terminal_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    owner: &str,
+    id: &str,
+) -> Result<Option<&'a str>, StorageError> {
+    match object.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(StorageError::Message(format!(
+            "V39 {owner} {id} has a non-string `{field}`"
+        ))),
+    }
+}
+
+fn optional_terminal_cause(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    owner: &str,
+    id: &str,
+) -> Result<Option<crate::protocol::TurnInterruptionCause>, StorageError> {
+    match object.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|error| {
+                StorageError::Message(format!(
+                    "V39 {owner} {id} has an invalid typed interruption cause: {error}"
+                ))
+            }),
+    }
+}
+
+fn protocol_json_object(
+    json: &str,
+    owner: &str,
+    id: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, StorageError> {
+    let value = serde_json::from_str::<serde_json::Value>(json).map_err(|error| {
+        StorageError::Message(format!(
+            "V39 cannot inspect protocol {owner} {id}: invalid JSON: {error}"
+        ))
+    })?;
+    let object = value.as_object().cloned().ok_or_else(|| {
+        StorageError::Message(format!("V39 protocol {owner} {id} is not a JSON object"))
+    })?;
+    json_kind(&object, owner, id)?;
+    Ok(object)
+}
+
+fn json_kind<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    owner: &str,
+    id: &str,
+) -> Result<&'a str, StorageError> {
+    object
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            StorageError::Message(format!("V39 protocol {owner} {id} has no string `kind`"))
+        })
+}
+
+fn run_remove_auto_review_access_mode(connection: &Connection) -> Result<(), StorageError> {
+    run_foreign_keys_disabled_migration(
+        connection,
+        V38_REMOVE_AUTO_REVIEW_ACCESS_MODE,
+        "V38 auto-review access mode removal migration",
+    )
 }
 
 fn run_raw_tool_call_history_migration(connection: &Connection) -> Result<(), StorageError> {
@@ -188,11 +927,826 @@ fn run_drop_sessions_memory_mode(connection: &Connection) -> Result<(), StorageE
 }
 
 fn run_canonical_protocol_storage_cutover(connection: &Connection) -> Result<(), StorageError> {
-    run_foreign_keys_disabled_migration(
+    run_foreign_keys_disabled_migration_action(
         connection,
-        V33_CANONICAL_PROTOCOL_STORAGE,
         "V33 canonical protocol storage migration",
+        |connection| {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            backfill_legacy_protocol_storage(connection)?;
+            connection.execute_batch(V33_CANONICAL_PROTOCOL_STORAGE)?;
+            connection.execute_batch("COMMIT")?;
+            Ok(())
+        },
     )
+}
+
+#[derive(Debug, Clone)]
+struct LegacyMessageRow {
+    id: String,
+    session_id: String,
+    parent_message_id: Option<String>,
+    role: String,
+    metadata_json: String,
+    created_at_ms: i64,
+}
+
+fn backfill_legacy_protocol_storage(connection: &Connection) -> Result<(), StorageError> {
+    if !table_exists(connection, "messages")? || !table_exists(connection, "message_parts")? {
+        return Err(StorageError::Message(
+            "V33 requires the released messages and message_parts tables before cutover"
+                .to_string(),
+        ));
+    }
+
+    let mut message_statement = connection.prepare(
+        "SELECT id, session_id, parent_message_id, role, metadata_json, created_at_ms
+         FROM messages ORDER BY session_id ASC, sequence_no ASC, id ASC",
+    )?;
+    let messages = message_statement
+        .query_map([], |row| {
+            Ok(LegacyMessageRow {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                parent_message_id: row.get(2)?,
+                role: row.get(3)?,
+                metadata_json: row.get(4)?,
+                created_at_ms: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(message_statement);
+
+    let mut message_turns = HashMap::<String, String>::new();
+    let mut dual_written_messages = BTreeSet::<String>::new();
+    let mut response_ids = HashMap::<String, String>::new();
+    let mut history_statement = connection.prepare(
+        "SELECT turn_id, payload_json FROM protocol_history_items
+         ORDER BY created_at_ms ASC, sequence_no ASC, id ASC",
+    )?;
+    let history_rows = history_statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in history_rows {
+        let (turn_id, payload_json) = row?;
+        let payload: serde_json::Value = serde_json::from_str(&payload_json).map_err(|error| {
+            StorageError::Message(format!(
+                "V33 cannot inspect canonical history while backfilling legacy messages: {error}"
+            ))
+        })?;
+        let Some(object) = payload.as_object() else {
+            continue;
+        };
+        let Some(message_id) = object
+            .get("message_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if let Some(existing_turn) = message_turns.insert(message_id.to_string(), turn_id.clone())
+            && existing_turn != turn_id
+        {
+            return Err(StorageError::Message(format!(
+                "V33 legacy message {message_id} is projected into more than one canonical turn"
+            )));
+        }
+        dual_written_messages.insert(message_id.to_string());
+        if let Some(response_id) = object
+            .get("response_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            response_ids.insert(message_id.to_string(), response_id.to_string());
+        }
+    }
+    drop(history_statement);
+
+    let mut latest_user_turn = HashMap::<String, String>::new();
+    for message in &messages {
+        let turn_id = if let Some(turn_id) = message_turns.get(&message.id) {
+            turn_id.clone()
+        } else if message.role == "assistant" {
+            message
+                .parent_message_id
+                .as_ref()
+                .and_then(|parent| message_turns.get(parent))
+                .cloned()
+                .or_else(|| latest_user_turn.get(&message.session_id).cloned())
+                .unwrap_or_else(new_migration_protocol_id)
+        } else if message.role == "user" {
+            new_migration_protocol_id()
+        } else {
+            return Err(StorageError::Message(format!(
+                "V33 legacy message {} has unsupported role `{}`",
+                message.id, message.role
+            )));
+        };
+        message_turns.insert(message.id.clone(), turn_id.clone());
+        if message.role == "user" {
+            latest_user_turn.insert(message.session_id.clone(), turn_id);
+        } else {
+            response_ids
+                .entry(message.id.clone())
+                .or_insert_with(new_migration_protocol_id);
+        }
+    }
+
+    normalize_dual_written_message_history(connection, &response_ids)?;
+
+    for message in &messages {
+        if dual_written_messages.contains(&message.id) {
+            continue;
+        }
+        let turn_id = message_turns.get(&message.id).ok_or_else(|| {
+            StorageError::Message(format!(
+                "V33 did not allocate a turn for message {}",
+                message.id
+            ))
+        })?;
+        let parts = legacy_message_parts(connection, &message.id)?;
+        let mut content = Vec::new();
+        let mut prompt_dispatch = None;
+        let mut deferred = Vec::new();
+        for part in parts {
+            match part.part_kind.as_str() {
+                "text" => {
+                    let inner = legacy_part_inner(&part, "Text")?;
+                    let text = required_value_string(&inner, "text", &part.id, "V33 text part")?;
+                    content.push(serde_json::json!({"kind": "text", "text": text}));
+                }
+                "image" => {
+                    let inner = legacy_part_inner(&part, "Image")?;
+                    content.push(serde_json::json!({"kind": "image", "image": inner}));
+                }
+                "prompt_dispatch" => {
+                    if prompt_dispatch.is_some() {
+                        return Err(StorageError::Message(format!(
+                            "V33 message {} has more than one prompt-dispatch part",
+                            message.id
+                        )));
+                    }
+                    prompt_dispatch = Some(legacy_part_inner(&part, "PromptDispatch")?);
+                }
+                "reasoning" => {
+                    // Raw reasoning was never a durable model-context contract and is retired by V36.
+                    legacy_part_inner(&part, "Reasoning")?;
+                }
+                "error" | "request_diagnostics" | "tool_call" | "tool_result" | "diff_summary" => {
+                    deferred.push(part)
+                }
+                other => {
+                    return Err(StorageError::Message(format!(
+                        "V33 message {} contains unsupported legacy part kind `{other}`",
+                        message.id
+                    )));
+                }
+            }
+        }
+        let payload = match message.role.as_str() {
+            "user" => {
+                let metadata: serde_json::Value = serde_json::from_str(&message.metadata_json)
+                    .map_err(|error| {
+                        StorageError::Message(format!(
+                            "V33 user message {} has invalid metadata JSON: {error}",
+                            message.id
+                        ))
+                    })?;
+                let editor_context = legacy_enum_inner(&metadata, "User")
+                    .and_then(|value| value.get("editor_context"))
+                    .filter(|value| !value.is_null())
+                    .cloned();
+                let mut object = serde_json::Map::new();
+                object.insert("kind".to_string(), serde_json::json!("user_turn"));
+                object.insert("content".to_string(), serde_json::Value::Array(content));
+                if let Some(dispatch) = prompt_dispatch {
+                    object.insert("prompt_dispatch".to_string(), dispatch);
+                }
+                if let Some(editor_context) = editor_context {
+                    object.insert("editor_context".to_string(), editor_context);
+                }
+                serde_json::Value::Object(object)
+            }
+            "assistant" => serde_json::json!({
+                "kind": "assistant_message",
+                "response_id": response_ids.get(&message.id).ok_or_else(|| StorageError::Message(
+                    format!("V33 assistant message {} has no response identity", message.id)
+                ))?,
+                "content": content,
+            }),
+            _ => unreachable!(),
+        };
+        insert_v33_history_item(
+            connection,
+            &message.session_id,
+            turn_id,
+            message.created_at_ms,
+            payload,
+        )?;
+        backfill_deferred_message_parts(
+            connection,
+            message,
+            turn_id,
+            response_ids.get(&message.id),
+            &deferred,
+        )?;
+    }
+
+    backfill_legacy_tool_and_file_evidence(connection, &message_turns, &response_ids)?;
+    rebuild_protocol_append_order(connection)?;
+    Ok(())
+}
+
+fn new_migration_protocol_id() -> String {
+    Ulid::new().to_string()
+}
+
+#[derive(Debug, Clone)]
+struct LegacyPartRow {
+    id: String,
+    part_kind: String,
+    payload_json: String,
+    created_at_ms: i64,
+}
+
+fn legacy_message_parts(
+    connection: &Connection,
+    message_id: &str,
+) -> Result<Vec<LegacyPartRow>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id, part_kind, payload_json, created_at_ms FROM message_parts
+         WHERE message_id = ?1 ORDER BY sequence_no ASC, id ASC",
+    )?;
+    let rows = statement
+        .query_map([message_id], |row| {
+            Ok(LegacyPartRow {
+                id: row.get(0)?,
+                part_kind: row.get(1)?,
+                payload_json: row.get(2)?,
+                created_at_ms: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn legacy_part_inner(
+    part: &LegacyPartRow,
+    variant: &str,
+) -> Result<serde_json::Value, StorageError> {
+    let payload: serde_json::Value = serde_json::from_str(&part.payload_json).map_err(|error| {
+        StorageError::Message(format!(
+            "V33 legacy part {} contains invalid JSON: {error}",
+            part.id
+        ))
+    })?;
+    legacy_enum_inner(&payload, variant)
+        .cloned()
+        .ok_or_else(|| {
+            StorageError::Message(format!(
+                "V33 legacy part {} is not the expected {variant} payload",
+                part.id
+            ))
+        })
+}
+
+fn legacy_enum_inner<'a>(
+    value: &'a serde_json::Value,
+    variant: &str,
+) -> Option<&'a serde_json::Value> {
+    value.as_object()?.get(variant)
+}
+
+fn required_value_string<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+    owner_id: &str,
+    owner: &str,
+) -> Result<&'a str, StorageError> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| StorageError::Message(format!("{owner} {owner_id} has no string `{field}`")))
+}
+
+fn insert_v33_history_item(
+    connection: &Connection,
+    session_id: &str,
+    turn_id: &str,
+    created_at_ms: i64,
+    payload: serde_json::Value,
+) -> Result<String, StorageError> {
+    let sequence_no = connection.query_row(
+        "SELECT COALESCE(MAX(sequence_no), -1) + 1 FROM (
+             SELECT sequence_no FROM protocol_history_items WHERE session_id = ?1 AND turn_id = ?2
+             UNION ALL SELECT sequence_no FROM protocol_runtime_events WHERE session_id = ?1 AND turn_id = ?2
+             UNION ALL SELECT sequence_no FROM protocol_turn_items WHERE session_id = ?1 AND turn_id = ?2
+         )",
+        (session_id, turn_id),
+        |row| row.get::<_, i64>(0),
+    )?;
+    let id = new_migration_protocol_id();
+    let payload_json = serde_json::to_string(&payload)?;
+    let payload_sha256 = sha256_text(&payload_json);
+    connection.execute(
+        "INSERT INTO protocol_history_items
+         (id, session_id, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            id,
+            session_id,
+            turn_id,
+            sequence_no,
+            payload_json,
+            payload_sha256,
+            created_at_ms
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO protocol_item_append_order
+         (session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms)
+         VALUES (?1, ?2, ?3, 'history_item', ?4, ?5)",
+        rusqlite::params![session_id, turn_id, sequence_no, id, created_at_ms],
+    )?;
+    connection.execute(
+        "INSERT INTO protocol_turn_sequence_allocators (session_id, turn_id, next_sequence_no)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(session_id, turn_id) DO UPDATE SET
+             next_sequence_no = MAX(protocol_turn_sequence_allocators.next_sequence_no,
+                                    excluded.next_sequence_no)",
+        rusqlite::params![session_id, turn_id, sequence_no + 1],
+    )?;
+    Ok(id)
+}
+
+fn normalize_dual_written_message_history(
+    connection: &Connection,
+    response_ids: &HashMap<String, String>,
+) -> Result<(), StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id, payload_json FROM protocol_history_items
+         WHERE json_valid(payload_json)
+           AND json_extract(payload_json, '$.kind') IN ('message', 'user_turn')
+           AND json_type(payload_json, '$.message_id') = 'text'
+         ORDER BY id ASC",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for (id, payload_json) in rows {
+        let payload: serde_json::Value = serde_json::from_str(&payload_json)?;
+        let object = payload.as_object().ok_or_else(|| {
+            StorageError::Message(format!("V33 history item {id} is not a JSON object"))
+        })?;
+        let message_id = required_value_string(&payload, "message_id", &id, "V33 history item")?;
+        let content = object
+            .get("content")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+        let canonical = match object.get("kind").and_then(serde_json::Value::as_str) {
+            Some("message") => match object.get("role").and_then(serde_json::Value::as_str) {
+                Some("assistant") => serde_json::json!({
+                    "kind": "assistant_message",
+                    "response_id": response_ids.get(message_id).ok_or_else(|| StorageError::Message(
+                        format!("V33 dual-written assistant message {message_id} has no response identity")
+                    ))?,
+                    "content": content,
+                }),
+                Some("user") => serde_json::json!({"kind": "user_turn", "content": content}),
+                role => {
+                    return Err(StorageError::Message(format!(
+                        "V33 history item {id} has unsupported legacy message role {role:?}"
+                    )));
+                }
+            },
+            Some("user_turn") => {
+                let mut canonical = serde_json::Map::new();
+                canonical.insert("kind".to_string(), serde_json::json!("user_turn"));
+                canonical.insert("content".to_string(), content);
+                for field in ["prompt_dispatch", "editor_context"] {
+                    if let Some(value) = object.get(field).filter(|value| !value.is_null()) {
+                        canonical.insert(field.to_string(), value.clone());
+                    }
+                }
+                serde_json::Value::Object(canonical)
+            }
+            _ => continue,
+        };
+        let canonical_json = serde_json::to_string(&canonical)?;
+        connection.execute(
+            "UPDATE protocol_history_items SET payload_json = ?1, payload_sha256 = ?2 WHERE id = ?3",
+            (&canonical_json, sha256_text(&canonical_json), &id),
+        )?;
+    }
+    Ok(())
+}
+
+fn backfill_deferred_message_parts(
+    connection: &Connection,
+    message: &LegacyMessageRow,
+    turn_id: &str,
+    response_id: Option<&String>,
+    parts: &[LegacyPartRow],
+) -> Result<(), StorageError> {
+    for part in parts {
+        let payload = match part.part_kind.as_str() {
+            "error" => {
+                let inner = legacy_part_inner(part, "Error")?;
+                serde_json::json!({
+                    "kind": "error",
+                    "message": required_value_string(&inner, "message", &part.id, "V33 error part")?,
+                })
+            }
+            "request_diagnostics" => serde_json::json!({
+                "kind": "request_diagnostics",
+                "diagnostics": legacy_part_inner(part, "RequestDiagnostics")?,
+            }),
+            "tool_call" => {
+                let inner = legacy_part_inner(part, "ToolCall")?;
+                let response_id = response_id.ok_or_else(|| {
+                    StorageError::Message(format!(
+                        "V33 tool-call part {} is not owned by an assistant response",
+                        part.id
+                    ))
+                })?;
+                let call_id =
+                    required_value_string(&inner, "tool_call_id", &part.id, "V33 tool-call part")?;
+                let tool_name =
+                    required_value_string(&inner, "tool_name", &part.id, "V33 tool-call part")?;
+                let arguments_json = required_value_string(
+                    &inner,
+                    "arguments_json",
+                    &part.id,
+                    "V33 tool-call part",
+                )?;
+                if legacy_tool_call_row_exists(connection, call_id)? {
+                    // The released tool_calls row is the lossless owner of this dual-written
+                    // projection and is materialized below with its exact provider fields.
+                    continue;
+                }
+                serde_json::json!({
+                    "kind": "tool_call",
+                    "call_id": call_id,
+                    "response_id": response_id,
+                    "tool_name": tool_name,
+                    "arguments_json": arguments_json,
+                })
+            }
+            "tool_result" => {
+                let inner = legacy_part_inner(part, "ToolResult")?;
+                let call_id = required_value_string(
+                    &inner,
+                    "tool_call_id",
+                    &part.id,
+                    "V33 tool-result part",
+                )?;
+                let status =
+                    required_value_string(&inner, "status", &part.id, "V33 tool-result part")?;
+                let title =
+                    required_value_string(&inner, "title", &part.id, "V33 tool-result part")?;
+                let output_text =
+                    required_value_string(&inner, "summary", &part.id, "V33 tool-result part")?;
+                if legacy_tool_call_row_exists(connection, call_id)? {
+                    // Avoid letting the summary-only message part mask the exact output,
+                    // error, metadata and terminal timestamps retained by tool_calls.
+                    continue;
+                }
+                serde_json::json!({
+                    "kind": "tool_output",
+                    "call_id": call_id,
+                    "status": status,
+                    "title": title,
+                    "output_text": output_text,
+                    "metadata": inner,
+                    "success": inner.get("success").cloned().unwrap_or(serde_json::Value::Null),
+                })
+            }
+            "diff_summary" => {
+                let inner = legacy_part_inner(part, "DiffSummary")?;
+                let call_id = inner
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        StorageError::Message(format!(
+                            "V33 diff-summary part {} has no tool_call_id",
+                            part.id
+                        ))
+                    })?;
+                serde_json::json!({
+                    "kind": "file_change",
+                    "call_id": call_id,
+                    "change_ids": inner.get("change_ids").cloned().unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+                    "changes": inner.get("changes").cloned().unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+                    "summary": required_value_string(&inner, "summary", &part.id, "V33 diff-summary part")?,
+                })
+            }
+            _ => continue,
+        };
+        insert_v33_history_item(
+            connection,
+            &message.session_id,
+            turn_id,
+            part.created_at_ms,
+            payload,
+        )?;
+    }
+    Ok(())
+}
+
+fn legacy_tool_call_row_exists(
+    connection: &Connection,
+    call_id: &str,
+) -> Result<bool, StorageError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tool_calls WHERE id = ?1)",
+            [call_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(StorageError::from)
+}
+
+fn backfill_legacy_tool_and_file_evidence(
+    connection: &Connection,
+    message_turns: &HashMap<String, String>,
+    response_ids: &HashMap<String, String>,
+) -> Result<(), StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id, session_id, message_id, tool_name, status, arguments_json, title,
+                metadata_json, output_text, error_text, started_at_ms, finished_at_ms
+         FROM tool_calls ORDER BY session_id ASC, started_at_ms ASC, id ASC",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, Option<i64>>(11)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    for (
+        call_id,
+        session_id,
+        message_id,
+        tool_name,
+        status,
+        arguments_json,
+        title,
+        metadata_json,
+        output_text,
+        error_text,
+        started_at_ms,
+        finished_at_ms,
+    ) in rows
+    {
+        let turn_id = message_turns.get(&message_id).ok_or_else(|| {
+            StorageError::Message(format!(
+                "V33 tool call {call_id} references unknown message {message_id}"
+            ))
+        })?;
+        let response_id = response_ids.get(&message_id).ok_or_else(|| {
+            StorageError::Message(format!(
+                "V33 tool call {call_id} is not owned by an assistant response"
+            ))
+        })?;
+        let existing_calls = history_item_ids_for_call(connection, "tool_call", &call_id)?;
+        let dual_written_tool_call_payload_json = match existing_calls.as_slice() {
+            [] => {
+                insert_v33_history_item(
+                    connection,
+                    &session_id,
+                    turn_id,
+                    started_at_ms,
+                    serde_json::json!({
+                        "kind": "tool_call",
+                        "call_id": call_id,
+                        "response_id": response_id,
+                        "tool_name": tool_name,
+                        "arguments_json": arguments_json,
+                    }),
+                )?;
+                None
+            }
+            [history_id] => {
+                let payload_json = connection.query_row(
+                    "SELECT payload_json FROM protocol_history_items WHERE id = ?1",
+                    [history_id],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let _: serde_json::Value = serde_json::from_str(&payload_json)?;
+                let canonical_json = serde_json::to_string(&serde_json::json!({
+                    "kind": "tool_call",
+                    "call_id": call_id,
+                    "response_id": response_id,
+                    "tool_name": tool_name,
+                    "arguments_json": arguments_json,
+                }))?;
+                connection.execute(
+                    "UPDATE protocol_history_items SET payload_json = ?1, payload_sha256 = ?2 WHERE id = ?3",
+                    (&canonical_json, sha256_text(&canonical_json), history_id),
+                )?;
+                Some(payload_json)
+            }
+            _ => {
+                return Err(StorageError::Message(format!(
+                    "V33 tool call {call_id} has more than one canonical history owner"
+                )));
+            }
+        };
+
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata_json).map_err(|error| {
+                StorageError::Message(format!(
+                    "V33 tool call {call_id} has invalid metadata JSON: {error}"
+                ))
+            })?;
+        let success = match status.as_str() {
+            "completed" => Some(true),
+            "declined" | "cancelled" | "failed" => Some(false),
+            "pending" | "running" => None,
+            _ => {
+                return Err(StorageError::Message(format!(
+                    "V33 tool call {call_id} has unsupported status `{status}`"
+                )));
+            }
+        };
+        let canonical_title = title.clone().unwrap_or_else(|| tool_name.clone());
+        let canonical_output = output_text
+            .clone()
+            .or_else(|| error_text.clone())
+            .unwrap_or_default();
+        let existing_outputs = history_item_ids_for_call(connection, "tool_output", &call_id)?;
+        if existing_outputs.len() > 1 {
+            return Err(StorageError::Message(format!(
+                "V33 tool call {call_id} has more than one canonical output owner"
+            )));
+        }
+        let dual_written_history_payload_json = existing_outputs
+            .first()
+            .map(|history_id| {
+                connection.query_row(
+                    "SELECT payload_json FROM protocol_history_items WHERE id = ?1",
+                    [history_id],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .transpose()?;
+        let lossless_legacy_evidence = serde_json::json!({
+            "legacy_metadata_json": metadata_json,
+            "legacy_metadata": metadata,
+            "legacy_title": title,
+            "legacy_output_text": output_text,
+            "legacy_error_text": error_text,
+            "legacy_started_at_ms": started_at_ms,
+            "legacy_finished_at_ms": finished_at_ms,
+            "dual_written_tool_call_payload_json": dual_written_tool_call_payload_json,
+            "dual_written_history_payload_json": dual_written_history_payload_json,
+        });
+        let canonical_tool_output = serde_json::json!({
+            "kind": "tool_output",
+            "call_id": call_id,
+            "status": status,
+            "title": canonical_title,
+            "output_text": canonical_output,
+            "metadata": lossless_legacy_evidence,
+            "success": success,
+        });
+        if let Some(history_id) = existing_outputs.first() {
+            let canonical_json = serde_json::to_string(&canonical_tool_output)?;
+            connection.execute(
+                "UPDATE protocol_history_items
+                 SET payload_json = ?1, payload_sha256 = ?2
+                 WHERE id = ?3",
+                (&canonical_json, sha256_text(&canonical_json), history_id),
+            )?;
+        } else {
+            insert_v33_history_item(
+                connection,
+                &session_id,
+                turn_id,
+                finished_at_ms.unwrap_or(started_at_ms),
+                canonical_tool_output,
+            )?;
+        }
+
+        let mut changes = connection.prepare(
+            "SELECT id, change_kind, path_before, path_after, summary_text, created_at_ms
+             FROM file_changes WHERE tool_call_id = ?1 ORDER BY created_at_ms ASC, id ASC",
+        )?;
+        let change_rows = changes
+            .query_map([&call_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(changes);
+        for (change_id, change_kind, path_before, path_after, summary, created_at_ms) in change_rows
+        {
+            if canonical_history_contains_change(connection, &change_id)? {
+                continue;
+            }
+            insert_v33_history_item(
+                connection,
+                &session_id,
+                turn_id,
+                created_at_ms,
+                serde_json::json!({
+                    "kind": "file_change",
+                    "call_id": call_id,
+                    "change_ids": [canonical_ulid_or_new(&change_id)],
+                    "changes": [{
+                        "change_id": canonical_ulid_or_new(&change_id),
+                        "kind": change_kind,
+                        "path_before": path_before,
+                        "path_after": path_after,
+                        "summary": summary,
+                    }],
+                    "summary": summary,
+                }),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn history_item_ids_for_call(
+    connection: &Connection,
+    kind: &str,
+    call_id: &str,
+) -> Result<Vec<String>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id FROM protocol_history_items
+         WHERE json_valid(payload_json)
+           AND json_extract(payload_json, '$.kind') = ?1
+           AND json_extract(payload_json, '$.call_id') = ?2
+         ORDER BY id ASC",
+    )?;
+    let rows = statement
+        .query_map((kind, call_id), |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn canonical_history_contains_change(
+    connection: &Connection,
+    change_id: &str,
+) -> Result<bool, StorageError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM protocol_history_items, json_each(protocol_history_items.payload_json, '$.change_ids')
+                 WHERE json_valid(protocol_history_items.payload_json)
+                   AND json_extract(protocol_history_items.payload_json, '$.kind') = 'file_change'
+                   AND json_each.value = ?1
+             )",
+            [change_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(StorageError::from)
+}
+
+fn canonical_ulid_or_new(value: &str) -> String {
+    Ulid::from_string(value)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| new_migration_protocol_id())
+}
+
+fn rebuild_protocol_append_order(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch(
+        "CREATE TEMP TABLE v33_append_order AS
+         SELECT session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms
+         FROM protocol_item_append_order
+         ORDER BY created_at_ms ASC, sequence_no ASC, source_kind ASC, source_id ASC;
+         DELETE FROM protocol_item_append_order;
+         DELETE FROM sqlite_sequence WHERE name = 'protocol_item_append_order';
+         INSERT INTO protocol_item_append_order
+         (session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms)
+         SELECT session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms
+         FROM v33_append_order;
+         DROP TABLE v33_append_order;",
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -211,7 +1765,43 @@ fn run_through_v36(connection: &Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn validate_canonical_protocol_storage(connection: &Connection) -> Result<(), StorageError> {
+fn validate_canonical_protocol_schema(connection: &Connection) -> Result<(), StorageError> {
+    if !schema_migration_applied(connection, UNIQUE_TURN_TERMINAL_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V44 unique turn-terminal marker".to_string(),
+        ));
+    }
+    if !schema_migration_applied(connection, INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V43 indexed internal-file ownership marker".to_string(),
+        ));
+    }
+    if !schema_migration_applied(connection, TYPED_HISTORY_SCOPE_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V42 typed history-scope marker".to_string(),
+        ));
+    }
+    if !schema_migration_applied(connection, INDEXED_COLLABORATION_MODE_LOOKUP_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V41 indexed collaboration-mode lookup marker"
+                .to_string(),
+        ));
+    }
+    if !schema_migration_applied(connection, FLATTEN_SESSION_SPAWN_EDGES_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V40 flat session spawn-edge marker".to_string(),
+        ));
+    }
+    if !schema_migration_applied(connection, TERMINAL_OUTCOME_CUTOVER_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V39 terminal outcome cutover marker".to_string(),
+        ));
+    }
+    if !schema_migration_applied(connection, REMOVE_AUTO_REVIEW_ACCESS_MODE_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V38 auto-review access mode removal marker".to_string(),
+        ));
+    }
     if !schema_migration_applied(connection, RAW_TOOL_CALL_HISTORY_VERSION)? {
         return Err(StorageError::Message(
             "current storage is missing the V37 raw tool-call history marker".to_string(),
@@ -246,6 +1836,12 @@ fn validate_canonical_protocol_storage(connection: &Connection) -> Result<(), St
                 .to_string(),
         ));
     }
+    if !table_has_exact_access_mode_domain(connection, "sessions", SESSION_ACCESS_MODE_DOMAIN)? {
+        return Err(StorageError::Message(
+            "V38 access mode marker exists but sessions still accepts auto_review or has another non-current access mode domain"
+                .to_string(),
+        ));
+    }
     if !tool_calls_schema_is_canonical(connection)? {
         return Err(StorageError::Message(
             "V33 canonical protocol storage marker exists but tool_calls is not canonical"
@@ -258,14 +1854,624 @@ fn validate_canonical_protocol_storage(connection: &Connection) -> Result<(), St
                 .to_string(),
         ));
     }
+    validate_typed_history_scope_schema(connection)?;
+    validate_indexed_collaboration_mode_lookup(connection)?;
+    validate_indexed_internal_file_ownership(connection)?;
+    validate_unique_turn_terminal_index(connection)?;
+    validate_flat_session_spawn_edge_schema(connection)?;
+    Ok(())
+}
+
+fn validate_canonical_protocol_storage(connection: &Connection) -> Result<(), StorageError> {
+    validate_canonical_protocol_schema(connection)?;
+    validate_typed_history_scope_data(connection)?;
     if legacy_reasoning_projection_row_count(connection)? != 0 {
         return Err(StorageError::Message(
             "V36 legacy reasoning item removal marker exists but retired reasoning or prompt-dispatch protocol rows remain"
                 .to_string(),
         ));
     }
+    validate_flat_session_spawn_edge_data(connection)?;
+    validate_terminal_outcome_storage(connection)?;
     validate_raw_tool_call_history(connection)?;
     Ok(())
+}
+
+fn validate_typed_history_scope_schema(connection: &Connection) -> Result<(), StorageError> {
+    let history_columns = connection
+        .prepare("SELECT name, [notnull] FROM pragma_table_info('protocol_history_items')")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !history_columns.contains(&("scope_kind".to_string(), 1))
+        || !history_columns.contains(&("turn_id".to_string(), 0))
+    {
+        return Err(StorageError::Message(
+            "V42 marker exists but protocol_history_items does not expose required scope_kind and nullable turn_id columns"
+                .to_string(),
+        ));
+    }
+    let append_columns = connection
+        .prepare("SELECT name, [notnull] FROM pragma_table_info('protocol_item_append_order')")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !append_columns.contains(&("scope_kind".to_string(), 1))
+        || !append_columns.contains(&("turn_id".to_string(), 0))
+    {
+        return Err(StorageError::Message(
+            "V42 marker exists but protocol_item_append_order does not expose required scope_kind and nullable turn_id columns"
+                .to_string(),
+        ));
+    }
+
+    for (table, required_fragments) in [
+        (
+            "protocol_history_items",
+            &[
+                "scope_kind in ('turn', 'session')",
+                "scope_kind = 'turn' and turn_id is not null",
+                "scope_kind = 'session' and turn_id is null",
+            ][..],
+        ),
+        (
+            "protocol_item_append_order",
+            &[
+                "scope_kind in ('turn', 'session')",
+                "scope_kind = 'turn' and turn_id is not null",
+                "scope_kind = 'session' and turn_id is null and source_kind = 'history_item'",
+            ][..],
+        ),
+    ] {
+        let sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StorageError::Message(format!(
+                    "V42 marker exists but required table `{table}` is missing"
+                ))
+            })?;
+        let normalized = sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        for fragment in required_fragments {
+            if !normalized.contains(fragment) {
+                return Err(StorageError::Message(format!(
+                    "V42 marker exists but `{table}` lacks typed-scope constraint `{fragment}`"
+                )));
+            }
+        }
+    }
+
+    for index_name in [
+        "idx_protocol_history_turn_sequence",
+        "idx_protocol_history_session_sequence",
+    ] {
+        let contract = connection
+            .query_row(
+                "SELECT [unique], origin, partial
+                 FROM pragma_index_list('protocol_history_items')
+                 WHERE name = ?1",
+                [index_name],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if contract != Some((1, "c".to_string(), 1)) {
+            return Err(StorageError::Message(format!(
+                "V42 marker exists but partial unique index `{index_name}` is missing or stale"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_typed_history_scope_data(connection: &Connection) -> Result<(), StorageError> {
+    let invalid_history_rows = connection.query_row(
+        "SELECT COUNT(*)
+         FROM protocol_history_items
+         WHERE (scope_kind = 'turn') <> (turn_id IS NOT NULL)
+            OR (scope_kind = 'session' AND json_extract(payload_json, '$.kind') NOT IN (
+                    'collaboration_mode_instruction', 'inter_agent_communication'
+               ))
+            OR (scope_kind = 'turn'
+                AND json_extract(payload_json, '$.kind') = 'collaboration_mode_instruction')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_history_rows != 0 {
+        return Err(StorageError::Message(format!(
+            "V42 typed history scope has {invalid_history_rows} invalid durable row(s)"
+        )));
+    }
+    let invalid_append_rows = connection.query_row(
+        "SELECT COUNT(*)
+         FROM protocol_item_append_order AS append_order
+         LEFT JOIN protocol_history_items AS history
+           ON append_order.source_kind = 'history_item'
+          AND history.id = append_order.source_id
+          AND history.session_id = append_order.session_id
+         WHERE (append_order.scope_kind = 'turn') <> (append_order.turn_id IS NOT NULL)
+            OR (append_order.scope_kind = 'session'
+                AND append_order.source_kind <> 'history_item')
+            OR (append_order.source_kind = 'history_item'
+                AND (
+                    history.id IS NULL
+                    OR history.scope_kind <> append_order.scope_kind
+                    OR history.turn_id IS NOT append_order.turn_id
+                    OR history.sequence_no <> append_order.sequence_no
+                ))",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_append_rows != 0 {
+        return Err(StorageError::Message(format!(
+            "V42 typed append order has {invalid_append_rows} invalid scope projection row(s)"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_indexed_collaboration_mode_lookup(connection: &Connection) -> Result<(), StorageError> {
+    const INDEX_NAME: &str = "idx_protocol_history_collaboration_mode_session";
+    let index: Option<(i64, String, i64)> = connection
+        .query_row(
+            "SELECT [unique], origin, partial
+             FROM pragma_index_list('protocol_history_items')
+             WHERE name = ?1",
+            [INDEX_NAME],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if index != Some((0, "c".to_string(), 1)) {
+        return Err(StorageError::Message(format!(
+            "V42 marker exists but partial index `{INDEX_NAME}` is missing or stale"
+        )));
+    }
+    let mut statement = connection.prepare(
+        "SELECT name
+         FROM pragma_index_xinfo(?1)
+         WHERE key = 1
+         ORDER BY seqno ASC",
+    )?;
+    let columns = statement
+        .query_map([INDEX_NAME], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if columns != ["session_id", "id"] {
+        return Err(StorageError::Message(format!(
+            "V42 marker exists but partial index `{INDEX_NAME}` has columns {columns:?} instead of [\"session_id\", \"id\"]"
+        )));
+    }
+    let sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [INDEX_NAME],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::Message(format!(
+                "V42 marker exists but partial index `{INDEX_NAME}` has no schema definition"
+            ))
+        })?;
+    let normalized = sql
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let predicate = normalized
+        .split_once(" where ")
+        .map(|(_, predicate)| predicate.trim_end_matches(';'));
+    let expected = "scope_kind = 'session' and json_extract(payload_json, '$.kind') = 'collaboration_mode_instruction'";
+    if predicate != Some(expected) {
+        return Err(StorageError::Message(format!(
+            "V42 marker exists but partial index `{INDEX_NAME}` has a stale predicate"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_indexed_internal_file_ownership(connection: &Connection) -> Result<(), StorageError> {
+    const INDEX_NAME: &str = "idx_tool_calls_truncated_output_path";
+    let index: Option<(i64, String, i64)> = connection
+        .query_row(
+            "SELECT [unique], origin, partial
+             FROM pragma_index_list('tool_calls')
+             WHERE name = ?1",
+            [INDEX_NAME],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if index != Some((0, "c".to_string(), 1)) {
+        return Err(StorageError::Message(format!(
+            "V43 marker exists but partial index `{INDEX_NAME}` is missing or stale"
+        )));
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT name
+         FROM pragma_index_xinfo(?1)
+         WHERE key = 1
+         ORDER BY seqno ASC",
+    )?;
+    let columns = statement
+        .query_map([INDEX_NAME], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if columns != ["truncated_output_path"] {
+        return Err(StorageError::Message(format!(
+            "V43 marker exists but partial index `{INDEX_NAME}` has columns {columns:?} instead of [\"truncated_output_path\"]"
+        )));
+    }
+
+    let sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [INDEX_NAME],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::Message(format!(
+                "V43 marker exists but partial index `{INDEX_NAME}` has no schema definition"
+            ))
+        })?;
+    let normalized = sql
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let predicate = normalized
+        .split_once(" where ")
+        .map(|(_, predicate)| predicate.trim_end_matches(';'));
+    if predicate != Some("truncated_output_path is not null") {
+        return Err(StorageError::Message(format!(
+            "V43 marker exists but partial index `{INDEX_NAME}` has a stale predicate"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_unique_turn_terminal_index(connection: &Connection) -> Result<(), StorageError> {
+    const INDEX_NAME: &str = "idx_protocol_runtime_events_unique_turn_terminal";
+    let index: Option<(i64, String, i64)> = connection
+        .query_row(
+            "SELECT [unique], origin, partial
+             FROM pragma_index_list('protocol_runtime_events')
+             WHERE name = ?1",
+            [INDEX_NAME],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if index != Some((1, "c".to_string(), 1)) {
+        return Err(StorageError::Message(format!(
+            "V44 marker exists but partial unique index `{INDEX_NAME}` is missing or stale"
+        )));
+    }
+
+    let columns = connection
+        .prepare(
+            "SELECT name
+             FROM pragma_index_xinfo(?1)
+             WHERE key = 1
+             ORDER BY seqno ASC",
+        )?
+        .query_map([INDEX_NAME], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if columns != ["session_id", "turn_id"] {
+        return Err(StorageError::Message(format!(
+            "V44 marker exists but partial unique index `{INDEX_NAME}` has columns {columns:?} instead of [\"session_id\", \"turn_id\"]"
+        )));
+    }
+
+    let sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [INDEX_NAME],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::Message(format!(
+                "V44 marker exists but partial unique index `{INDEX_NAME}` has no schema definition"
+            ))
+        })?;
+    let normalized = sql
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let predicate = normalized
+        .split_once(" where ")
+        .map(|(_, predicate)| predicate.trim_end_matches(';'));
+    if predicate != Some("json_extract(msg_json, '$.kind') = 'turn_terminal'") {
+        return Err(StorageError::Message(format!(
+            "V44 marker exists but partial unique index `{INDEX_NAME}` has a stale predicate"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_flat_session_spawn_edge_schema(connection: &Connection) -> Result<(), StorageError> {
+    let table_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_spawn_edges'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::Message(
+                "V40 marker exists but session_spawn_edges is missing".to_string(),
+            )
+        })?;
+    let normalized_table_sql = table_sql
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    for required_constraint in [
+        "check(parent_session_id = root_session_id)",
+        "check(child_session_id <> root_session_id)",
+        "check(task_name <> '')",
+        "check(task_name <> 'root')",
+        "check(task_name not glob '*[^a-z0-9_]*')",
+        "check(agent_path = '/root/' || task_name)",
+    ] {
+        if !normalized_table_sql.contains(required_constraint) {
+            return Err(StorageError::Message(format!(
+                "V40 marker exists but session_spawn_edges lacks `{required_constraint}`"
+            )));
+        }
+    }
+
+    let capacity_trigger = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'limit_session_spawn_edges_per_root'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let trigger_is_current = capacity_trigger.is_some_and(|sql| {
+        sql.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
+            .contains(">= 255")
+    });
+    if !trigger_is_current {
+        return Err(StorageError::Message(
+            "V40 marker exists but the per-root retained-child capacity trigger is missing or stale"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_flat_session_spawn_edge_data(connection: &Connection) -> Result<(), StorageError> {
+    let invalid_rows = connection.query_row(
+        "SELECT COUNT(*)
+         FROM session_spawn_edges
+         WHERE parent_session_id <> root_session_id
+            OR child_session_id = root_session_id
+            OR task_name = ''
+            OR task_name = 'root'
+            OR task_name GLOB '*[^a-z0-9_]*'
+            OR agent_path <> ('/root/' || task_name)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_rows != 0 {
+        return Err(StorageError::Message(format!(
+            "V40 marker exists but {invalid_rows} non-flat session spawn edge(s) remain"
+        )));
+    }
+    let max_direct_children = connection.query_row(
+        "SELECT COALESCE(MAX(child_count), 0)
+         FROM (
+             SELECT COUNT(*) AS child_count
+             FROM session_spawn_edges
+             GROUP BY root_session_id
+         )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if max_direct_children > 255 {
+        return Err(StorageError::Message(format!(
+            "V40 marker exists but one agent tree retains {max_direct_children} direct children"
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_terminal_outcome_storage(connection: &Connection) -> Result<(), StorageError> {
+    validate_v39_history_json(connection)?;
+    if retired_durable_protocol_row_count(connection)? != 0 {
+        return Err(StorageError::Message(
+            "V39 marker exists but retired durable runtime or retry-history rows remain"
+                .to_string(),
+        ));
+    }
+
+    let mut runtime_statement = connection.prepare(
+        "SELECT id, session_id, turn_id, sequence_no, msg_json, payload_sha256
+         FROM protocol_runtime_events ORDER BY id ASC",
+    )?;
+    let runtime_rows = runtime_statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    })?;
+    let mut runtime_outcomes = BTreeMap::new();
+    for row in runtime_rows {
+        let (id, session_id, turn_id, sequence_no, msg_json, payload_sha256) = row?;
+        let message = protocol_json_object(&msg_json, "runtime event", &id)?;
+        if json_kind(&message, "runtime event", &id)? != "turn_terminal" {
+            continue;
+        }
+        if payload_sha256 != sha256_text(&msg_json) {
+            return Err(StorageError::Message(format!(
+                "V39 marker exists but runtime terminal {id} has a stale payload hash"
+            )));
+        }
+        let terminal = message
+            .get("terminal")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                StorageError::Message(format!(
+                    "V39 marker exists but runtime terminal {id} has no terminal object"
+                ))
+            })?;
+        reject_mixed_terminal_contract(
+            terminal,
+            &["status", "finish_reason", "interruption_cause", "summary"],
+            "runtime terminal",
+            &id,
+        )?;
+        let outcome = decode_current_terminal_outcome(
+            terminal.get("outcome").ok_or_else(|| {
+                StorageError::Message(format!(
+                    "V39 marker exists but runtime terminal {id} has no outcome"
+                ))
+            })?,
+            "runtime terminal",
+            &id,
+        )?;
+        serde_json::from_value::<crate::session::DurableTurnTerminal>(serde_json::Value::Object(
+            terminal.clone(),
+        ))
+        .map_err(|error| {
+            StorageError::Message(format!(
+                "V39 marker exists but runtime terminal {id} violates the current contract: {error}"
+            ))
+        })?;
+        runtime_outcomes.insert((session_id, turn_id, sequence_no), outcome);
+    }
+    drop(runtime_statement);
+
+    let mut turn_statement = connection.prepare(
+        "SELECT id, session_id, turn_id, sequence_no, payload_json, payload_sha256
+         FROM protocol_turn_items ORDER BY id ASC",
+    )?;
+    let turn_rows = turn_statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    })?;
+    for row in turn_rows {
+        let (id, session_id, turn_id, sequence_no, payload_json, payload_sha256) = row?;
+        let payload = protocol_json_object(&payload_json, "turn item", &id)?;
+        if json_kind(&payload, "turn item", &id)? != "terminal" {
+            continue;
+        }
+        if payload_sha256 != sha256_text(&payload_json) {
+            return Err(StorageError::Message(format!(
+                "V39 marker exists but turn terminal {id} has a stale payload hash"
+            )));
+        }
+        if payload
+            .keys()
+            .any(|field| field != "kind" && field != "outcome")
+        {
+            return Err(StorageError::Message(format!(
+                "V39 marker exists but turn terminal {id} contains retired or unknown fields"
+            )));
+        }
+        let outcome = decode_current_terminal_outcome(
+            payload.get("outcome").ok_or_else(|| {
+                StorageError::Message(format!(
+                    "V39 marker exists but turn terminal {id} has no outcome"
+                ))
+            })?,
+            "turn terminal",
+            &id,
+        )?;
+        if let Some(runtime_outcome) = runtime_outcomes.get(&(session_id, turn_id, sequence_no))
+            && *runtime_outcome != outcome
+        {
+            return Err(StorageError::Message(format!(
+                "V39 marker exists but turn terminal {id} contradicts its runtime owner"
+            )));
+        }
+    }
+    drop(turn_statement);
+
+    if orphaned_protocol_append_order_count(connection)? != 0 {
+        return Err(StorageError::Message(
+            "V39 marker exists but protocol append order contains orphaned source rows".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn retired_durable_protocol_row_count(connection: &Connection) -> Result<i64, StorageError> {
+    connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM protocol_runtime_events
+                 WHERE json_valid(msg_json)
+                   AND json_extract(msg_json, '$.kind') IN (
+                       'thread_configured', 'assistant_text_delta',
+                       'reasoning_summary_delta', 'retry_scheduled',
+                       'history_item_recorded'
+                   ))
+              + (SELECT COUNT(*) FROM protocol_history_items
+                 WHERE json_valid(payload_json)
+                   AND json_extract(payload_json, '$.kind') = 'retry_decision')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StorageError::from)
+}
+
+fn orphaned_protocol_append_order_count(connection: &Connection) -> Result<i64, StorageError> {
+    connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM protocol_item_append_order AS append_order
+             WHERE (append_order.source_kind = 'runtime_event'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM protocol_runtime_events
+                        WHERE id = append_order.source_id
+                    ))
+                OR (append_order.source_kind = 'history_item'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM protocol_history_items
+                        WHERE id = append_order.source_id
+                    ))
+                OR (append_order.source_kind = 'turn_item'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM protocol_turn_items
+                        WHERE id = append_order.source_id
+                    ))",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StorageError::from)
 }
 
 fn canonicalize_raw_tool_call_history(connection: &Connection) -> Result<(), StorageError> {
@@ -273,11 +2479,7 @@ fn canonicalize_raw_tool_call_history(connection: &Connection) -> Result<(), Sto
         return Ok(());
     }
 
-    let turns_without_response_lineage =
-        legacy_tool_call_turns_without_response_lineage(connection)?;
-    for (session_id, turn_id) in turns_without_response_lineage {
-        delete_protocol_turn_for_raw_tool_cutover(connection, &session_id, &turn_id)?;
-    }
+    recover_missing_tool_call_response_lineage(connection)?;
 
     let mut statement = connection
         .prepare("SELECT id, payload_json FROM protocol_history_items ORDER BY id ASC")?;
@@ -361,9 +2563,7 @@ fn canonicalize_raw_tool_call_history(connection: &Connection) -> Result<(), Sto
     Ok(())
 }
 
-fn legacy_tool_call_turns_without_response_lineage(
-    connection: &Connection,
-) -> Result<BTreeSet<(String, String)>, StorageError> {
+fn recover_missing_tool_call_response_lineage(connection: &Connection) -> Result<(), StorageError> {
     let mut statement = connection.prepare(
         "SELECT id, session_id, turn_id, payload_json
          FROM protocol_history_items ORDER BY id ASC",
@@ -376,10 +2576,11 @@ fn legacy_tool_call_turns_without_response_lineage(
             row.get::<_, String>(3)?,
         ))
     })?;
-    let mut affected_turns = BTreeSet::new();
-    for row in rows {
-        let (id, session_id, turn_id, payload_json) = row?;
-        let payload =
+    let stored = rows.collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    for (id, session_id, turn_id, payload_json) in stored {
+        let mut payload =
             serde_json::from_str::<serde_json::Value>(&payload_json).map_err(|error| {
                 StorageError::Message(format!(
                     "V37 cannot inspect protocol history item {id}: invalid JSON: {error}"
@@ -395,40 +2596,110 @@ fn legacy_tool_call_turns_without_response_lineage(
             .get("response_id")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|response_id| !response_id.is_empty());
-        if !has_response_lineage {
-            affected_turns.insert((session_id, turn_id));
+        if has_response_lineage {
+            continue;
         }
+
+        let candidates = response_lineage_candidates(connection, &session_id, &turn_id)?;
+        let response_id = match candidates.as_slice() {
+            [response_id] => response_id,
+            [] => {
+                return Err(StorageError::Message(format!(
+                    "V37 tool-call history item {id} has no response_id and its turn has no uniquely recoverable assistant response lineage"
+                )));
+            }
+            _ => {
+                return Err(StorageError::Message(format!(
+                    "V37 tool-call history item {id} has no response_id and its turn has {} distinct assistant response lineage candidates",
+                    candidates.len()
+                )));
+            }
+        };
+        payload
+            .as_object_mut()
+            .expect("tool-call payload object")
+            .insert(
+                "response_id".to_string(),
+                serde_json::Value::String(response_id.clone()),
+            );
+        let recovered_json = serde_json::to_string(&payload)?;
+        connection.execute(
+            "UPDATE protocol_history_items SET payload_json = ?1, payload_sha256 = ?2 WHERE id = ?3",
+            (&recovered_json, sha256_text(&recovered_json), &id),
+        )?;
     }
-    Ok(affected_turns)
+    Ok(())
 }
 
-fn delete_protocol_turn_for_raw_tool_cutover(
+fn response_lineage_candidates(
     connection: &Connection,
     session_id: &str,
     turn_id: &str,
-) -> Result<(), StorageError> {
-    let owner = (session_id, turn_id);
-    connection.execute(
-        "DELETE FROM protocol_item_append_order WHERE session_id = ?1 AND turn_id = ?2",
-        owner,
+) -> Result<Vec<String>, StorageError> {
+    let mut candidates = BTreeSet::new();
+    let mut history = connection.prepare(
+        "SELECT id, payload_json
+         FROM protocol_history_items
+         WHERE session_id = ?1 AND turn_id = ?2
+         ORDER BY sequence_no ASC, id ASC",
     )?;
-    connection.execute(
-        "DELETE FROM protocol_turn_items WHERE session_id = ?1 AND turn_id = ?2",
-        owner,
+    let history_rows = history.query_map((session_id, turn_id), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in history_rows {
+        let (id, payload_json) = row?;
+        let payload =
+            serde_json::from_str::<serde_json::Value>(&payload_json).map_err(|error| {
+                StorageError::Message(format!(
+                    "V37 cannot inspect protocol history item {id}: invalid JSON: {error}"
+                ))
+            })?;
+        let Some(object) = payload.as_object() else {
+            continue;
+        };
+        if matches!(
+            object.get("kind").and_then(serde_json::Value::as_str),
+            Some("assistant_message" | "tool_call")
+        ) && let Some(response_id) = object
+            .get("response_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            candidates.insert(response_id.to_string());
+        }
+    }
+    drop(history);
+
+    let mut runtime = connection.prepare(
+        "SELECT id, msg_json
+         FROM protocol_runtime_events
+         WHERE session_id = ?1 AND turn_id = ?2
+         ORDER BY sequence_no ASC, id ASC",
     )?;
-    connection.execute(
-        "DELETE FROM protocol_runtime_events WHERE session_id = ?1 AND turn_id = ?2",
-        owner,
-    )?;
-    connection.execute(
-        "DELETE FROM protocol_history_items WHERE session_id = ?1 AND turn_id = ?2",
-        owner,
-    )?;
-    connection.execute(
-        "DELETE FROM protocol_turn_sequence_allocators WHERE session_id = ?1 AND turn_id = ?2",
-        owner,
-    )?;
-    Ok(())
+    let runtime_rows = runtime.query_map((session_id, turn_id), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in runtime_rows {
+        let (id, msg_json) = row?;
+        let payload = serde_json::from_str::<serde_json::Value>(&msg_json).map_err(|error| {
+            StorageError::Message(format!(
+                "V37 cannot inspect protocol runtime event {id}: invalid JSON: {error}"
+            ))
+        })?;
+        let Some(object) = payload.as_object() else {
+            continue;
+        };
+        if object.get("kind").and_then(serde_json::Value::as_str)
+            == Some("assistant_message_committed")
+            && let Some(response_id) = object
+                .get("response_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+        {
+            candidates.insert(response_id.to_string());
+        }
+    }
+    Ok(candidates.into_iter().collect())
 }
 
 fn required_json_string<'a>(
@@ -1311,6 +3582,23 @@ fn table_has_exact_status_domain(
     table_name: &str,
     expected: &[&str],
 ) -> Result<bool, StorageError> {
+    table_has_exact_check_domain(connection, table_name, "status", expected)
+}
+
+fn table_has_exact_access_mode_domain(
+    connection: &Connection,
+    table_name: &str,
+    expected: &[&str],
+) -> Result<bool, StorageError> {
+    table_has_exact_check_domain(connection, table_name, "access_mode", expected)
+}
+
+fn table_has_exact_check_domain(
+    connection: &Connection,
+    table_name: &str,
+    column_name: &str,
+    expected: &[&str],
+) -> Result<bool, StorageError> {
     let sql: Option<String> = connection
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -1321,7 +3609,7 @@ fn table_has_exact_status_domain(
     let Some(sql) = sql else {
         return Ok(false);
     };
-    let domains = status_check_domains(&sql);
+    let domains = check_domains_for_column(&sql, column_name);
     if domains.len() != 1 {
         return Ok(false);
     }
@@ -1418,14 +3706,14 @@ fn tool_calls_index_is_current(connection: &Connection) -> Result<bool, StorageE
         ])
 }
 
-fn status_check_domains(sql: &str) -> Vec<BTreeSet<String>> {
+fn check_domains_for_column(sql: &str, column_name: &str) -> Vec<BTreeSet<String>> {
     let tokens = tokenize_schema(sql);
     let mut domains = Vec::new();
     let mut index = 0;
     while index + 5 < tokens.len() {
         if !matches!(&tokens[index], SchemaToken::Word(word) if word == "check")
             || tokens[index + 1] != SchemaToken::LeftParen
-            || !matches!(&tokens[index + 2], SchemaToken::Word(word) if word == "status")
+            || !matches!(&tokens[index + 2], SchemaToken::Word(word) if word == column_name)
             || !matches!(&tokens[index + 3], SchemaToken::Word(word) if word == "in")
             || tokens[index + 4] != SchemaToken::LeftParen
         {
@@ -1573,6 +3861,18 @@ fn run_foreign_keys_disabled_migration(
     migration_sql: &str,
     migration_name: &str,
 ) -> Result<(), StorageError> {
+    run_foreign_keys_disabled_migration_action(connection, migration_name, |connection| {
+        connection
+            .execute_batch(migration_sql)
+            .map_err(StorageError::from)
+    })
+}
+
+fn run_foreign_keys_disabled_migration_action(
+    connection: &Connection,
+    migration_name: &str,
+    action: impl FnOnce(&Connection) -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
     if !connection.is_autocommit() {
         return Err(StorageError::Message(format!(
             "{migration_name} requires an autocommit connection"
@@ -1582,7 +3882,7 @@ fn run_foreign_keys_disabled_migration(
         connection.pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))?;
     connection.pragma_update(None, "foreign_keys", 0)?;
 
-    let migration_result = connection.execute_batch(migration_sql);
+    let migration_result = action(connection);
     let rollback_error = if connection.is_autocommit() {
         None
     } else {
@@ -1621,7 +3921,7 @@ fn run_foreign_keys_disabled_migration(
 
     match (migration_result, cleanup_errors.is_empty()) {
         (Ok(()), true) => Ok(()),
-        (Err(error), true) => Err(StorageError::Sqlite(error)),
+        (Err(error), true) => Err(error),
         (Ok(()), false) => Err(StorageError::Message(format!(
             "{migration_name} cleanup failed: {}",
             cleanup_errors.join("; ")
@@ -1638,6 +3938,50 @@ mod tests {
     use rusqlite::params;
 
     use super::*;
+
+    fn text_snapshot(connection: &Connection, sql: &str) -> String {
+        connection
+            .query_row(sql, [], |row| row.get::<_, String>(0))
+            .unwrap_or_else(|error| panic!("snapshot query failed: {error}; sql={sql}"))
+    }
+
+    fn v37_byte_order_snapshot(connection: &Connection) -> Vec<String> {
+        [
+            "SELECT json_group_array(json_array(id, session_id, turn_id, sequence_no, msg_json, payload_sha256, created_at_ms)) FROM (SELECT * FROM protocol_runtime_events ORDER BY session_id, turn_id, sequence_no, id)",
+            "SELECT json_group_array(json_array(id, session_id, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)) FROM (SELECT * FROM protocol_history_items ORDER BY session_id, turn_id, sequence_no, id)",
+            "SELECT json_group_array(json_array(id, session_id, turn_id, source_item_id, sequence_no, payload_json, payload_sha256)) FROM (SELECT * FROM protocol_turn_items ORDER BY session_id, turn_id, sequence_no, id)",
+            "SELECT json_group_array(json_array(append_position, session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms)) FROM (SELECT * FROM protocol_item_append_order ORDER BY append_position)",
+            "SELECT json_group_array(json_array(session_id, turn_id, next_sequence_no)) FROM (SELECT * FROM protocol_turn_sequence_allocators ORDER BY session_id, turn_id)",
+            "SELECT json_group_array(json_array(id, history_item_id, status, truncated_output_path, started_at_ms, finished_at_ms)) FROM (SELECT * FROM tool_calls ORDER BY id)",
+            "SELECT json_group_array(json_array(id, tool_call_id, change_kind, path_before, path_after, before_sha256, after_sha256, diff_text, summary_text, created_at_ms)) FROM (SELECT * FROM file_changes ORDER BY id)",
+            "SELECT json_group_array(json_array(id, active_run_id, active_turn_id, active_run_lease_expires_at_ms, status)) FROM (SELECT * FROM sessions ORDER BY id)",
+        ]
+        .into_iter()
+        .map(|sql| text_snapshot(connection, sql))
+        .collect()
+    }
+
+    fn run_through_v38(connection: &Connection) {
+        run_through_v36(connection).expect("schema through V36");
+        run_raw_tool_call_history_migration(connection).expect("V37 schema");
+        run_remove_auto_review_access_mode(connection).expect("V38 schema");
+    }
+
+    fn run_through_v39(connection: &Connection) {
+        run_through_v38(connection);
+        run_terminal_outcome_cutover(connection).expect("V39 schema");
+    }
+
+    fn run_through_v40(connection: &Connection) {
+        run_through_v39(connection);
+        run_flatten_session_spawn_edges(connection).expect("V40 schema");
+    }
+
+    fn run_through_v42(connection: &Connection) {
+        run_through_v40(connection);
+        run_indexed_collaboration_mode_lookup(connection).expect("V41 schema");
+        run_typed_history_scope(connection).expect("V42 schema");
+    }
 
     fn insert_tool_call_parent_rows(connection: &Connection) {
         connection
@@ -1716,8 +4060,8 @@ mod tests {
         let payload_hash = sha256_text(&payload);
         connection.execute(
             "INSERT INTO protocol_history_items
-             (id, session_id, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
-             VALUES (?1, 'tool-session', 'turn', ?2, ?3, ?4, ?5)",
+             (id, session_id, scope_kind, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
+             VALUES (?1, 'tool-session', 'turn', 'turn', ?2, ?3, ?4, ?5)",
             params![
                 history_item_id,
                 sequence_no,
@@ -1845,6 +4189,26 @@ mod tests {
             schema_migration_applied(&connection, RAW_TOOL_CALL_HISTORY_VERSION)
                 .expect("raw tool-call history marker")
         );
+        assert!(
+            schema_migration_applied(&connection, TERMINAL_OUTCOME_CUTOVER_VERSION)
+                .expect("terminal outcome marker")
+        );
+        assert!(
+            schema_migration_applied(&connection, FLATTEN_SESSION_SPAWN_EDGES_VERSION)
+                .expect("flat spawn-edge marker")
+        );
+        assert!(
+            schema_migration_applied(&connection, INDEXED_COLLABORATION_MODE_LOOKUP_VERSION)
+                .expect("indexed collaboration-mode marker")
+        );
+        assert!(
+            schema_migration_applied(&connection, INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION)
+                .expect("indexed internal-file ownership marker")
+        );
+        validate_indexed_collaboration_mode_lookup(&connection)
+            .expect("current collaboration-mode partial index");
+        validate_indexed_internal_file_ownership(&connection)
+            .expect("current internal-file ownership partial index");
         assert_eq!(
             legacy_reasoning_projection_row_count(&connection)
                 .expect("retired reasoning projection count"),
@@ -1863,14 +4227,931 @@ mod tests {
     }
 
     #[test]
+    fn released_v40_database_reaches_current_storage_atomically() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v40(&connection);
+        assert!(
+            schema_migration_applied(&connection, FLATTEN_SESSION_SPAWN_EDGES_VERSION)
+                .expect("V40 marker")
+        );
+        assert!(
+            !schema_migration_applied(&connection, INDEXED_COLLABORATION_MODE_LOOKUP_VERSION)
+                .expect("no V41 marker")
+        );
+        assert!(
+            !schema_migration_applied(&connection, TYPED_HISTORY_SCOPE_VERSION)
+                .expect("no V42 marker")
+        );
+        assert!(
+            !schema_migration_applied(&connection, INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION)
+                .expect("no V43 marker")
+        );
+
+        run(&connection).expect("upgrade V40 through current storage");
+
+        assert!(
+            schema_migration_applied(&connection, INDEXED_COLLABORATION_MODE_LOOKUP_VERSION)
+                .expect("V41 marker")
+        );
+        assert!(
+            schema_migration_applied(&connection, TYPED_HISTORY_SCOPE_VERSION).expect("V42 marker")
+        );
+        assert!(
+            schema_migration_applied(&connection, INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION)
+                .expect("V43 marker")
+        );
+        validate_indexed_collaboration_mode_lookup(&connection).expect("V41 index contract");
+        validate_indexed_internal_file_ownership(&connection).expect("V43 index contract");
+    }
+
+    #[test]
+    fn released_v42_database_reaches_current_storage() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v42(&connection);
+        assert!(
+            schema_migration_applied(&connection, TYPED_HISTORY_SCOPE_VERSION).expect("V42 marker")
+        );
+        assert!(
+            !schema_migration_applied(&connection, INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION)
+                .expect("no V43 marker")
+        );
+        assert!(
+            !schema_migration_applied(&connection, UNIQUE_TURN_TERMINAL_VERSION)
+                .expect("no V44 marker")
+        );
+
+        run(&connection).expect("upgrade V42 through current storage");
+
+        assert!(
+            schema_migration_applied(&connection, INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION)
+                .expect("V43 marker")
+        );
+        assert!(
+            schema_migration_applied(&connection, UNIQUE_TURN_TERMINAL_VERSION)
+                .expect("V44 marker")
+        );
+        validate_indexed_internal_file_ownership(&connection).expect("V43 index contract");
+        validate_unique_turn_terminal_index(&connection).expect("V44 index contract");
+    }
+
+    #[test]
+    fn v43_marker_rejects_a_stale_internal_file_ownership_index() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh current schema");
+        connection
+            .execute_batch(
+                "DROP INDEX idx_tool_calls_truncated_output_path;
+                 CREATE INDEX idx_tool_calls_truncated_output_path
+                 ON tool_calls(truncated_output_path);",
+            )
+            .expect("replace current index with non-partial index");
+
+        let error = run(&connection).expect_err("V43 marker must validate the index contract");
+        assert!(error.to_string().contains("missing or stale"));
+    }
+
+    #[test]
+    fn v42_marker_rejects_a_stale_partial_index_contract() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh current schema");
+        connection
+            .execute_batch(
+                "DROP INDEX idx_protocol_history_collaboration_mode_session;
+                 CREATE INDEX idx_protocol_history_collaboration_mode_session
+                 ON protocol_history_items(session_id, id)
+                 WHERE json_valid(payload_json);",
+            )
+            .expect("replace current index with stale predicate");
+
+        let error = run(&connection).expect_err("V42 marker must validate the index contract");
+        assert!(error.to_string().contains("stale predicate"));
+    }
+
+    #[test]
+    fn v42_converts_mode_and_idle_mail_pseudo_turns_to_session_scope() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_v40(&connection);
+        run_indexed_collaboration_mode_lookup(&connection).expect("V41 schema");
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('scope-project', 'C:/scope', 'scope', 'none', 1, 1);
+                 INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms)
+                 VALUES ('scope-session', 'scope-project', 'scope', 'completed', 'C:/scope',
+                         'model', 'http://localhost', 1, 1, 1);",
+            )
+            .expect("scope parents");
+
+        let user_payload = serde_json::to_string(&crate::protocol::HistoryItemPayload::UserTurn {
+            content: vec![crate::protocol::ContentPart::Text {
+                text: "real request".to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+        })
+        .expect("user payload");
+        let terminal_payload = serde_json::to_string(&crate::protocol::TurnItemPayload::Terminal {
+            outcome: crate::protocol::TurnTerminalOutcome::Completed,
+        })
+        .expect("terminal payload");
+        let mode_payload = serde_json::to_string(
+            &crate::protocol::HistoryItemPayload::CollaborationModeInstruction {
+                mode: crate::agent::mode::ModeKind::Plan,
+            },
+        )
+        .expect("mode payload");
+        let communication = crate::protocol::InterAgentCommunication {
+            author: "/root/worker".to_string(),
+            recipient: "/root".to_string(),
+            content: "idle evidence".to_string(),
+            trigger_turn: false,
+        };
+        let mail_history_payload = serde_json::to_string(
+            &crate::protocol::HistoryItemPayload::InterAgentCommunication {
+                communication: communication.clone(),
+            },
+        )
+        .expect("mail history payload");
+        let mail_runtime_payload = serde_json::to_string(
+            &crate::protocol::RuntimeEventMsg::InterAgentCommunicationReceived {
+                communication: communication.clone(),
+            },
+        )
+        .expect("mail runtime payload");
+        let mail_turn_payload =
+            serde_json::to_string(&crate::protocol::TurnItemPayload::InterAgentCommunication {
+                communication,
+            })
+            .expect("mail turn payload");
+
+        connection
+            .execute(
+                "INSERT INTO protocol_history_items
+                 (id, session_id, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
+                 VALUES ('real-user', 'scope-session', 'real-turn', 0, ?1, ?2, 10)",
+                (&user_payload, sha256_text(&user_payload)),
+            )
+            .expect("real history");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms)
+                 VALUES ('scope-session', 'real-turn', 0, 'history_item', 'real-user', 10)",
+                [],
+            )
+            .expect("real append order");
+        connection
+            .execute(
+                "INSERT INTO protocol_turn_items
+                 (id, session_id, turn_id, source_item_id, sequence_no, payload_json, payload_sha256)
+                 VALUES ('real-terminal', 'scope-session', 'real-turn', NULL, 1, ?1, ?2)",
+                (&terminal_payload, sha256_text(&terminal_payload)),
+            )
+            .expect("real terminal");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms)
+                 VALUES ('scope-session', 'real-turn', 1, 'turn_item', 'real-terminal', 11)",
+                [],
+            )
+            .expect("terminal append order");
+        connection
+            .execute(
+                "INSERT INTO protocol_history_items
+                 (id, session_id, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
+                 VALUES ('mode-history', 'scope-session', 'mode-pseudo-turn', 0, ?1, ?2, 20)",
+                (&mode_payload, sha256_text(&mode_payload)),
+            )
+            .expect("mode pseudo history");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms)
+                 VALUES ('scope-session', 'mode-pseudo-turn', 0, 'history_item', 'mode-history', 20)",
+                [],
+            )
+            .expect("mode append order");
+        connection
+            .execute(
+                "INSERT INTO protocol_runtime_events
+                 (id, session_id, turn_id, sequence_no, msg_json, payload_sha256, created_at_ms)
+                 VALUES ('mail-runtime', 'scope-session', 'mail-pseudo-turn', 0, ?1, ?2, 30)",
+                (&mail_runtime_payload, sha256_text(&mail_runtime_payload)),
+            )
+            .expect("mail runtime");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms)
+                 VALUES ('scope-session', 'mail-pseudo-turn', 0, 'runtime_event', 'mail-runtime', 30)",
+                [],
+            )
+            .expect("mail runtime append order");
+        connection
+            .execute(
+                "INSERT INTO protocol_history_items
+                 (id, session_id, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
+                 VALUES ('mail-history', 'scope-session', 'mail-pseudo-turn', 0, ?1, ?2, 31)",
+                (&mail_history_payload, sha256_text(&mail_history_payload)),
+            )
+            .expect("mail history");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms)
+                 VALUES ('scope-session', 'mail-pseudo-turn', 0, 'history_item', 'mail-history', 31)",
+                [],
+            )
+            .expect("mail history append order");
+        connection
+            .execute(
+                "INSERT INTO protocol_turn_items
+                 (id, session_id, turn_id, source_item_id, sequence_no, payload_json, payload_sha256)
+                 VALUES ('mail-turn', 'scope-session', 'mail-pseudo-turn', 'mail-history', 0, ?1, ?2)",
+                (&mail_turn_payload, sha256_text(&mail_turn_payload)),
+            )
+            .expect("mail turn projection");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms)
+                 VALUES ('scope-session', 'mail-pseudo-turn', 0, 'turn_item', 'mail-turn', 31)",
+                [],
+            )
+            .expect("mail turn append order");
+        connection
+            .execute_batch(
+                "INSERT INTO protocol_turn_sequence_allocators
+                 (session_id, turn_id, next_sequence_no)
+                 VALUES
+                 ('scope-session', 'real-turn', 2),
+                 ('scope-session', 'mode-pseudo-turn', 1),
+                 ('scope-session', 'mail-pseudo-turn', 1);",
+            )
+            .expect("sequence allocators");
+
+        run(&connection).expect("V42 scope cutover");
+
+        let rows = connection
+            .prepare(
+                "SELECT history.id, history.scope_kind, history.turn_id, history.sequence_no
+                 FROM protocol_history_items AS history
+                 INNER JOIN protocol_item_append_order AS append_order
+                   ON append_order.source_kind = 'history_item'
+                  AND append_order.source_id = history.id
+                 ORDER BY append_order.append_position ASC",
+            )
+            .expect("scoped history query")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .expect("scoped history rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("scoped history");
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "real-user".to_string(),
+                    "turn".to_string(),
+                    Some("real-turn".to_string()),
+                    0,
+                ),
+                ("mode-history".to_string(), "session".to_string(), None, 0),
+                ("mail-history".to_string(), "session".to_string(), None, 1),
+            ]
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM protocol_runtime_events WHERE turn_id = 'mail-pseudo-turn'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("retired mail runtime count"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM protocol_turn_items WHERE turn_id = 'mail-pseudo-turn'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("retired mail turn count"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM protocol_item_append_order
+                     WHERE source_id IN ('mail-runtime', 'mail-turn')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("retired known mail projection order"),
+            0,
+            "only the allow-listed legacy mail projections are deleted during cutover"
+        );
+        let allocators = connection
+            .prepare(
+                "SELECT turn_id FROM protocol_turn_sequence_allocators
+                 WHERE session_id = 'scope-session' ORDER BY turn_id",
+            )
+            .expect("allocator query")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("allocator rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("allocators");
+        assert_eq!(allocators, vec!["real-turn"]);
+        assert_eq!(foreign_keys_setting(&connection), 1);
+        assert!(foreign_key_violations(&connection).is_empty());
+        validate_canonical_protocol_storage(&connection).expect("full V42 audit");
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO protocol_history_items
+                     (id, session_id, scope_kind, turn_id, sequence_no, payload_json,
+                      payload_sha256, created_at_ms)
+                     VALUES ('ambiguous-session', 'scope-session', 'session', 'invented-turn',
+                             99, ?1, ?2, 99)",
+                    (&mail_history_payload, sha256_text(&mail_history_payload)),
+                )
+                .is_err(),
+            "session scope must reject a non-null turn identity"
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO protocol_history_items
+                     (id, session_id, scope_kind, turn_id, sequence_no, payload_json,
+                      payload_sha256, created_at_ms)
+                     VALUES ('ambiguous-turn', 'scope-session', 'turn', NULL,
+                             99, ?1, ?2, 99)",
+                    (&user_payload, sha256_text(&user_payload)),
+                )
+                .is_err(),
+            "turn scope must reject a null turn identity"
+        );
+    }
+
+    #[test]
+    fn v42_fails_closed_on_unknown_pseudo_turn_projections() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v40(&connection);
+        run_indexed_collaboration_mode_lookup(&connection).expect("V41 schema");
+        let mode_payload = serde_json::to_string(
+            &crate::protocol::HistoryItemPayload::CollaborationModeInstruction {
+                mode: crate::agent::mode::ModeKind::Plan,
+            },
+        )
+        .expect("mode payload");
+        let warning_payload = serde_json::to_string(&crate::protocol::RuntimeEventMsg::Warning {
+            message: "unexpected projection".to_string(),
+        })
+        .expect("warning payload");
+        let warning_turn_payload =
+            serde_json::to_string(&crate::protocol::TurnItemPayload::Warning {
+                message: "unexpected projection".to_string(),
+            })
+            .expect("warning turn payload");
+        connection
+            .execute(
+                "INSERT INTO protocol_history_items
+                 (id, session_id, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
+                 VALUES ('mode-history', 'session', 'mode-turn', 0, ?1, ?2, 1)",
+                (&mode_payload, sha256_text(&mode_payload)),
+            )
+            .expect("mode history");
+        connection
+            .execute(
+                "INSERT INTO protocol_runtime_events
+                 (id, session_id, turn_id, sequence_no, msg_json, payload_sha256, created_at_ms)
+                 VALUES ('unexpected-runtime', 'session', 'mode-turn', 0, ?1, ?2, 1)",
+                (&warning_payload, sha256_text(&warning_payload)),
+            )
+            .expect("unexpected runtime");
+        connection
+            .execute(
+                "INSERT INTO protocol_turn_items
+                 (id, session_id, turn_id, source_item_id, sequence_no, payload_json, payload_sha256)
+                 VALUES ('unexpected-turn-item', 'session', 'mode-turn', NULL, 0, ?1, ?2)",
+                (
+                    &warning_turn_payload,
+                    sha256_text(&warning_turn_payload),
+                ),
+            )
+            .expect("unexpected turn item");
+        connection
+            .execute_batch(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms)
+                 VALUES
+                 ('session', 'mode-turn', 0, 'history_item', 'mode-history', 1),
+                 ('session', 'mode-turn', 0, 'runtime_event', 'unexpected-runtime', 1),
+                 ('session', 'mode-turn', 0, 'turn_item', 'unexpected-turn-item', 1);",
+            )
+            .expect("append order");
+
+        let error = run(&connection).expect_err("unknown mode projection must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected mail, runtime, or turn")
+        );
+        assert!(
+            !schema_migration_applied(&connection, TYPED_HISTORY_SCOPE_VERSION)
+                .expect("no V42 marker")
+        );
+        assert_eq!(foreign_keys_setting(&connection), 1);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM protocol_history_items
+                     WHERE session_id = 'session' AND turn_id = 'mode-turn'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("mode history remains after rollback"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM protocol_runtime_events
+                     WHERE session_id = 'session' AND turn_id = 'mode-turn'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("mode runtime remains after rollback"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM protocol_turn_items
+                     WHERE session_id = 'session' AND turn_id = 'mode-turn'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("mode turn item remains after rollback"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM protocol_item_append_order
+                     WHERE session_id = 'session' AND turn_id = 'mode-turn'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("mode append order remains after rollback"),
+            3
+        );
+
+        let mail_connection = Connection::open_in_memory().expect("mail database");
+        run_through_v40(&mail_connection);
+        run_indexed_collaboration_mode_lookup(&mail_connection).expect("mail V41 schema");
+        let communication = crate::protocol::InterAgentCommunication {
+            author: "/root/worker".to_string(),
+            recipient: "/root".to_string(),
+            content: "idle evidence".to_string(),
+            trigger_turn: false,
+        };
+        let mail_payload = serde_json::to_string(
+            &crate::protocol::HistoryItemPayload::InterAgentCommunication { communication },
+        )
+        .expect("mail payload");
+        mail_connection
+            .execute(
+                "INSERT INTO protocol_history_items
+                 (id, session_id, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
+                 VALUES ('mail-history', 'session', 'mail-turn', 0, ?1, ?2, 1)",
+                (&mail_payload, sha256_text(&mail_payload)),
+            )
+            .expect("mail history");
+        mail_connection
+            .execute(
+                "INSERT INTO protocol_runtime_events
+                 (id, session_id, turn_id, sequence_no, msg_json, payload_sha256, created_at_ms)
+                 VALUES ('unknown-mail-runtime', 'session', 'mail-turn', 0, ?1, ?2, 1)",
+                (&warning_payload, sha256_text(&warning_payload)),
+            )
+            .expect("unknown mail runtime");
+        mail_connection
+            .execute_batch(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms)
+                 VALUES
+                 ('session', 'mail-turn', 0, 'history_item', 'mail-history', 1),
+                 ('session', 'mail-turn', 0, 'runtime_event', 'unknown-mail-runtime', 1);",
+            )
+            .expect("mail append order");
+        let error = run(&mail_connection).expect_err("unknown mail projection must fail closed");
+        assert!(error.to_string().contains("terminal-less mail-only"));
+        assert!(
+            !schema_migration_applied(&mail_connection, TYPED_HISTORY_SCOPE_VERSION)
+                .expect("no mail V42 marker")
+        );
+        assert_eq!(foreign_keys_setting(&mail_connection), 1);
+    }
+
+    #[test]
+    fn v39_rewrites_terminal_outcomes_and_deletes_retired_durable_rows() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_v38(&connection);
+        connection
+            .execute_batch(
+                r#"INSERT INTO protocol_runtime_events
+                   (id, session_id, turn_id, sequence_no, msg_json, payload_sha256, created_at_ms)
+                   VALUES
+                   ('runtime-completed', 'session', 'completed-turn', 1,
+                    '{"kind":"turn_terminal","terminal":{"status":"completed","finish_reason":"stop","interruption_cause":null,"summary":"canonical assistant text","tool_call_count":1,"failed_tool_count":0,"change_count":2,"metrics":{}}}',
+                    'old-completed-hash', 1),
+                   ('runtime-interrupted', 'session', 'interrupted-turn', 1,
+                    '{"kind":"turn_terminal","terminal":{"status":"interrupted","finish_reason":"cancelled","interruption_cause":"user_stop","summary":"custom text is not the cause owner","tool_call_count":0,"failed_tool_count":0,"change_count":0,"metrics":{}}}',
+                    'old-interrupted-hash', 2),
+                   ('runtime-failed', 'session', 'failed-turn', 1,
+                    '{"kind":"turn_terminal","terminal":{"status":"failed","finish_reason":"error","interruption_cause":null,"summary":"provider failed","tool_call_count":0,"failed_tool_count":0,"change_count":0,"metrics":{}}}',
+                    'old-failed-hash', 3),
+                   ('runtime-thread', 'session', 'dead-turn-1', 1,
+                    '{"kind":"thread_configured","model":"model","base_url":"http://localhost"}',
+                    'dead', 4),
+                   ('runtime-text', 'session', 'dead-turn-2', 1,
+                    '{"kind":"assistant_text_delta","response_id":"response","delta":"partial"}',
+                    'dead', 5),
+                   ('runtime-reasoning', 'session', 'dead-turn-3', 1,
+                    '{"kind":"reasoning_summary_delta","response_id":"response","delta":"partial"}',
+                    'dead', 6),
+                   ('runtime-history', 'session', 'dead-turn-4', 1,
+                    '{"kind":"history_item_recorded","item_id":"history"}',
+                    'dead', 7),
+                   ('runtime-retry', 'session', 'retry-turn', 1,
+                    '{"kind":"retry_scheduled","attempt":2,"message":"retry","next_retry_at_ms":99}',
+                    'dead', 8);
+
+                   INSERT INTO protocol_history_items
+                   (id, session_id, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
+                   VALUES ('history-retry', 'session', 'retry-turn', 1,
+                           '{"kind":"retry_decision","attempt":2,"message":"retry","next_retry_at_ms":99}',
+                           'dead', 8);
+
+                   INSERT INTO protocol_turn_items
+                   (id, session_id, turn_id, source_item_id, sequence_no, payload_json, payload_sha256)
+                   VALUES
+                   ('turn-completed', 'session', 'completed-turn', NULL, 1,
+                    '{"kind":"terminal","status":"completed","summary":"canonical assistant text","cause":null}',
+                    'old-completed-turn-hash'),
+                   ('turn-interrupted', 'session', 'interrupted-turn', NULL, 1,
+                    '{"kind":"terminal","status":"interrupted","summary":"ignored projection text","cause":"tree_stopped"}',
+                    'old-interrupted-turn-hash'),
+                   ('turn-failed', 'session', 'failed-turn', NULL, 1,
+                    '{"kind":"terminal","status":"failed","summary":"different projection error","cause":null}',
+                    'old-failed-turn-hash'),
+                   ('turn-retry', 'session', 'retry-turn', 'history-retry', 1,
+                    '{"kind":"warning","message":"retry"}', 'dead');
+
+                   INSERT INTO protocol_item_append_order
+                   (session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms)
+                   SELECT session_id, turn_id, sequence_no, 'runtime_event', id, created_at_ms
+                   FROM protocol_runtime_events;
+                   INSERT INTO protocol_item_append_order
+                   (session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms)
+                   VALUES
+                   ('session', 'retry-turn', 1, 'history_item', 'history-retry', 8),
+                   ('session', 'completed-turn', 1, 'turn_item', 'turn-completed', 1),
+                   ('session', 'interrupted-turn', 1, 'turn_item', 'turn-interrupted', 2),
+                   ('session', 'failed-turn', 1, 'turn_item', 'turn-failed', 3),
+                   ('session', 'retry-turn', 1, 'turn_item', 'turn-retry', 8);"#,
+            )
+            .expect("V38 terminal fixtures");
+
+        run(&connection).expect("V39 cutover");
+        run(&connection).expect("idempotent V39 validation");
+
+        assert!(
+            schema_migration_applied(&connection, TERMINAL_OUTCOME_CUTOVER_VERSION)
+                .expect("V39 marker")
+        );
+        assert_eq!(
+            retired_durable_protocol_row_count(&connection).expect("retired rows"),
+            0
+        );
+        assert_eq!(
+            orphaned_protocol_append_order_count(&connection).expect("append order"),
+            0
+        );
+        for (id, expected_kind) in [
+            ("runtime-completed", "completed"),
+            ("runtime-interrupted", "interrupted"),
+            ("runtime-failed", "failed"),
+        ] {
+            let (json, hash) = connection
+                .query_row(
+                    "SELECT msg_json, payload_sha256 FROM protocol_runtime_events WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .expect("migrated runtime terminal");
+            let value: serde_json::Value = serde_json::from_str(&json).expect("terminal JSON");
+            let terminal = value.get("terminal").expect("terminal object");
+            assert_eq!(
+                terminal
+                    .pointer("/outcome/kind")
+                    .and_then(serde_json::Value::as_str),
+                Some(expected_kind)
+            );
+            assert!(terminal.get("status").is_none());
+            assert!(terminal.get("summary").is_none());
+            assert_eq!(hash, sha256_text(&json));
+        }
+        let completed_turn_json = connection
+            .query_row(
+                "SELECT payload_json FROM protocol_turn_items WHERE id = 'turn-completed'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("completed turn projection");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&completed_turn_json).expect("turn JSON"),
+            serde_json::json!({"kind":"terminal","outcome":{"kind":"completed"}})
+        );
+        let interrupted_turn_json = connection
+            .query_row(
+                "SELECT payload_json FROM protocol_turn_items WHERE id = 'turn-interrupted'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("interrupted turn projection");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&interrupted_turn_json)
+                .expect("turn JSON")
+                .pointer("/outcome/cause")
+                .and_then(serde_json::Value::as_str),
+            Some("user_stop"),
+            "the runtime outcome owns the same-sequence turn projection"
+        );
+    }
+
+    #[test]
+    fn v40_keeps_only_bounded_flat_edges_without_deleting_detached_sessions() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_v39(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('flat-project', 'C:/flat', 'flat', 'none', 1, 1);
+                 INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms)
+                 VALUES ('flat-root', 'flat-project', 'root', 'idle', 'C:/flat', 'model',
+                         'http://localhost', 1, 1, NULL);",
+            )
+            .expect("root fixture");
+        for index in 0..=255 {
+            let session_id = format!("flat-child-{index:03}");
+            let task_name = format!("child_{index:03}");
+            let agent_path = format!("/root/{task_name}");
+            connection
+                .execute(
+                    "INSERT INTO sessions
+                     (id, project_id, title, status, cwd_path, model_name, base_url,
+                      created_at_ms, updated_at_ms, completed_at_ms)
+                     VALUES (?1, 'flat-project', ?2, 'idle', 'C:/flat', 'model',
+                             'http://localhost', ?3, ?3, NULL)",
+                    params![session_id, task_name, i64::from(index) + 2],
+                )
+                .expect("direct child session");
+            connection
+                .execute(
+                    "INSERT INTO session_spawn_edges
+                     (root_session_id, parent_session_id, child_session_id,
+                      agent_path, task_name, created_at_ms)
+                     VALUES ('flat-root', 'flat-root', ?1, ?2, ?3, ?4)",
+                    params![session_id, agent_path, task_name, i64::from(index) + 2],
+                )
+                .expect("legacy direct edge");
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms)
+                 VALUES ('nested-session', 'flat-project', 'nested', 'idle', 'C:/flat', 'model',
+                         'http://localhost', 999, 999, NULL);
+                 INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, created_at_ms)
+                 VALUES ('flat-root', 'flat-child-000', 'nested-session',
+                         '/root/child_000/nested', 'nested', 999);",
+            )
+            .expect("legacy nested edge");
+
+        run(&connection).expect("V40 cutover");
+        run(&connection).expect("idempotent V40 validation");
+
+        assert!(
+            schema_migration_applied(&connection, FLATTEN_SESSION_SPAWN_EDGES_VERSION)
+                .expect("V40 marker")
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_spawn_edges WHERE root_session_id = 'flat-root'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("retained edge count"),
+            255
+        );
+        for detached_session in ["flat-child-255", "nested-session"] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                        [detached_session],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("detached session"),
+                1
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM session_spawn_edges WHERE child_session_id = ?1",
+                        [detached_session],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("discarded edge"),
+                0
+            );
+        }
+
+        connection
+            .execute_batch(
+                "INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms)
+                 VALUES
+                 ('other-root', 'flat-project', 'other root', 'idle', 'C:/flat', 'model',
+                  'http://localhost', 2000, 2000, NULL),
+                 ('other-child', 'flat-project', 'other child', 'idle', 'C:/flat', 'model',
+                  'http://localhost', 2001, 2001, NULL);",
+            )
+            .expect("post-cutover sessions");
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO session_spawn_edges
+                     (root_session_id, parent_session_id, child_session_id,
+                      agent_path, task_name, created_at_ms)
+                     VALUES ('other-root', 'flat-child-000', 'other-child',
+                             '/root/child_000/other', 'other', 2001)",
+                    [],
+                )
+                .is_err(),
+            "the rebuilt table must reject nested lineage"
+        );
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO session_spawn_edges
+                     (root_session_id, parent_session_id, child_session_id,
+                      agent_path, task_name, created_at_ms)
+                     VALUES ('flat-root', 'flat-root', 'flat-child-255',
+                             '/root/child_255', 'child_255', 3000)",
+                    [],
+                )
+                .is_err(),
+            "the per-root capacity trigger must reject a 256th child"
+        );
+    }
+
+    #[test]
+    fn v40_fails_closed_instead_of_detaching_an_active_tree() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_v39(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('active-project', 'C:/active', 'active', 'none', 1, 1);
+                 INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms, active_run_id,
+                  active_turn_id, active_run_lease_expires_at_ms)
+                 VALUES
+                 ('active-root', 'active-project', 'root', 'running', 'C:/active', 'model',
+                  'http://localhost', 1, 1, NULL, 'run', 'turn', 999),
+                 ('active-parent', 'active-project', 'parent', 'idle', 'C:/active', 'model',
+                  'http://localhost', 2, 2, NULL, NULL, NULL, NULL),
+                 ('active-child', 'active-project', 'child', 'idle', 'C:/active', 'model',
+                  'http://localhost', 3, 3, NULL, NULL, NULL, NULL);
+                 INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, created_at_ms)
+                 VALUES ('active-root', 'active-parent', 'active-child',
+                         '/root/parent/child', 'child', 3);",
+            )
+            .expect("active nested fixture");
+        let edge_before = text_snapshot(
+            &connection,
+            "SELECT json_group_array(json_array(root_session_id, parent_session_id,
+                                                child_session_id, agent_path, task_name,
+                                                created_at_ms))
+             FROM (SELECT * FROM session_spawn_edges ORDER BY child_session_id)",
+        );
+
+        let error = run_flatten_session_spawn_edges(&connection)
+            .expect_err("active nested lineage must not be detached");
+
+        assert!(error.to_string().contains("retains active run state"));
+        assert_eq!(
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(root_session_id, parent_session_id,
+                                                    child_session_id, agent_path, task_name,
+                                                    created_at_ms))
+                 FROM (SELECT * FROM session_spawn_edges ORDER BY child_session_id)",
+            ),
+            edge_before
+        );
+        assert!(connection.is_autocommit());
+        assert!(
+            !schema_migration_applied(&connection, FLATTEN_SESSION_SPAWN_EDGES_VERSION)
+                .expect("no V40 marker")
+        );
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v39_fails_closed_when_interruption_cause_cannot_be_recovered() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v38(&connection);
+        let invalid_json = r#"{"kind":"turn_terminal","terminal":{"status":"interrupted","finish_reason":"cancelled","summary":"ambiguous custom interruption","tool_call_count":0,"failed_tool_count":0,"change_count":0,"metrics":{}}}"#;
+        connection
+            .execute(
+                "INSERT INTO protocol_runtime_events
+                 (id, session_id, turn_id, sequence_no, msg_json, payload_sha256, created_at_ms)
+                 VALUES ('invalid-terminal', 'session', 'turn', 1, ?1, ?2, 1)",
+                (invalid_json, sha256_text(invalid_json)),
+            )
+            .expect("invalid legacy terminal fixture");
+
+        let error = run(&connection).expect_err("ambiguous cause must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("uniquely recognized legacy summary")
+        );
+        assert!(connection.is_autocommit());
+        assert!(
+            !schema_migration_applied(&connection, TERMINAL_OUTCOME_CUTOVER_VERSION)
+                .expect("no V39 marker")
+        );
+        assert!(
+            connection
+                .query_row(
+                    "SELECT msg_json FROM protocol_runtime_events WHERE id = 'invalid-terminal'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("rolled-back terminal")
+                .contains("\"status\":\"interrupted\"")
+        );
+    }
+
+    #[test]
     fn v36_marker_rejects_reintroduced_legacy_reasoning_rows() {
         let connection = Connection::open_in_memory().expect("database");
         run(&connection).expect("fresh current schema");
         connection
             .execute(
                 "INSERT INTO protocol_history_items
-                 (id, session_id, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
-                 VALUES ('retired-reasoning', 'session', 'turn', 0,
+                 (id, session_id, scope_kind, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
+                 VALUES ('retired-reasoning', 'session', 'turn', 'turn', 0,
                          '{\"kind\":\"reasoning\",\"text\":\"retired\"}', 'sha', 1)",
                 [],
             )
@@ -1966,7 +5247,7 @@ mod tests {
     }
 
     #[test]
-    fn v37_drops_every_projection_for_a_legacy_turn_without_response_lineage() {
+    fn v37_recovers_unique_response_lineage_without_changing_other_turn_evidence() {
         let connection = Connection::open_in_memory().expect("database");
         connection
             .pragma_update(None, "foreign_keys", "ON")
@@ -2026,51 +5307,192 @@ mod tests {
                          'before', 'after', 'diff', 'old change', 4);"#,
             )
             .expect("legacy and retained turn fixtures");
+        connection
+            .execute(
+                "UPDATE sessions SET active_turn_id = 'legacy-turn' WHERE id = 'tool-session'",
+                [],
+            )
+            .expect("active legacy turn");
 
-        run(&connection).expect("destructive V37 turn cutover");
+        let unchanged_snapshots = [
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(id, session_id, turn_id, sequence_no, msg_json, payload_sha256, created_at_ms))
+                 FROM (SELECT * FROM protocol_runtime_events ORDER BY session_id, turn_id, sequence_no, id)",
+            ),
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(id, session_id, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms))
+                 FROM (SELECT * FROM protocol_history_items WHERE id <> 'legacy-tool-history'
+                       ORDER BY session_id, turn_id, sequence_no, id)",
+            ),
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(id, session_id, turn_id, source_item_id, sequence_no, payload_json, payload_sha256))
+                 FROM (SELECT * FROM protocol_turn_items ORDER BY session_id, turn_id, sequence_no, id)",
+            ),
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(append_position, session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms))
+                 FROM (SELECT * FROM protocol_item_append_order ORDER BY append_position)",
+            ),
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(session_id, turn_id, next_sequence_no))
+                 FROM (SELECT * FROM protocol_turn_sequence_allocators ORDER BY session_id, turn_id)",
+            ),
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(id, history_item_id, status, truncated_output_path, started_at_ms, finished_at_ms))
+                 FROM (SELECT * FROM tool_calls ORDER BY id)",
+            ),
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(id, tool_call_id, change_kind, path_before, path_after, before_sha256, after_sha256, diff_text, summary_text, created_at_ms))
+                 FROM (SELECT * FROM file_changes ORDER BY id)",
+            ),
+        ];
 
-        for table in [
-            "protocol_runtime_events",
-            "protocol_history_items",
-            "protocol_turn_items",
-            "protocol_item_append_order",
-            "protocol_turn_sequence_allocators",
-        ] {
-            let removed = connection
+        run_raw_tool_call_history_migration(&connection).expect("recoverable V37 cutover");
+
+        let snapshots_after = [
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(id, session_id, turn_id, sequence_no, msg_json, payload_sha256, created_at_ms))
+                 FROM (SELECT * FROM protocol_runtime_events ORDER BY session_id, turn_id, sequence_no, id)",
+            ),
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(id, session_id, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms))
+                 FROM (SELECT * FROM protocol_history_items WHERE id <> 'legacy-tool-history'
+                       ORDER BY session_id, turn_id, sequence_no, id)",
+            ),
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(id, session_id, turn_id, source_item_id, sequence_no, payload_json, payload_sha256))
+                 FROM (SELECT * FROM protocol_turn_items ORDER BY session_id, turn_id, sequence_no, id)",
+            ),
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(append_position, session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms))
+                 FROM (SELECT * FROM protocol_item_append_order ORDER BY append_position)",
+            ),
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(session_id, turn_id, next_sequence_no))
+                 FROM (SELECT * FROM protocol_turn_sequence_allocators ORDER BY session_id, turn_id)",
+            ),
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(id, history_item_id, status, truncated_output_path, started_at_ms, finished_at_ms))
+                 FROM (SELECT * FROM tool_calls ORDER BY id)",
+            ),
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(id, tool_call_id, change_kind, path_before, path_after, before_sha256, after_sha256, diff_text, summary_text, created_at_ms))
+                 FROM (SELECT * FROM file_changes ORDER BY id)",
+            ),
+        ];
+        assert_eq!(snapshots_after, unchanged_snapshots);
+        assert_eq!(
+            connection
                 .query_row(
-                    &format!(
-                        "SELECT COUNT(*) FROM {table} WHERE session_id = 'tool-session' AND turn_id = 'legacy-turn'"
-                    ),
+                    "SELECT active_turn_id FROM sessions WHERE id = 'tool-session'",
                     [],
-                    |row| row.get::<_, i64>(0),
+                    |row| row.get::<_, Option<String>>(0),
                 )
-                .unwrap_or_else(|error| panic!("removed {table}: {error}"));
-            let retained = connection
-                .query_row(
-                    &format!(
-                        "SELECT COUNT(*) FROM {table} WHERE session_id = 'tool-session' AND turn_id = 'kept-turn'"
-                    ),
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap_or_else(|error| panic!("retained {table}: {error}"));
-            assert_eq!(removed, 0, "affected table={table}");
-            assert!(retained > 0, "unaffected table={table}");
-        }
-        for table in ["tool_calls", "file_changes"] {
-            assert_eq!(
-                connection
-                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                    .unwrap_or_else(|error| panic!("cascaded {table}: {error}")),
-                0,
-                "sidecar table={table}"
-            );
-        }
+                .expect("active turn after V37")
+                .as_deref(),
+            Some("legacy-turn")
+        );
+        let (payload_json, payload_sha256) = connection
+            .query_row(
+                "SELECT payload_json, payload_sha256 FROM protocol_history_items
+                 WHERE id = 'legacy-tool-history'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("recovered tool call");
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload_json).expect("canonical tool-call JSON");
+        assert_eq!(payload["response_id"], "old");
+        assert_eq!(payload["tool_name"], "read");
+        assert_eq!(payload["arguments_json"], r#"{"path":"README.md"}"#);
+        assert_eq!(payload_sha256, sha256_text(&payload_json));
         assert!(
             schema_migration_applied(&connection, RAW_TOOL_CALL_HISTORY_VERSION)
                 .expect("V37 marker")
+        );
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v37_fails_closed_when_missing_response_lineage_is_not_uniquely_recoverable() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_v36(&connection).expect("schema through V36");
+        insert_canonical_tool_call_parent_rows(&connection);
+        connection
+            .execute_batch(
+                r#"UPDATE sessions
+                   SET active_turn_id = 'unresolved-turn'
+                   WHERE id = 'tool-session';
+                   INSERT INTO protocol_history_items
+                   (id, session_id, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
+                   VALUES
+                   ('unresolved-tool', 'tool-session', 'unresolved-turn', 0,
+                    '{"kind":"tool_call","call_id":"unresolved-call","tool":"read","arguments":{"path":"README.md"}}',
+                    'unresolved-tool-hash', 3),
+                   ('unresolved-output', 'tool-session', 'unresolved-turn', 1,
+                    '{"kind":"tool_output","call_id":"unresolved-call","status":"completed","title":"read","output_text":"old","metadata":null}',
+                    'unresolved-output-hash', 4);
+                   INSERT INTO protocol_runtime_events
+                   (id, session_id, turn_id, sequence_no, msg_json, payload_sha256, created_at_ms)
+                   VALUES ('unresolved-runtime', 'tool-session', 'unresolved-turn', 0,
+                           '{"kind":"warning","message":"preserve me"}', 'runtime-hash', 3);
+                   INSERT INTO protocol_turn_items
+                   (id, session_id, turn_id, source_item_id, sequence_no, payload_json, payload_sha256)
+                   VALUES ('unresolved-turn-item', 'tool-session', 'unresolved-turn',
+                           'unresolved-tool', 0,
+                           '{"kind":"tool_status","call_id":"unresolved-call","tool":"read","status":"completed","title":"read","summary":"old"}',
+                           'turn-hash');
+                   INSERT INTO protocol_item_append_order
+                   (session_id, turn_id, sequence_no, source_kind, source_id, created_at_ms)
+                   VALUES
+                   ('tool-session', 'unresolved-turn', 0, 'runtime_event', 'unresolved-runtime', 3),
+                   ('tool-session', 'unresolved-turn', 1, 'history_item', 'unresolved-tool', 3),
+                   ('tool-session', 'unresolved-turn', 2, 'history_item', 'unresolved-output', 4),
+                   ('tool-session', 'unresolved-turn', 3, 'turn_item', 'unresolved-turn-item', 4);
+                   INSERT INTO protocol_turn_sequence_allocators
+                   (session_id, turn_id, next_sequence_no)
+                   VALUES ('tool-session', 'unresolved-turn', 4);
+                   INSERT INTO tool_calls
+                   (id, history_item_id, status, truncated_output_path, started_at_ms, finished_at_ms)
+                   VALUES ('unresolved-call', 'unresolved-tool', 'completed', 'C:/old.txt', 3, 4);
+                   INSERT INTO file_changes
+                   (id, tool_call_id, change_kind, path_before, path_after, before_sha256,
+                    after_sha256, diff_text, summary_text, created_at_ms)
+                   VALUES ('unresolved-change', 'unresolved-call', 'update', 'README.md',
+                           'README.md', 'before', 'after', 'diff', 'summary', 4);"#,
+            )
+            .expect("unresolved V37 fixture");
+        let before = v37_byte_order_snapshot(&connection);
+
+        let error = run_raw_tool_call_history_migration(&connection)
+            .expect_err("missing response lineage must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("no uniquely recoverable assistant response lineage")
+        );
+        assert_eq!(v37_byte_order_snapshot(&connection), before);
+        assert!(connection.is_autocommit());
+        assert!(
+            !schema_migration_applied(&connection, RAW_TOOL_CALL_HISTORY_VERSION)
+                .expect("no V37 marker")
         );
         assert!(foreign_key_violations(&connection).is_empty());
     }
@@ -2115,7 +5537,7 @@ mod tests {
     }
 
     #[test]
-    fn v37_validation_accepts_invalid_provider_json_text_but_rejects_old_keys() {
+    fn full_canonical_validation_accepts_invalid_provider_json_text_but_rejects_old_keys() {
         let connection = Connection::open_in_memory().expect("database");
         run(&connection).expect("fresh current schema");
         insert_canonical_tool_call_parent_rows(&connection);
@@ -2130,12 +5552,13 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO protocol_history_items
-                 (id, session_id, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
-                 VALUES ('raw-tool-history', 'tool-session', 'turn', 0, ?1, ?2, 3)",
+                 (id, session_id, scope_kind, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
+                 VALUES ('raw-tool-history', 'tool-session', 'turn', 'turn', 0, ?1, ?2, 3)",
                 (&raw_payload, sha256_text(&raw_payload)),
             )
             .expect("raw tool-call fixture");
-        run(&connection).expect("raw invalid provider arguments remain valid history");
+        validate_canonical_protocol_storage(&connection)
+            .expect("raw invalid provider arguments remain valid history");
 
         let mut with_old_key: serde_json::Value =
             serde_json::from_str(&raw_payload).expect("raw payload");
@@ -2152,12 +5575,13 @@ mod tests {
                 (&with_old_key, sha256_text(&with_old_key)),
             )
             .expect("reintroduce old tool key");
-        let error = run(&connection).expect_err("old tool key must fail V37 validation");
+        let error = validate_canonical_protocol_storage(&connection)
+            .expect_err("old tool key must fail full canonical validation");
         assert!(error.to_string().contains("unexpected fields: tool"));
     }
 
     #[test]
-    fn released_v31_tool_turn_is_dropped_whole_while_other_turns_survive_v37() {
+    fn released_v31_messages_tools_and_active_turn_survive_the_current_cutover() {
         let connection = Connection::open_in_memory().expect("database");
         connection
             .pragma_update(None, "foreign_keys", "ON")
@@ -2357,7 +5781,7 @@ mod tests {
             "protocol_item_append_order",
             "protocol_turn_sequence_allocators",
         ] {
-            assert_eq!(
+            assert!(
                 connection
                     .query_row(
                         &format!(
@@ -2366,9 +5790,9 @@ mod tests {
                         [],
                         |row| row.get::<_, i64>(0),
                     )
-                    .unwrap_or_else(|error| panic!("removed legacy {table}: {error}")),
-                0,
-                "affected table={table}"
+                    .unwrap_or_else(|error| panic!("preserved legacy {table}: {error}"))
+                    > 0,
+                "legacy table={table}"
             );
             assert!(
                 connection
@@ -2390,9 +5814,35 @@ mod tests {
                     .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                         row.get::<_, i64>(0)
                     })
-                    .unwrap_or_else(|error| panic!("removed {table}: {error}")),
-                0,
+                    .unwrap_or_else(|error| panic!("preserved {table}: {error}")),
+                2,
                 "sidecar table={table}"
+            );
+        }
+        for call_id in ["matched", "unmatched"] {
+            let payload = connection
+                .query_row(
+                    "SELECT payload_json FROM protocol_history_items
+                     WHERE json_valid(payload_json)
+                       AND json_extract(payload_json, '$.kind') = 'tool_call'
+                       AND json_extract(payload_json, '$.call_id') = ?1",
+                    [call_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_or_else(|error| panic!("canonical call {call_id}: {error}"));
+            let value: serde_json::Value =
+                serde_json::from_str(&payload).expect("canonical call JSON");
+            assert!(
+                value["response_id"]
+                    .as_str()
+                    .is_some_and(|response_id| !response_id.is_empty()),
+                "call={call_id}"
+            );
+            assert_eq!(value["tool_name"], "shell", "call={call_id}");
+            assert_eq!(
+                value["arguments_json"],
+                format!(r#"{{"id":"{call_id}"}}"#),
+                "call={call_id}"
             );
         }
         assert_eq!(
@@ -2450,7 +5900,7 @@ mod tests {
             )
             .expect("v33 session fixture");
 
-        run(&connection).expect("v34 through v37 upgrade");
+        run(&connection).expect("v34 through v38 upgrade");
         run(&connection).expect("idempotent current upgrade");
 
         assert!(!sessions_has_memory_mode(&connection).expect("current session columns"));
@@ -2469,6 +5919,10 @@ mod tests {
         assert!(
             schema_migration_applied(&connection, RAW_TOOL_CALL_HISTORY_VERSION)
                 .expect("v37 marker")
+        );
+        assert!(
+            schema_migration_applied(&connection, REMOVE_AUTO_REVIEW_ACCESS_MODE_VERSION)
+                .expect("v38 marker")
         );
         assert!(
             table_has_exact_status_domain(&connection, "sessions", SESSION_STATUS_DOMAIN)
@@ -2494,11 +5948,111 @@ mod tests {
             session,
             (
                 "keep me".to_string(),
-                "auto_review".to_string(),
+                "default".to_string(),
                 "{\"temperature\":0.2}".to_string(),
                 2,
                 3,
             )
+        );
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn fresh_v38_schema_accepts_only_current_access_modes() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+
+        run(&connection).expect("fresh current schema");
+
+        assert!(
+            schema_migration_applied(&connection, REMOVE_AUTO_REVIEW_ACCESS_MODE_VERSION)
+                .expect("v38 marker")
+        );
+        assert!(
+            table_has_exact_access_mode_domain(
+                &connection,
+                "sessions",
+                SESSION_ACCESS_MODE_DOMAIN,
+            )
+            .expect("access mode domain")
+        );
+        connection
+            .execute(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('project-v38', 'C:/workspace', 'workspace', 'none', 1, 1)",
+                [],
+            )
+            .expect("project");
+        for (id, access_mode) in [
+            ("default-session", "default"),
+            ("full-session", "full_access"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO sessions
+                     (id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
+                      model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms)
+                     VALUES (?1, 'project-v38', ?1, 'idle', 'C:/workspace', 'model',
+                             'http://localhost', ?2, '{}', 1, 1, NULL)",
+                    (id, access_mode),
+                )
+                .expect("current access mode");
+        }
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO sessions
+                     (id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
+                      model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms)
+                     VALUES ('retired-session', 'project-v38', 'retired', 'idle', 'C:/workspace',
+                             'model', 'http://localhost', 'auto_review', '{}', 1, 1, NULL)",
+                    [],
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn v37_auto_review_session_upgrades_one_way_to_default() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_v36(&connection).expect("v36 schema");
+        run_raw_tool_call_history_migration(&connection).expect("v37 schema");
+        connection
+            .execute_batch(
+                r#"INSERT INTO projects
+                   (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                   VALUES ('project-v37', 'C:/workspace', 'workspace', 'none', 1, 1);
+                   INSERT INTO sessions
+                   (id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
+                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms)
+                   VALUES ('session-v37', 'project-v37', 'legacy access', 'idle', 'C:/workspace',
+                           'model', 'http://localhost', 'auto_review', '{"temperature":0.2}',
+                           2, 3, NULL);"#,
+            )
+            .expect("v37 auto-review fixture");
+
+        run(&connection).expect("v38 upgrade");
+        run(&connection).expect("idempotent v38 upgrade");
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT access_mode FROM sessions WHERE id = 'session-v37'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("migrated access mode"),
+            "default"
+        );
+        assert!(
+            schema_migration_applied(&connection, REMOVE_AUTO_REVIEW_ACCESS_MODE_VERSION)
+                .expect("v38 marker")
         );
         assert!(foreign_key_violations(&connection).is_empty());
     }
@@ -2549,11 +6103,12 @@ mod tests {
             .execute_batch("DROP TABLE tool_calls_v33;")
             .expect("remove collision");
         run_canonical_protocol_storage_cutover(&connection).expect("retry V33");
-        run_drop_sessions_memory_mode(&connection).expect("apply V34 after retry");
-        run_drop_sessions_awaiting_user_status(&connection).expect("apply V35 after retry");
-        run_drop_legacy_reasoning_items(&connection).expect("apply V36 after retry");
-        run_raw_tool_call_history_migration(&connection).expect("apply V37 after retry");
-        validate_canonical_protocol_storage(&connection).expect("canonical storage after retry");
+        run(&connection).expect("complete V34 through V40 after V33 retry");
+        run(&connection).expect("idempotent V40 validation after V33 retry");
+        assert!(
+            schema_migration_applied(&connection, FLATTEN_SESSION_SPAWN_EDGES_VERSION)
+                .expect("V40 marker after retry")
+        );
         assert_eq!(foreign_keys_setting(&connection), 1);
         assert!(foreign_key_violations(&connection).is_empty());
     }
@@ -3049,6 +6604,71 @@ mod tests {
     }
 
     #[test]
+    fn v44_rejects_preexisting_duplicate_turn_terminals_and_rolls_back() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh current schema");
+        connection
+            .execute_batch(
+                "DROP INDEX idx_protocol_runtime_events_unique_turn_terminal;
+                 DELETE FROM moyai_schema_migrations WHERE version = 44;",
+            )
+            .expect("restore V43 fixture");
+        let terminal = crate::session::DurableTurnTerminal {
+            outcome: crate::protocol::TurnTerminalOutcome::Completed,
+            final_response_id: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        };
+        let msg_json = serde_json::json!({
+            "kind": "turn_terminal",
+            "terminal": terminal,
+        })
+        .to_string();
+        connection
+            .execute(
+                "INSERT INTO protocol_runtime_events
+                 (id, session_id, turn_id, sequence_no, msg_json, payload_sha256, created_at_ms)
+                 VALUES
+                 ('terminal-1', 'session', 'turn', 0, ?1, 'hash-1', 1),
+                 ('terminal-2', 'session', 'turn', 1, ?1, 'hash-2', 2)",
+                [&msg_json],
+            )
+            .expect("duplicate terminal fixture");
+
+        let error = run(&connection).expect_err("V44 must reject duplicate terminal owners");
+        assert!(error.to_string().contains("UNIQUE constraint failed"));
+        assert!(
+            !schema_migration_applied(&connection, UNIQUE_TURN_TERMINAL_VERSION)
+                .expect("rolled-back V44 marker")
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM protocol_runtime_events
+                     WHERE session_id = 'session' AND turn_id = 'turn'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("retained duplicate rows"),
+            2
+        );
+    }
+
+    #[test]
+    fn v44_marker_requires_the_exact_partial_unique_index() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh current schema");
+        connection
+            .execute_batch("DROP INDEX idx_protocol_runtime_events_unique_turn_terminal")
+            .expect("drop V44 index");
+
+        let error = run(&connection).expect_err("stale V44 schema must fail closed");
+        assert!(error.to_string().contains("V44 marker"));
+    }
+
+    #[test]
     fn run_identity_turn_and_lease_migrate_v25_schema_and_are_idempotent() {
         let connection = Connection::open_in_memory().expect("database");
         run_through_v25(&connection).expect("v25 schema");
@@ -3095,5 +6715,41 @@ mod tests {
             )
             .expect("allocator table");
         assert_eq!(allocator_table_count, 1);
+    }
+
+    #[test]
+    fn current_schema_fast_path_does_not_scan_canonical_payload_rows() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run(&connection).expect("fresh migration");
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('project', 'C:/workspace', 'workspace', 'none', 1, 1);
+                 INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms)
+                 VALUES
+                 ('session', 'project', 'session', 'completed', 'C:/workspace', 'model',
+                  'http://localhost', 1, 1, 1);
+                 INSERT INTO protocol_history_items
+                 (id, session_id, scope_kind, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
+                 VALUES
+                 ('corrupt-history', 'session', 'turn', 'turn', 1,
+                  '{\"kind\":\"reasoning\",\"text\":\"retired\"}', 'stale', 1);",
+            )
+            .expect("current-schema corruption fixture");
+
+        run(&connection).expect("current schema validation must remain bounded to schema shape");
+        let error = validate_canonical_protocol_storage(&connection)
+            .expect_err("the explicit full cutover audit must still reject corrupt payloads");
+        assert!(
+            error
+                .to_string()
+                .contains("retired reasoning or prompt-dispatch")
+        );
     }
 }

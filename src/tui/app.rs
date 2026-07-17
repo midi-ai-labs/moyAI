@@ -1,6 +1,5 @@
 use std::fs;
 use std::io::{self, Stdout};
-use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -16,23 +15,25 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use tokio_util::sync::CancellationToken;
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, AppBootstrap, AppCommand, ReviewRequest, RunRequest, SessionSteerRequest};
+use crate::app::{
+    App, AppBootstrap, AppCommand, AppCommandOutcome, ReviewRequest, RunConfigInput, RunRequest,
+    SessionSteerRequest,
+};
 use crate::cli::{
     ConfirmationOutcome, ConfirmationPrompt, EventRenderer, OutputMode, ReviewDecision,
     SharedConfirmationPrompt, TuiArgs,
 };
-use crate::config::merge::apply_patch as apply_config_patch;
-use crate::config::model::full_effective_override;
 use crate::config::{ConfigLoader, ResolvedConfig, ShellFamily};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
 use crate::protocol::{PlanStepStatus, ToolApprovalDecision, TurnInterruptionCause};
-use crate::runtime::{
-    LiveConfigOverrides, RunCancelOutcome, RunCancellationCause, RunControl, SystemClock,
+use crate::runtime::{RunCancelOutcome, RunCancellationCause, RunControl, SystemClock};
+use crate::session::markdown::{
+    canonical_markdown_export_read, canonical_session_read_to_markdown, history_markdown_file_name,
 };
-use crate::session::markdown::{canonical_session_read_to_markdown, history_markdown_file_name};
 use crate::session::{
     EditorContext, LoadedSessionStatus, LoadedSessionSummary, PromptDispatchPart, RunEvent,
     RunSummary, SessionId, SessionRecord, SessionStatus,
@@ -51,6 +52,8 @@ use super::state::{
 };
 
 type TerminalHandle = Terminal<CrosstermBackend<Stdout>>;
+const TUI_RUNTIME_DRAIN_BUDGET: usize = 128;
+const TUI_RUNTIME_MAILBOX_CAPACITY: usize = 256;
 
 struct TuiRootRun {
     generation: u64,
@@ -106,16 +109,13 @@ impl TuiRootRunLifecycle {
 
 fn commit_tui_effective_config(
     effective_config: &mut ResolvedConfig,
-    live_config: &LiveConfigOverrides,
     candidate: ResolvedConfig,
     durable_access_ready: bool,
 ) -> bool {
     if !durable_access_ready {
         return false;
     }
-    let access_mode = candidate.permissions.access_mode;
     *effective_config = candidate;
-    live_config.set_access_mode(access_mode);
     true
 }
 
@@ -169,6 +169,12 @@ struct PendingComposerSubmission {
     draft_text: String,
 }
 
+fn has_pending_steer_submission(submissions: &[PendingComposerSubmission]) -> bool {
+    submissions
+        .iter()
+        .any(|pending| matches!(pending.id, PendingComposerSubmissionId::Steer(_)))
+}
+
 struct TuiController {
     app: App,
     state: AppState,
@@ -178,14 +184,13 @@ struct TuiController {
     config_editor: ConfigEditorState,
     base_config: ResolvedConfig,
     effective_config: ResolvedConfig,
-    live_config: LiveConfigOverrides,
     root_run_lifecycle: TuiRootRunLifecycle,
     next_root_run_generation: u64,
     next_steer_submission_id: u64,
     composer_draft_revision: u64,
     pending_composer_submissions: Vec<PendingComposerSubmission>,
-    runtime_tx: tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
-    runtime_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeMessage>,
+    runtime_tx: mpsc::SyncSender<RuntimeMessage>,
+    runtime_rx: mpsc::Receiver<RuntimeMessage>,
     pending_permission: Option<PendingPermission>,
     next_permission_request_id: Arc<AtomicU64>,
     preview_entries: Vec<TranscriptEntry>,
@@ -195,17 +200,17 @@ struct TuiController {
     preview_turn_total: usize,
     preview_turn_has_more: bool,
     next_enhance_request_id: u64,
+    pending_prompt_enhance: Option<(u64, CancellationToken)>,
     should_quit: bool,
     started_at: Instant,
 }
 
 impl TuiController {
     async fn new(app: App, args: TuiArgs) -> Result<Self, AppRunError> {
-        let (runtime_tx, runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (runtime_tx, runtime_rx) = mpsc::sync_channel(TUI_RUNTIME_MAILBOX_CAPACITY);
         let sessions = recent_sessions(&app.session_service, app.workspace.project_id, 20).await?;
         let base_config = app.config.clone();
         let effective_config = base_config.clone();
-        let live_config = LiveConfigOverrides::new(effective_config.permissions.access_mode);
         let mut controller = Self {
             app,
             state: AppState::default(),
@@ -215,7 +220,6 @@ impl TuiController {
             config_editor: ConfigEditorState::from_config(&effective_config),
             base_config,
             effective_config,
-            live_config,
             root_run_lifecycle: TuiRootRunLifecycle::default(),
             next_root_run_generation: 1,
             next_steer_submission_id: 1,
@@ -232,6 +236,7 @@ impl TuiController {
             preview_turn_total: 0,
             preview_turn_has_more: false,
             next_enhance_request_id: 1,
+            pending_prompt_enhance: None,
             should_quit: false,
             started_at: Instant::now(),
         };
@@ -290,7 +295,7 @@ impl TuiController {
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && self.state.run_status != RunStatus::Running =>
             {
-                self.should_quit = true;
+                self.quit_after_cancelling_prompt_enhance();
             }
             KeyCode::F(2) => {
                 self.state.route = Route::History;
@@ -456,13 +461,20 @@ impl TuiController {
     }
 
     async fn handle_enhance_review_key(&mut self, key: KeyEvent) -> Result<(), AppRunError> {
+        if key.code == KeyCode::Char('q')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.state.run_status != RunStatus::Running
+        {
+            self.quit_after_cancelling_prompt_enhance();
+            return Ok(());
+        }
         let Some(prompt_review) = self.state.prompt_review.clone() else {
             self.state.modal = Modal::None;
             return Ok(());
         };
         if prompt_review.phase == PromptReviewPhase::Enhancing {
             if key.code == KeyCode::Esc {
-                self.state.cancel_prompt_review();
+                self.cancel_pending_prompt_enhance();
                 self.state.status_message = Some("cancelled prompt enhancement".to_string());
             }
             return Ok(());
@@ -470,7 +482,7 @@ impl TuiController {
 
         match key.code {
             KeyCode::Esc => {
-                self.state.cancel_prompt_review();
+                self.cancel_pending_prompt_enhance();
                 self.state.status_message = Some("kept raw prompt in composer".to_string());
             }
             KeyCode::F(6) => {
@@ -479,7 +491,7 @@ impl TuiController {
                         "enhanced draft is not ready yet".to_string(),
                     ));
                 };
-                self.state.cancel_prompt_review();
+                self.cancel_pending_prompt_enhance();
                 self.launch_run(
                     prompt_dispatch.dispatch_prompt_text.clone(),
                     prompt_dispatch,
@@ -492,7 +504,7 @@ impl TuiController {
                         "enhanced draft is not ready yet".to_string(),
                     ));
                 };
-                self.state.cancel_prompt_review();
+                self.cancel_pending_prompt_enhance();
                 self.launch_run(
                     prompt_dispatch.dispatch_prompt_text.clone(),
                     prompt_dispatch,
@@ -522,27 +534,26 @@ impl TuiController {
             KeyCode::Backspace => self.config_editor.backspace(),
             KeyCode::Delete => self.config_editor.clear_selected(),
             KeyCode::F(2) => {
-                let patch = self
+                let candidate = self
                     .config_editor
-                    .build_session_override()
+                    .build_resolved_config(&self.effective_config)
                     .map_err(AppRunError::Message)?;
-                let candidate = apply_config_patch(self.base_config.clone(), patch);
                 let durable_access_ready = self
                     .persist_current_session_access_mode(candidate.permissions.access_mode)
                     .await;
                 if !commit_tui_effective_config(
                     &mut self.effective_config,
-                    &self.live_config,
                     candidate,
                     durable_access_ready,
                 ) {
                     return Ok(());
                 }
                 self.state.status_message = Some(if self.state.current_session_id.is_some() {
-                    "applied session override and remembered access mode for this session"
+                    "applied session override and remembered access mode for this session; changes apply to turns admitted later"
                         .to_string()
                 } else {
-                    "applied temporary session override".to_string()
+                    "applied temporary session override; changes apply to turns admitted later"
+                        .to_string()
                 });
             }
             KeyCode::F(3) => {
@@ -599,7 +610,6 @@ impl TuiController {
         let root_stop_accepted = self.root_run_lifecycle.request_cancel();
         let Some(session_id) = self.state.current_session_id else {
             if root_stop_accepted {
-                self.state.run_status = RunStatus::Cancelled;
                 self.state.status_message =
                     Some("stop requested before run admission completed".to_string());
                 return Ok(());
@@ -611,10 +621,16 @@ impl TuiController {
             .app
             .run_service
             .cancel_agent_tree(session_id, TurnInterruptionCause::UserStop);
+        if root_stop_accepted {
+            // Stop dispatch is not a terminal transition. The admitted turn remains the owner
+            // until its matching TurnTerminal/worker settlement is projected back to the TUI.
+            self.state.status_message = Some("stop requested for active run".to_string());
+            return Ok(());
+        }
         match self
             .app
             .session_service
-            .interrupt_running_session(session_id, "Stopped from TUI.".to_string())
+            .interrupt_running_session(session_id)
             .await
         {
             Ok(session) => {
@@ -627,7 +643,7 @@ impl TuiController {
                 self.refresh_sessions().await?;
             }
             Err(error) => {
-                if root_stop_accepted || tree_cancelled {
+                if tree_cancelled {
                     self.state.run_status = RunStatus::Cancelled;
                     self.state.status_message = Some("stopped the active agent tree".to_string());
                 } else {
@@ -684,12 +700,12 @@ impl TuiController {
         self.apply_access_mode_owner(access_mode);
         self.state.status_message = Some(if session_access_owner {
             format!(
-                "session access mode set to {} and remembered for this session",
+                "session access mode set to {} and remembered for this session; it applies to turns admitted later",
                 access_mode.label()
             )
         } else {
             format!(
-                "default access mode set to {} and remembered globally",
+                "default access mode set to {} and remembered globally; it applies to turns admitted later",
                 access_mode.label()
             )
         });
@@ -731,14 +747,8 @@ impl TuiController {
         }
     }
 
-    fn sync_live_access_mode(&self) {
-        self.live_config
-            .set_access_mode(self.effective_config.permissions.access_mode);
-    }
-
     fn apply_access_mode_owner(&mut self, access_mode: crate::config::AccessMode) {
         self.effective_config.permissions.access_mode = access_mode;
-        self.sync_live_access_mode();
         self.config_editor = ConfigEditorState::from_config(&self.effective_config);
     }
 
@@ -774,10 +784,10 @@ impl TuiController {
                 return Ok(());
             }
         };
+        self.cancel_pending_prompt_enhance();
         self.app = app;
         self.base_config = self.app.config.clone();
         self.effective_config = self.base_config.clone();
-        self.live_config = LiveConfigOverrides::new(self.effective_config.permissions.access_mode);
         self.root_run_lifecycle = TuiRootRunLifecycle::default();
         self.config_editor = ConfigEditorState::from_config(&self.effective_config);
         self.state = AppState::default();
@@ -828,15 +838,8 @@ impl TuiController {
     }
 
     fn open_path_in_file_manager(&mut self, path: &camino::Utf8Path) {
-        let mut command = if cfg!(target_os = "windows") {
-            ProcessCommand::new("explorer")
-        } else if cfg!(target_os = "macos") {
-            ProcessCommand::new("open")
-        } else {
-            ProcessCommand::new("xdg-open")
-        };
-        match command.arg(path.as_str()).spawn() {
-            Ok(_) => {
+        match open_path_with_platform_file_manager(path) {
+            Ok(()) => {
                 self.state.status_message = Some(format!("opened {} in file manager", path));
             }
             Err(error) => {
@@ -857,8 +860,20 @@ impl TuiController {
             );
             return Ok(());
         }
+        if self.pending_prompt_enhance.is_some() || self.state.prompt_review.is_some() {
+            self.state.status_message =
+                Some("prompt enhancement is already in progress or under review".to_string());
+            return Ok(());
+        }
         let request_id = self.next_enhance_request_id;
-        self.next_enhance_request_id += 1;
+        let Some(next_request_id) = request_id.checked_add(1) else {
+            self.state.status_message =
+                Some("prompt enhancement request generation is exhausted".to_string());
+            return Ok(());
+        };
+        self.next_enhance_request_id = next_request_id;
+        let cancellation = CancellationToken::new();
+        self.pending_prompt_enhance = Some((request_id, cancellation.clone()));
         self.state.begin_prompt_enhance(request_id, &raw_prompt);
         self.review_editor = build_composer();
         let runtime_tx = self.runtime_tx.clone();
@@ -869,7 +884,7 @@ impl TuiController {
                 .build()
                 .expect("failed to build prompt enhance runtime");
             let result = runtime.block_on(async move {
-                enhance_prompt(&config, &raw_prompt)
+                enhance_prompt(&config, &raw_prompt, cancellation)
                     .await
                     .map_err(|error| error.to_string())
             });
@@ -940,9 +955,7 @@ impl TuiController {
             continue_last: false,
             title: None,
             cwd: self.app.workspace.cwd.clone(),
-            model: self.effective_config.model.model.clone(),
-            base_url: self.effective_config.model.base_url.clone(),
-            config_override: Some(full_effective_override(&self.effective_config)),
+            config: RunConfigInput::Resolved(self.effective_config.clone()),
             output_mode: OutputMode::Human,
             show_reasoning_summary: true,
             prompt_dispatch: Some(prompt_dispatch.clone()),
@@ -950,7 +963,6 @@ impl TuiController {
             review_request,
             image_paths: Vec::new(),
             run_control,
-            live_config: Some(self.live_config.clone()),
             agent_confirmation: None,
             agent_context: None,
         };
@@ -985,6 +997,12 @@ impl TuiController {
                 let result = run_service
                     .execute(AppCommand::Run(request), &mut renderer, &mut prompt)
                     .await
+                    .and_then(|outcome| match outcome {
+                        AppCommandOutcome::Turn(summary) => Ok(summary),
+                        AppCommandOutcome::ControlCompleted => Err(AppRunError::Message(
+                            "an admitted TUI run completed as a control command".to_string(),
+                        )),
+                    })
                     .map_err(|error| error.to_string());
                 publish_tui_run_finished(&runtime_tx, run_generation, result);
             });
@@ -998,6 +1016,11 @@ impl TuiController {
                 Some("running session is not available for steer".to_string());
             return Ok(());
         };
+        if has_pending_steer_submission(&self.pending_composer_submissions) {
+            self.state.status_message =
+                Some("wait for the previous steer input to finish storing".to_string());
+            return Ok(());
+        }
         let submission_id = self.next_steer_submission_id;
         let Some(next_submission_id) = submission_id.checked_add(1) else {
             self.state.status_message =
@@ -1170,7 +1193,10 @@ impl TuiController {
     }
 
     async fn drain_runtime_messages(&mut self) -> Result<(), AppRunError> {
-        while let Ok(message) = self.runtime_rx.try_recv() {
+        for _ in 0..TUI_RUNTIME_DRAIN_BUDGET {
+            let Ok(message) = self.runtime_rx.try_recv() else {
+                break;
+            };
             match message {
                 RuntimeMessage::RunEvent {
                     root_run_generation,
@@ -1203,12 +1229,17 @@ impl TuiController {
                             if event_requires_plan_refresh(&event)
                                 && self.state.current_session_id == Some(session_id)
                             {
-                                let turn_items = self
+                                let snapshot = self
                                     .app
                                     .session_service
-                                    .canonical_turn_items(session_id)
+                                    .canonical_latest_session_snapshot(
+                                        session_id,
+                                        1,
+                                        crate::protocol::MAX_PROTOCOL_PAGE_LIMIT,
+                                    )
                                     .await?;
-                                self.state.refresh_plan_from_turn_items(&turn_items);
+                                self.state
+                                    .refresh_plan_from_turn_items(&snapshot.read.turns.items);
                             }
                             if self.state.route == Route::History
                                 && self
@@ -1304,29 +1335,35 @@ impl TuiController {
                             Some(format!("failed to store steer input: {message}"));
                     }
                 },
-                RuntimeMessage::EnhanceFinished { request_id, result } => match result {
-                    Ok(draft) => {
-                        if self.state.finish_prompt_enhance(request_id, draft.clone()) {
-                            self.review_editor = build_composer();
-                            self.review_editor.insert_str(&draft);
-                            self.state
-                                .update_prompt_review_draft(textarea_value(&self.review_editor));
+                RuntimeMessage::EnhanceFinished { request_id, result } => {
+                    if !self.finish_pending_prompt_enhance(request_id) {
+                        continue;
+                    }
+                    match result {
+                        Ok(draft) => {
+                            if self.state.finish_prompt_enhance(request_id, draft.clone()) {
+                                self.review_editor = build_composer();
+                                self.review_editor.insert_str(&draft);
+                                self.state.update_prompt_review_draft(textarea_value(
+                                    &self.review_editor,
+                                ));
+                            }
+                        }
+                        Err(message) => {
+                            if self
+                                .state
+                                .prompt_review
+                                .as_ref()
+                                .map(|review| review.request_id == request_id)
+                                .unwrap_or(false)
+                            {
+                                self.state.cancel_prompt_review();
+                                self.state.status_message =
+                                    Some(format!("prompt enhancement failed: {message}"));
+                            }
                         }
                     }
-                    Err(message) => {
-                        if self
-                            .state
-                            .prompt_review
-                            .as_ref()
-                            .map(|review| review.request_id == request_id)
-                            .unwrap_or(false)
-                        {
-                            self.state.cancel_prompt_review();
-                            self.state.status_message =
-                                Some(format!("prompt enhancement failed: {message}"));
-                        }
-                    }
-                },
+                }
             }
             self.discard_terminal_pending_permission();
         }
@@ -1353,10 +1390,35 @@ impl TuiController {
 
     async fn open_session(&mut self, session_id: SessionId) -> Result<(), AppRunError> {
         let read = session_view(&self.app.session_service, session_id).await?;
+        self.cancel_pending_prompt_enhance();
         self.apply_access_mode_owner(read.session.access_mode);
         self.state.load_turn_items(&read.session, &read.turns.items);
         self.state.modal = Modal::None;
         Ok(())
+    }
+
+    fn finish_pending_prompt_enhance(&mut self, request_id: u64) -> bool {
+        if self
+            .pending_prompt_enhance
+            .as_ref()
+            .is_none_or(|(active_request_id, _)| *active_request_id != request_id)
+        {
+            return false;
+        }
+        self.pending_prompt_enhance = None;
+        true
+    }
+
+    fn cancel_pending_prompt_enhance(&mut self) {
+        if let Some((_, cancellation)) = self.pending_prompt_enhance.take() {
+            cancellation.cancel();
+        }
+        self.state.cancel_prompt_review();
+    }
+
+    fn quit_after_cancelling_prompt_enhance(&mut self) {
+        self.cancel_pending_prompt_enhance();
+        self.should_quit = true;
     }
 
     async fn open_or_rejoin_selected_history_session(&mut self) -> Result<(), AppRunError> {
@@ -1398,14 +1460,16 @@ impl TuiController {
     }
 
     async fn rejoin_session(&mut self, session_id: SessionId) -> Result<(), AppRunError> {
-        let rejoin = self
-            .app
+        // Rejoin first validates the durable active-turn owner with a minimal bounded read, then
+        // hydrates the latest TUI page before live runtime events continue as deltas.
+        self.app
             .session_service
-            .rejoin_running_session(session_id, 0, 200, 0, 500)
+            .rejoin_running_session(session_id, 0, 1, 0, 1)
             .await?;
-        self.apply_access_mode_owner(rejoin.read.session.access_mode);
-        self.state
-            .load_turn_items(&rejoin.read.session, &rejoin.read.turns.items);
+        let read = session_view(&self.app.session_service, session_id).await?;
+        self.cancel_pending_prompt_enhance();
+        self.apply_access_mode_owner(read.session.access_mode);
+        self.state.load_turn_items(&read.session, &read.turns.items);
         self.state.status_message = Some(format!("rejoined running session {session_id}"));
         self.state.modal = Modal::None;
         Ok(())
@@ -1421,11 +1485,7 @@ impl TuiController {
             self.state.status_message = Some("select or open a session first".to_string());
             return Ok(());
         };
-        let read = self
-            .app
-            .session_service
-            .canonical_session_read(session_id, 0, usize::MAX, 0, usize::MAX)
-            .await?;
+        let read = canonical_markdown_export_read(&self.app.session_service, session_id).await?;
         if read.history.items.is_empty() {
             self.state.status_message = Some("session has no history to export".to_string());
             return Ok(());
@@ -1621,7 +1681,6 @@ impl TuiController {
         self.base_config = ConfigLoader::load(&self.app.workspace.root, None)
             .map_err(|error| AppRunError::Message(format!("failed to reload config: {error}")))?;
         self.effective_config = self.base_config.clone();
-        self.sync_live_access_mode();
         self.config_editor = ConfigEditorState::from_config(&self.effective_config);
         Ok(())
     }
@@ -2241,6 +2300,14 @@ impl TuiController {
     }
 }
 
+impl Drop for TuiController {
+    fn drop(&mut self) {
+        if let Some((_, cancellation)) = self.pending_prompt_enhance.take() {
+            cancellation.cancel();
+        }
+    }
+}
+
 #[derive(Debug)]
 enum RuntimeMessage {
     RunEvent {
@@ -2285,7 +2352,6 @@ fn live_event_requires_canonical_refresh(event: &RunEvent) -> bool {
             | RunEvent::CompactionCompleted { .. }
             | RunEvent::PermissionRequested { .. }
             | RunEvent::PermissionResolved { .. }
-            | RunEvent::RetryScheduled { .. }
             | RunEvent::RecoverableRuntimeFeedback { .. }
     )
 }
@@ -2301,7 +2367,7 @@ fn event_requires_plan_refresh(event: &RunEvent) -> bool {
 }
 
 struct TuiRenderer {
-    tx: tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
+    tx: mpsc::SyncSender<RuntimeMessage>,
     root_run_generation: Option<u64>,
 }
 
@@ -2375,7 +2441,7 @@ impl EventRenderer for TuiRenderer {
 }
 
 fn publish_tui_run_finished(
-    tx: &tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
+    tx: &mpsc::SyncSender<RuntimeMessage>,
     run_generation: u64,
     result: Result<RunSummary, String>,
 ) {
@@ -2404,7 +2470,7 @@ fn tui_run_status_for_session_status(status: SessionStatus) -> RunStatus {
 }
 
 struct TuiConfirmationPrompt {
-    tx: tokio::sync::mpsc::UnboundedSender<RuntimeMessage>,
+    tx: mpsc::SyncSender<RuntimeMessage>,
     next_permission_request_id: Arc<AtomicU64>,
 }
 
@@ -2503,6 +2569,92 @@ fn clear_cancelled_tui_permission(
     true
 }
 
+#[cfg(target_os = "windows")]
+fn open_path_with_platform_file_manager(path: &camino::Utf8Path) -> io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show_command: i32,
+        ) -> *mut c_void;
+    }
+
+    fn wide_null(value: &std::ffi::OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let operation = wide_null(std::ffi::OsStr::new("open"));
+    let file = wide_null(path.as_std_path().as_os_str());
+    let result = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            null(),
+            null(),
+            1,
+        )
+    } as isize;
+    if result > 32 {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "Windows ShellExecuteW failed with code {result}"
+        )))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_path_with_platform_file_manager(path: &camino::Utf8Path) -> io::Result<()> {
+    spawn_reaped_file_manager("/usr/bin/open", path)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_path_with_platform_file_manager(path: &camino::Utf8Path) -> io::Result<()> {
+    let executable = ["/usr/bin/xdg-open", "/bin/xdg-open"]
+        .into_iter()
+        .find(|candidate| std::path::Path::new(candidate).is_file())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "xdg-open was not found"))?;
+    spawn_reaped_file_manager(executable, path)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn open_path_with_platform_file_manager(_path: &camino::Utf8Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no trusted file manager launcher is available on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn spawn_reaped_file_manager(executable: &str, path: &camino::Utf8Path) -> io::Result<()> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<std::process::Child>(1);
+    std::thread::Builder::new()
+        .name("moyai-file-manager-reaper".to_string())
+        .spawn(move || {
+            if let Ok(mut child) = receiver.recv() {
+                let _ = child.wait();
+            }
+        })?;
+    let child = std::process::Command::new(executable)
+        .arg(path.as_str())
+        .spawn()?;
+    sender.send(child).map_err(|error| {
+        let mut child = error.0;
+        let _ = child.kill();
+        let _ = child.wait();
+        io::Error::new(io::ErrorKind::BrokenPipe, "file manager reaper exited")
+    })
+}
+
 fn setup_terminal() -> io::Result<TerminalHandle> {
     setup_terminal_resources(
         enable_raw_mode,
@@ -2543,9 +2695,24 @@ fn setup_terminal_resources<T>(
 }
 
 fn restore_terminal(terminal: &mut TerminalHandle) -> io::Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()
+    restore_terminal_resources(
+        terminal,
+        disable_raw_mode,
+        |terminal| execute!(terminal.backend_mut(), LeaveAlternateScreen),
+        |terminal| terminal.show_cursor(),
+    )
+}
+
+fn restore_terminal_resources<T>(
+    terminal: &mut T,
+    disable_raw: impl FnOnce() -> io::Result<()>,
+    leave_alternate: impl FnOnce(&mut T) -> io::Result<()>,
+    show_cursor: impl FnOnce(&mut T) -> io::Result<()>,
+) -> io::Result<()> {
+    let disable_result = disable_raw();
+    let leave_result = leave_alternate(terminal);
+    let cursor_result = show_cursor(terminal);
+    disable_result.and(leave_result).and(cursor_result)
 }
 
 fn build_composer() -> TextArea<'static> {
@@ -2991,10 +3158,7 @@ mod key_tests {
     }
 
     fn tui_run_config(controller: &TuiController) -> ResolvedConfig {
-        apply_config_patch(
-            controller.base_config.clone(),
-            full_effective_override(&controller.effective_config),
-        )
+        controller.effective_config.clone()
     }
 
     fn append_tui_user_history(controller: &TuiController, session_id: SessionId, text: &str) {
@@ -3005,7 +3169,9 @@ mod key_tests {
             .seed_history_item_for_test(&crate::protocol::HistoryItem {
                 id: crate::protocol::HistoryItemId::new(),
                 session_id,
-                turn_id: crate::protocol::TurnId::new(),
+                scope: crate::protocol::HistoryScope::Turn {
+                    turn_id: crate::protocol::TurnId::new(),
+                },
                 sequence_no: 1,
                 created_at_ms: 1,
                 payload: crate::protocol::HistoryItemPayload::UserTurn {
@@ -3033,29 +3199,26 @@ mod key_tests {
     }
 
     fn completed_tui_summary(session_id: SessionId) -> RunSummary {
-        RunSummary {
+        RunSummary::from_terminal(
             session_id,
-            turn_id: None,
-            final_response_id: None,
-            status: SessionStatus::Completed,
-            finish_reason: Some(crate::session::FinishReason::Stop),
-            interruption_cause: None,
-            tool_call_count: 0,
-            failed_tool_count: 0,
-            change_count: 0,
-            metrics: Default::default(),
-        }
+            crate::protocol::TurnId::new(),
+            crate::session::DurableTurnTerminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                final_response_id: None,
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            },
+        )
     }
 
     fn completed_turn_event(session_id: SessionId) -> RunEvent {
         RunEvent::TurnTerminal {
             session_id,
             terminal: Box::new(crate::session::DurableTurnTerminal {
-                status: crate::protocol::TurnTerminalStatus::Completed,
-                finish_reason: Some(crate::session::FinishReason::Stop),
-                interruption_cause: None,
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
                 final_response_id: None,
-                summary: "run completed".to_string(),
                 tool_call_count: 0,
                 failed_tool_count: 0,
                 change_count: 0,
@@ -3078,16 +3241,14 @@ mod key_tests {
         }
     }
 
-    fn recv_tui_runtime_message(
-        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<RuntimeMessage>,
-    ) -> RuntimeMessage {
+    fn recv_tui_runtime_message(receiver: &mpsc::Receiver<RuntimeMessage>) -> RuntimeMessage {
         for _ in 0..200 {
             match receiver.try_recv() {
                 Ok(message) => return message,
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                Err(mpsc::TryRecvError::Empty) => {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                Err(mpsc::TryRecvError::Disconnected) => {
                     panic!("TUI runtime channel disconnected")
                 }
             }
@@ -3099,6 +3260,73 @@ mod key_tests {
     fn running_session_accepts_ctrl_enter_for_steer() {
         assert!(ctrl_enter_available(Route::Session, RunStatus::Running));
         assert!(!ctrl_enter_available(Route::History, RunStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn ctrl_q_cancels_the_enhance_provider_request_before_quitting() {
+        let (_temp, mut controller, _session_id) =
+            tui_controller_with_session("enhance-ctrl-q-cancellation").await;
+        controller.composer.insert_str("keep this raw prompt");
+        let request_id = 41;
+        let cancellation = CancellationToken::new();
+        controller.pending_prompt_enhance = Some((request_id, cancellation.clone()));
+        controller
+            .state
+            .begin_prompt_enhance(request_id, "keep this raw prompt");
+
+        controller
+            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+            .await
+            .expect("Ctrl+Q while enhancing");
+
+        assert!(cancellation.is_cancelled());
+        assert!(controller.pending_prompt_enhance.is_none());
+        assert!(controller.state.prompt_review.is_none());
+        assert_eq!(controller.state.modal, Modal::None);
+        assert!(controller.should_quit);
+        assert_eq!(textarea_value(&controller.composer), "keep this raw prompt");
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::EnhanceFinished {
+                request_id,
+                result: Ok("stale enhanced prompt".to_string()),
+            })
+            .expect("stale enhance completion");
+        controller
+            .drain_runtime_messages()
+            .await
+            .expect("ignore stale enhance completion");
+        assert!(controller.state.prompt_review.is_none());
+    }
+
+    #[tokio::test]
+    async fn escape_cancels_prompt_enhance_but_keeps_the_tui_running() {
+        let (_temp, mut controller, _session_id) =
+            tui_controller_with_session("enhance-escape-cancellation").await;
+        controller.composer.insert_str("keep this raw prompt");
+        let request_id = 42;
+        let cancellation = CancellationToken::new();
+        controller.pending_prompt_enhance = Some((request_id, cancellation.clone()));
+        controller
+            .state
+            .begin_prompt_enhance(request_id, "keep this raw prompt");
+
+        controller
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .expect("Escape while enhancing");
+
+        assert!(cancellation.is_cancelled());
+        assert!(controller.pending_prompt_enhance.is_none());
+        assert!(controller.state.prompt_review.is_none());
+        assert_eq!(controller.state.modal, Modal::None);
+        assert!(!controller.should_quit);
+        assert_eq!(textarea_value(&controller.composer), "keep this raw prompt");
+        assert_eq!(
+            controller.state.status_message.as_deref(),
+            Some("cancelled prompt enhancement")
+        );
     }
 
     #[tokio::test]
@@ -3575,13 +3803,17 @@ mod key_tests {
             .expect("root admission")
             .expect("root admitted");
         append_tui_user_history(&controller, root_session_id, "run detached work");
+        let root_target = repository
+            .captured_running_terminal_target(root_session_id)
+            .await
+            .expect("capture root target")
+            .expect("root running target");
         assert!(
             repository
-                .terminalize_active_session_with_protocol_event(
+                .terminalize_captured_running_session_with_protocol_event(
                     root_session_id,
                     &completed_turn_event(root_session_id),
-                    root_turn,
-                    None,
+                    root_target,
                 )
                 .await
                 .expect("complete root")
@@ -3602,8 +3834,8 @@ mod key_tests {
                 root_session_id,
                 root_session_id,
                 child.id,
-                "/root/durable-child",
-                "durable-child",
+                "/root/durable_child",
+                "durable_child",
             )
             .await
             .expect("spawn edge");
@@ -3642,29 +3874,15 @@ mod key_tests {
 
     #[test]
     fn tui_renderer_defers_root_completion_until_worker_settlement() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::sync_channel(TUI_RUNTIME_MAILBOX_CAPACITY);
         let mut renderer = TuiRenderer {
             tx: tx.clone(),
             root_run_generation: None,
         };
-        let summary = RunSummary {
-            session_id: SessionId::new(),
-            turn_id: None,
-            final_response_id: None,
-            status: crate::session::SessionStatus::Completed,
-            finish_reason: Some(crate::session::FinishReason::Stop),
-            interruption_cause: None,
-            tool_call_count: 0,
-            failed_tool_count: 0,
-            change_count: 0,
-            metrics: Default::default(),
-        };
+        let summary = completed_tui_summary(SessionId::new());
 
         renderer.finish(&summary).expect("renderer finish");
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-        ));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
 
         publish_tui_run_finished(&tx, 9, Ok(summary.clone()));
         assert!(matches!(
@@ -3672,7 +3890,7 @@ mod key_tests {
             RuntimeMessage::Finished {
                 run_generation: 9,
                 result: Ok(received),
-            } if received.session_id == summary.session_id
+            } if received.session_id() == summary.session_id()
         ));
     }
 
@@ -3739,7 +3957,7 @@ mod key_tests {
 
     #[test]
     fn cancelled_tui_permission_clears_by_id_and_advances_broker() {
-        let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (runtime_tx, runtime_rx) = mpsc::sync_channel(TUI_RUNTIME_MAILBOX_CAPACITY);
         let broker = SharedConfirmationPrompt::new(TuiConfirmationPrompt {
             tx: runtime_tx,
             next_permission_request_id: Arc::new(AtomicU64::new(11)),
@@ -3755,7 +3973,7 @@ mod key_tests {
             let _ = first_done_tx.send(result);
         });
         let (first_id, first_response, first_request_control) =
-            match recv_tui_runtime_message(&mut runtime_rx) {
+            match recv_tui_runtime_message(&runtime_rx) {
                 RuntimeMessage::Permission {
                     confirmation_id,
                     response,
@@ -3765,7 +3983,7 @@ mod key_tests {
                 _ => panic!("expected first TUI permission"),
             };
         first_control.interrupt(TurnInterruptionCause::UserStop);
-        match recv_tui_runtime_message(&mut runtime_rx) {
+        match recv_tui_runtime_message(&runtime_rx) {
             RuntimeMessage::PermissionCancelled { confirmation_id } => {
                 assert_eq!(confirmation_id, first_id)
             }
@@ -3799,7 +4017,7 @@ mod key_tests {
             let result = second_prompt.confirm(&test_tui_permission("second"));
             let _ = second_done_tx.send(result);
         });
-        let (second_id, second_response) = match recv_tui_runtime_message(&mut runtime_rx) {
+        let (second_id, second_response) = match recv_tui_runtime_message(&runtime_rx) {
             RuntimeMessage::Permission {
                 confirmation_id,
                 response,
@@ -3822,7 +4040,7 @@ mod key_tests {
 
     #[test]
     fn tui_permission_abort_is_ticket_local_and_loses_to_existing_cause() {
-        let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (runtime_tx, runtime_rx) = mpsc::sync_channel(TUI_RUNTIME_MAILBOX_CAPACITY);
         let mut prompt = TuiConfirmationPrompt {
             tx: runtime_tx,
             next_permission_request_id: Arc::new(AtomicU64::new(31)),
@@ -3834,7 +4052,7 @@ mod key_tests {
             let result = prompt.confirm_with_control(&test_tui_permission("abort"), &control);
             let _ = done_tx.send(result);
         });
-        let response = match recv_tui_runtime_message(&mut runtime_rx) {
+        let response = match recv_tui_runtime_message(&runtime_rx) {
             RuntimeMessage::Permission { response, .. } => response,
             _ => panic!("expected TUI permission"),
         };
@@ -3850,7 +4068,7 @@ mod key_tests {
         );
         assert_eq!(observer.cause(), None);
 
-        let (runtime_tx, mut runtime_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (runtime_tx, runtime_rx) = mpsc::sync_channel(TUI_RUNTIME_MAILBOX_CAPACITY);
         let mut prompt = TuiConfirmationPrompt {
             tx: runtime_tx,
             next_permission_request_id: Arc::new(AtomicU64::new(41)),
@@ -3864,7 +4082,7 @@ mod key_tests {
                 .confirm_with_control(&test_tui_permission("competing abort"), &worker_control);
             let _ = done_tx.send(result);
         });
-        let response = match recv_tui_runtime_message(&mut runtime_rx) {
+        let response = match recv_tui_runtime_message(&runtime_rx) {
             RuntimeMessage::Permission { response, .. } => response,
             _ => panic!("expected competing TUI permission"),
         };
@@ -3888,7 +4106,7 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn f2_session_apply_persists_access_before_committing_effective_and_live_state() {
+    async fn f2_session_apply_persists_access_before_committing_next_turn_config() {
         use crate::session::SessionRepository as _;
 
         let (_temp, mut controller, session_id) =
@@ -3902,10 +4120,6 @@ mod key_tests {
 
         assert_eq!(
             controller.effective_config.permissions.access_mode,
-            crate::config::AccessMode::FullAccess
-        );
-        assert_eq!(
-            controller.live_config.access_mode(),
             crate::config::AccessMode::FullAccess
         );
         assert_eq!(
@@ -3968,7 +4182,6 @@ mod key_tests {
             controller.effective_config.permissions.access_mode,
             global_access_mode
         );
-        assert_eq!(controller.live_config.access_mode(), global_access_mode);
         assert_eq!(
             tui_access_mode_field(&controller),
             global_access_mode.as_str()
@@ -4022,7 +4235,6 @@ mod key_tests {
             controller.effective_config.permissions.access_mode,
             session_access_mode
         );
-        assert_eq!(controller.live_config.access_mode(), session_access_mode);
         assert_eq!(
             tui_access_mode_field(&controller),
             session_access_mode.as_str()
@@ -4045,7 +4257,7 @@ mod key_tests {
             tui_controller_with_session("rejoin-access-session-a").await;
         let global_access_mode = crate::config::AccessMode::Default;
         let session_a_access_mode = crate::config::AccessMode::FullAccess;
-        let session_b_access_mode = crate::config::AccessMode::AutoReview;
+        let session_b_access_mode = crate::config::AccessMode::Default;
         controller.app.config.permissions.access_mode = global_access_mode;
         controller.base_config.permissions.access_mode = global_access_mode;
         controller
@@ -4078,30 +4290,28 @@ mod key_tests {
             .await
             .expect("session B");
         let turn_id = crate::protocol::TurnId::new();
-        controller
-            .app
-            .store
-            .protocol_event_store()
-            .seed_history_item_for_test(&crate::protocol::HistoryItem {
-                id: crate::protocol::HistoryItemId::new(),
-                session_id: session_b.id,
-                turn_id,
-                sequence_no: 1,
-                created_at_ms: 1,
-                payload: crate::protocol::HistoryItemPayload::UserTurn {
-                    content: vec![crate::protocol::ContentPart::Text {
+        let admission = repository
+            .admit_session_turn(session_b.id, turn_id)
+            .await
+            .expect("session B admission")
+            .expect("session B admitted");
+        repository
+            .append_user_turn_with_protocol_bundle(
+                session_b.id,
+                admission.admission_id,
+                &crate::protocol::UserTurn {
+                    turn_id,
+                    items: vec![crate::protocol::UserInputItem::Text {
                         text: "active session B context".to_string(),
                     }],
                     prompt_dispatch: None,
                     editor_context: None,
                 },
-            })
-            .expect("session B history");
-        repository
-            .admit_session_turn(session_b.id, turn_id)
+                turn_id,
+                0,
+            )
             .await
-            .expect("session B admission")
-            .expect("session B admitted");
+            .expect("session B history");
 
         controller
             .rejoin_session(session_b.id)
@@ -4113,7 +4323,6 @@ mod key_tests {
             controller.effective_config.permissions.access_mode,
             session_b_access_mode
         );
-        assert_eq!(controller.live_config.access_mode(), session_b_access_mode);
         assert_eq!(
             tui_access_mode_field(&controller),
             session_b_access_mode.as_str()
@@ -4181,7 +4390,9 @@ mod key_tests {
             .seed_history_item_for_test(&crate::protocol::HistoryItem {
                 id: crate::protocol::HistoryItemId::new(),
                 session_id: child.id,
-                turn_id: crate::protocol::TurnId::new(),
+                scope: crate::protocol::HistoryScope::Turn {
+                    turn_id: crate::protocol::TurnId::new(),
+                },
                 sequence_no: 1,
                 created_at_ms: 1,
                 payload: crate::protocol::HistoryItemPayload::UserTurn {
@@ -4213,18 +4424,9 @@ mod key_tests {
             controller.effective_config.permissions.access_mode,
             crate::config::AccessMode::Default
         );
-        assert_eq!(
-            controller.live_config.access_mode(),
-            crate::config::AccessMode::Default
-        );
-
         controller.toggle_access_mode().await.expect("F8 rejection");
         assert_eq!(
             controller.effective_config.permissions.access_mode,
-            crate::config::AccessMode::Default
-        );
-        assert_eq!(
-            controller.live_config.access_mode(),
             crate::config::AccessMode::Default
         );
         assert_eq!(
@@ -4245,16 +4447,14 @@ mod key_tests {
     }
 
     #[test]
-    fn f2_session_apply_keeps_effective_and_live_state_when_persistence_fails() {
+    fn f2_session_apply_keeps_next_turn_config_when_persistence_fails() {
         let mut effective = ResolvedConfig::default();
         effective.permissions.access_mode = crate::config::AccessMode::Default;
-        let live = LiveConfigOverrides::new(crate::config::AccessMode::Default);
         let mut candidate = effective.clone();
         candidate.permissions.access_mode = crate::config::AccessMode::FullAccess;
 
         assert!(!commit_tui_effective_config(
             &mut effective,
-            &live,
             candidate,
             false,
         ));
@@ -4262,7 +4462,26 @@ mod key_tests {
             effective.permissions.access_mode,
             crate::config::AccessMode::Default
         );
-        assert_eq!(live.access_mode(), crate::config::AccessMode::Default);
+    }
+
+    #[test]
+    fn active_turn_steer_submission_is_single_flight() {
+        let submissions = vec![PendingComposerSubmission {
+            id: PendingComposerSubmissionId::Steer(7),
+            session_id: Some(SessionId::new()),
+            draft_revision: 3,
+            draft_text: "steer".to_string(),
+        }];
+
+        assert!(has_pending_steer_submission(&submissions));
+        assert!(!has_pending_steer_submission(&[
+            PendingComposerSubmission {
+                id: PendingComposerSubmissionId::RootRun(7),
+                session_id: None,
+                draft_revision: 3,
+                draft_text: "root".to_string(),
+            }
+        ]));
     }
 
     #[test]
@@ -4334,6 +4553,37 @@ mod key_tests {
         assert_eq!(
             events.into_inner(),
             vec!["enable_raw", "enter_alt", "leave_alt", "disable_raw"]
+        );
+    }
+
+    #[test]
+    fn terminal_restore_attempts_every_resource_after_an_earlier_failure() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let result = restore_terminal_resources(
+            &mut (),
+            || {
+                events.borrow_mut().push("disable_raw");
+                Err(io::Error::other("disable failed"))
+            },
+            |_| {
+                events.borrow_mut().push("leave_alt");
+                Err(io::Error::other("leave failed"))
+            },
+            |_| {
+                events.borrow_mut().push("show_cursor");
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            result
+                .expect_err("first cleanup error must be returned")
+                .to_string(),
+            "disable failed"
+        );
+        assert_eq!(
+            events.into_inner(),
+            vec!["disable_raw", "leave_alt", "show_cursor"]
         );
     }
 }

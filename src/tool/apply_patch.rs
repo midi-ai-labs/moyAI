@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::edit::{
-    FileContentIdentity, FormatterExecutionOptions, PatchChunk, PatchOperation, PatchParser,
+    FileContentIdentity, FormatterExecutionOptions, PatchOperation, PatchParser,
     path_for_change_storage,
 };
 use crate::error::ToolError;
@@ -14,7 +14,8 @@ use crate::session::ChangeRepository;
 use crate::tool::context::{ToolContext, ToolEffectAdmission};
 use crate::tool::registry::Tool;
 use crate::tool::write_support::{
-    read_text_file_with_identity, to_summary, write_text_file, write_text_file_noclobber,
+    delete_file_conditionally, read_text_file_with_identity, to_summary,
+    write_text_file_conditionally,
 };
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
 use crate::workspace::{AccessKind, GuardedPath, PathGuard, is_protected_workspace_authority_path};
@@ -99,7 +100,7 @@ async fn execute_admitted_patch_operations(
         output_text: commit
             .summaries
             .iter()
-            .map(|summary| summary.tool_feedback_text(Some(&ctx.workspace.root)))
+            .map(|summary| summary.summary_line(Some(&ctx.workspace.root)))
             .collect::<Vec<_>>()
             .join("\n"),
         metadata: json!({
@@ -108,12 +109,12 @@ async fn execute_admitted_patch_operations(
                 "kind": summary.kind,
                 "path_before": summary.path_before,
                 "path_after": summary.path_after
-            })).collect::<Vec<_>>(),
-            "diff_text": commit.changes.iter().map(|change| change.diff_text.clone()).collect::<Vec<_>>().join("\n")
+            })).collect::<Vec<_>>()
         }),
         truncated_output_path: None,
         recorded_changes: change_ids,
         change_summaries: commit.summaries.clone(),
+        _internal_file_lease: None,
     })
 }
 
@@ -239,13 +240,14 @@ async fn commit_admitted_patch(
 
     ctx.run_mutation_fence.assert_owned().await?;
     let _effect_commit = ctx.run_mutation_fence.begin_effect_commit()?;
-    let applied_count = match apply_patch_mutations(&ctx.services.edit_safety, &commit.mutations) {
-        Ok(value) => value,
-        Err((error, applied_count)) => {
-            rollback_patch_commit(&commit.mutations, applied_count, None)?;
-            return Err(error);
-        }
-    };
+    let applied =
+        match apply_patch_mutations(&ctx.services.edit_safety, &commit.mutations, ctx.workspace) {
+            Ok(value) => value,
+            Err((error, applied)) => {
+                rollback_patch_commit(&commit.mutations, &applied, ctx.workspace, None)?;
+                return Err(error);
+            }
+        };
 
     if let Err(error) = ctx.services.edit_safety.sync_file_mutations(
         session_id,
@@ -254,7 +256,8 @@ async fn commit_admitted_patch(
     ) {
         rollback_patch_commit(
             &commit.mutations,
-            applied_count,
+            &applied,
+            ctx.workspace,
             Some((&ctx.services.edit_safety, session_id, &baseline_snapshot)),
         )?;
         return Err(ToolError::from(error));
@@ -263,7 +266,8 @@ async fn commit_admitted_patch(
     if let Err(error) = ctx.run_mutation_fence.assert_owned().await {
         rollback_patch_commit(
             &commit.mutations,
-            applied_count,
+            &applied,
+            ctx.workspace,
             Some((&ctx.services.edit_safety, session_id, &baseline_snapshot)),
         )?;
         return Err(error);
@@ -280,7 +284,8 @@ async fn commit_admitted_patch(
         Err(error) => {
             rollback_patch_commit(
                 &commit.mutations,
-                applied_count,
+                &applied,
+                ctx.workspace,
                 Some((&ctx.services.edit_safety, session_id, &baseline_snapshot)),
             )?;
             Err(ToolError::from(error))
@@ -345,24 +350,43 @@ enum FileRollbackState {
     Present(String),
 }
 
+#[derive(Debug)]
+enum CommittedFileState {
+    Absent,
+    Present(FileContentIdentity),
+}
+
+#[derive(Debug)]
+struct AppliedPatchMutation {
+    mutation_index: usize,
+    committed_state: CommittedFileState,
+}
+
 fn apply_patch_mutations(
     edit_safety: &crate::edit::EditSafety,
     mutations: &[PatchMutation],
-) -> Result<usize, (ToolError, usize)> {
+    workspace: &crate::workspace::Workspace,
+) -> Result<Vec<AppliedPatchMutation>, (ToolError, Vec<AppliedPatchMutation>)> {
     if let Err(error) = validate_patch_mutation_preconditions(edit_safety, mutations) {
-        return Err((error, 0));
+        return Err((error, Vec::new()));
     }
-    let mut applied_count = 0;
-    for mutation in mutations {
-        if let Err(error) = apply_patch_mutation(mutation) {
-            return Err((error, applied_count));
+    let mut applied = Vec::with_capacity(mutations.len());
+    for (mutation_index, mutation) in mutations.iter().enumerate() {
+        match apply_patch_mutation(mutation, workspace) {
+            Ok(committed_state) => applied.push(AppliedPatchMutation {
+                mutation_index,
+                committed_state,
+            }),
+            Err(error) => return Err((error, applied)),
         }
-        applied_count += 1;
     }
-    Ok(applied_count)
+    Ok(applied)
 }
 
-fn apply_patch_mutation(mutation: &PatchMutation) -> Result<(), ToolError> {
+fn apply_patch_mutation(
+    mutation: &PatchMutation,
+    workspace: &crate::workspace::Workspace,
+) -> Result<CommittedFileState, ToolError> {
     match mutation {
         PatchMutation::Write {
             path,
@@ -370,20 +394,27 @@ fn apply_patch_mutation(mutation: &PatchMutation) -> Result<(), ToolError> {
             expected_identity,
             ..
         } => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            if expected_identity.is_some() {
-                write_text_file(path, text)?;
-            } else {
-                write_text_file_noclobber(path, text)?;
-            }
+            let guarded = PathGuard::require_path(workspace, path, AccessKind::Edit)?;
+            PathGuard::revalidate(&guarded)?;
+            let identity = write_text_file_conditionally(
+                &guarded,
+                text,
+                expected_identity.as_ref(),
+                |file| validate_patch_temporary_file(&guarded, file),
+            )?;
+            Ok(CommittedFileState::Present(identity))
         }
-        PatchMutation::Delete { path, .. } => {
-            fs::remove_file(path)?;
+        PatchMutation::Delete {
+            path,
+            expected_identity,
+            ..
+        } => {
+            let guarded = PathGuard::require_path(workspace, path, AccessKind::Edit)?;
+            PathGuard::revalidate(&guarded)?;
+            delete_file_conditionally(&guarded, expected_identity)?;
+            Ok(CommittedFileState::Absent)
         }
     }
-    Ok(())
 }
 
 fn validate_patch_mutation_preconditions(
@@ -409,7 +440,8 @@ fn validate_patch_mutation_preconditions(
 
 fn rollback_patch_commit(
     mutations: &[PatchMutation],
-    applied_count: usize,
+    applied: &[AppliedPatchMutation],
+    workspace: &crate::workspace::Workspace,
     baseline_snapshot: Option<(
         &crate::edit::EditSafety,
         crate::session::SessionId,
@@ -417,12 +449,17 @@ fn rollback_patch_commit(
     )>,
 ) -> Result<(), ToolError> {
     let mut rollback_errors = Vec::new();
-    for mutation in mutations.iter().take(applied_count).rev() {
-        if let Err(error) = rollback_patch_mutation(mutation) {
+    for applied_mutation in applied.iter().rev() {
+        let mutation = &mutations[applied_mutation.mutation_index];
+        if let Err(error) =
+            rollback_patch_mutation(mutation, &applied_mutation.committed_state, workspace)
+        {
             rollback_errors.push(error.to_string());
         }
     }
-    if let Some((edit_safety, session_id, snapshot)) = baseline_snapshot {
+    if rollback_errors.is_empty()
+        && let Some((edit_safety, session_id, snapshot)) = baseline_snapshot
+    {
         if let Err(error) = edit_safety.restore_path_stamps(session_id, snapshot) {
             rollback_errors.push(error.to_string());
         }
@@ -430,35 +467,99 @@ fn rollback_patch_commit(
     if rollback_errors.is_empty() {
         Ok(())
     } else {
-        Err(ToolError::from(crate::error::EditError::Message(format!(
-            "apply_patch atomic commit rollback failed: {}",
-            rollback_errors.join("; ")
-        ))))
+        Err(ToolError::from(crate::error::EditError::RollbackFailed {
+            operation: "apply_patch atomic commit".to_string(),
+            details: rollback_errors.join("; "),
+        }))
     }
 }
 
-fn rollback_patch_mutation(mutation: &PatchMutation) -> Result<(), ToolError> {
+fn rollback_patch_mutation(
+    mutation: &PatchMutation,
+    committed_state: &CommittedFileState,
+    workspace: &crate::workspace::Workspace,
+) -> Result<(), ToolError> {
     match mutation {
         PatchMutation::Write { path, rollback, .. }
-        | PatchMutation::Delete { path, rollback, .. } => restore_file_state(path, rollback),
+        | PatchMutation::Delete { path, rollback, .. } => {
+            restore_file_state(path, rollback, committed_state, workspace)
+        }
     }
 }
 
-fn restore_file_state(path: &Utf8Path, state: &FileRollbackState) -> Result<(), ToolError> {
+fn restore_file_state(
+    path: &Utf8Path,
+    state: &FileRollbackState,
+    committed_state: &CommittedFileState,
+    workspace: &crate::workspace::Workspace,
+) -> Result<(), ToolError> {
+    let guarded = PathGuard::require_path(workspace, path, AccessKind::Edit)?;
+    PathGuard::revalidate(&guarded)?;
+    let unchanged = match committed_state {
+        CommittedFileState::Present(identity) => crate::edit::EditSafety::default()
+            .assert_path_unchanged(path, Some(identity))
+            .is_ok(),
+        CommittedFileState::Absent => matches!(
+            fs::symlink_metadata(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        ),
+    };
+    if !unchanged {
+        return Err(ToolError::from(crate::error::EditError::RollbackConflict {
+            path: path.to_path_buf(),
+        }));
+    }
     match state {
         FileRollbackState::Absent => {
-            if path.exists() {
-                fs::remove_file(path)?;
-            }
+            let CommittedFileState::Present(identity) = committed_state else {
+                return Ok(());
+            };
+            delete_file_conditionally(&guarded, identity)
+                .map_err(|error| rollback_conflict(path, error))?;
         }
         FileRollbackState::Present(text) => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            write_text_file(path, text)?;
+            let expected_identity = match committed_state {
+                CommittedFileState::Present(identity) => Some(identity),
+                CommittedFileState::Absent => None,
+            };
+            write_text_file_conditionally(&guarded, text, expected_identity, |file| {
+                validate_patch_temporary_file(&guarded, file)
+            })
+            .map_err(|error| rollback_conflict(path, error))?;
         }
     }
     Ok(())
+}
+
+fn rollback_conflict(path: &Utf8Path, error: crate::error::EditError) -> ToolError {
+    match error {
+        crate::error::EditError::CommitConflictPreserved { preserved_path, .. } => {
+            ToolError::from(crate::error::EditError::RollbackConflictPreserved {
+                path: path.to_path_buf(),
+                preserved_path,
+            })
+        }
+        crate::error::EditError::CommitConflict { .. } => {
+            ToolError::from(crate::error::EditError::RollbackConflict {
+                path: path.to_path_buf(),
+            })
+        }
+        crate::error::EditError::PartialCommit { preserved_path, .. } => {
+            ToolError::from(crate::error::EditError::RollbackConflictPreserved {
+                path: path.to_path_buf(),
+                preserved_path,
+            })
+        }
+        other => ToolError::from(other),
+    }
+}
+
+fn validate_patch_temporary_file(
+    guarded: &GuardedPath,
+    file: &std::fs::File,
+) -> Result<(), crate::error::EditError> {
+    PathGuard::validate_open_file_within_boundary(guarded, file)
+        .map_err(|error| crate::error::EditError::Message(error.to_string()))
 }
 
 #[derive(Debug, Default)]
@@ -555,11 +656,6 @@ async fn classify_patch_operations_before_side_effects(
                 {
                     no_content_path.get_or_insert(destination);
                     continue;
-                }
-                if let Some(message) =
-                    suspicious_full_rewrite_message(&original, &formatted, hunks, &destination)
-                {
-                    return Err(ToolError::from(crate::error::EditError::Message(message)));
                 }
                 saw_content_changing_update = true;
                 planned_operations.push(AdmittedPatchOperation::Update {
@@ -867,7 +963,7 @@ fn claim_apply_patch_participant(
 ) -> Result<(), ToolError> {
     if owned_participants.iter().any(|owned| owned == path) {
         return Err(ToolError::from(crate::error::EditError::Message(format!(
-            "path `{path}` is targeted by multiple content-changing operations in the same apply_patch ToolInvocation. Split repeated edits to the same file into separate tool calls so each invocation has one owner per mutation participant; duplicate owner: {operation_name}."
+            "path `{path}` has multiple content-changing owners in one apply_patch invocation ({operation_name})"
         ))));
     }
     owned_participants.push(path.to_path_buf());
@@ -880,47 +976,18 @@ fn validate_move_destination_admission(
 ) -> Result<(), crate::error::EditError> {
     if destination != source_path && destination.exists() {
         return Err(crate::error::EditError::Message(format!(
-            "move destination `{destination}` already exists. `*** Move to:` cannot implicitly overwrite an existing file; read and update or delete the destination explicitly before moving."
+            "move destination `{destination}` already exists for source `{source_path}`"
         )));
     }
     Ok(())
 }
 
 fn add_existing_path_message(path: &Utf8Path) -> String {
-    format!(
-        "path `{path}` already exists; use `*** Update File: {path}` to modify an existing file instead of `*** Add File`"
-    )
-}
-
-fn suspicious_full_rewrite_message(
-    original: &str,
-    updated: &str,
-    hunks: &[PatchChunk],
-    path: &Utf8Path,
-) -> Option<String> {
-    if !PatchParser::is_full_rewrite(hunks) {
-        return None;
-    }
-    if substantive_artifact_collapsed_to_noop_acknowledgement(original, updated) {
-        return Some(format!(
-            "full-file rewrite for `{path}` would replace a substantive artifact with a no-op acknowledgement. Do not patch files to say they are already up to date; leave the file unchanged or make a real content update."
-        ));
-    }
-    let original_first = first_nonempty_line(original)?;
-    let updated_first = first_nonempty_line(updated)?;
-    if starts_with_indentation(updated_first) && !starts_with_indentation(original_first) {
-        return Some(format!(
-            "full-file rewrite for `{path}` appears to start in the middle of the file at `{}`. Resend the entire file from its real first line in one `*** Update File: {path}` patch using only inserted lines (`+...`).",
-            updated_first.trim()
-        ));
-    }
-    None
+    format!("path `{path}` already exists")
 }
 
 fn no_content_patch_message(path: &Utf8Path) -> String {
-    format!(
-        "apply_patch made no content changes to `{path}`. No file-change evidence was produced; submit a patch with actual content changes or leave the file unchanged."
-    )
+    format!("apply_patch made no content changes to `{path}`")
 }
 
 fn no_content_patch_result(path: &Utf8Path, workspace_root: &Utf8Path) -> ToolResult {
@@ -940,6 +1007,7 @@ fn no_content_patch_result(path: &Utf8Path, workspace_root: &Utf8Path) -> ToolRe
         truncated_output_path: None,
         recorded_changes: Vec::new(),
         change_summaries: Vec::new(),
+        _internal_file_lease: None,
     }
 }
 
@@ -948,48 +1016,6 @@ fn path_for_apply_patch_change_storage(
     workspace_root: &Utf8Path,
 ) -> camino::Utf8PathBuf {
     path_for_change_storage(path, workspace_root)
-}
-
-fn substantive_artifact_collapsed_to_noop_acknowledgement(original: &str, updated: &str) -> bool {
-    let original_lines = meaningful_line_count(original);
-    let updated_lines = meaningful_line_count(updated);
-    original_lines >= 8 && updated_lines <= 3 && is_noop_acknowledgement_text(updated)
-}
-
-fn meaningful_line_count(text: &str) -> usize {
-    text.lines().filter(|line| !line.trim().is_empty()).count()
-}
-
-fn is_noop_acknowledgement_text(text: &str) -> bool {
-    let normalized = text
-        .trim()
-        .trim_matches(|ch: char| {
-            ch == '-'
-                || ch == '*'
-                || ch == '#'
-                || ch == '`'
-                || ch == '"'
-                || ch == '\''
-                || ch.is_whitespace()
-        })
-        .to_lowercase();
-    let normalized = normalized.replace(['_', '-'], " ");
-    [
-        "content is already up to date",
-        "already up to date",
-        "no changes needed",
-        "no changes required",
-        "unchanged",
-        "変更なし",
-        "更新済み",
-        "変更はありません",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-}
-
-fn first_nonempty_line(text: &str) -> Option<&str> {
-    text.lines().find(|line| !line.trim().is_empty())
 }
 
 fn edit_request_is_outside_workspace(
@@ -1024,10 +1050,6 @@ fn edit_request_risks(
     risks
 }
 
-fn starts_with_indentation(line: &str) -> bool {
-    line.starts_with(' ') || line.starts_with('\t')
-}
-
 #[cfg(test)]
 mod tests {
     use camino::Utf8PathBuf;
@@ -1038,8 +1060,17 @@ mod tests {
     use crate::protocol::TurnInterruptionCause;
     use crate::runtime::{RunCancelOutcome, RunCancellationCause, RunControl};
     use crate::tool::context::ToolEffectAdmission;
+    use crate::workspace::{Workspace, WorkspaceDiscovery};
 
-    use super::{FileRollbackState, PatchMutation, apply_patch_mutations};
+    use super::{
+        CommittedFileState, FileRollbackState, PatchMutation, apply_patch_mutations,
+        restore_file_state,
+    };
+
+    fn test_workspace(root: &camino::Utf8Path) -> Workspace {
+        WorkspaceDiscovery::discover_fixed_root(root, &crate::config::ResolvedConfig::default())
+            .expect("test workspace")
+    }
 
     fn marker_formatter() -> Formatter {
         Formatter::new(FormatConfig {
@@ -1134,6 +1165,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let path =
             Utf8PathBuf::from_path_buf(temp.path().join("must-not-exist.txt")).expect("utf8 path");
+        let workspace = test_workspace(path.parent().expect("parent"));
         let control = RunControl::new();
         let effect_admission = ToolEffectAdmission::new(control.clone());
         let ready = Arc::new(Barrier::new(2));
@@ -1150,8 +1182,10 @@ mod tests {
             }];
             worker_ready.wait();
             worker_release.wait();
-            effect_admission.admit().map_err(|error| (error, 0))?;
-            apply_patch_mutations(&EditSafety::default(), &mutations)
+            effect_admission
+                .admit()
+                .map_err(|error| (error, Vec::new()))?;
+            apply_patch_mutations(&EditSafety::default(), &mutations, &workspace)
         });
 
         ready.wait();
@@ -1162,13 +1196,13 @@ mod tests {
             RunCancelOutcome::Applied
         );
         release.wait();
-        let (error, applied_count) = worker
+        let (error, applied) = worker
             .join()
             .expect("patch worker")
             .expect_err("Stop must win before patch effects");
 
         assert!(matches!(error, crate::error::ToolError::RunInterrupted));
-        assert_eq!(applied_count, 0);
+        assert_eq!(applied.len(), 0);
         assert!(!path.exists());
         assert_eq!(
             control.cause(),
@@ -1182,6 +1216,7 @@ mod tests {
     fn mutation_commit_preserves_same_size_external_rewrite() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = Utf8PathBuf::from_path_buf(temp.path().join("source.txt")).expect("utf8 path");
+        let workspace = test_workspace(path.parent().expect("parent"));
         std::fs::write(&path, "alpha").expect("seed file");
         let (_, expected_identity) = read_file_with_identity(&path).expect("capture identity");
         let mutations = vec![PatchMutation::Write {
@@ -1193,9 +1228,9 @@ mod tests {
 
         std::fs::write(&path, "bravo").expect("external rewrite");
 
-        let (_, applied_count) = apply_patch_mutations(&EditSafety::default(), &mutations)
+        let (_, applied) = apply_patch_mutations(&EditSafety::default(), &mutations, &workspace)
             .expect_err("external rewrite must stop the commit");
-        assert_eq!(applied_count, 0);
+        assert_eq!(applied.len(), 0);
         assert_eq!(std::fs::read_to_string(&path).expect("read file"), "bravo");
     }
 
@@ -1203,6 +1238,7 @@ mod tests {
     fn mutation_commit_preserves_externally_created_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = Utf8PathBuf::from_path_buf(temp.path().join("new.txt")).expect("utf8 path");
+        let workspace = test_workspace(path.parent().expect("parent"));
         let mutations = vec![PatchMutation::Write {
             path: path.clone(),
             text: "agent".to_string(),
@@ -1211,9 +1247,9 @@ mod tests {
         }];
         std::fs::write(&path, "external").expect("external create");
 
-        let (_, applied_count) = apply_patch_mutations(&EditSafety::default(), &mutations)
+        let (_, applied) = apply_patch_mutations(&EditSafety::default(), &mutations, &workspace)
             .expect_err("external creation must stop the commit");
-        assert_eq!(applied_count, 0);
+        assert_eq!(applied.len(), 0);
         assert_eq!(
             std::fs::read_to_string(&path).expect("read file"),
             "external"
@@ -1225,6 +1261,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let first = Utf8PathBuf::from_path_buf(temp.path().join("first.txt")).expect("utf8 path");
         let second = Utf8PathBuf::from_path_buf(temp.path().join("second.txt")).expect("utf8 path");
+        let workspace = test_workspace(first.parent().expect("parent"));
         std::fs::write(&first, "first-old").expect("seed first");
         std::fs::write(&second, "second-old").expect("seed second");
         let (_, first_identity) = read_file_with_identity(&first).expect("first identity");
@@ -1245,9 +1282,9 @@ mod tests {
         ];
         std::fs::write(&second, "second-out").expect("external rewrite");
 
-        let (_, applied_count) = apply_patch_mutations(&EditSafety::default(), &mutations)
+        let (_, applied) = apply_patch_mutations(&EditSafety::default(), &mutations, &workspace)
             .expect_err("any stale participant must stop the whole commit");
-        assert_eq!(applied_count, 0);
+        assert_eq!(applied.len(), 0);
         assert_eq!(
             std::fs::read_to_string(&first).expect("read first"),
             "first-old"
@@ -1255,6 +1292,30 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&second).expect("read second"),
             "second-out"
+        );
+    }
+
+    #[test]
+    fn rollback_cas_preserves_external_rewrite_after_patch_write() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("source.txt")).expect("utf8 path");
+        let workspace = test_workspace(path.parent().expect("parent"));
+        std::fs::write(&path, "agent").expect("agent write");
+        let (_, identity) = read_file_with_identity(&path).expect("agent identity");
+        std::fs::write(&path, "external").expect("external rewrite");
+
+        let error = restore_file_state(
+            &path,
+            &FileRollbackState::Present("old".to_string()),
+            &CommittedFileState::Present(identity),
+            &workspace,
+        )
+        .expect_err("rollback conflict must be explicit");
+
+        assert!(error.to_string().contains("partially committed"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read file"),
+            "external"
         );
     }
 }

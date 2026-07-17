@@ -170,9 +170,7 @@ impl ToolRegistry {
 
     pub(crate) fn unknown_tool_message(&self, name: &str) -> String {
         let available = self.available_tool_names().join(", ");
-        format!(
-            "unknown tool `{name}`. Available tools registered in this runtime: {available}. Treat this as no-progress tool lifecycle feedback and retry only with a tool currently allowed by the active turn control envelope."
-        )
+        format!("unknown tool `{name}`; registered tools: {available}")
     }
 
     fn unknown_tool_error(&self, name: &str) -> ToolError {

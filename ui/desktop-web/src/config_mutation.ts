@@ -12,14 +12,14 @@ export interface ConfigMutationOwner {
   configDraftValues: Map<string, string>;
   configDraftBaselineValues: Map<string, string>;
   configDraftTarget: ConfigMutationTarget | null;
-  configDraftRevision: number;
-  nextConfigMutationGeneration: number;
-  activeConfigMutationGeneration: number | null;
+  configDraftRevision: bigint;
+  nextConfigMutationGeneration: bigint;
+  activeConfigMutationGeneration: bigint | null;
 }
 
 export interface ConfigMutationRequest {
-  generation: number;
-  draftRevision: number;
+  generation: bigint;
+  draftRevision: bigint;
   target: ConfigMutationTarget;
 }
 
@@ -44,7 +44,7 @@ export function updateConfigDraftValue(
   owner.configDirty = Array.from(owner.configDraftValues).some(
     ([fieldKey, fieldValue]) => owner.configDraftBaselineValues.get(fieldKey) !== fieldValue,
   );
-  owner.configDraftRevision += 1;
+  owner.configDraftRevision += 1n;
   if (!owner.configDirty) resetConfigDraftStorage(owner);
 }
 
@@ -79,7 +79,7 @@ export function beginConfigMutation(
 ): ConfigMutationRequest {
   reconcileConfigDraftTarget(owner, target);
   const generation = owner.nextConfigMutationGeneration;
-  owner.nextConfigMutationGeneration += 1;
+  owner.nextConfigMutationGeneration += 1n;
   owner.activeConfigMutationGeneration = generation;
   return { generation, draftRevision: owner.configDraftRevision, target: { ...target } };
 }
@@ -88,11 +88,16 @@ export function finishConfigMutation(
   owner: ConfigMutationOwner,
   request: ConfigMutationRequest,
   succeeded: boolean,
+  settlementTarget: ConfigMutationTarget,
   currentTarget: ConfigMutationTarget | null,
 ): boolean {
   if (owner.activeConfigMutationGeneration !== request.generation) return false;
   owner.activeConfigMutationGeneration = null;
-  if (!sameConfigMutationTarget(request.target, currentTarget)) return false;
+  if (!sameConfigOwnerIdentity(request.target, settlementTarget)) return false;
+  if (
+    !sameConfigMutationTarget(request.target, currentTarget)
+    && !sameConfigMutationTarget(settlementTarget, currentTarget)
+  ) return false;
   if (
     succeeded
     && owner.configDraftRevision === request.draftRevision
@@ -113,6 +118,11 @@ export function sameConfigMutationTarget(
     && expected.configGeneration === actual.configGeneration;
 }
 
+function sameConfigOwnerIdentity(expected: ConfigMutationTarget, actual: ConfigMutationTarget): boolean {
+  return expected.workspacePath === actual.workspacePath
+    && expected.sessionId === actual.sessionId;
+}
+
 export function configMutationPending(owner: ConfigMutationOwner): boolean {
   return owner.activeConfigMutationGeneration !== null;
 }
@@ -124,7 +134,7 @@ export function discardConfigDraft(owner: ConfigMutationOwner): void {
 function clearConfigDraft(owner: ConfigMutationOwner): void {
   owner.configDirty = false;
   resetConfigDraftStorage(owner);
-  owner.configDraftRevision += 1;
+  owner.configDraftRevision += 1n;
 }
 
 function resetConfigDraftStorage(owner: ConfigMutationOwner): void {

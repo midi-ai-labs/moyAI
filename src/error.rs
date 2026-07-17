@@ -26,6 +26,12 @@ pub enum ConfigError {
     Io(#[from] io::Error),
     #[error("config parse error: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("config parse error in `{path}`: {source}")]
+    ParseFile {
+        path: String,
+        #[source]
+        source: toml::de::Error,
+    },
     #[error("config serialize error: {0}")]
     Serialize(#[from] toml::ser::Error),
     #[error("{0}")]
@@ -50,6 +56,18 @@ pub enum StorageError {
     Sqlite(#[from] rusqlite::Error),
     #[error("storage json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error(
+        "canonical history fence changed for session {session_id}: expected append position {expected_append_position:?}, {expected_history_count} history items, and {expected_active_count} active items; observed append position {actual_append_position:?}, {actual_history_count} history items, and {actual_active_count} active items"
+    )]
+    CanonicalHistoryFenceChanged {
+        session_id: crate::session::SessionId,
+        expected_append_position: Option<i64>,
+        actual_append_position: Option<i64>,
+        expected_history_count: usize,
+        actual_history_count: usize,
+        expected_active_count: usize,
+        actual_active_count: usize,
+    },
     #[error("{0}")]
     Message(String),
 }
@@ -86,6 +104,64 @@ pub enum CliPromptError {
     Message(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderRequestLimit {
+    SerializedBodyBytes,
+    MessageCount,
+    ToolCount,
+    ToolSchemaBytes,
+    ExtraBodyBytes,
+    StopSequenceCount,
+    StopSequenceBytes,
+    ImageCount,
+    ImageDecodedBytes,
+    ImageBase64Chars,
+    ImageWidth,
+    ImageHeight,
+    ImagePixels,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderStreamLimit {
+    RawBytes,
+    EventCount,
+    ToolCallCount,
+    ToolCallArgumentBytes,
+    DurationMs,
+}
+
+impl std::fmt::Display for ProviderStreamLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::RawBytes => "raw bytes",
+            Self::EventCount => "event count",
+            Self::ToolCallCount => "tool-call count",
+            Self::ToolCallArgumentBytes => "tool-call argument bytes",
+            Self::DurationMs => "duration milliseconds",
+        })
+    }
+}
+
+impl std::fmt::Display for ProviderRequestLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::SerializedBodyBytes => "serialized body bytes",
+            Self::MessageCount => "message count",
+            Self::ToolCount => "tool count",
+            Self::ToolSchemaBytes => "tool schema bytes",
+            Self::ExtraBodyBytes => "extra body bytes",
+            Self::StopSequenceCount => "stop-sequence count",
+            Self::StopSequenceBytes => "stop-sequence bytes",
+            Self::ImageCount => "image count",
+            Self::ImageDecodedBytes => "decoded image bytes",
+            Self::ImageBase64Chars => "base64 image characters",
+            Self::ImageWidth => "image width",
+            Self::ImageHeight => "image height",
+            Self::ImagePixels => "image pixels",
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum LlmError {
     #[error("llm http error: {0}")]
@@ -94,6 +170,24 @@ pub enum LlmError {
     Json(#[from] serde_json::Error),
     #[error("llm io error: {0}")]
     Io(#[from] io::Error),
+    #[error("provider response-start deadline expired after {timeout_ms}ms")]
+    ProviderResponseStartTimeout { timeout_ms: u64 },
+    #[error("provider stream was idle for {timeout_ms}ms")]
+    ProviderStreamIdleTimeout { timeout_ms: u64 },
+    #[error("provider request {surface} {actual} exceeds the admitted limit {maximum}")]
+    ProviderRequestLimitExceeded {
+        surface: ProviderRequestLimit,
+        actual: u64,
+        maximum: u64,
+    },
+    #[error("provider request image was rejected: {0}")]
+    ProviderRequestImage(#[from] crate::llm::ImageValidationError),
+    #[error("provider stream {surface} {actual} exceeds the admitted limit {maximum}")]
+    ProviderStreamLimitExceeded {
+        surface: ProviderStreamLimit,
+        actual: u64,
+        maximum: u64,
+    },
     #[error(
         "provider rejected the request{status_text}{code_text}{param_text}: {message}",
         status_text = status.map(|value| format!(" with status {value}")).unwrap_or_default(),
@@ -120,6 +214,12 @@ pub enum LlmError {
         reason: String,
         usage: Option<crate::session::TokenUsage>,
     },
+    #[error("{failure}")]
+    ProviderFailure {
+        failure: crate::llm::ProviderFailure,
+        #[source]
+        source: Box<LlmError>,
+    },
     #[error("{0}")]
     Message(String),
 }
@@ -128,6 +228,14 @@ impl LlmError {
     pub fn token_usage(&self) -> Option<&crate::session::TokenUsage> {
         match self {
             Self::IncompleteResponse { usage, .. } => usage.as_ref(),
+            Self::ProviderFailure { source, .. } => source.token_usage(),
+            _ => None,
+        }
+    }
+
+    pub fn provider_failure(&self) -> Option<&crate::llm::ProviderFailure> {
+        match self {
+            Self::ProviderFailure { failure, .. } => Some(failure),
             _ => None,
         }
     }
@@ -137,6 +245,9 @@ impl LlmError {
     /// separate from transport retries: callers may retry once with full
     /// canonical history, never by replaying a stale cursor.
     pub fn rejects_previous_response_id(&self) -> bool {
+        if let Self::ProviderFailure { source, .. } = self {
+            return source.rejects_previous_response_id();
+        }
         let Self::ProviderRejected {
             status,
             code,
@@ -197,6 +308,46 @@ mod llm_error_tests {
 pub enum EditError {
     #[error("edit io error: {0}")]
     Io(#[from] io::Error),
+    #[error(
+        "parent directory `{parent}` for `{path}` does not exist; the file mutation was not applied and no directory was created"
+    )]
+    MissingParent {
+        path: camino::Utf8PathBuf,
+        parent: camino::Utf8PathBuf,
+    },
+    #[error(
+        "path `{path}` changed while the edit was being prepared; external content was preserved and the commit was not applied"
+    )]
+    CommitConflict { path: camino::Utf8PathBuf },
+    #[error(
+        "path `{path}` changed while the edit was being prepared; external content was preserved at `{preserved_path}` because the target was occupied before it could be restored: {reason}"
+    )]
+    CommitConflictPreserved {
+        path: camino::Utf8PathBuf,
+        preserved_path: camino::Utf8PathBuf,
+        reason: String,
+    },
+    #[error(
+        "filesystem mutation for `{path}` may be partially committed; preserved content remains at `{preserved_path}` and requires recovery: {reason}"
+    )]
+    PartialCommit {
+        path: camino::Utf8PathBuf,
+        preserved_path: camino::Utf8PathBuf,
+        reason: String,
+    },
+    #[error(
+        "rollback for `{path}` was skipped because the committed filesystem state changed; external content was preserved and the agent change may remain partially committed"
+    )]
+    RollbackConflict { path: camino::Utf8PathBuf },
+    #[error(
+        "rollback for `{path}` could not restore the target because the committed filesystem state changed; external content was preserved at `{preserved_path}` and the agent change may remain partially committed"
+    )]
+    RollbackConflictPreserved {
+        path: camino::Utf8PathBuf,
+        preserved_path: camino::Utf8PathBuf,
+    },
+    #[error("{operation} rollback failed: {details}")]
+    RollbackFailed { operation: String, details: String },
     #[error("{0}")]
     Message(String),
 }
@@ -205,6 +356,21 @@ pub enum EditError {
 pub enum PatchError {
     #[error("{0}")]
     Message(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoclingLimitSurface {
+    InputBytes,
+    ResponseBytes,
+}
+
+impl std::fmt::Display for DoclingLimitSurface {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InputBytes => "input bytes",
+            Self::ResponseBytes => "response bytes",
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -223,6 +389,12 @@ pub enum ToolError {
     Edit(#[from] EditError),
     #[error("tool patch error: {0}")]
     Patch(#[from] PatchError),
+    #[error("docling {surface} {actual} exceeds the limit {maximum}")]
+    DoclingLimitExceeded {
+        surface: DoclingLimitSurface,
+        actual: u64,
+        maximum: u64,
+    },
     #[error("permission denied by user")]
     PermissionDenied {
         settlement: Option<crate::runtime::ToolSettlementReservation>,
@@ -248,7 +420,7 @@ pub enum AgentError {
     #[error("run admission `{admission_id}` no longer owns session {session_id}")]
     RunSuperseded {
         session_id: crate::session::SessionId,
-        admission_id: String,
+        admission_id: crate::session::AdmissionId,
     },
     #[error("agent llm error: {0}")]
     Llm(#[from] LlmError),

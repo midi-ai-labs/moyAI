@@ -2,13 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::error::RuntimeError;
-use crate::protocol::{HistoryItemId, SteerTurn, TurnId, TurnInterruptionCause};
+use crate::protocol::{TurnId, TurnInterruptionCause};
 use crate::runtime::{RunCancelOutcome, RunControl};
 use crate::session::SessionId;
-use tokio::sync::{
-    mpsc::{self, UnboundedReceiver, UnboundedSender},
-    watch,
-};
+use tokio::sync::watch;
 
 #[derive(Clone, Default)]
 pub struct ActiveRunRegistry {
@@ -24,7 +21,6 @@ struct ActiveRunState {
 struct ActiveRunEntry {
     generation: u64,
     control: RunControl,
-    steer_tx: UnboundedSender<ActiveSteerInput>,
     steer_activity_tx: watch::Sender<u64>,
     turn_id: Option<TurnId>,
 }
@@ -33,13 +29,6 @@ pub struct ActiveRunLease {
     registry: ActiveRunRegistry,
     session_id: SessionId,
     generation: u64,
-    steer_rx: Option<UnboundedReceiver<ActiveSteerInput>>,
-}
-
-#[derive(Clone)]
-pub struct ActiveSteerInput {
-    pub history_item_id: HistoryItemId,
-    pub steer: SteerTurn,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,14 +53,12 @@ impl ActiveRunRegistry {
         }
         state.next_generation = state.next_generation.wrapping_add(1);
         let generation = state.next_generation;
-        let (steer_tx, steer_rx) = mpsc::unbounded_channel();
         let (steer_activity_tx, _) = watch::channel(0);
         state.runs.insert(
             session_id,
             ActiveRunEntry {
                 generation,
                 control,
-                steer_tx,
                 steer_activity_tx,
                 turn_id: None,
             },
@@ -81,7 +68,6 @@ impl ActiveRunRegistry {
             registry: self.clone(),
             session_id,
             generation,
-            steer_rx: Some(steer_rx),
         })
     }
 
@@ -130,12 +116,15 @@ impl ActiveRunRegistry {
             .unwrap_or_default()
     }
 
-    pub fn enqueue_steer(
+    /// Notifies local waiters after the canonical steer transaction commits.
+    ///
+    /// The notification deliberately carries no item identity or content. A
+    /// coalesced or missed notification is harmless because canonical history
+    /// remains the sole input owner and is consumed through its durable cursor.
+    pub fn notify_steer_activity(
         &self,
         session_id: SessionId,
         expected_turn_id: TurnId,
-        history_item_id: HistoryItemId,
-        steer: SteerTurn,
     ) -> Result<(), RuntimeError> {
         let state = self.lock()?;
         let run = state.runs.get(&session_id).ok_or_else(|| {
@@ -153,16 +142,6 @@ impl ActiveRunRegistry {
                 "expected active turn id `{expected_turn_id}` but current active turn id is `{turn_id}`"
             )));
         }
-        run.steer_tx
-            .send(ActiveSteerInput {
-                history_item_id,
-                steer,
-            })
-            .map_err(|_| {
-                RuntimeError::Message(format!(
-                    "active run for session {session_id} stopped before steer input was delivered"
-                ))
-            })?;
         run.steer_activity_tx
             .send_modify(|generation| *generation = generation.wrapping_add(1));
         Ok(())
@@ -248,10 +227,6 @@ impl ActiveRunLease {
         self.registry
             .set_turn_id(self.session_id, self.generation, turn_id)
     }
-
-    pub fn take_steer_receiver(&mut self) -> Option<UnboundedReceiver<ActiveSteerInput>> {
-        self.steer_rx.take()
-    }
 }
 
 impl Drop for ActiveRunLease {
@@ -302,30 +277,23 @@ mod tests {
     }
 
     #[test]
-    fn cancel_and_steer_target_the_registered_run() {
+    fn cancel_and_steer_notification_target_the_registered_run() {
         let registry = ActiveRunRegistry::default();
         let session_id = SessionId::new();
         let control = RunControl::new();
-        let mut lease = registry
+        let lease = registry
             .try_start(session_id, control.clone())
             .expect("register run");
         let turn_id = TurnId::new();
         lease.set_turn_id(turn_id).expect("set turn");
-        let mut receiver = lease.take_steer_receiver().expect("receiver");
-        let steer = SteerTurn {
-            expected_turn_id: turn_id,
-            items: Vec::new(),
-            additional_context: Default::default(),
-            client_user_message_id: None,
-        };
-        let history_item_id = HistoryItemId::new();
+        let observed = registry.steer_generation(session_id).expect("generation");
 
         registry
-            .enqueue_steer(session_id, turn_id, history_item_id, steer)
-            .expect("enqueue steer");
-        assert_eq!(
-            receiver.try_recv().expect("steer").history_item_id,
-            history_item_id
+            .notify_steer_activity(session_id, turn_id)
+            .expect("notify steer");
+        assert_ne!(
+            registry.steer_generation(session_id).expect("generation"),
+            observed
         );
         assert_eq!(
             registry.cancel(session_id, TurnInterruptionCause::UserStop),
@@ -395,31 +363,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn steer_activity_wakes_observers_without_consuming_the_input() {
+    async fn steer_activity_wakes_observers_without_copying_canonical_input() {
         let registry = ActiveRunRegistry::default();
         let session_id = SessionId::new();
-        let mut lease = registry
+        let lease = registry
             .try_start(session_id, RunControl::new())
             .expect("register run");
         let turn_id = TurnId::new();
         lease.set_turn_id(turn_id).expect("set turn");
-        let mut receiver = lease.take_steer_receiver().expect("receiver");
         let observed = registry.steer_generation(session_id).expect("generation");
-        let history_item_id = HistoryItemId::new();
 
         registry
-            .enqueue_steer(
-                session_id,
-                turn_id,
-                history_item_id,
-                SteerTurn {
-                    expected_turn_id: turn_id,
-                    items: Vec::new(),
-                    additional_context: Default::default(),
-                    client_user_message_id: None,
-                },
-            )
-            .expect("enqueue steer");
+            .notify_steer_activity(session_id, turn_id)
+            .expect("notify steer");
 
         assert_ne!(
             registry
@@ -428,12 +384,32 @@ mod tests {
                 .expect("activity"),
             observed
         );
-        assert_eq!(
-            receiver
-                .try_recv()
-                .expect("steer remains queued")
-                .history_item_id,
-            history_item_id
+    }
+
+    #[test]
+    fn steer_activity_is_constant_memory_and_rejects_stale_turns() {
+        let registry = ActiveRunRegistry::default();
+        let session_id = SessionId::new();
+        let lease = registry
+            .try_start(session_id, RunControl::new())
+            .expect("register run");
+        let turn_id = TurnId::new();
+        lease.set_turn_id(turn_id).expect("set turn");
+        let observed = registry.steer_generation(session_id).expect("generation");
+
+        for _ in 0..10_000 {
+            registry
+                .notify_steer_activity(session_id, turn_id)
+                .expect("coalesced activity notification");
+        }
+        assert_ne!(
+            registry.steer_generation(session_id).expect("generation"),
+            observed
         );
+
+        let error = registry
+            .notify_steer_activity(session_id, TurnId::new())
+            .expect_err("stale turn notification must be rejected");
+        assert!(error.to_string().contains("expected active turn id"));
     }
 }

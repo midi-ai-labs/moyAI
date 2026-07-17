@@ -1,3 +1,4 @@
+use crate::cli::terminal::{terminal_safe_inline, terminal_safe_multiline};
 use crate::error::CliRenderError;
 use crate::protocol::{HistoryItem, HistoryItemPayload};
 use crate::session::{
@@ -5,9 +6,6 @@ use crate::session::{
     IdleTurnAdmission, LoadedSessionList, RunEvent, RunSummary, RunningSessionRejoin,
     SessionRecord, ThreadGoal, ThreadGoalClearResult, ThreadGoalGetResult, ThreadGoalSetResult,
 };
-
-const CURRENT_PROVIDER_MODEL: &str = "qwen/qwen3.6-35b-a3b";
-const CURRENT_PROVIDER_BASE_URL: &str = "http://127.0.0.1:1234";
 
 pub trait EventRenderer {
     fn render(&mut self, event: &RunEvent) -> Result<(), CliRenderError>;
@@ -73,36 +71,73 @@ impl EventRenderer for HumanRenderer {
         let mut stdout = io::stdout().lock();
         match event {
             RunEvent::SessionStarted { session_id, title } => {
-                writeln!(stdout, "session {} {}", session_id, title)?;
+                writeln!(
+                    stdout,
+                    "session {} {}",
+                    session_id,
+                    terminal_safe_inline(title)
+                )?;
             }
             RunEvent::SessionTitleUpdated { session_id, title } => {
-                writeln!(stdout, "session {} title {}", session_id, title)?;
+                writeln!(
+                    stdout,
+                    "session {} title {}",
+                    session_id,
+                    terminal_safe_inline(title)
+                )?;
             }
             RunEvent::UserTurnStored { session_id, .. } => {
                 writeln!(stdout, "user turn {session_id}")?;
             }
             RunEvent::ModelRequestPrepared { .. } | RunEvent::WorldStateUpdated { .. } => {}
+            RunEvent::ProviderPhase { event, .. } => {
+                if let Some(failure) = &event.failure {
+                    let failure = terminal_safe_inline(&failure.to_string()).into_owned();
+                    writeln!(
+                        stdout,
+                        "[provider:{}] request={} attempt={} elapsed_ms={} {}",
+                        event.phase.as_str(),
+                        event.request_id,
+                        event.attempt,
+                        event.elapsed_ms,
+                        failure
+                    )?;
+                } else {
+                    writeln!(
+                        stdout,
+                        "[provider:{}] request={} attempt={} elapsed_ms={}",
+                        event.phase.as_str(),
+                        event.request_id,
+                        event.attempt,
+                        event.elapsed_ms
+                    )?;
+                }
+            }
             RunEvent::TextDelta { delta, .. } => {
-                write!(stdout, "{delta}")?;
+                write!(stdout, "{}", terminal_safe_multiline(delta))?;
             }
             RunEvent::AssistantMessageCommitted { .. } => {}
             RunEvent::ReasoningSummaryDelta { delta, .. } => {
-                writeln!(stdout, "\n[reasoning summary] {delta}")?;
+                writeln!(
+                    stdout,
+                    "\n[reasoning summary] {}",
+                    terminal_safe_multiline(delta)
+                )?;
             }
             RunEvent::ToolCallPending { tool_name, .. } => {
-                writeln!(stdout, "\n[tool] {tool_name}")?;
+                writeln!(stdout, "\n[tool] {}", terminal_safe_inline(tool_name))?;
             }
             RunEvent::ToolCallCompleted { summary, .. } => {
-                writeln!(stdout, "[tool:done] {summary}")?;
+                writeln!(stdout, "[tool:done] {}", terminal_safe_inline(summary))?;
             }
             RunEvent::ToolCallDeclined { reason, .. } => {
-                writeln!(stdout, "[tool:declined] {reason}")?;
+                writeln!(stdout, "[tool:declined] {}", terminal_safe_inline(reason))?;
             }
             RunEvent::ToolCallCancelled { reason, .. } => {
-                writeln!(stdout, "[tool:cancelled] {reason}")?;
+                writeln!(stdout, "[tool:cancelled] {}", terminal_safe_inline(reason))?;
             }
             RunEvent::ToolCallFailed { error, .. } => {
-                writeln!(stdout, "[tool:error] {error}")?;
+                writeln!(stdout, "[tool:error] {}", terminal_safe_inline(error))?;
             }
             RunEvent::FileChangesRecorded { changes, .. } => {
                 writeln!(
@@ -110,7 +145,7 @@ impl EventRenderer for HumanRenderer {
                     "[changes] {}",
                     changes
                         .iter()
-                        .map(|value| value.summary_line(None))
+                        .map(|value| terminal_safe_inline(&value.summary_line(None)).into_owned())
                         .collect::<Vec<_>>()
                         .join(", ")
                 )?;
@@ -125,7 +160,7 @@ impl EventRenderer for HumanRenderer {
                 )?;
             }
             RunEvent::PermissionRequested { summary, .. } => {
-                writeln!(stdout, "[permission] {summary}")?;
+                writeln!(stdout, "[permission] {}", terminal_safe_inline(summary))?;
             }
             RunEvent::PermissionResolved { approved, .. } => {
                 writeln!(
@@ -138,34 +173,22 @@ impl EventRenderer for HumanRenderer {
                     }
                 )?;
             }
-            RunEvent::RetryScheduled {
-                attempt,
-                message,
-                next_retry_at_ms,
-                ..
-            } => {
-                writeln!(
-                    stdout,
-                    "[retry] attempt={} next_retry_at_ms={} {}",
-                    attempt, next_retry_at_ms, message
-                )?;
-            }
             RunEvent::RecoverableRuntimeFeedback { message, .. } => {
-                writeln!(stdout, "[feedback] {message}")?;
+                writeln!(stdout, "[feedback] {}", terminal_safe_inline(message))?;
             }
             RunEvent::TurnTerminal {
                 session_id,
                 terminal,
             } => {
-                let status = match terminal.status {
-                    crate::protocol::TurnTerminalStatus::Completed => "completed",
-                    crate::protocol::TurnTerminalStatus::Failed => "failed",
-                    crate::protocol::TurnTerminalStatus::Interrupted => "interrupted",
+                let status = match &terminal.outcome {
+                    crate::protocol::TurnTerminalOutcome::Completed => "completed",
+                    crate::protocol::TurnTerminalOutcome::Failed { .. } => "failed",
+                    crate::protocol::TurnTerminalOutcome::Interrupted { .. } => "interrupted",
                 };
                 writeln!(
                     stdout,
                     "\n[turn:{status}] {session_id} {}",
-                    terminal.summary
+                    terminal_safe_inline(&terminal.summary())
                 )?;
             }
         }
@@ -210,7 +233,12 @@ impl EventRenderer for HumanRenderer {
     ) -> Result<(), CliRenderError> {
         use std::io::{self, Write};
         let mut stdout = io::stdout().lock();
-        writeln!(stdout, "session {} {}", session.id, session.title)?;
+        writeln!(
+            stdout,
+            "session {} {}",
+            session.id,
+            terminal_safe_inline(&session.title)
+        )?;
         for item in history_items {
             writeln!(stdout, "{}", human_history_item_line(item)?)?;
         }
@@ -247,11 +275,11 @@ impl EventRenderer for HumanRenderer {
             stdout,
             "session {} {} status={} model={} access_mode={} cwd={}",
             read.session.id,
-            read.session.title,
+            terminal_safe_inline(&read.session.title),
             read.session.status.key(),
-            read.session.model,
+            terminal_safe_inline(&read.session.model),
             read.session.access_mode.as_str(),
-            read.session.cwd
+            terminal_safe_inline(read.session.cwd.as_str())
         )?;
         if let Some(turn_id) = read.active_turn_id {
             writeln!(
@@ -553,10 +581,10 @@ fn payload_kind<T: serde::Serialize>(payload: &T) -> Result<String, CliRenderErr
 fn human_run_summary_line(summary: &RunSummary) -> String {
     format!(
         "summary: status={} tools={} failed_tools={} changes={}",
-        summary.status.key(),
-        summary.tool_call_count,
-        summary.failed_tool_count,
-        summary.change_count
+        summary.status().key(),
+        summary.tool_call_count(),
+        summary.failed_tool_count(),
+        summary.change_count()
     )
 }
 
@@ -569,7 +597,7 @@ fn human_session_record_line(session: &SessionRecord) -> String {
         session.access_mode.as_str(),
         model_parameters,
         session.updated_at_ms,
-        session.title
+        terminal_safe_inline(&session.title)
     )
 }
 
@@ -611,7 +639,7 @@ fn human_loaded_session_summary_line(summary: &crate::session::LoadedSessionSumm
         active_turn,
         active_sequence,
         summary.pending_user_input_requests,
-        summary.session.title
+        terminal_safe_inline(&summary.session.title)
     )
 }
 
@@ -632,7 +660,7 @@ fn human_thread_goal_line(goal: &ThreadGoal) -> String {
         budget,
         remaining,
         goal.time_used_seconds,
-        goal.objective
+        terminal_safe_inline(&goal.objective)
     )
 }
 
@@ -652,8 +680,8 @@ fn renderer_fixture_session_record(title: &str) -> SessionRecord {
         title: title.to_string(),
         status: crate::session::SessionStatus::Completed,
         cwd: camino::Utf8PathBuf::from("C:/workspace"),
-        model: CURRENT_PROVIDER_MODEL.to_string(),
-        base_url: CURRENT_PROVIDER_BASE_URL.to_string(),
+        model: "fixture-model".to_string(),
+        base_url: "http://fixture.invalid/v1".to_string(),
         created_at_ms: 1,
         updated_at_ms: 3,
         completed_at_ms: Some(3),
@@ -667,7 +695,9 @@ pub fn cli_history_renderer_uses_canonical_history_projection_fixture_passes() -
     let later = HistoryItem {
         id: crate::protocol::HistoryItemId::new(),
         session_id: session.id,
-        turn_id: crate::protocol::TurnId::new(),
+        scope: crate::protocol::HistoryScope::Turn {
+            turn_id: crate::protocol::TurnId::new(),
+        },
         sequence_no: 2,
         created_at_ms: 2,
         payload: crate::protocol::HistoryItemPayload::AssistantMessage {
@@ -680,7 +710,9 @@ pub fn cli_history_renderer_uses_canonical_history_projection_fixture_passes() -
     let earlier = HistoryItem {
         id: crate::protocol::HistoryItemId::new(),
         session_id: session.id,
-        turn_id: crate::protocol::TurnId::new(),
+        scope: crate::protocol::HistoryScope::Turn {
+            turn_id: crate::protocol::TurnId::new(),
+        },
         sequence_no: 1,
         created_at_ms: 1,
         payload: crate::protocol::HistoryItemPayload::UserTurn {
@@ -736,30 +768,27 @@ pub fn cli_session_read_payload_preserves_metadata_pages_fixture_passes() -> boo
         && encoded.contains("\"total\":17")
 }
 
-pub fn cli_renderer_current_provider_profile_fixture_passes() -> bool {
-    let session = renderer_fixture_session_record("cli_renderer_fixture_current_provider_profile");
-    session.model == CURRENT_PROVIDER_MODEL && session.base_url == CURRENT_PROVIDER_BASE_URL
-}
-
 pub fn cli_human_renderer_typed_lifecycle_projection_fixture_passes() -> bool {
-    let summary_line = human_run_summary_line(&RunSummary {
-        session_id: crate::session::SessionId::new(),
-        turn_id: Some(crate::protocol::TurnId::new()),
-        final_response_id: None,
-        status: crate::session::SessionStatus::Completed,
-        finish_reason: None,
-        interruption_cause: None,
-        tool_call_count: 2,
-        failed_tool_count: 1,
-        change_count: 3,
-        metrics: Default::default(),
-    });
+    let summary_line = human_run_summary_line(&RunSummary::from_terminal(
+        crate::session::SessionId::new(),
+        crate::protocol::TurnId::new(),
+        crate::session::DurableTurnTerminal {
+            outcome: crate::protocol::TurnTerminalOutcome::Completed,
+            final_response_id: None,
+            tool_call_count: 2,
+            failed_tool_count: 1,
+            change_count: 3,
+            metrics: Default::default(),
+        },
+    ));
     let session = renderer_fixture_session_record("typed projection");
     let session_line = human_session_record_line(&session);
     let history_item = HistoryItem {
         id: crate::protocol::HistoryItemId::new(),
         session_id: session.id,
-        turn_id: crate::protocol::TurnId::new(),
+        scope: crate::protocol::HistoryScope::Turn {
+            turn_id: crate::protocol::TurnId::new(),
+        },
         sequence_no: 1,
         created_at_ms: 1,
         payload: HistoryItemPayload::AssistantMessage {
@@ -779,6 +808,18 @@ pub fn cli_human_renderer_typed_lifecycle_projection_fixture_passes() -> bool {
         && payload.contains("message")
 }
 
+pub fn cli_human_renderer_neutralizes_terminal_controls_fixture_passes() -> bool {
+    let session = renderer_fixture_session_record("visible\u{1b}]52;c;secret\u{7}\nspoofed");
+    let line = human_session_record_line(&session);
+
+    !line.contains('\u{1b}')
+        && !line.contains('\u{7}')
+        && !line.contains('\n')
+        && line.contains("\\u{001B}")
+        && line.contains("\\u{0007}")
+        && line.contains("\\u{000A}")
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -794,5 +835,10 @@ mod tests {
     #[test]
     fn cli_human_renderer_typed_lifecycle_projection() {
         assert!(super::cli_human_renderer_typed_lifecycle_projection_fixture_passes());
+    }
+
+    #[test]
+    fn cli_human_renderer_neutralizes_terminal_controls() {
+        assert!(super::cli_human_renderer_neutralizes_terminal_controls_fixture_passes());
     }
 }

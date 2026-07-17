@@ -11,8 +11,22 @@ pub struct ToolSpecPlan {
     parallel_tool_calls: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentToolRole {
+    Root,
+    Child,
+}
+
 impl ToolSpecPlan {
     pub fn build(step: &StepContext, registry: &ToolRegistry) -> Self {
+        Self::build_for_agent(step, registry, AgentToolRole::Root)
+    }
+
+    pub fn build_for_agent(
+        step: &StepContext,
+        registry: &ToolRegistry,
+        agent_role: AgentToolRole,
+    ) -> Self {
         if !step.turn.policy.model.supports_tools {
             return Self {
                 router: ToolRegistry::empty(),
@@ -25,7 +39,7 @@ impl ToolSpecPlan {
         if step.turn.mode.kind == ModeKind::Plan {
             router.retain_effect(ToolEffectClass::Read, step.external_tools.mcp.as_ref());
         }
-        if step.turn.multi_agent_mode.is_none() {
+        if step.turn.multi_agent_mode().is_none() {
             router.retain_tools(|name| {
                 !matches!(
                     name,
@@ -37,6 +51,8 @@ impl ToolSpecPlan {
                         | "list_agents"
                 )
             });
+        } else if agent_role == AgentToolRole::Child {
+            router.retain_tools(|name| name != "spawn_agent");
         }
         if !step.external_tools.docling_enabled {
             router.retain_tools(|name| name != "docling_convert");
@@ -52,7 +68,6 @@ impl ToolSpecPlan {
                 name: spec.name.to_string(),
                 description: spec.description.to_string(),
                 input_schema: spec.input_schema,
-                strict: true,
             })
             .collect::<Vec<_>>();
         let parallel_tool_calls =
@@ -114,10 +129,14 @@ mod tests {
         StepContext {
             turn: Arc::new(TurnContext {
                 turn_id: TurnId::new(),
-                admission_id: "admission".to_string(),
+                admission_id: crate::session::AdmissionId::new(),
                 mode,
                 policy,
-                multi_agent_mode: None,
+                config: Arc::new(
+                    crate::config::ResolvedTurnConfig::from_effective(config)
+                        .expect("valid provider endpoint"),
+                ),
+                goal: None,
                 current_time: crate::context::current_time::CurrentTimeSnapshot::now(),
             }),
             world_state: WorldState {
@@ -170,6 +189,34 @@ mod tests {
         let registry = ToolRegistry::core_agent();
         let plan = ToolSpecPlan::build(&step(ModeKind::Default), &registry);
         assert_eq!(plan.tool_names(), plan.router().available_tool_names());
+    }
+
+    #[test]
+    fn child_agent_keeps_collaboration_tools_but_cannot_spawn() {
+        let mut config = ResolvedConfig::default();
+        config.multi_agent.enabled = true;
+        config.multi_agent.mode = crate::config::MultiAgentMode::Proactive;
+        let registry = ToolRegistry::core_agent_for_config(&config);
+        let step = step_for_config(ModeKind::Default, &config);
+
+        let root = ToolSpecPlan::build_for_agent(&step, &registry, AgentToolRole::Root);
+        let child = ToolSpecPlan::build_for_agent(&step, &registry, AgentToolRole::Child);
+
+        assert!(root.tool_names().contains(&"spawn_agent".to_string()));
+        assert!(!child.tool_names().contains(&"spawn_agent".to_string()));
+        for name in [
+            "send_message",
+            "followup_task",
+            "wait_agent",
+            "interrupt_agent",
+            "list_agents",
+        ] {
+            assert!(
+                child.tool_names().contains(&name.to_string()),
+                "missing {name}"
+            );
+        }
+        assert_eq!(child.tool_names(), child.router().available_tool_names());
     }
 
     #[test]

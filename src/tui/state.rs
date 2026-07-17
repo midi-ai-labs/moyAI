@@ -2,7 +2,7 @@ use crate::context::ContextWindowTokenStatus;
 use crate::edit::ChangeSummary;
 use crate::protocol::{
     ModelResponseId, PlanStep, ToolLifecycleStatus, TurnInterruptionCause, TurnItem,
-    TurnItemPayload, TurnTerminalStatus, turn_items_in_projection_order,
+    TurnItemPayload, TurnTerminalOutcome, turn_items_in_projection_order,
 };
 use crate::runtime::RunCancellationCause;
 use crate::session::{
@@ -92,10 +92,53 @@ pub struct PermissionOverlayView {
     pub agent_task_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunProgressPhase {
+    Ready,
+    Session,
+    User,
+    Context,
+    Model,
+    Provider(crate::llm::ProviderPhase),
+    Permission,
+    Tool,
+    Compaction,
+    RuntimeFeedback,
+    StopRequested,
+    Terminal,
+    Loaded,
+}
+
+impl RunProgressPhase {
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Session => "session",
+            Self::User => "user",
+            Self::Context => "context",
+            Self::Model => "model",
+            Self::Provider(phase) => phase.as_str(),
+            Self::Permission => "permission",
+            Self::Tool => "tool",
+            Self::Compaction => "compaction",
+            Self::RuntimeFeedback => "runtime_feedback",
+            Self::StopRequested => "stop_requested",
+            Self::Terminal => "terminal",
+            Self::Loaded => "loaded",
+        }
+    }
+}
+
+impl std::fmt::Display for RunProgressPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.key())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunProgressView {
     pub status: String,
-    pub current_phase: String,
+    pub current_phase: RunProgressPhase,
     pub active_step: String,
     pub model_requests: usize,
     pub tool_calls_started: usize,
@@ -104,7 +147,6 @@ pub struct RunProgressView {
     pub tool_calls_cancelled: usize,
     pub tool_calls_failed: usize,
     pub compactions: usize,
-    pub retries: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,7 +159,7 @@ impl Default for RunProgressView {
     fn default() -> Self {
         Self {
             status: "Idle".to_string(),
-            current_phase: "ready".to_string(),
+            current_phase: RunProgressPhase::Ready,
             active_step: "No active run".to_string(),
             model_requests: 0,
             tool_calls_started: 0,
@@ -126,7 +168,6 @@ impl Default for RunProgressView {
             tool_calls_cancelled: 0,
             tool_calls_failed: 0,
             compactions: 0,
-            retries: 0,
         }
     }
 }
@@ -310,7 +351,7 @@ impl AppState {
                 self.status_message = Some(format!("session {} started", session_id));
                 self.progress = RunProgressView {
                     status: "Running".to_string(),
-                    current_phase: "session".to_string(),
+                    current_phase: RunProgressPhase::Session,
                     active_step: "Session started".to_string(),
                     ..RunProgressView::default()
                 };
@@ -336,6 +377,20 @@ impl AppState {
                         response_id: Some(*response_id),
                         tool_call_id: None,
                     });
+                }
+            }
+            RunEvent::ProviderPhase { event, .. } => {
+                self.progress.current_phase = RunProgressPhase::Provider(event.phase);
+                self.progress.active_step = format!(
+                    "Provider request {} {} via {} (attempt {}, {} ms)",
+                    event.request_id,
+                    event.phase.as_str(),
+                    event.endpoint,
+                    event.attempt,
+                    event.elapsed_ms
+                );
+                if let Some(failure) = &event.failure {
+                    self.status_message = Some(failure.to_string());
                 }
             }
             RunEvent::AssistantMessageCommitted {
@@ -379,7 +434,7 @@ impl AppState {
             } => {
                 let tool = crate::tool::ToolName::parse(tool_name);
                 self.progress.tool_calls_started += 1;
-                self.progress.current_phase = "tool".to_string();
+                self.progress.current_phase = RunProgressPhase::Tool;
                 self.progress.active_step = format!("Calling {tool_name}");
                 self.tool_statuses.push(ToolStatusView {
                     tool_call_id: *tool_call_id,
@@ -405,7 +460,7 @@ impl AppState {
                 ..
             } => {
                 self.progress.tool_calls_completed += 1;
-                self.progress.current_phase = "tool".to_string();
+                self.progress.current_phase = RunProgressPhase::Tool;
                 self.progress.active_step = format!("Completed {tool}: {title}");
                 update_tool_status(
                     &mut self.tool_statuses,
@@ -431,7 +486,7 @@ impl AppState {
                 ..
             } => {
                 self.progress.tool_calls_declined += 1;
-                self.progress.current_phase = "tool".to_string();
+                self.progress.current_phase = RunProgressPhase::Tool;
                 self.progress.active_step = format!("Declined {tool}: {reason}");
                 update_tool_status(
                     &mut self.tool_statuses,
@@ -457,7 +512,7 @@ impl AppState {
                 ..
             } => {
                 self.progress.tool_calls_cancelled += 1;
-                self.progress.current_phase = "tool".to_string();
+                self.progress.current_phase = RunProgressPhase::Tool;
                 self.progress.active_step = format!("Cancelled {tool}: {reason}");
                 update_tool_status(
                     &mut self.tool_statuses,
@@ -483,7 +538,7 @@ impl AppState {
                 ..
             } => {
                 self.progress.tool_calls_failed += 1;
-                self.progress.current_phase = "tool".to_string();
+                self.progress.current_phase = RunProgressPhase::Tool;
                 self.progress.active_step = format!("Failed {tool}: {error}");
                 update_tool_status(
                     &mut self.tool_statuses,
@@ -516,7 +571,7 @@ impl AppState {
                 ..
             } => {
                 self.progress.compactions += 1;
-                self.progress.current_phase = "compaction".to_string();
+                self.progress.current_phase = RunProgressPhase::Compaction;
                 self.progress.active_step = format!("Compacted {summarized_messages} messages");
                 self.transcript_entries.push(TranscriptEntry {
                     kind: TranscriptKind::System,
@@ -526,19 +581,10 @@ impl AppState {
                     tool_call_id: None,
                 });
             }
-            RunEvent::RetryScheduled {
-                attempt, message, ..
-            } => {
-                self.run_status = RunStatus::Running;
-                self.status_message = Some(format!("retry {attempt}: {message}"));
-                self.progress.retries += 1;
-                self.progress.current_phase = "retry".to_string();
-                self.progress.active_step = format!("Retry {attempt}: {message}");
-            }
             RunEvent::RecoverableRuntimeFeedback { message, .. } => {
                 self.run_status = RunStatus::Running;
                 self.status_message = Some(message.clone());
-                self.progress.current_phase = "runtime_feedback".to_string();
+                self.progress.current_phase = RunProgressPhase::RuntimeFeedback;
                 self.progress.active_step = message.clone();
                 self.transcript_entries.push(TranscriptEntry {
                     kind: TranscriptKind::Error,
@@ -549,44 +595,39 @@ impl AppState {
                 });
             }
             RunEvent::TurnTerminal { terminal, .. } => {
-                self.interruption_cause = terminal.interruption_cause;
+                self.interruption_cause = terminal.interruption_cause();
                 self.permission = None;
                 self.progress.model_requests = terminal.metrics.model_request_count;
                 self.progress.tool_calls_started = terminal.tool_call_count;
                 self.progress.tool_calls_failed = terminal.failed_tool_count;
-                self.progress.current_phase = "terminal".to_string();
-                self.progress.active_step = terminal.summary.clone();
-                match terminal.status {
-                    TurnTerminalStatus::Completed => {
+                self.progress.current_phase = RunProgressPhase::Terminal;
+                self.progress.active_step = terminal.summary().to_string();
+                match &terminal.outcome {
+                    TurnTerminalOutcome::Completed => {
                         self.run_status = RunStatus::Completed;
                         self.status_message = self.run_status.default_status_message();
                         self.progress.status = "Completed".to_string();
                     }
-                    TurnTerminalStatus::Interrupted => {
+                    TurnTerminalOutcome::Interrupted { cause } => {
                         self.run_status = RunStatus::Cancelled;
-                        self.status_message = Some(
-                            terminal
-                                .interruption_cause
-                                .map(interruption_status_message)
-                                .unwrap_or_else(|| terminal.summary.clone()),
-                        );
+                        self.status_message = Some(interruption_status_message(*cause));
                         self.progress.status = "Cancelled".to_string();
                         self.transcript_entries.push(TranscriptEntry {
                             kind: TranscriptKind::System,
                             title: "Run interrupted".to_string(),
-                            body: terminal.summary.clone(),
+                            body: terminal.summary().to_string(),
                             response_id: None,
                             tool_call_id: None,
                         });
                     }
-                    TurnTerminalStatus::Failed => {
+                    TurnTerminalOutcome::Failed { error } => {
                         self.run_status = RunStatus::Failed;
-                        self.status_message = Some(terminal.summary.clone());
+                        self.status_message = Some(error.clone());
                         self.progress.status = "Failed".to_string();
                         self.transcript_entries.push(TranscriptEntry {
                             kind: TranscriptKind::Error,
                             title: "Run failed".to_string(),
-                            body: terminal.summary.clone(),
+                            body: error.clone(),
                             response_id: None,
                             tool_call_id: None,
                         });
@@ -596,23 +637,23 @@ impl AppState {
             RunEvent::ModelRequestPrepared { diagnostics, .. } => {
                 self.progress.model_requests += 1;
                 self.latest_context_window = diagnostics.context_window.clone();
-                self.progress.current_phase = "model".to_string();
+                self.progress.current_phase = RunProgressPhase::Model;
                 self.progress.active_step = format!(
                     "Model request {} with {} tools",
                     self.progress.model_requests, diagnostics.tool_count
                 );
             }
             RunEvent::WorldStateUpdated { snapshot, .. } => {
-                self.progress.current_phase = "context".to_string();
+                self.progress.current_phase = RunProgressPhase::Context;
                 self.progress.active_step =
                     format!("World state updated: {} sections", snapshot.section_count());
             }
             RunEvent::PermissionRequested { summary, .. } => {
-                self.progress.current_phase = "permission".to_string();
+                self.progress.current_phase = RunProgressPhase::Permission;
                 self.progress.active_step = summary.clone();
             }
             RunEvent::PermissionResolved { approved, .. } => {
-                self.progress.current_phase = "permission".to_string();
+                self.progress.current_phase = RunProgressPhase::Permission;
                 self.progress.active_step = if *approved {
                     "permission approved".to_string()
                 } else {
@@ -658,7 +699,7 @@ impl AppState {
         });
         self.run_status = RunStatus::Running;
         self.progress.status = "Running".to_string();
-        self.progress.current_phase = "user".to_string();
+        self.progress.current_phase = RunProgressPhase::User;
         self.progress.active_step = "User input stored".to_string();
     }
 
@@ -673,7 +714,7 @@ impl AppState {
         });
         self.run_status = RunStatus::Running;
         self.progress.status = "Running".to_string();
-        self.progress.current_phase = "user".to_string();
+        self.progress.current_phase = RunProgressPhase::User;
         self.progress.active_step = "Steer input stored".to_string();
     }
 
@@ -759,12 +800,10 @@ fn latest_interruption_cause(turn_items: &[TurnItem]) -> Option<TurnInterruption
         .into_iter()
         .rev()
         .find(|item| matches!(item.payload, TurnItemPayload::Terminal { .. }))
-        .and_then(|item| match item.payload {
+        .and_then(|item| match &item.payload {
             TurnItemPayload::Terminal {
-                status: TurnTerminalStatus::Interrupted,
-                cause,
-                ..
-            } => cause,
+                outcome: TurnTerminalOutcome::Interrupted { cause },
+            } => Some(*cause),
             _ => None,
         })
 }
@@ -865,7 +904,7 @@ fn tool_status_transcript_title(tool: ToolName, status: ToolLifecycleStatus) -> 
 fn progress_from_loaded_state(status: RunStatus, tools: &[ToolStatusView]) -> RunProgressView {
     RunProgressView {
         status: run_status_label_for_progress(status).to_string(),
-        current_phase: "loaded".to_string(),
+        current_phase: RunProgressPhase::Loaded,
         active_step: "Loaded canonical turn items".to_string(),
         model_requests: 0,
         tool_calls_started: tools.len(),
@@ -886,7 +925,6 @@ fn progress_from_loaded_state(status: RunStatus, tools: &[ToolStatusView]) -> Ru
             .filter(|tool| tool.status == ToolCallStatus::Failed)
             .count(),
         compactions: 0,
-        retries: 0,
     }
 }
 
@@ -1062,16 +1100,17 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
                 response_id: None,
                 tool_call_id: None,
             }),
-            TurnItemPayload::Terminal {
-                status,
-                summary,
-                cause,
-            } => Some(TranscriptEntry {
-                kind: terminal_transcript_kind(*status),
+            TurnItemPayload::Terminal { outcome } => Some(TranscriptEntry {
+                kind: terminal_transcript_kind(outcome),
                 title: "Terminal".to_string(),
-                body: cause
-                    .map(interruption_status_message)
-                    .unwrap_or_else(|| summary.clone()),
+                body: match outcome {
+                    TurnTerminalOutcome::Interrupted { cause } => {
+                        interruption_status_message(*cause)
+                    }
+                    TurnTerminalOutcome::Completed | TurnTerminalOutcome::Failed { .. } => {
+                        outcome.summary().to_string()
+                    }
+                },
                 response_id: None,
                 tool_call_id: None,
             }),
@@ -1192,10 +1231,12 @@ fn session_tool_status_from_lifecycle(status: ToolLifecycleStatus) -> ToolCallSt
     }
 }
 
-fn terminal_transcript_kind(status: TurnTerminalStatus) -> TranscriptKind {
-    match status {
-        TurnTerminalStatus::Failed => TranscriptKind::Error,
-        TurnTerminalStatus::Completed | TurnTerminalStatus::Interrupted => TranscriptKind::System,
+fn terminal_transcript_kind(outcome: &TurnTerminalOutcome) -> TranscriptKind {
+    match outcome {
+        TurnTerminalOutcome::Failed { .. } => TranscriptKind::Error,
+        TurnTerminalOutcome::Completed | TurnTerminalOutcome::Interrupted { .. } => {
+            TranscriptKind::System
+        }
     }
 }
 
@@ -1287,6 +1328,39 @@ mod tests {
     }
 
     #[test]
+    fn provider_phase_projects_request_identity_endpoint_and_in_flight_phase() {
+        let response_id = ModelResponseId::new();
+        let request_id = crate::llm::ProviderRequestId::new();
+        let mut state = AppState::default();
+
+        state.apply_run_event(&RunEvent::ProviderPhase {
+            response_id,
+            event: crate::llm::ProviderPhaseEvent {
+                request_id: request_id.clone(),
+                endpoint: "http://external-host:1234".to_string(),
+                phase: crate::llm::ProviderPhase::RequestInFlight,
+                attempt: 1,
+                elapsed_ms: 604,
+                terminal_status: None,
+                failure: None,
+            },
+        });
+
+        assert_eq!(
+            state.progress.current_phase,
+            RunProgressPhase::Provider(crate::llm::ProviderPhase::RequestInFlight)
+        );
+        assert!(state.progress.active_step.contains(request_id.as_str()));
+        assert!(
+            state
+                .progress
+                .active_step
+                .contains("http://external-host:1234")
+        );
+        assert!(state.progress.active_step.contains("604 ms"));
+    }
+
+    #[test]
     fn canonical_plan_item_owns_loaded_plan_projection() {
         let session_id = SessionId::new();
         let items = vec![TurnItem {
@@ -1316,7 +1390,7 @@ mod tests {
                 status: crate::protocol::PlanStepStatus::InProgress,
             }]
         );
-        assert_eq!(state.progress.current_phase, "loaded");
+        assert_eq!(state.progress.current_phase, RunProgressPhase::Loaded);
     }
 
     #[test]

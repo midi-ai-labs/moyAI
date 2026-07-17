@@ -1,10 +1,97 @@
 use serde_json::Value;
 
+use crate::config::sanitize_provider_endpoint;
+use crate::error::SessionError;
 use crate::protocol::{
     ContentPart, HistoryItem, HistoryItemPayload, ToolLifecycleStatus, TurnItemPayload,
-    TurnTerminalStatus, turn_items_in_projection_order,
+    TurnTerminalOutcome, turn_items_in_projection_order,
 };
-use crate::session::{CanonicalSessionRead, RequestDiagnosticsPart, SessionId, ToolCallId};
+use crate::session::{
+    CanonicalHistoryPage, CanonicalSessionRead, CanonicalTurnPage, RequestDiagnosticsPart,
+    SessionId, SessionService, ToolCallId,
+};
+
+const MARKDOWN_EXPORT_PAGE_LIMIT: usize = crate::protocol::MAX_PROTOCOL_PAGE_LIMIT;
+const MARKDOWN_EXPORT_SNAPSHOT_ATTEMPTS: usize = 3;
+
+/// Captures an explicit full-export artifact through bounded SQL pages.
+///
+/// Normal UI/session reads remain paged. Export is the one operation allowed to assemble all
+/// canonical items, and it verifies the append fence before returning so pages from different
+/// revisions are never silently combined.
+pub async fn canonical_markdown_export_read(
+    service: &SessionService,
+    session_id: SessionId,
+) -> Result<CanonicalSessionRead, SessionError> {
+    for _ in 0..MARKDOWN_EXPORT_SNAPSHOT_ATTEMPTS {
+        let first = service
+            .canonical_session_snapshot(
+                session_id,
+                0,
+                MARKDOWN_EXPORT_PAGE_LIMIT,
+                0,
+                MARKDOWN_EXPORT_PAGE_LIMIT,
+            )
+            .await?;
+        let expected_fence = first.fence;
+        let mut history_items = first.read.history.items;
+        let mut turn_items = first.read.turns.items;
+
+        while history_items.len() < expected_fence.history_count {
+            let page = service
+                .canonical_history_page(session_id, history_items.len(), MARKDOWN_EXPORT_PAGE_LIMIT)
+                .await?;
+            if page.items.is_empty() {
+                break;
+            }
+            history_items.extend(page.items);
+        }
+        while turn_items.len() < expected_fence.turn_count {
+            let page = service
+                .canonical_turn_page(session_id, turn_items.len(), MARKDOWN_EXPORT_PAGE_LIMIT)
+                .await?;
+            if page.items.is_empty() {
+                break;
+            }
+            turn_items.extend(page.items);
+        }
+
+        let final_snapshot = service
+            .canonical_latest_session_snapshot(session_id, 1, 1)
+            .await?;
+        if final_snapshot.fence != expected_fence
+            || history_items.len() != expected_fence.history_count
+            || turn_items.len() != expected_fence.turn_count
+        {
+            continue;
+        }
+        let session = final_snapshot.read.session;
+        return Ok(CanonicalSessionRead {
+            history: CanonicalHistoryPage {
+                session: session.clone(),
+                offset: 0,
+                limit: history_items.len(),
+                total: history_items.len(),
+                has_more: false,
+                items: history_items,
+            },
+            turns: CanonicalTurnPage {
+                session: session.clone(),
+                offset: 0,
+                limit: turn_items.len(),
+                total: turn_items.len(),
+                has_more: false,
+                items: turn_items,
+            },
+            active_turn_id: final_snapshot.read.active_turn_id,
+            active_turn_sequence_no: final_snapshot.read.active_turn_sequence_no,
+            session,
+        });
+    }
+    Err(SessionError::Message(format!(
+        "session {session_id} changed while its Markdown export snapshot was being captured"
+    )))
+}
 
 pub fn canonical_session_read_to_markdown(read: &CanonicalSessionRead) -> String {
     let session = &read.session;
@@ -46,25 +133,29 @@ pub fn canonical_session_read_to_markdown(read: &CanonicalSessionRead) -> String
 fn latest_canonical_terminal(
     read: &CanonicalSessionRead,
 ) -> Option<(MarkdownTerminalStatus, String)> {
+    let latest_turn_id = read
+        .history
+        .items
+        .iter()
+        .rev()
+        .find_map(HistoryItem::turn_id)
+        .or_else(|| {
+            turn_items_in_projection_order(&read.turns.items)
+                .last()
+                .map(|item| item.turn_id)
+        })?;
     turn_items_in_projection_order(&read.turns.items)
         .into_iter()
         .rev()
+        .filter(|item| item.turn_id == latest_turn_id)
         .find_map(|item| match &item.payload {
-            TurnItemPayload::Terminal {
-                status,
-                summary,
-                cause,
-            } => Some((
-                match status {
-                    TurnTerminalStatus::Completed => MarkdownTerminalStatus::Completed,
-                    TurnTerminalStatus::Failed => MarkdownTerminalStatus::Failed,
-                    TurnTerminalStatus::Interrupted => MarkdownTerminalStatus::Interrupted,
+            TurnItemPayload::Terminal { outcome } => Some((
+                match outcome {
+                    TurnTerminalOutcome::Completed => MarkdownTerminalStatus::Completed,
+                    TurnTerminalOutcome::Failed { .. } => MarkdownTerminalStatus::Failed,
+                    TurnTerminalOutcome::Interrupted { .. } => MarkdownTerminalStatus::Interrupted,
                 },
-                if summary.trim().is_empty() {
-                    cause.map(|cause| format!("{cause:?}")).unwrap_or_default()
-                } else {
-                    summary.clone()
-                },
+                outcome.summary().to_string(),
             )),
             _ => None,
         })
@@ -396,7 +487,6 @@ fn history_item_detail_title(item: &HistoryItem) -> &'static str {
         HistoryItemPayload::FileChange { .. } => "File Changes",
         HistoryItemPayload::WorldState { .. } => "World State",
         HistoryItemPayload::ApprovalDecision { .. } => "Approval Decision",
-        HistoryItemPayload::RetryDecision { .. } => "Retry Decision",
         HistoryItemPayload::InterAgentCommunication { .. } => "Sub-agent Message",
         HistoryItemPayload::SubAgentActivity { .. } => "Sub-agent Activity",
         HistoryItemPayload::CollaborationModeInstruction { .. } => "Collaboration Mode",
@@ -422,7 +512,7 @@ fn history_metadata_lines(session: &crate::session::SessionRecord) -> Vec<Markdo
         MarkdownMetadataLine::new("Status", format!("{:?}", session.status)),
         MarkdownMetadataLine::new("Workspace", session.cwd.as_str()),
         MarkdownMetadataLine::new("Model", session.model.clone()),
-        MarkdownMetadataLine::new("Base URL", session.base_url.clone()),
+        MarkdownMetadataLine::new("Base URL", sanitize_provider_endpoint(&session.base_url)),
         MarkdownMetadataLine::new("Created At (ms)", session.created_at_ms.to_string()),
         MarkdownMetadataLine::new("Updated At (ms)", session.updated_at_ms.to_string()),
     ];
@@ -592,21 +682,6 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
                 &serde_json::to_string_pretty(decision).unwrap_or_default(),
             );
         }
-        HistoryItemPayload::RetryDecision {
-            attempt,
-            message,
-            next_retry_at_ms,
-        } => {
-            output.push_str("### Retry Decision\n\n");
-            output.push_str("- Attempt: `");
-            output.push_str(&attempt.to_string());
-            output.push_str("`\n");
-            output.push_str("- Next retry at ms: `");
-            output.push_str(&next_retry_at_ms.to_string());
-            output.push_str("`\n\n");
-            output.push_str(message);
-            output.push_str("\n\n");
-        }
         HistoryItemPayload::Compaction { summary, .. } => {
             output.push_str("### Compaction\n\n");
             output.push_str(summary);
@@ -704,7 +779,11 @@ fn push_request_diagnostics(output: &mut String, value: &RequestDiagnosticsPart)
     output.push_str("### Request Diagnostics\n\n");
     push_metadata_line(output, "Provider", &value.provider);
     push_metadata_line(output, "Model", &value.model_name);
-    push_metadata_line(output, "Base URL", &value.base_url);
+    push_metadata_line(
+        output,
+        "Base URL",
+        &sanitize_provider_endpoint(&value.base_url),
+    );
     push_metadata_line(
         output,
         "Request Timeout (ms)",
@@ -847,8 +926,8 @@ mod tests {
     use super::*;
     use crate::config::AccessMode;
     use crate::protocol::{
-        ContentPart, HistoryItemId, InterAgentCommunication, ModelResponseId, SubAgentActivityKind,
-        TurnId, TurnItem, TurnItemId,
+        ContentPart, HistoryItemId, HistoryScope, InterAgentCommunication, ModelResponseId,
+        SubAgentActivityKind, TurnId, TurnItem, TurnItemId,
     };
     use crate::session::{
         CanonicalHistoryPage, CanonicalTurnPage, ProjectId, SessionId, SessionModelParameters,
@@ -885,7 +964,7 @@ mod tests {
         let communication = HistoryItem {
             id: HistoryItemId::new(),
             session_id: session.id,
-            turn_id,
+            scope: HistoryScope::Session,
             sequence_no: 1,
             created_at_ms: 100,
             payload: HistoryItemPayload::InterAgentCommunication {
@@ -900,7 +979,7 @@ mod tests {
         let activity = HistoryItem {
             id: HistoryItemId::new(),
             session_id: session.id,
-            turn_id,
+            scope: HistoryScope::Turn { turn_id },
             sequence_no: 2,
             created_at_ms: 101,
             payload: HistoryItemPayload::SubAgentActivity {
@@ -975,9 +1054,9 @@ mod tests {
             source_item_id: None,
             sequence_no: 2,
             payload: TurnItemPayload::Terminal {
-                status: TurnTerminalStatus::Interrupted,
-                summary: "run cancelled by user".to_string(),
-                cause: Some(crate::protocol::TurnInterruptionCause::UserStop),
+                outcome: TurnTerminalOutcome::Interrupted {
+                    cause: crate::protocol::TurnInterruptionCause::UserStop,
+                },
             },
         };
         let read = canonical_read(
@@ -988,7 +1067,84 @@ mod tests {
 
         let markdown = canonical_session_read_to_markdown(&read);
 
-        assert!(markdown.contains("停止しました: run cancelled by user"));
+        assert!(markdown.contains("停止しました: run stopped by user"));
+    }
+
+    #[test]
+    fn session_scoped_mail_does_not_hide_the_latest_real_turn_terminal() {
+        let session = test_session();
+        let turn_id = TurnId::new();
+        let terminal = TurnItem {
+            id: TurnItemId::new(),
+            session_id: session.id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 2,
+            payload: TurnItemPayload::Terminal {
+                outcome: TurnTerminalOutcome::Completed,
+            },
+        };
+        let mail = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: session.id,
+            scope: HistoryScope::Session,
+            sequence_no: 0,
+            created_at_ms: 200,
+            payload: HistoryItemPayload::InterAgentCommunication {
+                communication: InterAgentCommunication {
+                    author: "/root/worker".to_string(),
+                    recipient: "/root".to_string(),
+                    content: "future evidence".to_string(),
+                    trigger_turn: false,
+                },
+            },
+        };
+        let read = canonical_read(
+            &session,
+            vec![message_item(&session, turn_id, 1, 100, "request"), mail],
+            vec![terminal],
+        );
+
+        assert!(matches!(
+            latest_canonical_terminal(&read),
+            Some((MarkdownTerminalStatus::Completed, summary)) if summary == "completed"
+        ));
+        let markdown = canonical_session_read_to_markdown(&read);
+        assert!(markdown.contains("future evidence"));
+    }
+
+    #[test]
+    fn history_markdown_does_not_attach_an_older_terminal_to_a_new_incomplete_turn() {
+        let mut session = test_session();
+        session.status = SessionStatus::Running;
+        session.completed_at_ms = None;
+        let completed_turn_id = TurnId::new();
+        let incomplete_turn_id = TurnId::new();
+        let older_terminal = TurnItem {
+            id: TurnItemId::new(),
+            session_id: session.id,
+            turn_id: completed_turn_id,
+            source_item_id: None,
+            sequence_no: 2,
+            payload: TurnItemPayload::Terminal {
+                outcome: TurnTerminalOutcome::Interrupted {
+                    cause: crate::protocol::TurnInterruptionCause::UserStop,
+                },
+            },
+        };
+        let read = canonical_read(
+            &session,
+            vec![
+                message_item(&session, completed_turn_id, 1, 100, "older request"),
+                message_item(&session, incomplete_turn_id, 1, 200, "new request"),
+            ],
+            vec![older_terminal],
+        );
+
+        let markdown = canonical_session_read_to_markdown(&read);
+
+        assert!(markdown.contains("new request"));
+        assert!(!markdown.contains("停止しました: run stopped by user"));
     }
 
     fn canonical_read(
@@ -1029,7 +1185,7 @@ mod tests {
         HistoryItem {
             id: HistoryItemId::new(),
             session_id: session.id,
-            turn_id,
+            scope: HistoryScope::Turn { turn_id },
             sequence_no,
             created_at_ms,
             payload: HistoryItemPayload::UserTurn {
@@ -1051,7 +1207,7 @@ mod tests {
         HistoryItem {
             id: HistoryItemId::new(),
             session_id: session.id,
-            turn_id,
+            scope: HistoryScope::Turn { turn_id },
             sequence_no: 1,
             created_at_ms: 100,
             payload: HistoryItemPayload::ToolCall {

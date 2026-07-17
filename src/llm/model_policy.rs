@@ -1,6 +1,5 @@
-use std::collections::BTreeSet;
-
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 use crate::agent::mode::CollaborationMode;
 use crate::config::ResolvedConfig;
@@ -23,10 +22,11 @@ pub struct ModelPolicy {
     pub base_instructions: String,
     pub default_reasoning: Option<ReasoningEffort>,
     pub context_window: u32,
-    pub auto_compact_token_limit: u32,
+    pub working_context_token_limit: u32,
     pub max_output_tokens: u32,
     pub input_modalities: BTreeSet<InputModality>,
     pub supports_tools: bool,
+    pub supports_reasoning: bool,
     pub supports_parallel_tool_calls: bool,
 }
 
@@ -36,11 +36,23 @@ impl ModelPolicy {
         if config.model.supports_images {
             input_modalities.insert(InputModality::Image);
         }
+        let hard_request_limit = config.model.context_window.saturating_sub(
+            config
+                .model
+                .max_output_tokens
+                .saturating_add(config.session.overflow_margin_tokens as u32),
+        );
+        // Keep the normal working set below 40% of the advertised context.
+        // For the default 131,072-token profile this triggers before a roughly
+        // 52k-token full-history resend, while the hard request limit remains a
+        // separate last-resort safety boundary.
+        let working_context_target = config.model.context_window.saturating_mul(2) / 5;
         let compact_margin = config
             .model
             .max_output_tokens
             .saturating_add(config.session.overflow_margin_tokens as u32)
             .saturating_add(config.model.context_window / 20);
+        let legacy_margin_limit = config.model.context_window.saturating_sub(compact_margin);
         Self {
             id: config.model.model.clone(),
             base_instructions: format!(
@@ -50,10 +62,13 @@ impl ModelPolicy {
             ),
             default_reasoning: config.model.reasoning_effort.clone(),
             context_window: config.model.context_window,
-            auto_compact_token_limit: config.model.context_window.saturating_sub(compact_margin),
+            working_context_token_limit: working_context_target
+                .min(hard_request_limit)
+                .min(legacy_margin_limit),
             max_output_tokens: config.model.max_output_tokens,
             input_modalities,
             supports_tools: config.model.supports_tools,
+            supports_reasoning: config.model.supports_reasoning,
             supports_parallel_tool_calls: config.model.parallel_tool_calls,
         }
     }
@@ -69,7 +84,7 @@ impl ModelPolicy {
             provider_metadata_mode,
             capabilities: ModelCapabilities {
                 supports_tools: self.supports_tools,
-                supports_reasoning: self.default_reasoning.is_some(),
+                supports_reasoning: self.supports_reasoning,
                 supports_images: self.input_modalities.contains(&InputModality::Image),
             },
         }
@@ -84,12 +99,8 @@ pub struct ProviderCapabilities {
 
 impl ProviderCapabilities {
     pub fn from_config(config: &ResolvedConfig) -> Self {
-        let api_mode = config
-            .model
-            .provider_api_mode
-            .resolved_for_provider_metadata_mode(config.model.provider_metadata_mode);
+        let api_mode = config.model.provider_api_mode;
         let reasoning = match api_mode {
-            ProviderApiMode::Auto => ProviderReasoningCapability::Unsupported,
             ProviderApiMode::ChatCompletions => config
                 .model
                 .chat_completions_reasoning_parameters
@@ -117,12 +128,16 @@ pub struct ResolvedTurnPolicy {
 impl ResolvedTurnPolicy {
     pub fn resolve(
         mode: &CollaborationMode,
-        mut model: ModelPolicy,
+        model: ModelPolicy,
         provider: ProviderCapabilities,
         reasoning_summary: ReasoningSummary,
     ) -> Result<Self, AgentError> {
         if let Some(model_override) = &mode.model_override {
-            model.id.clone_from(model_override);
+            if model_override.trim() != model.id {
+                return Err(AgentError::Message(format!(
+                    "model override `{model_override}` has no explicit capability profile; configure that model before admitting the turn"
+                )));
+            }
         }
         let effort = mode
             .reasoning_effort_override
@@ -133,6 +148,12 @@ impl ResolvedTurnPolicy {
             summary: reasoning_summary,
         };
         let reasoning = (!reasoning.is_disabled()).then_some(reasoning);
+        if reasoning.is_some() && !model.supports_reasoning {
+            return Err(AgentError::Message(format!(
+                "reasoning was requested for model `{}`, but its configured capability profile does not support reasoning",
+                model.id
+            )));
+        }
         if reasoning.is_some()
             && matches!(provider.reasoning, ProviderReasoningCapability::Unsupported)
         {
@@ -180,5 +201,54 @@ mod tests {
             resolved.model.supports_parallel_tool_calls,
             config.model.parallel_tool_calls
         );
+        assert_eq!(
+            resolved.model.supports_reasoning,
+            config.model.supports_reasoning
+        );
+    }
+
+    #[test]
+    fn model_reasoning_capability_is_independent_from_default_reasoning_request() {
+        let mut config = ResolvedConfig::default();
+        config.model.supports_reasoning = true;
+        config.model.reasoning_effort = None;
+        assert!(
+            ModelPolicy::from_config(&config)
+                .transport_profile(config.model.provider_metadata_mode)
+                .capabilities
+                .supports_reasoning
+        );
+
+        config.model.supports_reasoning = false;
+        config.model.reasoning_effort = Some(ReasoningEffort::High);
+        assert!(
+            !ModelPolicy::from_config(&config)
+                .transport_profile(config.model.provider_metadata_mode)
+                .capabilities
+                .supports_reasoning
+        );
+    }
+
+    #[test]
+    fn unprofiled_mode_model_override_fails_closed() {
+        let config = ResolvedConfig::default();
+        let mut mode = CollaborationMode::resolve(ModeKind::Default);
+        mode.model_override = Some("unprofiled-model".to_string());
+        let error = ResolvedTurnPolicy::resolve(
+            &mode,
+            ModelPolicy::from_config(&config),
+            ProviderCapabilities::from_config(&config),
+            ReasoningSummary::None,
+        )
+        .expect_err("capabilities must not be inherited by an id-only override");
+        assert!(error.to_string().contains("no explicit capability profile"));
+    }
+
+    #[test]
+    fn default_working_context_triggers_before_fifty_two_k_resend() {
+        let config = ResolvedConfig::default();
+        let policy = ModelPolicy::from_config(&config);
+        assert!(policy.working_context_token_limit <= 52_428);
+        assert!(policy.working_context_token_limit < config.model.context_window);
     }
 }

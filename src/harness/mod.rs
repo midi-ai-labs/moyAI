@@ -30,4 +30,4 @@ pub use replay::{ReplayExecution, ReplayMode, ReplayProfile, ReplayRunInput, Rep
 pub use report::{ReplayReport, ReplayStatus, StateTimeline};
 pub use report_store::{ReplayReportStore, SqliteReplayReportStore};
 pub use run_store::{HarnessRunRecord, HarnessRunStatus, HarnessRunStore, SqliteHarnessRunStore};
-pub use runtime_writer::{HarnessRecordingSink, NativeHarnessRecorder};
+pub use runtime_writer::{HarnessRecordingSink, HarnessRecordingStatus, NativeHarnessRecorder};

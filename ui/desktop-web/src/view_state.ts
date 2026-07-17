@@ -2,10 +2,13 @@ import {
   configDraftAppliesTo,
   configMutationPending,
   reconcileConfigDraftTarget,
+  type ConfigValueInput,
 } from "./config_mutation.ts";
 import type {
   ConfigMutationTarget,
+  ConfigDraftCapabilityProjection,
   DesktopWebState,
+  DesktopViewState,
   DraftActionTarget,
   SessionSearchTarget,
 } from "./types.ts";
@@ -58,7 +61,10 @@ export function runOwnerMutationOpen(
   return !uiState.runStartMutationPending && !uiState.externalConfigMutationPending;
 }
 
-export function mutationAdmissionOpen(uiState: UiLocalState, mutationName: string): boolean {
+export function mutationAdmissionOpen(
+  uiState: UiLocalState,
+  mutationName: string,
+): boolean {
   if (mutationConsumesRunOwner(mutationName)) return runOwnerMutationOpen(uiState);
   if (mutationChangesConfigOwner(mutationName)) return configOwnerMutationOpen(uiState);
   return true;
@@ -76,8 +82,7 @@ export interface UiCapabilities {
 }
 
 export function configOwnerMutationOpen(uiState: UiLocalState): boolean {
-  return !uiState.configDirty
-    && !configMutationPending(uiState)
+  return !configMutationPending(uiState)
     && !uiState.externalConfigMutationPending
     && !uiState.runStartMutationPending;
 }
@@ -88,7 +93,8 @@ export function configDraftEditOpen(uiState: UiLocalState): boolean {
 }
 
 export function configDraftDiscardOpen(uiState: UiLocalState): boolean {
-  return uiState.configDirty && configDraftEditOpen(uiState);
+  return uiState.configDirty
+    && configDraftEditOpen(uiState);
 }
 
 export function configDraftCommitOpen(
@@ -96,6 +102,7 @@ export function configDraftCommitOpen(
   initialSetupRequired: boolean,
 ): boolean {
   return configDraftEditOpen(uiState)
+    && !uiState.runStartMutationPending
     && (uiState.configDirty || initialSetupRequired);
 }
 
@@ -113,7 +120,7 @@ export function composerCapabilities(
 
 export function providerCapabilities(
   state: Pick<
-    DesktopWebState,
+    DesktopViewState,
     | "provider_loading"
     | "provider_base_url"
     | "provider_metadata_mode"
@@ -123,7 +130,7 @@ export function providerCapabilities(
     | "provider_max_output_tokens"
     | "provider_selected_index"
     | "provider_apply_enabled"
-    | "config_owner_mutation_open"
+    | "config_draft"
   >,
 ): Pick<UiCapabilities, "canLoadProviderModels" | "canApplyProvider"> {
   const urlValid = /^https?:\/\/\S+$/i.test(state.provider_base_url.trim());
@@ -135,7 +142,7 @@ export function providerCapabilities(
   return {
     canLoadProviderModels: !state.provider_loading && urlValid && limitsValid,
     canApplyProvider: state.provider_apply_enabled
-      && state.config_owner_mutation_open
+      && state.config_draft.external_owner_mutation_open
       && !state.provider_loading
       && urlValid
       && limitsValid
@@ -176,13 +183,16 @@ export function captureDraftMutation(
     snapshot.imageRevision = drafts.imageRevision;
   }
   if (mutationName === "switch_workspace" || mutationName === "open_typed_path") snapshot.workspaceRevision = drafts.workspaceRevision;
-  if (mutationName === "send_prompt_review" || mutationName === "cancel_prompt_review") snapshot.reviewRevision = drafts.reviewRevision;
+  if (mutationName === "send_prompt_review" || mutationName === "cancel_prompt_review") {
+    snapshot.composerOwner = drafts.composerOwner;
+    snapshot.reviewRevision = drafts.reviewRevision;
+  }
   if (PROVIDER_COMMIT_MUTATIONS.has(mutationName)) snapshot.providerRevision = drafts.providerRevision;
   if (RUN_START_MUTATIONS.has(mutationName)) {
     snapshot.runStart = true;
     drafts.pendingRunSubmission = {
       owner: drafts.composerOwner,
-      workspacePath: drafts.composerOwner.slice(0, drafts.composerOwner.lastIndexOf("\u0000")),
+      workspacePath: drafts.composerOwner.slice(0, drafts.composerOwner.indexOf("\u0000")),
       composerRevision: drafts.composerRevision,
       imageRevision: drafts.imageRevision,
       reviewRevision: snapshot.reviewRevision ?? null,
@@ -228,14 +238,19 @@ export function acknowledgeDraftMutation(
     if (snapshot.imageRevision === drafts.imageRevision) drafts.imageInput = state.image_input;
   }
   if (snapshot.workspaceRevision === drafts.workspaceRevision) drafts.workspaceInput = state.workspace_input;
-  if (!startsRun && snapshot.reviewRevision === drafts.reviewRevision) {
-    drafts.reviewDraft = state.review_draft_text;
+  if (
+    !startsRun
+    && snapshot.reviewRevision === drafts.reviewRevision
+    && snapshot.composerOwner === drafts.composerOwner
+    && snapshot.composerOwner === composerOwner(state)
+  ) {
+    synchronizeReviewDraft(drafts, state.review_draft_text);
   }
   if (snapshot.providerRevision === drafts.providerRevision) hydrateProviderDraft(drafts.provider, state);
 }
 
 export function composerOwner(state: DesktopWebState): string {
-  return `${state.draft_target.workspacePath}\u0000${state.draft_target.sessionId ?? "new"}`;
+  return `${state.draft_target.workspacePath}\u0000${state.draft_target.ownerGeneration}\u0000${state.draft_target.sessionId ?? "new"}`;
 }
 
 export function sessionSearchOwner(state: DesktopWebState): string {
@@ -266,19 +281,20 @@ export function draftMutationTarget(state: DesktopWebState): DraftActionTarget {
 export function providerDraftPayload(
   draft: ProviderDraft,
   expectedTarget: ConfigMutationTarget,
-  configOwnerMutationOpen: boolean,
+  draftValues?: ConfigValueInput[],
 ): Record<string, unknown> {
-  return {
+  const payload: Record<string, unknown> = {
     input: {
       baseUrl: draft.baseUrl,
       metadataMode: draft.metadataMode,
       contextWindow: draft.contextWindow,
       maxOutputTokens: draft.maxOutputTokens,
       selectedModelId: draft.selectedModelId,
-      configOwnerMutationOpen,
     },
     expectedTarget,
   };
+  if (draftValues) payload.draftValues = draftValues;
+  return payload;
 }
 
 export function reconcileUiDrafts(
@@ -293,6 +309,7 @@ export function reconcileUiDrafts(
   const nextSearchOwner = sessionSearchOwner(state);
   const nextProviderOwner = providerOwner(state);
   const firstProjection = !drafts.initialized;
+  const composerOwnerChanged = !firstProjection && drafts.composerOwner !== nextComposerOwner;
   const commitGenerationChanged = !firstProjection
     && drafts.composerCommitGeneration !== state.composer_commit_generation;
   const pendingRun = drafts.pendingRunSubmission;
@@ -301,6 +318,7 @@ export function reconcileUiDrafts(
     && pendingRun.owner.endsWith("\u0000new")
     && pendingRun.workspacePath === state.draft_target.workspacePath
     && state.draft_target.sessionId !== null;
+  const reviewOwnerChanged = composerOwnerChanged && !bindsCreatedSession;
   const providerOwnerChanged = drafts.providerOwner !== nextProviderOwner;
   const providerCommitHasNewerDraft = mutationSnapshot?.providerRevision !== undefined
     && mutationSnapshot.providerRevision !== drafts.providerRevision;
@@ -320,7 +338,7 @@ export function reconcileUiDrafts(
         if (pendingRun.composerRevision === drafts.composerRevision) drafts.prompt = state.draft_prompt;
         if (pendingRun.imageRevision === drafts.imageRevision) drafts.imageInput = state.image_input;
         if (pendingRun.reviewRevision === drafts.reviewRevision) {
-          drafts.reviewDraft = state.review_draft_text;
+          synchronizeReviewDraft(drafts, state.review_draft_text);
         }
         drafts.pendingRunSubmission = null;
       } else {
@@ -364,14 +382,29 @@ export function reconcileUiDrafts(
     drafts.provider.selectedModelId = selectedProviderModelId(state);
   }
   if (firstProjection || workspaceOverlayOpened(previous, state)) drafts.workspaceInput = state.workspace_input;
-  if (firstProjection || promptReviewOpened(previous, state)) drafts.reviewDraft = state.review_draft_text;
+  const reviewProjectionAdvanced = state.overlay === "prompt_review"
+    && previous?.overlay === "prompt_review"
+    && previous.review_draft_text !== state.review_draft_text;
+  if (
+    firstProjection
+    || reviewOwnerChanged
+    || promptReviewOpened(previous, state)
+    || (reviewProjectionAdvanced && drafts.reviewRevision === drafts.reviewSyncedRevision)
+  ) {
+    synchronizeReviewDraft(drafts, state.review_draft_text);
+  }
   if (firstProjection || commandPaletteOpened(previous, state)) drafts.localSearch = state.local_search_text;
   if (!mutationSnapshot?.runStart && mutationSnapshot?.imageRevision === drafts.imageRevision) {
     drafts.imageInput = state.image_input;
   }
   if (mutationSnapshot?.workspaceRevision === drafts.workspaceRevision) drafts.workspaceInput = state.workspace_input;
-  if (!mutationSnapshot?.runStart && mutationSnapshot?.reviewRevision === drafts.reviewRevision) {
-    drafts.reviewDraft = state.review_draft_text;
+  if (
+    !mutationSnapshot?.runStart
+    && mutationSnapshot?.reviewRevision === drafts.reviewRevision
+    && mutationSnapshot.composerOwner === drafts.composerOwner
+    && mutationSnapshot.composerOwner === nextComposerOwner
+  ) {
+    synchronizeReviewDraft(drafts, state.review_draft_text);
   }
   drafts.initialized = true;
 }
@@ -385,6 +418,7 @@ export function deriveUiCapabilities(state: DesktopWebState, uiState: UiLocalSta
     composer.canReviewUncommitted = false;
   }
   const provider = uiState.drafts.provider;
+  const configDraft = activeConfigDraftProjection(state, uiState);
   const selectedModelIndex = state.provider_model_ids.indexOf(provider.selectedModelId);
   const providerActions = providerCapabilities({
     provider_loading: state.provider_loading,
@@ -396,7 +430,7 @@ export function deriveUiCapabilities(state: DesktopWebState, uiState: UiLocalSta
     provider_max_output_tokens: provider.maxOutputTokens,
     provider_selected_index: selectedModelIndex,
     provider_apply_enabled: state.provider_apply_enabled,
-    config_owner_mutation_open: configOwnerMutationOpen(uiState),
+    config_draft: configDraft,
   });
   return {
     ...composer,
@@ -412,9 +446,9 @@ export function deriveUiCapabilities(state: DesktopWebState, uiState: UiLocalSta
   };
 }
 
-export function projectViewState(state: DesktopWebState, uiState: UiLocalState): DesktopWebState {
+export function projectViewState(state: DesktopWebState, uiState: UiLocalState): DesktopViewState {
   const capabilities = deriveUiCapabilities(state, uiState);
-  const configMutationOpen = configOwnerMutationOpen(uiState);
+  const configDraft = activeConfigDraftProjection(state, uiState);
   const runStartPending = uiState.runStartMutationPending;
   const providerIndex = state.provider_model_ids.indexOf(uiState.drafts.provider.selectedModelId);
   const configFields = state.config_fields.map((field) => ({
@@ -436,19 +470,8 @@ export function projectViewState(state: DesktopWebState, uiState: UiLocalState):
     provider_context_window: uiState.drafts.provider.contextWindow,
     provider_max_output_tokens: uiState.drafts.provider.maxOutputTokens,
     provider_selected_index: providerIndex >= 0 ? providerIndex : state.provider_selected_index,
-    config_owner_mutation_open: configMutationOpen,
-    config_draft_dirty: uiState.configDirty,
-    config_draft_discard_enabled: configDraftDiscardOpen(uiState),
-    config_draft_commit_enabled: configDraftCommitOpen(
-      uiState,
-      state.startup.initial_setup_required,
-    ),
-    access_target: {
-      ...state.access_target,
-      configOwnerMutationOpen: configMutationOpen,
-    },
-    access_mode_mutation_enabled: state.access_mode_mutation_enabled
-      && configMutationOpen,
+    config_draft: configDraft,
+    access_target: state.access_target,
     navigation_admission_open: state.navigation_admission_open && !runStartPending,
     background_mutation_pending: state.background_mutation_pending || runStartPending,
     busy: state.busy || runStartPending,
@@ -460,7 +483,26 @@ export function projectViewState(state: DesktopWebState, uiState: UiLocalState):
     send_raw_enabled: capabilities.canSendRawReview,
     provider_apply_enabled: capabilities.canApplyProvider,
     config_fields: configFields,
-    config_value_text: configFields[state.selected_config_index]?.value ?? state.config_value_text,
+  };
+}
+
+export function activeConfigDraftProjection(
+  state: DesktopWebState,
+  uiState: UiLocalState,
+): ConfigDraftCapabilityProjection {
+  const projected = uiState.configDirty
+    ? state.config_draft_capabilities.dirty
+    : state.config_draft_capabilities.clean;
+  const editOpen = configDraftEditOpen(uiState);
+  const ownerMutationOpen = configOwnerMutationOpen(uiState);
+  return {
+    ...projected,
+    edit_enabled: projected.edit_enabled && editOpen,
+    discard_enabled: projected.discard_enabled && configDraftDiscardOpen(uiState),
+    commit_enabled: projected.commit_enabled
+      && configDraftCommitOpen(uiState, state.startup.initial_setup_required),
+    external_owner_mutation_open: projected.external_owner_mutation_open && ownerMutationOpen,
+    access_mode_mutation_enabled: projected.access_mode_mutation_enabled && ownerMutationOpen,
   };
 }
 
@@ -478,6 +520,14 @@ function hydrateProviderDraft(draft: ProviderDraft, state: DesktopWebState): voi
 
 function selectedProviderModelId(state: DesktopWebState): string {
   return state.provider_model_ids[state.provider_selected_index] ?? "";
+}
+
+function synchronizeReviewDraft(
+  drafts: UiLocalState["drafts"],
+  reviewDraft: string,
+): void {
+  drafts.reviewDraft = reviewDraft;
+  drafts.reviewSyncedRevision = drafts.reviewRevision;
 }
 
 function positiveInteger(value: string): boolean {

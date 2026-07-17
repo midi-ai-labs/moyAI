@@ -2,6 +2,7 @@ pub mod loader;
 pub mod merge;
 pub mod model;
 pub mod permission_profile_catalog;
+pub mod turn;
 
 pub use loader::ConfigLoader;
 pub use model::{
@@ -15,4 +16,8 @@ pub use model::{
 };
 pub use permission_profile_catalog::{
     PermissionProfileCatalog, PermissionProfileEntry, builtin_permission_profiles,
+};
+pub use turn::{
+    ProviderDeadlines, ProviderEndpoint, ProviderEndpointError, ProviderRequestLimits,
+    ProviderStreamLimits, ProviderTarget, ResolvedTurnConfig, sanitize_provider_endpoint,
 };

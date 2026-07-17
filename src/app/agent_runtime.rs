@@ -5,24 +5,25 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::app::{AppCommand, RunRequest, RunService};
+use crate::app::{AppCommand, RunConfigInput, RunRequest, RunService};
 use crate::cli::{EventRenderer, OutputMode, SharedConfirmationPrompt};
-use crate::config::ResolvedConfig;
-use crate::config::model::full_effective_override;
+use crate::config::{ResolvedConfig, ResolvedTurnConfig};
 use crate::error::{AppRunError, CliRenderError};
 use crate::protocol::{
-    ContentPart, HistoryItemPayload, InterAgentCommunication, ProtocolEventStore,
-    SubAgentActivityKind, TurnInterruptionCause,
+    ContentPart, HistoryItemId, HistoryItemPayload, InterAgentCommunication, ProtocolEventStore,
+    SubAgentActivityKind, TurnId, TurnInterruptionCause,
 };
 use crate::runtime::{
-    AgentControl, AgentControlError, AgentExecutionLease, AgentMailDeliveryOutcome,
-    AgentMailboxMessage, AgentPath, AgentRootContinuationOutcome, AgentSnapshot, AgentStatus,
-    RunCancellationCause, RunControl,
+    ActiveAgentStatus, AgentControl, AgentControlError, AgentExecutionLease, AgentExecutionScope,
+    AgentMailDeliveryOutcome, AgentMailboxNotice, AgentPath, AgentRootContinuationOutcome,
+    AgentSnapshot, AgentStatus, InactiveAgentStatus, RunCancellationCause, RunControl,
 };
+#[cfg(test)]
+use crate::session::SessionRepository;
 use crate::session::{
-    CanonicalHistoryPage, CanonicalRuntimeEventPage, CanonicalSessionRead, CanonicalTurnPage,
-    IdleTurnAdmission, LoadedSessionList, RunEvent, RunSummary, RunningSessionRejoin,
-    SessionContext, SessionId, SessionRecord, SessionRepository, SessionSettingsPatch,
+    AdmissionId, CanonicalHistoryPage, CanonicalRuntimeEventPage, CanonicalSessionRead,
+    CanonicalTurnPage, IdleTurnAdmission, LoadedSessionList, RunEvent, RunSummary,
+    RunningSessionRejoin, SessionContext, SessionId, SessionRecord, SessionSettingsPatch,
     SessionSpawnEdge, SessionStartRequest, SessionStatus, ThreadGoalClearResult,
     ThreadGoalGetResult, ThreadGoalSetResult,
 };
@@ -64,9 +65,16 @@ pub struct AgentRunContext {
     tree: Arc<AgentTreeRuntime>,
     path: AgentPath,
     session_id: SessionId,
-    config: ResolvedConfig,
+    execution: AgentExecutionScope,
+    root_turn_owner: Arc<OnceLock<AgentDurableTurnOwner>>,
+    config: Arc<ResolvedTurnConfig>,
     workspace: Workspace,
-    live_config: Option<crate::runtime::LiveConfigOverrides>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentDurableTurnOwner {
+    admission_id: AdmissionId,
+    turn_id: TurnId,
 }
 
 impl fmt::Debug for AgentRunContext {
@@ -110,11 +118,7 @@ impl AgentRunContext {
     }
 
     fn effective_config(&self) -> ResolvedConfig {
-        let mut config = self.config.clone();
-        if let Some(live_config) = self.live_config.as_ref() {
-            live_config.apply_to(&mut config);
-        }
-        config
+        self.config.runtime_config().clone()
     }
 
     pub(crate) fn cancel_for_durable_terminal(&self) -> Result<(), String> {
@@ -196,26 +200,63 @@ impl AgentRunContext {
     }
 
     pub(crate) fn set_activity(&self, activity: impl Into<String>) {
-        let _ = self
-            .tree
-            .control
-            .set_activity(&self.path, Some(activity.into()));
+        let _ = self.execution.set_activity(Some(activity.into()));
     }
 
-    pub(crate) fn drain_mailbox(&self) -> Vec<AgentMailboxMessage> {
-        let messages = self
+    pub(crate) fn bind_root_turn_owner(
+        &self,
+        admission_id: AdmissionId,
+        turn_id: TurnId,
+    ) -> Result<(), String> {
+        if !self.path.is_root() {
+            return Err(format!(
+                "agent `{}` cannot own the root durable turn fence",
+                self.path
+            ));
+        }
+        let owner = AgentDurableTurnOwner {
+            admission_id,
+            turn_id,
+        };
+        self.root_turn_owner
+            .set(owner)
+            .map_err(|_| "root execution is already bound to a durable turn owner".to_string())?;
+        *self
+            .tree
+            .active_root_turn_owner
+            .lock()
+            .map_err(|_| "active root turn owner lock was poisoned".to_string())? = Some(owner);
+        Ok(())
+    }
+
+    fn durable_root_turn_owner(&self) -> Result<AgentDurableTurnOwner, String> {
+        self.root_turn_owner.get().copied().ok_or_else(|| {
+            format!(
+                "agent `{}` has no originating durable root turn owner",
+                self.path
+            )
+        })
+    }
+
+    pub(crate) fn drain_mailbox(&self) -> Result<Vec<AgentMailboxNotice>, String> {
+        let notices = self
             .tree
             .control
             .drain_mailbox(&self.path)
-            .unwrap_or_default();
+            .map_err(agent_control_error)?;
+        let item_ids = notices
+            .iter()
+            .map(|notice| notice.history_item_id)
+            .collect::<Vec<_>>();
+        let authors = self.durable_mailbox_authors(&item_ids).unwrap_or_default();
         if let Ok(mut metadata) = self.tree.metadata.lock() {
-            for message in &messages {
-                if let Some(author) = metadata.get_mut(&message.author) {
+            for author_path in authors {
+                if let Some(author) = metadata.get_mut(&author_path) {
                     author.updated = false;
                 }
             }
         }
-        messages
+        Ok(notices)
     }
 
     fn ensure_spawn_depth(&self) -> Result<(), String> {
@@ -229,11 +270,13 @@ impl AgentRunContext {
     }
 
     fn wait_result(&self, timed_out: bool) -> Result<AgentWaitResult, String> {
-        let updated_agents = self
+        let item_ids = self
             .tree
             .control
-            .mailbox_senders(&self.path)
-            .map_err(agent_control_error)?
+            .mailbox_history_item_ids(&self.path)
+            .map_err(agent_control_error)?;
+        let updated_agents = self
+            .durable_mailbox_authors(&item_ids)?
             .into_iter()
             .map(String::from)
             .collect::<Vec<_>>();
@@ -247,6 +290,38 @@ impl AgentRunContext {
             updated_agents,
         })
     }
+
+    fn durable_mailbox_authors(
+        &self,
+        item_ids: &[HistoryItemId],
+    ) -> Result<Vec<AgentPath>, String> {
+        let items = self
+            .runtime
+            .store
+            .protocol_event_store()
+            .history_items_by_id(self.session_id, item_ids)
+            .map_err(|error| error.to_string())?;
+        let mut authors = Vec::new();
+        for item in items {
+            let HistoryItemPayload::InterAgentCommunication { communication } = item.payload else {
+                return Err(format!(
+                    "mailbox notice {} does not reference canonical inter-agent communication",
+                    item.id
+                ));
+            };
+            if communication.recipient != self.path.as_str() {
+                return Err(format!(
+                    "mailbox notice {} targets `{}` instead of `{}`",
+                    item.id, communication.recipient, self.path
+                ));
+            }
+            let author = AgentPath::try_from(communication.author.as_str())?;
+            if !authors.contains(&author) {
+                authors.push(author);
+            }
+        }
+        Ok(authors)
+    }
 }
 
 pub(crate) struct AgentRuntimeExecution {
@@ -255,7 +330,6 @@ pub(crate) struct AgentRuntimeExecution {
 }
 
 pub(crate) enum AgentRuntimeContinuationOutcome {
-    Unmanaged,
     Admitted(AgentRuntimeExecution),
     Blocked,
     NotReady,
@@ -263,6 +337,13 @@ pub(crate) enum AgentRuntimeContinuationOutcome {
 }
 
 impl AgentRuntimeExecution {
+    pub(crate) fn run_control(&self) -> RunControl {
+        self.lease
+            .as_ref()
+            .map(AgentExecutionLease::run_control)
+            .expect("an active agent runtime execution must retain its lease")
+    }
+
     fn complete(mut self, status: AgentStatus) -> Result<Vec<AgentExecutionLease>, String> {
         let lease = self
             .lease
@@ -272,7 +353,7 @@ impl AgentRuntimeExecution {
             .context
             .tree
             .control
-            .complete_execution(lease, status, None)
+            .complete_execution(lease, inactive_agent_status(status)?, None)
             .map_err(agent_control_error)?;
         self.context.tree.release_confirmation_if_quiescent();
         Ok(scheduled)
@@ -282,11 +363,13 @@ impl AgentRuntimeExecution {
 impl Drop for AgentRuntimeExecution {
     fn drop(&mut self) {
         if let Some(lease) = self.lease.take() {
-            let _ = self.context.tree.control.set_status(
-                &self.context.path,
-                AgentStatus::Errored("agent execution ended before terminal handoff".to_string()),
+            let _ = self.context.tree.control.complete_execution(
+                lease,
+                InactiveAgentStatus::Errored(
+                    "agent execution ended before terminal handoff".to_string(),
+                ),
+                None,
             );
-            drop(lease);
             self.context.tree.release_confirmation_if_quiescent();
         }
     }
@@ -304,6 +387,7 @@ struct AgentTreeRuntime {
     control: AgentControl,
     confirmation: Mutex<Option<SharedConfirmationPrompt>>,
     model_request_gate: Mutex<Arc<tokio::sync::Semaphore>>,
+    active_root_turn_owner: Mutex<Option<AgentDurableTurnOwner>>,
     metadata: Mutex<HashMap<AgentPath, AgentNodeMetadata>>,
 }
 
@@ -311,15 +395,15 @@ struct AgentTreeRuntime {
 struct AgentNodeMetadata {
     task_name: String,
     task_preview: String,
-    config: ResolvedConfig,
+    config: Arc<ResolvedTurnConfig>,
     workspace: Workspace,
-    live_config: Option<crate::runtime::LiveConfigOverrides>,
     updated: bool,
 }
 
 struct DurableAgentChild {
     edge: SessionSpawnEdge,
-    session: SessionRecord,
+    session_id: SessionId,
+    session_status: SessionStatus,
     task_preview: String,
     result: Option<String>,
     interruption_cause: Option<TurnInterruptionCause>,
@@ -329,6 +413,36 @@ struct AgentLaunchFailure {
     message: String,
     context: AgentRunContext,
     lease: AgentExecutionLease,
+}
+
+struct AgentTurnCompletion {
+    status: AgentStatus,
+    activity: Option<String>,
+}
+
+impl AgentTurnCompletion {
+    fn new(status: AgentStatus) -> Self {
+        Self {
+            status,
+            activity: None,
+        }
+    }
+
+    fn with_delivery_outcome(
+        mut self,
+        outcome: Result<AgentMailDeliveryOutcome, AgentControlError>,
+    ) -> Self {
+        self.activity = match outcome {
+            Ok(AgentMailDeliveryOutcome::Enqueued { .. }) => None,
+            Ok(AgentMailDeliveryOutcome::Suppressed) => {
+                Some(SUPPRESSED_MAIL_DELIVERY_ERROR.to_string())
+            }
+            Err(error) => Some(format!(
+                "agent result could not be delivered durably: {error}"
+            )),
+        };
+        self
+    }
 }
 
 impl AgentTreeRuntime {
@@ -398,16 +512,51 @@ impl AgentRuntime {
             .map_err(|_| "agent runtime is already bound to a run service".to_string())
     }
 
-    pub(crate) fn begin_root(
+    pub(crate) async fn begin_root(
         self: &Arc<Self>,
         session: &SessionContext,
-        config: ResolvedConfig,
+        config: Arc<ResolvedTurnConfig>,
         confirmation: SharedConfirmationPrompt,
-        live_config: Option<crate::runtime::LiveConfigOverrides>,
         run_control: RunControl,
     ) -> Result<AgentRuntimeExecution, String> {
+        let effective_config = config.runtime_config();
         let root_session_id = session.session.id;
-        let (tree, lease) = {
+        let existing = {
+            let trees = self
+                .trees
+                .lock()
+                .map_err(|_| "agent tree registry lock was poisoned".to_string())?;
+            if let Some(tree) = trees
+                .get(&root_session_id)
+                .filter(|tree| !tree.control.tree_is_cancelled())
+                .cloned()
+            {
+                if !tree.control.is_quiescent().map_err(agent_control_error)? {
+                    return Err(format!(
+                        "agent tree for session {root_session_id} is still active"
+                    ));
+                }
+                tree.control
+                    .reconfigure_max_concurrent_agents(
+                        effective_config.multi_agent.max_concurrent_agents,
+                    )
+                    .map_err(agent_control_error)?;
+                let lease = tree
+                    .control
+                    .try_acquire_root_execution(run_control.clone())
+                    .map_err(agent_control_error)?;
+                Some((tree, lease))
+            } else {
+                None
+            }
+        };
+        let (tree, lease) = if let Some(existing) = existing {
+            existing
+        } else {
+            // Durable restoration performs bounded storage work without holding the process-wide
+            // tree registry. Revalidate after the await because another admission may have
+            // installed the retained tree meanwhile.
+            let durable_children = self.load_durable_children(root_session_id).await?;
             let mut trees = self
                 .trees
                 .lock()
@@ -423,18 +572,19 @@ impl AgentRuntime {
                     ));
                 }
                 tree.control
-                    .reconfigure_max_concurrent_agents(config.multi_agent.max_concurrent_agents)
+                    .reconfigure_max_concurrent_agents(
+                        effective_config.multi_agent.max_concurrent_agents,
+                    )
                     .map_err(agent_control_error)?;
                 let lease = tree
                     .control
-                    .try_acquire_execution_with_control(&AgentPath::root(), run_control.clone())
+                    .try_acquire_root_execution(run_control.clone())
                     .map_err(agent_control_error)?;
                 (tree, lease)
             } else {
-                let durable_children = self.load_durable_children(root_session_id)?;
                 let (control, lease) = AgentControl::with_root_control(
                     root_session_id,
-                    config.multi_agent.max_concurrent_agents,
+                    effective_config.multi_agent.max_concurrent_agents,
                     run_control,
                 )
                 .map_err(agent_control_error)?;
@@ -443,6 +593,7 @@ impl AgentRuntime {
                     control,
                     confirmation: Mutex::new(None),
                     model_request_gate: Mutex::new(Arc::new(tokio::sync::Semaphore::new(1))),
+                    active_root_turn_owner: Mutex::new(None),
                     metadata: Mutex::new(HashMap::new()),
                 });
                 self.restore_durable_children(
@@ -450,7 +601,6 @@ impl AgentRuntime {
                     durable_children,
                     &config,
                     &session.workspace,
-                    live_config.as_ref(),
                 )?;
                 trees.insert(root_session_id, tree.clone());
                 (tree, lease)
@@ -458,10 +608,10 @@ impl AgentRuntime {
         };
         tree.install_run_resources(
             confirmation,
-            config.multi_agent.max_concurrent_model_requests,
+            effective_config.multi_agent.max_concurrent_model_requests,
         );
-        tree.control
-            .set_status(&AgentPath::root(), AgentStatus::Running)
+        lease
+            .set_status(ActiveAgentStatus::Running)
             .map_err(agent_control_error)?;
         let mut metadata = tree
             .metadata
@@ -469,9 +619,8 @@ impl AgentRuntime {
             .map_err(|_| "agent metadata lock was poisoned".to_string())?;
         for (path, node) in metadata.iter_mut() {
             if !path.is_root() {
-                node.config = config.clone();
+                node.config = Arc::clone(&config);
                 node.workspace = session.workspace.clone();
-                node.live_config = live_config.clone();
             }
         }
         metadata.insert(
@@ -479,9 +628,8 @@ impl AgentRuntime {
             AgentNodeMetadata {
                 task_name: "root".to_string(),
                 task_preview: String::new(),
-                config: config.clone(),
+                config: Arc::clone(&config),
                 workspace: session.workspace.clone(),
-                live_config: live_config.clone(),
                 updated: false,
             },
         );
@@ -491,9 +639,10 @@ impl AgentRuntime {
             tree: tree.clone(),
             path: AgentPath::root(),
             session_id: root_session_id,
+            execution: lease.scope(),
+            root_turn_owner: Arc::new(OnceLock::new()),
             config,
             workspace: session.workspace.clone(),
-            live_config,
         };
         Ok(AgentRuntimeExecution {
             context,
@@ -512,16 +661,15 @@ impl AgentRuntime {
             .lock()
             .map_err(|_| "agent tree registry lock was poisoned".to_string())?
             .get(&root_session_id)
-            .cloned();
-        let Some(tree) = tree else {
-            return Ok(AgentRuntimeContinuationOutcome::Unmanaged);
-        };
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "session {root_session_id} has no retained root task scope for continuation"
+                )
+            })?;
         let confirmation = confirmation.ok_or_else(|| {
-            "multi-agent continuation requires a shared permission confirmation channel".to_string()
+            "root continuation requires a shared permission confirmation channel".to_string()
         })?;
-        let context = self.context_for_path(&tree, &AgentPath::root())?;
-        let max_concurrent_model_requests =
-            context.config.multi_agent.max_concurrent_model_requests;
         let lease = match tree
             .control
             .try_acquire_root_continuation(run_control.clone())
@@ -538,58 +686,50 @@ impl AgentRuntime {
                 return Ok(AgentRuntimeContinuationOutcome::Invalid);
             }
         };
+        let context = self.context_for_execution(&tree, &lease)?;
+        let max_concurrent_model_requests = context
+            .config
+            .runtime_config()
+            .multi_agent
+            .max_concurrent_model_requests;
+        let continuation_control = lease.run_control();
+        if let Err(error) = lease.set_status(ActiveAgentStatus::Running) {
+            let message = agent_control_error(error);
+            continuation_control.fail(message.clone());
+            drop(lease);
+            return Err(message);
+        }
         let execution = AgentRuntimeExecution {
             context,
             lease: Some(lease),
         };
-        if let Err(error) = tree
-            .control
-            .set_status(&AgentPath::root(), AgentStatus::Running)
-        {
-            let message = agent_control_error(error);
-            run_control.fail(message.clone());
-            drop(execution);
-            return Err(message);
-        }
         tree.install_run_resources(confirmation, max_concurrent_model_requests);
         Ok(AgentRuntimeContinuationOutcome::Admitted(execution))
     }
 
-    fn load_durable_children(
+    async fn load_durable_children(
         &self,
         root_session_id: SessionId,
     ) -> Result<Vec<DurableAgentChild>, String> {
         let store = self.store.clone();
-        let worker = std::thread::Builder::new()
-            .name("moyai-agent-tree-rehydrate".to_string())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| {
-                        format!("failed to build agent tree rehydration runtime: {error}")
-                    })?;
-                runtime.block_on(load_durable_agent_children(&store, root_session_id))
-            })
-            .map_err(|error| format!("failed to start agent tree rehydration: {error}"))?;
-        worker
-            .join()
-            .map_err(|_| "agent tree rehydration worker panicked".to_string())?
+        tokio::task::spawn_blocking(move || load_durable_agent_children(&store, root_session_id))
+            .await
+            .map_err(|error| format!("agent tree rehydration worker failed: {error}"))?
     }
 
     fn restore_durable_children(
         &self,
         tree: &Arc<AgentTreeRuntime>,
         durable_children: Vec<DurableAgentChild>,
-        config: &ResolvedConfig,
+        config: &Arc<ResolvedTurnConfig>,
         workspace: &Workspace,
-        live_config: Option<&crate::runtime::LiveConfigOverrides>,
     ) -> Result<(), String> {
         let mut restored_metadata = Vec::with_capacity(durable_children.len());
         for durable_child in durable_children {
             let DurableAgentChild {
                 edge,
-                session: child,
+                session_id,
+                session_status,
                 task_preview,
                 result,
                 interruption_cause,
@@ -597,20 +737,17 @@ impl AgentRuntime {
             if edge.root_session_id != tree.root_session_id {
                 return Err(format!(
                     "spawn edge for child {} belongs to root {}, expected {}",
-                    child.id, edge.root_session_id, tree.root_session_id
+                    session_id, edge.root_session_id, tree.root_session_id
                 ));
             }
-            let parent_path = tree
-                .control
-                .path_for_session(edge.parent_session_id)
-                .map_err(agent_control_error)?
-                .ok_or_else(|| {
-                    format!(
-                        "spawn edge {} refers to missing parent session {}",
-                        edge.agent_path, edge.parent_session_id
-                    )
-                })?;
-            let expected_path = parent_path.join(&edge.task_name)?;
+            if edge.parent_session_id != tree.root_session_id {
+                return Err(format!(
+                    "spawn edge {} uses non-root parent session {}; only root → direct-child lineage is supported",
+                    edge.agent_path, edge.parent_session_id
+                ));
+            }
+            let root_path = AgentPath::root();
+            let expected_path = root_path.join(&edge.task_name)?;
             let durable_path = AgentPath::try_from(edge.agent_path.as_str())?;
             if expected_path != durable_path {
                 return Err(format!(
@@ -618,19 +755,25 @@ impl AgentRuntime {
                     durable_path, expected_path
                 ));
             }
-            let status = rehydrated_agent_state(&child, result, interruption_cause)?;
+            let status =
+                rehydrated_agent_state(session_id, session_status, result, interruption_cause)?;
             let snapshot = tree
                 .control
-                .restore_inactive_child(&parent_path, &edge.task_name, child.id, status, None)
+                .restore_inactive_child(
+                    &root_path,
+                    &edge.task_name,
+                    session_id,
+                    inactive_agent_status(status)?,
+                    None,
+                )
                 .map_err(agent_control_error)?;
             restored_metadata.push((
                 snapshot.path,
                 AgentNodeMetadata {
                     task_name: edge.task_name,
                     task_preview,
-                    config: config.clone(),
+                    config: Arc::clone(config),
                     workspace: workspace.clone(),
-                    live_config: live_config.cloned(),
                     updated: false,
                 },
             ));
@@ -646,19 +789,22 @@ impl AgentRuntime {
         &self,
         root_session_id: SessionId,
     ) -> Result<Vec<AgentActivityRecord>, String> {
-        load_durable_agent_children(&self.store, root_session_id)
-            .await?
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || load_durable_agent_children(&store, root_session_id))
+            .await
+            .map_err(|error| format!("durable agent projection worker failed: {error}"))??
             .into_iter()
             .enumerate()
             .map(|(index, child)| {
                 let status = durable_projection_status(
-                    &child.session,
+                    child.session_id,
+                    child.session_status,
                     child.result,
                     child.interruption_cause,
                 );
                 Ok(AgentActivityRecord {
                     agent_path: child.edge.agent_path,
-                    session_id: child.session.id,
+                    session_id: child.session_id,
                     task_name: child.edge.task_name,
                     task_preview: preview(&child.task_preview, 240),
                     result_preview: agent_status_result(&status),
@@ -682,7 +828,7 @@ impl AgentRuntime {
         let tree = execution.context.tree.clone();
         let durable_success = matches!(
             result,
-            Ok(summary) if summary.status == SessionStatus::Completed
+            Ok(summary) if summary.status() == SessionStatus::Completed
         );
         let terminal_cause = effective_run_terminal_cause(result, cancellation_cause);
         if !durable_success {
@@ -710,6 +856,17 @@ impl AgentRuntime {
             self.launch_scheduled_turns(&tree, scheduled);
         }
         tree.release_confirmation_if_quiescent();
+    }
+
+    pub(crate) fn release_unadmitted_root_continuation(
+        self: &Arc<Self>,
+        execution: AgentRuntimeExecution,
+    ) -> Result<(), String> {
+        let tree = execution.context.tree.clone();
+        let scheduled = execution.complete(AgentStatus::Completed(None))?;
+        self.launch_scheduled_turns(&tree, scheduled);
+        tree.release_confirmation_if_quiescent();
+        Ok(())
     }
 
     pub fn activity_records(&self, root_session_id: SessionId) -> Vec<AgentActivityRecord> {
@@ -900,23 +1057,27 @@ impl AgentRuntime {
                 AgentNodeMetadata {
                     task_name: task_name.to_string(),
                     task_preview: message.clone(),
-                    config: child_config.clone(),
+                    config: Arc::clone(&caller.config),
                     workspace: caller.workspace.clone(),
-                    live_config: caller.live_config.clone(),
                     updated: false,
                 },
             );
         if let Err(error) = self.append_activity(
-            caller.session_id,
+            caller,
             &activity_id,
             child_session_id,
             &child_path,
             SubAgentActivityKind::Started,
         ) {
-            drop(lease);
-            self.rollback_spawn(&caller.tree, &child_path, child_session_id)
-                .await;
-            return Err(error);
+            return match self
+                .rollback_spawn(&caller.tree, lease, child_session_id)
+                .await
+            {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(format!(
+                    "{error}; failed to roll back the uncommitted child registration: {cleanup_error}"
+                )),
+            };
         }
 
         let child_context = AgentRunContext {
@@ -924,15 +1085,22 @@ impl AgentRuntime {
             tree: caller.tree.clone(),
             path: child_path.clone(),
             session_id: child_session_id,
-            config: child_config,
+            execution: lease.scope(),
+            root_turn_owner: Arc::clone(&caller.root_turn_owner),
+            config: Arc::clone(&caller.config),
             workspace: caller.workspace.clone(),
-            live_config: caller.live_config.clone(),
         };
         if let Err(failure) = self.launch_agent_turn(child_context, lease, message) {
-            drop(failure.lease);
-            self.rollback_spawn(&caller.tree, &child_path, child_session_id)
-                .await;
-            return Err(failure.message);
+            let AgentLaunchFailure { message, lease, .. } = failure;
+            return match self
+                .rollback_spawn(&caller.tree, lease, child_session_id)
+                .await
+            {
+                Ok(()) => Err(message),
+                Err(cleanup_error) => Err(format!(
+                    "{message}; failed to roll back the uncommitted child registration: {cleanup_error}"
+                )),
+            };
         }
         Ok(snapshot)
     }
@@ -940,18 +1108,23 @@ impl AgentRuntime {
     async fn rollback_spawn(
         &self,
         tree: &Arc<AgentTreeRuntime>,
-        path: &AgentPath,
+        lease: AgentExecutionLease,
         child_session_id: SessionId,
-    ) {
+    ) -> Result<(), String> {
+        let path = lease.path().clone();
+        tree.control
+            .rollback_child_registration(&lease, child_session_id)
+            .map_err(agent_control_error)?;
+        drop(lease);
         if let Ok(mut metadata) = tree.metadata.lock() {
-            metadata.remove(path);
+            metadata.remove(&path);
         }
-        let _ = tree.control.remove_agent(path);
-        let _ = self
-            .store
+        self.store
             .session_repo()
             .delete_session_tree(child_session_id)
-            .await;
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     async fn send_message(
@@ -986,17 +1159,11 @@ impl AgentRuntime {
             content: message.clone(),
             trigger_turn,
         };
-        let mailbox_message = AgentMailboxMessage::new(
-            caller.path.clone(),
-            recipient_path.clone(),
-            message,
-            trigger_turn,
-        );
         let require_active_recipient = recipient.is_active;
         let delivery = caller
             .tree
             .control
-            .enqueue_mail_after_durable_commit(mailbox_message, trigger_turn, || {
+            .commit_and_enqueue_mail(&caller.path, &recipient_path, trigger_turn, || {
                 self.append_communication(
                     recipient.session_id,
                     communication,
@@ -1005,15 +1172,16 @@ impl AgentRuntime {
             })
             .map_err(agent_control_error)?;
         let scheduled = scheduled_mail_delivery(delivery)?;
-        let _ = caller.tree.control.set_activity(
-            &recipient_path,
-            Some(format!("Message queued from {}", caller.path)),
-        );
+        let (activity_session_id, activity_path) = if recipient_path.is_root() {
+            (caller.session_id, &caller.path)
+        } else {
+            (recipient.session_id, &recipient_path)
+        };
         let _ = self.append_activity(
-            caller.session_id,
+            caller,
             &activity_id,
-            recipient.session_id,
-            &recipient_path,
+            activity_session_id,
+            activity_path,
             SubAgentActivityKind::Interacted,
         );
         self.launch_scheduled_turns(&caller.tree, scheduled);
@@ -1048,13 +1216,9 @@ impl AgentRuntime {
                 .control
                 .cancel_agent(&target_path)
                 .map_err(agent_control_error)?;
-            let _ = caller
-                .tree
-                .control
-                .set_activity(&target_path, Some("Interrupt requested".to_string()));
         }
         let _ = self.append_activity(
-            caller.session_id,
+            caller,
             &activity_id,
             snapshot.session_id,
             &target_path,
@@ -1088,10 +1252,10 @@ impl AgentRuntime {
                 else {
                     return;
                 };
-                let _ = context
-                    .tree
-                    .control
-                    .set_status(&context.path, AgentStatus::Running);
+                if let Err(completion) = activate_child_execution(&lease) {
+                    runtime.complete_child_before_run(&context, lease, completion);
+                    return;
+                }
                 context.set_activity("Running assigned task");
                 let mut confirmation = context.confirmation_prompt();
                 let mut renderer = AgentEventRenderer;
@@ -1106,7 +1270,7 @@ impl AgentRuntime {
                             .control
                             .complete_execution(
                                 lease,
-                                AgentStatus::Errored(format!(
+                                InactiveAgentStatus::Errored(format!(
                                     "failed to build sub-agent runtime: {error}"
                                 )),
                                 None,
@@ -1117,48 +1281,71 @@ impl AgentRuntime {
                     }
                 };
                 let run_context = context.clone();
-                let runtime_for_run = runtime.clone();
                 let run_control = lease.run_control();
                 let request_run_control = run_control.clone();
-                let result = local.block_on(async move {
-                    let config = runtime_for_run
-                        .materialize_context_config_and_sync_session(&run_context)
-                        .await
-                        .map_err(AppRunError::Message)?;
-                    let request = RunRequest {
-                        prompt,
-                        session_id: Some(run_context.session_id),
-                        continue_last: false,
-                        title: None,
-                        cwd: run_context.workspace.cwd.clone(),
-                        model: config.model.model.clone(),
-                        base_url: config.model.base_url.clone(),
-                        config_override: Some(full_effective_override(&config)),
-                        output_mode: OutputMode::Human,
-                        show_reasoning_summary: false,
-                        prompt_dispatch: None,
-                        editor_context: None,
-                        review_request: None,
-                        image_paths: Vec::new(),
-                        run_control: request_run_control,
-                        live_config: run_context.live_config.clone(),
-                        agent_confirmation: Some(run_context.confirmation_prompt()),
-                        agent_context: Some(run_context),
-                    };
-                    run_service
-                        .execute(AppCommand::Run(request), &mut renderer, &mut confirmation)
-                        .await
-                });
+                let config = local
+                    .block_on(runtime.materialize_context_config_and_sync_session(&run_context));
+                let result = match config {
+                    Ok(config) => {
+                        // The non-cloneable lease still owns its marker after activation. Recheck
+                        // its turn-scoped terminal owner immediately before RunService can admit
+                        // the durable turn, without publishing a duplicate Running transition.
+                        if let Some(completion) =
+                            child_completion_before_run_admission(&request_run_control)
+                        {
+                            runtime.complete_child_before_run(&context, lease, completion);
+                            return;
+                        }
+                        local.block_on(async move {
+                            let request = RunRequest {
+                                prompt,
+                                session_id: Some(run_context.session_id),
+                                continue_last: false,
+                                title: None,
+                                cwd: run_context.workspace.cwd.clone(),
+                                config: RunConfigInput::Resolved(config),
+                                output_mode: OutputMode::Human,
+                                show_reasoning_summary: false,
+                                prompt_dispatch: None,
+                                editor_context: None,
+                                review_request: None,
+                                image_paths: Vec::new(),
+                                run_control: request_run_control,
+                                agent_confirmation: Some(run_context.confirmation_prompt()),
+                                agent_context: Some(run_context),
+                            };
+                            match run_service
+                                .execute(AppCommand::Run(request), &mut renderer, &mut confirmation)
+                                .await?
+                            {
+                                crate::app::AppCommandOutcome::Turn(summary) => Ok(summary),
+                                crate::app::AppCommandOutcome::ControlCompleted => {
+                                    Err(AppRunError::Message(
+                                        "an admitted child turn completed as a control command"
+                                            .to_string(),
+                                    ))
+                                }
+                            }
+                        })
+                    }
+                    Err(error) => Err(AppRunError::Message(error)),
+                };
                 let cancellation_cause = run_control.cause();
-                let status = local.block_on(runtime.finish_agent_turn(
+                let completion = local.block_on(runtime.finish_agent_turn(
                     &context,
                     &result,
                     cancellation_cause,
                 ));
+                let AgentTurnCompletion { status, activity } = completion;
+                let status = inactive_agent_status(status).unwrap_or_else(|error| {
+                    InactiveAgentStatus::Errored(format!(
+                        "invalid child terminal lifecycle handoff: {error}"
+                    ))
+                });
                 let scheduled = context
                     .tree
                     .control
-                    .complete_execution(lease, status, None)
+                    .complete_execution(lease, status, activity)
                     .unwrap_or_default();
                 runtime.launch_scheduled_turns(&context.tree, scheduled);
             });
@@ -1177,6 +1364,25 @@ impl AgentRuntime {
                 })
             }
         }
+    }
+
+    fn complete_child_before_run(
+        self: &Arc<Self>,
+        context: &AgentRunContext,
+        lease: AgentExecutionLease,
+        completion: AgentTurnCompletion,
+    ) {
+        let status = inactive_agent_status(completion.status).unwrap_or_else(|error| {
+            InactiveAgentStatus::Errored(format!(
+                "invalid pre-admission child terminal lifecycle handoff: {error}"
+            ))
+        });
+        let scheduled = context
+            .tree
+            .control
+            .complete_execution(lease, status, completion.activity)
+            .unwrap_or_default();
+        self.launch_scheduled_turns(&context.tree, scheduled);
     }
 
     async fn materialize_context_config_and_sync_session(
@@ -1204,19 +1410,21 @@ impl AgentRuntime {
         context: &AgentRunContext,
         result: &Result<RunSummary, AppRunError>,
         cancellation_cause: Option<RunCancellationCause>,
-    ) -> AgentStatus {
+    ) -> AgentTurnCompletion {
         let terminal_cause = effective_run_terminal_cause(result, cancellation_cause);
         let final_content = self
             .final_child_result_content(result, terminal_cause.as_ref())
             .await;
-        let mut status = match result {
+        let result_read_error = final_content.as_ref().err().cloned();
+        let final_content = final_content.ok().flatten();
+        let status = match result {
             Ok(summary)
                 if matches!(
-                    summary.status,
+                    summary.status(),
                     SessionStatus::Completed | SessionStatus::Failed
                 ) =>
             {
-                durable_child_terminal_status(summary.status, final_content.clone())
+                durable_child_terminal_status(summary.status(), final_content.clone())
             }
             _ => agent_status_from_terminal_result(
                 result,
@@ -1229,15 +1437,24 @@ impl AgentRuntime {
         {
             node.updated = true;
         }
+        if let Some(error) = result_read_error {
+            // Do not turn a storage/read failure into durable evidence claiming that the child
+            // completed without a text result. The durable terminal status remains authoritative;
+            // the read failure is retained as execution activity for diagnosis.
+            return AgentTurnCompletion {
+                status,
+                activity: Some(format!("durable child result could not be read: {error}")),
+            };
+        }
         if interruption_suppresses_child_result_delivery(terminal_cause.as_ref()) {
             // An interrupted child has no model result to deliver. In particular, approval Abort
             // stops the root tree and must not leave an "Agent interrupted" mailbox/history item
             // that would be replayed after the user's next instruction.
-            return status;
+            return AgentTurnCompletion::new(status);
         }
 
         let Some(parent) = context.path.parent() else {
-            return status;
+            return AgentTurnCompletion::new(status);
         };
         let parent_snapshot = context
             .tree
@@ -1246,7 +1463,7 @@ impl AgentRuntime {
             .ok()
             .and_then(|agents| agents.into_iter().find(|agent| agent.path == parent));
         let Some(parent_snapshot) = parent_snapshot else {
-            return status;
+            return AgentTurnCompletion::new(status);
         };
         let content = final_content.unwrap_or_else(|| match &status {
             AgentStatus::Interrupted => "Agent interrupted.".to_string(),
@@ -1259,37 +1476,17 @@ impl AgentRuntime {
             content: content.clone(),
             trigger_turn: false,
         };
-        let mailbox_message =
-            AgentMailboxMessage::new(context.path.clone(), parent.clone(), content, false);
-        match context
-            .tree
-            .control
-            .enqueue_mail_after_durable_commit(mailbox_message, false, || {
-                // A child can finish after the parent's durable success commit but before the
-                // retained root execution marker is cleared. Result mail is consumed by the next
-                // root turn, so its durable append must not depend on that transient active flag.
-                self.append_communication(parent_snapshot.session_id, communication, false)
-            }) {
-            Ok(AgentMailDeliveryOutcome::Enqueued { .. }) => {}
-            Ok(AgentMailDeliveryOutcome::Suppressed) => {
-                status = AgentStatus::Errored(
-                    "agent result was recorded durably, but delivery was suppressed because the recipient became terminal or the agent tree was stopped"
-                        .to_string(),
-                );
-            }
-            Err(error) => {
-                status = AgentStatus::Errored(format!(
-                    "agent result could not be delivered durably: {error}"
-                ));
-                let _ = context.tree.control.enqueue_mail(AgentMailboxMessage::new(
-                    context.path.clone(),
-                    parent,
-                    "Agent result delivery failed; inspect list_agents for status.",
-                    false,
-                ));
-            }
-        }
-        status
+        let delivery =
+            context
+                .tree
+                .control
+                .commit_and_enqueue_mail(&context.path, &parent, false, || {
+                    // A child can finish after the parent's durable success commit but before the
+                    // retained root execution marker is cleared. Result mail is consumed by the next
+                    // root turn, so its durable append must not depend on that transient active flag.
+                    self.append_communication(parent_snapshot.session_id, communication, false)
+                });
+        AgentTurnCompletion::new(status).with_delivery_outcome(delivery)
     }
 
     fn launch_scheduled_turns(
@@ -1299,41 +1496,39 @@ impl AgentRuntime {
     ) {
         let mut pending = scheduled.into_iter().collect::<VecDeque<_>>();
         while let Some(lease) = pending.pop_front() {
-            let path = lease.path().clone();
-            let context = self.context_for_path(tree, &path);
+            let context = self.context_for_execution(tree, &lease);
             let context = match context {
                 Ok(context) => context,
                 Err(error) => {
-                    let additional = tree
-                        .control
-                        .complete_execution(lease, AgentStatus::Errored(error), None)
-                        .unwrap_or_default();
+                    let additional =
+                        settle_unlaunchable_scheduled_execution(&tree.control, lease, error);
                     pending.extend(additional);
                     continue;
                 }
             };
             if let Err(failure) = self.launch_agent_turn(context, lease, String::new()) {
-                let _ = tree.control.drain_mailbox(&failure.context.path);
                 if let Ok(mut metadata) = tree.metadata.lock()
                     && let Some(node) = metadata.get_mut(&failure.context.path)
                 {
                     node.updated = true;
                 }
-                let additional = tree
-                    .control
-                    .complete_execution(failure.lease, AgentStatus::Errored(failure.message), None)
-                    .unwrap_or_default();
+                let additional = settle_unlaunchable_scheduled_execution(
+                    &tree.control,
+                    failure.lease,
+                    failure.message,
+                );
                 pending.extend(additional);
             }
         }
         tree.release_confirmation_if_quiescent();
     }
 
-    fn context_for_path(
+    fn context_for_execution(
         self: &Arc<Self>,
         tree: &Arc<AgentTreeRuntime>,
-        path: &AgentPath,
+        lease: &AgentExecutionLease,
     ) -> Result<AgentRunContext, String> {
+        let path = lease.path();
         let session_id = tree
             .control
             .list_agents(Some(path))
@@ -1349,63 +1544,87 @@ impl AgentRuntime {
             .get(path)
             .cloned()
             .ok_or_else(|| format!("agent `{path}` has no runtime metadata"))?;
+        let root_turn_owner = if path.is_root() {
+            Arc::new(OnceLock::new())
+        } else {
+            let owner = tree
+                .active_root_turn_owner
+                .lock()
+                .map_err(|_| "active root turn owner lock was poisoned".to_string())?
+                .ok_or_else(|| format!("agent `{path}` has no active durable root turn owner"))?;
+            let cell = OnceLock::new();
+            cell.set(owner)
+                .expect("a fresh child root-turn owner cell must be empty");
+            Arc::new(cell)
+        };
         Ok(AgentRunContext {
             runtime: self.clone(),
             tree: tree.clone(),
             path: path.clone(),
             session_id,
+            execution: lease.scope(),
+            root_turn_owner,
             config: metadata.config,
             workspace: metadata.workspace,
-            live_config: metadata.live_config,
         })
     }
 
-    async fn final_assistant_text(&self, summary: &RunSummary) -> Option<String> {
-        let response_id = summary.final_response_id?;
-        self.store
+    async fn final_assistant_text(&self, summary: &RunSummary) -> Result<Option<String>, String> {
+        let Some(response_id) = summary.final_response_id() else {
+            return Ok(None);
+        };
+        let content = self
+            .store
             .protocol_event_store()
-            .list_history_items_for_session(summary.session_id)
-            .ok()?
-            .iter()
-            .rev()
-            .find_map(|item| match &item.payload {
-                HistoryItemPayload::AssistantMessage {
-                    response_id: candidate,
-                    content,
-                } if *candidate == response_id => content_parts_text(content, "\n"),
-                _ => None,
-            })
-            .filter(|text| !text.trim().is_empty())
+            .assistant_content_for_response(summary.session_id(), response_id)
+            .map_err(|error| error.to_string())?;
+        Ok(content
+            .as_deref()
+            .and_then(|content| content_parts_text(content, "\n")))
     }
 
     async fn final_child_result_content(
         &self,
         result: &Result<RunSummary, AppRunError>,
         terminal_cause: Option<&RunCancellationCause>,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, String> {
         match result {
-            Ok(summary) => match summary.status {
+            Ok(summary) => match summary.status() {
                 SessionStatus::Completed => {
-                    self.final_assistant_text(summary).await.or_else(|| {
-                        self.store
-                            .protocol_event_store()
-                            .list_history_items_for_session(summary.session_id)
-                            .ok()
-                            .and_then(|history| durable_child_result(summary.status, &history))
-                    })
+                    if summary.final_response_id().is_some() {
+                        // A durable terminal response identity is authoritative. Do not substitute
+                        // unrelated later assistant text if that exact point lookup is absent.
+                        return self.final_assistant_text(summary).await;
+                    }
+                    let projection = self
+                        .store
+                        .protocol_event_store()
+                        .durable_child_result_projection(summary.session_id())
+                        .map_err(|error| error.to_string())?;
+                    Ok(durable_child_result_from_projection(
+                        summary.status(),
+                        projection.latest_assistant_content.as_deref(),
+                        projection.latest_error.as_deref(),
+                    ))
                 }
-                SessionStatus::Failed => self
-                    .store
-                    .protocol_event_store()
-                    .list_history_items_for_session(summary.session_id)
-                    .ok()
-                    .and_then(|history| durable_child_result(summary.status, &history)),
-                SessionStatus::Cancelled | SessionStatus::Idle | SessionStatus::Running => None,
+                SessionStatus::Failed => {
+                    let projection = self
+                        .store
+                        .protocol_event_store()
+                        .durable_child_result_projection(summary.session_id())
+                        .map_err(|error| error.to_string())?;
+                    Ok(durable_child_result_from_projection(
+                        summary.status(),
+                        projection.latest_assistant_content.as_deref(),
+                        projection.latest_error.as_deref(),
+                    ))
+                }
+                SessionStatus::Cancelled | SessionStatus::Idle | SessionStatus::Running => Ok(None),
             },
             Err(error) => match terminal_cause {
-                Some(RunCancellationCause::Interruption(_)) => None,
-                Some(RunCancellationCause::Failure(message)) => Some(message.clone()),
-                Some(RunCancellationCause::Superseded) | None => Some(error.to_string()),
+                Some(RunCancellationCause::Interruption(_)) => Ok(None),
+                Some(RunCancellationCause::Failure(message)) => Ok(Some(message.clone())),
+                Some(RunCancellationCause::Superseded) | None => Ok(Some(error.to_string())),
             },
         }
     }
@@ -1415,7 +1634,7 @@ impl AgentRuntime {
         session_id: SessionId,
         communication: InterAgentCommunication,
         require_active_recipient: bool,
-    ) -> Result<(), String> {
+    ) -> Result<HistoryItemId, String> {
         self.store
             .session_repo()
             .append_inter_agent_communication_with_protocol_bundle(
@@ -1423,22 +1642,24 @@ impl AgentRuntime {
                 communication,
                 require_active_recipient,
             )
-            .map(|_| ())
             .map_err(|error| error.to_string())
     }
 
     fn append_activity(
         &self,
-        owner_session_id: SessionId,
+        caller: &AgentRunContext,
         activity_id: &str,
         agent_session_id: SessionId,
         agent_path: &AgentPath,
         activity_kind: SubAgentActivityKind,
     ) -> Result<(), String> {
+        let owner = caller.durable_root_turn_owner()?;
         self.store
             .protocol_event_store()
             .append_sub_agent_activity(
-                owner_session_id,
+                caller.tree.root_session_id,
+                owner.admission_id,
+                owner.turn_id,
                 activity_id.to_string(),
                 agent_session_id,
                 agent_path.to_string(),
@@ -1456,28 +1677,67 @@ fn effective_run_terminal_cause(
         Err(error) => {
             cancellation_cause.or_else(|| Some(RunCancellationCause::Failure(error.to_string())))
         }
-        Ok(summary) => match summary.status {
+        Ok(summary) => match summary.status() {
             SessionStatus::Failed => Some(RunCancellationCause::Failure(format!(
                 "run {} settled with durable failed status",
-                summary.session_id
+                summary.session_id()
             ))),
             SessionStatus::Cancelled => summary
-                .interruption_cause
+                .interruption_cause()
                 .map(RunCancellationCause::Interruption)
                 .or_else(|| {
                     Some(RunCancellationCause::Failure(
-                        missing_interruption_cause_message(summary.session_id),
+                        missing_interruption_cause_message(summary.session_id()),
                     ))
                 }),
             SessionStatus::Idle | SessionStatus::Running => {
                 Some(RunCancellationCause::Failure(format!(
                     "run {} returned non-terminal status {}",
-                    summary.session_id,
-                    summary.status.key()
+                    summary.session_id(),
+                    summary.status().key()
                 )))
             }
             SessionStatus::Completed => None,
         },
+    }
+}
+
+fn activate_child_execution(lease: &AgentExecutionLease) -> Result<(), AgentTurnCompletion> {
+    let run_control = lease.run_control();
+    if let Some(completion) = child_completion_before_run_admission(&run_control) {
+        return Err(completion);
+    }
+    if let Err(error) = lease.set_status(ActiveAgentStatus::Running) {
+        return Err(AgentTurnCompletion::new(AgentStatus::Errored(format!(
+            "child execution lease was rejected before durable turn admission: {error}"
+        ))));
+    }
+    if let Some(completion) = child_completion_before_run_admission(&run_control) {
+        return Err(completion);
+    }
+    Ok(())
+}
+
+fn child_completion_before_run_admission(run_control: &RunControl) -> Option<AgentTurnCompletion> {
+    if let Some(cause) = run_control.cause() {
+        return Some(AgentTurnCompletion::new(child_status_before_run_admission(
+            cause,
+        )));
+    }
+    run_control.success_is_sealed().then(|| {
+        AgentTurnCompletion::new(AgentStatus::Errored(
+            "child execution was sealed before durable turn admission".to_string(),
+        ))
+    })
+}
+
+fn child_status_before_run_admission(cause: RunCancellationCause) -> AgentStatus {
+    match cause {
+        RunCancellationCause::Interruption(_) => AgentStatus::Interrupted,
+        RunCancellationCause::Failure(message) => AgentStatus::Errored(message),
+        RunCancellationCause::Superseded => AgentStatus::Errored(
+            "child execution was superseded before durable turn admission".to_string(),
+        ),
     }
 }
 
@@ -1496,6 +1756,18 @@ async fn wait_for_control_quiescence(control: &AgentControl) -> Result<(), Agent
 
 fn agent_control_error(error: AgentControlError) -> String {
     error.to_string()
+}
+
+fn inactive_agent_status(status: AgentStatus) -> Result<InactiveAgentStatus, String> {
+    match status {
+        AgentStatus::Interrupted => Ok(InactiveAgentStatus::Interrupted),
+        AgentStatus::Completed(result) => Ok(InactiveAgentStatus::Completed(result)),
+        AgentStatus::Errored(message) => Ok(InactiveAgentStatus::Errored(message)),
+        AgentStatus::Shutdown => Ok(InactiveAgentStatus::Shutdown),
+        AgentStatus::PendingInit | AgentStatus::Running => Err(format!(
+            "active status {status:?} cannot be retained after execution completion"
+        )),
+    }
 }
 
 fn interruption_suppresses_child_result_delivery(cause: Option<&RunCancellationCause>) -> bool {
@@ -1518,64 +1790,123 @@ fn scheduled_mail_delivery(
     }
 }
 
-async fn load_durable_agent_children(
+fn settle_unlaunchable_scheduled_execution(
+    control: &AgentControl,
+    lease: AgentExecutionLease,
+    error: String,
+) -> Vec<AgentExecutionLease> {
+    let path = lease.path().clone();
+    // The canonical communication remains durable, but this in-memory trigger cannot be consumed
+    // by a turn whose context or worker failed to launch. Retaining it while handing the lease back
+    // as inactive would make `complete_execution` reserve the same trigger again in a tight loop.
+    let error = match control.drain_mailbox(&path) {
+        Ok(_) => error,
+        Err(mailbox_error) => format!(
+            "{error}; failed to clear undeliverable trigger notices for `{path}`: {mailbox_error}"
+        ),
+    };
+    control
+        .complete_execution(lease, InactiveAgentStatus::Errored(error), None)
+        .unwrap_or_default()
+}
+
+fn load_durable_agent_children(
     store: &StoreBundle,
     root_session_id: SessionId,
 ) -> Result<Vec<DurableAgentChild>, String> {
-    let repo = store.session_repo();
-    let edges = repo
-        .list_session_spawn_edges(root_session_id)
-        .await
-        .map_err(|error| error.to_string())?;
     let protocol_store = store.protocol_event_store();
-    let mut durable_children = Vec::with_capacity(edges.len());
-    for edge in edges {
-        let session = repo
-            .get_session(edge.child_session_id)
-            .await
+    let child_limit = crate::runtime::agent_control::MAX_RETAINED_AGENTS.saturating_sub(1);
+    let mut projected_children = Vec::new();
+    let mut expected_total = None;
+    loop {
+        let page = protocol_store
+            .retained_direct_child_page(
+                root_session_id,
+                projected_children.len(),
+                crate::protocol::MAX_PROTOCOL_PAGE_LIMIT,
+            )
             .map_err(|error| error.to_string())?;
-        let history = protocol_store
-            .list_history_items_for_session(edge.child_session_id)
-            .map_err(|error| error.to_string())?;
-        let task_preview = latest_history_text(&history, |payload| match payload {
-            HistoryItemPayload::UserTurn { content, .. }
-            | HistoryItemPayload::SteerTurn { content, .. } => Some(content),
-            _ => None,
-        })
-        .unwrap_or_else(|| edge.task_name.clone());
-        let result = durable_child_result(session.status, &history);
-        let interruption_cause = if session.status == SessionStatus::Cancelled {
-            match protocol_store
-                .latest_turn_position_for_session(edge.child_session_id)
-                .map_err(|error| error.to_string())?
-            {
-                Some((turn_id, _)) => protocol_store
-                    .list_runtime_events(edge.child_session_id, turn_id)
-                    .map_err(|error| error.to_string())?
-                    .into_iter()
-                    .rev()
-                    .find_map(|event| match event.msg {
-                        crate::protocol::RuntimeEventMsg::TurnTerminal { terminal } => {
-                            terminal.interruption_cause
-                        }
-                        _ => None,
-                    }),
-                None => None,
+        if page.total > child_limit {
+            return Err(format!(
+                "session {root_session_id} retains {} direct children, exceeding the supported maximum {child_limit}",
+                page.total
+            ));
+        }
+        match expected_total {
+            Some(expected) if expected != page.total => {
+                return Err(format!(
+                    "retained child projection for session {root_session_id} changed during bounded hydration"
+                ));
             }
-        } else {
-            None
-        };
+            None => expected_total = Some(page.total),
+            _ => {}
+        }
+        let page_len = page.items.len();
+        projected_children.extend(page.items);
+        if projected_children.len() >= page.total {
+            break;
+        }
+        if page_len == 0 {
+            return Err(format!(
+                "retained child projection for session {root_session_id} made no progress at offset {}",
+                projected_children.len()
+            ));
+        }
+    }
+    let mut durable_children = Vec::with_capacity(projected_children.len());
+    for child in projected_children {
+        let session_status = parse_durable_session_status(&child.session_status)?;
+        let task_preview = child
+            .latest_task_content
+            .as_deref()
+            .and_then(|content| content_parts_text(content, "\n"))
+            .unwrap_or_else(|| child.edge.task_name.clone());
+        let result = durable_child_result_from_projection(
+            session_status,
+            child.latest_assistant_content.as_deref(),
+            child.latest_error.as_deref(),
+        );
         durable_children.push(DurableAgentChild {
-            edge,
-            session,
+            session_id: child.edge.child_session_id,
+            edge: child.edge,
+            session_status,
             task_preview,
             result,
-            interruption_cause,
+            interruption_cause: child.interruption_cause,
         });
     }
     Ok(durable_children)
 }
 
+fn parse_durable_session_status(value: &str) -> Result<SessionStatus, String> {
+    match value {
+        "idle" => Ok(SessionStatus::Idle),
+        "running" => Ok(SessionStatus::Running),
+        "completed" => Ok(SessionStatus::Completed),
+        "cancelled" => Ok(SessionStatus::Cancelled),
+        "failed" => Ok(SessionStatus::Failed),
+        _ => Err(format!("unknown persisted session status `{value}`")),
+    }
+}
+
+fn durable_child_result_from_projection(
+    status: SessionStatus,
+    latest_assistant_content: Option<&[ContentPart]>,
+    latest_error: Option<&str>,
+) -> Option<String> {
+    let assistant = latest_assistant_content.and_then(|content| content_parts_text(content, "\n"));
+    let error = latest_error
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string);
+    if status == SessionStatus::Failed {
+        error.or(assistant)
+    } else {
+        assistant.or(error)
+    }
+}
+
+#[cfg(test)]
 fn durable_child_result(
     status: SessionStatus,
     history: &[crate::protocol::HistoryItem],
@@ -1587,6 +1918,7 @@ fn durable_child_result(
     }
 }
 
+#[cfg(test)]
 fn latest_error_history_text(history: &[crate::protocol::HistoryItem]) -> Option<String> {
     history.iter().rev().find_map(|item| match &item.payload {
         HistoryItemPayload::Error { message, .. } if !message.trim().is_empty() => {
@@ -1596,21 +1928,12 @@ fn latest_error_history_text(history: &[crate::protocol::HistoryItem]) -> Option
     })
 }
 
+#[cfg(test)]
 fn latest_assistant_history_text(history: &[crate::protocol::HistoryItem]) -> Option<String> {
     history.iter().rev().find_map(|item| match &item.payload {
         HistoryItemPayload::AssistantMessage { content, .. } => content_parts_text(content, "\n"),
         _ => None,
     })
-}
-
-fn latest_history_text<'a>(
-    history: &'a [crate::protocol::HistoryItem],
-    content: impl Fn(&'a HistoryItemPayload) -> Option<&'a [ContentPart]>,
-) -> Option<String> {
-    history
-        .iter()
-        .rev()
-        .find_map(|item| content_parts_text(content(&item.payload)?, "\n"))
 }
 
 fn content_parts_text(content: &[ContentPart], separator: &str) -> Option<String> {
@@ -1626,19 +1949,21 @@ fn content_parts_text(content: &[ContentPart], separator: &str) -> Option<String
 }
 
 fn rehydrated_agent_state(
-    session: &SessionRecord,
+    session_id: SessionId,
+    status: SessionStatus,
     result: Option<String>,
     interruption_cause: Option<TurnInterruptionCause>,
 ) -> Result<AgentStatus, String> {
-    match session.status {
+    match status {
         SessionStatus::Running => {
             return Err(format!(
                 "cannot rehydrate running child session {} without an active execution owner",
-                session.id
+                session_id
             ));
         }
         _ => Ok(durable_projection_status(
-            session,
+            session_id,
+            status,
             result,
             interruption_cause,
         )),
@@ -1646,17 +1971,18 @@ fn rehydrated_agent_state(
 }
 
 fn durable_projection_status(
-    session: &SessionRecord,
+    session_id: SessionId,
+    status: SessionStatus,
     result: Option<String>,
     interruption_cause: Option<TurnInterruptionCause>,
 ) -> AgentStatus {
-    if session.status == SessionStatus::Cancelled {
+    if status == SessionStatus::Cancelled {
         return match interruption_cause {
             Some(_) => AgentStatus::Interrupted,
-            None => AgentStatus::Errored(missing_interruption_cause_message(session.id)),
+            None => AgentStatus::Errored(missing_interruption_cause_message(session_id)),
         };
     }
-    durable_child_terminal_status(session.status, result)
+    durable_child_terminal_status(status, result)
 }
 
 fn missing_interruption_cause_message(session_id: SessionId) -> String {
@@ -1693,13 +2019,13 @@ fn agent_status_from_terminal_result(
             }))
         }
         None => match result {
-            Ok(summary) if summary.status == SessionStatus::Completed => {
+            Ok(summary) if summary.status() == SessionStatus::Completed => {
                 AgentStatus::Completed(content)
             }
             Ok(summary) => AgentStatus::Errored(format!(
                 "run {} returned terminal status {} without a typed terminal cause",
-                summary.session_id,
-                summary.status.key()
+                summary.session_id(),
+                summary.status().key()
             )),
             Err(error) => AgentStatus::Errored(error.to_string()),
         },
@@ -1712,7 +2038,6 @@ fn agent_status_result(status: &AgentStatus) -> String {
         AgentStatus::Completed(None) => "Completed".to_string(),
         AgentStatus::Interrupted => "Interrupted".to_string(),
         AgentStatus::Shutdown => "Stopped".to_string(),
-        AgentStatus::NotFound => "Agent not found".to_string(),
         AgentStatus::PendingInit | AgentStatus::Running => String::new(),
     }
 }

@@ -1,12 +1,18 @@
+use crate::cli::terminal::terminal_safe_inline;
 use crate::error::CliPromptError;
 use crate::protocol::{ReviewDecision, ToolApprovalDecision, TurnInterruptionCause};
 use crate::runtime::{RunCancelOutcome, RunCancellationCause, RunControl};
 use crate::tool::PermissionRequest;
 
 use std::fmt;
+use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Duration;
+
+const STDIN_LINE_QUEUE_CAPACITY: usize = 16;
+const MAX_STDIN_LINE_BYTES: usize = 16 * 1024;
+const PERMISSION_TICKET_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfirmationOutcome {
@@ -64,7 +70,7 @@ pub struct SharedConfirmationPrompt {
 }
 
 struct ConfirmationBroker {
-    tickets: mpsc::Sender<ConfirmationTicket>,
+    tickets: mpsc::SyncSender<ConfirmationTicket>,
     approval_abort_handler: Arc<Mutex<Option<ApprovalAbortHandler>>>,
 }
 
@@ -98,7 +104,8 @@ impl SharedConfirmationPrompt {
         prompt: impl ConfirmationPrompt + Send + 'static,
         root_control: Option<RunControl>,
     ) -> Self {
-        let (tickets, receiver) = mpsc::channel::<ConfirmationTicket>();
+        let (tickets, receiver) =
+            mpsc::sync_channel::<ConfirmationTicket>(PERMISSION_TICKET_QUEUE_CAPACITY);
         let approval_abort_handler = Arc::new(Mutex::new(None));
         let dispatcher_abort_handler = Arc::clone(&approval_abort_handler);
         std::thread::Builder::new()
@@ -145,14 +152,19 @@ impl SharedConfirmationPrompt {
         let abort_origin = Arc::new(AtomicBool::new(false));
         self.inner
             .tickets
-            .send(ConfirmationTicket {
+            .try_send(ConfirmationTicket {
                 request: request.clone(),
                 control,
                 abort_origin: Arc::clone(&abort_origin),
                 response,
             })
-            .map_err(|_| {
-                CliPromptError::Message("permission prompt broker is unavailable".to_string())
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => CliPromptError::Message(format!(
+                    "permission prompt queue reached its capacity of {PERMISSION_TICKET_QUEUE_CAPACITY}"
+                )),
+                mpsc::TrySendError::Disconnected(_) => {
+                    CliPromptError::Message("permission prompt broker is unavailable".to_string())
+                }
             })?;
         Ok(PendingConfirmation {
             response: receiver,
@@ -344,16 +356,20 @@ impl ConfirmationPrompt for StdConfirmationPrompt {
         }
         let mut stderr = io::stderr().lock();
         if let Some(identity) = permission_agent_identity(request) {
-            writeln!(stderr, "requesting_agent={identity}")?;
+            writeln!(
+                stderr,
+                "requesting_agent={}",
+                terminal_safe_inline(&identity)
+            )?;
         }
         writeln!(
             stderr,
             "[confirm] {} [{}]",
-            request.summary,
+            terminal_safe_inline(&request.summary),
             request
                 .targets
                 .iter()
-                .map(|value| value.as_str())
+                .map(|value| terminal_safe_inline(value.as_str()).into_owned())
                 .collect::<Vec<_>>()
                 .join(", ")
         )?;
@@ -367,7 +383,7 @@ impl ConfirmationPrompt for StdConfirmationPrompt {
                 request
                     .risks
                     .iter()
-                    .map(|risk| risk.label())
+                    .map(|risk| terminal_safe_inline(risk.label()).into_owned())
                     .collect::<Vec<_>>()
                     .join(", ")
             }
@@ -375,7 +391,7 @@ impl ConfirmationPrompt for StdConfirmationPrompt {
         if !request.details.is_empty() {
             writeln!(stderr, "details:")?;
             for detail in &request.details {
-                writeln!(stderr, "  - {detail}")?;
+                writeln!(stderr, "  - {}", terminal_safe_inline(detail))?;
             }
         }
         write!(
@@ -402,14 +418,22 @@ struct StdinLineReader {
 
 enum StdinLineEvent {
     Line(String),
+    TooLong,
     Eof,
     Error(std::io::Error),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedStdinLine {
+    Line(String),
+    TooLong,
+    Eof,
 }
 
 fn stdin_line_reader() -> &'static StdinLineReader {
     static READER: OnceLock<StdinLineReader> = OnceLock::new();
     READER.get_or_init(|| {
-        let (lines, receiver) = mpsc::channel::<StdinLineEvent>();
+        let (lines, receiver) = mpsc::sync_channel::<StdinLineEvent>(STDIN_LINE_QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("moyai-stdin-reader".to_string())
             .spawn(move || stdin_read_loop(lines))
@@ -420,16 +444,22 @@ fn stdin_line_reader() -> &'static StdinLineReader {
     })
 }
 
-fn stdin_read_loop(lines: mpsc::Sender<StdinLineEvent>) {
+fn stdin_read_loop(lines: mpsc::SyncSender<StdinLineEvent>) {
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
     loop {
-        let mut input = String::new();
-        match std::io::stdin().read_line(&mut input) {
-            Ok(0) => {
+        match read_bounded_stdin_line(&mut stdin, MAX_STDIN_LINE_BYTES) {
+            Ok(BoundedStdinLine::Eof) => {
                 let _ = lines.send(StdinLineEvent::Eof);
                 return;
             }
-            Ok(_) => {
+            Ok(BoundedStdinLine::Line(input)) => {
                 if lines.send(StdinLineEvent::Line(input)).is_err() {
+                    return;
+                }
+            }
+            Ok(BoundedStdinLine::TooLong) => {
+                if lines.send(StdinLineEvent::TooLong).is_err() {
                     return;
                 }
             }
@@ -441,12 +471,58 @@ fn stdin_read_loop(lines: mpsc::Sender<StdinLineEvent>) {
     }
 }
 
+fn read_bounded_stdin_line(
+    reader: &mut impl BufRead,
+    max_bytes: usize,
+) -> std::io::Result<BoundedStdinLine> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(1024));
+    let mut too_long = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if too_long {
+                return Ok(BoundedStdinLine::TooLong);
+            }
+            if bytes.is_empty() {
+                return Ok(BoundedStdinLine::Eof);
+            }
+            return decode_bounded_stdin_line(bytes).map(BoundedStdinLine::Line);
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map(|offset| offset + 1).unwrap_or(available.len());
+        if !too_long {
+            let remaining = max_bytes.saturating_sub(bytes.len());
+            if consumed <= remaining {
+                bytes.extend_from_slice(&available[..consumed]);
+            } else {
+                too_long = true;
+                bytes.clear();
+            }
+        }
+        reader.consume(consumed);
+
+        if newline.is_some() {
+            return if too_long {
+                Ok(BoundedStdinLine::TooLong)
+            } else {
+                decode_bounded_stdin_line(bytes).map(BoundedStdinLine::Line)
+            };
+        }
+    }
+}
+
+fn decode_bounded_stdin_line(bytes: Vec<u8>) -> std::io::Result<String> {
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 /// Drops input that arrived before this prompt became active. The receiver lock is held only for
 /// the lifetime of the active prompt and is released immediately when its cancellation is seen.
 fn drain_stale_stdin_lines(lines: &mpsc::Receiver<StdinLineEvent>) -> Result<bool, CliPromptError> {
     loop {
         match lines.try_recv() {
-            Ok(StdinLineEvent::Line(_)) => {}
+            Ok(StdinLineEvent::Line(_) | StdinLineEvent::TooLong) => {}
             Ok(StdinLineEvent::Eof) => return Ok(false),
             Ok(StdinLineEvent::Error(error)) => return Err(error.into()),
             Err(mpsc::TryRecvError::Empty) => return Ok(true),
@@ -477,6 +553,9 @@ fn wait_for_stdin_confirmation(
                         ToolApprovalDecision::Approved,
                     ));
                 }
+                return Ok(ConfirmationOutcome::AbortRequested);
+            }
+            Ok(StdinLineEvent::TooLong) => {
                 return Ok(ConfirmationOutcome::AbortRequested);
             }
             Ok(StdinLineEvent::Eof) => {
@@ -515,6 +594,7 @@ fn permission_agent_identity(request: &PermissionRequest) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufReader, Cursor};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use camino::Utf8PathBuf;
@@ -672,6 +752,42 @@ mod tests {
             ConfirmationOutcome::Resolved(ToolApprovalDecision::Approved)
         );
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn broker_rejects_tickets_beyond_its_bounded_queue() {
+        let (broker, entered, release, _) = broker_fixture();
+        let control = RunControl::new();
+        let active = broker
+            .enqueue(&permission("active"), control.clone())
+            .expect("enqueue active");
+        assert_eq!(
+            entered
+                .recv_timeout(Duration::from_secs(1))
+                .expect("active prompt entered"),
+            "active"
+        );
+        let mut queued = Vec::with_capacity(PERMISSION_TICKET_QUEUE_CAPACITY);
+        for index in 0..PERMISSION_TICKET_QUEUE_CAPACITY {
+            queued.push(
+                broker
+                    .enqueue(&permission(&format!("queued-{index}")), control.clone())
+                    .expect("enqueue within capacity"),
+            );
+        }
+
+        let error = match broker.enqueue(&permission("overflow"), control.clone()) {
+            Ok(_) => panic!("queue overflow must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("reached its capacity"));
+        drop(queued);
+        release.send(()).expect("release active prompt");
+        assert_eq!(
+            active.wait(&control).expect("active result"),
+            ConfirmationOutcome::Resolved(ToolApprovalDecision::Approved)
+        );
     }
 
     #[test]
@@ -931,6 +1047,37 @@ mod tests {
             wait_for_stdin_confirmation(&receiver, &racing_control)
                 .expect("cancellation wins over queued approval"),
             ConfirmationOutcome::Interrupted
+        );
+    }
+
+    #[test]
+    fn bounded_stdin_reader_discards_the_entire_overlong_line() {
+        let input = b"123456789\nyes\n";
+        let mut reader = BufReader::new(Cursor::new(input));
+
+        assert_eq!(
+            read_bounded_stdin_line(&mut reader, 8).expect("overlong line"),
+            BoundedStdinLine::TooLong
+        );
+        assert_eq!(
+            read_bounded_stdin_line(&mut reader, 8).expect("following line"),
+            BoundedStdinLine::Line("yes\n".to_string())
+        );
+        assert_eq!(
+            read_bounded_stdin_line(&mut reader, 8).expect("EOF"),
+            BoundedStdinLine::Eof
+        );
+    }
+
+    #[test]
+    fn overlong_confirmation_input_fails_closed() {
+        let (response, receiver) = mpsc::channel();
+        response
+            .send(StdinLineEvent::TooLong)
+            .expect("queue overlong response");
+        assert_eq!(
+            wait_for_stdin_confirmation(&receiver, &RunControl::new()).expect("overlong response"),
+            ConfirmationOutcome::AbortRequested
         );
     }
 

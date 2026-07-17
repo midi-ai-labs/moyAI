@@ -214,6 +214,7 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             load_provider_models,
             apply_provider_session,
             save_provider_global,
+            reset_config_draft,
             apply_session_config,
             save_global_config,
             toggle_access_mode,
@@ -380,6 +381,15 @@ where
 struct DesktopDraftActionTarget {
     workspace_path: String,
     session_id: Option<String>,
+    owner_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopRunMutationTarget {
+    workspace_path: String,
+    session_id: Option<String>,
+    runtime_owner_token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -425,20 +435,63 @@ fn ensure_draft_action_target(
         .app_state
         .current_session_id
         .map(|session_id| session_id.to_string());
-    validate_draft_action_target(expected, controller.app.workspace.root.as_str(), session_id)
+    validate_draft_action_target(
+        expected,
+        controller.app.workspace.root.as_str(),
+        session_id,
+        controller.state.composer.owner_generation(),
+    )
 }
 
 fn validate_draft_action_target(
     expected: &DesktopDraftActionTarget,
     workspace_path: &str,
     session_id: Option<String>,
+    owner_generation: u64,
 ) -> Result<(), DesktopCommandConflict> {
-    if expected.workspace_path != workspace_path || expected.session_id != session_id {
+    if expected.workspace_path != workspace_path
+        || expected.session_id != session_id
+        || expected.owner_generation != owner_generation
+    {
         return Err(DesktopCommandConflict::new(
             "the request draft owner changed before the action was applied; review the current chat and try again",
         ));
     }
     Ok(())
+}
+
+fn validate_run_mutation_target(
+    expected: &DesktopRunMutationTarget,
+    workspace_path: &str,
+    session_id: Option<String>,
+    runtime_owner_token: String,
+) -> Result<(), DesktopCommandConflict> {
+    if expected.workspace_path != workspace_path
+        || expected.session_id != session_id
+        || expected.runtime_owner_token != runtime_owner_token
+    {
+        return Err(DesktopCommandConflict::new(
+            "the active run owner changed before Stop was applied; review the current task and try again",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_run_mutation_target(
+    controller: &DesktopController,
+    expected: &DesktopRunMutationTarget,
+) -> Result<(), DesktopCommandConflict> {
+    let (runtime_owner_token, _) = controller.access_mode_mutation_runtime_contract();
+    validate_run_mutation_target(
+        expected,
+        controller.app.workspace.root.as_str(),
+        controller
+            .state
+            .app_state
+            .current_session_id
+            .map(|session_id| session_id.to_string()),
+        runtime_owner_token,
+    )
 }
 
 fn rejected_action(controller: &DesktopController, fallback: &str) -> DesktopCommandConflict {
@@ -666,8 +719,16 @@ async fn submit_prompt(
 }
 
 #[tauri::command]
-async fn cancel_run(controller: State<'_, SharedController>) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::cancel_active_run).await
+async fn cancel_run(
+    controller: State<'_, SharedController>,
+    expected_target: DesktopRunMutationTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_run_mutation_target(controller, &expected_target)?;
+        controller.cancel_active_run();
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1479,15 +1540,15 @@ async fn open_global_config_folder(
 #[tauri::command]
 async fn import_global_config_toml(
     controller: State<'_, SharedController>,
+    draft_values: Vec<DesktopConfigValueInput>,
     expected_target: DesktopConfigMutationTarget,
-    config_owner_mutation_open: bool,
 ) -> Result<(DesktopWebState, bool), DesktopCommandError> {
     let mut controller = controller.lock().await;
     controller.drain_runtime_messages();
-    if let Err(conflict) = ensure_external_config_owner_mutation_open(config_owner_mutation_open) {
+    if let Err(conflict) = ensure_config_mutation_target(&controller, &expected_target) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
-    if let Err(conflict) = ensure_config_mutation_target(&controller, &expected_target) {
+    if let Err(conflict) = ensure_external_config_owner_mutation_open(&controller, &draft_values) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
     let selected = controller.pick_global_config_toml_dialog();
@@ -1578,7 +1639,7 @@ async fn insert_command(
     .await
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopProviderActionInput {
     base_url: String,
@@ -1586,13 +1647,38 @@ struct DesktopProviderActionInput {
     context_window: String,
     max_output_tokens: String,
     selected_model_id: String,
-    config_owner_mutation_open: bool,
+}
+
+impl std::fmt::Debug for DesktopProviderActionInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DesktopProviderActionInput")
+            .field(
+                "base_url",
+                &crate::config::sanitize_provider_endpoint(&self.base_url),
+            )
+            .field("metadata_mode", &self.metadata_mode)
+            .field("context_window", &self.context_window)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field("selected_model_id", &self.selected_model_id)
+            .finish()
+    }
 }
 
 fn accept_provider_action_input(
     controller: &mut DesktopController,
-    input: DesktopProviderActionInput,
+    mut input: DesktopProviderActionInput,
 ) -> Result<(), DesktopCommandConflict> {
+    input.base_url = match crate::config::ProviderEndpoint::parse(&input.base_url) {
+        Ok(endpoint) => endpoint.as_str().to_string(),
+        Err(error) => {
+            controller.state.set_status_message(error.to_string());
+            return Err(rejected_action(
+                controller,
+                "the provider endpoint is invalid",
+            ));
+        }
+    };
     let metadata_mode = match input.metadata_mode.as_str() {
         "lm_studio_native_required" | "lm-studio-native-required" | "lm_studio" | "lm-studio" => {
             crate::config::ProviderMetadataMode::LmStudioNativeRequired
@@ -1650,11 +1736,12 @@ async fn load_provider_models(
 async fn apply_provider_session(
     controller: State<'_, SharedController>,
     input: DesktopProviderActionInput,
+    draft_values: Vec<DesktopConfigValueInput>,
     expected_target: DesktopConfigMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
         ensure_config_mutation_target(controller, &expected_target)?;
-        ensure_external_config_owner_mutation_open(input.config_owner_mutation_open)?;
+        ensure_external_config_owner_mutation_open(controller, &draft_values)?;
         accept_provider_action_input(controller, input)?;
         if !controller.apply_provider_session() {
             return Err(rejected_action(
@@ -1671,11 +1758,12 @@ async fn apply_provider_session(
 async fn save_provider_global(
     controller: State<'_, SharedController>,
     input: DesktopProviderActionInput,
+    draft_values: Vec<DesktopConfigValueInput>,
     expected_target: DesktopConfigMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
         ensure_config_mutation_target(controller, &expected_target)?;
-        ensure_external_config_owner_mutation_open(input.config_owner_mutation_open)?;
+        ensure_external_config_owner_mutation_open(controller, &draft_values)?;
         accept_provider_action_input(controller, input)?;
         if !controller.save_provider_global() {
             return Err(rejected_action(
@@ -1688,7 +1776,7 @@ async fn save_provider_global(
     .await
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 struct DesktopConfigValueInput {
     key: String,
     text: String,
@@ -1699,7 +1787,7 @@ struct DesktopConfigValueInput {
 struct DesktopConfigMutationTarget {
     workspace_path: String,
     session_id: Option<String>,
-    config_generation: u64,
+    config_generation: String,
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
@@ -1707,10 +1795,9 @@ struct DesktopConfigMutationTarget {
 struct DesktopAccessModeMutationTarget {
     workspace_path: String,
     session_id: Option<String>,
-    config_generation: u64,
+    config_generation: String,
     access_mode: crate::config::AccessMode,
     runtime_owner_token: String,
-    config_owner_mutation_open: bool,
 }
 
 fn validate_config_mutation_target(
@@ -1721,7 +1808,7 @@ fn validate_config_mutation_target(
 ) -> Result<(), DesktopCommandConflict> {
     if expected.workspace_path != workspace_path
         || expected.session_id != session_id
-        || expected.config_generation != config_generation
+        || expected.config_generation != config_generation.to_string()
     {
         return Err(DesktopCommandConflict::new(
             "configuration owner changed before the mutation was applied; reopen settings and try again",
@@ -1730,10 +1817,38 @@ fn validate_config_mutation_target(
     Ok(())
 }
 
+fn validate_complete_config_draft(
+    controller: &DesktopController,
+    values: &[DesktopConfigValueInput],
+) -> Result<bool, DesktopCommandConflict> {
+    complete_config_draft_is_dirty(&controller.state.provider_config.effective_config, values)
+}
+
+fn complete_config_draft_is_dirty(
+    effective_config: &crate::config::ResolvedConfig,
+    values: &[DesktopConfigValueInput],
+) -> Result<bool, DesktopCommandConflict> {
+    if values.len() != crate::tui::config_editor::ConfigField::ALL.len() {
+        return Err(DesktopCommandConflict::new(
+            "the complete settings draft must accompany the configuration owner target",
+        ));
+    }
+    let editor = crate::tui::config_editor::ConfigEditorState::from_config_values(
+        effective_config,
+        values
+            .iter()
+            .map(|value| (value.key.clone(), value.text.clone()))
+            .collect(),
+    )
+    .map_err(DesktopCommandConflict::new)?;
+    Ok(editor.fields.iter().any(|field| field.dirty))
+}
+
 fn ensure_external_config_owner_mutation_open(
-    config_owner_mutation_open: bool,
+    controller: &DesktopController,
+    draft_values: &[DesktopConfigValueInput],
 ) -> Result<(), DesktopCommandConflict> {
-    if !config_owner_mutation_open {
+    if validate_complete_config_draft(controller, draft_values)? {
         return Err(DesktopCommandConflict::new(
             "finish or discard the current settings draft before changing configuration from another surface",
         ));
@@ -1750,10 +1865,22 @@ fn ensure_config_mutation_target(
         controller.app.workspace.root.as_str(),
         controller
             .state
-            .selected_session_id()
+            .app_state
+            .current_session_id
             .map(|session_id| session_id.to_string()),
         controller.state.provider_config.config_generation,
     )
+}
+
+fn ensure_config_draft_commit_admission(
+    controller: &DesktopController,
+) -> Result<(), DesktopCommandConflict> {
+    if !controller.config_draft_mutation_admission_open() {
+        return Err(DesktopCommandConflict::new(
+            "configuration cannot be committed while a run, Agent Tree, navigation, or owner mutation is active",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_access_mode_mutation_target(
@@ -1766,7 +1893,7 @@ fn validate_access_mode_mutation_target(
 ) -> Result<(), DesktopCommandConflict> {
     if expected.workspace_path != workspace_path
         || expected.session_id != session_id
-        || expected.config_generation != config_generation
+        || expected.config_generation != config_generation.to_string()
         || expected.access_mode != access_mode
         || expected.runtime_owner_token != runtime_owner_token
     {
@@ -1774,13 +1901,13 @@ fn validate_access_mode_mutation_target(
             "access-mode owner changed before the mutation was applied; review the current chat and try again",
         ));
     }
-    ensure_external_config_owner_mutation_open(expected.config_owner_mutation_open)?;
     Ok(())
 }
 
 fn ensure_access_mode_mutation_target(
     controller: &DesktopController,
     expected: &DesktopAccessModeMutationTarget,
+    draft_values: &[DesktopConfigValueInput],
 ) -> Result<(), DesktopCommandConflict> {
     let (runtime_owner_token, admission_open) = controller.access_mode_mutation_runtime_contract();
     validate_access_mode_mutation_target(
@@ -1800,12 +1927,32 @@ fn ensure_access_mode_mutation_target(
             .access_mode,
         runtime_owner_token,
     )?;
+    ensure_external_config_owner_mutation_open(controller, draft_values)?;
     if !admission_open {
         return Err(DesktopCommandConflict::new(
             "access mode cannot change while navigation or an owner mutation is active",
         ));
     }
     Ok(())
+}
+
+#[tauri::command]
+async fn reset_config_draft(
+    controller: State<'_, SharedController>,
+    values: Vec<DesktopConfigValueInput>,
+    expected_target: DesktopConfigMutationTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    if let Err(conflict) = ensure_config_mutation_target(&controller, &expected_target) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    if let Err(conflict) = validate_complete_config_draft(&controller, &values) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    controller
+        .next_web_state()
+        .map_err(DesktopCommandError::internal)
 }
 
 #[tauri::command]
@@ -1819,16 +1966,18 @@ async fn apply_session_config(
     if let Err(conflict) = ensure_config_mutation_target(&controller, &expected_target) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
-    controller
-        .state
-        .set_config_values_by_key(
-            values
-                .into_iter()
-                .map(|value| (value.key, value.text))
-                .collect(),
-        )
-        .map_err(DesktopCommandError::internal)?;
-    let applied = controller.apply_session_config();
+    if let Err(conflict) = ensure_config_draft_commit_admission(&controller) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    if let Err(conflict) = validate_complete_config_draft(&controller, &values) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    let applied = controller.apply_session_config(
+        values
+            .into_iter()
+            .map(|value| (value.key, value.text))
+            .collect(),
+    );
     controller.drain_runtime_messages();
     Ok((
         controller
@@ -1849,16 +1998,18 @@ async fn save_global_config(
     if let Err(conflict) = ensure_config_mutation_target(&controller, &expected_target) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
-    controller
-        .state
-        .set_config_values_by_key(
-            values
-                .into_iter()
-                .map(|value| (value.key, value.text))
-                .collect(),
-        )
-        .map_err(DesktopCommandError::internal)?;
-    let saved = controller.save_global_config();
+    if let Err(conflict) = ensure_config_draft_commit_admission(&controller) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    if let Err(conflict) = validate_complete_config_draft(&controller, &values) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    let saved = controller.save_global_config(
+        values
+            .into_iter()
+            .map(|value| (value.key, value.text))
+            .collect(),
+    );
     controller.drain_runtime_messages();
     Ok((
         controller
@@ -1871,10 +2022,11 @@ async fn save_global_config(
 #[tauri::command]
 async fn toggle_access_mode(
     controller: State<'_, SharedController>,
+    draft_values: Vec<DesktopConfigValueInput>,
     expected_target: DesktopAccessModeMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
-        ensure_access_mode_mutation_target(controller, &expected_target)?;
+        ensure_access_mode_mutation_target(controller, &expected_target, &draft_values)?;
         let expected_session_id = expected_target.session_id.clone();
         if !controller.toggle_access_mode_remembered() {
             return Err(rejected_action(
@@ -2022,19 +2174,84 @@ mod tests {
         let expected = DesktopDraftActionTarget {
             workspace_path: "C:/workspace".to_string(),
             session_id: Some("session-a".to_string()),
+            owner_generation: 7,
         };
         assert!(
-            validate_draft_action_target(&expected, "C:/workspace", Some("session-a".to_string()),)
-                .is_ok()
+            validate_draft_action_target(
+                &expected,
+                "C:/workspace",
+                Some("session-a".to_string()),
+                7,
+            )
+            .is_ok()
         );
         assert!(
-            validate_draft_action_target(&expected, "C:/other", Some("session-a".to_string()),)
+            validate_draft_action_target(&expected, "C:/other", Some("session-a".to_string()), 7,)
                 .is_err()
         );
         assert!(
-            validate_draft_action_target(&expected, "C:/workspace", Some("session-b".to_string()),)
-                .is_err()
+            validate_draft_action_target(
+                &expected,
+                "C:/workspace",
+                Some("session-b".to_string()),
+                7,
+            )
+            .is_err()
         );
+        assert!(
+            validate_draft_action_target(
+                &expected,
+                "C:/workspace",
+                Some("session-a".to_string()),
+                8,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn stop_target_rejects_workspace_session_and_runtime_owner_drift() {
+        let expected = DesktopRunMutationTarget {
+            workspace_path: "C:/workspace".to_string(),
+            session_id: Some("session-a".to_string()),
+            runtime_owner_token: "root:11".to_string(),
+        };
+        assert!(
+            validate_run_mutation_target(
+                &expected,
+                "C:/workspace",
+                Some("session-a".to_string()),
+                "root:11".to_string(),
+            )
+            .is_ok()
+        );
+        for (workspace, session_id, runtime_owner_token) in [
+            (
+                "C:/other",
+                Some("session-a".to_string()),
+                "root:11".to_string(),
+            ),
+            (
+                "C:/workspace",
+                Some("session-b".to_string()),
+                "root:11".to_string(),
+            ),
+            (
+                "C:/workspace",
+                Some("session-a".to_string()),
+                "root:12".to_string(),
+            ),
+        ] {
+            assert!(
+                validate_run_mutation_target(
+                    &expected,
+                    workspace,
+                    session_id,
+                    runtime_owner_token,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -2070,7 +2287,7 @@ mod tests {
         let expected = DesktopConfigMutationTarget {
             workspace_path: "C:/workspace".to_string(),
             session_id: Some("session-a".to_string()),
-            config_generation: 7,
+            config_generation: "7".to_string(),
         };
 
         assert!(
@@ -2122,14 +2339,83 @@ mod tests {
     }
 
     #[test]
+    fn config_generation_round_trips_as_an_exact_decimal_string() {
+        const GENERATION: u64 = 9_007_199_254_740_993;
+        let projection = super::super::web_model::DesktopConfigMutationTargetProjection {
+            workspace_path: "C:/workspace".to_string(),
+            session_id: Some("session-a".to_string()),
+            config_generation: GENERATION.to_string(),
+        };
+        let json = serde_json::to_value(projection).expect("serialize config target");
+        assert_eq!(
+            json.get("configGeneration")
+                .and_then(serde_json::Value::as_str),
+            Some("9007199254740993")
+        );
+
+        let expected: DesktopConfigMutationTarget =
+            serde_json::from_value(json).expect("deserialize exact config target");
+        assert!(
+            validate_config_mutation_target(
+                &expected,
+                "C:/workspace",
+                Some("session-a".to_string()),
+                GENERATION,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_config_mutation_target(
+                &expected,
+                "C:/workspace",
+                Some("session-a".to_string()),
+                GENERATION + 1,
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<DesktopConfigMutationTarget>(serde_json::json!({
+                "workspacePath": "C:/workspace",
+                "sessionId": "session-a",
+                "configGeneration": GENERATION,
+            }))
+            .is_err(),
+            "JSON numbers must not cross the Rust/TypeScript generation boundary"
+        );
+    }
+
+    #[test]
+    fn full_config_draft_is_compared_without_creating_a_rust_draft_owner() {
+        let config = crate::config::ResolvedConfig::default();
+        let editor = crate::tui::config_editor::ConfigEditorState::from_config(&config);
+        let mut values = editor
+            .fields
+            .iter()
+            .map(|field| DesktopConfigValueInput {
+                key: field.key.label().to_string(),
+                text: field.value.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!complete_config_draft_is_dirty(&config, &values).expect("clean full draft"));
+        values
+            .iter_mut()
+            .find(|value| value.key == "model.model")
+            .expect("model field")
+            .text = "locally-edited-model".to_string();
+        assert!(complete_config_draft_is_dirty(&config, &values).expect("dirty full draft"));
+        values.pop();
+        assert!(complete_config_draft_is_dirty(&config, &values).is_err());
+    }
+
+    #[test]
     fn access_mode_target_rejects_owner_generation_and_mode_drift() {
         let expected = DesktopAccessModeMutationTarget {
             workspace_path: "C:/workspace".to_string(),
             session_id: Some("session-a".to_string()),
-            config_generation: 7,
+            config_generation: "7".to_string(),
             access_mode: crate::config::AccessMode::Default,
             runtime_owner_token: "root:11".to_string(),
-            config_owner_mutation_open: true,
         };
 
         assert!(
@@ -2169,7 +2455,7 @@ mod tests {
                 "C:/workspace",
                 Some("session-a".to_string()),
                 7,
-                crate::config::AccessMode::AutoReview,
+                crate::config::AccessMode::FullAccess,
                 "root:11".to_string(),
             ),
             (
@@ -2192,27 +2478,6 @@ mod tests {
                 .is_err()
             );
         }
-        let dirty = DesktopAccessModeMutationTarget {
-            config_owner_mutation_open: false,
-            ..expected
-        };
-        assert!(
-            validate_access_mode_mutation_target(
-                &dirty,
-                "C:/workspace",
-                Some("session-a".to_string()),
-                7,
-                crate::config::AccessMode::Default,
-                "root:11".to_string(),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn external_config_owner_mutations_require_a_clean_client_draft() {
-        assert!(ensure_external_config_owner_mutation_open(true).is_ok());
-        assert!(ensure_external_config_owner_mutation_open(false).is_err());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -26,7 +27,7 @@ struct BoundResponsesCursor {
 /// Turn-scoped owner for Responses continuity and its one-shot recovery path.
 ///
 /// The session does not own network deadlines. Transport timeout and stream-idle
-/// behavior remain properties of `ChatRequest` and the provider client.
+/// behavior remain properties of `ChatRequest` and the provider transport.
 #[derive(Debug, Clone)]
 pub struct LlmTurnSession {
     cursor: Option<BoundResponsesCursor>,
@@ -93,7 +94,8 @@ impl LlmTurnSession {
         let response_id = response_id
             .filter(|response_id| !response_id.trim().is_empty())
             .filter(|_| {
-                request.provider_api_mode == crate::config::model::ProviderApiMode::Responses
+                request.provider_target().api_mode()
+                    == crate::config::model::ProviderApiMode::Responses
             });
         self.cursor = response_id.map(|previous_response_id| BoundResponsesCursor {
             continuation: ResponsesContinuation {
@@ -175,26 +177,12 @@ impl LlmTurnSession {
     }
 }
 
-/// Hashes the provider-semantic request contract. Canonical history messages,
-/// the Responses cursor, and transport-only timeout/retry values are excluded:
-/// history is guarded by its own revision and transport policy does not affect
-/// server-side response lineage.
+/// Hashes an explicit provider-semantic projection. Canonical history messages,
+/// the Responses cursor, transport endpoint/headers, and timing/retry policy are
+/// excluded: history is guarded by its own revision and transport policy does
+/// not affect server-side response lineage.
 fn chat_request_fingerprint(request: &ChatRequest) -> Result<String, LlmError> {
-    let mut value = serde_json::to_value(request)?;
-    let Some(object) = value.as_object_mut() else {
-        return Err(LlmError::Message(
-            "ChatRequest fingerprint serialization did not produce an object".to_string(),
-        ));
-    };
-    for transient in [
-        "messages",
-        "responses_continuation",
-        "timeout_ms",
-        "stream_idle_timeout_ms",
-    ] {
-        object.remove(transient);
-    }
-    let canonical = canonical_json(value);
+    let canonical = canonical_json(chat_request_semantic_projection(request)?);
     let encoded = serde_json::to_vec(&canonical)?;
     let digest = Sha256::digest(encoded);
     let mut fingerprint = String::with_capacity(digest.len() * 2);
@@ -202,6 +190,47 @@ fn chat_request_fingerprint(request: &ChatRequest) -> Result<String, LlmError> {
         write!(&mut fingerprint, "{byte:02x}").expect("writing to String cannot fail");
     }
     Ok(fingerprint)
+}
+
+#[derive(Serialize)]
+struct ChatRequestSemanticProjection<'a> {
+    model: &'a super::ModelProfile,
+    system_prompt: &'a str,
+    tools: &'a [super::ToolSchema],
+    provider_api_mode: crate::config::model::ProviderApiMode,
+    reasoning: &'a Option<super::ReasoningRequest>,
+    reasoning_capability: crate::config::model::ProviderReasoningCapability,
+    tool_choice: &'a Option<super::ProviderToolChoice>,
+    parallel_tool_calls: bool,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    top_k: Option<u32>,
+    presence_penalty: Option<f64>,
+    frequency_penalty: Option<f64>,
+    seed: Option<u64>,
+    stop_sequences: &'a [String],
+    extra_body: &'a Option<Value>,
+}
+
+fn chat_request_semantic_projection(request: &ChatRequest) -> Result<Value, LlmError> {
+    Ok(serde_json::to_value(ChatRequestSemanticProjection {
+        model: &request.model,
+        system_prompt: &request.system_prompt,
+        tools: &request.tools,
+        provider_api_mode: request.provider_target().api_mode(),
+        reasoning: &request.reasoning,
+        reasoning_capability: request.reasoning_capability,
+        tool_choice: &request.tool_choice,
+        parallel_tool_calls: request.parallel_tool_calls,
+        temperature: request.temperature,
+        top_p: request.top_p,
+        top_k: request.top_k,
+        presence_penalty: request.presence_penalty,
+        frequency_penalty: request.frequency_penalty,
+        seed: request.seed,
+        stop_sequences: &request.stop_sequences,
+        extra_body: &request.extra_body,
+    })?)
 }
 
 fn canonical_json(value: Value) -> Value {
@@ -234,35 +263,61 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::config::ProviderMetadataMode;
     use crate::config::model::{
         ProviderApiMode, ProviderReasoningCapability, ReasoningEffort, ReasoningSummary,
     };
+    use crate::config::{ProviderDeadlines, ProviderMetadataMode, ProviderTarget};
     use crate::llm::{
         ModelCapabilities, ModelProfile, ProviderToolChoice, ReasoningRequest, ToolSchema,
     };
 
     use super::*;
 
+    fn provider_target(
+        endpoint: &str,
+        api_mode: ProviderApiMode,
+        deadlines: ProviderDeadlines,
+    ) -> ProviderTarget {
+        ProviderTarget::new(
+            endpoint,
+            "model",
+            ProviderMetadataMode::OpenAiCompatibleOnly,
+            api_mode,
+            deadlines,
+        )
+        .expect("provider target")
+    }
+
     fn request() -> ChatRequest {
-        ChatRequest {
-            model: ModelProfile {
-                name: "model".to_string(),
-                context_window: 32_768,
-                max_output_tokens: 4_096,
-                provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
-                capabilities: ModelCapabilities {
-                    supports_tools: true,
-                    supports_reasoning: true,
-                    supports_images: false,
-                },
+        let model = ModelProfile {
+            name: "model".to_string(),
+            context_window: 32_768,
+            max_output_tokens: 4_096,
+            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            capabilities: ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: true,
+                supports_images: false,
             },
-            base_url: "http://localhost:1234".to_string(),
-            system_prompt: "stable instructions".to_string(),
-            messages: vec![ModelMessage::User {
+        };
+        let provider = provider_target(
+            "http://localhost:1234",
+            ProviderApiMode::Responses,
+            ProviderDeadlines {
+                response_start_timeout_ms: 600_000,
+                stream_idle_timeout_ms: 60_000,
+                connect_timeout_ms: 10_000,
+                max_connect_retries: 2,
+            },
+        );
+        let mut request = ChatRequest::new(
+            provider,
+            model,
+            "stable instructions".to_string(),
+            vec![ModelMessage::User {
                 content: "first input".to_string(),
             }],
-            tools: vec![ToolSchema {
+            vec![ToolSchema {
                 name: "read".to_string(),
                 description: "read a file".to_string(),
                 input_schema: json!({
@@ -272,32 +327,24 @@ mod tests {
                         "offset": {"type": "integer"}
                     }
                 }),
-                strict: true,
             }],
-            provider_api_mode: ProviderApiMode::Responses,
-            reasoning: Some(ReasoningRequest {
+            Some(ReasoningRequest {
                 effort: Some(ReasoningEffort::Medium),
                 summary: ReasoningSummary::Concise,
             }),
-            reasoning_capability: ProviderReasoningCapability::Responses {
+            ProviderReasoningCapability::Responses {
                 supports_summary: true,
                 supports_previous_response_id: true,
             },
-            responses_continuation: None,
-            tool_choice: Some(ProviderToolChoice::Required),
-            parallel_tool_calls: false,
-            timeout_ms: 600_000,
-            stream_idle_timeout_ms: 60_000,
-            extra_headers: BTreeMap::from([("x-provider".to_string(), "test".to_string())]),
-            temperature: Some(0.2),
-            top_p: Some(0.9),
-            top_k: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            seed: Some(7),
-            stop_sequences: vec!["stop".to_string()],
-            extra_body: Some(json!({"nested": {"b": 2, "a": 1}})),
-        }
+            BTreeMap::from([("x-provider".to_string(), "test".to_string())]),
+        );
+        request.tool_choice = Some(ProviderToolChoice::Required);
+        request.temperature = Some(0.2);
+        request.top_p = Some(0.9);
+        request.seed = Some(7);
+        request.stop_sequences = vec!["stop".to_string()];
+        request.extra_body = Some(json!({"nested": {"b": 2, "a": 1}}));
+        request
     }
 
     #[test]
@@ -312,8 +359,16 @@ mod tests {
             previous_response_id: "resp_old".to_string(),
             input_start: 2,
         });
-        equivalent.timeout_ms = 1;
-        equivalent.stream_idle_timeout_ms = 2;
+        equivalent.replace_provider_target(provider_target(
+            "http://localhost:1234",
+            ProviderApiMode::Responses,
+            ProviderDeadlines {
+                response_start_timeout_ms: 1,
+                stream_idle_timeout_ms: 2,
+                connect_timeout_ms: 3,
+                max_connect_retries: 4,
+            },
+        ));
 
         assert_eq!(
             chat_request_fingerprint(&equivalent).expect("equivalent fingerprint"),
@@ -323,6 +378,66 @@ mod tests {
         equivalent.system_prompt.push_str(" changed");
         assert_ne!(
             chat_request_fingerprint(&equivalent).expect("changed fingerprint"),
+            expected
+        );
+    }
+
+    #[test]
+    fn transport_endpoint_headers_and_secrets_are_absent_from_fingerprint_projection() {
+        let mut first = request();
+        first.replace_provider_target(provider_target(
+            "https://provider.example/v1",
+            ProviderApiMode::Responses,
+            ProviderDeadlines {
+                response_start_timeout_ms: 600_000,
+                stream_idle_timeout_ms: 60_000,
+                connect_timeout_ms: 10_000,
+                max_connect_retries: 2,
+            },
+        ));
+        first.replace_extra_headers(BTreeMap::from([
+            (
+                "authorization".to_string(),
+                "Bearer header-secret".to_string(),
+            ),
+            ("x-provider-key".to_string(), "another-secret".to_string()),
+        ]));
+        first.responses_continuation = Some(ResponsesContinuation {
+            previous_response_id: "response-id-secret".to_string(),
+            input_start: 0,
+        });
+
+        let debug = format!("{first:?}");
+        for secret in ["header-secret", "another-secret", "response-id-secret"] {
+            assert!(!debug.contains(secret));
+        }
+
+        let projection = serde_json::to_string(
+            &chat_request_semantic_projection(&first).expect("semantic projection"),
+        )
+        .expect("serialize semantic projection");
+        for secret in ["header-secret", "another-secret", "response-id-secret"] {
+            assert!(!projection.contains(secret));
+        }
+
+        let expected = chat_request_fingerprint(&first).expect("fingerprint");
+        let mut different_transport = first.clone();
+        different_transport.replace_provider_target(provider_target(
+            "http://different-provider.invalid",
+            ProviderApiMode::Responses,
+            ProviderDeadlines {
+                response_start_timeout_ms: 1,
+                stream_idle_timeout_ms: 2,
+                connect_timeout_ms: 3,
+                max_connect_retries: 4,
+            },
+        ));
+        different_transport.replace_extra_headers(BTreeMap::from([(
+            "authorization".to_string(),
+            "Bearer different-secret".to_string(),
+        )]));
+        assert_eq!(
+            chat_request_fingerprint(&different_transport).expect("transport-independent hash"),
             expected
         );
     }
@@ -478,7 +593,16 @@ mod tests {
     fn non_responses_and_blank_response_ids_do_not_create_cursor() {
         let mut session = LlmTurnSession::new("rev-0");
         let mut chat_completions = request();
-        chat_completions.provider_api_mode = ProviderApiMode::ChatCompletions;
+        chat_completions.replace_provider_target(provider_target(
+            "http://localhost:1234",
+            ProviderApiMode::ChatCompletions,
+            ProviderDeadlines {
+                response_start_timeout_ms: 600_000,
+                stream_idle_timeout_ms: 60_000,
+                connect_timeout_ms: 10_000,
+                max_connect_retries: 2,
+            },
+        ));
         chat_completions.reasoning = None;
         chat_completions.reasoning_capability = ProviderReasoningCapability::Unsupported;
         session

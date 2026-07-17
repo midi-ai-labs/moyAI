@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { actionById, paletteActions, type ActionContext } from "../src/actions.ts";
-import { updateConfigDraftValue } from "../src/config_mutation.ts";
+import {
+  discardConfigDraft,
+  sameConfigMutationTarget,
+  updateConfigDraftValue,
+} from "../src/config_mutation.ts";
 import {
   InteractionLifecycle,
   shouldBeginKeyboardInteraction,
@@ -18,7 +22,7 @@ import {
   renderTopbar,
   setRenderContext,
 } from "../src/render.ts";
-import type { DesktopWebState } from "../src/types.ts";
+import type { DesktopViewState, DesktopWebState } from "../src/types.ts";
 import { createUiLocalState } from "../src/ui_state.ts";
 import { validateConfigInput } from "../src/utils.ts";
 import {
@@ -33,7 +37,7 @@ import {
   sessionSearchMutationTarget,
 } from "../src/view_state.ts";
 
-function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
+function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState {
   return {
     projection_revision: "1",
     workspace_path: "C:/workspace",
@@ -46,16 +50,36 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
     access_target: {
       workspacePath: "C:/workspace",
       sessionId: "session-a",
-      configGeneration: 1,
+      configGeneration: "1",
       accessMode: "default",
       runtimeOwnerToken: "idle:0",
-      configOwnerMutationOpen: true,
     },
-    access_mode_mutation_enabled: true,
-    config_owner_mutation_open: true,
-    config_draft_dirty: false,
-    config_draft_discard_enabled: false,
-    config_draft_commit_enabled: false,
+    config_draft_capabilities: {
+      clean: {
+        dirty: false,
+        edit_enabled: true,
+        discard_enabled: false,
+        commit_enabled: false,
+        external_owner_mutation_open: true,
+        access_mode_mutation_enabled: true,
+      },
+      dirty: {
+        dirty: true,
+        edit_enabled: true,
+        discard_enabled: true,
+        commit_enabled: true,
+        external_owner_mutation_open: false,
+        access_mode_mutation_enabled: false,
+      },
+    },
+    config_draft: {
+      dirty: false,
+      edit_enabled: true,
+      discard_enabled: false,
+      commit_enabled: false,
+      external_owner_mutation_open: true,
+      access_mode_mutation_enabled: true,
+    },
     model_label: "model-a",
     provider_label: "Local",
     selected_project_index: 0,
@@ -90,7 +114,7 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
       checks: [],
     },
     composer_commit_generation: "0",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "session-a" },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "session-a", ownerGeneration: 1 },
     busy: false,
     navigation_loading: false,
     navigation_admission_open: true,
@@ -98,6 +122,11 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
     agent_tree_active: false,
     can_submit: true,
     can_cancel_run: false,
+    run_target: {
+      workspacePath: "C:/workspace",
+      sessionId: "session-a",
+      runtimeOwnerToken: "idle:0",
+    },
     enhance_enabled: true,
     image_input_enabled: true,
     send_enhanced_enabled: true,
@@ -115,7 +144,11 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
     provider_selected_model_summary: [],
     provider_loading: false,
     provider_apply_enabled: true,
-    config_target: { workspacePath: "C:/workspace", sessionId: "session-a", configGeneration: 1 },
+    config_target: {
+      workspacePath: "C:/workspace",
+      sessionId: "session-a",
+      configGeneration: "1",
+    },
     config_fields: [{
       key: "model.model",
       value: "model-a",
@@ -126,9 +159,6 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
       max_value: null,
       options: [],
     }],
-    selected_config_index: 0,
-    config_value_text: "model-a",
-    config_feedback_text: "",
     attached_images: [],
     transcript_rows: [],
     thread_empty: true,
@@ -144,7 +174,7 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
     session_search_include_archived: false,
     history_export_enabled: true,
     ...overrides,
-  } as DesktopWebState;
+  } as DesktopViewState;
 }
 
 test("local drafts produce a view without mutating the Rust projection", () => {
@@ -279,7 +309,7 @@ test("draft ownership resets only when its durable target changes", () => {
     projection_revision: "3",
     selected_session_title: "Session B",
     session_rows: [{ session_id: "session-b", label: "Session B" }],
-    draft_target: { workspacePath: "C:/workspace", sessionId: "session-b" },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "session-b", ownerGeneration: 2 },
     draft_prompt: "",
     config_target: { workspacePath: "C:/workspace", sessionId: "session-b", configGeneration: 1 },
   });
@@ -336,7 +366,7 @@ test("new-session binding preserves follow-up text typed after send", () => {
   const ui = createUiLocalState();
   const initial = projection({
     draft_prompt: "first request",
-    draft_target: { workspacePath: "C:/workspace", sessionId: null },
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 1 },
   });
   reconcileUiDrafts(ui, null, initial, null);
   const snapshot = captureDraftMutation(ui, "submit_prompt");
@@ -346,7 +376,7 @@ test("new-session binding preserves follow-up text typed after send", () => {
   const response = projection({
     projection_revision: "2",
     draft_prompt: "",
-    draft_target: { workspacePath: "C:/workspace", sessionId: null },
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 1 },
     busy: true,
   });
   acknowledgeDraftMutation(ui, response, "submit_prompt", snapshot);
@@ -355,13 +385,13 @@ test("new-session binding preserves follow-up text typed after send", () => {
     projection_revision: "3",
     composer_commit_generation: "1",
     draft_prompt: "",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "created-session" },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "created-session", ownerGeneration: 1 },
     busy: true,
   });
   reconcileUiDrafts(ui, response, bound, null);
 
   assert.equal(ui.drafts.prompt, "follow-up typed while running");
-  assert.equal(ui.drafts.composerOwner, "C:/workspace\u0000created-session");
+  assert.equal(ui.drafts.composerOwner, "C:/workspace\u00001\u0000created-session");
   assert.equal(ui.drafts.pendingRunSubmission, null);
 });
 
@@ -369,7 +399,7 @@ test("new-session binding is registered before a newer poll can beat the command
   const ui = createUiLocalState();
   const initial = projection({
     draft_prompt: "first request",
-    draft_target: { workspacePath: "C:/workspace", sessionId: null },
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 1 },
   });
   reconcileUiDrafts(ui, null, initial, null);
   const snapshot = captureDraftMutation(ui, "submit_prompt");
@@ -380,25 +410,47 @@ test("new-session binding is registered before a newer poll can beat the command
     projection_revision: "3",
     composer_commit_generation: "1",
     draft_prompt: "",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "created-before-response" },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "created-before-response", ownerGeneration: 1 },
     busy: true,
   });
   reconcileUiDrafts(ui, initial, boundPoll, null);
   const olderResponse = projection({
     projection_revision: "2",
     draft_prompt: "",
-    draft_target: { workspacePath: "C:/workspace", sessionId: null },
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 2 },
     busy: true,
   });
   acknowledgeDraftMutation(ui, olderResponse, "submit_prompt", snapshot);
 
   assert.equal(ui.drafts.prompt, "follow-up before command response");
-  assert.equal(ui.drafts.composerOwner, "C:/workspace\u0000created-before-response");
+  assert.equal(ui.drafts.composerOwner, "C:/workspace\u00001\u0000created-before-response");
+});
+
+test("same-owner generation reset discards stale local composer text", () => {
+  const ui = createUiLocalState();
+  const initial = projection({
+    draft_prompt: "server draft",
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 4 },
+  });
+  reconcileUiDrafts(ui, null, initial, null);
+  ui.drafts.prompt = "stale local draft";
+  ui.drafts.composerRevision += 1;
+
+  const reset = projection({
+    projection_revision: "2",
+    draft_prompt: "",
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 5 },
+  });
+  reconcileUiDrafts(ui, initial, reset, null);
+
+  assert.equal(ui.drafts.prompt, "");
 });
 
 test("failed run start releases an unconsumed pending submission", () => {
   const ui = createUiLocalState();
-  const initial = projection({ draft_target: { workspacePath: "C:/workspace", sessionId: null } });
+  const initial = projection({
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 1 },
+  });
   reconcileUiDrafts(ui, null, initial, null);
   const snapshot = captureDraftMutation(ui, "submit_prompt");
   assert.notEqual(ui.drafts.pendingRunSubmission, null);
@@ -492,6 +544,103 @@ test("review draft is retained until the reviewed run is durably admitted", () =
   });
   reconcileUiDrafts(ui, launchAccepted, admitted, null);
   assert.equal(ui.drafts.reviewDraft, "");
+});
+
+test("same-overlay prompt enhancement completion hydrates an untouched local review draft", () => {
+  const ui = createUiLocalState();
+  const enhancing = projection({
+    overlay: "prompt_review",
+    review_draft_text: "",
+    review_status_text: "Enhancing",
+  });
+  reconcileUiDrafts(ui, null, enhancing, null);
+
+  const reviewing = projection({
+    projection_revision: "2",
+    overlay: "prompt_review",
+    review_draft_text: "enhanced request",
+    review_status_text: "Reviewing",
+  });
+  reconcileUiDrafts(ui, enhancing, reviewing, null);
+
+  assert.equal(ui.drafts.reviewDraft, "enhanced request");
+  assert.equal(projectViewState(reviewing, ui).review_draft_text, "enhanced request");
+});
+
+test("late same-owner enhancement cannot overwrite a local review edit", () => {
+  const ui = createUiLocalState();
+  const enhancing = projection({
+    overlay: "prompt_review",
+    review_draft_text: "",
+    review_status_text: "Enhancing",
+  });
+  reconcileUiDrafts(ui, null, enhancing, null);
+  ui.drafts.reviewDraft = "user refinement";
+  ui.drafts.reviewRevision += 1;
+
+  const staleCompletion = projection({
+    projection_revision: "2",
+    overlay: "prompt_review",
+    review_draft_text: "late enhanced request",
+    review_status_text: "Reviewing",
+  });
+  reconcileUiDrafts(ui, enhancing, staleCompletion, null);
+
+  assert.equal(ui.drafts.reviewDraft, "user refinement");
+  assert.equal(projectViewState(staleCompletion, ui).review_draft_text, "user refinement");
+});
+
+test("prompt review owner change replaces an old owner's local edit", () => {
+  const ui = createUiLocalState();
+  const ownerA = projection({
+    overlay: "prompt_review",
+    review_draft_text: "owner A review",
+    draft_target: { workspacePath: "C:/workspace", sessionId: "session-a", ownerGeneration: 1 },
+  });
+  reconcileUiDrafts(ui, null, ownerA, null);
+  ui.drafts.reviewDraft = "owner A local edit";
+  ui.drafts.reviewRevision += 1;
+
+  const ownerB = projection({
+    projection_revision: "2",
+    overlay: "prompt_review",
+    review_draft_text: "owner B review",
+    draft_target: { workspacePath: "C:/workspace", sessionId: "session-b", ownerGeneration: 2 },
+  });
+  reconcileUiDrafts(ui, ownerA, ownerB, null);
+
+  assert.equal(ui.drafts.reviewDraft, "owner B review");
+  assert.equal(projectViewState(ownerB, ui).review_draft_text, "owner B review");
+});
+
+test("stale prompt review acknowledgement cannot cross an owner change", () => {
+  const ui = createUiLocalState();
+  const ownerA = projection({
+    overlay: "prompt_review",
+    review_draft_text: "owner A review",
+    draft_target: { workspacePath: "C:/workspace", sessionId: "session-a", ownerGeneration: 1 },
+  });
+  reconcileUiDrafts(ui, null, ownerA, null);
+  const staleSnapshot = captureDraftMutation(ui, "cancel_prompt_review");
+
+  const ownerB = projection({
+    projection_revision: "3",
+    overlay: "prompt_review",
+    review_draft_text: "owner B review",
+    draft_target: { workspacePath: "C:/workspace", sessionId: "session-b", ownerGeneration: 2 },
+  });
+  reconcileUiDrafts(ui, ownerA, ownerB, null);
+
+  const staleResponse = projection({
+    projection_revision: "2",
+    overlay: "none",
+    review_draft_text: "",
+    draft_target: { workspacePath: "C:/workspace", sessionId: "session-a", ownerGeneration: 1 },
+  });
+  acknowledgeDraftMutation(ui, staleResponse, "cancel_prompt_review", staleSnapshot);
+
+  assert.equal(ui.drafts.reviewDraft, "owner B review");
+  assert.equal(projectViewState(ownerB, ui).review_draft_text, "owner B review");
 });
 
 test("same-owner navigation acknowledgement cannot clear an unsaved composer draft", () => {
@@ -596,7 +745,11 @@ test("workspace browser submits its local draft with the authoritative draft own
     name: "browse_workspace",
     args: {
       text: "D:/next-workspace",
-      expectedTarget: { workspacePath: "C:/workspace", sessionId: "session-a" },
+      expectedTarget: {
+        workspacePath: "C:/workspace",
+        sessionId: "session-a",
+        ownerGeneration: 1,
+      },
     },
   });
 });
@@ -608,6 +761,10 @@ test("search and attachment actions carry their authoritative owners", async () 
     mutate: async (name: string, args?: Record<string, unknown>) => {
       invocations.push({ name, args });
     },
+    prepareConfigSnapshot: () => state.config_fields.map((field) => ({
+      key: field.key,
+      text: field.value,
+    })),
   } as unknown as ActionContext;
 
   await actionById("toggle-session-archived-search")?.run(state, context, { index: -1, value: "" });
@@ -628,7 +785,13 @@ test("search and attachment actions carry their authoritative owners", async () 
     },
     {
       name: "clear_images",
-      args: { expectedTarget: { workspacePath: "C:/workspace", sessionId: "session-a" } },
+      args: {
+        expectedTarget: {
+          workspacePath: "C:/workspace",
+          sessionId: "session-a",
+          ownerGeneration: 1,
+        },
+      },
     },
     {
       name: "toggle_access_mode",
@@ -636,17 +799,22 @@ test("search and attachment actions carry their authoritative owners", async () 
         expectedTarget: {
           workspacePath: "C:/workspace",
           sessionId: "session-a",
-          configGeneration: 1,
+          configGeneration: "1",
           accessMode: "default",
           runtimeOwnerToken: "idle:0",
-          configOwnerMutationOpen: true,
         },
+        draftValues: [{ key: "model.model", text: "model-a" }],
       },
     },
   ]);
   assert.equal(
     actionById("toggle-access")?.enabled?.(
-      projection({ access_mode_mutation_enabled: false }),
+      projection({
+        config_draft: {
+          ...projection().config_draft,
+          access_mode_mutation_enabled: false,
+        },
+      }),
       { index: -1, value: "" },
     ),
     false,
@@ -674,18 +842,25 @@ test("stable row identity and selected-state semantics survive list reordering",
 });
 
 test("access-mode control consumes the Rust mutation capability", () => {
+  const enabled = projection();
+  const disabled = projection({
+    config_draft: {
+      ...projection().config_draft,
+      access_mode_mutation_enabled: false,
+    },
+  });
   assert.match(
-    renderTopbar(projection({ access_mode_mutation_enabled: true })),
+    renderTopbar(enabled),
     /data-action="toggle-access"[^>]*aria-disabled="false"(?![^>]*\sdisabled(?:\s|>|=))[^>]*>/,
   );
   assert.match(
-    renderTopbar(projection({ access_mode_mutation_enabled: false })),
+    renderTopbar(disabled),
     /data-action="toggle-access"[^>]*aria-disabled="true"[^>]*\sdisabled>/,
   );
 });
 
 test("config commit capability never gates unrelated workspace or window actions", () => {
-  const clean = projection({ config_draft_commit_enabled: false });
+  const clean = projection();
   for (const id of ["browse-workspace", "toggle-maximize-window"]) {
     assert.equal(actionById(id)?.enabled?.(clean, { index: -1, value: "" }), true, id);
   }
@@ -720,7 +895,7 @@ test("a closed dirty settings draft blocks every external config owner mutation"
       required: false,
       min_value: null,
       max_value: null,
-      options: ["default", "auto_review", "full_access"],
+      options: ["default", "full_access"],
     },
   ];
   const before = projection({ config_fields: fields });
@@ -737,9 +912,8 @@ test("a closed dirty settings draft blocks every external config owner mutation"
 
   assert.equal(dirtyView.config_target.configGeneration, before.config_target.configGeneration);
   assert.equal(ui.configDirty, true);
-  assert.equal(dirtyView.config_owner_mutation_open, false);
-  assert.equal(dirtyView.access_target.configOwnerMutationOpen, false);
-  assert.equal(dirtyView.access_mode_mutation_enabled, false);
+  assert.equal(dirtyView.config_draft.external_owner_mutation_open, false);
+  assert.equal(dirtyView.config_draft.access_mode_mutation_enabled, false);
   assert.equal(dirtyView.provider_apply_enabled, false);
   assert.equal(
     dirtyView.config_fields.find((field) => field.key === "model.model")?.value,
@@ -795,11 +969,11 @@ test("a closed dirty settings draft blocks every external config owner mutation"
   });
 
   const after = projection({
-    access_label: "auto_review",
-    access_target: { ...before.access_target, accessMode: "auto_review" },
+    access_label: "full_access",
+    access_target: { ...before.access_target, accessMode: "full_access" },
     config_target: { ...before.config_target },
     config_fields: fields.map((field) => field.key === "permissions.access_mode"
-      ? { ...field, value: "auto_review" }
+      ? { ...field, value: "full_access" }
       : field),
   });
 
@@ -808,13 +982,13 @@ test("a closed dirty settings draft blocks every external config owner mutation"
   assert.equal(
     projectViewState(after, cleanUi).config_fields
       .find((field) => field.key === "permissions.access_mode")?.value,
-    "auto_review",
+    "full_access",
     "a clean settings view consumes the new Rust baseline",
   );
 });
 
 test("local config and run-start mutations close external config owner admission", async () => {
-  const state = projection({ access_mode_mutation_enabled: true });
+  const state = projection();
   const configPending = createUiLocalState();
   reconcileUiDrafts(configPending, null, state, null);
   updateConfigDraftValue(
@@ -824,13 +998,13 @@ test("local config and run-start mutations close external config owner admission
     "model.model",
     "pending-model",
   );
-  configPending.activeConfigMutationGeneration = 1;
+  configPending.activeConfigMutationGeneration = 1n;
   const configPendingView = projectViewState(state, configPending);
-  assert.equal(configPendingView.access_mode_mutation_enabled, false);
+  assert.equal(configPendingView.config_draft.access_mode_mutation_enabled, false);
   assert.equal(configPendingView.provider_apply_enabled, false);
-  assert.equal(configPendingView.config_owner_mutation_open, false);
-  assert.equal(configPendingView.config_draft_discard_enabled, false);
-  assert.equal(configPendingView.config_draft_commit_enabled, false);
+  assert.equal(configPendingView.config_draft.external_owner_mutation_open, false);
+  assert.equal(configPendingView.config_draft.discard_enabled, false);
+  assert.equal(configPendingView.config_draft.commit_enabled, false);
   assert.equal(configDraftEditOpen(configPending), false);
   for (const id of ["discard-config-draft", "apply-session-config", "save-global-config"]) {
     assert.equal(actionById(id)?.enabled?.(
@@ -885,18 +1059,27 @@ test("local config and run-start mutations close external config owner admission
   });
 
   configPending.activeConfigMutationGeneration = null;
-  const resumed = projectViewState(state, configPending);
+  const rustOwnedDirty = projection();
+  const resumed = projectViewState(rustOwnedDirty, configPending);
   assert.equal(configDraftEditOpen(configPending), true);
-  assert.equal(resumed.config_draft_discard_enabled, true);
-  assert.equal(resumed.config_draft_commit_enabled, true);
+  assert.equal(resumed.config_draft.discard_enabled, true);
+  assert.equal(resumed.config_draft.commit_enabled, true);
 
   const runPending = createUiLocalState();
-  reconcileUiDrafts(runPending, null, state, null);
+  reconcileUiDrafts(runPending, null, rustOwnedDirty, null);
+  updateConfigDraftValue(
+    runPending,
+    rustOwnedDirty.config_target,
+    rustOwnedDirty.config_fields.map((field) => ({ key: field.key, text: field.value })),
+    "model.model",
+    "run-pending-model",
+  );
   runPending.runStartMutationPending = true;
-  const runPendingView = projectViewState(state, runPending);
-  assert.equal(runPendingView.access_mode_mutation_enabled, false);
+  const runPendingView = projectViewState(rustOwnedDirty, runPending);
+  assert.equal(runPendingView.config_draft.access_mode_mutation_enabled, false);
   assert.equal(runPendingView.provider_apply_enabled, false);
-  assert.equal(runPendingView.config_owner_mutation_open, false);
+  assert.equal(runPendingView.config_draft.external_owner_mutation_open, false);
+  assert.equal(runPendingView.config_draft.commit_enabled, false);
 });
 
 test("hidden settings draft can be reopened, discarded, and release external mutations", async () => {
@@ -910,29 +1093,29 @@ test("hidden settings draft can be reopened, discarded, and release external mut
     "model.model",
     "invalid-hidden-draft",
   );
-  assert.equal(projectViewState(raw, ui).config_owner_mutation_open, false);
+  assert.equal(projectViewState(raw, ui).config_draft.external_owner_mutation_open, false);
 
-  const reopened = { ...raw, overlay: "config" };
+  const reopened = {
+    ...raw,
+    overlay: "config",
+  };
   reconcileUiDrafts(ui, raw, reopened, null);
   const reopenedView = projectViewState(reopened, ui);
-  assert.equal(reopenedView.config_draft_dirty, true);
+  assert.equal(reopenedView.config_draft.dirty, true);
   assert.equal(actionById("discard-config-draft")?.enabled?.(
     reopenedView,
     { index: -1, value: "" },
   ), true);
-  let rerenders = 0;
-  await actionById("discard-config-draft")?.run(
-    reopenedView,
-    { uiState: ui, rerender: () => { rerenders += 1; } } as unknown as ActionContext,
-    { index: -1, value: "" },
-  );
+  discardConfigDraft(ui);
 
-  const cleanView = projectViewState(reopened, ui);
+  const rustOwnedClean = {
+    ...reopened,
+  };
+  const cleanView = projectViewState(rustOwnedClean, ui);
   assert.equal(ui.configDirty, false);
-  assert.equal(cleanView.config_owner_mutation_open, true);
-  assert.equal(cleanView.access_mode_mutation_enabled, true);
+  assert.equal(cleanView.config_draft.external_owner_mutation_open, true);
+  assert.equal(cleanView.config_draft.access_mode_mutation_enabled, true);
   assert.equal(cleanView.provider_apply_enabled, true);
-  assert.equal(rerenders, 1);
 });
 
 test("external config mutation roundtrip prevents a settings draft from starting", async () => {
@@ -944,10 +1127,10 @@ test("external config mutation roundtrip prevents a settings draft from starting
 
   const pending = projectViewState(state, ui);
   assert.equal(configDraftEditOpen(ui), false);
-  assert.equal(pending.config_owner_mutation_open, false);
-  assert.equal(pending.access_mode_mutation_enabled, false);
+  assert.equal(pending.config_draft.external_owner_mutation_open, false);
+  assert.equal(pending.config_draft.access_mode_mutation_enabled, false);
   assert.equal(pending.provider_apply_enabled, false);
-  assert.equal(pending.config_draft_commit_enabled, false);
+  assert.equal(pending.config_draft.commit_enabled, false);
   assert.equal(ui.configDirty, false);
   let configCommands = 0;
   await actionById("apply-session-config")?.run(
@@ -1079,6 +1262,20 @@ test("canonical row_kind selects specialized transcript rendering", () => {
   }));
   assert.match(html, /message work-summary work_summary_running/);
   assert.match(html, /<details[^>]+open>/);
+});
+
+test("config owner generation remains exact beyond JavaScript's safe integer range", () => {
+  const current = {
+    ...projection().config_target,
+    configGeneration: "9007199254740993",
+  };
+  const newerFence = {
+    ...current,
+    configGeneration: "9007199254740994",
+  };
+
+  assert.equal(sameConfigMutationTarget(current, { ...current }), true);
+  assert.equal(sameConfigMutationTarget(current, newerFence), false);
 });
 
 test("incomplete canonical turn is rendered as nonterminal evidence", () => {

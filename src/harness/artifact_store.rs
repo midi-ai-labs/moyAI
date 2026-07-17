@@ -21,25 +21,32 @@ impl SqliteArtifactStore {
     }
 }
 
+pub(crate) fn insert_artifact_in_connection(
+    connection: &Connection,
+    manifest: &ArtifactManifest,
+) -> Result<(), StorageError> {
+    connection.execute(
+        "INSERT OR REPLACE INTO harness_artifacts (id, run_id, kind, relative_path, sha256, size_bytes, tags_json, created_by_event_id, contract_refs_json, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%s','now') * 1000)",
+        params![
+            manifest.id.to_string(),
+            manifest.run_id.to_string(),
+            serde_json::to_string(&manifest.kind)?,
+            manifest.relative_path.as_str(),
+            manifest.sha256,
+            manifest.size_bytes as i64,
+            serde_json::to_string(&manifest.tags)?,
+            manifest.created_by_event.map(|id| id.to_string()),
+            serde_json::to_string(&manifest.contract_refs)?,
+        ],
+    )?;
+    Ok(())
+}
+
 impl ArtifactStore for SqliteArtifactStore {
     fn insert_artifact(&self, manifest: &ArtifactManifest) -> Result<(), StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.execute(
-            "INSERT OR REPLACE INTO harness_artifacts (id, run_id, kind, relative_path, sha256, size_bytes, tags_json, created_by_event_id, contract_refs_json, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%s','now') * 1000)",
-            params![
-                manifest.id.to_string(),
-                manifest.run_id.to_string(),
-                serde_json::to_string(&manifest.kind)?,
-                manifest.relative_path.as_str(),
-                manifest.sha256,
-                manifest.size_bytes as i64,
-                serde_json::to_string(&manifest.tags)?,
-                manifest.created_by_event.map(|id| id.to_string()),
-                serde_json::to_string(&manifest.contract_refs)?,
-            ],
-        )?;
-        Ok(())
+        insert_artifact_in_connection(&connection, manifest)
     }
 
     fn list_artifacts(&self, run_id: HarnessRunId) -> Result<Vec<ArtifactManifest>, StorageError> {

@@ -78,7 +78,6 @@ export function shortenPath(path: string): string {
 
 export function displayAccessLabel(label: string): string {
   if (label === "default") return "標準";
-  if (label === "auto_review") return "自動レビュー";
   if (label === "full_access") return "フルアクセス";
   return label;
 }

@@ -4,7 +4,11 @@ use std::io::Write;
 use camino::{Utf8Path, Utf8PathBuf};
 use tempfile::NamedTempFile;
 
-use crate::config::loader::{acquire_global_config_write_lease, global_config_path};
+use crate::config::ProviderEndpoint;
+use crate::config::loader::{
+    acquire_global_config_write_lease, global_config_path, read_toml_utf8_bounded,
+};
+use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::model::{
     AccessMode, McpServerConfig, MultiAgentMode, PartialDoclingConfig, PartialFileGuardConfig,
     PartialInspectionConfig, PartialMcpConfig, PartialModelConfig, PartialMultiAgentConfig,
@@ -267,6 +271,37 @@ impl ConfigEditorState {
         }
     }
 
+    pub fn from_config_values(
+        config: &ResolvedConfig,
+        values: Vec<(String, String)>,
+    ) -> Result<Self, String> {
+        let mut candidate = Self::from_config(config);
+        candidate.replace_values_by_key(values)?;
+        Ok(candidate)
+    }
+
+    pub fn replace_values_by_key(&mut self, values: Vec<(String, String)>) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut updates = Vec::with_capacity(values.len());
+        for (key, value) in values {
+            if !seen.insert(key.clone()) {
+                return Err(format!("duplicate config field key: {key}"));
+            }
+            let index = self
+                .fields
+                .iter()
+                .position(|field| field.key.label() == key)
+                .ok_or_else(|| format!("unknown config field key: {key}"))?;
+            updates.push((index, value));
+        }
+        for (index, value) in updates {
+            let field = &mut self.fields[index];
+            field.dirty = field.value != value;
+            field.value = value;
+        }
+        Ok(())
+    }
+
     pub fn selected_field(&self) -> &ConfigFieldState {
         &self.fields[self.selected]
     }
@@ -295,8 +330,31 @@ impl ConfigEditorState {
         self.fields[self.selected].dirty = true;
     }
 
-    pub fn build_session_override(&self) -> Result<PartialResolvedConfig, String> {
-        parse_editor_patch(self)
+    pub fn build_resolved_config(&self, base: &ResolvedConfig) -> Result<ResolvedConfig, String> {
+        validate_complete_editor_values(self)?;
+        let mut config = apply_config_patch(base.clone(), parse_editor_patch(self)?);
+
+        for field in &self.fields {
+            if !field.value.trim().is_empty() {
+                continue;
+            }
+            match field.key {
+                ConfigField::Temperature => config.model.temperature = None,
+                ConfigField::TopP => config.model.top_p = None,
+                ConfigField::TopK => config.model.top_k = None,
+                ConfigField::PresencePenalty => config.model.presence_penalty = None,
+                ConfigField::FrequencyPenalty => config.model.frequency_penalty = None,
+                ConfigField::Seed => config.model.seed = None,
+                ConfigField::ExtraHeadersJson => config.model.extra_headers.clear(),
+                ConfigField::ExtraBodyJson => config.model.extra_body_json = None,
+                ConfigField::DoclingApiKeyEnv => config.docling.api_key_env = None,
+                ConfigField::DoclingHeadersJson => config.docling.headers.clear(),
+                ConfigField::McpServersJson => config.mcp.servers.clear(),
+                _ => {}
+            }
+        }
+
+        Ok(config)
     }
 
     pub fn save_scope(&self, _root: &Utf8Path, scope: ConfigSaveScope) -> Result<String, String> {
@@ -364,6 +422,7 @@ fn write_access_mode(
         "access_mode".to_string(),
         toml::Value::String(access_mode.as_str().to_string()),
     );
+    normalize_provider_endpoint_in_document(&mut existing)?;
     let text = toml::to_string_pretty(&existing).map_err(|error| error.to_string())?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -384,7 +443,8 @@ fn access_mode_from_document(document: &toml::Value) -> Result<AccessMode, Strin
         .ok_or_else(|| "permissions.access_mode must be a string".to_string())?;
     match value {
         "default" | "standard" => Ok(AccessMode::Default),
-        "auto_review" | "auto-review" => Ok(AccessMode::AutoReview),
+        // One-way normalization for user config written by the retired AI-review mode.
+        "auto_review" | "auto-review" => Ok(AccessMode::Default),
         "full_access" | "full-access" => Ok(AccessMode::FullAccess),
         _ => Err(format!("unknown permissions.access_mode `{value}`")),
     }
@@ -409,6 +469,7 @@ fn save_config_sections(path: &Utf8Path, editor: &ConfigEditorState) -> Result<(
     for field in dirty_fields {
         apply_dirty_toml_field(&mut existing, &patch, field)?;
     }
+    normalize_provider_endpoint_in_document(&mut existing)?;
     let text = toml::to_string_pretty(&existing).map_err(|error| error.to_string())?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -420,7 +481,7 @@ fn read_toml_document(path: &Utf8Path) -> Result<toml::Value, String> {
     if !path.exists() {
         return Ok(toml::Value::Table(toml::map::Map::new()));
     }
-    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let text = read_toml_utf8_bounded(path).map_err(|error| error.to_string())?;
     if text.trim().is_empty() {
         Ok(toml::Value::Table(toml::map::Map::new()))
     } else {
@@ -459,6 +520,24 @@ fn apply_dirty_toml_field(
     Ok(())
 }
 
+fn normalize_provider_endpoint_in_document(document: &mut toml::Value) -> Result<(), String> {
+    let Some(model) = document.get_mut("model") else {
+        return Ok(());
+    };
+    let model = model
+        .as_table_mut()
+        .ok_or_else(|| "global config section `model` must be a TOML table".to_string())?;
+    let Some(base_url) = model.get_mut("base_url") else {
+        return Ok(());
+    };
+    let raw = base_url
+        .as_str()
+        .ok_or_else(|| "model.base_url must be a string".to_string())?;
+    let endpoint = ProviderEndpoint::parse(raw).map_err(|error| error.to_string())?;
+    *base_url = toml::Value::String(endpoint.as_str().to_string());
+    Ok(())
+}
+
 fn persist_config_tempfile(path: &Utf8Path, text: &str) -> Result<(), String> {
     let parent = path
         .parent()
@@ -477,6 +556,36 @@ fn persist_config_tempfile(path: &Utf8Path, text: &str) -> Result<(), String> {
 
 fn parse_editor_patch(editor: &ConfigEditorState) -> Result<PartialResolvedConfig, String> {
     parse_editor_patch_matching(editor, false)
+}
+
+fn validate_complete_editor_values(editor: &ConfigEditorState) -> Result<(), String> {
+    for field in &editor.fields {
+        if !field.value.trim().is_empty() || field_allows_empty_complete_value(field.key) {
+            continue;
+        }
+        return Err(format!("{} must not be empty", field.key.label()));
+    }
+    Ok(())
+}
+
+fn field_allows_empty_complete_value(field: ConfigField) -> bool {
+    matches!(
+        field,
+        ConfigField::Temperature
+            | ConfigField::TopP
+            | ConfigField::TopK
+            | ConfigField::PresencePenalty
+            | ConfigField::FrequencyPenalty
+            | ConfigField::Seed
+            | ConfigField::StopSequences
+            | ConfigField::ExtraHeadersJson
+            | ConfigField::ExtraBodyJson
+            | ConfigField::FileGuardBlockedReadExtensions
+            | ConfigField::FileGuardStructuredDocumentExtensions
+            | ConfigField::DoclingApiKeyEnv
+            | ConfigField::DoclingHeadersJson
+            | ConfigField::McpServersJson
+    )
 }
 
 fn parse_editor_patch_matching(
@@ -499,7 +608,17 @@ fn parse_editor_patch_matching(
         }
         let text = field.value.trim();
         match field.key {
-            ConfigField::BaseUrl => model.base_url = parse_string(text),
+            ConfigField::BaseUrl => {
+                model.base_url = match parse_string(text) {
+                    Some(value) => Some(
+                        ProviderEndpoint::parse(&value)
+                            .map_err(|error| error.to_string())?
+                            .as_str()
+                            .to_string(),
+                    ),
+                    None => None,
+                }
+            }
             ConfigField::Model => model.model = parse_string(text),
             ConfigField::ProviderMetadataMode => {
                 model.provider_metadata_mode = match parse_string(text) {
@@ -645,7 +764,7 @@ fn parse_provider_metadata_mode(value: &str) -> Result<ProviderMetadataMode, Str
 fn parse_access_mode(value: &str) -> Result<AccessMode, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "default" | "normal" => Ok(AccessMode::Default),
-        "auto_review" | "auto-review" | "autoreview" | "auto" => Ok(AccessMode::AutoReview),
+        "auto_review" | "auto-review" | "autoreview" | "auto" => Ok(AccessMode::Default),
         "full_access" | "full-access" | "full" => Ok(AccessMode::FullAccess),
         other => Err(format!("unsupported access_mode `{other}`")),
     }
@@ -710,7 +829,6 @@ fn field_value(key: ConfigField, config: &ResolvedConfig) -> String {
         },
         ConfigField::AccessMode => match config.permissions.access_mode {
             AccessMode::Default => "default".to_string(),
-            AccessMode::AutoReview => "auto_review".to_string(),
             AccessMode::FullAccess => "full_access".to_string(),
         },
         ConfigField::MultiAgentEnabled => config.multi_agent.enabled.to_string(),
@@ -845,6 +963,89 @@ mod tests {
     }
 
     #[test]
+    fn config_value_candidate_uses_stable_keys_and_rejects_invalid_batch_atomically() {
+        let config = ResolvedConfig::default();
+        let mut editor = ConfigEditorState::from_config(&config);
+        let original_model = editor
+            .fields
+            .iter()
+            .find(|field| field.key == ConfigField::Model)
+            .expect("model field")
+            .value
+            .clone();
+
+        let error = editor
+            .replace_values_by_key(vec![
+                ("model.model".to_string(), "changed-model".to_string()),
+                ("unknown.field".to_string(), "invalid".to_string()),
+            ])
+            .expect_err("unknown field must reject the full batch");
+        assert!(error.contains("unknown config field key"));
+        let model = editor
+            .fields
+            .iter()
+            .find(|field| field.key == ConfigField::Model)
+            .expect("model field");
+        assert_eq!(model.value, original_model);
+        assert!(!model.dirty);
+
+        let candidate = ConfigEditorState::from_config_values(
+            &config,
+            vec![("model.model".to_string(), "changed-model".to_string())],
+        )
+        .expect("known stable key");
+        let model = candidate
+            .fields
+            .iter()
+            .find(|field| field.key == ConfigField::Model)
+            .expect("model field");
+        assert_eq!(model.value, "changed-model");
+        assert!(model.dirty);
+    }
+
+    #[test]
+    fn complete_session_candidate_preserves_explicit_optional_absence() {
+        let mut base = ResolvedConfig::default();
+        base.model.temperature = Some(0.7);
+        base.model.extra_body_json = Some(serde_json::json!({"num_ctx": 32768}));
+        let candidate = ConfigEditorState::from_config_values(
+            &base,
+            vec![
+                (ConfigField::Temperature.label().to_string(), String::new()),
+                (
+                    ConfigField::ExtraBodyJson.label().to_string(),
+                    String::new(),
+                ),
+            ],
+        )
+        .expect("complete config values");
+
+        let resolved = candidate
+            .build_resolved_config(&base)
+            .expect("complete config candidate");
+
+        assert_eq!(resolved.model.temperature, None);
+        assert_eq!(resolved.model.extra_body_json, None);
+        assert_eq!(resolved.model.model, base.model.model);
+    }
+
+    #[test]
+    fn complete_session_candidate_rejects_missing_required_values() {
+        let base = ResolvedConfig::default();
+        let candidate = ConfigEditorState::from_config_values(
+            &base,
+            vec![(ConfigField::Model.label().to_string(), String::new())],
+        )
+        .expect("complete config values");
+
+        let error = candidate
+            .build_resolved_config(&base)
+            .expect_err("required model cannot be cleared");
+
+        assert_eq!(error, "model.model must not be empty");
+    }
+
+    #[test]
     fn config_editor_projects_provider_metadata_mode_patch() {
         let config = ResolvedConfig::default();
         let mut editor = ConfigEditorState::from_config(&config);
@@ -861,6 +1062,79 @@ mod tests {
             patch.model.and_then(|model| model.provider_metadata_mode),
             Some(ProviderMetadataMode::OpenAiCompatibleOnly)
         );
+    }
+
+    #[test]
+    fn config_editor_canonicalizes_lm_studio_endpoint_and_rejects_url_secrets() {
+        let config = ResolvedConfig::default();
+        let mut editor = ConfigEditorState::from_config(&config);
+        let field = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::BaseUrl)
+            .expect("provider endpoint field");
+        field.value = " http://lm-studio.local:1234/v1/ ".to_string();
+
+        let patch = parse_editor_patch(&editor).expect("valid LM Studio endpoint");
+        assert_eq!(
+            patch.model.and_then(|model| model.base_url),
+            Some("http://lm-studio.local:1234/v1".to_string())
+        );
+
+        for raw in [
+            "https://user:super-secret@provider.example/v1",
+            "https://provider.example/v1?api_key=hidden",
+            "https://provider.example/v1#hidden",
+        ] {
+            let mut editor = ConfigEditorState::from_config(&config);
+            let field = editor
+                .fields
+                .iter_mut()
+                .find(|field| field.key == ConfigField::BaseUrl)
+                .expect("provider endpoint field");
+            field.value = raw.to_string();
+            let error = parse_editor_patch(&editor).expect_err("reject secret endpoint");
+            assert!(!error.contains("super-secret"));
+            assert!(!error.contains("hidden"));
+            assert!(!error.contains(raw));
+        }
+    }
+
+    #[test]
+    fn global_config_writes_never_persist_an_invalid_provider_endpoint() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        let original = "[model]\nbase_url = \"http://provider.example\"\n";
+        std::fs::write(&path, original).expect("seed config");
+        let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+        let field = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::BaseUrl)
+            .expect("provider endpoint field");
+        field.value = "https://user:super-secret@provider.example/v1".to_string();
+        field.dirty = true;
+
+        let error = save_config_sections(&path, &editor).expect_err("reject invalid endpoint");
+
+        assert!(!error.contains("super-secret"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read config"),
+            original
+        );
+
+        std::fs::write(
+            &path,
+            "[model]\nbase_url = \"https://provider.example/v1?api_key=hidden\"\n",
+        )
+        .expect("seed invalid existing config");
+        let error = save_access_mode(&path, AccessMode::FullAccess)
+            .expect_err("unrelated save cannot preserve invalid endpoint");
+        assert!(!error.contains("hidden"));
+        let saved = std::fs::read_to_string(&path).expect("read unchanged config");
+        assert!(saved.contains("api_key=hidden"));
+        assert!(!saved.contains("full_access"));
     }
 
     #[test]
@@ -982,7 +1256,6 @@ mod tests {
         .expect("seed config");
 
         for (mode, expected) in [
-            (AccessMode::AutoReview, "auto_review"),
             (AccessMode::FullAccess, "full_access"),
             (AccessMode::Default, "default"),
         ] {
@@ -1039,7 +1312,7 @@ mod tests {
                 .expect("first CAS")
         );
         assert!(
-            !compare_and_set_access_mode(&path, AccessMode::Default, AccessMode::AutoReview)
+            !compare_and_set_access_mode(&path, AccessMode::Default, AccessMode::Default)
                 .expect("stale CAS")
         );
 

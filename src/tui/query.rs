@@ -1,6 +1,8 @@
 use crate::error::SessionError;
 use crate::session::{CanonicalSessionRead, ProjectId, SessionId, SessionRecord, SessionService};
 
+const TUI_SESSION_HYDRATION_PAGE_LIMIT: usize = crate::protocol::MAX_PROTOCOL_PAGE_LIMIT;
+
 pub async fn recent_sessions(
     service: &SessionService,
     project_id: ProjectId,
@@ -45,9 +47,12 @@ pub async fn session_view(
     service: &SessionService,
     session_id: SessionId,
 ) -> Result<CanonicalSessionRead, SessionError> {
+    // Initial UI hydration is one bounded latest page. Committed RunEvents are the delta path
+    // while the session remains open; the TUI must not materialize the whole durable stream.
     service
-        .canonical_session_read(session_id, 0, usize::MAX, 0, usize::MAX)
+        .canonical_latest_session_snapshot(session_id, 1, TUI_SESSION_HYDRATION_PAGE_LIMIT)
         .await
+        .map(|snapshot| snapshot.read)
 }
 
 #[cfg(test)]

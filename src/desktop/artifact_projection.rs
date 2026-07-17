@@ -110,6 +110,7 @@ pub(crate) fn artifact_rows_from_file_changes(
 ) -> Vec<DesktopArtifactRow> {
     let mut artifacts = rows
         .iter()
+        .filter(|row| !matches!(row.kind, ChangeKind::Delete))
         .map(|row| DesktopArtifactRow {
             label: row.label.clone(),
             path: row.path.clone(),
@@ -147,14 +148,17 @@ fn dedupe_file_change_rows(rows: Vec<DesktopFileChangeRow>) -> Vec<DesktopFileCh
 }
 
 fn merged_file_change_kind(existing: ChangeKind, incoming: ChangeKind) -> ChangeKind {
-    if matches!(existing, ChangeKind::Add) || matches!(incoming, ChangeKind::Add) {
-        ChangeKind::Add
-    } else if matches!(incoming, ChangeKind::Delete) {
-        ChangeKind::Delete
-    } else if matches!(incoming, ChangeKind::Move) {
-        ChangeKind::Move
-    } else {
-        ChangeKind::Update
+    match (existing, incoming) {
+        // A path that no longer exists must never remain projected as an available Add artifact.
+        (_, ChangeKind::Delete) => ChangeKind::Delete,
+        // Recreating a previously deleted path is an update to the path's net state.
+        (ChangeKind::Delete, ChangeKind::Add) => ChangeKind::Update,
+        // Later evidence owns the current move state.
+        (_, ChangeKind::Move) => ChangeKind::Move,
+        // Updates to a path created in this turn remain an Add net change.
+        (ChangeKind::Add, ChangeKind::Update) => ChangeKind::Add,
+        (_, ChangeKind::Add) => ChangeKind::Add,
+        _ => ChangeKind::Update,
     }
 }
 
@@ -234,4 +238,41 @@ fn change_kind_label(kind: ChangeKind) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    fn row(kind: ChangeKind, summary: &str) -> DesktopFileChangeRow {
+        DesktopFileChangeRow {
+            label: "result.txt".to_string(),
+            path: "result.txt".to_string(),
+            kind,
+            action: change_kind_label(kind).to_string(),
+            summary: summary.to_string(),
+            tool_call_ids: vec![ToolCallId::new()],
+        }
+    }
+
+    #[test]
+    fn add_then_delete_projects_the_destructive_terminal_state() {
+        let rows = dedupe_file_change_rows(vec![
+            row(ChangeKind::Add, "created"),
+            row(ChangeKind::Delete, "removed"),
+        ]);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ChangeKind::Delete);
+        assert_eq!(rows[0].summary, "removed");
+        assert!(artifact_rows_from_file_changes(&rows).is_empty());
+    }
+
+    #[test]
+    fn delete_then_recreate_projects_an_available_update() {
+        let rows = dedupe_file_change_rows(vec![
+            row(ChangeKind::Delete, "removed"),
+            row(ChangeKind::Add, "recreated"),
+        ]);
+
+        assert_eq!(rows[0].kind, ChangeKind::Update);
+        assert_eq!(artifact_rows_from_file_changes(&rows).len(), 1);
+    }
+}

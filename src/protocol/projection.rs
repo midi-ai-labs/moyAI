@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use crate::protocol::{
-    ContentPart, FileChangeEvidence, HistoryItem, HistoryItemId, HistoryItemPayload,
+    ContentPart, FileChangeEvidence, HistoryItem, HistoryItemId, HistoryItemPayload, HistoryScope,
     InterAgentCommunication, PermissionDecision, PlanStep, PlanStepStatus, RuntimeEvent,
     RuntimeEventId, RuntimeEventMsg, SubAgentActivityKind, ToolLifecycleEnvelope,
     ToolLifecycleStatus, TurnId, TurnItem, TurnItemId, TurnItemPayload,
@@ -23,6 +23,14 @@ pub fn project_protocol_run_event(
     turn_id: TurnId,
     sequence_no: i64,
 ) -> Option<ProtocolRunEventProjection> {
+    if matches!(
+        event,
+        RunEvent::ProviderPhase { .. }
+            | RunEvent::TextDelta { .. }
+            | RunEvent::ReasoningSummaryDelta { .. }
+    ) {
+        return None;
+    }
     let session_id = event.session_id().or(fallback_session_id)?;
     let history_item = project_history_item(event, session_id, turn_id, sequence_no);
     let runtime_event = RuntimeEvent {
@@ -54,7 +62,7 @@ pub fn project_inter_agent_communication(
     let history_item = HistoryItem {
         id: HistoryItemId::new(),
         session_id,
-        turn_id,
+        scope: HistoryScope::Turn { turn_id },
         sequence_no,
         created_at_ms,
         payload: HistoryItemPayload::InterAgentCommunication {
@@ -98,7 +106,7 @@ pub fn project_sub_agent_activity(
     let history_item = HistoryItem {
         id: HistoryItemId::new(),
         session_id,
-        turn_id,
+        scope: HistoryScope::Turn { turn_id },
         sequence_no,
         created_at_ms,
         payload: HistoryItemPayload::SubAgentActivity {
@@ -148,6 +156,7 @@ fn project_history_item(
 ) -> Option<HistoryItem> {
     let payload = match event {
         RunEvent::TextDelta { .. }
+        | RunEvent::ProviderPhase { .. }
         | RunEvent::ReasoningSummaryDelta { .. }
         | RunEvent::SessionStarted { .. }
         | RunEvent::SessionTitleUpdated { .. }
@@ -267,16 +276,6 @@ fn project_history_item(
             call_id: *tool_call_id,
             decision: permission_decision(*approved),
         },
-        RunEvent::RetryScheduled {
-            attempt,
-            message,
-            next_retry_at_ms,
-            ..
-        } => HistoryItemPayload::RetryDecision {
-            attempt: *attempt,
-            message: message.clone(),
-            next_retry_at_ms: *next_retry_at_ms,
-        },
         RunEvent::RecoverableRuntimeFeedback { message, .. } => HistoryItemPayload::Error {
             message: message.clone(),
         },
@@ -289,7 +288,7 @@ fn project_history_item(
     Some(HistoryItem {
         id: HistoryItemId::new(),
         session_id,
-        turn_id,
+        scope: HistoryScope::Turn { turn_id },
         sequence_no,
         created_at_ms: SystemClock::now_ms(),
         payload,
@@ -322,6 +321,7 @@ pub fn project_turn_item_for_run_event(
 ) -> Option<TurnItem> {
     let payload = match event {
         RunEvent::TextDelta { .. }
+        | RunEvent::ProviderPhase { .. }
         | RunEvent::ReasoningSummaryDelta { .. }
         | RunEvent::SessionStarted { .. }
         | RunEvent::SessionTitleUpdated { .. }
@@ -418,16 +418,11 @@ pub fn project_turn_item_for_run_event(
             summary: summary.clone(),
         },
         RunEvent::PermissionResolved { .. } => return None,
-        RunEvent::RetryScheduled { message, .. } => TurnItemPayload::Warning {
-            message: message.clone(),
-        },
         RunEvent::RecoverableRuntimeFeedback { message, .. } => TurnItemPayload::Error {
             message: message.clone(),
         },
         RunEvent::TurnTerminal { terminal, .. } => TurnItemPayload::Terminal {
-            status: terminal.status,
-            summary: terminal.summary.clone(),
-            cause: terminal.interruption_cause,
+            outcome: terminal.outcome.clone(),
         },
         RunEvent::UserTurnStored { turn, .. } => TurnItemPayload::UserMessage {
             text: user_turn_text(turn),
@@ -451,6 +446,13 @@ fn project_runtime_message(
     history_item: Option<&HistoryItem>,
 ) -> RuntimeEventMsg {
     match event {
+        RunEvent::ProviderPhase { .. }
+        | RunEvent::TextDelta { .. }
+        | RunEvent::ReasoningSummaryDelta { .. } => {
+            unreachable!(
+                "streamed provider events are runtime-only and have no protocol projection"
+            )
+        }
         RunEvent::SessionStarted { title, .. } => RuntimeEventMsg::Warning {
             message: format!("thread started: {title}"),
         },
@@ -468,22 +470,12 @@ fn project_runtime_message(
         RunEvent::WorldStateUpdated { snapshot, .. } => RuntimeEventMsg::WorldStateUpdated {
             snapshot: snapshot.clone(),
         },
-        RunEvent::TextDelta { response_id, delta } => RuntimeEventMsg::AssistantTextDelta {
-            response_id: *response_id,
-            delta: delta.clone(),
-        },
         RunEvent::AssistantMessageCommitted {
             response_id, text, ..
         } => RuntimeEventMsg::AssistantMessageCommitted {
             response_id: *response_id,
             text: text.clone(),
         },
-        RunEvent::ReasoningSummaryDelta { response_id, delta } => {
-            RuntimeEventMsg::ReasoningSummaryDelta {
-                response_id: *response_id,
-                delta: delta.clone(),
-            }
-        }
         RunEvent::ToolCallPending {
             tool_call_id,
             tool_name,
@@ -590,16 +582,6 @@ fn project_runtime_message(
             call_id: *tool_call_id,
             tool: *tool,
             decision: permission_decision(*approved),
-        },
-        RunEvent::RetryScheduled {
-            attempt,
-            message,
-            next_retry_at_ms,
-            ..
-        } => RuntimeEventMsg::RetryScheduled {
-            attempt: *attempt,
-            message: message.clone(),
-            next_retry_at_ms: *next_retry_at_ms,
         },
         RunEvent::RecoverableRuntimeFeedback { message, .. } => RuntimeEventMsg::Warning {
             message: message.clone(),
@@ -788,14 +770,8 @@ mod tests {
             Some(SessionId::new()),
             TurnId::new(),
             3,
-        )
-        .expect("projection");
-        assert!(projection.history_item.is_none());
-        assert!(projection.turn_item.is_none());
-        assert!(matches!(
-            projection.runtime_event.msg,
-            RuntimeEventMsg::AssistantTextDelta { .. }
-        ));
+        );
+        assert!(projection.is_none());
     }
 
     #[test]

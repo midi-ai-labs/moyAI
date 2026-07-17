@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -106,6 +108,7 @@ pub enum McpOperationResult {
 pub struct McpClient {
     config: McpConfig,
     http: reqwest::Client,
+    resolved_endpoints: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl McpClient {
@@ -113,6 +116,7 @@ impl McpClient {
         Self {
             config,
             http: reqwest::Client::new(),
+            resolved_endpoints: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -131,16 +135,7 @@ impl McpClient {
         let server = self.server(server_id)?;
 
         let (endpoint, response) = self
-            .post_json_with_fallback(
-                server,
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/list",
-                    "params": {}
-                }),
-                &mut effect_checkpoint,
-            )
+            .resolve_endpoint_with_tools_list(server, &mut effect_checkpoint)
             .await?;
         let mut tools = parse_tools(&response)?;
         for tool in &mut tools {
@@ -189,9 +184,35 @@ impl McpClient {
             )));
         }
 
-        let (endpoint, response) = self
-            .post_json_with_fallback(
+        let endpoint = if let Some(endpoint) = self
+            .resolved_endpoints
+            .lock()
+            .await
+            .get(&server.id)
+            .cloned()
+        {
+            endpoint
+        } else {
+            let (endpoint, response) = self
+                .resolve_endpoint_with_tools_list(server, &mut effect_checkpoint)
+                .await?;
+            let tools = parse_tools(&response)?;
+            if !tools.iter().any(|tool| tool.name == tool_name) {
+                return Err(ToolError::Message(format!(
+                    "mcp server `{}` did not advertise tool `{tool_name}` during endpoint resolution",
+                    server.id
+                )));
+            }
+            endpoint
+        };
+        // The effectful request has exactly one transport boundary. Endpoint
+        // discovery is completed by a read-only tools/list call before this
+        // point, so an ambiguous HTTP failure can never replay tools/call at a
+        // fallback URL.
+        let response = self
+            .post_json(
                 server,
+                &endpoint,
                 json!({
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -256,9 +277,9 @@ impl McpClient {
         }
 
         let request = request.body(payload.to_string());
-        // A fallback endpoint is a new externally observable effect. Re-check the
-        // typed run owner at the actual send boundary instead of treating the
-        // whole fallback loop as one admitted operation.
+        // Re-check the typed run owner at every actual send boundary. Endpoint
+        // discovery may issue multiple read-only tools/list requests, while a
+        // tools/call request reaches this boundary exactly once.
         effect_checkpoint()?;
         let response = request
             .send()
@@ -299,10 +320,9 @@ impl McpClient {
         parse_json_or_sse(&body)
     }
 
-    async fn post_json_with_fallback(
+    async fn resolve_endpoint_with_tools_list(
         &self,
         server: &McpServerConfig,
-        payload: Value,
         effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
     ) -> Result<(String, Value), ToolError> {
         let endpoints = endpoint_candidates(&server.base_url);
@@ -314,10 +334,27 @@ impl McpClient {
         let mut last_error = None;
         for endpoint in endpoints {
             match self
-                .post_json(server, &endpoint, payload.clone(), effect_checkpoint)
+                .post_json(
+                    server,
+                    &endpoint,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/list",
+                        "params": {}
+                    }),
+                    effect_checkpoint,
+                )
                 .await
             {
-                Ok(response) => return Ok((endpoint, response)),
+                Ok(response) => {
+                    parse_tools(&response)?;
+                    self.resolved_endpoints
+                        .lock()
+                        .await
+                        .insert(server.id.clone(), endpoint.clone());
+                    return Ok((endpoint, response));
+                }
                 Err(error) => last_error = Some(error),
             }
         }
@@ -559,9 +596,10 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use axum::Json;
     use axum::Router;
     use axum::http::StatusCode;
-    use axum::routing::any;
+    use axum::routing::{any, post};
 
     use super::*;
 
@@ -722,6 +760,91 @@ mod tests {
         assert!(matches!(error, ToolError::RunInterrupted));
         assert_eq!(checkpoints, 2);
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tool_call_uses_one_resolved_endpoint_and_never_falls_back_after_send() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let root_tool_calls = Arc::new(AtomicUsize::new(0));
+        let mcp_tool_calls = Arc::new(AtomicUsize::new(0));
+        let root_calls = Arc::clone(&root_tool_calls);
+        let mcp_calls = Arc::clone(&mcp_tool_calls);
+        let app = Router::new()
+            .route(
+                "/",
+                post(move |Json(payload): Json<Value>| {
+                    let root_calls = Arc::clone(&root_calls);
+                    async move {
+                        if payload["method"] == "tools/call" {
+                            root_calls.fetch_add(1, Ordering::SeqCst);
+                        }
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({"error": "not an MCP endpoint"})),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/mcp",
+                post(move |Json(payload): Json<Value>| {
+                    let mcp_calls = Arc::clone(&mcp_calls);
+                    async move {
+                        if payload["method"] == "tools/list" {
+                            (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "jsonrpc": "2.0",
+                                    "id": 1,
+                                    "result": {"tools": [{"name": "change"}]}
+                                })),
+                            )
+                        } else {
+                            mcp_calls.fetch_add(1, Ordering::SeqCst);
+                            (
+                                StatusCode::BAD_GATEWAY,
+                                Json(json!({"error": "ambiguous upstream failure"})),
+                            )
+                        }
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve MCP fixture");
+        });
+
+        let client = McpClient::new(McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                id: "fixture".to_string(),
+                enabled: true,
+                transport: crate::config::McpTransportKind::Http,
+                base_url: format!("http://{address}"),
+                timeout_ms: 2_000,
+                tool_routes: vec![crate::config::McpToolRouteConfig {
+                    name: "change".to_string(),
+                    effect: ToolEffectClass::Mutation,
+                }],
+                headers: BTreeMap::new(),
+            }],
+        });
+        let mut checkpoints = 0;
+        let error = client
+            .call_tool("fixture", "change", json!({"value": 1}), || {
+                checkpoints += 1;
+                Ok(())
+            })
+            .await
+            .expect_err("ambiguous tools/call failure must be returned without replay");
+
+        assert!(error.to_string().contains("HTTP 502"));
+        assert_eq!(checkpoints, 3, "two read probes plus one tools/call");
+        assert_eq!(mcp_tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(root_tool_calls.load(Ordering::SeqCst), 0);
         server.abort();
     }
 }

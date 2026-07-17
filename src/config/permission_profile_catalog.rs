@@ -61,30 +61,6 @@ pub fn builtin_permission_profiles() -> Vec<PermissionProfileEntry> {
             available: true,
         },
         PermissionProfileEntry {
-            mode: AccessMode::AutoReview,
-            id: "auto_review".to_string(),
-            label: "Auto Review".to_string(),
-            summary: "Uses an independent AI reviewer for requests that deterministic permission rules do not already allow."
-                .to_string(),
-            auto_allowed: strings(&[
-                "workspace list/search/read",
-                "non-risky workspace edits",
-                "non-risky configured-boundary shell",
-                "configured Docling uploads",
-                "actions approved by the independent AI reviewer",
-            ]),
-            requires_review: vec![
-                "actions denied by the AI reviewer",
-                "actions the AI reviewer cannot decide",
-                "reviewer transport, timeout, or response failures",
-            ]
-            .into_iter()
-            .map(ToString::to_string)
-            .collect(),
-            selected: false,
-            available: true,
-        },
-        PermissionProfileEntry {
             mode: AccessMode::FullAccess,
             id: "full_access".to_string(),
             label: "Full Access".to_string(),
@@ -112,14 +88,14 @@ mod tests {
 
     #[test]
     fn permission_profile_catalog_selects_current_mode() {
-        let catalog = super::PermissionProfileCatalog::for_current(AccessMode::AutoReview);
+        let catalog = super::PermissionProfileCatalog::for_current(AccessMode::FullAccess);
 
-        assert_eq!(catalog.profiles.len(), 3);
+        assert_eq!(catalog.profiles.len(), 2);
         assert_eq!(
             catalog
                 .selected_profile()
                 .map(|profile| profile.id.as_str()),
-            Some("auto_review")
+            Some("full_access")
         );
     }
 
@@ -128,14 +104,8 @@ mod tests {
         let profiles = super::builtin_permission_profiles();
 
         assert_eq!(profiles[0].auto_allowed, vec!["workspace list/search/read"]);
-        assert!(
-            profiles[1]
-                .auto_allowed
-                .iter()
-                .any(|value| value == "non-risky configured-boundary shell")
-        );
         assert_eq!(
-            profiles[2].auto_allowed,
+            profiles[1].auto_allowed,
             vec![
                 "configured-boundary list/search/read",
                 "configured-boundary edits",
@@ -144,13 +114,9 @@ mod tests {
         );
         assert_eq!(profiles[0].requires_review[0], "workspace edits");
         assert_eq!(profiles[0].requires_review[1], "shell");
-        assert_eq!(
-            profiles[1].requires_review[0],
-            "actions denied by the AI reviewer"
-        );
-        assert!(profiles[2].summary.contains("not an OS sandbox"));
+        assert!(profiles[1].summary.contains("not an OS sandbox"));
         assert!(
-            profiles[2]
+            profiles[1]
                 .requires_review
                 .iter()
                 .any(|value| value == "detected outside configured boundary")

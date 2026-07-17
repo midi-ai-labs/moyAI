@@ -315,8 +315,7 @@ mod tests {
         let mut execution = options(root.clone());
         execution.timeout_ms = 30_000;
         execution.cancel = cancel.clone();
-        let formatter = formatter(delayed_grandchild_command(&marker, &ready));
-        let marker_deadline = Instant::now() + Duration::from_millis(2_200);
+        let formatter = formatter(delayed_grandchild_command(&marker, &ready, 1_500));
         let target_for_task = target.clone();
         let task = tokio::spawn(async move {
             formatter
@@ -325,6 +324,7 @@ mod tests {
         });
 
         wait_for_file(&ready).await;
+        let marker_deadline = Instant::now() + Duration::from_millis(2_200);
         cancel.cancel();
         let error = timeout(
             crate::tool::process::MANAGED_PROCESS_CLEANUP_GRACE + Duration::from_secs(2),
@@ -356,25 +356,27 @@ mod tests {
         let ready = root.join("grandchild-ready.txt");
         let marker = root.join("grandchild-effect.txt");
         std::fs::write(&target, "original").expect("write target fixture");
+        let (timeout_ms, effect_delay_ms, observation_ms) = timeout_grandchild_timing();
         let mut execution = options(root.clone());
-        execution.timeout_ms = 750;
-        let marker_deadline = Instant::now() + Duration::from_millis(2_200);
+        execution.timeout_ms = timeout_ms;
 
         let error = timeout(
             crate::tool::process::MANAGED_PROCESS_CLEANUP_GRACE + Duration::from_secs(2),
-            formatter(delayed_grandchild_command(&marker, &ready)).format_if_configured(
-                &target,
-                "input".to_string(),
-                execution,
-            ),
+            formatter(delayed_grandchild_command(&marker, &ready, effect_delay_ms))
+                .format_if_configured(&target, "input".to_string(), execution),
         )
         .await
         .expect("formatter timeout cleanup must be bounded")
         .expect_err("timed out formatter must fail");
+        assert!(ready.exists(), "fixture never launched its grandchild");
+        let marker_deadline = Instant::now() + Duration::from_millis(observation_ms);
         sleep_until(marker_deadline).await;
 
-        assert!(error.to_string().contains("timed out after 750 ms"));
-        assert!(ready.exists(), "fixture never launched its grandchild");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("timed out after {timeout_ms} ms"))
+        );
         assert!(
             !marker.exists(),
             "formatter grandchild survived timeout and applied a delayed effect"
@@ -412,13 +414,32 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn delayed_grandchild_command(marker: &Utf8PathBuf, ready: &Utf8PathBuf) -> Vec<String> {
+    fn timeout_grandchild_timing() -> (u64, u64, u64) {
+        // The formatter deadline starts before the outer PowerShell process has
+        // initialized. Under a parallel Windows test load, that startup plus
+        // Start-Process can legitimately exceed a sub-second deadline before
+        // the fixture creates its grandchild. Keep the delayed effect beyond
+        // the formatter deadline, and observe for a full delay after cleanup.
+        (3_000, 4_000, 4_700)
+    }
+
+    #[cfg(not(windows))]
+    fn timeout_grandchild_timing() -> (u64, u64, u64) {
+        (750, 1_500, 2_200)
+    }
+
+    #[cfg(windows)]
+    fn delayed_grandchild_command(
+        marker: &Utf8PathBuf,
+        ready: &Utf8PathBuf,
+        effect_delay_ms: u64,
+    ) -> Vec<String> {
         use base64::Engine as _;
 
         let marker = marker.as_str().replace('\'', "''");
         let ready = ready.as_str().replace('\'', "''");
         let child_script = format!(
-            "Start-Sleep -Milliseconds 1500; [IO.File]::WriteAllText('{marker}', 'leaked')"
+            "Start-Sleep -Milliseconds {effect_delay_ms}; [IO.File]::WriteAllText('{marker}', 'leaked')"
         );
         let encoded = base64::engine::general_purpose::STANDARD.encode(
             child_script
@@ -439,12 +460,18 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    fn delayed_grandchild_command(marker: &Utf8PathBuf, ready: &Utf8PathBuf) -> Vec<String> {
+    fn delayed_grandchild_command(
+        marker: &Utf8PathBuf,
+        ready: &Utf8PathBuf,
+        effect_delay_ms: u64,
+    ) -> Vec<String> {
+        let effect_delay = format!("{}.{:03}", effect_delay_ms / 1_000, effect_delay_ms % 1_000);
         vec![
             "sh".to_string(),
             "-c".to_string(),
-            "(sleep 1.5; printf leaked > \"$1\") & printf ready > \"$2\"; cat >/dev/null; sleep 30"
-                .to_string(),
+            format!(
+                "(sleep {effect_delay}; printf leaked > \"$1\") & printf ready > \"$2\"; cat >/dev/null; sleep 30"
+            ),
             "formatter-fixture".to_string(),
             marker.to_string(),
             ready.to_string(),
