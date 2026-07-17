@@ -559,17 +559,30 @@ function removeMarkdownSections(body: string, headings: string[]): string {
   return result.join("\n").trim();
 }
 
+export function composerSendTitle(
+  state: Pick<DesktopWebState, "composer_submit_mode" | "navigation_loading" | "agent_tree_active" | "busy">,
+  prompt: string,
+): string {
+  if (state.composer_submit_mode !== "blocked") {
+    if (prompt.trim().length === 0) return "依頼文を入力してください";
+    return state.composer_submit_mode === "steer"
+      ? "実行中のタスクへ追加指示を送信"
+      : "送信";
+  }
+  return state.navigation_loading
+      ? "画面の切り替え完了後に送信できます"
+      : state.agent_tree_active
+        ? "Sub Agentの完了または停止後に送信できます"
+        : state.busy
+          ? "実行中は送信できません"
+          : prompt.trim().length === 0
+            ? "依頼文を入力してください"
+            : "現在は送信できません";
+}
+
 export function renderComposer(state: DesktopWebState): string {
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
-  const sendTitle = state.navigation_loading
-    ? "画面の切り替え完了後に送信できます"
-    : state.agent_tree_active
-      ? "Sub Agentの完了または停止後に送信できます"
-    : state.busy
-      ? "実行中は送信できません"
-      : state.draft_prompt.trim().length === 0
-        ? "依頼文を入力してください"
-        : "送信";
+  const sendTitle = composerSendTitle(state, state.draft_prompt);
   const enhanceTitle = state.navigation_loading
     ? "画面の切り替え完了後にEnhanceできます"
     : state.agent_tree_active

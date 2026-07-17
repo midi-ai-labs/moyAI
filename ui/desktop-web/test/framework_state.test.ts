@@ -12,17 +12,19 @@ import {
   shouldBeginKeyboardInteraction,
   shouldBeginPointerInteraction,
 } from "../src/interaction_lifecycle.ts";
+import { wireEvents } from "../src/events.ts";
 import { globalShortcutAction } from "../src/keyboard_shortcut.ts";
 import { autoRefreshAllowed, runtimePollingRequired } from "../src/polling_state.ts";
 import {
   renderArtifactPane,
+  renderComposer,
   renderOverlay,
   renderSidebar,
   renderThreadContent,
   renderTopbar,
   setRenderContext,
 } from "../src/render.ts";
-import type { DesktopViewState, DesktopWebState } from "../src/types.ts";
+import type { DesktopViewState, DesktopWebState, RunMutationTarget } from "../src/types.ts";
 import { createUiLocalState } from "../src/ui_state.ts";
 import { validateConfigInput } from "../src/utils.ts";
 import {
@@ -120,13 +122,14 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
     navigation_admission_open: true,
     background_mutation_pending: false,
     agent_tree_active: false,
+    composer_submit_mode: "new_request",
     can_submit: true,
     can_cancel_run: false,
     run_target: {
       workspacePath: "C:/workspace",
       sessionId: "session-a",
       runtimeOwnerToken: "idle:0",
-    },
+    } satisfies RunMutationTarget,
     enhance_enabled: true,
     image_input_enabled: true,
     send_enhanced_enabled: true,
@@ -216,6 +219,148 @@ test("all composer actions preserve the authoritative Rust admission gate", () =
   assert.equal(capabilities.canEnhance, false);
   assert.equal(capabilities.canReviewUncommitted, false);
   assert.equal(capabilities.canUseImageInput, true, "draft attachments remain available for the next prompt");
+});
+
+test("active root steering keeps an enabled send control labeled as additional instruction", () => {
+  for (const agentTreeActive of [false, true]) {
+    const rendered = renderComposer(projection({
+      busy: true,
+      agent_tree_active: agentTreeActive,
+      composer_submit_mode: "steer",
+      can_submit: true,
+      enhance_enabled: false,
+      draft_prompt: "追加指示",
+      token_meter_label: "",
+      token_meter_title: "",
+    }));
+
+    assert.match(
+      rendered,
+      /data-action="send" title="実行中のタスクへ追加指示を送信" aria-label="実行中のタスクへ追加指示を送信"/,
+      agentTreeActive ? "active child retention" : "active root",
+    );
+    assert.doesNotMatch(rendered, /実行中は送信できません|Sub Agentの完了または停止後に送信できます/);
+  }
+});
+
+test("active root steering with an empty draft asks for input instead of claiming steering is blocked", () => {
+  for (const agentTreeActive of [false, true]) {
+    const rendered = renderComposer(projection({
+      busy: true,
+      agent_tree_active: agentTreeActive,
+      composer_submit_mode: "steer",
+      can_submit: false,
+      enhance_enabled: false,
+      draft_prompt: "",
+      token_meter_label: "",
+      token_meter_title: "",
+    }));
+
+    assert.match(
+      rendered,
+      /data-action="send" title="依頼文を入力してください" aria-label="依頼文を入力してください"[^>]*disabled/,
+      agentTreeActive ? "active child retention" : "active root",
+    );
+    assert.doesNotMatch(rendered, /実行中は送信できません|Sub Agentの完了または停止後に送信できます/);
+  }
+});
+
+test("the installed prompt input handler refreshes the steer send title and aria label", () => {
+  class FakeHtmlElement {
+    hidden = false;
+  }
+  class FakePrompt extends FakeHtmlElement {
+    value = "";
+    scrollHeight = 24;
+    style = { height: "", overflowY: "" };
+    private readonly listeners = new Map<string, (event: { currentTarget: FakePrompt }) => void>();
+
+    addEventListener(name: string, listener: (event: { currentTarget: FakePrompt }) => void): void {
+      this.listeners.set(name, listener);
+    }
+
+    input(value: string): void {
+      this.value = value;
+      this.listeners.get("input")?.({ currentTarget: this });
+    }
+  }
+  class FakeButton extends FakeHtmlElement {
+    disabled = true;
+    title = "依頼文を入力してください";
+    readonly attributes = new Map<string, string>([["aria-label", this.title]]);
+
+    setAttribute(name: string, value: string): void {
+      this.attributes.set(name, value);
+    }
+
+    getAttribute(name: string): string | null {
+      return this.attributes.get(name) ?? null;
+    }
+  }
+
+  const prompt = new FakePrompt();
+  const send = new FakeButton();
+  const fakeDocument = {
+    activeElement: null,
+    addEventListener: () => undefined,
+    querySelector: (selector: string) => {
+      if (selector === "#prompt") return prompt;
+      if (selector === '[data-action="send"]') return send;
+      return null;
+    },
+    querySelectorAll: () => [],
+  };
+  const fakeWindow = {
+    getComputedStyle: () => ({ maxHeight: "200" }),
+    localStorage: { getItem: () => null, setItem: () => undefined },
+    addEventListener: () => undefined,
+  };
+  const previousGlobals = new Map(
+    ["document", "window", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "HTMLSelectElement", "HTMLButtonElement", "Element"]
+      .map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)] as const),
+  );
+  const defineGlobal = (name: string, value: unknown) => {
+    Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+  };
+
+  try {
+    defineGlobal("document", fakeDocument);
+    defineGlobal("window", fakeWindow);
+    defineGlobal("HTMLElement", FakeHtmlElement);
+    defineGlobal("HTMLInputElement", FakeHtmlElement);
+    defineGlobal("HTMLTextAreaElement", FakePrompt);
+    defineGlobal("HTMLSelectElement", FakeHtmlElement);
+    defineGlobal("HTMLButtonElement", FakeButton);
+    defineGlobal("Element", FakeHtmlElement);
+
+    const rustProjection = projection({
+      busy: true,
+      agent_tree_active: true,
+      composer_submit_mode: "steer",
+      can_submit: true,
+      enhance_enabled: false,
+      draft_prompt: "",
+    });
+    const ui = createUiLocalState();
+    reconcileUiDrafts(ui, null, rustProjection, null);
+    const view = projectViewState(rustProjection, ui);
+    const context = {
+      uiState: ui,
+      getProjection: () => rustProjection,
+    } as unknown as ActionContext;
+
+    wireEvents(view, context);
+    prompt.input("追加指示");
+
+    assert.equal(send.disabled, false);
+    assert.equal(send.title, "実行中のタスクへ追加指示を送信");
+    assert.equal(send.getAttribute("aria-label"), "実行中のタスクへ追加指示を送信");
+  } finally {
+    for (const [name, descriptor] of previousGlobals) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete (globalThis as Record<string, unknown>)[name];
+    }
+  }
 });
 
 test("local typing cannot reopen the hidden Rust finalizing gate", () => {
@@ -1276,6 +1421,16 @@ test("config owner generation remains exact beyond JavaScript's safe integer ran
 
   assert.equal(sameConfigMutationTarget(current, { ...current }), true);
   assert.equal(sameConfigMutationTarget(current, newerFence), false);
+});
+
+test("run target mirrors the exact Rust Stop owner projection", () => {
+  const target = projection().run_target;
+
+  assert.deepEqual(
+    Object.keys(target).sort(),
+    ["runtimeOwnerToken", "sessionId", "workspacePath"],
+  );
+  assert.equal("ownerGeneration" in target, false);
 });
 
 test("incomplete canonical turn is rendered as nonterminal evidence", () => {

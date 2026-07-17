@@ -631,6 +631,8 @@ pub struct CanonicalSessionRead {
     pub history: CanonicalHistoryPage,
     pub turns: CanonicalTurnPage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_turn_id: Option<TurnId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_sequence_no: Option<i64>,

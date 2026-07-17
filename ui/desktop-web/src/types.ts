@@ -148,7 +148,9 @@ export interface DraftActionTarget {
   ownerGeneration: number;
 }
 
-export interface RunMutationTarget extends DraftActionTarget {
+export interface RunMutationTarget {
+  workspacePath: string;
+  sessionId: string | null;
   runtimeOwnerToken: string;
 }
 
@@ -194,6 +196,8 @@ export interface PlanProjection {
   steps: PlanStepProjection[];
 }
 
+export type ComposerSubmitMode = "new_request" | "steer" | "blocked";
+
 export interface DesktopWebState {
   projection_revision: string;
   workspace_path: string;
@@ -228,6 +232,7 @@ export interface DesktopWebState {
   draft_prompt: string;
   image_input: string;
   attached_images: string[];
+  composer_submit_mode: ComposerSubmitMode;
   can_submit: boolean;
   can_cancel_run: boolean;
   run_target: RunMutationTarget;

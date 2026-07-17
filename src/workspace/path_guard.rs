@@ -120,6 +120,33 @@ impl PathGuard {
         })
     }
 
+    pub(crate) fn trusted_exact_path(path: &Utf8Path) -> Result<GuardedPath, WorkspaceError> {
+        let effective_absolute = effective_path_for_boundary(path)?;
+        Ok(GuardedPath {
+            absolute: path.to_path_buf(),
+            relative_to_root: path.to_path_buf(),
+            inside_workspace: false,
+            trusted_external: true,
+            boundary_root: effective_absolute.clone(),
+            effective_absolute,
+        })
+    }
+
+    pub(crate) fn same_path_identity(left: &Utf8Path, right: &Utf8Path) -> bool {
+        path_is_same(left, right)
+    }
+
+    pub(crate) fn compare_path_identity(left: &Utf8Path, right: &Utf8Path) -> std::cmp::Ordering {
+        #[cfg(windows)]
+        {
+            comparable_path(left).cmp(&comparable_path(right))
+        }
+        #[cfg(not(windows))]
+        {
+            left.cmp(right)
+        }
+    }
+
     /// Rechecks the lexical target immediately before a path-based operation.
     /// Opened files must additionally pass [`Self::validate_open_file`], which
     /// validates the filesystem object behind the stable handle.
@@ -150,6 +177,15 @@ impl PathGuard {
             )));
         }
         Ok(())
+    }
+
+    pub fn open_validated_read_file(
+        guarded: &GuardedPath,
+    ) -> Result<std::fs::File, WorkspaceError> {
+        Self::revalidate(guarded)?;
+        let file = std::fs::File::open(&guarded.absolute)?;
+        Self::validate_open_file(guarded, &file)?;
+        Ok(file)
     }
 
     pub fn validate_open_file_within_boundary(
@@ -331,6 +367,20 @@ mod tests {
         std::fs::write(&path, "content").expect("seed file");
         let guarded = PathGuard::trusted_internal_path(&path, &root).expect("guard path");
         let file = std::fs::File::open(&path).expect("open file");
+
+        PathGuard::validate_open_file(&guarded, &file).expect("same opened object");
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn validated_read_open_returns_the_boundary_checked_handle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let path = root.join("file.txt");
+        std::fs::write(&path, "content").expect("seed file");
+        let guarded = PathGuard::trusted_internal_path(&path, &root).expect("guard path");
+
+        let file = PathGuard::open_validated_read_file(&guarded).expect("validated read open");
 
         PathGuard::validate_open_file(&guarded, &file).expect("same opened object");
     }

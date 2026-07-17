@@ -1886,6 +1886,7 @@ mod command_projection_owner_tests {
             })
             .into_iter()
             .collect::<Vec<_>>();
+        let latest_turn_id = turn_items.last().map(|item| item.turn_id);
         LoadedSession {
             read: crate::session::CanonicalSessionRead {
                 session: session.clone(),
@@ -1905,6 +1906,7 @@ mod command_projection_owner_tests {
                     has_more: false,
                     items: turn_items,
                 },
+                latest_turn_id,
                 active_turn_id: None,
                 active_turn_sequence_no: None,
             },

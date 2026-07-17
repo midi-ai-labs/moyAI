@@ -272,7 +272,8 @@ impl OpenAiCompatClient {
         let mut stream =
             bounded_response_bytes(response, stream_limits.max_raw_bytes).eventsource();
         let mut stream_budget = ProviderStreamBudget::new(stream_limits);
-        let mut accumulator = ResponsesStreamAccumulator::default();
+        let mut accumulator =
+            ResponsesStreamAccumulator::new(stream_limits.max_tool_call_argument_bytes);
 
         loop {
             let idle_timeout_ms = request.provider_target().deadlines().stream_idle_timeout_ms;
@@ -330,12 +331,15 @@ impl OpenAiCompatClient {
                 ));
             }
 
-            let update = accumulator.push_json(&event.data).map_err(|error| {
-                LlmError::Message(format!(
-                    "failed to parse Responses stream event: {error}. Raw event: {}",
-                    summarize_stream_chunk(&event.data)
-                ))
-            })?;
+            let update = accumulator
+                .push_json(&event.data)
+                .map_err(|error| match error {
+                    limit @ LlmError::ProviderStreamLimitExceeded { .. } => limit,
+                    error => LlmError::Message(format!(
+                        "failed to parse Responses stream event: {error}. Raw event: {}",
+                        summarize_stream_chunk(&event.data)
+                    )),
+                })?;
             stream_budget.record_projected_events(&update.events)?;
             match update.terminal {
                 Some(ResponsesTerminal::Completed {
@@ -857,12 +861,10 @@ impl ProviderStreamBudget {
                 LlmEvent::ToolCallStart { call_id, .. } => {
                     self.record_tool_call(format!("responses:{call_id}"))?;
                 }
-                LlmEvent::ToolCallArgsDelta { call_id, delta } => {
-                    self.record_tool_arguments(
-                        &format!("responses:{call_id}"),
-                        delta.len() as u64,
-                    )?;
-                }
+                // Responses arguments are admitted by the accumulator before its
+                // canonical per-call argument value is mutated. Recounting the
+                // projected full value here would create a second budget owner.
+                LlmEvent::ToolCallArgsDelta { .. } => {}
                 LlmEvent::TextDelta(_)
                 | LlmEvent::ReasoningSummaryDelta(_)
                 | LlmEvent::Finished { .. } => {}
@@ -2485,6 +2487,50 @@ mod tests {
                     LlmError::ProviderStreamLimitExceeded {
                         surface: ProviderStreamLimit::RawBytes,
                         ..
+                    }
+                )
+        ));
+        assert_eq!(requests.lock().expect("request capture").len(), 1);
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn responses_argument_limit_is_typed_before_projection_without_reposting() {
+        let response = responses_sse([json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_oversized",
+            "delta": "12345"
+        })]);
+        let (base_url, requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "bound tool arguments".to_string(),
+            }],
+        );
+        let mut provider = request.provider_target().clone();
+        let mut limits = ProviderStreamLimits::product_default();
+        limits.max_tool_call_argument_bytes = 4;
+        provider.replace_stream_limits(limits);
+        request.replace_provider_target(provider);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("Responses arguments must be bounded before projection");
+        server.abort();
+
+        assert!(matches!(
+            error,
+            LlmError::ProviderFailure { source, .. }
+                if matches!(
+                    *source,
+                    LlmError::ProviderStreamLimitExceeded {
+                        surface: ProviderStreamLimit::ToolCallArgumentBytes,
+                        actual: 5,
+                        maximum: 4,
                     }
                 )
         ));

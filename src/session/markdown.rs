@@ -83,6 +83,7 @@ pub async fn canonical_markdown_export_read(
                 has_more: false,
                 items: turn_items,
             },
+            latest_turn_id: final_snapshot.read.latest_turn_id,
             active_turn_id: final_snapshot.read.active_turn_id,
             active_turn_sequence_no: final_snapshot.read.active_turn_sequence_no,
             session,
@@ -133,17 +134,7 @@ pub fn canonical_session_read_to_markdown(read: &CanonicalSessionRead) -> String
 fn latest_canonical_terminal(
     read: &CanonicalSessionRead,
 ) -> Option<(MarkdownTerminalStatus, String)> {
-    let latest_turn_id = read
-        .history
-        .items
-        .iter()
-        .rev()
-        .find_map(HistoryItem::turn_id)
-        .or_else(|| {
-            turn_items_in_projection_order(&read.turns.items)
-                .last()
-                .map(|item| item.turn_id)
-        })?;
+    let latest_turn_id = read.active_turn_id.or(read.latest_turn_id)?;
     turn_items_in_projection_order(&read.turns.items)
         .into_iter()
         .rev()
@@ -1147,11 +1138,67 @@ mod tests {
         assert!(!markdown.contains("停止しました: run stopped by user"));
     }
 
+    #[test]
+    fn history_markdown_uses_a_later_terminal_only_turn() {
+        let mut session = test_session();
+        session.status = SessionStatus::Failed;
+        let older_turn_id = TurnId::new();
+        let terminal_only_turn_id = TurnId::new();
+        let older_terminal = TurnItem {
+            id: TurnItemId::new(),
+            session_id: session.id,
+            turn_id: older_turn_id,
+            source_item_id: None,
+            sequence_no: 2,
+            payload: TurnItemPayload::Terminal {
+                outcome: TurnTerminalOutcome::Completed,
+            },
+        };
+        let later_terminal = TurnItem {
+            id: TurnItemId::new(),
+            session_id: session.id,
+            turn_id: terminal_only_turn_id,
+            source_item_id: None,
+            sequence_no: 0,
+            payload: TurnItemPayload::Terminal {
+                outcome: TurnTerminalOutcome::Failed {
+                    error: "startup recovery failed the admitted turn".to_string(),
+                },
+            },
+        };
+        let mut read = canonical_read(
+            &session,
+            vec![message_item(
+                &session,
+                older_turn_id,
+                1,
+                100,
+                "older request",
+            )],
+            vec![older_terminal, later_terminal],
+        );
+        read.latest_turn_id = Some(terminal_only_turn_id);
+
+        assert!(matches!(
+            latest_canonical_terminal(&read),
+            Some((MarkdownTerminalStatus::Failed, summary))
+                if summary == "startup recovery failed the admitted turn"
+        ));
+        let markdown = canonical_session_read_to_markdown(&read);
+        assert!(markdown.contains("失敗しました: startup recovery failed the admitted turn"));
+        assert!(!markdown.contains("完了しました。"));
+    }
+
     fn canonical_read(
         session: &SessionRecord,
         history_items: Vec<HistoryItem>,
         turn_items: Vec<TurnItem>,
     ) -> CanonicalSessionRead {
+        let latest_turn_id = history_items
+            .iter()
+            .rev()
+            .find_map(HistoryItem::turn_id)
+            .or_else(|| turn_items.last().map(|item| item.turn_id));
         CanonicalSessionRead {
             session: session.clone(),
             history: CanonicalHistoryPage {
@@ -1170,6 +1217,7 @@ mod tests {
                 has_more: false,
                 items: turn_items,
             },
+            latest_turn_id,
             active_turn_id: None,
             active_turn_sequence_no: None,
         }

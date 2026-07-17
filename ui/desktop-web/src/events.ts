@@ -1,5 +1,5 @@
-import { command } from "./api";
-import { dispatchRegisteredAction, type ActionContext } from "./actions";
+import { command } from "./api.ts";
+import { dispatchRegisteredAction, type ActionContext } from "./actions.ts";
 import {
   beginConfigMutation,
   configMutationValues,
@@ -7,33 +7,34 @@ import {
   reconcileConfigDraftTarget,
   type ConfigValueInput,
   updateConfigDraftValue,
-} from "./config_mutation";
+} from "./config_mutation.ts";
 import {
   beginLocalDecision,
   failLocalDecision,
   finishLocalDecision,
   permissionDecisionForEscape,
-} from "./decision_state";
+} from "./decision_state.ts";
 import {
   confirmationFocusSelectors,
   isRegularModalOverlay,
   modalIdentity,
   modalIsOpen,
   nextDialogFocusIndex,
-} from "./modal_state";
-import { globalShortcutAction } from "./keyboard_shortcut";
-import { navigationIsIdle } from "./navigation_state";
-import { rowMutationArgs } from "./row_target";
-import { TitlebarDragGesture, windowControlKeyboardActivation } from "./titlebar_interaction";
+} from "./modal_state.ts";
+import { globalShortcutAction } from "./keyboard_shortcut.ts";
+import { navigationIsIdle } from "./navigation_state.ts";
+import { rowMutationArgs } from "./row_target.ts";
+import { composerSendTitle } from "./render.ts";
+import { TitlebarDragGesture, windowControlKeyboardActivation } from "./titlebar_interaction.ts";
 import type {
   ConfigFieldProjection,
   ConfigMutationTarget,
   DesktopViewState,
   DesktopWebState,
   RowMutationTarget,
-} from "./types";
-import type { UiLocalState } from "./ui_state";
-import { goalSlashCommandHint, validateConfigInput } from "./utils";
+} from "./types.ts";
+import type { UiLocalState } from "./ui_state.ts";
+import { goalSlashCommandHint, validateConfigInput } from "./utils.ts";
 import {
   deriveUiCapabilities,
   activeConfigDraftProjection,
@@ -42,7 +43,7 @@ import {
   localSearchOwner,
   sessionSearchMutationTarget,
   sessionSearchOwner,
-} from "./view_state";
+} from "./view_state.ts";
 
 let pendingOpacityPreviewPercent: number | null = null;
 let opacityPreviewFrame: number | null = null;
@@ -128,7 +129,12 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
       const capabilities = deriveUiCapabilities(projection, context.uiState);
       updateGoalCommandHint(text);
       const send = document.querySelector<HTMLButtonElement>('[data-action="send"]');
-      if (send) send.disabled = !capabilities.canSubmit;
+      if (send) {
+        send.disabled = !capabilities.canSubmit;
+        const title = composerSendTitle(projection, text);
+        send.title = title;
+        send.setAttribute("aria-label", title);
+      }
       const enhance = document.querySelector<HTMLButtonElement>('[data-action="enhance-prompt"]');
       if (enhance) {
         enhance.disabled = !capabilities.canEnhance;

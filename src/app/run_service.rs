@@ -53,9 +53,12 @@ use crate::storage::{
         RunAdmissionLeaseRenewalOutcome,
     },
 };
-use crate::workspace::{branch_review_scope, uncommitted_review_scope};
+use crate::workspace::{AccessKind, PathGuard, branch_review_scope, uncommitted_review_scope};
 
 const DEFAULT_SESSION_SHOW_LIMIT: usize = 100;
+const MAX_WORKFLOW_COMMAND_BYTES: usize = 16 * 1024;
+const MAX_EXPANDED_WORKFLOW_BYTES: usize = 64 * 1024;
+const WORKFLOW_ARGUMENT_PLACEHOLDER: &str = "{{args}}";
 
 enum SingleRunOutcome {
     Turn(RunSummary),
@@ -2171,32 +2174,107 @@ fn maybe_expand_workflow_command(
         .root
         .join(".moyai/commands")
         .join(format!("{name}.md"));
-    if !path.exists() {
-        return Ok(None);
-    }
-    let template = fs::read_to_string(path.as_std_path()).map_err(|error| {
-        AppRunError::Message(format!("failed to read workflow `{path}`: {error}"))
+    let guarded = PathGuard::require_path(workspace, &path, AccessKind::Read).map_err(|error| {
+        AppRunError::Message(format!("failed to resolve workflow `{path}`: {error}"))
     })?;
-    let expanded_body = if template.contains("{{args}}") {
-        template.replace("{{args}}", args.as_deref().unwrap_or(""))
-    } else if let Some(args) = args.as_deref().filter(|value| !value.is_empty()) {
-        format!("{template}\n\nUser arguments:\n{args}")
-    } else {
-        template
+    let file = match PathGuard::open_validated_read_file(&guarded) {
+        Ok(file) => file,
+        Err(crate::error::WorkspaceError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(AppRunError::Message(format!(
+                "failed to open workflow `{path}`: {error}"
+            )));
+        }
     };
+    if !file
+        .metadata()
+        .map_err(|error| {
+            AppRunError::Message(format!("failed to inspect workflow `{path}`: {error}"))
+        })?
+        .is_file()
+    {
+        return Err(AppRunError::Message(format!(
+            "workflow `{path}` is not a regular file"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(MAX_WORKFLOW_COMMAND_BYTES.saturating_add(1));
+    file.take(MAX_WORKFLOW_COMMAND_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            AppRunError::Message(format!("failed to read workflow `{path}`: {error}"))
+        })?;
+    if bytes.len() > MAX_WORKFLOW_COMMAND_BYTES {
+        return Err(AppRunError::Message(format!(
+            "workflow `{path}` exceeds the source byte limit {MAX_WORKFLOW_COMMAND_BYTES}"
+        )));
+    }
+    let template = String::from_utf8(bytes).map_err(|error| {
+        AppRunError::Message(format!("workflow `{path}` is not valid UTF-8: {error}"))
+    })?;
+    let expanded_body = expand_workflow_template(&template, args)?;
     let relative = path
         .strip_prefix(workspace.root.as_path())
         .map(|value| value.as_str().replace('\\', "/"))
         .unwrap_or_else(|_| path.as_str().replace('\\', "/"));
     Ok(Some(WorkflowExpansion {
-        name: name.clone(),
+        name: name.to_string(),
         prompt: format!(
             "Reusable workflow command: /{name}\nSource: {relative}\n\nWorkflow instructions:\n{expanded_body}"
         ),
     }))
 }
 
-fn parse_workflow_invocation(prompt: &str) -> Option<(String, Option<String>)> {
+fn expand_workflow_template(template: &str, args: Option<&str>) -> Result<String, AppRunError> {
+    let expanded_len = if template.contains(WORKFLOW_ARGUMENT_PLACEHOLDER) {
+        let placeholder_count = template
+            .match_indices(WORKFLOW_ARGUMENT_PLACEHOLDER)
+            .count();
+        let removed_bytes = placeholder_count
+            .checked_mul(WORKFLOW_ARGUMENT_PLACEHOLDER.len())
+            .ok_or_else(workflow_expansion_overflow)?;
+        let retained_bytes = template
+            .len()
+            .checked_sub(removed_bytes)
+            .ok_or_else(workflow_expansion_overflow)?;
+        let argument_bytes = placeholder_count
+            .checked_mul(args.unwrap_or("").len())
+            .ok_or_else(workflow_expansion_overflow)?;
+        retained_bytes
+            .checked_add(argument_bytes)
+            .ok_or_else(workflow_expansion_overflow)?
+    } else if let Some(args) = args.filter(|value| !value.is_empty()) {
+        template
+            .len()
+            .checked_add("\n\nUser arguments:\n".len())
+            .and_then(|size| size.checked_add(args.len()))
+            .ok_or_else(workflow_expansion_overflow)?
+    } else {
+        template.len()
+    };
+    if expanded_len > MAX_EXPANDED_WORKFLOW_BYTES {
+        return Err(AppRunError::Message(format!(
+            "expanded workflow exceeds the byte limit {MAX_EXPANDED_WORKFLOW_BYTES}"
+        )));
+    }
+
+    Ok(if template.contains(WORKFLOW_ARGUMENT_PLACEHOLDER) {
+        template.replace(WORKFLOW_ARGUMENT_PLACEHOLDER, args.unwrap_or(""))
+    } else if let Some(args) = args.filter(|value| !value.is_empty()) {
+        format!("{template}\n\nUser arguments:\n{args}")
+    } else {
+        template.to_string()
+    })
+}
+
+fn workflow_expansion_overflow() -> AppRunError {
+    AppRunError::Message("expanded workflow byte length overflowed this platform".to_string())
+}
+
+fn parse_workflow_invocation(prompt: &str) -> Option<(&str, Option<&str>)> {
     let trimmed = prompt.trim_start();
     let rest = trimmed.strip_prefix('/')?;
     let name_len = rest
@@ -2206,9 +2284,9 @@ fn parse_workflow_invocation(prompt: &str) -> Option<(String, Option<String>)> {
     if name_len == 0 {
         return None;
     }
-    let name = rest[..name_len].to_string();
+    let name = &rest[..name_len];
     let args = rest[name_len..].trim();
-    Some((name, (!args.is_empty()).then(|| args.to_string())))
+    Some((name, (!args.is_empty()).then_some(args)))
 }
 
 const REVIEW_PROMPT_FILE_LIST_LIMIT: usize = 200;
@@ -2283,6 +2361,7 @@ impl<'a> RunEventSink for RendererSink<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2296,6 +2375,26 @@ mod tests {
         AdmissionId, NewSession, ProjectId, ProjectRepository, SessionRepository, ThreadGoalStatus,
     };
     use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
+
+    #[cfg(unix)]
+    fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(unix)]
+    fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
 
     #[test]
     fn image_attachment_records_bytes_read_from_the_open_handle() {
@@ -2317,6 +2416,151 @@ mod tests {
                 .expect("base64"),
             bytes
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn workflow_command_link_cannot_ingest_an_external_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        let external =
+            Utf8PathBuf::from_path_buf(temp.path().join("external.md")).expect("utf8 external");
+        std::fs::create_dir_all(root.join(".moyai/commands")).expect("commands directory");
+        std::fs::write(&external, "EXTERNAL_WORKFLOW_SECRET").expect("external fixture");
+        symlink_file(
+            external.as_std_path(),
+            root.join(".moyai/commands/escape.md").as_std_path(),
+        )
+        .expect("workflow symlink fixture");
+        let workspace = crate::workspace::WorkspaceDiscovery::discover_fixed_root(
+            &root,
+            &ResolvedConfig::default(),
+        )
+        .expect("workspace");
+
+        let error = super::maybe_expand_workflow_command(&workspace, "/escape")
+            .expect_err("external workflow link must fail closed");
+
+        assert!(error.to_string().contains("outside the allowed roots"));
+        assert!(!error.to_string().contains("EXTERNAL_WORKFLOW_SECRET"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn workflow_command_directory_link_cannot_escape_the_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        let external_commands = Utf8PathBuf::from_path_buf(temp.path().join("external-commands"))
+            .expect("utf8 external commands");
+        std::fs::create_dir_all(root.join(".moyai")).expect("moyai directory");
+        std::fs::create_dir_all(&external_commands).expect("external commands directory");
+        std::fs::write(
+            external_commands.join("escape.md"),
+            "EXTERNAL_DIRECTORY_WORKFLOW_SECRET",
+        )
+        .expect("external workflow fixture");
+        symlink_dir(
+            external_commands.as_std_path(),
+            root.join(".moyai/commands").as_std_path(),
+        )
+        .expect("workflow directory symlink fixture");
+        let workspace = crate::workspace::WorkspaceDiscovery::discover_fixed_root(
+            &root,
+            &ResolvedConfig::default(),
+        )
+        .expect("workspace");
+
+        let error = super::maybe_expand_workflow_command(&workspace, "/escape")
+            .expect_err("external workflow directory link must fail closed");
+
+        assert!(error.to_string().contains("outside the allowed roots"));
+        assert!(
+            !error
+                .to_string()
+                .contains("EXTERNAL_DIRECTORY_WORKFLOW_SECRET")
+        );
+    }
+
+    #[test]
+    fn workflow_command_rejects_a_template_above_the_byte_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(root.join(".moyai/commands")).expect("commands directory");
+        std::fs::write(
+            root.join(".moyai/commands/large.md"),
+            vec![b'x'; super::MAX_WORKFLOW_COMMAND_BYTES + 1],
+        )
+        .expect("large workflow fixture");
+        let workspace = crate::workspace::WorkspaceDiscovery::discover_fixed_root(
+            &root,
+            &ResolvedConfig::default(),
+        )
+        .expect("workspace");
+
+        let error = super::maybe_expand_workflow_command(&workspace, "/large")
+            .expect_err("oversized workflow must fail closed");
+
+        assert!(error.to_string().contains("byte limit"));
+        assert!(error.to_string().contains("16384"));
+
+        std::fs::write(
+            root.join(".moyai/commands/exact.md"),
+            vec![b'y'; super::MAX_WORKFLOW_COMMAND_BYTES],
+        )
+        .expect("exact-limit workflow fixture");
+        let exact = super::maybe_expand_workflow_command(&workspace, "/exact")
+            .expect("exact-limit workflow")
+            .expect("workflow expansion");
+        assert!(
+            exact
+                .prompt
+                .ends_with(&"y".repeat(super::MAX_WORKFLOW_COMMAND_BYTES))
+        );
+    }
+
+    #[test]
+    fn workflow_command_rejects_argument_amplification_before_replacement() {
+        let template = super::WORKFLOW_ARGUMENT_PLACEHOLDER.repeat(9);
+        let args = "z".repeat(8 * 1024);
+
+        let error = super::expand_workflow_template(&template, Some(&args))
+            .expect_err("amplified workflow must fail before replacement");
+
+        assert!(error.to_string().contains("byte limit 65536"));
+    }
+
+    #[test]
+    fn workflow_command_preserves_small_argument_expansion_contracts() {
+        assert_eq!(
+            super::expand_workflow_template("Do {{args}} now.", Some("the task"))
+                .expect("placeholder expansion"),
+            "Do the task now."
+        );
+        assert_eq!(
+            super::expand_workflow_template("Do the task.", Some("carefully"))
+                .expect("argument append"),
+            "Do the task.\n\nUser arguments:\ncarefully"
+        );
+    }
+
+    #[test]
+    fn workflow_invocation_parser_borrows_large_arguments_from_the_request() {
+        let prompt = format!(
+            "/review {}",
+            "x".repeat(super::MAX_EXPANDED_WORKFLOW_BYTES + 1)
+        );
+
+        let (name, args) = super::parse_workflow_invocation(&prompt).expect("workflow invocation");
+        let args = args.expect("workflow arguments");
+        let prompt_start = prompt.as_ptr() as usize;
+        let prompt_end = prompt_start + prompt.len();
+
+        for pointer in [name.as_ptr() as usize, args.as_ptr() as usize] {
+            assert!(
+                (prompt_start..prompt_end).contains(&pointer),
+                "parser must not allocate an owned copy before workflow limits are checked"
+            );
+        }
     }
 
     #[test]

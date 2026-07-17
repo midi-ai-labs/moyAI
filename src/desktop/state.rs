@@ -1613,6 +1613,11 @@ mod tests {
         history_items: Vec<HistoryItem>,
         turn_items: Vec<crate::protocol::TurnItem>,
     ) -> CanonicalSessionRead {
+        let latest_turn_id = history_items
+            .iter()
+            .rev()
+            .find_map(HistoryItem::turn_id)
+            .or_else(|| turn_items.last().map(|item| item.turn_id));
         CanonicalSessionRead {
             session: session.clone(),
             history: CanonicalHistoryPage {
@@ -1631,6 +1636,7 @@ mod tests {
                 has_more: false,
                 items: turn_items,
             },
+            latest_turn_id,
             active_turn_id: None,
             active_turn_sequence_no: None,
         }

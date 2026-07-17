@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::io::Read;
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -9,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::PermissionProfileCatalog;
 use crate::config::{AccessMode, ResolvedConfig};
 use crate::context::current_time::CurrentTimeSnapshot;
-use crate::workspace::{Workspace, instruction_file_names};
+use crate::error::WorkspaceError;
+use crate::workspace::{AccessKind, PathGuard, Workspace, instruction_file_names};
 
 const MAX_CONTEXT_SOURCE_BYTES: usize = 16 * 1024;
 const MAX_CONTEXT_TOTAL_BYTES: usize = 48 * 1024;
@@ -48,7 +48,11 @@ pub struct WorldState {
 }
 
 impl WorldState {
-    pub fn build(workspace: &Workspace, config: &ResolvedConfig, tools: &[String]) -> Self {
+    pub fn build(
+        workspace: &Workspace,
+        config: &ResolvedConfig,
+        tools: &[String],
+    ) -> Result<Self, WorkspaceError> {
         Self::build_at(workspace, config, tools, CurrentTimeSnapshot::now())
     }
 
@@ -57,16 +61,16 @@ impl WorldState {
         config: &ResolvedConfig,
         tools: &[String],
         current_time: CurrentTimeSnapshot,
-    ) -> Self {
+    ) -> Result<Self, WorkspaceError> {
         let environment = EnvironmentSection::new(workspace, config, tools);
-        let instructions = InstructionsSection::load(workspace, config);
+        let instructions = InstructionsSection::load(workspace, config)?;
         let time = CurrentTimeSection {
             snapshot: current_time,
         };
         let sections: Vec<&dyn WorldStateSection> = vec![&environment, &instructions, &time];
         let snapshot = WorldStateSnapshot::from_sections(&sections);
         let rendered = render_world_state(&sections);
-        Self { snapshot, rendered }
+        Ok(Self { snapshot, rendered })
     }
 }
 
@@ -159,6 +163,12 @@ pub enum InstructionKind {
     Configured,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstructionPathAuthority {
+    Workspace,
+    ExplicitFile,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstructionsSection {
     pub sources: Vec<InstructionSource>,
@@ -166,25 +176,23 @@ pub struct InstructionsSection {
 }
 
 impl InstructionsSection {
-    pub fn load(workspace: &Workspace, config: &ResolvedConfig) -> Self {
-        let (mut candidates, discovery_truncated) = instruction_candidates(workspace, config);
-        candidates.sort_by(|left, right| left.0.cmp(&right.0));
-        candidates.dedup_by(|left, right| left.0 == right.0);
+    pub fn load(workspace: &Workspace, config: &ResolvedConfig) -> Result<Self, WorkspaceError> {
+        let (candidates, discovery_truncated) = instruction_candidates(workspace, config);
+        let candidates = merge_instruction_candidates(candidates);
 
         let mut total_bytes = 0usize;
         let mut sources = Vec::new();
         let mut truncated = discovery_truncated;
-        for (path, kind) in candidates {
-            if !path.exists() {
-                continue;
-            }
+        for (path, kind, authority) in candidates {
             let remaining = MAX_CONTEXT_TOTAL_BYTES.saturating_sub(total_bytes);
             if remaining == 0 {
                 truncated = true;
                 break;
             }
             let limit = remaining.min(MAX_CONTEXT_SOURCE_BYTES);
-            let Some((content, source_truncated)) = read_bounded_utf8_prefix(&path, limit) else {
+            let Some((content, source_truncated)) =
+                read_bounded_utf8_prefix(workspace, &path, authority, limit)?
+            else {
                 continue;
             };
             if content.trim().is_empty() {
@@ -200,8 +208,28 @@ impl InstructionsSection {
                 truncated: source_truncated,
             });
         }
-        Self { sources, truncated }
+        Ok(Self { sources, truncated })
     }
+}
+
+fn merge_instruction_candidates(
+    mut candidates: Vec<(Utf8PathBuf, InstructionKind, InstructionPathAuthority)>,
+) -> Vec<(Utf8PathBuf, InstructionKind, InstructionPathAuthority)> {
+    candidates.sort_by(|left, right| PathGuard::compare_path_identity(&left.0, &right.0));
+    let mut merged: Vec<(Utf8PathBuf, InstructionKind, InstructionPathAuthority)> =
+        Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if let Some(retained) = merged.last_mut()
+            && PathGuard::same_path_identity(&retained.0, &candidate.0)
+        {
+            if candidate.2 == InstructionPathAuthority::ExplicitFile {
+                retained.2 = InstructionPathAuthority::ExplicitFile;
+            }
+            continue;
+        }
+        merged.push(candidate);
+    }
+    merged
 }
 
 impl WorldStateSection for InstructionsSection {
@@ -262,12 +290,19 @@ impl WorldStateSection for CurrentTimeSection {
 fn instruction_candidates(
     workspace: &Workspace,
     config: &ResolvedConfig,
-) -> (Vec<(Utf8PathBuf, InstructionKind)>, bool) {
+) -> (
+    Vec<(Utf8PathBuf, InstructionKind, InstructionPathAuthority)>,
+    bool,
+) {
     let mut candidates = Vec::new();
     let mut current = Some(workspace.cwd.as_path());
     while let Some(dir) = current {
         for file_name in instruction_file_names() {
-            candidates.push((dir.join(file_name), InstructionKind::Agents));
+            candidates.push((
+                dir.join(file_name),
+                InstructionKind::Agents,
+                InstructionPathAuthority::Workspace,
+            ));
         }
         if dir == workspace.root {
             break;
@@ -275,14 +310,21 @@ fn instruction_candidates(
         current = dir.parent();
     }
     let (rules, rules_truncated) = rule_candidates(&workspace.root);
-    candidates.extend(rules);
+    candidates.extend(
+        rules
+            .into_iter()
+            .map(|(path, kind)| (path, kind, InstructionPathAuthority::Workspace)),
+    );
     candidates.extend(config.instructions.additional_files.iter().map(|path| {
-        let resolved = if path.is_absolute() {
-            path.clone()
+        let (resolved, authority) = if path.is_absolute() {
+            (path.clone(), InstructionPathAuthority::ExplicitFile)
         } else {
-            workspace.root.join(path)
+            (
+                workspace.root.join(path),
+                InstructionPathAuthority::Workspace,
+            )
         };
-        (resolved, InstructionKind::Configured)
+        (resolved, InstructionKind::Configured, authority)
     }));
     (candidates, rules_truncated)
 }
@@ -336,15 +378,31 @@ fn relative_display_path(root: &Utf8Path, path: &Utf8Path) -> String {
         .unwrap_or_else(|_| path.as_str().replace('\\', "/"))
 }
 
-fn read_bounded_utf8_prefix(path: &Utf8Path, max_bytes: usize) -> Option<(String, bool)> {
-    let file = File::open(path.as_std_path()).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
+fn read_bounded_utf8_prefix(
+    workspace: &Workspace,
+    path: &Utf8Path,
+    authority: InstructionPathAuthority,
+    max_bytes: usize,
+) -> Result<Option<(String, bool)>, WorkspaceError> {
+    let guarded = match authority {
+        InstructionPathAuthority::Workspace => {
+            PathGuard::require_path(workspace, path, AccessKind::Read)?
+        }
+        InstructionPathAuthority::ExplicitFile => PathGuard::trusted_exact_path(path)?,
+    };
+    let file = match PathGuard::open_validated_read_file(&guarded) {
+        Ok(file) => file,
+        Err(WorkspaceError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Ok(None);
     }
     let mut bytes = Vec::with_capacity(max_bytes.saturating_add(1));
     file.take(max_bytes.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)
-        .ok()?;
+        .read_to_end(&mut bytes)?;
     let truncated = bytes.len() > max_bytes;
     if truncated {
         bytes.truncate(max_bytes);
@@ -353,11 +411,14 @@ fn read_bounded_utf8_prefix(path: &Utf8Path, max_bytes: usize) -> Option<(String
         Ok(content) => content.to_string(),
         Err(error) if error.error_len().is_none() => {
             bytes.truncate(error.valid_up_to());
-            std::str::from_utf8(&bytes).ok()?.to_string()
+            let Ok(content) = std::str::from_utf8(&bytes) else {
+                return Ok(None);
+            };
+            content.to_string()
         }
-        Err(_) => return None,
+        Err(_) => return Ok(None),
     };
-    Some((content, truncated))
+    Ok(Some((content, truncated)))
 }
 
 fn escape_xml_text(value: &str) -> String {
@@ -378,6 +439,8 @@ fn escape_xml_attribute(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use camino::Utf8PathBuf;
 
     use super::WorldStateSection;
@@ -402,6 +465,16 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
     #[test]
     fn world_state_loads_agents_and_rules() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -412,7 +485,8 @@ mod tests {
 
         let ws = workspace(root);
         let state =
-            super::WorldState::build(&ws, &ResolvedConfig::default(), &["read".to_string()]);
+            super::WorldState::build(&ws, &ResolvedConfig::default(), &["read".to_string()])
+                .expect("world state");
 
         assert!(state.rendered.contains("Follow workspace rules."));
         assert!(state.rendered.contains("Use compact edits."));
@@ -432,7 +506,8 @@ mod tests {
         .expect("large agents file");
 
         let section =
-            super::InstructionsSection::load(&workspace(root), &ResolvedConfig::default());
+            super::InstructionsSection::load(&workspace(root), &ResolvedConfig::default())
+                .expect("instructions");
 
         assert_eq!(section.sources.len(), 1);
         assert!(section.sources[0].content.len() <= super::MAX_CONTEXT_SOURCE_BYTES);
@@ -443,6 +518,102 @@ mod tests {
         );
         assert!(section.sources[0].truncated);
         assert!(section.truncated);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn workspace_instruction_link_cannot_ingest_an_external_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        let external =
+            Utf8PathBuf::from_path_buf(temp.path().join("external.md")).expect("utf8 external");
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::write(&external, "EXTERNAL_INSTRUCTION_SECRET").expect("external fixture");
+        symlink_file(external.as_std_path(), root.join("AGENTS.md").as_std_path())
+            .expect("instruction symlink fixture");
+
+        let error = super::InstructionsSection::load(&workspace(root), &ResolvedConfig::default())
+            .expect_err("external instruction link must fail closed");
+
+        assert!(
+            error.to_string().contains("outside the allowed roots"),
+            "unexpected boundary error: {error}"
+        );
+        assert!(!error.to_string().contains("EXTERNAL_INSTRUCTION_SECRET"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn explicit_absolute_instruction_authority_survives_auto_candidate_deduplication() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        let external =
+            Utf8PathBuf::from_path_buf(temp.path().join("explicit.md")).expect("utf8 external");
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::write(&external, "EXPLICIT_DUPLICATE_INSTRUCTION").expect("external fixture");
+        let instruction_link = root.join("AGENTS.md");
+        symlink_file(external.as_std_path(), instruction_link.as_std_path())
+            .expect("instruction symlink fixture");
+        let mut config = ResolvedConfig::default();
+        config.instructions.additional_files = vec![instruction_link];
+
+        let section = super::InstructionsSection::load(&workspace(root), &config)
+            .expect("the explicit absolute candidate must retain exact-file authority");
+
+        assert_eq!(section.sources.len(), 1);
+        assert_eq!(section.sources[0].content, "EXPLICIT_DUPLICATE_INSTRUCTION");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_absolute_instruction_authority_uses_windows_path_identity_for_deduplication() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        let external =
+            Utf8PathBuf::from_path_buf(temp.path().join("explicit.md")).expect("utf8 external");
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::write(&external, "EXPLICIT_CASE_INSENSITIVE_INSTRUCTION")
+            .expect("external fixture");
+        let instruction_link = root.join("AGENTS.md");
+        symlink_file(external.as_std_path(), instruction_link.as_std_path())
+            .expect("instruction symlink fixture");
+        let differently_cased_path =
+            Utf8PathBuf::from(instruction_link.as_str().to_ascii_uppercase());
+        assert_ne!(instruction_link, differently_cased_path);
+        let mut config = ResolvedConfig::default();
+        config.instructions.additional_files = vec![differently_cased_path];
+
+        let section = super::InstructionsSection::load(&workspace(root), &config)
+            .expect("Windows-equivalent paths must share explicit-file authority");
+
+        assert_eq!(section.sources.len(), 1);
+        assert_eq!(
+            section.sources[0].content,
+            "EXPLICIT_CASE_INSENSITIVE_INSTRUCTION"
+        );
+    }
+
+    #[test]
+    fn configured_absolute_instruction_is_exact_while_relative_escape_is_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        let external =
+            Utf8PathBuf::from_path_buf(temp.path().join("explicit.md")).expect("utf8 external");
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::write(&external, "EXPLICIT_EXTERNAL_INSTRUCTION").expect("external fixture");
+
+        let mut explicit_config = ResolvedConfig::default();
+        explicit_config.instructions.additional_files = vec![external];
+        let explicit = super::InstructionsSection::load(&workspace(root.clone()), &explicit_config)
+            .expect("explicit absolute instruction");
+        assert_eq!(explicit.sources.len(), 1);
+        assert_eq!(explicit.sources[0].content, "EXPLICIT_EXTERNAL_INSTRUCTION");
+
+        let mut escaped_config = ResolvedConfig::default();
+        escaped_config.instructions.additional_files = vec![Utf8PathBuf::from("../explicit.md")];
+        let error = super::InstructionsSection::load(&workspace(root), &escaped_config)
+            .expect_err("relative configured instruction must remain workspace-bound");
+        assert!(error.to_string().contains("outside the allowed roots"));
     }
 
     #[test]

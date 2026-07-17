@@ -4467,19 +4467,37 @@ fn recover_expired_run_admission_in_transaction(
     Ok(())
 }
 
+pub(crate) fn fresh_active_admission_matches_in_connection(
+    connection: &Connection,
+    session_id: SessionId,
+    admission_id: AdmissionId,
+    turn_id: TurnId,
+    now_ms: i64,
+) -> Result<bool, StorageError> {
+    let now = normalize_run_lease_now_ms(now_ms);
+    Ok(
+        session_runtime_state_from_connection(connection, session_id)?
+            .filter(|runtime_state| runtime_state.status == SessionStatus::Running)
+            .and_then(|runtime_state| runtime_state.fresh_admission_at(now))
+            .is_some_and(|admission| {
+                admission.admission_id == admission_id && admission.turn_id == turn_id
+            }),
+    )
+}
+
 fn require_active_admission_in_transaction(
     transaction: &Transaction<'_>,
     session_id: SessionId,
     admission_id: AdmissionId,
     turn_id: TurnId,
 ) -> Result<(), StorageError> {
-    let now = normalize_run_lease_now_ms(SystemClock::now_ms());
-    let owned = session_runtime_state_from_connection(transaction, session_id)?
-        .filter(|runtime_state| runtime_state.status == SessionStatus::Running)
-        .and_then(|runtime_state| runtime_state.fresh_admission_at(now))
-        .is_some_and(|admission| {
-            admission.admission_id == admission_id && admission.turn_id == turn_id
-        });
+    let owned = fresh_active_admission_matches_in_connection(
+        transaction,
+        session_id,
+        admission_id,
+        turn_id,
+        SystemClock::now_ms(),
+    )?;
     if owned {
         Ok(())
     } else {

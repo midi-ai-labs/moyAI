@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io::Read;
 use std::time::UNIX_EPOCH;
 
@@ -61,18 +60,14 @@ impl Tool for ReadTool {
         .await?
         .admit()?;
 
-        PathGuard::revalidate(&guarded)?;
-
-        if guarded.absolute.is_dir() {
+        let mut file = PathGuard::open_validated_read_file(&guarded)?;
+        let metadata = file.metadata()?;
+        if metadata.is_dir() {
             return Err(ToolError::Message(format!(
                 "path `{}` is a directory",
                 guarded.absolute
             )));
         }
-
-        let mut file = File::open(&guarded.absolute)?;
-        PathGuard::validate_open_file(&guarded, &file)?;
-        let metadata = file.metadata()?;
         let size_bytes = metadata.len();
         let extension = normalized_extension(&guarded.absolute);
         let blocked_extensions =

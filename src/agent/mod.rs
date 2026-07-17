@@ -242,7 +242,7 @@ impl AgentLoop {
                     &request.session.workspace,
                     skills,
                     &step_registry.available_tool_names(),
-                );
+                )?;
                 let agent_role = if request
                     .agent_context
                     .as_ref()
@@ -260,7 +260,7 @@ impl AgentLoop {
                 step.refresh_world_state(
                     &request.session.workspace,
                     &tool_plan.tool_names(),
-                );
+                )?;
                 let messages = request
                     .context
                     .model_messages(

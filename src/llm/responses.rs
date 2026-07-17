@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 
+use crate::config::ProviderStreamLimits;
 use crate::config::model::{ProviderApiMode, ProviderReasoningCapability, ReasoningSummary};
-use crate::error::LlmError;
+use crate::error::{LlmError, ProviderStreamLimit};
 use crate::llm::contract::{
     ChatRequest, LlmEvent, ModelContentPart, ModelMessage, ProviderToolChoice, ReasoningRequest,
     validate_responses_reasoning_request,
@@ -382,10 +383,104 @@ struct EmittedToolCall {
     arguments: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FunctionArgumentKey {
+    Item(String),
+    Call(String),
+}
+
+impl FunctionArgumentKey {
+    fn item(item_id: &str) -> Self {
+        Self::Item(item_id.to_string())
+    }
+
+    fn call(call_id: &str) -> Self {
+        Self::Call(call_id.to_string())
+    }
+
+    fn description(&self) -> String {
+        match self {
+            Self::Item(item_id) => format!("item `{item_id}`"),
+            Self::Call(call_id) => format!("call `{call_id}`"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FunctionArgumentLifecycle {
+    Accumulating,
+    Finalized,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FunctionArgumentState {
+    value: String,
+    lifecycle: FunctionArgumentLifecycle,
+}
+
+impl FunctionArgumentState {
+    fn accumulating() -> Self {
+        Self {
+            value: String::new(),
+            lifecycle: FunctionArgumentLifecycle::Accumulating,
+        }
+    }
+
+    fn finalized(value: &str) -> Self {
+        Self {
+            value: value.to_string(),
+            lifecycle: FunctionArgumentLifecycle::Finalized,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.value.len()
+    }
+
+    fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    fn is_finalized(&self) -> bool {
+        self.lifecycle == FunctionArgumentLifecycle::Finalized
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PendingArgumentMerge {
+    None,
+    KeepCall {
+        length: usize,
+        lifecycle: FunctionArgumentLifecycle,
+    },
+    MoveItem {
+        length: usize,
+        lifecycle: FunctionArgumentLifecycle,
+    },
+}
+
+impl PendingArgumentMerge {
+    fn length(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::KeepCall { length, .. } | Self::MoveItem { length, .. } => length,
+        }
+    }
+
+    fn lifecycle(self) -> FunctionArgumentLifecycle {
+        match self {
+            Self::None => FunctionArgumentLifecycle::Accumulating,
+            Self::KeepCall { lifecycle, .. } | Self::MoveItem { lifecycle, .. } => lifecycle,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct ResponsesStreamAccumulator {
-    pending_arguments: HashMap<String, String>,
+    max_tool_call_argument_bytes: u64,
+    pending_arguments: HashMap<FunctionArgumentKey, FunctionArgumentState>,
     item_to_call: HashMap<String, String>,
+    call_to_item: HashMap<String, String>,
     incomplete_function_items: HashSet<String>,
     emitted_tool_calls: HashMap<String, EmittedToolCall>,
     text_items_with_delta: HashSet<String>,
@@ -394,7 +489,28 @@ pub struct ResponsesStreamAccumulator {
     terminal: Option<ResponsesTerminal>,
 }
 
+impl Default for ResponsesStreamAccumulator {
+    fn default() -> Self {
+        Self::new(ProviderStreamLimits::product_default().max_tool_call_argument_bytes)
+    }
+}
+
 impl ResponsesStreamAccumulator {
+    pub fn new(max_tool_call_argument_bytes: u64) -> Self {
+        Self {
+            max_tool_call_argument_bytes,
+            pending_arguments: HashMap::new(),
+            item_to_call: HashMap::new(),
+            call_to_item: HashMap::new(),
+            incomplete_function_items: HashSet::new(),
+            emitted_tool_calls: HashMap::new(),
+            text_items_with_delta: HashSet::new(),
+            completed_message_items: HashSet::new(),
+            saw_unscoped_text_delta: false,
+            terminal: None,
+        }
+    }
+
     pub fn terminal(&self) -> Option<&ResponsesTerminal> {
         self.terminal.as_ref()
     }
@@ -562,23 +678,27 @@ impl ResponsesStreamAccumulator {
         let call_id = required_nonempty_string(item, "call_id", "Responses function_call item")?;
         let name = required_nonempty_string(item, "name", "Responses function_call item")?;
         let item_id = item.get("id").and_then(Value::as_str);
+        let inline_arguments = item.get("arguments").and_then(Value::as_str);
+        if let Some(arguments) = inline_arguments {
+            self.ensure_argument_bytes(arguments.len())?;
+        }
         if let Some(item_id) = item_id {
             self.bind_item_to_call(item_id, call_id)?;
         }
 
-        let inline_arguments = item.get("arguments").and_then(Value::as_str);
-        let call_arguments = self.pending_arguments.get(call_id).map(String::as_str);
-        let item_arguments = item_id
-            .and_then(|item_id| self.pending_arguments.get(item_id))
-            .map(String::as_str);
+        let call_arguments = self
+            .pending_arguments
+            .get(&FunctionArgumentKey::call(call_id))
+            .map(FunctionArgumentState::as_str);
         let arguments = consistent_arguments(
-            [inline_arguments, call_arguments, item_arguments],
+            [inline_arguments, call_arguments],
             "Responses function_call item",
         )?
         .ok_or_else(|| {
             LlmError::Message("Responses function_call item is missing `arguments`".to_string())
-        })?
-        .to_string();
+        })?;
+        self.ensure_argument_bytes(arguments.len())?;
+        let arguments = arguments.to_string();
 
         self.emit_tool_call(call_id, name, &arguments, events)
     }
@@ -597,16 +717,15 @@ impl ResponsesStreamAccumulator {
                 "response.function_call_arguments.done requires `item_id` or `call_id`".to_string(),
             ));
         }
+        self.ensure_argument_bytes(arguments.len())?;
 
-        if let Some(item_id) = item_id {
-            self.remember_final_arguments(item_id, arguments)?;
+        if let (Some(item_id), Some(call_id)) = (item_id, explicit_call_id) {
+            self.bind_item_to_call(item_id, call_id)?;
         }
-        if let Some(call_id) = explicit_call_id {
-            self.remember_final_arguments(call_id, arguments)?;
-            if let Some(item_id) = item_id {
-                self.bind_item_to_call(item_id, call_id)?;
-            }
-        }
+        let argument_key = self
+            .canonical_argument_key(item_id, explicit_call_id)
+            .expect("an item or call id was validated above");
+        self.remember_final_arguments(argument_key, arguments)?;
 
         let call_id = explicit_call_id
             .map(str::to_string)
@@ -629,52 +748,253 @@ impl ResponsesStreamAccumulator {
 
     fn handle_function_call_arguments_delta(&mut self, event: &Value) -> Result<(), LlmError> {
         let delta = required_string(event, "delta", "response.function_call_arguments.delta")?;
-        let key = event
-            .get("item_id")
-            .and_then(Value::as_str)
-            .or_else(|| event.get("call_id").and_then(Value::as_str))
-            .ok_or_else(|| {
-                LlmError::Message(
-                    "response.function_call_arguments.delta requires `item_id` or `call_id`"
-                        .to_string(),
-                )
-            })?;
+        let item_id = event.get("item_id").and_then(Value::as_str);
+        let call_id = event.get("call_id").and_then(Value::as_str);
+        if item_id.is_none() && call_id.is_none() {
+            return Err(LlmError::Message(
+                "response.function_call_arguments.delta requires `item_id` or `call_id`"
+                    .to_string(),
+            ));
+        }
+
+        let key = if let (Some(item_id), Some(call_id)) = (item_id, call_id) {
+            let merge = self.plan_item_to_call_binding(item_id, call_id)?;
+            let key = FunctionArgumentKey::call(call_id);
+            self.ensure_argument_delta_allowed(&key, merge.lifecycle())?;
+            self.ensure_argument_append(merge.length(), delta.len())?;
+            self.apply_item_to_call_binding(item_id, call_id, merge);
+            key
+        } else {
+            let key = self
+                .canonical_argument_key(item_id, call_id)
+                .expect("an item or call id was validated above");
+            let current_state = self.pending_arguments.get(&key);
+            let lifecycle = current_state
+                .map_or(FunctionArgumentLifecycle::Accumulating, |state| {
+                    state.lifecycle
+                });
+            self.ensure_argument_delta_allowed(&key, lifecycle)?;
+            let current_length = current_state.map_or(0, FunctionArgumentState::len);
+            self.ensure_argument_append(current_length, delta.len())?;
+            key
+        };
         self.pending_arguments
-            .entry(key.to_string())
-            .or_default()
+            .entry(key)
+            .or_insert_with(FunctionArgumentState::accumulating)
+            .value
             .push_str(delta);
         Ok(())
     }
 
-    fn remember_final_arguments(&mut self, key: &str, arguments: &str) -> Result<(), LlmError> {
-        if let Some(existing) = self.pending_arguments.get_mut(key) {
-            if existing == arguments {
+    fn remember_final_arguments(
+        &mut self,
+        key: FunctionArgumentKey,
+        arguments: &str,
+    ) -> Result<(), LlmError> {
+        self.ensure_argument_bytes(arguments.len())?;
+        let key_description = key.description();
+        if let Some(existing) = self.pending_arguments.get_mut(&key) {
+            if existing.value == arguments {
+                existing.lifecycle = FunctionArgumentLifecycle::Finalized;
                 return Ok(());
             }
-            if arguments.starts_with(existing.as_str()) {
-                *existing = arguments.to_string();
+            if existing.is_finalized() {
+                return Err(LlmError::Message(format!(
+                    "Responses function call {key_description} was finalized with different arguments"
+                )));
+            }
+            if arguments.starts_with(existing.value.as_str()) {
+                existing.value = arguments.to_string();
+                existing.lifecycle = FunctionArgumentLifecycle::Finalized;
                 return Ok(());
             }
             return Err(LlmError::Message(format!(
-                "Responses function call item `{key}` completed with conflicting arguments"
+                "Responses function call {key_description} completed with conflicting arguments"
             )));
         }
         self.pending_arguments
-            .insert(key.to_string(), arguments.to_string());
+            .insert(key, FunctionArgumentState::finalized(arguments));
         Ok(())
     }
 
     fn bind_item_to_call(&mut self, item_id: &str, call_id: &str) -> Result<(), LlmError> {
+        let merge = self.plan_item_to_call_binding(item_id, call_id)?;
+        self.apply_item_to_call_binding(item_id, call_id, merge);
+        Ok(())
+    }
+
+    fn plan_item_to_call_binding(
+        &self,
+        item_id: &str,
+        call_id: &str,
+    ) -> Result<PendingArgumentMerge, LlmError> {
         if let Some(existing) = self.item_to_call.get(item_id) {
             if existing != call_id {
                 return Err(LlmError::Message(format!(
                     "Responses item `{item_id}` was associated with multiple function calls"
                 )));
             }
-            return Ok(());
         }
+        if let Some(existing) = self.call_to_item.get(call_id) {
+            if existing != item_id {
+                return Err(LlmError::Message(format!(
+                    "Responses function call `{call_id}` was associated with multiple items (`{existing}` and `{item_id}`)"
+                )));
+            }
+        }
+
+        let item_key = FunctionArgumentKey::item(item_id);
+        let call_key = FunctionArgumentKey::call(call_id);
+        let item_arguments = self.pending_arguments.get(&item_key);
+        let call_arguments = self.pending_arguments.get(&call_key);
+        match (item_arguments, call_arguments) {
+            (None, None) => Ok(PendingArgumentMerge::None),
+            (None, Some(call_arguments)) => Ok(PendingArgumentMerge::KeepCall {
+                length: call_arguments.len(),
+                lifecycle: call_arguments.lifecycle,
+            }),
+            (Some(item_arguments), None) => Ok(PendingArgumentMerge::MoveItem {
+                length: item_arguments.len(),
+                lifecycle: item_arguments.lifecycle,
+            }),
+            (Some(item_arguments), Some(call_arguments)) => {
+                let (keep_call, canonical_arguments) = if call_arguments
+                    .as_str()
+                    .starts_with(item_arguments.as_str())
+                {
+                    (true, call_arguments)
+                } else if item_arguments.as_str().starts_with(call_arguments.as_str()) {
+                    (false, item_arguments)
+                } else {
+                    return Err(LlmError::Message(format!(
+                        "Responses item `{item_id}` and function call `{call_id}` contain conflicting arguments"
+                    )));
+                };
+                let lifecycle = Self::merged_argument_lifecycle(
+                    item_arguments,
+                    call_arguments,
+                    canonical_arguments,
+                    item_id,
+                    call_id,
+                )?;
+                if keep_call {
+                    Ok(PendingArgumentMerge::KeepCall {
+                        length: canonical_arguments.len(),
+                        lifecycle,
+                    })
+                } else {
+                    Ok(PendingArgumentMerge::MoveItem {
+                        length: canonical_arguments.len(),
+                        lifecycle,
+                    })
+                }
+            }
+        }
+    }
+
+    fn merged_argument_lifecycle(
+        item_arguments: &FunctionArgumentState,
+        call_arguments: &FunctionArgumentState,
+        canonical_arguments: &FunctionArgumentState,
+        item_id: &str,
+        call_id: &str,
+    ) -> Result<FunctionArgumentLifecycle, LlmError> {
+        for arguments in [item_arguments, call_arguments] {
+            if arguments.is_finalized() && arguments.as_str() != canonical_arguments.as_str() {
+                return Err(LlmError::Message(format!(
+                    "Responses item `{item_id}` and function call `{call_id}` disagree with finalized arguments"
+                )));
+            }
+        }
+        Ok(
+            if item_arguments.is_finalized() || call_arguments.is_finalized() {
+                FunctionArgumentLifecycle::Finalized
+            } else {
+                FunctionArgumentLifecycle::Accumulating
+            },
+        )
+    }
+
+    fn apply_item_to_call_binding(
+        &mut self,
+        item_id: &str,
+        call_id: &str,
+        merge: PendingArgumentMerge,
+    ) {
         self.item_to_call
-            .insert(item_id.to_string(), call_id.to_string());
+            .entry(item_id.to_string())
+            .or_insert_with(|| call_id.to_string());
+        self.call_to_item
+            .entry(call_id.to_string())
+            .or_insert_with(|| item_id.to_string());
+        let item_key = FunctionArgumentKey::item(item_id);
+        let call_key = FunctionArgumentKey::call(call_id);
+        match merge {
+            PendingArgumentMerge::None => {}
+            PendingArgumentMerge::KeepCall { lifecycle, .. } => {
+                if let Some(arguments) = self.pending_arguments.get_mut(&call_key) {
+                    arguments.lifecycle = lifecycle;
+                }
+                self.pending_arguments.remove(&item_key);
+            }
+            PendingArgumentMerge::MoveItem { lifecycle, .. } => {
+                if let Some(mut arguments) = self.pending_arguments.remove(&item_key) {
+                    arguments.lifecycle = lifecycle;
+                    self.pending_arguments.insert(call_key, arguments);
+                }
+            }
+        }
+    }
+
+    fn canonical_argument_key(
+        &self,
+        item_id: Option<&str>,
+        call_id: Option<&str>,
+    ) -> Option<FunctionArgumentKey> {
+        call_id.map(FunctionArgumentKey::call).or_else(|| {
+            item_id.map(|item_id| {
+                self.item_to_call.get(item_id).map_or_else(
+                    || FunctionArgumentKey::item(item_id),
+                    |call_id| FunctionArgumentKey::call(call_id),
+                )
+            })
+        })
+    }
+
+    fn ensure_argument_append(
+        &self,
+        current_length: usize,
+        delta_length: usize,
+    ) -> Result<(), LlmError> {
+        let actual = current_length
+            .checked_add(delta_length)
+            .unwrap_or(usize::MAX);
+        self.ensure_argument_bytes(actual)
+    }
+
+    fn ensure_argument_delta_allowed(
+        &self,
+        key: &FunctionArgumentKey,
+        lifecycle: FunctionArgumentLifecycle,
+    ) -> Result<(), LlmError> {
+        if lifecycle == FunctionArgumentLifecycle::Finalized {
+            return Err(LlmError::Message(format!(
+                "Responses function argument {} received a delta after it was finalized",
+                key.description()
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_argument_bytes(&self, actual: usize) -> Result<(), LlmError> {
+        let actual = u64::try_from(actual).unwrap_or(u64::MAX);
+        if actual > self.max_tool_call_argument_bytes {
+            return Err(LlmError::ProviderStreamLimitExceeded {
+                surface: ProviderStreamLimit::ToolCallArgumentBytes,
+                actual,
+                maximum: self.max_tool_call_argument_bytes,
+            });
+        }
         Ok(())
     }
 
@@ -694,7 +1014,7 @@ impl ResponsesStreamAccumulator {
             return Ok(());
         }
 
-        self.remember_final_arguments(call_id, arguments)?;
+        self.remember_final_arguments(FunctionArgumentKey::call(call_id), arguments)?;
         self.emitted_tool_calls.insert(
             call_id.to_string(),
             EmittedToolCall {
@@ -753,15 +1073,16 @@ impl ResponsesStreamAccumulator {
                 "Responses stream completed before function call `{call_id}` for item `{item_id}` was complete"
             )));
         }
-        if let Some(key) = self.pending_arguments.keys().find(|key| {
-            !self.emitted_tool_calls.contains_key(key.as_str())
-                && !self
-                    .item_to_call
-                    .get(key.as_str())
-                    .is_some_and(|call_id| self.emitted_tool_calls.contains_key(call_id))
+        if let Some(key) = self.pending_arguments.keys().find(|key| match key {
+            FunctionArgumentKey::Call(call_id) => !self.emitted_tool_calls.contains_key(call_id),
+            FunctionArgumentKey::Item(item_id) => !self
+                .item_to_call
+                .get(item_id)
+                .is_some_and(|call_id| self.emitted_tool_calls.contains_key(call_id)),
         }) {
             return Err(LlmError::Message(format!(
-                "Responses stream completed with unresolved function arguments for `{key}`"
+                "Responses stream completed with unresolved function arguments for {}",
+                key.description()
             )));
         }
         Ok(())
@@ -917,6 +1238,7 @@ mod tests {
     use super::*;
     use crate::config::model::{ProviderApiMode, ReasoningEffort};
     use crate::config::{ProviderDeadlines, ProviderMetadataMode, ProviderTarget};
+    use crate::error::ProviderStreamLimit;
     use crate::llm::contract::{
         ModelCapabilities, ModelProfile, ModelToolCall, ResponsesContinuation, ToolSchema,
     };
@@ -1361,6 +1683,337 @@ mod tests {
                 finish_reason: FinishReason::ToolCall,
                 ..
             }) if response_id == "resp_1"
+        ));
+    }
+
+    #[test]
+    fn oversized_function_argument_delta_is_rejected_before_retention() {
+        let maximum = 4;
+        let mut accumulator = ResponsesStreamAccumulator::new(maximum);
+        let result = accumulator.push_value(&json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_oversized_delta",
+            "delta": "12345"
+        }));
+
+        assert!(
+            accumulator.pending_arguments.is_empty(),
+            "an oversized delta must not mutate retained argument state"
+        );
+        assert!(matches!(
+            result,
+            Err(LlmError::ProviderStreamLimitExceeded {
+                surface: ProviderStreamLimit::ToolCallArgumentBytes,
+                actual,
+                maximum: admitted_maximum,
+            }) if actual == maximum + 1 && admitted_maximum == maximum
+        ));
+    }
+
+    #[test]
+    fn oversized_output_item_arguments_are_rejected_before_emission() {
+        let maximum = 4;
+        let mut accumulator = ResponsesStreamAccumulator::new(maximum);
+        let result = accumulator.push_value(&json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "id": "fc_oversized_item",
+                "call_id": "call_oversized_item",
+                "name": "read_file",
+                "arguments": "12345"
+            }
+        }));
+
+        assert!(accumulator.pending_arguments.is_empty());
+        assert!(accumulator.item_to_call.is_empty());
+        assert!(accumulator.call_to_item.is_empty());
+        assert!(accumulator.emitted_tool_calls.is_empty());
+        assert!(matches!(
+            result,
+            Err(LlmError::ProviderStreamLimitExceeded {
+                surface: ProviderStreamLimit::ToolCallArgumentBytes,
+                actual,
+                maximum: admitted_maximum,
+            }) if actual == maximum + 1 && admitted_maximum == maximum
+        ));
+    }
+
+    #[test]
+    fn item_and_call_aliases_retain_one_canonical_argument_value() {
+        let arguments = "{\"path\":\"README.md\"}";
+        let mut accumulator = ResponsesStreamAccumulator::new(arguments.len() as u64);
+        accumulator
+            .push_value(&json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_canonical",
+                "delta": arguments
+            }))
+            .expect("arguments delta");
+        accumulator
+            .push_value(&json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_canonical",
+                "arguments": arguments
+            }))
+            .expect("arguments done");
+        let update = accumulator
+            .push_value(&json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_canonical",
+                    "call_id": "call_canonical",
+                    "name": "read_file",
+                    "arguments": arguments
+                }
+            }))
+            .expect("function call item");
+
+        assert_eq!(accumulator.pending_arguments.len(), 1);
+        assert_eq!(
+            accumulator
+                .call_to_item
+                .get("call_canonical")
+                .map(String::as_str),
+            Some("fc_canonical")
+        );
+        assert_eq!(
+            accumulator
+                .pending_arguments
+                .get(&FunctionArgumentKey::call("call_canonical"))
+                .map(FunctionArgumentState::as_str),
+            Some(arguments)
+        );
+        assert!(
+            accumulator
+                .pending_arguments
+                .get(&FunctionArgumentKey::call("call_canonical"))
+                .is_some_and(FunctionArgumentState::is_finalized)
+        );
+        assert!(
+            !accumulator
+                .pending_arguments
+                .contains_key(&FunctionArgumentKey::item("fc_canonical"))
+        );
+        assert!(matches!(
+            update.events.as_slice(),
+            [
+                LlmEvent::ToolCallStart { call_id, .. },
+                LlmEvent::ToolCallArgsDelta { call_id: args_id, delta }
+            ] if call_id == "call_canonical"
+                && args_id == "call_canonical"
+                && delta == arguments
+        ));
+    }
+
+    #[test]
+    fn argument_delta_limit_rejects_before_extending_existing_value() {
+        let mut accumulator = ResponsesStreamAccumulator::new(4);
+        accumulator
+            .push_value(&json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_boundary",
+                "delta": "1234"
+            }))
+            .expect("argument boundary");
+
+        let result = accumulator.push_value(&json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_boundary",
+            "delta": "5"
+        }));
+
+        assert_eq!(
+            accumulator
+                .pending_arguments
+                .get(&FunctionArgumentKey::item("fc_boundary"))
+                .map(FunctionArgumentState::as_str),
+            Some("1234")
+        );
+        assert!(matches!(
+            result,
+            Err(LlmError::ProviderStreamLimitExceeded {
+                surface: ProviderStreamLimit::ToolCallArgumentBytes,
+                actual: 5,
+                maximum: 4,
+            })
+        ));
+    }
+
+    #[test]
+    fn equal_item_and_call_id_text_use_distinct_provisional_keys() {
+        let mut accumulator = ResponsesStreamAccumulator::new(4);
+        accumulator
+            .push_value(&json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "shared_id",
+                "delta": "12"
+            }))
+            .expect("item-keyed delta");
+        accumulator
+            .push_value(&json!({
+                "type": "response.function_call_arguments.delta",
+                "call_id": "shared_id",
+                "delta": "34"
+            }))
+            .expect("call-keyed delta");
+
+        assert_eq!(
+            accumulator
+                .pending_arguments
+                .get(&FunctionArgumentKey::item("shared_id"))
+                .map(FunctionArgumentState::as_str),
+            Some("12")
+        );
+        assert_eq!(
+            accumulator
+                .pending_arguments
+                .get(&FunctionArgumentKey::call("shared_id"))
+                .map(FunctionArgumentState::as_str),
+            Some("34")
+        );
+    }
+
+    #[test]
+    fn finalized_output_item_rejects_late_delta_without_mutation() {
+        for identity_field in ["item_id", "call_id"] {
+            let mut accumulator = ResponsesStreamAccumulator::new(64);
+            accumulator
+                .push_value(&json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_finalized",
+                        "call_id": "call_finalized",
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"README.md\"}"
+                    }
+                }))
+                .expect("finalized output item");
+            let pending_before = accumulator.pending_arguments.clone();
+            let bindings_before = accumulator.item_to_call.clone();
+            let reverse_bindings_before = accumulator.call_to_item.clone();
+            let emitted_before = accumulator
+                .emitted_tool_calls
+                .get("call_finalized")
+                .map(|call| (call.name.clone(), call.arguments.clone()));
+            let mut late_delta = json!({
+                "type": "response.function_call_arguments.delta",
+                "delta": " "
+            });
+            late_delta[identity_field] = json!(if identity_field == "item_id" {
+                "fc_finalized"
+            } else {
+                "call_finalized"
+            });
+
+            let result = accumulator.push_value(&late_delta);
+
+            assert_eq!(accumulator.pending_arguments, pending_before);
+            assert_eq!(accumulator.item_to_call, bindings_before);
+            assert_eq!(accumulator.call_to_item, reverse_bindings_before);
+            assert_eq!(
+                accumulator
+                    .emitted_tool_calls
+                    .get("call_finalized")
+                    .map(|call| (call.name.clone(), call.arguments.clone())),
+                emitted_before
+            );
+            assert!(accumulator.terminal().is_none());
+            assert!(matches!(
+                result,
+                Err(LlmError::Message(message)) if message.contains("finalized")
+            ));
+        }
+    }
+
+    #[test]
+    fn finalized_arguments_done_rejects_late_delta_without_mutation() {
+        let mut accumulator = ResponsesStreamAccumulator::new(64);
+        accumulator
+            .push_value(&json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_arguments_done",
+                "arguments": "{\"path\":\"README.md\"}"
+            }))
+            .expect("final arguments");
+        let pending_before = accumulator.pending_arguments.clone();
+        let bindings_before = accumulator.item_to_call.clone();
+        let reverse_bindings_before = accumulator.call_to_item.clone();
+
+        let result = accumulator.push_value(&json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_arguments_done",
+            "delta": " "
+        }));
+
+        assert_eq!(accumulator.pending_arguments, pending_before);
+        assert_eq!(accumulator.item_to_call, bindings_before);
+        assert_eq!(accumulator.call_to_item, reverse_bindings_before);
+        assert!(accumulator.emitted_tool_calls.is_empty());
+        assert!(accumulator.terminal().is_none());
+        assert!(matches!(
+            result,
+            Err(LlmError::Message(message)) if message.contains("finalized")
+        ));
+    }
+
+    #[test]
+    fn distinct_items_cannot_bind_to_the_same_call() {
+        let arguments = "{\"path\":\"README.md\"}";
+        let mut accumulator = ResponsesStreamAccumulator::new(64);
+        accumulator
+            .push_value(&json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_first",
+                    "call_id": "call_shared",
+                    "name": "read_file",
+                    "arguments": arguments
+                }
+            }))
+            .expect("first function call item");
+        accumulator
+            .push_value(&json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_second",
+                "delta": arguments
+            }))
+            .expect("second provisional item");
+        let pending_before = accumulator.pending_arguments.clone();
+        let bindings_before = accumulator.item_to_call.clone();
+        let reverse_bindings_before = accumulator.call_to_item.clone();
+        let emitted_before = accumulator
+            .emitted_tool_calls
+            .get("call_shared")
+            .map(|call| (call.name.clone(), call.arguments.clone()));
+
+        let result = accumulator.push_value(&json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "id": "fc_second",
+                "call_id": "call_shared",
+                "name": "read_file",
+                "arguments": arguments
+            }
+        }));
+
+        assert_eq!(accumulator.pending_arguments, pending_before);
+        assert_eq!(accumulator.item_to_call, bindings_before);
+        assert_eq!(accumulator.call_to_item, reverse_bindings_before);
+        assert_eq!(
+            accumulator
+                .emitted_tool_calls
+                .get("call_shared")
+                .map(|call| (call.name.clone(), call.arguments.clone())),
+            emitted_before
+        );
+        assert!(matches!(
+            result,
+            Err(LlmError::Message(message)) if message.contains("multiple items")
         ));
     }
 

@@ -86,6 +86,20 @@ pub struct DesktopAgentActivityRow {
     pub updated: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopComposerSubmitMode {
+    NewRequest,
+    Steer,
+    Blocked,
+}
+
+impl DesktopComposerSubmitMode {
+    fn admission_is_open(self) -> bool {
+        !matches!(self, Self::Blocked)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DesktopRuntimeProjection {
     pub agent_activity_rows: Vec<DesktopAgentActivityRow>,
@@ -277,6 +291,7 @@ pub struct DesktopWebState {
     pub draft_target: DesktopDraftActionTargetProjection,
     pub image_input: String,
     pub attached_images: Vec<String>,
+    pub composer_submit_mode: DesktopComposerSubmitMode,
     pub can_submit: bool,
     pub can_cancel_run: bool,
     pub run_target: DesktopRunMutationTargetProjection,
@@ -394,7 +409,14 @@ pub(crate) fn desktop_web_state_with_permission(
         state.navigation_loading(),
         state.background_mutation_pending(),
     );
-    let composer_admission_open = new_request_admission_open || steer_admission_open;
+    let composer_submit_mode = if steer_admission_open {
+        DesktopComposerSubmitMode::Steer
+    } else if new_request_admission_open {
+        DesktopComposerSubmitMode::NewRequest
+    } else {
+        DesktopComposerSubmitMode::Blocked
+    };
+    let composer_admission_open = composer_submit_mode.admission_is_open();
     let image_input_enabled =
         desktop_image_input_delegates_capability_to_runtime(state) && composer_admission_open;
     let navigation_admission_open = navigation_admission_blocker(
@@ -576,6 +598,7 @@ pub(crate) fn desktop_web_state_with_permission(
             .iter()
             .map(|path| path.to_string())
             .collect(),
+        composer_submit_mode,
         can_submit: composer_admission_open,
         can_cancel_run: busy || pending_permission.is_some() || runtime.agent_tree_active,
         run_target: DesktopRunMutationTargetProjection {
@@ -1649,12 +1672,33 @@ mod tests {
 
         let running = desktop_web_state(&state, &runtime);
         assert!(running.can_submit);
+        assert_eq!(
+            running.composer_submit_mode,
+            DesktopComposerSubmitMode::Steer
+        );
         assert!(!running.enhance_enabled);
         assert!(!running.send_enhanced_enabled);
+
+        let running_with_child = desktop_web_state(
+            &state,
+            &DesktopRuntimeProjection {
+                agent_tree_active: true,
+                ..runtime.clone()
+            },
+        );
+        assert!(running_with_child.can_submit);
+        assert_eq!(
+            running_with_child.composer_submit_mode,
+            DesktopComposerSubmitMode::Steer
+        );
 
         let operation_id = state.begin_steer_submission();
         let pending = desktop_web_state(&state, &runtime);
         assert!(!pending.can_submit);
+        assert_eq!(
+            pending.composer_submit_mode,
+            DesktopComposerSubmitMode::Blocked
+        );
         assert!(pending.background_mutation_pending);
         assert!(state.finish_steer_submission(operation_id));
     }

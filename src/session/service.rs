@@ -1019,7 +1019,7 @@ fn canonical_session_snapshot_from_storage(
         fence,
         history,
         turns,
-        latest_turn_position: _,
+        latest_turn_position,
     } = protocol;
     let history_has_more = history.has_more();
     let turn_has_more = turns.has_more();
@@ -1042,6 +1042,7 @@ fn canonical_session_snapshot_from_storage(
                 has_more: turn_has_more,
                 items: turns.items,
             },
+            latest_turn_id: latest_turn_position.map(|(turn_id, _)| turn_id),
             active_turn_id: active_turn_position.map(|(turn_id, _)| turn_id),
             active_turn_sequence_no: active_turn_position.map(|(_, sequence_no)| sequence_no),
         },
@@ -1368,6 +1369,67 @@ mod tests {
                 .await
                 .expect("release completed admission")
         );
+    }
+
+    #[tokio::test]
+    async fn canonical_snapshot_and_markdown_use_a_later_terminal_only_recovery_turn() {
+        let (service, workspace, _) = service_fixture().await;
+        let session = create_session(&service, &workspace).await;
+        let (older_admission_id, older_turn_id) =
+            admit_session_turn(&service, session.session.id).await;
+        let user_turn = UserTurn {
+            turn_id: older_turn_id,
+            items: vec![UserInputItem::Text {
+                text: "older persisted request".to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+        };
+        service
+            .store_user_turn_with_protocol_bundle(
+                &session,
+                older_admission_id,
+                &user_turn,
+                older_turn_id,
+                0,
+            )
+            .await
+            .expect("store older user turn");
+        terminalize_admitted_session(&service, session.session.id, older_turn_id).await;
+        assert!(
+            service
+                .store
+                .session_repo()
+                .release_stopped_run_admission(session.session.id, older_admission_id)
+                .await
+                .expect("release older admission")
+        );
+
+        let terminal_only_turn_id = TurnId::new();
+        service
+            .store
+            .session_repo()
+            .admit_session_turn_at(session.session.id, terminal_only_turn_id, 0, 1)
+            .await
+            .expect("admit expired terminal-only turn")
+            .expect("terminal-only turn admitted");
+        assert_eq!(
+            service
+                .mark_stale_running_sessions("recover terminal-only turn")
+                .await
+                .expect("recover terminal-only turn"),
+            1
+        );
+
+        let snapshot = service
+            .canonical_latest_session_snapshot(session.session.id, 10, 10)
+            .await
+            .expect("canonical snapshot");
+        assert_eq!(snapshot.read.active_turn_id, None);
+        assert_eq!(snapshot.read.latest_turn_id, Some(terminal_only_turn_id));
+        let markdown = crate::session::canonical_session_read_to_markdown(&snapshot.read);
+        assert!(markdown.contains("失敗しました: recover terminal-only turn"));
+        assert!(!markdown.contains("完了しました。"));
     }
 
     async fn cross_process_service_fixture() -> (SessionService, SessionService, Workspace) {

@@ -432,6 +432,8 @@ pub enum AgentError {
     Storage(#[from] StorageError),
     #[error("agent runtime error: {0}")]
     Runtime(#[from] RuntimeError),
+    #[error("agent workspace error: {0}")]
+    Workspace(#[from] WorkspaceError),
     #[error("provider stopped because the output token limit was reached")]
     ProviderOutputLimit,
     #[error("provider reported an error finish reason")]

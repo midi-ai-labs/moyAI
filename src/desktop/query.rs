@@ -2454,6 +2454,7 @@ mod tests {
                     has_more: false,
                     items: turn_items,
                 },
+                latest_turn_id: Some(turn_id),
                 active_turn_id: None,
                 active_turn_sequence_no: None,
             },

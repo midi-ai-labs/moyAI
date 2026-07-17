@@ -12,7 +12,10 @@ use crate::protocol::{
 };
 use crate::runtime::SystemClock;
 use crate::session::{AdmissionId, SessionId, SessionSpawnEdge};
-use crate::storage::session_repo::{SessionProtocolWriteAuthority, normalize_run_lease_now_ms};
+use crate::storage::session_repo::{
+    SessionProtocolWriteAuthority, fresh_active_admission_matches_in_connection,
+    normalize_run_lease_now_ms,
+};
 
 pub trait ProtocolEventStore {
     #[cfg(test)]
@@ -663,25 +666,13 @@ impl SqliteProtocolEventStore {
         let now = normalize_run_lease_now_ms(now_ms);
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owned = transaction
-            .query_row(
-                "SELECT 1
-                 FROM sessions
-                 WHERE id = ?1
-                   AND active_run_id = ?2
-                   AND active_turn_id = ?3
-                   AND active_run_lease_expires_at_ms > ?4
-                   AND status = 'running'",
-                params![
-                    event.session_id.to_string(),
-                    admission_id.to_string(),
-                    event.turn_id.to_string(),
-                    now
-                ],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
+        let owned = fresh_active_admission_matches_in_connection(
+            &transaction,
+            event.session_id,
+            admission_id,
+            event.turn_id,
+            now,
+        )?;
         if !owned {
             transaction.commit()?;
             return Ok(None);
@@ -709,35 +700,31 @@ impl SqliteProtocolEventStore {
         let now = normalize_run_lease_now_ms(SystemClock::now_ms());
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owned_lineage = transaction
-            .query_row(
-                "SELECT 1
-                 FROM sessions AS root
-                 WHERE root.id = ?1
-                   AND root.status = 'running'
-                   AND root.active_run_id = ?2
-                   AND root.active_turn_id = ?3
-                   AND root.active_run_lease_expires_at_ms > ?4
-                   AND EXISTS (
-                       SELECT 1
-                       FROM session_spawn_edges AS edge
-                       WHERE edge.root_session_id = root.id
-                         AND edge.parent_session_id = root.id
-                         AND edge.child_session_id = ?5
-                         AND edge.agent_path = ?6
-                   )",
-                params![
-                    root_session_id.to_string(),
-                    originating_admission_id.to_string(),
-                    originating_turn_id.to_string(),
-                    now,
-                    agent_session_id.to_string(),
-                    agent_path
-                ],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
+        let owns_root_turn = fresh_active_admission_matches_in_connection(
+            &transaction,
+            root_session_id,
+            originating_admission_id,
+            originating_turn_id,
+            now,
+        )?;
+        let owned_lineage = owns_root_turn
+            && transaction
+                .query_row(
+                    "SELECT 1
+                     FROM session_spawn_edges AS edge
+                     WHERE edge.root_session_id = ?1
+                       AND edge.parent_session_id = ?1
+                       AND edge.child_session_id = ?2
+                       AND edge.agent_path = ?3",
+                    params![
+                        root_session_id.to_string(),
+                        agent_session_id.to_string(),
+                        agent_path
+                    ],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
         if !owned_lineage {
             return Err(StorageError::Message(format!(
                 "sub-agent activity owner or retained direct-child identity is stale for root session {root_session_id} admission {originating_admission_id} turn {originating_turn_id}"
@@ -5096,12 +5083,12 @@ mod tests {
             Connection::open_in_memory().expect("in-memory db"),
         ));
         let active_admission_id = crate::session::AdmissionId::new();
+        let session_id = SessionId::new();
+        let owned_turn_id = TurnId::new();
         {
             let locked = connection.lock().expect("sqlite mutex");
             crate::storage::migration::run(&locked).expect("migrations");
             let project_id = crate::session::ProjectId::new();
-            let session_id = SessionId::new();
-            let owned_turn_id = TurnId::new();
             locked
                 .execute(
                     "INSERT INTO projects
@@ -5130,14 +5117,6 @@ mod tests {
                 .expect("current admission fixture");
         }
         let store = SqliteProtocolEventStore::new(connection);
-        let session_id = {
-            let connection = store.connection.lock().expect("sqlite mutex");
-            connection
-                .query_row("SELECT id FROM sessions", [], |row| row.get::<_, String>(0))
-                .expect("session id")
-                .parse::<SessionId>()
-                .expect("valid session id")
-        };
         let turn_id = TurnId::new();
         let event = warning_event(session_id, turn_id, 0, "must have an exact turn owner");
 
@@ -5159,6 +5138,31 @@ mod tests {
                 .list_runtime_events(session_id, turn_id)
                 .expect("runtime events")
                 .is_empty()
+        );
+
+        store
+            .seed_runtime_event_for_test(&completed_terminal_event(session_id, owned_turn_id, 0))
+            .expect("corrupt running-plus-terminal fixture");
+        let corrupt_append = store
+            .append_admitted_recording_projection_allocating_at(
+                active_admission_id,
+                &warning_event(session_id, owned_turn_id, 0, "must reject corruption"),
+                None,
+                None,
+                100,
+            )
+            .expect_err("running plus terminal must fail closed before recording append");
+        assert!(
+            corrupt_append
+                .to_string()
+                .contains("already has a durable terminal")
+        );
+        assert_eq!(
+            store
+                .list_runtime_events(session_id, owned_turn_id)
+                .expect("owned-turn events after rejected append")
+                .len(),
+            1
         );
     }
 
@@ -5261,6 +5265,33 @@ mod tests {
                 .payload,
             TurnItemPayload::SubAgentActivity { .. }
         ));
+
+        store
+            .seed_runtime_event_for_test(&completed_terminal_event(root_session_id, turn_a, 1))
+            .expect("corrupt running-plus-terminal fixture");
+        let corrupt_activity = store
+            .append_sub_agent_activity(
+                root_session_id,
+                admission_a,
+                turn_a,
+                "activity-after-terminal".to_string(),
+                child_session_id,
+                "/root/reviewer".to_string(),
+                SubAgentActivityKind::Interacted,
+            )
+            .expect_err("running plus terminal must fail closed before activity append");
+        assert!(
+            corrupt_activity
+                .to_string()
+                .contains("already has a durable terminal")
+        );
+        assert_eq!(
+            store
+                .list_history_items(root_session_id, turn_a)
+                .expect("history after rejected corrupt activity")
+                .len(),
+            1
+        );
 
         let admission_b = AdmissionId::new();
         let turn_b = TurnId::new();
@@ -5408,6 +5439,31 @@ mod tests {
                 message: message.to_string(),
             },
         }
+    }
+
+    fn completed_terminal_event(
+        session_id: SessionId,
+        turn_id: TurnId,
+        sequence_no: i64,
+    ) -> RuntimeEvent {
+        crate::protocol::project_protocol_run_event(
+            &crate::session::RunEvent::TurnTerminal {
+                session_id,
+                terminal: Box::new(crate::session::DurableTurnTerminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                    final_response_id: None,
+                    tool_call_count: 0,
+                    failed_tool_count: 0,
+                    change_count: 0,
+                    metrics: Default::default(),
+                }),
+            },
+            Some(session_id),
+            turn_id,
+            sequence_no,
+        )
+        .expect("terminal projection")
+        .runtime_event
     }
 
     fn history_user_turn(
