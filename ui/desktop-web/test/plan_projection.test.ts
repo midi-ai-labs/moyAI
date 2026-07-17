@@ -23,4 +23,3 @@ test("canonical plan projection stays separate from runtime activity", () => {
   assert.match(html, /data-plan-status="pending"/);
   assert.doesNotMatch(html, /class="activity"/);
 });
-

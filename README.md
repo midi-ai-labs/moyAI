@@ -69,7 +69,7 @@ moyAI is designed around those constraints:
 - LM Studio metadata discovery through `/v1/models` and `/api/v1/models`.
 - Bounded workspace traversal/search/directory inspection with continuation cursors, guarded file reads, diff-based edits, and shell execution.
 - File writes and patches use one stable-handle, no-clobber conditional commit for create, update, delete, and rollback. A concurrent external replacement wins without being overwritten; if restoration cannot reclaim the target name, moyAI reports the preserved backup path. Parent directories are not created implicitly, so create the parent first.
-- Permission presets: `default` and `full_access`. `default` automatically allows configured-boundary reads and sends all other actions to explicit human confirmation. `full_access` automatically allows file operations verified against the configured boundary through stable filesystem handles, but shell commands always require human confirmation because there is no OS sandbox and command-text inspection cannot prove their effect boundary. Detected outside-boundary file operations also require confirmation. There is no second AI reviewer/model loop. Desktop and TUI remember the selected root-session owner. Choosing **do not run; change instructions**, an external Stop, and an operational failure remain separate typed outcomes. Commands run with the current user account.
+- Permission presets: `default` and `full_access`. `default` automatically allows configured-boundary reads and sends all other actions to explicit human confirmation. `full_access` automatically allows file operations verified against the configured boundary through stable filesystem handles, but shell commands, network/service calls, and other external operations always require human confirmation because there is no OS sandbox and those effect boundaries cannot be proven locally. Detected outside-boundary file operations also require confirmation. There is no second AI reviewer/model loop. Desktop and TUI remember the selected root-session owner. Choosing **do not run; change instructions**, an external Stop, and an operational failure remain separate typed outcomes. Commands run with the current user account.
 - Vision-capable model support for image attachments.
 - Optional Docling Serve and HTTP MCP integration for document-heavy workflows.
 - Local instructions from `AGENTS.md`, `CLAUDE.md`, `.moyai/rules*`, `.moyai/commands/*.md`, and local `SKILL.md` files.
@@ -130,6 +130,10 @@ Windows release package:
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.7.0 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
+
+Run packaging from the clean source commit for that release. If `v<version>` already exists, the
+script permits a publishable rebuild only from the commit identified by that tag; use a newly
+synchronized version for later source.
 
 By default, release artifacts are written outside the repository under `project_sandbox/releases/`.
 

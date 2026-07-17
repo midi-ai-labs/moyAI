@@ -261,7 +261,19 @@ pub fn access_mode_allows_permission(
 }
 
 fn full_access_allows(request: &crate::tool::PermissionRequest) -> bool {
-    !request.outside_workspace && request.access != AccessKind::Shell
+    if request.outside_workspace || request.access == AccessKind::Shell {
+        return false;
+    }
+    !request.risks.iter().any(|risk| {
+        matches!(
+            risk,
+            crate::tool::PermissionRisk::Network
+                | crate::tool::PermissionRisk::ExternalConnection
+                | crate::tool::PermissionRisk::ConfiguredLocalService
+                | crate::tool::PermissionRisk::ExternalMutation
+                | crate::tool::PermissionRisk::ExternalDestructiveOperation
+        )
+    })
 }
 
 fn default_allows(request: &crate::tool::PermissionRequest) -> bool {
@@ -346,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn full_access_allows_detected_risks_inside_the_configured_boundary() {
+    fn full_access_still_requires_shell_confirmation_with_detected_risks() {
         let request = permission(
             AccessKind::Shell,
             vec![crate::tool::PermissionRisk::ExternalConnection],
@@ -404,14 +416,43 @@ mod tests {
     }
 
     #[test]
-    fn configured_local_service_requires_default_confirmation() {
+    fn configured_local_service_requires_confirmation_in_both_modes() {
         let request = permission(
             AccessKind::Read,
             vec![crate::tool::PermissionRisk::ConfiguredLocalService],
         );
         let decisions = [AccessMode::Default, AccessMode::FullAccess]
             .map(|mode| access_mode_allows_permission(mode, &request));
-        assert_eq!(decisions, [false, true]);
+        assert_eq!(decisions, [false, false]);
+    }
+
+    #[test]
+    fn full_access_keeps_external_effects_for_explicit_confirmation() {
+        for (access, risk) in [
+            (AccessKind::Read, crate::tool::PermissionRisk::Network),
+            (
+                AccessKind::Read,
+                crate::tool::PermissionRisk::ExternalConnection,
+            ),
+            (
+                AccessKind::Read,
+                crate::tool::PermissionRisk::ConfiguredLocalService,
+            ),
+            (
+                AccessKind::Edit,
+                crate::tool::PermissionRisk::ExternalMutation,
+            ),
+            (
+                AccessKind::Edit,
+                crate::tool::PermissionRisk::ExternalDestructiveOperation,
+            ),
+        ] {
+            let request = permission(access, vec![risk]);
+            assert!(!access_mode_allows_permission(
+                AccessMode::FullAccess,
+                &request
+            ));
+        }
     }
 
     #[test]

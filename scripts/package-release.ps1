@@ -1,5 +1,7 @@
 param(
-  [string]$Version = "0.7.0",
+  [Parameter(Mandatory = $true)]
+  [ValidateNotNullOrEmpty()]
+  [string]$Version,
   [string]$Target = "windows-x86_64",
   [string]$OutputRoot = "",
   [string]$ManualGuiStResultsPath = "",
@@ -140,6 +142,31 @@ try {
     throw "package.json version is $($packageJson.version), expected $Version"
   }
 
+  $versionTagRef = "refs/tags/v$Version"
+  $versionTagCommit = $null
+  git show-ref --verify --quiet $versionTagRef
+  $versionTagStatus = $LASTEXITCODE
+  if ($versionTagStatus -eq 0) {
+    $versionTagCommit = (git rev-list -n 1 $versionTagRef).Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($versionTagCommit)) {
+      throw "failed to resolve existing version tag $versionTagRef"
+    }
+    if ($versionTagCommit -ne $commit) {
+      $message = "version $Version is already tagged at $versionTagCommit and cannot identify source commit $commit"
+      if ($SkipManualGuiStGate) {
+        Write-Warning "$message. The diagnostic package must not be published."
+      } else {
+        throw "$message. Choose and synchronize a new release version, or rebuild from the tagged commit."
+      }
+    }
+  } elseif ($versionTagStatus -ne 1) {
+    throw "failed to inspect existing version tag $versionTagRef"
+  }
+
+  if ($SkipBuild -and -not $SkipManualGuiStGate) {
+    throw "-SkipBuild is permitted only with -SkipManualGuiStGate for an unpublished diagnostic package. Published packages must rebuild every binary from the recorded source commit."
+  }
+
   $manualGuiStResultsResolved = $null
   $manualGuiStResultsSha256 = $null
   if ($SkipManualGuiStGate) {
@@ -244,6 +271,7 @@ try {
   Copy-RequiredFile (Join-Path $repoRoot "README.md") (Join-Path $releaseRoot "README.md")
   Copy-RequiredFile (Join-Path $repoRoot "README.ja.md") (Join-Path $releaseRoot "README.ja.md")
   Copy-RequiredFile (Join-Path $repoRoot "LICENSE") (Join-Path $releaseRoot "LICENSE")
+  Copy-RequiredFile (Join-Path $repoRoot "config.example.toml") (Join-Path $releaseRoot "config.example.toml")
   Copy-RequiredFile (Join-Path $repoRoot "docs\user\getting-started.md") (Join-Path $releaseRoot "docs\user\getting-started.md")
   if ($manualGuiStResultsResolved) {
     Copy-RequiredFile $manualGuiStResultsResolved (Join-Path $releaseRoot "docs\release\manual-gui-st-results.md")
@@ -252,32 +280,6 @@ try {
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $desktopDistDestination) | Out-Null
   Copy-Item -LiteralPath $desktopDist -Destination $desktopDistDestination -Recurse -Force
   Copy-Item -LiteralPath (Join-Path $repoRoot "logo") -Destination (Join-Path $releaseRoot "logo") -Recurse -Force
-
-  $configExample = @"
-[model]
-base_url = "http://127.0.0.1:1234"
-model = "qwen/qwen3.6-35b-a3b"
-connect_timeout_ms = 5000
-request_timeout_ms = 30000
-stream_idle_timeout_ms = 300000
-
-[permissions]
-access_mode = "auto_review"
-
-[multi_agent]
-enabled = false
-mode = "explicit_request_only"
-# This profile has one child level; only the root can spawn.
-# Root-inclusive number of simultaneously active agents. Completed agents remain available without consuming an active slot.
-max_concurrent_agents = 4
-max_concurrent_model_requests = 1
-
-[docling]
-enabled = false
-base_url = "http://127.0.0.1:8123"
-timeout_ms = 30000
-"@
-  Write-Utf8File (Join-Path $releaseRoot "config.example.toml") $configExample
 
   $notesTemplate = @'
 # moyAI v{0}
@@ -301,16 +303,15 @@ This release module contains the Windows CLI and Tauri Desktop binaries.
 - Local-first LM Studio / OpenAI-compatible endpoint configuration.
 - Optional root-scoped multi-agent collaboration with separate child sessions, bounded delegation, tree-wide Stop, and a read-only Sub Agent inspector.
 - Desktop state ownership rebuilt around Rust semantic capabilities and frontend-local drafts while preserving the existing visual design.
-- Standard, Auto Review, and Full Access now form a monotonic permission policy, with durable global/root-session selection across Desktop and TUI.
-- Runtime and storage race hardening for terminal cancellation, provider readiness/cache, config persistence, session fork, and inter-agent delivery.
+- Default and Full Access are the only runtime permission profiles. Full Access automatically allows only stable-handle-verified file operations inside the configured boundary; shell, network/service calls, and other external operations require explicit human confirmation.
+- Explicit provider catalog loading and availability diagnostics stay separate from cold start and generation, with bounded transport phases and deadlines for the configured external HTTP endpoint.
 - Workspace file editing, patching, search, directory inspection, shell execution, session history, and Markdown export.
-- Codex-compatible goal runtime with `/goal`, goal tools, request-local steering, status accounting, and bounded idle continuation.
-- Codex 2026-07 context handling updates: workspace world-state context, local instruction discovery, local `SKILL.md` snapshot reuse, and the `current_time` tool.
-- Non-destructive context-limit handling that preserves canonical history instead of generating lossy count-only summaries.
+- Codex-compatible goal runtime with `/goal`, goal tools, request-local steering, status accounting, and continuation governed by goal state, optional token/elapsed budgets, cancellation, and typed terminal outcomes.
+- Codex 2026-07 context handling updates: workspace world-state context, local instruction discovery, bounded per-workspace skill discovery snapshots, bounded `SKILL.md` rereads when a skill is loaded, and the `current_time` tool.
+- Automatic semantic compaction over response/call-output units with prepared-request token targets, giant-item map/reduce, durable replacement lineage, unchanged history on no-progress, and explicit hard-limit errors.
 - Desktop token meter showing approximate `used / max` context tokens, including session reopen restoration from recorded diagnostics.
 - Desktop UX hardening for quick chat, live access-mode changes, hidden shell windows, composer autosize, and window controls.
-- Vision attachment path verified through Desktop GUI with provider request diagnostics recording `image_count`.
-- v{0} contains the fixes and verification recorded in this package's manual GUI ST artifact.
+- The package includes a manual GUI ST artifact bound to this exact version and source commit.
 - Published release packages are gated by a visible Desktop GUI manual ST results artifact.
 
 ## Quick Start
@@ -351,6 +352,12 @@ To reset moyAI to its first-run state, close all moyAI windows and run `bin/moya
     target = $Target
     git_commit = $commit
     source_clean = $sourceClean
+    build_skipped = [bool]$SkipBuild
+    version_tag = [ordered]@{
+      ref = $versionTagRef
+      commit = $versionTagCommit
+      matches_source = $null -ne $versionTagCommit -and $versionTagCommit -eq $commit
+    }
     cli_version_output = $cliVersionOutput
     desktop_build_identity = [ordered]@{
       path = "ui/desktop-web/dist/build-identity.json"

@@ -132,7 +132,7 @@ TUI では実行中も `Ctrl+Enter` で現在 turn へ追加指示を送り、`C
 `access_mode` は shell / file operation の確認動作を切り替える。
 
 - `default`: 設定済み境界内のlist/search/readだけを自動承認する。編集、shell、設定済み境界外、network、delete/moveなどは確認する。
-- `full_access`: stable filesystem handleで設定済み境界内と確認できるfile操作を自動承認する。設定済み境界外のfile操作は引き続き確認する。shellはOS sandboxを持たず、command文字列から最終的な作用範囲を保証できないため、`full_access`でも常に確認する。信頼できるworkspaceでのみ使う。
+- `full_access`: stable filesystem handleで設定済み境界内と確認できるfile操作だけを自動承認する。設定済み境界外のfile操作、shell、network/service call、その他のexternal operationは作用境界をlocalに証明できないため、`full_access`でも常に確認する。信頼できるworkspaceでのみ使う。
 
 permissionはdeterministic policyと明示的なhuman decisionだけが所有し、同じtask modelを別のAI reviewerとして再呼出ししない。shellとその子processは現在のユーザー権限で動き、変数、式、script内部で動的に組み立てたpathやnetwork accessをmoyAIが実行前に完全解決することはできない。Access ModeはいずれもOS filesystem sandboxではない。
 

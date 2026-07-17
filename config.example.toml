@@ -1,0 +1,34 @@
+[model]
+base_url = "http://127.0.0.1:1234"
+model = "qwen/qwen3.6-35b-a3b"
+provider_metadata_mode = "lm_studio_native_required"
+provider_api_mode = "responses"
+reasoning_summary = "none"
+connect_timeout_ms = 10000
+request_timeout_ms = 300000
+stream_idle_timeout_ms = 300000
+max_retries = 2
+context_window = 131072
+max_output_tokens = 8192
+supports_tools = true
+supports_images = true
+
+[model.extra_body_json]
+num_ctx = 131072
+
+[permissions]
+access_mode = "default"
+
+[multi_agent]
+enabled = false
+mode = "explicit_request_only"
+max_concurrent_agents = 4
+max_concurrent_model_requests = 1
+
+[docling]
+enabled = false
+base_url = "http://127.0.0.1:8123"
+timeout_ms = 120000
+
+[mcp]
+enabled = false

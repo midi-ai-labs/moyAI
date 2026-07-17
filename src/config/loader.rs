@@ -758,6 +758,29 @@ mod tests {
     }
 
     #[test]
+    fn packaged_config_example_uses_canonical_current_defaults() {
+        let text = include_str!("../../config.example.toml");
+        let document = toml::from_str::<toml::Value>(text).expect("config example TOML");
+
+        assert_eq!(
+            document["permissions"]["access_mode"].as_str(),
+            Some("default")
+        );
+        assert_eq!(
+            document["model"]["provider_api_mode"].as_str(),
+            Some("responses")
+        );
+
+        let patch = toml::from_str::<PartialResolvedConfig>(text)
+            .expect("config example follows the strict current schema");
+        let resolved = apply_patch(ResolvedConfig::default(), patch);
+        assert_eq!(
+            serde_json::to_value(resolved).expect("resolved example"),
+            serde_json::to_value(ResolvedConfig::default()).expect("current defaults")
+        );
+    }
+
+    #[test]
     fn default_global_config_does_not_overwrite_existing_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 path");
