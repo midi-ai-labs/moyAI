@@ -655,6 +655,12 @@ struct WorkspaceLoadResult {
     snapshot: super::models::DesktopSnapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceRootMode {
+    Discover,
+    Fixed,
+}
+
 struct DesktopRollbackLoaded {
     snapshot: super::models::DesktopSnapshot,
     loaded: LoadedSession,
@@ -5667,7 +5673,7 @@ impl DesktopController {
         self.state
             .set_status_message("opening workspace-free quick chat...");
         let request_id = self.state.begin_workspace_load(root.clone(), None);
-        self.spawn_workspace_load(root, request_id);
+        self.spawn_fixed_workspace_load(root, request_id);
         true
     }
 
@@ -5743,7 +5749,12 @@ impl DesktopController {
         let request_id = self
             .state
             .begin_workspace_load(root.clone(), Some(session_id));
-        self.spawn_workspace_load_for_selection(root, Some(session_id), request_id);
+        self.spawn_workspace_load_for_selection(
+            root,
+            Some(session_id),
+            request_id,
+            WorkspaceRootMode::Fixed,
+        );
         true
     }
 
@@ -6503,7 +6514,21 @@ impl DesktopController {
     }
 
     fn spawn_workspace_load(&self, requested: Utf8PathBuf, request_id: NavigationRequestId) {
-        self.spawn_workspace_load_for_selection(requested, None, request_id);
+        self.spawn_workspace_load_for_selection(
+            requested,
+            None,
+            request_id,
+            WorkspaceRootMode::Discover,
+        );
+    }
+
+    fn spawn_fixed_workspace_load(&self, requested: Utf8PathBuf, request_id: NavigationRequestId) {
+        self.spawn_workspace_load_for_selection(
+            requested,
+            None,
+            request_id,
+            WorkspaceRootMode::Fixed,
+        );
     }
 
     fn spawn_workspace_load_for_new_project_session(
@@ -6537,6 +6562,7 @@ impl DesktopController {
         requested: Utf8PathBuf,
         selected_session_id: Option<SessionId>,
         request_id: NavigationRequestId,
+        root_mode: WorkspaceRootMode,
     ) {
         let store = self.app.session_service.store.clone();
         let runtime_tx = self.runtime_tx.clone();
@@ -6546,9 +6572,16 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop workspace runtime");
             let result = runtime.block_on(async move {
-                let app = AppBootstrap::rebuild_for_directory(&requested, store)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                let app = match root_mode {
+                    WorkspaceRootMode::Discover => {
+                        AppBootstrap::rebuild_for_directory(&requested, store).await
+                    }
+                    WorkspaceRootMode::Fixed => {
+                        AppBootstrap::rebuild_for_directory_as_workspace_root(&requested, store)
+                            .await
+                    }
+                }
+                .map_err(|error| error.to_string())?;
                 let snapshot = load_snapshot_for_selection(&app, selected_session_id)
                     .await
                     .map_err(|error| error.to_string())?;
@@ -9153,6 +9186,38 @@ mod tests {
                 metrics: Default::default(),
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn fixed_workspace_load_does_not_rediscover_parent_git_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let outer = Utf8PathBuf::from_path_buf(temp.path().join("outer")).expect("utf8 outer");
+        let quick_chat_root = outer.join("data/quick-chat-workspace");
+        std::fs::create_dir_all(outer.join(".git")).expect("parent git marker");
+        std::fs::create_dir_all(&quick_chat_root).expect("quick chat root");
+
+        let data_dir =
+            Utf8PathBuf::from_path_buf(temp.path().join("storage")).expect("utf8 storage");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+
+        let app = crate::app::AppBootstrap::rebuild_for_directory_as_workspace_root_with_config(
+            &quick_chat_root,
+            store,
+            ResolvedConfig::default(),
+        )
+        .await
+        .expect("fixed workspace load");
+
+        assert_eq!(app.workspace.root, quick_chat_root);
+        assert_eq!(app.workspace.cwd, quick_chat_root);
+        assert_eq!(app.workspace.vcs, crate::workspace::VcsKind::None);
     }
 
     #[test]

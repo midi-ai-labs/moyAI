@@ -1276,11 +1276,12 @@ impl AgentLoop {
             None => None,
         };
 
-        let mut collector = ResponseCollector::default();
+        let mut collector = CompactionResponseCollector::new(ModelResponseId::new(), sink);
         let response = self
             .llm
             .stream_chat(compaction_request, request.cancel_token(), &mut collector)
             .await?;
+        let collector = collector.into_inner();
         validate_provider_response_terminal(
             response.finish_reason,
             !collector.tool_calls.is_empty(),
@@ -2353,6 +2354,45 @@ struct StreamingResponseCollector<'a> {
     sink: &'a mut dyn RunEventSink,
 }
 
+struct CompactionResponseCollector<'a> {
+    inner: ResponseCollector,
+    response_id: ModelResponseId,
+    sink: &'a mut dyn RunEventSink,
+}
+
+impl<'a> CompactionResponseCollector<'a> {
+    fn new(response_id: ModelResponseId, sink: &'a mut dyn RunEventSink) -> Self {
+        Self {
+            inner: ResponseCollector::default(),
+            response_id,
+            sink,
+        }
+    }
+
+    fn into_inner(self) -> ResponseCollector {
+        self.inner
+    }
+}
+
+impl LlmEventSink for CompactionResponseCollector<'_> {
+    fn push(&mut self, event: LlmEvent) -> Result<(), crate::error::LlmError> {
+        self.inner.push(event)
+    }
+
+    fn provider_phase(
+        &mut self,
+        event: crate::llm::ProviderPhaseEvent,
+    ) -> Result<(), crate::error::LlmError> {
+        self.sink
+            .emit_runtime_only(RunEvent::ProviderPhase {
+                response_id: self.response_id,
+                event: event.clone(),
+            })
+            .map_err(|error| crate::error::LlmError::Message(error.to_string()))?;
+        self.inner.provider_phase(event)
+    }
+}
+
 impl<'a> StreamingResponseCollector<'a> {
     fn new(response_id: ModelResponseId, sink: &'a mut dyn RunEventSink) -> Self {
         Self {
@@ -2959,6 +2999,47 @@ mod tests {
             .saturating_add(template.model.max_output_tokens)
             .saturating_add(overflow_margin_tokens.min(u32::MAX as usize) as u32)
             .saturating_add(input_capacity_tokens);
+    }
+
+    #[test]
+    fn compaction_collector_projects_provider_phase_without_exposing_summary_delta() {
+        let response_id = ModelResponseId::new();
+        let phase = crate::llm::ProviderPhaseEvent {
+            request_id: crate::llm::ProviderRequestId::new(),
+            endpoint: "http://provider.example:1234".to_string(),
+            phase: crate::llm::ProviderPhase::RequestInFlight,
+            attempt: 1,
+            elapsed_ms: 42,
+            terminal_status: None,
+            failure: None,
+        };
+        let mut sink = CapturingSink::default();
+        let mut collector = CompactionResponseCollector::new(response_id, &mut sink);
+
+        collector
+            .push(LlmEvent::TextDelta(
+                "private compaction summary".to_string(),
+            ))
+            .expect("collect compaction delta");
+        collector
+            .provider_phase(phase.clone())
+            .expect("project provider phase");
+        let collector = collector.into_inner();
+
+        assert_eq!(collector.text, "private compaction summary");
+        assert_eq!(collector.provider_phases, vec![phase.clone()]);
+        assert_eq!(sink.events.len(), 1);
+        assert!(matches!(
+            &sink.events[0],
+            RunEvent::ProviderPhase {
+                response_id: projected_response_id,
+                event,
+            } if *projected_response_id == response_id && event == &phase
+        ));
+        assert!(!sink.events.iter().any(|event| matches!(
+            event,
+            RunEvent::TextDelta { .. } | RunEvent::ReasoningSummaryDelta { .. }
+        )));
     }
 
     #[test]
