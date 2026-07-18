@@ -13,6 +13,7 @@ fn main() {
     println!("cargo:rerun-if-changed={APP_ICON}");
     println!("cargo:rerun-if-changed={WINDOW_ICON}");
     configure_windows_main_thread_stack();
+    configure_windows_reproducible_linking();
     embed_windows_application_manifest();
 
     #[cfg(feature = "tauri-desktop")]
@@ -81,6 +82,18 @@ fn configure_windows_main_thread_stack() {
         for bin in ["moyai", "moyai-desktop"] {
             println!("cargo:rustc-link-arg-bin={bin}=-Wl,--stack,{stack_bytes}");
         }
+    }
+}
+
+fn configure_windows_reproducible_linking() {
+    if env::var("CARGO_CFG_WINDOWS").is_err()
+        || env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc")
+    {
+        return;
+    }
+
+    for bin in ["moyai", "moyai-cleanup", "moyai-desktop"] {
+        println!("cargo:rustc-link-arg-bin={bin}=/Brepro");
     }
 }
 

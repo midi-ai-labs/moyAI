@@ -22,7 +22,7 @@ function Write-Utf8File([string]$Path, [string]$Content) {
   if ($dir) {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
   }
-  Set-Content -LiteralPath $Path -Value $Content -Encoding UTF8
+  [System.IO.File]::WriteAllText($Path, $Content, [System.Text.UTF8Encoding]::new($false))
 }
 
 function Copy-RequiredFile([string]$Source, [string]$Destination) {
@@ -64,6 +64,23 @@ function Test-ExactMarkerLine([string]$Content, [string]$ExpectedLine) {
     }
   }
   return $false
+}
+
+function Assert-ReleaseNotesIdentity([string]$Content, [string]$Version, [string]$Path) {
+  $lines = @($Content -split "`r?`n")
+  $expectedHeading = "# moyAI v$Version"
+  if ($lines.Count -eq 0 -or $lines[0] -cne $expectedHeading) {
+    throw "release notes source must start with the exact release heading '$expectedHeading': $Path"
+  }
+  $topLevelHeadingCount = 0
+  foreach ($line in $lines) {
+    if ($line.StartsWith("# ", [System.StringComparison]::Ordinal)) {
+      $topLevelHeadingCount++
+    }
+  }
+  if ($topLevelHeadingCount -ne 1) {
+    throw "release notes source must contain exactly one top-level heading: $Path"
+  }
 }
 
 function Get-RelativePathForRelease([string]$BasePath, [string]$FullPath) {
@@ -141,6 +158,13 @@ try {
   if ($packageJson.version -ne $Version) {
     throw "package.json version is $($packageJson.version), expected $Version"
   }
+
+  $releaseNotesSource = Join-Path $repoRoot "docs\release\v$Version.md"
+  if (-not (Test-Path -LiteralPath $releaseNotesSource -PathType Leaf)) {
+    throw "release notes source not found: $releaseNotesSource"
+  }
+  $notes = Get-Content -Raw -Encoding UTF8 -LiteralPath $releaseNotesSource
+  Assert-ReleaseNotesIdentity $notes $Version $releaseNotesSource
 
   $versionTagRef = "refs/tags/v$Version"
   $versionTagCommit = $null
@@ -281,94 +305,6 @@ try {
   Copy-Item -LiteralPath $desktopDist -Destination $desktopDistDestination -Recurse -Force
   Copy-Item -LiteralPath (Join-Path $repoRoot "logo") -Destination (Join-Path $releaseRoot "logo") -Recurse -Force
 
-  $notesTemplate = @'
-# moyAI v{0}
-
-## 日本語
-
-今回の中心は、計画と実行ループのCodex parityです。指示から外れにくく、同じ確認を繰り返しにくいように、turn設定、plan、履歴、tool結果の持ち主を整理しました。
-
-### 主な変更
-
-- `update_plan`を正規の進捗表示として追加し、計画を実行開始の条件にはしない構成にしました。
-- turn開始時にmodel、provider、timeout、permissionなどを固定し、実行中の設定変更でactive turnが揺れないようにしました。
-- LM Studio Responses APIに対応しました。turn内では`previous_response_id`を使って継続し、reasoning summaryはruntime-onlyで扱います。
-- provider requestとSSE streamへ上限、deadline、phase診断を追加しました。timeoutやstream開始後の失敗で、同じ生成requestを自動再送しません。
-- conversationの正本をcanonical historyへ一本化し、assistant本文とtool call、terminal、Stop、recovery、multi-agentの状態遷移をより厳密にしました。
-- permissionは`default`と`full_access`の2種類に整理しました。`full_access`でもshell、network/service callなどは人間の確認が必要です。
-- context compactionを固定件数ではなくresponse/call-output単位で行う方式へ変更し、大きなitemや縮約できない場合も安全に扱います。
-- file編集、patch、search、directory traversalをbounded化し、外部から同時に変更されたfileを上書きしない仕組みを強化しました。
-- DesktopのSettings、Quick Chat、Stop、非同期応答、focus/selectionの競合を見直し、画面操作の安定性を高めました。
-- visible Desktop manual STを通過した証跡をrelease packageへ同梱します。
-
-### 更新時の注意
-
-- 既存DBはV44までmigrationされます。初回起動前にmoyAIのdata directoryをbackupしておくことをおすすめします。
-- generation transportの既定はResponses APIです。Chat Completionsが必要なproviderでは`provider_api_mode = "chat_completions"`を明示してください。
-- configの未知keyと廃止keyはerrorになります。`stream_max_retries`、`[model_providers.*]`、`session.auto_compact_*`が残っている場合は削除または置き換えてください。
-- 旧`auto_review` permissionは`default`へ一方向に移行します。
-
-### クイックスタート
-
-1. OpenAI-compatibleなLLM endpointを起動します。
-2. `bin/moyai-desktop.exe`を実行します。
-3. `LLM URL`でURLとmodelを設定し、Quick ChatまたはProject workspaceから始めます。
-
-target PCにnpm、Rust toolchain、internet接続、local dev serverは不要です。
-
-### 既知の制限
-
-- 長いmulti-file taskの結果や速度は、使用するlocal LLMとstreamの安定性に左右されます。
-- LM Studioがtoken usageを返さない場合、metricsの`token_usage`は`null`になります。
-- malformedな`apply_patch`は通常のtool errorとしてmodelへ返し、自動修復は行いません。
-
-## English
-
-This release focuses on Codex planning parity. Turn configuration, plans, canonical history, and tool-result ownership have been clarified to make task execution more predictable and reduce unnecessary loops.
-
-### Highlights
-
-- Added canonical `update_plan` progress projection without making plans an execution gate.
-- Model, provider, deadlines, permissions, and other effective settings are captured once at turn admission.
-- Added LM Studio Responses API support with turn-scoped `previous_response_id` continuity and runtime-only reasoning summaries.
-- Added bounded provider requests and SSE streams, operation deadlines, and transport-phase diagnostics. Generation requests are not automatically replayed after response-start timeout or streaming failure.
-- Consolidated conversation state into canonical history with typed terminals and stricter Stop, recovery, and multi-agent transitions.
-- Simplified runtime permissions to `default` and `full_access`. Shell, network/service calls, and other external operations still require human confirmation under Full Access.
-- Reworked semantic compaction around response and call-output units, including safe handling of oversized items and no-progress results.
-- Hardened bounded file editing, patching, search, and traversal while preventing concurrent external replacements from being overwritten.
-- Improved Desktop Settings, Quick Chat, Stop, asynchronous response, focus, and selection lifecycle stability.
-- The package includes evidence from the visible Desktop manual ST gate.
-
-### Upgrade notes
-
-- Existing databases migrate through V44. Back up the moyAI data directory before the first launch.
-- Responses is now the default generation transport. Set `provider_api_mode = "chat_completions"` explicitly when required by the provider.
-- Unknown and retired configuration keys are rejected. Remove or replace `stream_max_retries`, `[model_providers.*]`, and `session.auto_compact_*` entries.
-- The retired `auto_review` permission value is migrated one way to `default`.
-
-### Quick Start
-
-1. Start an OpenAI-compatible LLM endpoint.
-2. Run `bin/moyai-desktop.exe`.
-3. Configure the URL and model under `LLM URL`, then use Quick Chat or a Project workspace.
-
-The target machine does not need npm, a Rust toolchain, internet access, or a local development server.
-
-### Known limitations
-
-- Long multi-file task quality and speed remain dependent on the local model and stream stability.
-- When LM Studio omits token usage, metrics record `token_usage: null`.
-- Malformed `apply_patch` input is returned as a normal tool error without an automatic repair layer.
-
-## 配布ファイル / Assets
-
-- `moyAI-v{0}-windows-x86_64.zip`
-- `moyAI-v{0}-windows-x86_64.manifest.json`
-- `moyAI-v{0}-windows-x86_64.zip.sha256`
-
-**Full Changelog**: https://github.com/midi-ai-labs/moyAI/compare/v0.7.0...v{0}
-'@
-  $notes = $notesTemplate -f $Version
   Write-Utf8File (Join-Path $releaseRoot "RELEASE_NOTES.md") $notes
 
   $fileHashes = Get-ChildItem -LiteralPath $releaseRoot -Recurse -File |
