@@ -1,17 +1,15 @@
-use std::collections::BTreeMap;
-use std::fs;
-
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::BTreeMap;
 
 use crate::error::ToolError;
 use crate::tool::context::ToolContext;
 use crate::tool::registry::Tool;
 use crate::tool::truncate::clip_text_with_ellipsis;
 use crate::tool::{ToolName, ToolResult, ToolSpec};
-use crate::workspace::traversal::{TraversalOptions, walk_page};
+use crate::workspace::traversal::{TraversalOptions, walk_guarded_page};
 use crate::workspace::{AccessKind, PathGuard};
 
 #[derive(Debug, Deserialize)]
@@ -70,21 +68,6 @@ impl Tool for InspectDirectoryTool {
         .await?
         .admit()?;
 
-        PathGuard::revalidate(&guarded)?;
-
-        if !guarded.absolute.exists() {
-            return Err(ToolError::Message(format!(
-                "path `{}` does not exist",
-                guarded.absolute
-            )));
-        }
-        if !guarded.absolute.is_dir() {
-            return Err(ToolError::Message(format!(
-                "path `{}` is not a directory",
-                guarded.absolute
-            )));
-        }
-
         let limit = input
             .limit
             .unwrap_or(ctx.config.tool_output.max_results.max(1))
@@ -98,8 +81,8 @@ impl Tool for InspectDirectoryTool {
             .include_hidden
             .unwrap_or(ctx.config.inspection.include_hidden_by_default);
         let visit_limit = limit.saturating_mul(8).max(128).min(4_096);
-        let page = walk_page(
-            &guarded.absolute,
+        let page = walk_guarded_page(
+            &guarded,
             ctx.workspace,
             input.cursor.as_deref(),
             TraversalOptions {
@@ -127,7 +110,12 @@ impl Tool for InspectDirectoryTool {
             let (mut line, size_bytes) = if entry.is_directory {
                 (format!("{relative}/"), None)
             } else {
-                let size_bytes = fs::metadata(entry.path.as_std_path())?.len();
+                let size_bytes = entry.size_bytes.ok_or_else(|| {
+                    ToolError::Message(format!(
+                        "traversal file `{}` is missing its validated metadata snapshot",
+                        entry.path
+                    ))
+                })?;
                 (
                     format!("{relative} ({})", human_size(size_bytes)),
                     Some(size_bytes),

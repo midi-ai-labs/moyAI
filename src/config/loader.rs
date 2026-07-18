@@ -63,6 +63,7 @@ impl ConfigLoader {
         global_config_path: Utf8PathBuf,
         cli: Option<&RunArgs>,
     ) -> Result<ResolvedConfig, ConfigError> {
+        let config_source = global_config_path.clone();
         let mut resolved = ResolvedConfig::default();
 
         if let Some(global) = read_optional(global_config_path)? {
@@ -83,9 +84,23 @@ impl ConfigLoader {
             resolved = apply_patch(resolved, patch);
         }
 
+        resolved
+            .normalize_and_validate_provider_runtime()
+            .map_err(|error| {
+                ConfigError::Message(format!(
+                    "invalid config loaded from `{config_source}`: {error}"
+                ))
+            })?;
         let endpoint = ProviderEndpoint::parse(&resolved.model.base_url)
             .map_err(|error| ConfigError::Message(error.to_string()))?;
         resolved.model.base_url = endpoint.as_str().to_string();
+        resolved
+            .validate_workspace_boundary_roots()
+            .map_err(|error| {
+                ConfigError::Message(format!(
+                    "invalid config loaded from `{config_source}`: {error}"
+                ))
+            })?;
         Ok(resolved)
     }
 
@@ -321,10 +336,7 @@ fn validate_env_overrides() -> Result<(), ConfigError> {
         "MOYAI_FREQUENCY_PENALTY",
     ] {
         if let Some(value) = env_utf8(name)? {
-            let parsed = value.parse::<f64>().map_err(|_| invalid_env(name))?;
-            if !parsed.is_finite() {
-                return Err(invalid_env(name));
-            }
+            validate_provider_float_env_value(name, &value)?;
         }
     }
 
@@ -390,6 +402,12 @@ where
         value.parse::<T>().map_err(|_| invalid_env(name))?;
     }
     Ok(())
+}
+
+fn validate_provider_float_env_value(name: &str, value: &str) -> Result<(), ConfigError> {
+    let parsed = value.parse::<f64>().map_err(|_| invalid_env(name))?;
+    crate::config::model::validate_optional_provider_float(name, Some(parsed))
+        .map_err(|_| invalid_env(name))
 }
 
 fn validate_with(name: &str, validate: impl FnOnce(&str) -> bool) -> Result<(), ConfigError> {
@@ -853,6 +871,98 @@ mod tests {
 
         assert!(error.to_string().contains("stream_max_retries"));
         assert!(error.to_string().contains(&expected_path));
+    }
+
+    #[test]
+    fn relative_workspace_boundary_roots_are_rejected_with_the_exact_field() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for (section, field) in [
+            ("permissions", "additional_read_roots"),
+            ("permissions", "additional_write_roots"),
+            ("workspace", "protected_paths"),
+        ] {
+            let path =
+                Utf8PathBuf::from_path_buf(temp.path().join(format!("{section}-{field}.toml")))
+                    .expect("utf8 path");
+            fs::write(
+                &path,
+                format!("[{section}]\n{field} = [\"relative/safety-root\"]\n"),
+            )
+            .expect("relative root config");
+
+            let error = ConfigLoader::load_with_global_path(path.clone(), None)
+                .expect_err("relative boundary roots must fail closed");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains(&format!("{section}.{field}")));
+            assert!(diagnostic.contains("absolute path"));
+            assert!(diagnostic.contains(path.as_str()));
+        }
+    }
+
+    #[test]
+    fn provider_runtime_fields_are_canonicalized_and_bounded_at_load() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let canonical_path =
+            Utf8PathBuf::from_path_buf(temp.path().join("canonical-model.toml")).expect("utf8");
+        fs::write(
+            &canonical_path,
+            "[model]\nmodel = \"  canonical-model  \"\n",
+        )
+        .expect("canonical model config");
+        let canonical = ConfigLoader::load_with_global_path(canonical_path, None)
+            .expect("canonical provider runtime config");
+        assert_eq!(canonical.model.model, "canonical-model");
+
+        for (name, body, field) in [
+            ("blank-model", "[model]\nmodel = \" \\t \"\n", "model.model"),
+            (
+                "zero-response-start-timeout",
+                "[model]\nrequest_timeout_ms = 0\n",
+                "model.request_timeout_ms",
+            ),
+            (
+                "nan-temperature",
+                "[model]\ntemperature = nan\n",
+                "model.temperature",
+            ),
+            ("infinite-top-p", "[model]\ntop_p = inf\n", "model.top_p"),
+            (
+                "negative-infinite-presence-penalty",
+                "[model]\npresence_penalty = -inf\n",
+                "model.presence_penalty",
+            ),
+            (
+                "nan-frequency-penalty",
+                "[model]\nfrequency_penalty = nan\n",
+                "model.frequency_penalty",
+            ),
+        ] {
+            let path = Utf8PathBuf::from_path_buf(temp.path().join(format!("{name}.toml")))
+                .expect("utf8 path");
+            fs::write(&path, body).expect("invalid provider config");
+            let error = ConfigLoader::load_with_global_path(path.clone(), None)
+                .expect_err("invalid provider runtime config must fail closed");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains(field));
+            assert!(diagnostic.contains(path.as_str()));
+        }
+    }
+
+    #[test]
+    fn provider_float_environment_values_share_the_finite_runtime_contract() {
+        for name in [
+            "MOYAI_TEMPERATURE",
+            "MOYAI_TOP_P",
+            "MOYAI_PRESENCE_PENALTY",
+            "MOYAI_FREQUENCY_PENALTY",
+        ] {
+            assert!(validate_provider_float_env_value(name, "0.5").is_ok());
+            for non_finite in ["NaN", "inf", "-inf"] {
+                let error = validate_provider_float_env_value(name, non_finite)
+                    .expect_err("non-finite environment value must fail closed");
+                assert!(error.to_string().contains(name));
+            }
+        }
     }
 
     #[test]

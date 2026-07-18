@@ -450,6 +450,67 @@ pub struct ResolvedConfig {
     pub logging: LoggingConfig,
 }
 
+impl ResolvedConfig {
+    pub(crate) fn normalize_and_validate_provider_runtime(&mut self) -> Result<(), String> {
+        let model = self.model.model.trim();
+        if model.is_empty() {
+            return Err("config field `model.model` must not be empty".to_string());
+        }
+        self.model.model = model.to_string();
+
+        if self.model.request_timeout_ms == 0 {
+            return Err(
+                "config field `model.request_timeout_ms` must be greater than zero".to_string(),
+            );
+        }
+        for (field, value) in [
+            ("model.temperature", self.model.temperature),
+            ("model.top_p", self.model.top_p),
+            ("model.presence_penalty", self.model.presence_penalty),
+            ("model.frequency_penalty", self.model.frequency_penalty),
+        ] {
+            validate_optional_provider_float(field, value)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_workspace_boundary_roots(&self) -> Result<(), String> {
+        for (field, paths) in [
+            (
+                "permissions.additional_read_roots",
+                self.permissions.additional_read_roots.as_slice(),
+            ),
+            (
+                "permissions.additional_write_roots",
+                self.permissions.additional_write_roots.as_slice(),
+            ),
+            (
+                "workspace.protected_paths",
+                self.workspace.protected_paths.as_slice(),
+            ),
+        ] {
+            for (index, path) in paths.iter().enumerate() {
+                if !path.is_absolute() {
+                    return Err(format!(
+                        "config field `{field}[{index}]` must be an absolute path; relative path `{path}` has no defined safety boundary"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_optional_provider_float(
+    field: &str,
+    value: Option<f64>,
+) -> Result<(), String> {
+    if value.is_some_and(|value| !value.is_finite()) {
+        return Err(format!("config field `{field}` must be finite"));
+    }
+    Ok(())
+}
+
 impl Default for ResolvedConfig {
     fn default() -> Self {
         let default_shell_family = if cfg!(windows) {

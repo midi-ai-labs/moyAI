@@ -28,13 +28,14 @@ use crate::llm::{
     tool_surface_scoped_parallel_tool_calls_projection,
 };
 use crate::session::{FinishReason, TokenUsage};
-use crate::tool::truncate::clip_text_with_ellipsis;
-
 const RETRY_INITIAL_DELAY_MS: u64 = 2_000;
 const RETRY_BACKOFF_FACTOR: u64 = 2;
 const RETRY_MAX_DELAY_MS: u64 = 30_000;
 const PROVIDER_FAILURE_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES: usize = 243;
+const PROVIDER_STREAM_SUMMARY_SCAN_LIMIT_BYTES: usize = PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES * 4;
+const PROVIDER_STREAM_ERROR_MESSAGE_LIMIT_BYTES: usize = 160;
+const PROVIDER_STREAM_ERROR_FIELD_LIMIT_BYTES: usize = 48;
 
 #[derive(Clone)]
 pub struct OpenAiCompatClient {
@@ -106,10 +107,9 @@ impl OpenAiCompatClient {
             bounded_response_bytes(response, stream_limits.max_raw_bytes).eventsource();
         let mut stream_budget = ProviderStreamBudget::new(stream_limits);
         let mut usage = None;
-        let mut finish_reason = None;
         let mut saw_terminal_signal = false;
         let mut ended_by_eof = false;
-        let mut tool_calls: HashMap<usize, PartialToolCall> = HashMap::new();
+        let mut accumulator = ChatStreamAccumulator::default();
 
         loop {
             let idle_timeout_ms = request.provider_target().deadlines().stream_idle_timeout_ms;
@@ -176,56 +176,22 @@ impl OpenAiCompatClient {
                     summarize_stream_error(error)
                 )));
             }
-            if let Some(value) = chunk.usage.as_ref() {
-                usage = Some(to_usage(value));
+            let chunk_usage = chunk.usage.as_ref().map(to_usage).transpose()?;
+            if let (Some(existing), Some(candidate)) = (usage.as_ref(), chunk_usage.as_ref())
+                && !same_token_usage(existing, candidate)
+            {
+                return Err(LlmError::Message(
+                    "openai-compatible stream returned conflicting usage payloads across chunks"
+                        .to_string(),
+                ));
             }
-            if chunk.choices.is_empty() {
-                continue;
+            let update = accumulator.apply_chunk(chunk, &mut stream_budget)?;
+            if usage.is_none() {
+                usage = chunk_usage;
             }
-
-            for choice in chunk.choices {
-                if let Some(value) = choice.delta.content {
-                    sink.push(LlmEvent::TextDelta(value))?;
-                }
-                if let Some(deltas) = choice.delta.tool_calls {
-                    for delta in deltas {
-                        let delta_index = delta.index;
-                        stream_budget.record_tool_call(format!("chat:{delta_index}"))?;
-                        let entry = tool_calls.entry(delta_index).or_default();
-                        if let Some(id) = delta.id {
-                            entry.record_call_id(id, delta_index)?;
-                        }
-                        if let Some(function) = delta.function {
-                            if let Some(name) = function.name {
-                                entry.record_tool_name(name, delta_index)?;
-                            }
-                            if let Some(arguments) = function.arguments {
-                                entry.saw_arguments_field = true;
-                                stream_budget.record_tool_arguments(
-                                    &format!("chat:{delta_index}"),
-                                    arguments.len() as u64,
-                                )?;
-                                entry.arguments.push_str(&arguments);
-                            }
-                        }
-                        if !entry.started {
-                            if let Some((call_id, tool_name)) = entry.identity() {
-                                sink.push(LlmEvent::ToolCallStart { call_id, tool_name })?;
-                                entry.started = true;
-                            }
-                        }
-                        if entry.started && entry.emitted_len < entry.arguments.len() {
-                            sink.push(LlmEvent::ToolCallArgsDelta {
-                                call_id: entry.call_id.clone().unwrap_or_default(),
-                                delta: entry.arguments_delta(),
-                            })?;
-                        }
-                    }
-                }
-                if let Some(value) = choice.finish_reason {
-                    saw_terminal_signal = true;
-                    finish_reason = Some(parse_finish_reason(&value)?);
-                }
+            saw_terminal_signal |= update.saw_terminal_signal;
+            for event in update.events {
+                sink.push(event)?;
             }
         }
 
@@ -233,8 +199,9 @@ impl OpenAiCompatClient {
             return Err(stream_missing_terminal_signal_error());
         }
 
-        let has_complete_tool_calls = validate_streamed_tool_calls(&tool_calls)?;
-        let finish_reason = resolve_finish_reason(finish_reason, has_complete_tool_calls)?;
+        let has_complete_tool_calls = validate_streamed_tool_calls(&accumulator.tool_calls)?;
+        let finish_reason =
+            resolve_finish_reason(accumulator.finish_reason, has_complete_tool_calls)?;
 
         sink.push(LlmEvent::Finished {
             finish_reason,
@@ -249,6 +216,18 @@ impl OpenAiCompatClient {
 }
 
 impl OpenAiCompatClient {
+    fn request_headers(&self, request: &ChatRequest) -> Result<HeaderMap, LlmError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if let Some(api_key) = &self.api_key {
+            let value = HeaderValue::from_str(&format!("Bearer {api_key}"))
+                .map_err(|error| LlmError::Message(format!("invalid API key header: {error}")))?;
+            headers.insert(AUTHORIZATION, value);
+        }
+        apply_extra_headers(&mut headers, request.extra_headers())?;
+        Ok(headers)
+    }
+
     async fn stream_responses(
         &self,
         request: ChatRequest,
@@ -384,6 +363,9 @@ impl OpenAiCompatClient {
         cancel: &CancellationToken,
         trace: &mut ProviderTraceSink<'_>,
     ) -> Result<Option<reqwest::Response>, LlmError> {
+        // Header parsing is a local request preflight. Complete it before an
+        // attempt exists so invalid configuration cannot project provider lifecycle.
+        let headers = self.request_headers(request)?;
         let deadlines = request.provider_target().deadlines();
         let deadline = OperationDeadline::new(deadlines.response_start_timeout_ms);
         let client_builder = reqwest::Client::builder();
@@ -401,20 +383,9 @@ impl OpenAiCompatClient {
         let mut attempt = 1u16;
         loop {
             trace.begin_attempt(attempt)?;
-            let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-            if let Some(api_key) = &self.api_key {
-                let value =
-                    HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|error| {
-                        LlmError::Message(format!("invalid API key header: {error}"))
-                    })?;
-                headers.insert(AUTHORIZATION, value);
-            }
-            apply_extra_headers(&mut headers, request.extra_headers())?;
-
             let request_builder = client
                 .post(endpoint_url.clone())
-                .headers(headers)
+                .headers(headers.clone())
                 .body(body.clone());
 
             trace.phase(ProviderPhase::RequestInFlight)?;
@@ -439,13 +410,19 @@ impl OpenAiCompatClient {
             };
 
             match result {
-                Ok(response) if response.status().is_success() => {
-                    trace.phase(ProviderPhase::HeadersReceived)?;
-                    return Ok(Some(response));
-                }
                 Ok(response) => {
-                    let Some(failure) =
-                        parse_response_failure_until_cancelled(response, cancel, &deadline).await?
+                    trace.phase(ProviderPhase::HeadersReceived)?;
+                    if response.status().is_success() {
+                        return Ok(Some(response));
+                    }
+                    let stream_limits = request.provider_target().stream_limits();
+                    let Some(failure) = parse_response_failure_until_cancelled(
+                        response,
+                        cancel,
+                        deadlines.stream_idle_timeout_ms,
+                        stream_limits.max_duration_ms,
+                    )
+                    .await
                     else {
                         return Ok(None);
                     };
@@ -486,6 +463,12 @@ struct ProviderTraceSink<'a> {
     current_phase: ProviderPhase,
     first_progress_seen: bool,
     last_progress_elapsed_ms: Option<u64>,
+    failure_origin: Option<ProviderTraceFailureOrigin>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderTraceFailureOrigin {
+    EventProjection,
 }
 
 impl<'a> ProviderTraceSink<'a> {
@@ -499,6 +482,7 @@ impl<'a> ProviderTraceSink<'a> {
             current_phase: ProviderPhase::AttemptStarted,
             first_progress_seen: false,
             last_progress_elapsed_ms: None,
+            failure_origin: None,
         }
     }
 
@@ -516,7 +500,7 @@ impl<'a> ProviderTraceSink<'a> {
 
     fn phase(&mut self, phase: ProviderPhase) -> Result<(), LlmError> {
         self.current_phase = phase;
-        self.inner.provider_phase(ProviderPhaseEvent {
+        self.project_provider_phase(ProviderPhaseEvent {
             request_id: self.request_id.clone(),
             endpoint: self.endpoint.clone(),
             phase,
@@ -525,6 +509,23 @@ impl<'a> ProviderTraceSink<'a> {
             terminal_status: None,
             failure: None,
         })
+    }
+
+    fn project_model_event(&mut self, event: LlmEvent) -> Result<(), LlmError> {
+        let result = self.inner.push(event);
+        self.record_projection_result(result)
+    }
+
+    fn project_provider_phase(&mut self, event: ProviderPhaseEvent) -> Result<(), LlmError> {
+        let result = self.inner.provider_phase(event);
+        self.record_projection_result(result)
+    }
+
+    fn record_projection_result(&mut self, result: Result<(), LlmError>) -> Result<(), LlmError> {
+        if result.is_err() {
+            self.failure_origin = Some(ProviderTraceFailureOrigin::EventProjection);
+        }
+        result
     }
 
     fn record_progress(&mut self) -> Result<(), LlmError> {
@@ -540,9 +541,43 @@ impl<'a> ProviderTraceSink<'a> {
         &mut self,
         result: Result<LlmResponseSummary, LlmError>,
     ) -> Result<LlmResponseSummary, LlmError> {
+        if self.attempt == 0 {
+            return result;
+        }
+        let result = match result {
+            Err(source)
+                if self.failure_origin == Some(ProviderTraceFailureOrigin::EventProjection) =>
+            {
+                return Err(self.normalize_failure(source));
+            }
+            other => other,
+        };
+        let (result, provider_failure) = match result {
+            Ok(summary) => (Ok(summary), None),
+            Err(source)
+                if matches!(
+                    &source,
+                    LlmError::ProviderRequestLimitExceeded { .. }
+                        | LlmError::ProviderRequestImage(_)
+                        | LlmError::ProviderFailure { .. }
+                ) =>
+            {
+                (Err(source), None)
+            }
+            Err(source) => {
+                let failure = self.failure_for(&source);
+                (
+                    Err(LlmError::ProviderFailure {
+                        failure: failure.clone(),
+                        source: Box::new(source),
+                    }),
+                    Some(failure),
+                )
+            }
+        };
         if let Some(elapsed_ms) = self.last_progress_elapsed_ms {
             self.current_phase = ProviderPhase::LastProgress;
-            self.inner.provider_phase(ProviderPhaseEvent {
+            if let Err(source) = self.project_provider_phase(ProviderPhaseEvent {
                 request_id: self.request_id.clone(),
                 endpoint: self.endpoint.clone(),
                 phase: ProviderPhase::LastProgress,
@@ -550,7 +585,9 @@ impl<'a> ProviderTraceSink<'a> {
                 elapsed_ms,
                 terminal_status: None,
                 failure: None,
-            })?;
+            }) {
+                return Err(self.normalize_projection_failure(source, result.err()));
+            }
         }
 
         match result {
@@ -561,7 +598,7 @@ impl<'a> ProviderTraceSink<'a> {
                     ProviderTerminalStatus::Completed
                 };
                 self.current_phase = ProviderPhase::ProviderTerminal;
-                self.inner.provider_phase(ProviderPhaseEvent {
+                if let Err(source) = self.project_provider_phase(ProviderPhaseEvent {
                     request_id: self.request_id.clone(),
                     endpoint: self.endpoint.clone(),
                     phase: ProviderPhase::ProviderTerminal,
@@ -569,63 +606,79 @@ impl<'a> ProviderTraceSink<'a> {
                     elapsed_ms: self.elapsed_ms(),
                     terminal_status: Some(terminal_status),
                     failure: None,
-                })?;
+                }) {
+                    return Err(self.normalize_failure(source));
+                }
                 Ok(summary)
             }
             Err(source) => {
-                if matches!(
-                    &source,
-                    LlmError::ProviderRequestLimitExceeded { .. }
-                        | LlmError::ProviderRequestImage(_)
-                ) {
+                let Some(failure) = provider_failure else {
                     return Err(source);
-                }
-                if matches!(source, LlmError::ProviderFailure { .. }) {
-                    return Err(source);
-                }
-                let failure = self.failure_for(&source);
-                self.inner.provider_phase(ProviderPhaseEvent {
+                };
+                self.current_phase = ProviderPhase::ProviderTerminal;
+                if let Err(projection_source) = self.project_provider_phase(ProviderPhaseEvent {
                     request_id: self.request_id.clone(),
                     endpoint: self.endpoint.clone(),
                     phase: ProviderPhase::ProviderTerminal,
                     attempt: self.attempt,
                     elapsed_ms: self.elapsed_ms(),
                     terminal_status: Some(ProviderTerminalStatus::Failed),
-                    failure: Some(failure.clone()),
-                })?;
-                Err(LlmError::ProviderFailure {
-                    failure,
-                    source: Box::new(source),
-                })
+                    failure: Some(failure),
+                }) {
+                    return Err(self.normalize_projection_failure(projection_source, Some(source)));
+                }
+                Err(source)
             }
         }
     }
 
+    fn normalize_failure(&self, source: LlmError) -> LlmError {
+        self.normalize_projection_failure(source, None)
+    }
+
+    fn normalize_projection_failure(
+        &self,
+        projection_source: LlmError,
+        pending_provider_error: Option<LlmError>,
+    ) -> LlmError {
+        let failure = self.failure_for(&projection_source);
+        LlmError::ProviderFailure {
+            failure,
+            source: Box::new(pending_provider_error.unwrap_or(projection_source)),
+        }
+    }
+
     fn failure_for(&self, source: &LlmError) -> ProviderFailure {
-        let (kind, status, code) = match source {
-            LlmError::Http(error) if error.is_connect() => {
-                (ProviderFailureKind::Connect, None, None)
+        let (kind, status, code) = if self.failure_origin
+            == Some(ProviderTraceFailureOrigin::EventProjection)
+        {
+            (ProviderFailureKind::EventProjection, None, None)
+        } else {
+            match source {
+                LlmError::Http(error) if error.is_connect() => {
+                    (ProviderFailureKind::Connect, None, None)
+                }
+                LlmError::ProviderResponseStartTimeout { .. } => {
+                    (ProviderFailureKind::ResponseStartTimeout, None, None)
+                }
+                LlmError::ProviderStreamIdleTimeout { .. } => {
+                    (ProviderFailureKind::StreamIdleTimeout, None, None)
+                }
+                LlmError::ProviderStreamLimitExceeded { .. } => {
+                    (ProviderFailureKind::Protocol, None, None)
+                }
+                LlmError::ProviderRejected { status, code, .. } => {
+                    (ProviderFailureKind::HttpStatus, *status, code.clone())
+                }
+                LlmError::Json(_) => (ProviderFailureKind::Decode, None, None),
+                LlmError::Message(_) if self.current_phase == ProviderPhase::FirstProgress => {
+                    (ProviderFailureKind::Protocol, None, None)
+                }
+                LlmError::Message(_) if self.current_phase == ProviderPhase::HeadersReceived => {
+                    (ProviderFailureKind::Protocol, None, None)
+                }
+                _ => (ProviderFailureKind::Other, None, None),
             }
-            LlmError::ProviderResponseStartTimeout { .. } => {
-                (ProviderFailureKind::ResponseStartTimeout, None, None)
-            }
-            LlmError::ProviderStreamIdleTimeout { .. } => {
-                (ProviderFailureKind::StreamIdleTimeout, None, None)
-            }
-            LlmError::ProviderStreamLimitExceeded { .. } => {
-                (ProviderFailureKind::Protocol, None, None)
-            }
-            LlmError::ProviderRejected { status, code, .. } => {
-                (ProviderFailureKind::HttpStatus, *status, code.clone())
-            }
-            LlmError::Json(_) => (ProviderFailureKind::Decode, None, None),
-            LlmError::Message(_) if self.current_phase == ProviderPhase::FirstProgress => {
-                (ProviderFailureKind::Protocol, None, None)
-            }
-            LlmError::Message(_) if self.current_phase == ProviderPhase::HeadersReceived => {
-                (ProviderFailureKind::Protocol, None, None)
-            }
-            _ => (ProviderFailureKind::Other, None, None),
         };
         ProviderFailure {
             request_id: self.request_id.clone(),
@@ -643,25 +696,24 @@ impl<'a> ProviderTraceSink<'a> {
 
 impl LlmEventSink for ProviderTraceSink<'_> {
     fn push(&mut self, event: LlmEvent) -> Result<(), LlmError> {
-        self.inner.push(event)
+        self.project_model_event(event)
     }
 
     fn provider_phase(&mut self, event: ProviderPhaseEvent) -> Result<(), LlmError> {
-        self.inner.provider_phase(event)
+        self.current_phase = event.phase;
+        self.project_provider_phase(event)
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct OperationDeadline {
     deadline: Option<Instant>,
-    response_start_timeout_ms: u64,
 }
 
 impl OperationDeadline {
     fn new(timeout_ms: u64) -> Self {
         Self {
             deadline: (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms)),
-            response_start_timeout_ms: timeout_ms,
         }
     }
 
@@ -679,10 +731,12 @@ struct ResponseFailure {
     message: String,
 }
 
-async fn parse_response_failure(response: reqwest::Response) -> Result<ResponseFailure, LlmError> {
-    let status = response.status();
-    let (body, body_was_truncated) = read_provider_failure_body_bounded(response).await?;
-    let body = String::from_utf8_lossy(&body);
+fn parse_response_failure_body(
+    status: StatusCode,
+    body: &[u8],
+    body_was_truncated: bool,
+) -> ResponseFailure {
+    let body = String::from_utf8_lossy(body);
     let parsed = serde_json::from_str::<Value>(&body).ok();
     let error = parsed.as_ref().and_then(|value| value.get("error"));
     let code = error
@@ -698,56 +752,97 @@ async fn parse_response_failure(response: reqwest::Response) -> Result<ResponseF
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| summarize_failure_body(&body, body_was_truncated));
-    Ok(ResponseFailure {
+    ResponseFailure {
         status,
         code,
         param,
         message,
-    })
+    }
 }
 
 async fn read_provider_failure_body_bounded(
     response: reqwest::Response,
-) -> Result<(Vec<u8>, bool), LlmError> {
+    cancel: &CancellationToken,
+    idle_timeout_ms: u64,
+    max_duration_ms: u64,
+) -> Option<(Vec<u8>, bool)> {
+    let declared_length = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok());
     let mut stream = response.bytes_stream();
     let mut body = Vec::with_capacity(PROVIDER_FAILURE_BODY_LIMIT_BYTES.min(8 * 1024));
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| LlmError::Http(error.without_url()))?;
+    let started_at = Instant::now();
+    loop {
+        let next = if let Some(timeout) =
+            bounded_wait_timeout(started_at, idle_timeout_ms, max_duration_ms)
+        {
+            tokio::select! {
+                _ = cancel.cancelled() => return None,
+                result = tokio::time::timeout(timeout, stream.next()) => match result {
+                    Ok(next) => next,
+                    Err(_) => return Some((body, true)),
+                },
+            }
+        } else {
+            tokio::select! {
+                _ = cancel.cancelled() => return None,
+                next = stream.next() => next,
+            }
+        };
+        let Some(chunk) = next else {
+            return Some((body, false));
+        };
+        let Ok(chunk) = chunk else {
+            return Some((body, true));
+        };
         let remaining = PROVIDER_FAILURE_BODY_LIMIT_BYTES.saturating_sub(body.len());
         if remaining == 0 {
-            return Ok((body, true));
+            return Some((body, true));
         }
         let retained = remaining.min(chunk.len());
         body.extend_from_slice(&chunk[..retained]);
         if retained < chunk.len() {
-            return Ok((body, true));
+            return Some((body, true));
+        }
+        if declared_length == Some(body.len()) {
+            return Some((body, false));
+        }
+        if body.len() == PROVIDER_FAILURE_BODY_LIMIT_BYTES {
+            return Some((body, true));
         }
     }
-    Ok((body, false))
 }
 
 async fn parse_response_failure_until_cancelled(
     response: reqwest::Response,
     cancel: &CancellationToken,
-    deadline: &OperationDeadline,
-) -> Result<Option<ResponseFailure>, LlmError> {
-    let parse = parse_response_failure(response);
-    tokio::pin!(parse);
-    if let Some(timeout) = deadline.remaining() {
-        tokio::select! {
-            _ = cancel.cancelled() => Ok(None),
-            result = tokio::time::timeout(timeout, &mut parse) => match result {
-                Ok(result) => result.map(Some),
-                Err(_) => Err(LlmError::ProviderResponseStartTimeout {
-                    timeout_ms: deadline.response_start_timeout_ms,
-                }),
-            },
-        }
-    } else {
-        tokio::select! {
-            _ = cancel.cancelled() => Ok(None),
-            result = &mut parse => result.map(Some),
-        }
+    idle_timeout_ms: u64,
+    max_duration_ms: u64,
+) -> Option<ResponseFailure> {
+    let status = response.status();
+    let (body, body_was_truncated) =
+        read_provider_failure_body_bounded(response, cancel, idle_timeout_ms, max_duration_ms)
+            .await?;
+    Some(parse_response_failure_body(
+        status,
+        &body,
+        body_was_truncated,
+    ))
+}
+
+fn bounded_wait_timeout(
+    started_at: Instant,
+    idle_timeout_ms: u64,
+    max_duration_ms: u64,
+) -> Option<Duration> {
+    let idle = (idle_timeout_ms > 0).then(|| Duration::from_millis(idle_timeout_ms));
+    let absolute = (max_duration_ms > 0)
+        .then(|| Duration::from_millis(max_duration_ms).saturating_sub(started_at.elapsed()));
+    match (idle, absolute) {
+        (Some(idle), Some(absolute)) => Some(idle.min(absolute)),
+        (Some(idle), None) => Some(idle),
+        (None, Some(absolute)) => Some(absolute),
+        (None, None) => None,
     }
 }
 
@@ -794,17 +889,11 @@ impl ProviderStreamBudget {
     }
 
     fn wait_timeout(&self, idle_timeout_ms: u64) -> Option<Duration> {
-        let idle = (idle_timeout_ms > 0).then(|| Duration::from_millis(idle_timeout_ms));
-        let absolute = (self.limits.max_duration_ms > 0).then(|| {
-            Duration::from_millis(self.limits.max_duration_ms)
-                .saturating_sub(self.started_at.elapsed())
-        });
-        match (idle, absolute) {
-            (Some(idle), Some(absolute)) => Some(idle.min(absolute)),
-            (Some(idle), None) => Some(idle),
-            (None, Some(absolute)) => Some(absolute),
-            (None, None) => None,
-        }
+        bounded_wait_timeout(
+            self.started_at,
+            idle_timeout_ms,
+            self.limits.max_duration_ms,
+        )
     }
 
     fn timeout_error(&self, idle_timeout_ms: u64) -> LlmError {
@@ -845,16 +934,6 @@ impl ProviderStreamBudget {
         Ok(())
     }
 
-    fn record_tool_arguments(&mut self, key: &str, delta_bytes: u64) -> Result<(), LlmError> {
-        let total = self.tool_argument_bytes.entry(key.to_string()).or_default();
-        *total = total.saturating_add(delta_bytes);
-        ensure_stream_limit(
-            ProviderStreamLimit::ToolCallArgumentBytes,
-            *total,
-            self.limits.max_tool_call_argument_bytes,
-        )
-    }
-
     fn record_projected_events(&mut self, events: &[LlmEvent]) -> Result<(), LlmError> {
         for event in events {
             match event {
@@ -871,6 +950,69 @@ impl ProviderStreamBudget {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ProviderStreamBudgetStage {
+    new_tool_calls: HashSet<String>,
+    tool_argument_bytes: HashMap<String, u64>,
+}
+
+impl ProviderStreamBudgetStage {
+    fn record_tool_call(
+        &mut self,
+        budget: &ProviderStreamBudget,
+        key: String,
+    ) -> Result<(), LlmError> {
+        if budget.tool_calls.contains(&key) || self.new_tool_calls.contains(&key) {
+            return Ok(());
+        }
+        let actual = (budget.tool_calls.len() as u64)
+            .saturating_add(self.new_tool_calls.len() as u64)
+            .saturating_add(1);
+        ensure_stream_limit(
+            ProviderStreamLimit::ToolCallCount,
+            actual,
+            budget.limits.max_tool_calls,
+        )?;
+        self.new_tool_calls.insert(key);
+        Ok(())
+    }
+
+    fn record_tool_arguments(
+        &mut self,
+        budget: &ProviderStreamBudget,
+        key: &str,
+        delta_bytes: u64,
+    ) -> Result<(), LlmError> {
+        let prior = budget
+            .tool_argument_bytes
+            .get(key)
+            .copied()
+            .unwrap_or_default();
+        let staged = self
+            .tool_argument_bytes
+            .get(key)
+            .copied()
+            .unwrap_or_default();
+        let actual = prior.saturating_add(staged).saturating_add(delta_bytes);
+        ensure_stream_limit(
+            ProviderStreamLimit::ToolCallArgumentBytes,
+            actual,
+            budget.limits.max_tool_call_argument_bytes,
+        )?;
+        let total = self.tool_argument_bytes.entry(key.to_string()).or_default();
+        *total = total.saturating_add(delta_bytes);
+        Ok(())
+    }
+
+    fn commit(self, budget: &mut ProviderStreamBudget) {
+        budget.tool_calls.extend(self.new_tool_calls);
+        for (key, delta_bytes) in self.tool_argument_bytes {
+            let total = budget.tool_argument_bytes.entry(key).or_default();
+            *total = total.saturating_add(delta_bytes);
+        }
     }
 }
 
@@ -1022,6 +1164,274 @@ fn retry_delay_ms(attempt: u8, header_delay_ms: Option<u64>) -> u64 {
 }
 
 #[derive(Default)]
+struct ChatStreamAccumulator {
+    finish_reason: Option<FinishReason>,
+    tool_calls: HashMap<usize, PartialToolCall>,
+    call_id_to_delta_index: HashMap<String, usize>,
+}
+
+struct ChatChunkUpdate {
+    events: Vec<LlmEvent>,
+    saw_terminal_signal: bool,
+}
+
+impl ChatStreamAccumulator {
+    fn apply_chunk(
+        &mut self,
+        chunk: OpenAiChatChunk,
+        stream_budget: &mut ProviderStreamBudget,
+    ) -> Result<ChatChunkUpdate, LlmError> {
+        let mut journal = ChatChunkJournal::new(self);
+        let mut budget_stage = ProviderStreamBudgetStage::default();
+        let result =
+            self.apply_chunk_transaction(chunk, stream_budget, &mut budget_stage, &mut journal);
+        match result {
+            Ok(update) => {
+                budget_stage.commit(stream_budget);
+                Ok(update)
+            }
+            Err(error) => {
+                journal.rollback(self);
+                Err(error)
+            }
+        }
+    }
+
+    fn apply_chunk_transaction(
+        &mut self,
+        chunk: OpenAiChatChunk,
+        stream_budget: &ProviderStreamBudget,
+        budget_stage: &mut ProviderStreamBudgetStage,
+        journal: &mut ChatChunkJournal,
+    ) -> Result<ChatChunkUpdate, LlmError> {
+        let mut events = Vec::new();
+        let mut saw_terminal_signal = false;
+        if chunk.choices.len() > 1 {
+            return Err(LlmError::Message(format!(
+                "openai-compatible stream returned {} choice entries in one chunk; moyAI admits at most one choice entry for index `0`",
+                chunk.choices.len()
+            )));
+        }
+        if !chunk.choices.is_empty() && self.finish_reason.is_some() {
+            return Err(LlmError::Message(
+                "openai-compatible stream returned a non-empty choices chunk after choice index `0` was terminal"
+                    .to_string(),
+            ));
+        }
+        for choice in chunk.choices {
+            if choice.index != 0 {
+                return Err(LlmError::Message(format!(
+                    "openai-compatible stream returned unsupported choice index `{}`; moyAI admits exactly choice index `0`",
+                    choice.index
+                )));
+            }
+            if let Some(value) = choice.delta.content {
+                events.push(LlmEvent::TextDelta(value));
+            }
+            if let Some(deltas) = choice.delta.tool_calls {
+                for delta in deltas {
+                    journal.checkpoint_tool_call(self, delta.index);
+                    self.apply_tool_call_delta(
+                        delta,
+                        stream_budget,
+                        budget_stage,
+                        journal,
+                        &mut events,
+                    )?;
+                }
+            }
+            if let Some(value) = choice.finish_reason {
+                let finish_reason = parse_finish_reason(&value)?;
+                self.record_finish_reason(finish_reason)?;
+                saw_terminal_signal = true;
+            }
+        }
+        if saw_terminal_signal {
+            let has_complete_tool_calls = validate_streamed_tool_calls(&self.tool_calls)?;
+            resolve_finish_reason(self.finish_reason, has_complete_tool_calls)?;
+        }
+        Ok(ChatChunkUpdate {
+            events,
+            saw_terminal_signal,
+        })
+    }
+
+    fn apply_tool_call_delta(
+        &mut self,
+        delta: crate::llm::dto::OpenAiToolCallDelta,
+        stream_budget: &ProviderStreamBudget,
+        budget_stage: &mut ProviderStreamBudgetStage,
+        journal: &mut ChatChunkJournal,
+        events: &mut Vec<LlmEvent>,
+    ) -> Result<(), LlmError> {
+        let delta_index = delta.index;
+        let budget_key = format!("chat:{delta_index}");
+        budget_stage.record_tool_call(stream_budget, budget_key.clone())?;
+        if let Some(call_id) = delta.id {
+            if let Some(inserted_alias) = self.bind_call_id(delta_index, call_id)? {
+                journal.inserted_call_id_aliases.push(inserted_alias);
+            }
+        }
+        let entry = self.tool_calls.entry(delta_index).or_default();
+        if let Some(function) = delta.function {
+            if let Some(name) = function.name {
+                entry.record_tool_name(name, delta_index)?;
+            }
+            if let Some(arguments) = function.arguments {
+                entry.saw_arguments_field = true;
+                budget_stage.record_tool_arguments(
+                    stream_budget,
+                    &budget_key,
+                    arguments.len() as u64,
+                )?;
+                entry.arguments.push_str(&arguments);
+            }
+        }
+        if !entry.started {
+            if let Some((call_id, tool_name)) = entry.identity() {
+                events.push(LlmEvent::ToolCallStart { call_id, tool_name });
+                entry.started = true;
+            }
+        }
+        if entry.started && entry.emitted_len < entry.arguments.len() {
+            events.push(LlmEvent::ToolCallArgsDelta {
+                call_id: entry.call_id.clone().unwrap_or_default(),
+                delta: entry.arguments_delta(),
+            });
+        }
+        Ok(())
+    }
+
+    fn bind_call_id(
+        &mut self,
+        delta_index: usize,
+        call_id: String,
+    ) -> Result<Option<String>, LlmError> {
+        if let Some(existing_index) = self.call_id_to_delta_index.get(&call_id)
+            && *existing_index != delta_index
+        {
+            return Err(LlmError::Message(format!(
+                "openai-compatible stream associated provider call id `{call_id}` with multiple tool delta indices (`{existing_index}` and `{delta_index}`)"
+            )));
+        }
+        let alias_is_new = !self.call_id_to_delta_index.contains_key(&call_id);
+        self.tool_calls
+            .entry(delta_index)
+            .or_default()
+            .record_call_id(call_id.clone(), delta_index)?;
+        if alias_is_new {
+            self.call_id_to_delta_index
+                .insert(call_id.clone(), delta_index);
+            Ok(Some(call_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn record_finish_reason(&mut self, finish_reason: FinishReason) -> Result<(), LlmError> {
+        if let Some(existing) = self.finish_reason {
+            if existing != finish_reason {
+                return Err(LlmError::Message(format!(
+                    "openai-compatible stream returned conflicting finish reasons `{existing:?}` and `{finish_reason:?}` for choice index `0`"
+                )));
+            }
+            return Ok(());
+        }
+        self.finish_reason = Some(finish_reason);
+        Ok(())
+    }
+}
+
+struct ChatChunkJournal {
+    original_finish_reason: Option<FinishReason>,
+    tool_call_checkpoints: Vec<PartialToolCallCheckpoint>,
+    inserted_call_id_aliases: Vec<String>,
+}
+
+impl ChatChunkJournal {
+    fn new(accumulator: &ChatStreamAccumulator) -> Self {
+        Self {
+            original_finish_reason: accumulator.finish_reason,
+            tool_call_checkpoints: Vec::new(),
+            inserted_call_id_aliases: Vec::new(),
+        }
+    }
+
+    fn checkpoint_tool_call(&mut self, accumulator: &ChatStreamAccumulator, delta_index: usize) {
+        self.tool_call_checkpoints
+            .push(PartialToolCallCheckpoint::capture(accumulator, delta_index));
+    }
+
+    fn rollback(self, accumulator: &mut ChatStreamAccumulator) {
+        for alias in self.inserted_call_id_aliases.into_iter().rev() {
+            accumulator.call_id_to_delta_index.remove(&alias);
+        }
+        for checkpoint in self.tool_call_checkpoints.into_iter().rev() {
+            checkpoint.rollback(accumulator);
+        }
+        accumulator.finish_reason = self.original_finish_reason;
+    }
+}
+
+struct PartialToolCallCheckpoint {
+    delta_index: usize,
+    existed: bool,
+    call_id_was_none: bool,
+    tool_name_was_none: bool,
+    arguments_len: usize,
+    saw_arguments_field: bool,
+    emitted_len: usize,
+    started: bool,
+}
+
+impl PartialToolCallCheckpoint {
+    fn capture(accumulator: &ChatStreamAccumulator, delta_index: usize) -> Self {
+        let Some(entry) = accumulator.tool_calls.get(&delta_index) else {
+            return Self {
+                delta_index,
+                existed: false,
+                call_id_was_none: true,
+                tool_name_was_none: true,
+                arguments_len: 0,
+                saw_arguments_field: false,
+                emitted_len: 0,
+                started: false,
+            };
+        };
+        Self {
+            delta_index,
+            existed: true,
+            call_id_was_none: entry.call_id.is_none(),
+            tool_name_was_none: entry.tool_name.is_none(),
+            arguments_len: entry.arguments.len(),
+            saw_arguments_field: entry.saw_arguments_field,
+            emitted_len: entry.emitted_len,
+            started: entry.started,
+        }
+    }
+
+    fn rollback(self, accumulator: &mut ChatStreamAccumulator) {
+        if !self.existed {
+            accumulator.tool_calls.remove(&self.delta_index);
+            return;
+        }
+        let Some(entry) = accumulator.tool_calls.get_mut(&self.delta_index) else {
+            return;
+        };
+        if self.call_id_was_none {
+            entry.call_id = None;
+        }
+        if self.tool_name_was_none {
+            entry.tool_name = None;
+        }
+        entry.arguments.truncate(self.arguments_len);
+        entry.saw_arguments_field = self.saw_arguments_field;
+        entry.emitted_len = self.emitted_len;
+        entry.started = self.started;
+    }
+}
+
+#[derive(Default)]
 struct PartialToolCall {
     call_id: Option<String>,
     tool_name: Option<String>,
@@ -1061,12 +1471,12 @@ impl PartialToolCall {
     }
 
     fn identity(&self) -> Option<(String, String)> {
-        let call_id = self.call_id.as_deref()?.trim();
-        let tool_name = self.tool_name.as_deref()?.trim();
-        if call_id.is_empty() || tool_name.is_empty() {
+        let call_id = self.call_id.as_ref()?;
+        let tool_name = self.tool_name.as_ref()?;
+        if call_id.trim().is_empty() || tool_name.trim().is_empty() {
             return None;
         }
-        Some((call_id.to_string(), tool_name.to_string()))
+        Some((call_id.clone(), tool_name.clone()))
     }
 
     fn arguments_delta(&mut self) -> String {
@@ -1212,8 +1622,9 @@ pub(crate) fn to_openai_request_with_reasoning(
         }
     }));
     let base = OpenAiChatRequest {
-        model: request.model.name.clone(),
+        model: request.provider_target().model().to_string(),
         stream: true,
+        n: 1,
         messages,
         max_tokens: Some(request.effective_max_output_tokens()),
         temperature: request.temperature,
@@ -1321,6 +1732,7 @@ fn is_runtime_owned_openai_request_key(key: &str) -> bool {
         key,
         "model"
             | "stream"
+            | "n"
             | "messages"
             | "max_tokens"
             | "temperature"
@@ -1351,48 +1763,142 @@ fn parse_finish_reason(value: &str) -> Result<FinishReason, LlmError> {
     }
 }
 
-fn to_usage(value: &OpenAiUsage) -> TokenUsage {
-    TokenUsage {
+fn to_usage(value: &OpenAiUsage) -> Result<TokenUsage, LlmError> {
+    let nested_reasoning_tokens = value
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|details| details.reasoning_tokens);
+    let reasoning_tokens = match (value.reasoning_tokens, nested_reasoning_tokens) {
+        (Some(legacy), Some(nested)) if legacy != nested => {
+            return Err(LlmError::Message(format!(
+                "openai-compatible usage contains conflicting reasoning token counts: reasoning_tokens={legacy}, completion_tokens_details.reasoning_tokens={nested}"
+            )));
+        }
+        (Some(value), _) | (_, Some(value)) => Some(value),
+        (None, None) => None,
+    };
+    Ok(TokenUsage {
         prompt_tokens: value.prompt_tokens,
         completion_tokens: value.completion_tokens,
         total_tokens: value.total_tokens,
-        reasoning_tokens: value.reasoning_tokens,
-    }
+        reasoning_tokens,
+    })
+}
+
+fn same_token_usage(left: &TokenUsage, right: &TokenUsage) -> bool {
+    left.prompt_tokens == right.prompt_tokens
+        && left.completion_tokens == right.completion_tokens
+        && left.total_tokens == right.total_tokens
+        && left.reasoning_tokens == right.reasoning_tokens
 }
 
 fn summarize_stream_chunk(chunk: &str) -> String {
-    let compact = chunk.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.len() > 240 {
-        clip_text_with_ellipsis(&compact, 243)
-    } else {
-        compact
-    }
+    compact_provider_text_bounded(
+        chunk,
+        PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES,
+        PROVIDER_STREAM_SUMMARY_SCAN_LIMIT_BYTES,
+    )
 }
 
 fn summarize_stream_error(error: &OpenAiErrorPayload) -> String {
-    let mut parts = Vec::new();
-    if let Some(message) = error
-        .message
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        parts.push(message.trim().to_string());
+    let mut parts = Vec::with_capacity(3);
+    if let Some(message) = error.message.as_ref() {
+        let summary = compact_provider_text_bounded(
+            message,
+            PROVIDER_STREAM_ERROR_MESSAGE_LIMIT_BYTES,
+            PROVIDER_STREAM_SUMMARY_SCAN_LIMIT_BYTES,
+        );
+        if !summary.is_empty() {
+            parts.push(summary);
+        }
     }
-    if let Some(error_type) = error
-        .error_type
-        .as_ref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        parts.push(format!("type={}", error_type.trim()));
+    if let Some(error_type) = error.error_type.as_ref() {
+        let summary = compact_provider_text_bounded(
+            error_type,
+            PROVIDER_STREAM_ERROR_FIELD_LIMIT_BYTES,
+            PROVIDER_STREAM_SUMMARY_SCAN_LIMIT_BYTES,
+        );
+        if !summary.is_empty() {
+            parts.push(format!("type={summary}"));
+        }
     }
     if let Some(code) = error.code.as_ref() {
-        parts.push(format!("code={code}"));
+        parts.push(summarize_stream_error_code(code));
     }
     if parts.is_empty() {
         "provider returned an unspecified stream error".to_string()
     } else {
-        parts.join(" | ")
+        compact_provider_text_bounded(
+            &parts.join(" | "),
+            PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES,
+            PROVIDER_STREAM_SUMMARY_SCAN_LIMIT_BYTES,
+        )
     }
+}
+
+fn summarize_stream_error_code(code: &Value) -> String {
+    match code {
+        Value::String(value) => format!(
+            "code={}",
+            compact_provider_text_bounded(
+                value,
+                PROVIDER_STREAM_ERROR_FIELD_LIMIT_BYTES,
+                PROVIDER_STREAM_SUMMARY_SCAN_LIMIT_BYTES,
+            )
+        ),
+        Value::Null => "code=null".to_string(),
+        Value::Bool(value) => format!("code={value}"),
+        Value::Number(value) => format!("code={value}"),
+        Value::Array(_) => "code=<array>".to_string(),
+        Value::Object(_) => "code=<object>".to_string(),
+    }
+}
+
+fn compact_provider_text_bounded(text: &str, max_bytes: usize, max_scan_bytes: usize) -> String {
+    if max_bytes == 0 {
+        return String::new();
+    }
+
+    const ELLIPSIS: &str = "...";
+    let content_limit = max_bytes.saturating_sub(ELLIPSIS.len());
+    let mut compact = String::with_capacity(max_bytes);
+    let mut pending_space = false;
+    let mut scanned_end = 0usize;
+    let mut was_truncated = false;
+
+    for (offset, character) in text.char_indices() {
+        let character_end = offset.saturating_add(character.len_utf8());
+        if character_end > max_scan_bytes {
+            was_truncated = true;
+            break;
+        }
+        scanned_end = character_end;
+        if character.is_whitespace() {
+            pending_space = !compact.is_empty();
+            continue;
+        }
+
+        let separator_len = usize::from(pending_space && !compact.is_empty());
+        let required = separator_len.saturating_add(character.len_utf8());
+        if compact.len().saturating_add(required) > content_limit {
+            was_truncated = true;
+            break;
+        }
+        if separator_len > 0 {
+            compact.push(' ');
+        }
+        compact.push(character);
+        pending_space = false;
+    }
+
+    was_truncated |= scanned_end < text.len();
+    if was_truncated {
+        if max_bytes < ELLIPSIS.len() {
+            return ".".repeat(max_bytes);
+        }
+        compact.push_str(ELLIPSIS);
+    }
+    compact
 }
 
 #[cfg(test)]
@@ -1405,7 +1911,7 @@ mod tests {
 
     use axum::body::{Body, Bytes};
     use axum::extract::State;
-    use axum::http::header::CONTENT_TYPE;
+    use axum::http::{StatusCode, header::CONTENT_TYPE};
     use axum::response::Response;
     use axum::routing::post;
     use axum::{Json, Router};
@@ -1413,8 +1919,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        OpenAiCompatClient, PartialToolCall, parse_finish_reason, resolve_finish_reason,
-        retry_delay_ms, to_openai_request, to_openai_request_with_reasoning,
+        ChatStreamAccumulator, OpenAiCompatClient, PartialToolCall, ProviderStreamBudget,
+        ProviderStreamBudgetStage, parse_finish_reason, resolve_finish_reason, retry_delay_ms,
+        to_openai_request, to_openai_request_with_reasoning, to_usage,
         validate_streamed_tool_calls,
     };
     use crate::config::model::{
@@ -1423,7 +1930,7 @@ mod tests {
     };
     use crate::config::{
         ProviderDeadlines, ProviderMetadataMode, ProviderRequestLimits, ProviderStreamLimits,
-        ProviderTarget,
+        ProviderTarget, ResolvedConfig, ResolvedTurnConfig,
     };
     use crate::error::{LlmError, ProviderRequestLimit, ProviderStreamLimit};
     use crate::llm::contract::ReasoningRequest;
@@ -1513,6 +2020,33 @@ mod tests {
         let system_prompt = first_system_prompt(&body);
 
         assert_eq!(system_prompt, "Base coding prompt");
+    }
+
+    #[test]
+    fn canonical_turn_model_identity_reaches_chat_wire_unchanged() {
+        let mut config = ResolvedConfig::default();
+        config.model.model = "  canonical-wire-model  ".to_string();
+        config.model.provider_api_mode = ProviderApiMode::ChatCompletions;
+        let turn = ResolvedTurnConfig::capture(config).expect("canonical turn config");
+        let profile = crate::llm::model_policy::ModelPolicy::from_config(turn.runtime_config())
+            .transport_profile(turn.provider().metadata_mode());
+        let request = ChatRequest::new(
+            turn.provider().clone(),
+            profile,
+            "Canonical model fixture".to_string(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            ProviderReasoningCapability::Unsupported,
+            BTreeMap::new(),
+        );
+
+        let body = to_openai_request(&request).expect("canonical Chat wire");
+
+        assert_eq!(turn.runtime_config().model.model, "canonical-wire-model");
+        assert_eq!(turn.provider().model(), "canonical-wire-model");
+        assert_eq!(request.model.name, "canonical-wire-model");
+        assert_eq!(body["model"], json!("canonical-wire-model"));
     }
 
     #[test]
@@ -1686,6 +2220,20 @@ mod tests {
     }
 
     #[test]
+    fn chat_request_forces_one_choice_and_extra_body_cannot_override_it() {
+        let mut request = reasoning_fixture_request();
+        request.extra_body = Some(json!({
+            "n": 2,
+            "num_ctx": 8192
+        }));
+
+        let body = to_openai_request(&request).expect("one-choice Chat request");
+
+        assert_eq!(body["n"], 1);
+        assert_eq!(body["num_ctx"], 8192);
+    }
+
+    #[test]
     fn finish_reason_parser_is_typed_and_unknown_values_fail_closed() {
         assert_eq!(
             parse_finish_reason("stop").expect("stop"),
@@ -1714,6 +2262,240 @@ mod tests {
         assert!(resolve_finish_reason(Some(FinishReason::ToolCall), false).is_err());
         assert!(resolve_finish_reason(Some(FinishReason::Stop), true).is_err());
         assert!(resolve_finish_reason(Some(FinishReason::Length), true).is_err());
+    }
+
+    #[test]
+    fn invalid_terminal_chat_chunks_restore_accumulator_and_budget_state() {
+        let mut accumulator = ChatStreamAccumulator::default();
+        let mut budget = ProviderStreamBudget::new(ProviderStreamLimits::product_default());
+        let initial = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_0",
+                        "function": { "name": "read_file", "arguments": "{}" }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }))
+        .expect("initial Chat tool chunk");
+        accumulator
+            .apply_chunk(initial, &mut budget)
+            .expect("non-terminal tool delta");
+
+        let invalid_stop = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": "must not escape",
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": { "arguments": "x" }
+                    }]
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .expect("invalid stop terminal chunk");
+        let Err(error) = accumulator.apply_chunk(invalid_stop, &mut budget) else {
+            panic!("stop plus a tool payload must fail before commit");
+        };
+        assert!(error.to_string().contains("tool-call payload"));
+        assert_eq!(accumulator.finish_reason, None);
+        assert_eq!(accumulator.call_id_to_delta_index.get("call_0"), Some(&0));
+        let entry = accumulator.tool_calls.get(&0).expect("prior tool call");
+        assert_eq!(entry.call_id.as_deref(), Some("call_0"));
+        assert_eq!(entry.tool_name.as_deref(), Some("read_file"));
+        assert_eq!(entry.arguments, "{}");
+        assert!(entry.saw_arguments_field);
+        assert_eq!(entry.emitted_len, 2);
+        assert!(entry.started);
+        assert_eq!(budget.tool_calls.len(), 1);
+        assert_eq!(budget.tool_argument_bytes.get("chat:0"), Some(&2));
+
+        let mut incomplete_accumulator = ChatStreamAccumulator::default();
+        let mut incomplete_budget =
+            ProviderStreamBudget::new(ProviderStreamLimits::product_default());
+        let invalid_tool_terminal = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": "must also stay staged",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_incomplete",
+                        "function": { "name": "read_file" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("incomplete tool terminal chunk");
+        let Err(error) =
+            incomplete_accumulator.apply_chunk(invalid_tool_terminal, &mut incomplete_budget)
+        else {
+            panic!("incomplete terminal tool call must fail before commit");
+        };
+        assert!(error.to_string().contains("without an arguments field"));
+        assert_eq!(incomplete_accumulator.finish_reason, None);
+        assert!(incomplete_accumulator.tool_calls.is_empty());
+        assert!(incomplete_accumulator.call_id_to_delta_index.is_empty());
+        assert!(incomplete_budget.tool_calls.is_empty());
+        assert!(incomplete_budget.tool_argument_bytes.is_empty());
+    }
+
+    #[test]
+    fn many_small_chat_argument_deltas_preserve_exact_events_arguments_and_budget() {
+        const DELTA_COUNT: usize = 1_024;
+        let mut limits = ProviderStreamLimits::product_default();
+        limits.max_tool_call_argument_bytes = DELTA_COUNT as u64;
+        let mut budget = ProviderStreamBudget::new(limits);
+        let mut accumulator = ChatStreamAccumulator::default();
+        let initial = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_0",
+                        "function": { "name": "write", "arguments": "" }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }))
+        .expect("initial Chat tool delta");
+        let initial_update = accumulator
+            .apply_chunk(initial, &mut budget)
+            .expect("initial tool identity and empty arguments");
+        assert!(matches!(
+            initial_update.events.as_slice(),
+            [LlmEvent::ToolCallStart { call_id, tool_name }]
+                if call_id == "call_0" && tool_name == "write"
+        ));
+
+        let mut projected_arguments = String::with_capacity(DELTA_COUNT);
+        for _ in 0..DELTA_COUNT {
+            let chunk = serde_json::from_value(json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": { "arguments": "x" }
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }))
+            .expect("small Chat argument delta");
+            let update = accumulator
+                .apply_chunk(chunk, &mut budget)
+                .expect("small argument delta remains admitted");
+            assert!(matches!(
+                update.events.as_slice(),
+                [LlmEvent::ToolCallArgsDelta { call_id, delta }]
+                    if call_id == "call_0" && delta == "x"
+            ));
+            projected_arguments.push('x');
+        }
+
+        let terminal = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("terminal Chat tool chunk");
+        let terminal_update = accumulator
+            .apply_chunk(terminal, &mut budget)
+            .expect("complete tool-call terminal");
+        assert!(terminal_update.events.is_empty());
+        assert!(terminal_update.saw_terminal_signal);
+
+        let entry = accumulator
+            .tool_calls
+            .get(&0)
+            .expect("accumulated tool call");
+        assert_eq!(projected_arguments, "x".repeat(DELTA_COUNT));
+        assert_eq!(entry.arguments, projected_arguments);
+        assert_eq!(entry.emitted_len, DELTA_COUNT);
+        assert_eq!(
+            budget.tool_argument_bytes.get("chat:0"),
+            Some(&(DELTA_COUNT as u64))
+        );
+        assert_eq!(budget.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn chat_usage_reads_nested_reasoning_tokens_and_reconciles_legacy_exactly() {
+        for usage_json in [
+            json!({
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "completion_tokens_details": { "reasoning_tokens": 3 }
+            }),
+            json!({
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "reasoning_tokens": 3,
+                "completion_tokens_details": { "reasoning_tokens": 3 }
+            }),
+        ] {
+            let chunk = serde_json::from_value::<crate::llm::dto::OpenAiChatChunk>(json!({
+                "choices": [],
+                "usage": usage_json
+            }))
+            .expect("typed Chat usage");
+            let usage = to_usage(chunk.usage.as_ref().expect("usage payload"))
+                .expect("matching reasoning usage");
+            assert_eq!(usage.reasoning_tokens, Some(3));
+        }
+
+        let conflicting = serde_json::from_value::<crate::llm::dto::OpenAiChatChunk>(json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "reasoning_tokens": 2,
+                "completion_tokens_details": { "reasoning_tokens": 3 }
+            }
+        }))
+        .expect("individually typed conflicting usage values");
+        let error = to_usage(conflicting.usage.as_ref().expect("usage payload"))
+            .expect_err("legacy and nested reasoning usage must not diverge");
+        assert!(error.to_string().contains("conflicting reasoning token"));
+    }
+
+    #[test]
+    fn chat_usage_rejects_malformed_nested_completion_details() {
+        for completion_tokens_details in [
+            Value::Null,
+            json!([]),
+            json!({ "reasoning_tokens": "3" }),
+            json!({ "reasoning_tokens": -1 }),
+        ] {
+            let result = serde_json::from_value::<crate::llm::dto::OpenAiChatChunk>(json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                    "completion_tokens_details": completion_tokens_details
+                }
+            }));
+            assert!(
+                result.is_err(),
+                "malformed completion_tokens_details must fail closed"
+            );
+        }
     }
 
     #[test]
@@ -1760,6 +2542,34 @@ mod tests {
         ] {
             let calls = std::collections::HashMap::from([(0, partial)]);
             assert!(validate_streamed_tool_calls(&calls).is_err());
+        }
+    }
+
+    #[test]
+    fn chat_tool_identity_preserves_exact_provider_strings_and_only_trims_for_emptiness() {
+        let exact = PartialToolCall {
+            call_id: Some(" call_raw ".to_string()),
+            tool_name: Some("\tread_file\n".to_string()),
+            ..PartialToolCall::default()
+        };
+        assert_eq!(
+            exact.identity(),
+            Some((" call_raw ".to_string(), "\tread_file\n".to_string()))
+        );
+
+        for blank in [
+            PartialToolCall {
+                call_id: Some(" \t".to_string()),
+                tool_name: Some("read_file".to_string()),
+                ..PartialToolCall::default()
+            },
+            PartialToolCall {
+                call_id: Some("call_raw".to_string()),
+                tool_name: Some("\r\n".to_string()),
+                ..PartialToolCall::default()
+            },
+        ] {
+            assert!(blank.identity().is_none());
         }
     }
 
@@ -1821,6 +2631,35 @@ mod tests {
 
         assert!(summary.len() <= super::PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES);
         assert!(summary.ends_with("..."));
+    }
+
+    #[test]
+    fn stream_error_summaries_bound_scan_and_allocation() {
+        let late_marker = "must-not-be-scanned";
+        let whitespace_prefix = " ".repeat(super::PROVIDER_STREAM_SUMMARY_SCAN_LIMIT_BYTES + 32);
+        let chunk = format!("{whitespace_prefix}{late_marker}");
+
+        let chunk_summary = super::summarize_stream_chunk(&chunk);
+
+        assert_eq!(chunk_summary, "...");
+        assert!(!chunk_summary.contains(late_marker));
+        assert!(chunk_summary.len() <= super::PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES);
+
+        let error = crate::llm::dto::OpenAiErrorPayload {
+            message: Some(format!(
+                "provider message {} {late_marker}",
+                "x".repeat(super::PROVIDER_STREAM_SUMMARY_SCAN_LIMIT_BYTES + 32)
+            )),
+            error_type: Some("y".repeat(super::PROVIDER_STREAM_SUMMARY_SCAN_LIMIT_BYTES + 32)),
+            code: Some(json!({ "large": "z".repeat(4_096) })),
+        };
+
+        let error_summary = super::summarize_stream_error(&error);
+
+        assert!(error_summary.len() <= super::PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES);
+        assert!(error_summary.contains("provider message"));
+        assert!(!error_summary.contains(late_marker));
+        assert!(error_summary.contains("code=<object>"));
     }
 
     #[tokio::test]
@@ -1901,6 +2740,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_preflight_failure_emits_no_provider_lifecycle() {
+        let (base_url, requests, server) = start_responses_fixture(Vec::new()).await;
+        let mut request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "Reject the invalid local request".to_string(),
+            }],
+        );
+        request.tool_choice = Some(ProviderToolChoice::Required);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("tool choice without tools must fail before transport");
+        server.abort();
+
+        assert!(error.provider_failure().is_none());
+        assert!(requests.lock().expect("request capture").is_empty());
+        assert!(sink.phases.is_empty());
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_local_headers_emit_no_provider_lifecycle() {
+        let (base_url, requests, server) = start_responses_fixture(Vec::new()).await;
+        let mut request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "Reject the invalid local header".to_string(),
+            }],
+        );
+        request.replace_extra_headers(BTreeMap::from([(
+            "invalid header name".to_string(),
+            "value".to_string(),
+        )]));
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("invalid local header must fail before transport");
+        server.abort();
+
+        assert!(error.provider_failure().is_none());
+        assert!(error.to_string().contains("invalid header name"));
+        assert!(requests.lock().expect("request capture").is_empty());
+        assert!(sink.phases.is_empty());
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_model_profile_emits_no_provider_lifecycle_or_post() {
+        let (base_url, requests, server) = start_responses_fixture(Vec::new()).await;
+        let mut request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "Reject the stale model profile".to_string(),
+            }],
+        );
+        request.model.name = "stale-profile-model".to_string();
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("stale model profile must fail before transport");
+        server.abort();
+
+        assert!(error.provider_failure().is_none());
+        assert!(
+            error
+                .to_string()
+                .contains("canonical provider target model")
+        );
+        assert!(requests.lock().expect("request capture").is_empty());
+        assert!(sink.phases.is_empty());
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
     async fn chat_completions_raw_reasoning_fields_are_not_client_projection() {
         let response = [
             format!(
@@ -1952,6 +2875,628 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_model_event_sink_failure_is_typed_and_stops_later_projection() {
+        let response = [
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": "first" },
+                        "finish_reason": null
+                    }]
+                })
+            ),
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": "must not project" },
+                        "finish_reason": "stop"
+                    }]
+                })
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = FailingLlmEventSink::fail_push_on(1);
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("the first model event projection must fail the request");
+        server.abort();
+
+        let failure = error.provider_failure().expect("typed projection failure");
+        assert_eq!(failure.kind, ProviderFailureKind::EventProjection);
+        assert_eq!(failure.phase, ProviderPhase::FirstProgress);
+        assert!(!failure.request_id.as_str().is_empty());
+        assert!(matches!(
+            sink.attempted_events.as_slice(),
+            [LlmEvent::TextDelta(text)] if text == "first"
+        ));
+        assert!(
+            !sink.phases.iter().any(|event| matches!(
+                event.phase,
+                ProviderPhase::LastProgress | ProviderPhase::ProviderTerminal
+            )),
+            "a failed model-event sink must not receive follow-up lifecycle projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_phase_sink_failure_is_typed_before_model_projection() {
+        let response = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "must not project" },
+                    "finish_reason": "stop"
+                }]
+            })
+        );
+        let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = FailingLlmEventSink::fail_phase(ProviderPhase::FirstProgress);
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("first-progress projection must fail the request");
+        server.abort();
+
+        let failure = error
+            .provider_failure()
+            .expect("typed phase projection failure");
+        assert_eq!(failure.kind, ProviderFailureKind::EventProjection);
+        assert_eq!(failure.phase, ProviderPhase::FirstProgress);
+        assert!(!failure.request_id.as_str().is_empty());
+        assert!(sink.attempted_events.is_empty());
+        assert_eq!(
+            sink.phases
+                .iter()
+                .filter(|event| event.phase == ProviderPhase::FirstProgress)
+                .count(),
+            1
+        );
+        assert!(
+            !sink.phases.iter().any(|event| matches!(
+                event.phase,
+                ProviderPhase::LastProgress | ProviderPhase::ProviderTerminal
+            )),
+            "a failed phase sink must not be used for terminal failure projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_success_terminal_phase_sink_failure_is_event_projection_not_provider_other() {
+        let response = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "complete" },
+                    "finish_reason": "stop"
+                }]
+            })
+        );
+        let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = FailingLlmEventSink::fail_phase(ProviderPhase::ProviderTerminal);
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("terminal lifecycle projection must remain a typed local failure");
+        server.abort();
+
+        let LlmError::ProviderFailure { failure, source } = error else {
+            panic!("terminal projection failure must remain typed");
+        };
+        assert_eq!(failure.kind, ProviderFailureKind::EventProjection);
+        assert_eq!(failure.phase, ProviderPhase::ProviderTerminal);
+        assert!(!failure.request_id.as_str().is_empty());
+        assert_eq!(failure.message, "fixture provider-phase projection failed");
+        assert!(matches!(
+            *source,
+            LlmError::Message(message)
+                if message == "fixture provider-phase projection failed"
+        ));
+        assert!(matches!(
+            sink.attempted_events.as_slice(),
+            [
+                LlmEvent::TextDelta(text),
+                LlmEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    ..
+                }
+            ] if text == "complete"
+        ));
+        assert_eq!(
+            sink.phases
+                .iter()
+                .filter(|event| event.phase == ProviderPhase::ProviderTerminal)
+                .count(),
+            1,
+            "the failed terminal projection must not be retried on the same sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_provider_semantic_failure_survives_lifecycle_projection_failure() {
+        const SEMANTIC_MESSAGE: &str = "openai-compatible stream returned unsupported choice index `1`; moyAI admits exactly choice index `0`";
+        let response = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "index": 1,
+                    "delta": { "content": "must not project" },
+                    "finish_reason": "stop"
+                }]
+            })
+        );
+        let (base_url, _requests, server) =
+            start_responses_fixture(vec![response.clone(), response]).await;
+        let client = OpenAiCompatClient::new(None);
+
+        for projection_phase in [ProviderPhase::LastProgress, ProviderPhase::ProviderTerminal] {
+            let mut request = reasoning_fixture_request();
+            replace_provider_endpoint(&mut request, &base_url);
+            let mut sink = FailingLlmEventSink::fail_phase(projection_phase);
+
+            let error = client
+                .stream_chat(request, CancellationToken::new(), &mut sink)
+                .await
+                .expect_err("provider and lifecycle projection failures must both be retained");
+
+            let LlmError::ProviderFailure {
+                failure: projection_failure,
+                source: provider_source,
+            } = error
+            else {
+                panic!("projection failure must be the outer typed failure");
+            };
+            assert_eq!(
+                projection_failure.kind,
+                ProviderFailureKind::EventProjection
+            );
+            assert_eq!(projection_failure.phase, projection_phase);
+            assert_eq!(
+                projection_failure.message,
+                "fixture provider-phase projection failed"
+            );
+            assert!(!projection_failure.request_id.as_str().is_empty());
+
+            let LlmError::ProviderFailure {
+                failure: provider_failure,
+                source: semantic_source,
+            } = *provider_source
+            else {
+                panic!("original provider failure must be nested below projection failure");
+            };
+            assert_eq!(provider_failure.kind, ProviderFailureKind::Protocol);
+            assert_eq!(provider_failure.phase, ProviderPhase::FirstProgress);
+            assert_eq!(provider_failure.message, SEMANTIC_MESSAGE);
+            assert_eq!(
+                provider_failure.request_id.as_str(),
+                projection_failure.request_id.as_str()
+            );
+            assert!(matches!(
+                *semantic_source,
+                LlmError::Message(message) if message == SEMANTIC_MESSAGE
+            ));
+            assert!(sink.attempted_events.is_empty());
+            assert_eq!(
+                sink.phases
+                    .iter()
+                    .filter(|event| event.phase == projection_phase)
+                    .count(),
+                1,
+                "the failed lifecycle projection must not be retried"
+            );
+            assert_eq!(
+                sink.phases.last().map(|event| event.phase),
+                Some(projection_phase),
+                "a broken sink must not receive later lifecycle projection"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_nonzero_choice_without_projection() {
+        let response = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "index": 1,
+                    "delta": { "content": "alternate" },
+                    "finish_reason": "stop"
+                }]
+            })
+        );
+        let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("choice index 1 must fail closed");
+        server.abort();
+
+        assert!(error.to_string().contains("choice index `1`"));
+        assert_eq!(
+            error.provider_failure().map(|failure| failure.kind),
+            Some(ProviderFailureKind::Protocol),
+            "provider semantic errors remain protocol failures when the sink succeeds"
+        );
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_duplicate_choice_zero_entries_without_projecting_the_first() {
+        let response = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": { "content": "must roll back" },
+                        "finish_reason": null
+                    },
+                    {
+                        "index": 0,
+                        "delta": { "content": "duplicate choice" },
+                        "finish_reason": "stop"
+                    }
+                ]
+            })
+        );
+        let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("duplicate choice zero entries must fail closed");
+        server.abort();
+
+        assert!(error.to_string().contains("2 choice entries"));
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_nonempty_choice_chunk_after_finish_without_projecting_late_content() {
+        let response = [
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": "complete" },
+                        "finish_reason": "stop"
+                    }]
+                })
+            ),
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": "late" },
+                        "finish_reason": null
+                    }]
+                })
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("choice content after finish_reason must fail closed");
+        server.abort();
+
+        assert!(
+            error
+                .to_string()
+                .contains("after choice index `0` was terminal")
+        );
+        assert!(matches!(
+            sink.events.as_slice(),
+            [LlmEvent::TextDelta(text)] if text == "complete"
+        ));
+    }
+
+    #[tokio::test]
+    async fn chat_allows_exact_usage_repetition_in_empty_chunk_after_terminal() {
+        let usage = json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "completion_tokens_details": { "reasoning_tokens": 3 }
+        });
+        let response = [
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": "complete" },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": usage.clone()
+                })
+            ),
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [],
+                    "usage": usage
+                })
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let summary = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect("an exact usage-only repeat remains valid after finish_reason");
+        server.abort();
+
+        assert!(matches!(
+            summary.usage,
+            Some(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                reasoning_tokens: Some(3),
+            })
+        ));
+        assert!(matches!(
+            sink.events.as_slice(),
+            [
+                LlmEvent::TextDelta(text),
+                LlmEvent::Finished {
+                    finish_reason: FinishReason::Stop,
+                    ..
+                }
+            ] if text == "complete"
+        ));
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_conflicting_usage_repeat_without_projecting_finished() {
+        let response = [
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": "complete" },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 5,
+                        "total_tokens": 15
+                    }
+                })
+            ),
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 6,
+                        "total_tokens": 16
+                    }
+                })
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("usage changes across chunks must fail closed");
+        server.abort();
+
+        assert!(error.to_string().contains("conflicting usage payloads"));
+        assert!(matches!(
+            sink.events.as_slice(),
+            [LlmEvent::TextDelta(text)] if text == "complete"
+        ));
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_call_id_alias_across_delta_indices_atomically() {
+        let response = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": " call_raw ",
+                                "function": { "name": " read_file ", "arguments": "{}" }
+                            },
+                            {
+                                "index": 1,
+                                "id": " call_raw ",
+                                "function": { "name": " write_file ", "arguments": "{}" }
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            })
+        );
+        let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("one provider call id cannot alias two delta indices");
+        server.abort();
+
+        assert!(error.to_string().contains("multiple tool delta indices"));
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_semantic_error_rolls_back_all_events_from_the_same_chunk() {
+        let response = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_first",
+                                "function": { "name": "read_file", "arguments": "{}" }
+                            },
+                            {
+                                "index": 0,
+                                "id": "call_changed",
+                                "function": { "arguments": "" }
+                            }
+                        ]
+                    },
+                    "finish_reason": null
+                }]
+            })
+        );
+        let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("a conflicting delta must reject its whole parsed chunk");
+        server.abort();
+
+        assert!(error.to_string().contains("changed the call id"));
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_stop_with_same_chunk_tool_payload_without_projection() {
+        let response = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": "must remain staged",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_0",
+                            "function": { "name": "read_file", "arguments": "{}" }
+                        }]
+                    },
+                    "finish_reason": "stop"
+                }]
+            })
+        );
+        let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("stop with a tool payload must fail before projection");
+        server.abort();
+
+        assert!(error.to_string().contains("tool-call payload"));
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_rejects_incomplete_terminal_tool_call_without_projection() {
+        let response = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": "must remain staged",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_0",
+                            "function": { "name": "read_file" }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            })
+        );
+        let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("incomplete terminal tool call must fail before projection");
+        server.abort();
+
+        assert!(error.to_string().contains("without an arguments field"));
+        assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
     async fn responses_transport_posts_typed_wire_and_projects_completed_text_and_summary() {
         let response = responses_sse([
             json!({
@@ -1961,12 +3506,35 @@ mod tests {
             json!({
                 "type": "response.output_text.delta",
                 "item_id": "msg_1",
+                "output_index": 0,
                 "delta": "The change is ready."
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "The change is ready."
+                    }]
+                }
             }),
             json!({
                 "type": "response.completed",
                 "response": {
                     "id": "resp_text_1",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_1",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "The change is ready."
+                        }]
+                    }],
                     "usage": {
                         "input_tokens": 12,
                         "output_tokens": 7,
@@ -2087,6 +3655,7 @@ mod tests {
         let first_response = responses_sse([
             json!({
                 "type": "response.output_item.done",
+                "output_index": 0,
                 "item": {
                     "type": "function_call",
                     "id": "fc_1",
@@ -2097,18 +3666,52 @@ mod tests {
             }),
             json!({
                 "type": "response.completed",
-                "response": { "id": "resp_tool_1" }
+                "response": {
+                    "id": "resp_tool_1",
+                    "output": [{
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"README.md\"}"
+                    }]
+                }
             }),
         ]);
         let second_response = responses_sse([
             json!({
                 "type": "response.output_text.delta",
                 "item_id": "msg_2",
+                "output_index": 0,
                 "delta": "README inspected."
             }),
             json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": "msg_2",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "README inspected."
+                    }]
+                }
+            }),
+            json!({
                 "type": "response.completed",
-                "response": { "id": "resp_text_2" }
+                "response": {
+                    "id": "resp_text_2",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_2",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "README inspected."
+                        }]
+                    }]
+                }
             }),
         ]);
         let (base_url, requests, server) =
@@ -2245,11 +3848,30 @@ mod tests {
             json!({
                 "type": "response.output_text.delta",
                 "item_id": "msg_after_retry",
+                "output_index": 0,
                 "delta": "Recovered."
             }),
             json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": "msg_after_retry",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Recovered." }]
+                }
+            }),
+            json!({
                 "type": "response.completed",
-                "response": { "id": "resp_recovered" }
+                "response": {
+                    "id": "resp_recovered",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg_after_retry",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Recovered." }]
+                    }]
+                }
             }),
         ]);
         let (base_url, requests, server) = start_responses_fixture(vec![failed, completed]).await;
@@ -2299,9 +3921,76 @@ mod tests {
 
         let failure = error.provider_failure().expect("typed provider failure");
         assert_eq!(failure.kind, ProviderFailureKind::HttpStatus);
+        assert_eq!(failure.phase, ProviderPhase::HeadersReceived);
         assert!(failure.message.len() < 1_024);
         assert!(failure.message.ends_with("..."));
         assert_eq!(requests.lock().expect("request capture").len(), 1);
+        assert_eq!(
+            sink.phases
+                .iter()
+                .map(|event| event.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                ProviderPhase::AttemptStarted,
+                ProviderPhase::RequestInFlight,
+                ProviderPhase::HeadersReceived,
+                ProviderPhase::ProviderTerminal,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_http_failure_body_uses_post_header_budget_not_response_start_timeout() {
+        let (base_url, request_count, server) = start_delayed_fixture_with_status(
+            "late failure details".to_string(),
+            Duration::from_secs(1),
+            false,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let mut request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "Classify the received HTTP failure".to_string(),
+            }],
+        );
+        replace_provider_deadlines(
+            &mut request,
+            ProviderDeadlines {
+                response_start_timeout_ms: 500,
+                stream_idle_timeout_ms: 30,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 2,
+            },
+        );
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("received HTTP failure must remain a status rejection");
+        server.abort();
+
+        let failure = error.provider_failure().expect("typed provider failure");
+        assert_eq!(failure.kind, ProviderFailureKind::HttpStatus);
+        assert_eq!(failure.phase, ProviderPhase::HeadersReceived);
+        assert_eq!(failure.status, Some(500));
+        assert!(!error.to_string().contains("response-start deadline"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert!(sink.events.is_empty());
+        assert_eq!(
+            sink.phases
+                .iter()
+                .map(|event| event.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                ProviderPhase::AttemptStarted,
+                ProviderPhase::RequestInFlight,
+                ProviderPhase::HeadersReceived,
+                ProviderPhase::ProviderTerminal,
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2439,16 +4128,19 @@ mod tests {
                 ..
             })
         ));
-        budget
-            .record_tool_arguments("call_1", 4)
+        let mut stage = ProviderStreamBudgetStage::default();
+        stage
+            .record_tool_arguments(&budget, "call_1", 4)
             .expect("argument boundary");
         assert!(matches!(
-            budget.record_tool_arguments("call_1", 1),
+            stage.record_tool_arguments(&budget, "call_1", 1),
             Err(LlmError::ProviderStreamLimitExceeded {
                 surface: ProviderStreamLimit::ToolCallArgumentBytes,
                 ..
             })
         ));
+        stage.commit(&mut budget);
+        assert_eq!(budget.tool_argument_bytes.get("call_1"), Some(&4));
     }
 
     #[tokio::test]
@@ -2456,6 +4148,7 @@ mod tests {
         let response = responses_sse([json!({
             "type": "response.output_text.delta",
             "item_id": "large_event",
+            "output_index": 0,
             "delta": "x".repeat(4_096)
         })]);
         let (base_url, requests, server) = start_responses_fixture(vec![response]).await;
@@ -2614,6 +4307,7 @@ mod tests {
         let terminal_less = responses_sse([json!({
             "type": "response.output_text.delta",
             "item_id": "msg_unfinished",
+            "output_index": 0,
             "delta": "partial output"
         })]);
         let (base_url, _requests, server) =
@@ -2681,12 +4375,37 @@ mod tests {
         response: Arc<String>,
         delay: Duration,
         delay_before_headers: bool,
+        status: StatusCode,
     }
 
     #[derive(Default)]
     struct RecordingLlmEventSink {
         events: Vec<LlmEvent>,
         phases: Vec<ProviderPhaseEvent>,
+    }
+
+    #[derive(Default)]
+    struct FailingLlmEventSink {
+        attempted_events: Vec<LlmEvent>,
+        phases: Vec<ProviderPhaseEvent>,
+        fail_push_on: Option<usize>,
+        fail_phase: Option<ProviderPhase>,
+    }
+
+    impl FailingLlmEventSink {
+        fn fail_push_on(attempt: usize) -> Self {
+            Self {
+                fail_push_on: Some(attempt),
+                ..Self::default()
+            }
+        }
+
+        fn fail_phase(phase: ProviderPhase) -> Self {
+            Self {
+                fail_phase: Some(phase),
+                ..Self::default()
+            }
+        }
     }
 
     impl LlmEventSink for RecordingLlmEventSink {
@@ -2700,6 +4419,32 @@ mod tests {
             event: ProviderPhaseEvent,
         ) -> Result<(), crate::error::LlmError> {
             self.phases.push(event);
+            Ok(())
+        }
+    }
+
+    impl LlmEventSink for FailingLlmEventSink {
+        fn push(&mut self, event: LlmEvent) -> Result<(), crate::error::LlmError> {
+            self.attempted_events.push(event);
+            if self.fail_push_on == Some(self.attempted_events.len()) {
+                return Err(LlmError::Message(
+                    "fixture model-event projection failed".to_string(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn provider_phase(
+            &mut self,
+            event: ProviderPhaseEvent,
+        ) -> Result<(), crate::error::LlmError> {
+            let should_fail = self.fail_phase == Some(event.phase);
+            self.phases.push(event);
+            if should_fail {
+                return Err(LlmError::Message(
+                    "fixture provider-phase projection failed".to_string(),
+                ));
+            }
             Ok(())
         }
     }
@@ -2762,12 +4507,23 @@ mod tests {
         delay: Duration,
         delay_before_headers: bool,
     ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        start_delayed_fixture_with_status(response, delay, delay_before_headers, StatusCode::OK)
+            .await
+    }
+
+    async fn start_delayed_fixture_with_status(
+        response: String,
+        delay: Duration,
+        delay_before_headers: bool,
+        status: StatusCode,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let request_count = Arc::new(AtomicUsize::new(0));
         let state = DelayedFixtureState {
             request_count: request_count.clone(),
             response: Arc::new(response),
             delay,
             delay_before_headers,
+            status,
         };
         let app = Router::new()
             .route("/v1/responses", post(delayed_fixture_handler))
@@ -2793,6 +4549,7 @@ mod tests {
         if state.delay_before_headers {
             tokio::time::sleep(state.delay).await;
             return Response::builder()
+                .status(state.status)
                 .header(CONTENT_TYPE, "text/event-stream")
                 .body(Body::from(state.response.as_str().to_string()))
                 .expect("delayed-header fixture response");
@@ -2805,6 +4562,7 @@ mod tests {
             Ok::<Bytes, Infallible>(Bytes::from(response))
         }));
         Response::builder()
+            .status(state.status)
             .header(CONTENT_TYPE, "text/event-stream")
             .body(body)
             .expect("delayed-stream fixture response")

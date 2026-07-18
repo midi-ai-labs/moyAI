@@ -19,7 +19,7 @@ use crate::tool::process::{ProcessTerminationStep, process_tree_termination_plan
 use crate::tool::registry::Tool;
 use crate::tool::truncate::clip_text_with_ellipsis;
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
-use crate::workspace::{AccessKind, PathGuard, is_protected_workspace_authority_path};
+use crate::workspace::{AccessKind, GuardedPath, PathGuard};
 
 #[derive(Debug, Deserialize)]
 pub struct ShellInput {
@@ -80,7 +80,7 @@ impl Tool for ShellTool {
         } else {
             input.description.clone()
         };
-        let risks = shell_permission_risks_from(ctx.workspace, &guarded.absolute, &input.command);
+        let risks = shell_permission_risks_from(ctx.workspace, &guarded, &input.command);
         let effect_admission = ctx
             .confirm_if_needed_with_details(
                 AccessKind::Shell,
@@ -574,16 +574,18 @@ fn shell_permission_risks(
     workspace: &crate::workspace::Workspace,
     command: &str,
 ) -> Vec<PermissionRisk> {
-    shell_permission_risks_from(workspace, &workspace.cwd, command)
+    let guarded = PathGuard::require_path(workspace, &workspace.cwd, AccessKind::Shell)
+        .expect("test workspace cwd");
+    shell_permission_risks_from(workspace, &guarded, command)
 }
 
 fn shell_permission_risks_from(
     workspace: &crate::workspace::Workspace,
-    workdir: &Utf8Path,
+    guarded_workdir: &GuardedPath,
     command: &str,
 ) -> Vec<PermissionRisk> {
     let mut risks = Vec::new();
-    let references_network_path = shell_references_network_path(workdir, command);
+    let references_network_path = shell_references_network_path(&guarded_workdir.absolute, command);
     if shell_has_delete_risk(command) {
         risks.push(PermissionRisk::DestructiveDelete);
     }
@@ -596,7 +598,7 @@ fn shell_permission_risks_from(
     if shell_requires_external_connection_review(command) || references_network_path {
         risks.push(PermissionRisk::ExternalConnection);
     }
-    if command_mentions_protected_target(workspace, workdir, command) {
+    if command_mentions_protected_target(workspace, guarded_workdir, command) {
         risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
     }
     risks
@@ -720,9 +722,12 @@ fn command_tokens(command: &str) -> Vec<String> {
 
 fn command_mentions_protected_target(
     workspace: &crate::workspace::Workspace,
-    workdir: &Utf8Path,
+    guarded_workdir: &GuardedPath,
     command: &str,
 ) -> bool {
+    if PathGuard::targets_protected_workspace_authority(&workspace.root, guarded_workdir) {
+        return true;
+    }
     let lower = command.to_ascii_lowercase();
     if [
         "agents.md",
@@ -738,9 +743,13 @@ fn command_mentions_protected_target(
     {
         return true;
     }
-    extract_absolute_paths(workdir, command)
+    extract_absolute_paths(&guarded_workdir.absolute, command)
         .into_iter()
-        .any(|path| is_protected_workspace_authority_path(&workspace.root, &path))
+        .any(|path| {
+            PathGuard::require_path(workspace, &path, AccessKind::Shell).is_ok_and(|guarded| {
+                PathGuard::targets_protected_workspace_authority(&workspace.root, &guarded)
+            })
+        })
 }
 
 #[cfg(test)]

@@ -340,11 +340,20 @@ pub enum EditError {
     )]
     RollbackConflict { path: camino::Utf8PathBuf },
     #[error(
-        "rollback for `{path}` could not restore the target because the committed filesystem state changed; external content was preserved at `{preserved_path}` and the agent change may remain partially committed"
+        "rollback for `{path}` could not restore the target because the committed filesystem state changed; external content was preserved at `{preserved_path}` and the agent change may remain partially committed: {reason}"
     )]
     RollbackConflictPreserved {
         path: camino::Utf8PathBuf,
         preserved_path: camino::Utf8PathBuf,
+        reason: String,
+    },
+    #[error(
+        "filesystem recovery for `{path}` left files at {preserved_paths:?}; each path requires recovery: {reason}"
+    )]
+    RecoveryFilesPreserved {
+        path: camino::Utf8PathBuf,
+        preserved_paths: Vec<camino::Utf8PathBuf>,
+        reason: String,
     },
     #[error("{operation} rollback failed: {details}")]
     RollbackFailed { operation: String, details: String },

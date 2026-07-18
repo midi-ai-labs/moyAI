@@ -18,6 +18,10 @@ num_ctx = 131072
 
 [permissions]
 access_mode = "default"
+# additional_read_roots and additional_write_roots, when set, must contain absolute paths.
+
+[workspace]
+# protected_paths, when set, must contain absolute paths.
 
 [multi_agent]
 enabled = false

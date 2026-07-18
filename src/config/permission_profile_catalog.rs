@@ -64,13 +64,14 @@ pub fn builtin_permission_profiles() -> Vec<PermissionProfileEntry> {
             mode: AccessMode::FullAccess,
             id: "full_access".to_string(),
             label: "Full Access".to_string(),
-            summary: "Automatically allows stable-handle-verified file operations inside the configured boundary. Shell and external operations require explicit human confirmation because this is not an OS sandbox."
+            summary: "Automatically allows stable-handle-verified non-authority file operations inside the configured boundary. Workspace authority files, shell, and external operations require explicit human confirmation because this is not an OS sandbox."
                 .to_string(),
             auto_allowed: strings(&[
                 "stable-handle-verified file list/search/read inside the configured boundary",
                 "stable-handle-verified file edits inside the configured boundary",
             ]),
             requires_review: strings(&[
+                "workspace authority files",
                 "shell",
                 "detected outside configured boundary",
                 "network, configured services, or other external operations",
@@ -117,6 +118,12 @@ mod tests {
         assert_eq!(profiles[0].requires_review[0], "workspace edits");
         assert_eq!(profiles[0].requires_review[1], "shell");
         assert!(profiles[1].summary.contains("not an OS sandbox"));
+        assert!(
+            profiles[1]
+                .requires_review
+                .iter()
+                .any(|value| value == "workspace authority files")
+        );
         assert!(
             profiles[1]
                 .requires_review

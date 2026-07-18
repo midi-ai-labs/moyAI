@@ -324,6 +324,25 @@ impl ChatRequest {
     }
 
     pub fn validate_provider_lifecycle(&self) -> Result<(), LlmError> {
+        if self.model.name.trim().is_empty() {
+            return Err(LlmError::Message(
+                "ChatRequest model profile name must not be empty".to_string(),
+            ));
+        }
+        if self.model.name != self.provider.model() {
+            return Err(LlmError::Message(format!(
+                "ChatRequest model profile `{}` does not match canonical provider target model `{}`",
+                self.model.name,
+                self.provider.model()
+            )));
+        }
+        if self.model.provider_metadata_mode != self.provider.metadata_mode() {
+            return Err(LlmError::Message(format!(
+                "ChatRequest model profile metadata mode {:?} does not match canonical provider target mode {:?}",
+                self.model.provider_metadata_mode,
+                self.provider.metadata_mode()
+            )));
+        }
         self.validate_request_envelope_shape()?;
         if let Some(capability_api_mode) = self.reasoning_capability.api_mode()
             && capability_api_mode != self.provider.api_mode()
@@ -411,9 +430,18 @@ impl ChatRequest {
 
     fn validate_request_envelope_shape(&self) -> Result<(), LlmError> {
         let limits = self.provider.request_limits();
+        let message_count = if self.provider.api_mode() == ProviderApiMode::ChatCompletions {
+            self.messages
+                .iter()
+                .filter(|message| !matches!(message, ModelMessage::System { .. }))
+                .count()
+                .saturating_add(1)
+        } else {
+            self.messages.len()
+        };
         ensure_request_limit(
             ProviderRequestLimit::MessageCount,
-            self.messages.len() as u64,
+            message_count as u64,
             limits.max_messages as u64,
         )?;
         ensure_request_limit(
@@ -898,6 +926,123 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn chat_message_limit_counts_the_injected_system_message() {
+        let mut provider = ProviderTarget::new(
+            "http://lm-studio.local:1234/v1",
+            "fixture-model",
+            ProviderMetadataMode::OpenAiCompatibleOnly,
+            ProviderApiMode::ChatCompletions,
+            ProviderDeadlines {
+                response_start_timeout_ms: 10_000,
+                stream_idle_timeout_ms: 10_000,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 0,
+            },
+        )
+        .expect("typed provider target");
+        let mut limits = ProviderRequestLimits::product_default();
+        limits.max_messages = 2;
+        provider.replace_request_limits(limits);
+        let mut request = ChatRequest::new(
+            provider,
+            ModelProfile {
+                name: "fixture-model".to_string(),
+                context_window: 16_384,
+                max_output_tokens: 1_024,
+                provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+                capabilities: ModelCapabilities {
+                    supports_tools: true,
+                    supports_reasoning: false,
+                    supports_images: false,
+                },
+            },
+            "injected system".to_string(),
+            vec![
+                ModelMessage::System {
+                    content: "merged system".to_string(),
+                },
+                ModelMessage::User {
+                    content: "first user".to_string(),
+                },
+            ],
+            Vec::new(),
+            None,
+            ProviderReasoningCapability::Unsupported,
+            std::collections::BTreeMap::new(),
+        );
+
+        request
+            .validate_provider_lifecycle()
+            .expect("one wire system plus one user reaches the boundary");
+        request.messages.push(ModelMessage::User {
+            content: "second user".to_string(),
+        });
+
+        assert!(matches!(
+            request.validate_provider_lifecycle(),
+            Err(LlmError::ProviderRequestLimitExceeded {
+                surface: ProviderRequestLimit::MessageCount,
+                actual: 3,
+                maximum: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_lifecycle_rejects_stale_or_blank_model_profiles() {
+        let provider = ProviderTarget::new(
+            "http://lm-studio.local:1234/v1",
+            "canonical-model",
+            ProviderMetadataMode::OpenAiCompatibleOnly,
+            ProviderApiMode::Responses,
+            ProviderDeadlines {
+                response_start_timeout_ms: 10_000,
+                stream_idle_timeout_ms: 10_000,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 0,
+            },
+        )
+        .expect("typed provider target");
+        let mut request = ChatRequest::new(
+            provider,
+            ModelProfile {
+                name: "stale-model".to_string(),
+                context_window: 16_384,
+                max_output_tokens: 1_024,
+                provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+                capabilities: ModelCapabilities {
+                    supports_tools: true,
+                    supports_reasoning: false,
+                    supports_images: false,
+                },
+            },
+            "system".to_string(),
+            vec![ModelMessage::User {
+                content: "request".to_string(),
+            }],
+            Vec::new(),
+            None,
+            ProviderReasoningCapability::Unsupported,
+            std::collections::BTreeMap::new(),
+        );
+
+        let stale = request
+            .validate_provider_lifecycle()
+            .expect_err("stale model profile must fail closed");
+        assert!(
+            stale
+                .to_string()
+                .contains("canonical provider target model")
+        );
+
+        request.model.name = " \t ".to_string();
+        let blank = request
+            .validate_provider_lifecycle()
+            .expect_err("blank model profile must fail closed");
+        assert!(blank.to_string().contains("must not be empty"));
     }
 
     #[test]

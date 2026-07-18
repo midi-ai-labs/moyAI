@@ -28,8 +28,7 @@ import { createUiLocalState, reconcileAgentPaneState } from "./ui_state";
 import {
   InteractionLifecycle,
   type InteractionRelease,
-  shouldBeginKeyboardInteraction,
-  shouldBeginPointerInteraction,
+  installInteractionEventGate,
 } from "./interaction_lifecycle";
 import {
   appliedProjectionRevision,
@@ -81,11 +80,6 @@ let splashTimer: number | null = null;
 const splashStartedAt = performance.now();
 const SPLASH_MIN_VISIBLE_MS = 5000;
 const THREAD_END_THRESHOLD_PX = 96;
-// This timer is only a lost-event recovery path. Active pointer movement, key events,
-// and IME updates continuously re-arm it, so a genuinely live interaction is not
-// interrupted while a missing pointerup/keyup/compositionend cannot hide a terminal
-// or permission projection for minutes.
-const INTERACTION_INACTIVITY_RECOVERY_MS = 10_000;
 const uiState = createUiLocalState();
 
 interface StateUpdate {
@@ -108,7 +102,6 @@ const interactionLifecycle = new InteractionLifecycle<StateUpdate>((current, can
 let nextStateSequence = 1;
 let lastAppliedStateSequence = 0;
 let lastAppliedProjectionRevision = "0";
-let interactionWatchdog: number | null = null;
 const modalScrollReturnStack: ScrollSnapshot[][] = [];
 const modalDetailsReturnStack: DetailSnapshot[][] = [];
 const modalFocusReturnStack: Array<FocusSnapshot | null> = [];
@@ -135,9 +128,13 @@ const eventContext: ActionContext = {
   setWindowMaximized,
 };
 
-installPointerRenderGate();
-installKeyboardStateGate();
-installCompositionStateGate();
+installInteractionEventGate({
+  documentTarget: document,
+  windowTarget: window,
+  appRoot,
+  lifecycle: interactionLifecycle,
+  finish: finishInteraction,
+});
 installWindowMaximizedSync();
 void refresh();
 window.setInterval(() => {
@@ -730,113 +727,8 @@ function isModalClosing(previous: DesktopWebState, state: DesktopWebState): bool
   );
 }
 
-function installPointerRenderGate(): void {
-  document.addEventListener(
-    "pointerdown",
-    (event) => {
-      const target = event.target;
-      if (!(target instanceof Element) || !shouldBeginPointerInteraction(event.button, appRoot.contains(target))) return;
-      const directOwner = target.closest<HTMLElement>(
-        'input, textarea, select, summary, [contenteditable="true"]',
-      );
-      const action = target.closest<HTMLElement>("[data-action]");
-      const owner = directOwner ?? action;
-      if (!interactionLifecycle.beginPointer(event.pointerId)) return;
-      if (owner && !owner.matches(":disabled")) {
-        try {
-          owner.setPointerCapture(event.pointerId);
-        } catch {
-          // Text selection, native scrollbars, and synthetic pointer events may not support capture.
-        }
-      }
-      armInteractionWatchdog();
-    },
-    true,
-  );
-  document.addEventListener(
-    "pointerup",
-    (event) => window.setTimeout(() => finishInteraction(interactionLifecycle.endPointer(event.pointerId)), 0),
-    true,
-  );
-  document.addEventListener("pointermove", () => {
-    if (interactionLifecycle.active) armInteractionWatchdog();
-  }, true);
-  document.addEventListener("pointercancel", (event) => finishInteraction(interactionLifecycle.endPointer(event.pointerId)), true);
-  document.addEventListener(
-    "lostpointercapture",
-    (event) => window.setTimeout(() => finishInteraction(interactionLifecycle.endPointer(event.pointerId)), 0),
-    true,
-  );
-  window.addEventListener("blur", cancelInteractionLifecycle);
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) cancelInteractionLifecycle();
-  });
-}
-
-function installKeyboardStateGate(): void {
-  document.addEventListener(
-    "keydown",
-    (event) => {
-      const target = event.target;
-      if (!(target instanceof Element)) return;
-      const disabledOwner = target.closest<HTMLElement>(":disabled");
-      if (!shouldBeginKeyboardInteraction(
-        event.isComposing,
-        event.code,
-        appRoot.contains(target),
-        disabledOwner !== null,
-      )) return;
-      interactionLifecycle.beginKey(event.code);
-      armInteractionWatchdog();
-    },
-    true,
-  );
-  document.addEventListener(
-    "keyup",
-    (event) => {
-      window.setTimeout(() => finishInteraction(interactionLifecycle.endKey(event.code)), 0);
-    },
-    true,
-  );
-  window.addEventListener("blur", cancelInteractionLifecycle);
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) cancelInteractionLifecycle();
-  });
-}
-
-function installCompositionStateGate(): void {
-  document.addEventListener("compositionstart", () => {
-    interactionLifecycle.beginComposition();
-    armInteractionWatchdog();
-  }, true);
-  document.addEventListener("compositionend", () => {
-    window.setTimeout(() => finishInteraction(interactionLifecycle.endComposition()), 0);
-  }, true);
-  document.addEventListener("compositionupdate", armInteractionWatchdog, true);
-  document.addEventListener("input", (event) => {
-    if ((event as InputEvent).isComposing) armInteractionWatchdog();
-  }, true);
-  window.addEventListener("blur", cancelInteractionLifecycle);
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) cancelInteractionLifecycle();
-  });
-}
-
-function armInteractionWatchdog(): void {
-  if (interactionWatchdog !== null) window.clearTimeout(interactionWatchdog);
-  interactionWatchdog = window.setTimeout(cancelInteractionLifecycle, INTERACTION_INACTIVITY_RECOVERY_MS);
-}
-
-function cancelInteractionLifecycle(): void {
-  finishInteraction(interactionLifecycle.cancel());
-}
-
 function finishInteraction(release: InteractionRelease<StateUpdate> | null): void {
   if (!release) return;
-  if (interactionWatchdog !== null) {
-    window.clearTimeout(interactionWatchdog);
-    interactionWatchdog = null;
-  }
   if (release.deferred && deferredStateUpdateStillAccepted(release.deferred)) {
     applyStateUpdate({ ...release.deferred, render: release.deferred.render || release.renderCurrent });
   } else if (release.renderCurrent && currentState) {

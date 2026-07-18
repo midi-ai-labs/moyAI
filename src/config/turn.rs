@@ -127,6 +127,16 @@ pub enum ProviderEndpointError {
     FragmentNotAllowed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ResolvedTurnConfigError {
+    #[error(transparent)]
+    ProviderEndpoint(#[from] ProviderEndpointError),
+    #[error("{message}")]
+    ProviderRuntime { message: String },
+    #[error("{message}")]
+    WorkspaceBoundary { message: String },
+}
+
 /// The only parsed owner of an OpenAI-compatible provider endpoint.
 ///
 /// It accepts an HTTP(S) origin or base path (including LM Studio's optional
@@ -270,10 +280,22 @@ impl ProviderTarget {
         metadata_mode: ProviderMetadataMode,
         api_mode: ProviderApiMode,
         deadlines: ProviderDeadlines,
-    ) -> Result<Self, ProviderEndpointError> {
+    ) -> Result<Self, ResolvedTurnConfigError> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(ResolvedTurnConfigError::ProviderRuntime {
+                message: "config field `model.model` must not be empty".to_string(),
+            });
+        }
+        if deadlines.response_start_timeout_ms == 0 {
+            return Err(ResolvedTurnConfigError::ProviderRuntime {
+                message: "config field `model.request_timeout_ms` must be greater than zero"
+                    .to_string(),
+            });
+        }
         Ok(Self {
             endpoint: ProviderEndpoint::parse(endpoint)?,
-            model: Arc::from(model.trim().to_string()),
+            model: Arc::from(model),
             metadata_mode,
             api_mode,
             deadlines,
@@ -282,7 +304,7 @@ impl ProviderTarget {
         })
     }
 
-    pub fn from_resolved_config(config: &ResolvedConfig) -> Result<Self, ProviderEndpointError> {
+    pub fn from_resolved_config(config: &ResolvedConfig) -> Result<Self, ResolvedTurnConfigError> {
         Self::new(
             &config.model.base_url,
             &config.model.model,
@@ -338,12 +360,6 @@ impl ProviderTarget {
     pub(crate) fn replace_stream_limits(&mut self, stream_limits: ProviderStreamLimits) {
         self.stream_limits = stream_limits;
     }
-
-    fn with_model_override(&self, model: &str) -> Self {
-        let mut target = self.clone();
-        target.model = Arc::from(model.trim().to_string());
-        target
-    }
 }
 
 impl fmt::Debug for ProviderTarget {
@@ -373,16 +389,23 @@ pub struct ResolvedTurnConfig {
 }
 
 impl ResolvedTurnConfig {
-    pub fn capture(mut effective: ResolvedConfig) -> Result<Self, ProviderEndpointError> {
+    pub fn capture(mut effective: ResolvedConfig) -> Result<Self, ResolvedTurnConfigError> {
+        effective
+            .normalize_and_validate_provider_runtime()
+            .map_err(|message| ResolvedTurnConfigError::ProviderRuntime { message })?;
+        effective
+            .validate_workspace_boundary_roots()
+            .map_err(|message| ResolvedTurnConfigError::WorkspaceBoundary { message })?;
         let provider = ProviderTarget::from_resolved_config(&effective)?;
         effective.model.base_url = provider.sanitized_endpoint().to_string();
+        effective.model.model = provider.model().to_string();
         Ok(Self {
             effective: Arc::new(effective),
             provider,
         })
     }
 
-    pub fn from_effective(effective: &ResolvedConfig) -> Result<Self, ProviderEndpointError> {
+    pub fn from_effective(effective: &ResolvedConfig) -> Result<Self, ResolvedTurnConfigError> {
         Self::capture(effective.clone())
     }
 
@@ -394,13 +417,10 @@ impl ResolvedTurnConfig {
         &self.provider
     }
 
-    pub fn with_model_override(&self, model: &str) -> Self {
+    pub fn with_model_override(&self, model: &str) -> Result<Self, ResolvedTurnConfigError> {
         let mut effective = self.runtime_config().clone();
         effective.model.model = model.to_string();
-        Self {
-            effective: Arc::new(effective),
-            provider: self.provider.with_model_override(model),
-        }
+        Self::capture(effective)
     }
 }
 
@@ -494,6 +514,43 @@ mod tests {
     }
 
     #[test]
+    fn complete_turn_capture_owns_canonical_model_and_response_start_deadline() {
+        let mut canonical = ResolvedConfig::default();
+        canonical.model.model = "  canonical-model  ".to_string();
+        let turn = ResolvedTurnConfig::capture(canonical).expect("canonical turn config");
+        assert_eq!(turn.runtime_config().model.model, "canonical-model");
+        assert_eq!(turn.provider().model(), "canonical-model");
+
+        let overridden = turn
+            .with_model_override("  override-model  ")
+            .expect("valid canonical model override");
+        assert_eq!(overridden.runtime_config().model.model, "override-model");
+        assert_eq!(overridden.provider().model(), "override-model");
+        assert!(turn.with_model_override(" \t ").is_err());
+
+        for (field, mut invalid) in [
+            ("model.model", {
+                let mut config = ResolvedConfig::default();
+                config.model.model = "  ".to_string();
+                config
+            }),
+            ("model.request_timeout_ms", {
+                let mut config = ResolvedConfig::default();
+                config.model.request_timeout_ms = 0;
+                config
+            }),
+        ] {
+            let error = ResolvedTurnConfig::capture(std::mem::take(&mut invalid))
+                .expect_err("invalid provider runtime config must fail closed");
+            assert!(matches!(
+                &error,
+                ResolvedTurnConfigError::ProviderRuntime { .. }
+            ));
+            assert!(error.to_string().contains(field));
+        }
+    }
+
+    #[test]
     fn turn_capture_freezes_access_and_multi_agent_settings() {
         let mut effective = ResolvedConfig::default();
         effective.permissions.access_mode = crate::config::AccessMode::Default;
@@ -509,6 +566,34 @@ mod tests {
             crate::config::AccessMode::Default
         );
         assert!(!turn.runtime_config().multi_agent.enabled);
+    }
+
+    #[test]
+    fn complete_turn_capture_rejects_relative_workspace_boundary_roots() {
+        let mut additional_read = ResolvedConfig::default();
+        additional_read.permissions.additional_read_roots =
+            vec![camino::Utf8PathBuf::from("relative/read-root")];
+        let mut additional_write = ResolvedConfig::default();
+        additional_write.permissions.additional_write_roots =
+            vec![camino::Utf8PathBuf::from("relative/write-root")];
+        let mut protected = ResolvedConfig::default();
+        protected.workspace.protected_paths =
+            vec![camino::Utf8PathBuf::from("relative/protected-root")];
+
+        for (field, config) in [
+            ("permissions.additional_read_roots[0]", additional_read),
+            ("permissions.additional_write_roots[0]", additional_write),
+            ("workspace.protected_paths[0]", protected),
+        ] {
+            let error = ResolvedTurnConfig::capture(config)
+                .expect_err("relative safety roots must not enter immutable turn state");
+            assert!(matches!(
+                &error,
+                ResolvedTurnConfigError::WorkspaceBoundary { .. }
+            ));
+            assert!(error.to_string().contains(field));
+            assert!(error.to_string().contains("absolute path"));
+        }
     }
 
     #[test]
@@ -541,6 +626,42 @@ mod tests {
                 connect_timeout_ms: 3_000,
                 max_connect_retries: 4,
             }
+        );
+    }
+
+    #[test]
+    fn provider_target_constructor_rejects_blank_model_and_zero_response_start_deadline() {
+        let deadlines = ProviderDeadlines {
+            response_start_timeout_ms: 1_000,
+            stream_idle_timeout_ms: 1_000,
+            connect_timeout_ms: 100,
+            max_connect_retries: 0,
+        };
+        let blank_model = ProviderTarget::new(
+            "http://provider.local",
+            " \t ",
+            ProviderMetadataMode::OpenAiCompatibleOnly,
+            ProviderApiMode::Responses,
+            deadlines,
+        )
+        .expect_err("blank provider model must fail closed");
+        assert!(blank_model.to_string().contains("model.model"));
+
+        let zero_deadline = ProviderTarget::new(
+            "http://provider.local",
+            "configured-model",
+            ProviderMetadataMode::OpenAiCompatibleOnly,
+            ProviderApiMode::Responses,
+            ProviderDeadlines {
+                response_start_timeout_ms: 0,
+                ..deadlines
+            },
+        )
+        .expect_err("zero response-start deadline must fail closed");
+        assert!(
+            zero_deadline
+                .to_string()
+                .contains("model.request_timeout_ms")
         );
     }
 }

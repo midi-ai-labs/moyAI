@@ -9,7 +9,7 @@ use crate::config::PermissionProfileCatalog;
 use crate::config::{AccessMode, ResolvedConfig};
 use crate::context::current_time::CurrentTimeSnapshot;
 use crate::error::WorkspaceError;
-use crate::workspace::{AccessKind, PathGuard, Workspace, instruction_file_names};
+use crate::workspace::{AccessKind, PathGuard, Workspace, instruction_file_names, is_rule_file};
 
 const MAX_CONTEXT_SOURCE_BYTES: usize = 16 * 1024;
 const MAX_CONTEXT_TOTAL_BYTES: usize = 48 * 1024;
@@ -177,7 +177,7 @@ pub struct InstructionsSection {
 
 impl InstructionsSection {
     pub fn load(workspace: &Workspace, config: &ResolvedConfig) -> Result<Self, WorkspaceError> {
-        let (candidates, discovery_truncated) = instruction_candidates(workspace, config);
+        let (candidates, discovery_truncated) = instruction_candidates(workspace, config)?;
         let candidates = merge_instruction_candidates(candidates);
 
         let mut total_bytes = 0usize;
@@ -290,10 +290,13 @@ impl WorldStateSection for CurrentTimeSection {
 fn instruction_candidates(
     workspace: &Workspace,
     config: &ResolvedConfig,
-) -> (
-    Vec<(Utf8PathBuf, InstructionKind, InstructionPathAuthority)>,
-    bool,
-) {
+) -> Result<
+    (
+        Vec<(Utf8PathBuf, InstructionKind, InstructionPathAuthority)>,
+        bool,
+    ),
+    WorkspaceError,
+> {
     let mut candidates = Vec::new();
     let mut current = Some(workspace.cwd.as_path());
     while let Some(dir) = current {
@@ -309,7 +312,7 @@ fn instruction_candidates(
         }
         current = dir.parent();
     }
-    let (rules, rules_truncated) = rule_candidates(&workspace.root);
+    let (rules, rules_truncated) = rule_candidates(&workspace.root)?;
     candidates.extend(
         rules
             .into_iter()
@@ -326,19 +329,34 @@ fn instruction_candidates(
         };
         (resolved, InstructionKind::Configured, authority)
     }));
-    (candidates, rules_truncated)
+    Ok((candidates, rules_truncated))
 }
 
-fn rule_candidates(root: &Utf8Path) -> (Vec<(Utf8PathBuf, InstructionKind)>, bool) {
+fn rule_candidates(
+    root: &Utf8Path,
+) -> Result<(Vec<(Utf8PathBuf, InstructionKind)>, bool), WorkspaceError> {
     let moyai_dir = root.join(".moyai");
-    if !moyai_dir.exists() {
-        return (Vec::new(), false);
+    if !moyai_dir.try_exists()? {
+        return Ok((Vec::new(), false));
     }
+    collect_rule_candidates(root, WalkBuilder::new(&moyai_dir).hidden(false).build())
+}
+
+fn collect_rule_candidates(
+    root: &Utf8Path,
+    entries: impl IntoIterator<Item = Result<ignore::DirEntry, ignore::Error>>,
+) -> Result<(Vec<(Utf8PathBuf, InstructionKind)>, bool), WorkspaceError> {
     let mut candidates = Vec::new();
     let mut visited_entries = 0usize;
-    for entry in WalkBuilder::new(&moyai_dir).hidden(false).build().flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            WorkspaceError::Message(format!(
+                "rule discovery failed below `{}`: {error}",
+                root.join(".moyai")
+            ))
+        })?;
         if visited_entries >= MAX_RULE_DISCOVERY_VISITS {
-            return (candidates, true);
+            return Ok((candidates, true));
         }
         visited_entries = visited_entries.saturating_add(1);
         if !entry
@@ -347,29 +365,21 @@ fn rule_candidates(root: &Utf8Path) -> (Vec<(Utf8PathBuf, InstructionKind)>, boo
         {
             continue;
         }
-        let Ok(path) = Utf8PathBuf::from_path_buf(entry.into_path()) else {
-            continue;
-        };
-        let Some(relative) = path.strip_prefix(root).ok() else {
-            continue;
-        };
-        let mut components = relative.components();
-        let Some(first) = components.next() else {
-            continue;
-        };
-        let Some(second) = components.next() else {
-            continue;
-        };
-        if first.as_str() == ".moyai"
-            && (second.as_str() == "rules" || second.as_str().starts_with("rules-"))
-        {
+        let path = Utf8PathBuf::from_path_buf(entry.into_path()).map_err(|path| {
+            WorkspaceError::Message(format!(
+                "rule discovery returned a non-UTF-8 path below `{}`: {}",
+                root.join(".moyai"),
+                path.display()
+            ))
+        })?;
+        if is_rule_file(root, &path) {
             if candidates.len() >= MAX_RULE_CANDIDATES {
-                return (candidates, true);
+                return Ok((candidates, true));
             }
             candidates.push((path, InstructionKind::Rules));
         }
     }
-    (candidates, false)
+    Ok((candidates, false))
 }
 
 fn relative_display_path(root: &Utf8Path, path: &Utf8Path) -> String {
@@ -493,6 +503,49 @@ mod tests {
         assert!(state.snapshot.sections.contains_key("environment"));
         assert!(state.snapshot.sections.contains_key("instructions"));
         assert!(state.snapshot.sections.contains_key("current_time"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rule_authority_case_variants_are_loaded_into_world_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
+        std::fs::create_dir_all(root.join(".MOYAI/RuLeS-Team")).expect("rules dir");
+        std::fs::write(
+            root.join(".MOYAI/RuLeS-Team/policy.md"),
+            "WINDOWS_CASE_RULE_AUTHORITY",
+        )
+        .expect("rule");
+
+        let section =
+            super::InstructionsSection::load(&workspace(root), &ResolvedConfig::default())
+                .expect("instructions");
+
+        assert_eq!(section.sources.len(), 1);
+        assert_eq!(section.sources[0].kind, super::InstructionKind::Rules);
+        assert_eq!(section.sources[0].content, "WINDOWS_CASE_RULE_AUTHORITY");
+    }
+
+    #[test]
+    fn rule_discovery_error_fails_closed_instead_of_returning_partial_instructions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
+        let entries = std::iter::once(Result::<ignore::DirEntry, ignore::Error>::Err(
+            ignore::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected rule discovery failure",
+            )),
+        ));
+
+        let error = super::collect_rule_candidates(&root, entries)
+            .expect_err("rule discovery errors must fail closed");
+
+        assert!(error.to_string().contains("rule discovery failed below"));
+        assert!(
+            error
+                .to_string()
+                .contains("injected rule discovery failure")
+        );
     }
 
     #[test]

@@ -402,8 +402,8 @@ pub fn apply_provider_model_info_to_config(
     if let Some(value) = model.supports_images {
         config.supports_images = value;
     }
-    if model.supports_tools == Some(true) {
-        config.supports_tools = true;
+    if let Some(value) = model.supports_tools {
+        config.supports_tools = value;
     }
     if let Some(value) = model.supports_reasoning {
         config.supports_reasoning = value;
@@ -458,15 +458,63 @@ pub fn validate_model_availability_report(
             report.require_vision, require_vision
         )));
     }
+    let listed_in_v1 = report.v1_models.iter().any(|model| model == &report.model);
+    if report.v1_present != listed_in_v1 {
+        return Err(LlmError::Message(format!(
+            "model availability report for `{}` has inconsistent OpenAI-compatible catalog evidence",
+            report.model
+        )));
+    }
+    let listed_in_native = report
+        .native_models
+        .iter()
+        .any(|model| model == &report.model);
+    if report.native_present != listed_in_native {
+        return Err(LlmError::Message(format!(
+            "model availability report for `{}` has inconsistent LM Studio catalog evidence",
+            report.model
+        )));
+    }
+    if !model_availability_passes(
+        report.provider_metadata_mode,
+        report.v1_present,
+        report.native_present,
+        report.require_vision,
+        report.vision_capable,
+        report.load_state,
+    ) {
+        return Err(LlmError::Message(format!(
+            "model availability report for `{}` claims Pass without the required catalog, load-state, and vision evidence",
+            report.model
+        )));
+    }
     let matched_model = report.matched_model.as_ref().ok_or_else(|| {
         LlmError::Message(format!(
             "model availability report passed without matched model metadata for `{}`",
             report.model
         ))
     })?;
+    if matched_model.id != report.model {
+        return Err(LlmError::Message(format!(
+            "model availability report matched model `{}` does not match report model `{}`",
+            matched_model.id, report.model
+        )));
+    }
     if matched_model.load_state != report.load_state {
         return Err(LlmError::Message(format!(
             "model availability report for `{}` has inconsistent load-state evidence",
+            report.model
+        )));
+    }
+    if report.vision_capable != matched_model.supports_images.unwrap_or(false)
+        || report.tool_use_capable != matched_model.supports_tools
+        || report.reasoning_capable != matched_model.supports_reasoning
+        || report.context != matched_model.context_window
+        || report.max_output_tokens != matched_model.max_output_tokens
+        || report.max_parallel_predictions != matched_model.max_parallel_predictions
+    {
+        return Err(LlmError::Message(format!(
+            "model availability report for `{}` has derived capability or limit fields that do not match the selected model evidence",
             report.model
         )));
     }
@@ -943,7 +991,7 @@ mod tests {
             v1_present: true,
             native_present: true,
             require_vision,
-            vision_capable: require_vision,
+            vision_capable: matched_model.supports_images.unwrap_or(false),
             tool_use_capable: Some(true),
             reasoning_capable: Some(true),
             context: matched_model.context_window,
@@ -1015,6 +1063,37 @@ mod tests {
         let mut incomplete = report.clone();
         incomplete.matched_model = None;
         assert!(validate_model_availability_report(&config, &incomplete, false).is_err());
+
+        let mut mismatched_evidence = report.clone();
+        mismatched_evidence
+            .matched_model
+            .as_mut()
+            .expect("matched model evidence")
+            .id = "other-model".to_string();
+        assert!(validate_model_availability_report(&config, &mismatched_evidence, false).is_err());
+
+        let mut missing_catalog_entry = report.clone();
+        missing_catalog_entry.v1_models.clear();
+        assert!(
+            validate_model_availability_report(&config, &missing_catalog_entry, false).is_err()
+        );
+
+        let mut unproven_catalog_presence = report.clone();
+        unproven_catalog_presence.v1_present = false;
+        unproven_catalog_presence.v1_models.clear();
+        assert!(
+            validate_model_availability_report(&config, &unproven_catalog_presence, false).is_err()
+        );
+
+        let mut mismatched_projection = report.clone();
+        mismatched_projection.context = Some(1);
+        assert!(
+            validate_model_availability_report(&config, &mismatched_projection, false).is_err()
+        );
+
+        let mut vision_report = passing_availability_report(&config, true);
+        vision_report.vision_capable = false;
+        assert!(validate_model_availability_report(&config, &vision_report, true).is_err());
 
         let mut failed = report;
         failed.status = ModelAvailabilityStatus::Fail;
@@ -1095,6 +1174,28 @@ mod tests {
         assert_eq!(models[0].max_output_tokens, None);
         assert_eq!(config.context_window, 131_072);
         assert_eq!(config.max_output_tokens, 4_096);
+    }
+
+    #[test]
+    fn provider_model_info_explicit_false_disables_tools() {
+        let mut config = ResolvedConfig::default().model;
+        config.supports_tools = true;
+        let model = ProviderModelInfo {
+            id: "tool-less-model".to_string(),
+            display_name: None,
+            context_window: None,
+            max_output_tokens: None,
+            supports_images: None,
+            supports_tools: Some(false),
+            supports_reasoning: None,
+            max_parallel_predictions: None,
+            load_state: ProviderModelLoadState::Unknown,
+            source: "test".to_string(),
+        };
+
+        apply_provider_model_info_to_config(&mut config, &model);
+
+        assert!(!config.supports_tools);
     }
 
     #[tokio::test]

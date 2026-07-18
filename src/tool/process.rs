@@ -9,7 +9,9 @@ use crate::tool::truncate::{BoundedPipeOutput, read_pipe_bounded};
 
 const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(3);
 const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(windows)]
 const CLEANUP_HELPER_TIMEOUT: Duration = Duration::from_millis(1_500);
+#[cfg(windows)]
 const CLEANUP_HELPER_REAP_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Cancellation callers must keep the tool future alive for at least this
@@ -261,6 +263,7 @@ async fn drain_pipe_reader(
     }
 }
 
+#[cfg(windows)]
 async fn run_cleanup_helper(
     mut command: Command,
     hide_window: bool,
@@ -306,6 +309,7 @@ async fn run_cleanup_helper(
     }
 }
 
+#[cfg(windows)]
 fn cleanup_helper_status(status: ExitStatus, label: &str) -> Result<(), io::Error> {
     if status.success() {
         return Ok(());
@@ -494,20 +498,37 @@ fn configure_process_group(_command: &mut Command, _hide_window: bool, _start_su
 
 #[cfg(unix)]
 async fn kill_process_tree(pid: u32, _hide_window: bool) -> Result<(), io::Error> {
-    let process_group = format!("-{pid}");
-    let mut terminate = Command::new("/bin/kill");
-    terminate
-        .args(["-TERM", &process_group])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let terminate_result = run_cleanup_helper(terminate, false, "process-group TERM").await;
+    let terminate_result = signal_unix_process_group(pid, libc::SIGTERM);
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut kill = Command::new("/bin/kill");
-    kill.args(["-KILL", &process_group])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let kill_result = run_cleanup_helper(kill, false, "process-group KILL").await;
+    let kill_result = signal_unix_process_group(pid, libc::SIGKILL);
     combine_cleanup_results(terminate_result, kill_result)
+}
+
+#[cfg(unix)]
+fn signal_unix_process_group(pid: u32, signal: i32) -> Result<(), io::Error> {
+    let pid = i32::try_from(pid).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("process id {pid} does not fit the Unix pid type"),
+        )
+    })?;
+    if pid <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process id must be positive",
+        ));
+    }
+    // SAFETY: a negative positive pid addresses exactly one process group and `signal` is one of
+    // the platform signal constants supplied by the caller.
+    if unsafe { libc::kill(-pid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 #[cfg(windows)]
@@ -547,6 +568,7 @@ async fn kill_process_tree(_pid: u32, _hide_window: bool) -> Result<(), io::Erro
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::cleanup_helper_status;
 
     #[cfg(windows)]
@@ -564,15 +586,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn cleanup_helper_rejects_nonzero_unix_exit_status() {
-        use std::os::unix::process::ExitStatusExt;
-
-        let status = std::process::ExitStatus::from_raw(7 << 8);
-        assert!(cleanup_helper_status(status, "test").is_err());
-    }
-
     #[cfg(windows)]
     #[test]
     fn cleanup_helper_rejects_nonzero_windows_exit_status() {
@@ -580,5 +593,29 @@ mod tests {
 
         let status = std::process::ExitStatus::from_raw(7);
         assert!(cleanup_helper_status(status, "test").is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn absent_process_group_cleanup_is_idempotent() {
+        super::kill_process_tree(i32::MAX as u32, false)
+            .await
+            .expect("an already absent process group is clean");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_process_exit_does_not_report_false_cleanup_failure() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let mut process = super::ManagedProcess::spawn(command, false, 1_024)
+            .await
+            .expect("spawn normal process");
+        let status = process.wait().await.expect("wait normal process");
+
+        let output = process.finish_after_exit(status).await;
+
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert_eq!(output.cleanup_error(), None);
     }
 }

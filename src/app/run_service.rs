@@ -547,7 +547,8 @@ impl RunService {
         let turn_config = Arc::new(
             ResolvedTurnConfig::capture(effective_config.clone())
                 .map_err(|error| AppRunError::Message(error.to_string()))?
-                .with_model_override(&turn_policy.model.id),
+                .with_model_override(&turn_policy.model.id)
+                .map_err(|error| AppRunError::Message(error.to_string()))?,
         );
         if request.agent_context.is_none() {
             let child_states = self

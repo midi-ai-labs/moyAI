@@ -2050,44 +2050,8 @@ impl SqliteSessionRepository {
         &self,
         project_id: ProjectId,
     ) -> Result<Option<SessionId>, StorageError> {
-        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let mut statement = connection.prepare(
-            "SELECT id, status, active_run_id, active_turn_id,
-                    active_run_lease_expires_at_ms,
-                    (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
-                     WHERE terminal_event.session_id = sessions.id
-                       AND terminal_event.turn_id = sessions.active_turn_id
-                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
-                    (SELECT terminal_event.msg_json FROM protocol_runtime_events AS terminal_event
-                     WHERE terminal_event.session_id = sessions.id
-                       AND terminal_event.turn_id = sessions.active_turn_id
-                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
-                     ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC LIMIT 1)
-             FROM sessions
-             WHERE project_id = ?1
-               AND (
-                   status = 'running'
-                   OR status NOT IN ('idle', 'completed', 'cancelled', 'failed')
-                   OR active_run_id IS NOT NULL
-                   OR active_turn_id IS NOT NULL
-                   OR active_run_lease_expires_at_ms IS NOT NULL
-               )
-             ORDER BY updated_at_ms DESC, id DESC",
-        )?;
-        let mut rows = statement.query(params![project_id.to_string()])?;
-        let mut first_blocker = None;
-        while let Some(row) = rows.next()? {
-            let session_id = parse_session_id_column(row, 0)?;
-            let runtime_state = validate_raw_session_runtime_state(
-                session_id,
-                raw_session_runtime_state_from_row(row, 1)?,
-            )?;
-            if first_blocker.is_none() && runtime_state.blocks_mutation_at(now) {
-                first_blocker = Some(session_id);
-            }
-        }
-        Ok(first_blocker)
+        mutation_blocker_for_project_in_connection(&connection, project_id, SystemClock::now_ms())
     }
 
     pub(crate) async fn terminalize_captured_running_session_with_protocol_event(
@@ -3107,6 +3071,50 @@ impl SessionRepository for SqliteSessionRepository {
         self.delete_session_tree(id).await?;
         Ok(())
     }
+}
+
+pub(crate) fn mutation_blocker_for_project_in_connection(
+    connection: &Connection,
+    project_id: ProjectId,
+    now_ms: i64,
+) -> Result<Option<SessionId>, StorageError> {
+    let now_ms = normalize_run_lease_now_ms(now_ms);
+    let mut statement = connection.prepare(
+        "SELECT id, status, active_run_id, active_turn_id,
+                active_run_lease_expires_at_ms,
+                (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
+                 WHERE terminal_event.session_id = sessions.id
+                   AND terminal_event.turn_id = sessions.active_turn_id
+                   AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
+                (SELECT terminal_event.msg_json FROM protocol_runtime_events AS terminal_event
+                 WHERE terminal_event.session_id = sessions.id
+                   AND terminal_event.turn_id = sessions.active_turn_id
+                   AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
+                 ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC LIMIT 1)
+         FROM sessions
+         WHERE project_id = ?1
+           AND (
+               status = 'running'
+               OR status NOT IN ('idle', 'completed', 'cancelled', 'failed')
+               OR active_run_id IS NOT NULL
+               OR active_turn_id IS NOT NULL
+               OR active_run_lease_expires_at_ms IS NOT NULL
+           )
+         ORDER BY updated_at_ms DESC, id DESC",
+    )?;
+    let mut rows = statement.query(params![project_id.to_string()])?;
+    let mut first_blocker = None;
+    while let Some(row) = rows.next()? {
+        let session_id = parse_session_id_column(row, 0)?;
+        let runtime_state = validate_raw_session_runtime_state(
+            session_id,
+            raw_session_runtime_state_from_row(row, 1)?,
+        )?;
+        if first_blocker.is_none() && runtime_state.blocks_mutation_at(now_ms) {
+            first_blocker = Some(session_id);
+        }
+    }
+    Ok(first_blocker)
 }
 
 fn active_session_for_mutation_branch(

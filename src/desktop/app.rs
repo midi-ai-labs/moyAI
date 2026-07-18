@@ -479,7 +479,7 @@ enum SessionLoadReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CurrentSessionRefreshPurpose {
     Refresh,
-    StopSettlement,
+    StopSettlement { root_admission_fence: u64 },
 }
 
 fn stop_settlement_status_message(status: SessionStatus) -> &'static str {
@@ -635,6 +635,19 @@ fn finish_steer_submission(
             false
         }
     }
+}
+
+fn finish_steer_operation_if_current(
+    state: &mut DesktopState,
+    workspace_root: &Utf8Path,
+    target: &SteerSubmissionTarget,
+) -> bool {
+    if target.workspace_root != workspace_root
+        || state.app_state.current_session_id != Some(target.session_id)
+    {
+        return false;
+    }
+    state.finish_steer_submission(target.operation_id)
 }
 
 fn finish_durable_agent_activity_refresh_request(
@@ -1912,6 +1925,143 @@ mod command_projection_owner_tests {
             },
             agent_activity_records: None,
         }
+    }
+
+    #[tokio::test]
+    async fn current_stop_settlement_applies_once_without_a_new_root_admission() {
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let session_id = SessionId::new();
+        controller.state.app_state.current_session_id = Some(session_id);
+        controller.state.app_state.run_status = crate::tui::state::RunStatus::Running;
+        controller.state.mark_post_run_refresh_pending();
+        let target = SessionRefreshRequestTarget {
+            workspace_root: root.clone(),
+            session_id,
+        };
+        let request_id = controller
+            .current_session_refresh_requests
+            .begin(target.clone());
+        let root_admission_fence = controller.next_root_run_generation;
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::CurrentSessionRefreshed {
+                request_id,
+                target: target.clone(),
+                purpose: CurrentSessionRefreshPurpose::StopSettlement {
+                    root_admission_fence,
+                },
+                result: Ok(loaded_test_session(
+                    &controller,
+                    &root,
+                    session_id,
+                    SessionStatus::Completed,
+                    None,
+                )),
+            })
+            .expect("current Stop settlement");
+        controller.drain_runtime_messages();
+
+        assert!(!controller.current_session_refresh_requests.is_pending());
+        assert_eq!(
+            controller.state.app_state.run_status,
+            crate::tui::state::RunStatus::Completed
+        );
+        assert!(!controller.state.post_run_refresh_pending());
+        let settled_status = controller.state.app_state.status_message.clone();
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::CurrentSessionRefreshed {
+                request_id,
+                target,
+                purpose: CurrentSessionRefreshPurpose::StopSettlement {
+                    root_admission_fence,
+                },
+                result: Err("duplicate Stop settlement".to_string()),
+            })
+            .expect("duplicate Stop settlement");
+        controller.drain_runtime_messages();
+
+        assert_eq!(controller.state.app_state.status_message, settled_status);
+        assert!(!controller.current_session_refresh_requests.is_pending());
+    }
+
+    #[tokio::test]
+    async fn stop_settlement_from_before_the_next_root_admission_cannot_mutate_that_root() {
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let session_id = SessionId::new();
+        controller.state.app_state.current_session_id = Some(session_id);
+        let target = SessionRefreshRequestTarget {
+            workspace_root: root.clone(),
+            session_id,
+        };
+        let request_id = controller
+            .current_session_refresh_requests
+            .begin(target.clone());
+        let old_root_admission_fence = controller.next_root_run_generation;
+
+        controller.next_root_run_generation = old_root_admission_fence + 1;
+        controller
+            .run_lifecycle
+            .begin(old_root_admission_fence, RunControl::new());
+        controller.state.begin_agent_run();
+        controller.state.app_state.run_status = crate::tui::state::RunStatus::Running;
+        controller.state.composer.draft_prompt = "new root draft".to_string();
+        controller.state.begin_prompt_enhance(
+            91,
+            "new root review source",
+            CancellationToken::new(),
+        );
+        assert!(
+            controller
+                .state
+                .finish_prompt_enhance(91, "new root review".to_string())
+        );
+        controller.state.mark_post_run_refresh_pending();
+        controller
+            .state
+            .set_status_message("new root terminal refresh pending");
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::CurrentSessionRefreshed {
+                request_id,
+                target,
+                purpose: CurrentSessionRefreshPurpose::StopSettlement {
+                    root_admission_fence: old_root_admission_fence,
+                },
+                result: Ok(loaded_test_session(
+                    &controller,
+                    &root,
+                    session_id,
+                    SessionStatus::Completed,
+                    None,
+                )),
+            })
+            .expect("stale Stop settlement");
+        controller.drain_runtime_messages();
+
+        assert!(!controller.current_session_refresh_requests.is_pending());
+        assert_eq!(
+            controller.run_lifecycle.root_generation(),
+            Some(old_root_admission_fence)
+        );
+        assert_eq!(
+            controller.state.app_state.run_status,
+            crate::tui::state::RunStatus::Running
+        );
+        assert_eq!(controller.state.composer.draft_prompt, "new root draft");
+        assert!(controller.state.app_state.prompt_review.is_some());
+        assert_eq!(
+            controller.state.composer.review_draft_text,
+            "new root review"
+        );
+        assert!(controller.state.post_run_refresh_pending());
+        assert_eq!(
+            controller.state.app_state.status_message.as_deref(),
+            Some("new root terminal refresh pending")
+        );
     }
 
     #[tokio::test]
@@ -3598,6 +3748,28 @@ mod command_projection_owner_tests {
             image_paths: vec![retained_image.clone()],
             cancel_prompt_review_on_commit: true,
         });
+        let delayed_refresh_target = SessionRefreshRequestTarget {
+            workspace_root: root.clone(),
+            session_id: session_a.id,
+        };
+        let delayed_refresh_request = controller
+            .current_session_refresh_requests
+            .begin(delayed_refresh_target.clone());
+        let delayed_refresh = loaded_session_from_detail(
+            load_latest_session_detail(&controller.app, session_a.id)
+                .await
+                .expect("delayed terminal refresh"),
+            None,
+        );
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::CurrentSessionRefreshed {
+                request_id: delayed_refresh_request,
+                target: delayed_refresh_target,
+                purpose: CurrentSessionRefreshPurpose::Refresh,
+                result: Ok(delayed_refresh),
+            })
+            .expect("terminal refresh queued before the next session event");
         controller
             .runtime_tx
             .send(RuntimeMessage::RunEvent {
@@ -5354,6 +5526,7 @@ impl DesktopController {
         in_memory_stop_accepted: bool,
     ) {
         let app = self.app.clone();
+        let root_admission_fence = self.next_root_run_generation;
         let target = SessionRefreshRequestTarget {
             workspace_root: self.app.workspace.root.clone(),
             session_id,
@@ -5382,7 +5555,9 @@ impl DesktopController {
             let _ = runtime_tx.send(RuntimeMessage::CurrentSessionRefreshed {
                 request_id,
                 target,
-                purpose: CurrentSessionRefreshPurpose::StopSettlement,
+                purpose: CurrentSessionRefreshPurpose::StopSettlement {
+                    root_admission_fence,
+                },
                 result,
             });
         });
@@ -7377,7 +7552,7 @@ impl DesktopController {
         purpose: CurrentSessionRefreshPurpose,
         result: Result<LoadedSession, String>,
     ) {
-        if (purpose == CurrentSessionRefreshPurpose::Refresh
+        if (matches!(purpose, CurrentSessionRefreshPurpose::Refresh)
             && self.session_load_is_blocked_by_active_run())
             || self.state.app_state.current_session_id != Some(session_id)
         {
@@ -7393,7 +7568,7 @@ impl DesktopController {
                     self.durable_agent_activity_refresh_failures = 0;
                 }
                 self.state.clear_post_run_refresh_pending();
-                if purpose == CurrentSessionRefreshPurpose::StopSettlement {
+                if matches!(purpose, CurrentSessionRefreshPurpose::StopSettlement { .. }) {
                     self.state.finish_agent_run();
                     if !self.state.status_code.is_terminal_interruption() {
                         self.state
@@ -7403,7 +7578,7 @@ impl DesktopController {
             }
             Err(error) => {
                 self.state.clear_post_run_refresh_pending();
-                if purpose == CurrentSessionRefreshPurpose::StopSettlement {
+                if matches!(purpose, CurrentSessionRefreshPurpose::StopSettlement { .. }) {
                     self.state
                         .set_status_message(format!("failed to stop active agent tree: {error}"));
                 } else {
@@ -7414,10 +7589,11 @@ impl DesktopController {
     }
 
     fn session_load_is_blocked_by_active_run(&self) -> bool {
-        matches!(
-            self.state.app_state.run_status,
-            crate::tui::state::RunStatus::Running
-        )
+        self.run_lifecycle.root_is_active()
+            || matches!(
+                self.state.app_state.run_status,
+                crate::tui::state::RunStatus::Running
+            )
     }
 
     fn refresh_current_session_after_terminal_run(&mut self) {
@@ -7705,10 +7881,11 @@ impl DesktopController {
                     cancel_prompt_review_on_commit,
                     result,
                 } => {
-                    if !self.state.finish_steer_submission(target.operation_id)
-                        || target.workspace_root != self.app.workspace.root
-                        || self.state.app_state.current_session_id != Some(target.session_id)
-                    {
+                    if !finish_steer_operation_if_current(
+                        &mut self.state,
+                        &self.app.workspace.root,
+                        &target,
+                    ) {
                         continue;
                     }
                     let accepted = finish_steer_submission(
@@ -7763,6 +7940,15 @@ impl DesktopController {
                         .finish_if_current(request_id, &target)
                         || !self.live_session_target_is_current(&target)
                     {
+                        continue;
+                    }
+                    let root_admission_is_current = match purpose {
+                        CurrentSessionRefreshPurpose::Refresh => true,
+                        CurrentSessionRefreshPurpose::StopSettlement {
+                            root_admission_fence,
+                        } => root_admission_fence == self.next_root_run_generation,
+                    };
+                    if !root_admission_is_current {
                         continue;
                     }
                     self.apply_current_session_refreshed_message(
@@ -9127,7 +9313,8 @@ mod tests {
         DESKTOP_RUNTIME_MAILBOX_CAPACITY, DesktopRenderer, HistoryExportRequestTarget,
         PendingPermission, PendingPermissionResolution, ProviderCatalogRequestTarget,
         RuntimeMessage, RuntimeMessageAsyncContract, SessionRefreshRequestTarget,
-        desktop_terminal_status_message, fallback_workspace_after_project_delete,
+        SteerSubmissionTarget, desktop_terminal_status_message,
+        fallback_workspace_after_project_delete, finish_steer_operation_if_current,
         first_restorable_project_root, normalize_image_attachment_path, notification_session_title,
         open_transcript_rows_to_markdown, provider_catalog_probe_config,
         publish_desktop_run_finished, resolve_pending_permission, run_completion_notification_body,
@@ -9138,8 +9325,9 @@ mod tests {
     use crate::config::{ProviderMetadataMode, ResolvedConfig};
     use crate::desktop::async_ops::LatestRequestTracker;
     use crate::desktop::models::DesktopTranscriptRowKind;
-    use crate::desktop::models::{DesktopFileChangeRow, DesktopTranscriptRow};
-    use crate::session::{ProjectId, ProjectRecord, RunEvent, RunSummary};
+    use crate::desktop::models::{DesktopFileChangeRow, DesktopSnapshot, DesktopTranscriptRow};
+    use crate::desktop::state::DesktopState;
+    use crate::session::{ProjectId, ProjectRecord, RunEvent, RunSummary, SessionId};
     use camino::{Utf8Path, Utf8PathBuf};
     use std::sync::mpsc;
 
@@ -9152,6 +9340,57 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
         }
+    }
+
+    #[test]
+    fn stale_steer_target_does_not_consume_current_operation() {
+        let current_session_id = SessionId::new();
+        let mut state = DesktopState::new(
+            DesktopSnapshot {
+                workspace_path: "C:/current".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            ResolvedConfig::default(),
+        );
+        state.app_state.current_session_id = Some(current_session_id);
+        let operation_id = state.begin_steer_submission();
+        let stale_target = SteerSubmissionTarget {
+            operation_id,
+            workspace_root: "C:/stale".into(),
+            session_id: current_session_id,
+        };
+
+        assert!(!finish_steer_operation_if_current(
+            &mut state,
+            Utf8Path::new("C:/current"),
+            &stale_target,
+        ));
+        assert!(state.steer_submission_pending());
+
+        let current_target = SteerSubmissionTarget {
+            operation_id,
+            workspace_root: "C:/current".into(),
+            session_id: current_session_id,
+        };
+        assert!(finish_steer_operation_if_current(
+            &mut state,
+            Utf8Path::new("C:/current"),
+            &current_target,
+        ));
+        assert!(!state.steer_submission_pending());
+        assert!(!finish_steer_operation_if_current(
+            &mut state,
+            Utf8Path::new("C:/current"),
+            &current_target,
+        ));
     }
 
     fn completed_run_summary(

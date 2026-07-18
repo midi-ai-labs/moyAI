@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use camino::{Utf8Path, Utf8PathBuf};
 use ignore::WalkBuilder;
 
-use crate::workspace::skill_roots;
+use crate::workspace::{PathGuard, skill_roots};
 
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const MAX_SAMPLED_FILES: usize = 10;
@@ -155,7 +155,11 @@ fn discover_from_roots(root: &Utf8Path, roots: &[Utf8PathBuf]) -> Vec<Discovered
             {
                 continue;
             }
-            let Ok(text) = read_utf8_prefix(&path, MAX_SKILL_MANIFEST_BYTES) else {
+            let Ok(text) = read_utf8_prefix(
+                &path,
+                std::slice::from_ref(skill_root),
+                MAX_SKILL_MANIFEST_BYTES,
+            ) else {
                 continue;
             };
             let (name, description) = parse_skill_manifest(&path, &text);
@@ -183,6 +187,7 @@ pub fn load(root: &Utf8Path, name: &str) -> Result<Option<LoadedSkill>, String> 
 }
 
 fn load_from_snapshot(snapshot: SkillsSnapshot, name: &str) -> Result<Option<LoadedSkill>, String> {
+    let roots = snapshot.roots;
     let manifest = snapshot
         .skills
         .into_iter()
@@ -190,12 +195,13 @@ fn load_from_snapshot(snapshot: SkillsSnapshot, name: &str) -> Result<Option<Loa
     let Some(manifest) = manifest else {
         return Ok(None);
     };
-    let content = read_utf8_bounded(&manifest.path, MAX_SKILL_CONTENT_BYTES).map_err(|error| {
-        format!(
-            "failed to read skill `{}` from {}: {error}",
-            manifest.name, manifest.path
-        )
-    })?;
+    let content =
+        read_utf8_bounded(&manifest.path, &roots, MAX_SKILL_CONTENT_BYTES).map_err(|error| {
+            format!(
+                "failed to read skill `{}` from {}: {error}",
+                manifest.name, manifest.path
+            )
+        })?;
     let sampled_files = sample_related_files(&manifest.base_dir)?;
     Ok(Some(LoadedSkill {
         manifest,
@@ -204,8 +210,15 @@ fn load_from_snapshot(snapshot: SkillsSnapshot, name: &str) -> Result<Option<Loa
     }))
 }
 
-fn read_utf8_bounded(path: &Utf8Path, max_bytes: usize) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+fn read_utf8_bounded(
+    path: &Utf8Path,
+    roots: &[Utf8PathBuf],
+    max_bytes: usize,
+) -> Result<String, String> {
+    let (mut file, before) = open_validated_skill_file(path, roots)?;
+    if before.len() > max_bytes as u64 {
+        return Err(format!("content exceeds {max_bytes} bytes"));
+    }
     let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
     file.by_ref()
         .take(max_bytes.saturating_add(1) as u64)
@@ -214,16 +227,28 @@ fn read_utf8_bounded(path: &Utf8Path, max_bytes: usize) -> Result<String, String
     if bytes.len() > max_bytes {
         return Err(format!("content exceeds {max_bytes} bytes"));
     }
+    ensure_stable_skill_read(path, &file, &before, bytes.len() as u64, Some(before.len()))?;
     String::from_utf8(bytes).map_err(|_| "content is not valid UTF-8".to_string())
 }
 
-fn read_utf8_prefix(path: &Utf8Path, max_bytes: usize) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+fn read_utf8_prefix(
+    path: &Utf8Path,
+    roots: &[Utf8PathBuf],
+    max_bytes: usize,
+) -> Result<String, String> {
+    let (mut file, before) = open_validated_skill_file(path, roots)?;
     let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
     file.by_ref()
         .take(max_bytes as u64)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
+    ensure_stable_skill_read(
+        path,
+        &file,
+        &before,
+        bytes.len() as u64,
+        Some(before.len().min(max_bytes as u64)),
+    )?;
     match std::str::from_utf8(&bytes) {
         Ok(text) => Ok(text.to_string()),
         Err(error) if error.error_len().is_none() => {
@@ -232,6 +257,41 @@ fn read_utf8_prefix(path: &Utf8Path, max_bytes: usize) -> Result<String, String>
         }
         Err(_) => Err("content is not valid UTF-8".to_string()),
     }
+}
+
+fn open_validated_skill_file(
+    path: &Utf8Path,
+    roots: &[Utf8PathBuf],
+) -> Result<(fs::File, fs::Metadata), String> {
+    let guarded = roots
+        .iter()
+        .find_map(|root| PathGuard::trusted_internal_path(path, root).ok())
+        .ok_or_else(|| format!("skill file `{path}` is outside the configured skill roots"))?;
+    let file = PathGuard::open_validated_read_file(&guarded).map_err(|error| error.to_string())?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err(format!("skill file `{path}` is not a regular file"));
+    }
+    Ok((file, metadata))
+}
+
+fn ensure_stable_skill_read(
+    path: &Utf8Path,
+    file: &fs::File,
+    before: &fs::Metadata,
+    bytes_read: u64,
+    expected_bytes: Option<u64>,
+) -> Result<(), String> {
+    let after = file.metadata().map_err(|error| error.to_string())?;
+    if before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || expected_bytes.is_some_and(|expected| bytes_read != expected)
+    {
+        return Err(format!(
+            "skill file `{path}` changed while its contents were being read"
+        ));
+    }
+    Ok(())
 }
 
 pub fn render_available_skills(root: &Utf8Path) -> String {
@@ -342,6 +402,154 @@ fn sample_related_files(base_dir: &Utf8Path) -> Result<Vec<Utf8PathBuf>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot_for_manifest(root: &Utf8Path, manifest_path: &Utf8Path) -> SkillsSnapshot {
+        SkillsSnapshot {
+            workspace_root: root.to_path_buf(),
+            roots: vec![root.to_path_buf()],
+            skills: vec![DiscoveredSkill {
+                name: "fixture".to_string(),
+                description: "fixture skill".to_string(),
+                path: manifest_path.to_path_buf(),
+                base_dir: manifest_path
+                    .parent()
+                    .expect("manifest parent")
+                    .to_path_buf(),
+            }],
+        }
+    }
+
+    #[cfg(unix)]
+    fn create_file_symlink(target: &Utf8Path, link: &Utf8Path) -> bool {
+        std::os::unix::fs::symlink(target, link).expect("create skill symlink fixture");
+        true
+    }
+
+    #[cfg(windows)]
+    fn create_file_symlink(target: &Utf8Path, link: &Utf8Path) -> bool {
+        match std::os::windows::fs::symlink_file(target, link) {
+            Ok(()) => true,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) =>
+            {
+                false
+            }
+            Err(error) => panic!("create skill symlink fixture: {error}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_skill_fifo_replacement_is_rejected_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("skills")).expect("utf8 root");
+        std::fs::create_dir(&root).expect("skill root");
+        let manifest_path = root.join(SKILL_FILE_NAME);
+        std::fs::write(&manifest_path, "---\nname: fixture\n---\n# Fixture\n")
+            .expect("seed skill manifest");
+        let snapshot = snapshot_for_manifest(&root, &manifest_path);
+        std::fs::remove_file(&manifest_path).expect("remove discovered manifest");
+        let fifo_path = std::ffi::CString::new(manifest_path.as_std_path().as_os_str().as_bytes())
+            .expect("FIFO path without NUL");
+        // SAFETY: `fifo_path` is a live NUL-terminated pathname and the manifest is absent.
+        let created = unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600 as libc::mode_t) };
+        assert_eq!(
+            created,
+            0,
+            "create raced FIFO: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(load_from_snapshot(snapshot, "fixture"))
+                .expect("send skill load outcome");
+        });
+        let mut blocked = false;
+        let outcome = match receiver.recv_timeout(Duration::from_secs(2)) {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                blocked = true;
+                let release_deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&manifest_path)
+                    {
+                        Ok(writer) => {
+                            drop(writer);
+                            break;
+                        }
+                        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                            assert!(
+                                Instant::now() < release_deadline,
+                                "blocked skill manifest reader could not be released"
+                            );
+                            std::thread::yield_now();
+                        }
+                        Err(error) => panic!("release blocked skill manifest reader: {error}"),
+                    }
+                }
+                receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("released skill load must return")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("skill load worker disconnected before publishing its result")
+            }
+        };
+        worker.join().expect("join skill load worker");
+
+        assert!(!blocked, "skill load blocked while opening a raced FIFO");
+        assert!(outcome.is_err(), "FIFO replacement must fail skill load");
+        assert!(
+            std::fs::symlink_metadata(&manifest_path)
+                .expect("FIFO metadata")
+                .file_type()
+                .is_fifo()
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn cached_skill_and_discovery_prefix_reject_external_symlink_replacement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let temp_root =
+            Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 temp root");
+        let root = temp_root.join("skills");
+        std::fs::create_dir(&root).expect("skill root");
+        let manifest_path = root.join(SKILL_FILE_NAME);
+        let external_path = temp_root.join("external.md");
+        std::fs::write(&manifest_path, "---\nname: fixture\n---\n# Fixture\n")
+            .expect("seed skill manifest");
+        std::fs::write(&external_path, "external content must not be loaded")
+            .expect("seed external target");
+        let snapshot = snapshot_for_manifest(&root, &manifest_path);
+        std::fs::remove_file(&manifest_path).expect("remove discovered manifest");
+        if !create_file_symlink(&external_path, &manifest_path) {
+            return;
+        }
+
+        let roots = vec![root.clone()];
+        let prefix_error = read_utf8_prefix(&manifest_path, &roots, MAX_SKILL_MANIFEST_BYTES)
+            .expect_err("discovery prefix must not follow an external symlink");
+        let load_error = load_from_snapshot(snapshot, "fixture")
+            .expect_err("cached skill load must not follow an external symlink");
+
+        assert!(!prefix_error.contains("external content must not be loaded"));
+        assert!(!load_error.contains("external content must not be loaded"));
+        assert_eq!(
+            std::fs::read_to_string(&external_path).expect("read untouched external target"),
+            "external content must not be loaded"
+        );
+    }
 
     #[test]
     fn workspace_snapshot_cache_is_bounded_and_recently_used() {

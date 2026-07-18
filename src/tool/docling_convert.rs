@@ -4,7 +4,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::docling::{DoclingConvertRequest, DoclingConvertResult};
+use crate::docling::{DoclingConvertRequest, DoclingConvertResult, DoclingLocalInput};
 use crate::error::ToolError;
 use crate::tool::context::ToolContext;
 use crate::tool::registry::Tool;
@@ -108,7 +108,7 @@ impl Tool for DoclingConvertTool {
         };
         let page_range = parse_page_range(input.page_range)?;
 
-        let (path, effect_admission) = match (
+        let (local_input, effect_admission) = match (
             input.path,
             input
                 .source_url
@@ -127,19 +127,14 @@ impl Tool for DoclingConvertTool {
                         vec![PermissionRisk::ConfiguredLocalService],
                     )
                     .await?;
-                if !guarded.absolute.exists() {
-                    return Err(ToolError::Message(format!(
-                        "Docling input path `{}` does not exist",
-                        guarded.absolute
-                    )));
-                }
-                if guarded.absolute.is_dir() {
-                    return Err(ToolError::Message(format!(
-                        "Docling input path `{}` is a directory",
-                        guarded.absolute
-                    )));
-                }
-                (Some(guarded.absolute), effect_admission)
+                let file = PathGuard::open_validated_read_file(&guarded)?;
+                (
+                    Some(DoclingLocalInput::from_validated_handle(
+                        guarded.absolute,
+                        file,
+                    )),
+                    effect_admission,
+                )
             }
             (None, Some(source_url)) => {
                 let effect_admission = ctx
@@ -165,15 +160,10 @@ impl Tool for DoclingConvertTool {
             }
         };
 
-        if let Some(path) = path.as_deref() {
-            let guarded = PathGuard::require_path(ctx.workspace, path, AccessKind::Read)?;
-            PathGuard::revalidate(&guarded)?;
-        }
-
         let result = crate::docling::DoclingClient::new(ctx.config.docling.clone())
             .convert(
                 DoclingConvertRequest {
-                    path,
+                    local_input,
                     source_url: input.source_url,
                     from_formats,
                     to_formats,

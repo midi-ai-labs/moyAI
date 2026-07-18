@@ -127,12 +127,14 @@ TUI では実行中も `Ctrl+Enter` で現在 turn へ追加指示を送り、`C
 
 `write`と`apply_patch`のcreate / update / delete / rollbackは、同じstable-handle・no-clobber条件付きcommitを使う。準備中に別processがtargetを更新・置換した場合は外部側を上書きせず、復元不能時は保持したbackup pathをerrorへ含める。親directoryは暗黙作成しないため、存在しない場合は先に明示作成する。
 
+Unixでは、update/delete前に開かれた書込可能descriptorが切り離した旧inodeを参照していないことを証明できない。createは従来どおりだが、既存fileのupdateは新しいtargetを設置し、deleteはtargetを切り離したうえで旧inodeをprivate backup pathに保持し、安全なcleanup成功とはせずtyped partial-commit errorを返す。先に開かれたwriterはそのbackupを後から変更できるため、errorに示されたpathを確認して調整する。
+
 ## Access Mode
 
 `access_mode` は shell / file operation の確認動作を切り替える。
 
 - `default`: 設定済み境界内のlist/search/readだけを自動承認する。編集、shell、設定済み境界外、network、delete/moveなどは確認する。
-- `full_access`: stable filesystem handleで設定済み境界内と確認できるfile操作だけを自動承認する。設定済み境界外のfile操作、shell、network/service call、その他のexternal operationは作用境界をlocalに証明できないため、`full_access`でも常に確認する。信頼できるworkspaceでのみ使う。
+- `full_access`: stable filesystem handleで設定済み境界内と確認できる通常のfile操作だけを自動承認する。workspace authority file、設定済み境界外のfile操作、shell、network/service call、その他のexternal operationは`full_access`でも常に確認する。信頼できるworkspaceでのみ使う。
 
 permissionはdeterministic policyと明示的なhuman decisionだけが所有し、同じtask modelを別のAI reviewerとして再呼出ししない。shellとその子processは現在のユーザー権限で動き、変数、式、script内部で動的に組み立てたpathやnetwork accessをmoyAIが実行前に完全解決することはできない。Access ModeはいずれもOS filesystem sandboxではない。
 

@@ -479,15 +479,15 @@ impl<S: RunEventSink + ?Sized> RunEventSink for HarnessRecordingSink<'_, S> {
     }
 
     fn emit(&mut self, event: RunEvent) -> Result<(), RuntimeError> {
-        let inner_result = self.inner.emit(event.clone());
+        self.inner.emit(event.clone())?;
         self.recorder.record_run_event_best_effort(&event);
-        inner_result
+        Ok(())
     }
 
     fn emit_runtime_only(&mut self, event: RunEvent) -> Result<(), RuntimeError> {
-        let inner_result = self.inner.emit_runtime_only(event.clone());
+        self.inner.emit_runtime_only(event.clone())?;
         self.recorder.record_run_event_best_effort(&event);
-        inner_result
+        Ok(())
     }
 }
 
@@ -931,6 +931,73 @@ mod tests {
         assert_eq!(sink.recording_status().failure_count, 1);
         drop(sink);
         assert_eq!(inner.events.len(), 1);
+    }
+
+    #[test]
+    fn failed_inner_delivery_does_not_become_semantic_harness_evidence() {
+        #[derive(Default)]
+        struct FailingSink {
+            emit_calls: usize,
+            runtime_only_calls: usize,
+        }
+
+        impl RunEventSink for FailingSink {
+            fn emit(&mut self, _event: RunEvent) -> Result<(), RuntimeError> {
+                self.emit_calls += 1;
+                Err(RuntimeError::Message("inner emit failed".to_string()))
+            }
+
+            fn emit_runtime_only(&mut self, _event: RunEvent) -> Result<(), RuntimeError> {
+                self.runtime_only_calls += 1;
+                Err(RuntimeError::Message(
+                    "inner runtime-only emit failed".to_string(),
+                ))
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 path");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let store = SqliteStore::open(&paths).expect("open store");
+        store.migrate().expect("migrate store");
+        let bundle = StoreBundle::new(store);
+        let recorder = NativeHarnessRecorder::start_harness_only(
+            &bundle,
+            None,
+            Utf8PathBuf::from("C:/workspace"),
+        )
+        .expect("recorder");
+        let run_id = recorder.run_id();
+        let response_id = ModelResponseId::new();
+        let mut inner = FailingSink::default();
+
+        {
+            let mut sink = HarnessRecordingSink::new(recorder, &mut inner);
+            sink.emit(RunEvent::TextDelta {
+                response_id,
+                delta: "not delivered".to_string(),
+            })
+            .expect_err("failed delivery must remain failed");
+            sink.emit_runtime_only(RunEvent::ReasoningSummaryDelta {
+                response_id,
+                delta: "also not delivered".to_string(),
+            })
+            .expect_err("failed runtime-only delivery must remain failed");
+            assert!(!sink.recording_status().disabled);
+            assert_eq!(sink.recording_status().failure_count, 0);
+        }
+
+        assert_eq!(inner.emit_calls, 1);
+        assert_eq!(inner.runtime_only_calls, 1);
+        let events = bundle
+            .harness_event_store()
+            .list_events(run_id)
+            .expect("list events");
+        assert!(events.is_empty());
     }
 
     #[test]

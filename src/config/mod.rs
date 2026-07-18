@@ -19,5 +19,6 @@ pub use permission_profile_catalog::{
 };
 pub use turn::{
     ProviderDeadlines, ProviderEndpoint, ProviderEndpointError, ProviderRequestLimits,
-    ProviderStreamLimits, ProviderTarget, ResolvedTurnConfig, sanitize_provider_endpoint,
+    ProviderStreamLimits, ProviderTarget, ResolvedTurnConfig, ResolvedTurnConfigError,
+    sanitize_provider_endpoint,
 };

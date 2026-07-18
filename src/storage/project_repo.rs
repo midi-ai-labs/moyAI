@@ -7,6 +7,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::error::StorageError;
 use crate::runtime::{Clock, SystemClock};
 use crate::session::{ProjectId, ProjectRecord, ProjectRepository};
+use crate::storage::session_repo::mutation_blocker_for_project_in_connection;
 
 #[derive(Clone)]
 pub struct SqliteProjectRepository {
@@ -148,25 +149,8 @@ impl ProjectRepository for SqliteProjectRepository {
     async fn delete_project(&self, id: ProjectId) -> Result<(), StorageError> {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = SystemClock.now_ms();
-        let active_session_id = tx
-            .query_row(
-                "SELECT id
-                 FROM sessions
-                 WHERE project_id = ?1
-                   AND (
-                        status = 'running'
-                        OR (
-                            active_run_id IS NOT NULL
-                            AND active_run_lease_expires_at_ms > ?2
-                        )
-                   )
-                 ORDER BY id ASC
-                 LIMIT 1",
-                params![id.to_string(), now],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+        let active_session_id =
+            mutation_blocker_for_project_in_connection(&tx, id, SystemClock.now_ms())?;
         if let Some(active_session_id) = active_session_id {
             return Err(StorageError::Message(format!(
                 "project {id} contains active session {active_session_id}; stop it before deleting the project"
@@ -264,7 +248,7 @@ mod tests {
 
     use super::*;
 
-    fn project_repo_fixture() -> (SqliteProjectRepository, camino::Utf8PathBuf) {
+    fn project_store_fixture() -> (StoreBundle, camino::Utf8PathBuf) {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = camino::Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8");
         let paths = StoragePaths {
@@ -274,7 +258,12 @@ mod tests {
         };
         let sqlite = SqliteStore::open(&paths).expect("store");
         sqlite.migrate().expect("migrate");
-        (StoreBundle::new(sqlite).project_repo(), data_dir)
+        (StoreBundle::new(sqlite), data_dir)
+    }
+
+    fn project_repo_fixture() -> (SqliteProjectRepository, camino::Utf8PathBuf) {
+        let (store, data_dir) = project_store_fixture();
+        (store.project_repo(), data_dir)
     }
 
     #[tokio::test]
@@ -420,5 +409,152 @@ mod tests {
         assert!(error.to_string().contains(&session.id.to_string()));
         assert!(store.session_repo().get_session(session.id).await.is_ok());
         assert!(store.project_repo().get_project(project_id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn repository_project_delete_rejects_runtime_corruption_before_any_delete() {
+        let (store, data_dir) = project_store_fixture();
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &data_dir, "project", "none")
+            .await
+            .expect("project");
+        let session = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id,
+                title: "corrupt session".to_string(),
+                cwd: data_dir,
+                model: "model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+                access_mode: AccessMode::Default,
+            })
+            .await
+            .expect("session");
+        let retained_turn_id = TurnId::new().to_string();
+        store
+            .session_repo()
+            .inject_raw_runtime_state_for_corruption_test(
+                session.id,
+                "completed",
+                None,
+                Some(&retained_turn_id),
+                None,
+            )
+            .expect("inject partial durable owner");
+
+        let repository = store.project_repo();
+        let error = repository
+            .delete_project(project_id)
+            .await
+            .expect_err("runtime corruption must fail before project deletion");
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete durable run admission")
+        );
+        let connection = repository.connection.lock().expect("sqlite mutex");
+        let project_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                params![project_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("project count");
+        let session_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE project_id = ?1",
+                params![project_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("session count");
+        assert_eq!((project_count, session_count), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn repository_project_delete_validates_later_corruption_after_first_active_blocker() {
+        let (store, data_dir) = project_store_fixture();
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &data_dir, "project", "none")
+            .await
+            .expect("project");
+        let repository = store.session_repo();
+        let active_session = repository
+            .create_session(NewSession {
+                project_id,
+                title: "active session".to_string(),
+                cwd: data_dir.clone(),
+                model: "model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+                access_mode: AccessMode::Default,
+            })
+            .await
+            .expect("active session");
+        let corrupt_session = repository
+            .create_session(NewSession {
+                project_id,
+                title: "corrupt session".to_string(),
+                cwd: data_dir,
+                model: "model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+                access_mode: AccessMode::Default,
+            })
+            .await
+            .expect("corrupt session");
+        repository
+            .admit_session_turn(active_session.id, TurnId::new())
+            .await
+            .expect("active admission")
+            .expect("active session admitted");
+        let corrupt_turn_id = TurnId::new();
+        let corrupt_admission = repository
+            .admit_session_turn(corrupt_session.id, corrupt_turn_id)
+            .await
+            .expect("corrupt admission")
+            .expect("corrupt session admitted");
+        repository
+            .inject_raw_runtime_state_for_corruption_test(
+                corrupt_session.id,
+                "completed",
+                Some(&corrupt_admission.admission_id.to_string()),
+                Some(&corrupt_turn_id.to_string()),
+                Some(1),
+            )
+            .expect("inject missing terminal state");
+        let project_repository = store.project_repo();
+        {
+            let connection = project_repository.connection.lock().expect("sqlite mutex");
+            connection
+                .execute(
+                    "UPDATE sessions SET updated_at_ms = ?2 WHERE id = ?1",
+                    params![active_session.id.to_string(), i64::MAX - 1],
+                )
+                .expect("order active blocker before corrupt candidate");
+        }
+
+        let error = project_repository
+            .delete_project(project_id)
+            .await
+            .expect_err("later corruption must override the remembered active blocker");
+        assert!(error.to_string().contains("without a durable terminal"));
+        let connection = project_repository.connection.lock().expect("sqlite mutex");
+        let project_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                params![project_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("project count");
+        let session_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE project_id = ?1",
+                params![project_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("session count");
+        assert_eq!((project_count, session_count), (1, 2));
     }
 }

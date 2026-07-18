@@ -5,7 +5,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::{ConfirmationOutcome, ConfirmationPrompt};
 use crate::config::{AccessMode, ResolvedConfig};
-use crate::edit::{ChangeTracker, EditSafety, Formatter, FormatterExecutionOptions};
+use crate::edit::{
+    ChangeTracker, EditSafety, Formatter, FormatterExecutionOptions, ResolvedFormatterInvocation,
+};
 use crate::error::ToolError;
 use crate::protocol::{ToolApprovalDecision, TurnId};
 use crate::runtime::{RunCancelOutcome, RunCancellationCause, RunControl};
@@ -13,7 +15,7 @@ use crate::session::{AdmissionId, SessionContext, SessionId, ToolCallId};
 use crate::storage::{SqliteSessionRepository, session_repo::RunAdmissionLeaseRenewalOutcome};
 use crate::storage::{StoragePaths, StoreBundle};
 use crate::tool::truncate::ToolTruncator;
-use crate::workspace::{AccessKind, Workspace};
+use crate::workspace::{AccessKind, GuardedPath, PathGuard, Workspace};
 
 #[derive(Clone)]
 pub struct ToolServices {
@@ -40,6 +42,46 @@ pub struct ToolContext<'a> {
     pub agent: Option<&'a crate::app::AgentRunContext>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ToolFormatterPlan {
+    invocation: ResolvedFormatterInvocation,
+    target_guard: GuardedPath,
+    working_directory_guard: GuardedPath,
+}
+
+impl ToolFormatterPlan {
+    pub fn resolve(
+        config: &ResolvedConfig,
+        workspace: &Workspace,
+        target_guard: &GuardedPath,
+    ) -> Result<Option<Self>, ToolError> {
+        let Some(invocation) =
+            Formatter::resolve_invocation(&config.format, &target_guard.absolute, &workspace.root)?
+        else {
+            return Ok(None);
+        };
+        let working_directory_guard =
+            PathGuard::require_path(workspace, invocation.working_directory(), AccessKind::Shell)?;
+        Ok(Some(Self {
+            invocation,
+            target_guard: target_guard.clone(),
+            working_directory_guard,
+        }))
+    }
+
+    pub fn permission_detail(&self) -> String {
+        self.invocation.permission_detail()
+    }
+
+    pub fn target(&self) -> &Utf8Path {
+        self.invocation.target()
+    }
+
+    pub fn command(&self) -> &[String] {
+        self.invocation.command()
+    }
+}
+
 #[must_use = "call admit immediately before every independently startable observable effect"]
 #[derive(Clone)]
 pub struct ToolEffectAdmission {
@@ -63,16 +105,21 @@ impl ToolEffectAdmission {
             .map_err(|_| ToolError::RunInterrupted)
     }
 
-    pub async fn format_if_configured(
+    pub async fn format_if_planned(
         &self,
         formatter: &Formatter,
-        path: &Utf8Path,
+        plan: Option<&ToolFormatterPlan>,
         normalized: String,
         options: FormatterExecutionOptions,
     ) -> Result<String, ToolError> {
+        let Some(plan) = plan else {
+            return Ok(normalized);
+        };
+        PathGuard::revalidate(&plan.target_guard)?;
+        PathGuard::revalidate(&plan.working_directory_guard)?;
         self.admit()?;
         formatter
-            .format_if_configured(path, normalized, options)
+            .format_resolved(&plan.invocation, normalized, options)
             .await
             .map_err(ToolError::from)
     }
@@ -270,6 +317,7 @@ fn full_access_allows(request: &crate::tool::PermissionRequest) -> bool {
             crate::tool::PermissionRisk::Network
                 | crate::tool::PermissionRisk::ExternalConnection
                 | crate::tool::PermissionRisk::ConfiguredLocalService
+                | crate::tool::PermissionRisk::ProtectedWorkspaceAuthority
                 | crate::tool::PermissionRisk::ExternalMutation
                 | crate::tool::PermissionRisk::ExternalDestructiveOperation
         )
@@ -424,6 +472,22 @@ mod tests {
         let decisions = [AccessMode::Default, AccessMode::FullAccess]
             .map(|mode| access_mode_allows_permission(mode, &request));
         assert_eq!(decisions, [false, false]);
+    }
+
+    #[test]
+    fn workspace_authority_requires_confirmation_in_both_modes() {
+        let request = permission(
+            AccessKind::Edit,
+            vec![crate::tool::PermissionRisk::ProtectedWorkspaceAuthority],
+        );
+        let decisions = [AccessMode::Default, AccessMode::FullAccess]
+            .map(|mode| access_mode_allows_permission(mode, &request));
+
+        assert_eq!(decisions, [false, false]);
+        assert!(access_mode_allows_permission(
+            AccessMode::FullAccess,
+            &permission(AccessKind::Edit, Vec::new())
+        ));
     }
 
     #[test]

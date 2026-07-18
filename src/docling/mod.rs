@@ -14,9 +14,21 @@ use crate::tool::truncate::clip_text_with_ellipsis;
 pub const MAX_DOCLING_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_DOCLING_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+pub struct DoclingLocalInput {
+    pub path: Utf8PathBuf,
+    pub file: std::fs::File,
+}
+
+impl DoclingLocalInput {
+    pub fn from_validated_handle(path: Utf8PathBuf, file: std::fs::File) -> Self {
+        Self { path, file }
+    }
+}
+
+#[derive(Debug)]
 pub struct DoclingConvertRequest {
-    pub path: Option<Utf8PathBuf>,
+    pub local_input: Option<DoclingLocalInput>,
     pub source_url: Option<String>,
     pub from_formats: Vec<String>,
     pub to_formats: Vec<String>,
@@ -56,7 +68,7 @@ impl DoclingClient {
 
     pub async fn convert(
         &self,
-        request: DoclingConvertRequest,
+        mut request: DoclingConvertRequest,
         mut effect_checkpoint: impl FnMut() -> Result<(), ToolError>,
     ) -> Result<DoclingConvertResult, ToolError> {
         if !self.config.enabled {
@@ -65,16 +77,17 @@ impl DoclingClient {
             ));
         }
 
+        let local_input = request.local_input.take();
         match (
-            request.path.as_ref(),
+            local_input,
             request
                 .source_url
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty()),
         ) {
-            (Some(path), None) => {
-                self.convert_file(path, &request, &mut effect_checkpoint)
+            (Some(input), None) => {
+                self.convert_file(input, &request, &mut effect_checkpoint)
                     .await
             }
             (None, Some(source_url)) => {
@@ -92,19 +105,20 @@ impl DoclingClient {
 
     async fn convert_file(
         &self,
-        path: &Utf8Path,
+        input: DoclingLocalInput,
         request: &DoclingConvertRequest,
         effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
     ) -> Result<DoclingConvertResult, ToolError> {
         let endpoint = endpoint(&self.config.base_url, "/v1/convert/file");
-        let bytes = read_docling_input_bounded(path, MAX_DOCLING_INPUT_BYTES).await?;
+        let path = input.path;
+        let bytes = read_docling_input_bounded(input.file, &path, MAX_DOCLING_INPUT_BYTES).await?;
         let file_name = path
             .file_name()
             .map(str::to_string)
             .unwrap_or_else(|| "document".to_string());
         let part = Part::bytes(bytes)
             .file_name(file_name)
-            .mime_str(mime_for_path(path))
+            .mime_str(mime_for_path(&path))
             .map_err(|error| ToolError::Message(format!("failed to prepare upload: {error}")))?;
 
         let mut form = Form::new().part("files", part);
@@ -311,10 +325,12 @@ async fn parse_convert_response(
     })
 }
 
-async fn read_docling_input_bounded(path: &Utf8Path, maximum: u64) -> Result<Vec<u8>, ToolError> {
-    let file = tokio::fs::File::open(path.as_std_path())
-        .await
-        .map_err(|error| ToolError::Message(format!("failed to open `{path}`: {error}")))?;
+async fn read_docling_input_bounded(
+    file: std::fs::File,
+    path: &Utf8Path,
+    maximum: u64,
+) -> Result<Vec<u8>, ToolError> {
+    let file = tokio::fs::File::from_std(file);
     let metadata = file
         .metadata()
         .await
@@ -480,7 +496,7 @@ mod tests {
         let error = client
             .convert(
                 DoclingConvertRequest {
-                    path: None,
+                    local_input: None,
                     source_url: Some("https://example.test/document.pdf".to_string()),
                     from_formats: Vec::new(),
                     to_formats: vec!["md".to_string()],
@@ -505,7 +521,8 @@ mod tests {
         let file = std::fs::File::create(&path).expect("fixture");
         file.set_len(9).expect("sparse length");
 
-        let error = read_docling_input_bounded(&path, 8)
+        let file = std::fs::File::open(&path).expect("open sparse fixture");
+        let error = read_docling_input_bounded(file, &path, 8)
             .await
             .expect_err("metadata over the input limit must fail");
 
@@ -517,6 +534,26 @@ mod tests {
                 maximum: 8,
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn docling_input_reads_the_validated_handle_after_namespace_replacement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("document.pdf")).expect("utf8");
+        std::fs::write(&path, b"validated object").expect("seed validated object");
+        let file = std::fs::File::open(&path).expect("open validated handle");
+        std::fs::remove_file(&path).expect("remove namespace entry after validated open");
+        std::fs::write(&path, b"replacement object").expect("replace namespace entry");
+
+        let bytes = read_docling_input_bounded(file, &path, 1_024)
+            .await
+            .expect("read validated handle");
+
+        assert_eq!(bytes, b"validated object");
+        assert_eq!(
+            std::fs::read(&path).expect("read replacement"),
+            b"replacement object"
+        );
     }
 
     #[tokio::test]

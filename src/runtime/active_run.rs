@@ -248,25 +248,27 @@ mod tests {
         let registry = ActiveRunRegistry::default();
         let session_id = SessionId::new();
         let barrier = Arc::new(Barrier::new(3));
-        let release = Arc::new(Barrier::new(2));
+        let attempted = Arc::new(Barrier::new(3));
+        let release = Arc::new(Barrier::new(3));
         let mut workers = Vec::new();
         for _ in 0..2 {
             let registry = registry.clone();
             let barrier = barrier.clone();
+            let attempted = attempted.clone();
             let release = release.clone();
             workers.push(thread::spawn(move || {
                 barrier.wait();
                 let lease = registry.try_start(session_id, RunControl::new());
-                if lease.is_ok() {
-                    release.wait();
-                }
-                lease.is_ok()
+                let admitted = lease.is_ok();
+                attempted.wait();
+                release.wait();
+                drop(lease);
+                admitted
             }));
         }
         barrier.wait();
-        while !registry.is_active(session_id) {
-            thread::yield_now();
-        }
+        attempted.wait();
+        assert!(registry.is_active(session_id));
         release.wait();
         let admitted = workers
             .into_iter()

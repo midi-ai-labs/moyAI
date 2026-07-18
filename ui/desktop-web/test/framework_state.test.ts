@@ -9,6 +9,7 @@ import {
 } from "../src/config_mutation.ts";
 import {
   InteractionLifecycle,
+  installInteractionEventGate,
   shouldBeginKeyboardInteraction,
   shouldBeginPointerInteraction,
 } from "../src/interaction_lifecycle.ts";
@@ -804,27 +805,433 @@ test("same-owner navigation acknowledgement cannot clear an unsaved composer dra
   assert.equal(ui.drafts.prompt, "unsaved local");
 });
 
+class FakeInteractionEventTarget {
+  private readonly listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+
+  addEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    _options?: boolean | AddEventListenerOptions,
+  ): void {
+    if (!listener) return;
+    const listeners = this.listeners.get(type) ?? new Set<EventListenerOrEventListenerObject>();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    _options?: boolean | EventListenerOptions,
+  ): void {
+    if (listener) this.listeners.get(type)?.delete(listener);
+  }
+
+  dispatch(type: string, values: Record<string, unknown> = {}): void {
+    const event = { type, ...values } as unknown as Event;
+    for (const listener of Array.from(this.listeners.get(type) ?? [])) {
+      if (typeof listener === "function") listener.call(this, event);
+      else listener.handleEvent(event);
+    }
+  }
+}
+
+class FakeInteractionWindow extends FakeInteractionEventTarget {
+  private now = 0;
+  private nextTimerId = 1;
+  private readonly timers = new Map<number, { at: number; handler: TimerHandler; args: unknown[] }>();
+
+  setTimeout(handler: TimerHandler, timeout = 0, ...args: unknown[]): number {
+    const id = this.nextTimerId++;
+    this.timers.set(id, { at: this.now + Math.max(0, timeout), handler, args });
+    return id;
+  }
+
+  clearTimeout(id: number | undefined): void {
+    if (id !== undefined) this.timers.delete(id);
+  }
+
+  advanceBy(milliseconds: number): void {
+    const target = this.now + milliseconds;
+    while (true) {
+      const next = Array.from(this.timers.entries())
+        .filter(([, timer]) => timer.at <= target)
+        .sort((left, right) => left[1].at - right[1].at || left[0] - right[0])[0];
+      if (!next) break;
+      const [id, timer] = next;
+      this.timers.delete(id);
+      this.now = timer.at;
+      if (typeof timer.handler !== "function") throw new Error("string timers are not supported by the fake clock");
+      timer.handler(...timer.args);
+    }
+    this.now = target;
+  }
+}
+
+class FakeInteractionDocument extends FakeInteractionEventTarget {
+  hidden = false;
+  body: FakeInteractionElement | null = null;
+  documentElement: FakeInteractionElement | null = null;
+}
+
+class FakeInteractionElement extends FakeInteractionEventTarget {
+  disabled = false;
+  projection = "revision-1";
+  replacements = 0;
+  readonly kind: "html" | "body" | "div" | "input";
+  readonly parentElement: FakeInteractionElement | null;
+
+  constructor(
+    kind: "html" | "body" | "div" | "input",
+    parentElement: FakeInteractionElement | null = null,
+  ) {
+    super();
+    this.kind = kind;
+    this.parentElement = parentElement;
+  }
+
+  contains(target: Node | null): boolean {
+    let current = target as unknown as FakeInteractionElement | null;
+    while (current) {
+      if (current === this) return true;
+      current = current.parentElement;
+    }
+    return false;
+  }
+
+  closest<E extends Element = Element>(selectors: string): E | null {
+    if (selectors === ":disabled") {
+      return (this.disabled ? this : null) as unknown as E | null;
+    }
+    if (selectors === "[data-action]") return null;
+    return (this.kind === "input" ? this : null) as unknown as E | null;
+  }
+
+  matches(selectors: string): boolean {
+    return selectors === ":disabled" && this.disabled;
+  }
+
+  setPointerCapture(_pointerId: number): void {}
+
+  applyProjection(revision: number): void {
+    this.projection = `revision-${revision}`;
+    this.replacements += 1;
+  }
+}
+
+interface InteractionGateHarness {
+  documentTarget: FakeInteractionDocument;
+  windowTarget: FakeInteractionWindow;
+  documentElement: FakeInteractionElement;
+  body: FakeInteractionElement;
+  appRoot: FakeInteractionElement;
+  input: FakeInteractionElement;
+  unrelated: FakeInteractionElement;
+  disabledInput: FakeInteractionElement;
+  lifecycle: InteractionLifecycle<number>;
+  applied: number[];
+  queueProjection: (revision: number) => void;
+  dispose: () => void;
+}
+
+function withInteractionGate(run: (harness: InteractionGateHarness) => void): void {
+  const elementDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Element");
+  Object.defineProperty(globalThis, "Element", {
+    configurable: true,
+    writable: true,
+    value: FakeInteractionElement,
+  });
+  const documentTarget = new FakeInteractionDocument();
+  const windowTarget = new FakeInteractionWindow();
+  const documentElement = new FakeInteractionElement("html");
+  const body = new FakeInteractionElement("body", documentElement);
+  const appRoot = new FakeInteractionElement("div", body);
+  const input = new FakeInteractionElement("input", appRoot);
+  const unrelated = new FakeInteractionElement("div", body);
+  const disabledInput = new FakeInteractionElement("input", appRoot);
+  disabledInput.disabled = true;
+  documentTarget.documentElement = documentElement;
+  documentTarget.body = body;
+  const lifecycle = new InteractionLifecycle<number>((current, candidate) => candidate > current);
+  const applied: number[] = [];
+  const applyProjection = (revision: number): void => {
+    appRoot.applyProjection(revision);
+    applied.push(revision);
+  };
+  const dispose = installInteractionEventGate({
+    documentTarget: documentTarget as unknown as Document,
+    windowTarget: windowTarget as unknown as Window,
+    appRoot: appRoot as unknown as Element,
+    lifecycle,
+    finish: (release) => {
+      if (release?.deferred !== null && release?.deferred !== undefined) {
+        applyProjection(release.deferred);
+      }
+    },
+  });
+
+  try {
+    run({
+      documentTarget,
+      windowTarget,
+      documentElement,
+      body,
+      appRoot,
+      input,
+      unrelated,
+      disabledInput,
+      lifecycle,
+      applied,
+      queueProjection: (revision) => {
+        if (!lifecycle.defer(revision, false, true)) applyProjection(revision);
+      },
+      dispose,
+    });
+  } finally {
+    dispose();
+    if (elementDescriptor) Object.defineProperty(globalThis, "Element", elementDescriptor);
+    else delete (globalThis as Record<string, unknown>).Element;
+  }
+}
+
 test("interaction lifecycle holds one newest projection across pointer, keyboard, and IME", () => {
   const lifecycle = new InteractionLifecycle<number>((current, candidate) => candidate > current);
   lifecycle.beginPointer(7);
   lifecycle.beginKey("Enter");
   lifecycle.beginComposition();
+  const endPointer = lifecycle.capturePointerEnd(7);
+  const endKey = lifecycle.captureKeyEnd("Enter");
+  const endComposition = lifecycle.captureCompositionEnd();
 
   assert.equal(lifecycle.defer(2, false, true), true);
   assert.equal(lifecycle.defer(1, false, true), true);
-  assert.equal(lifecycle.endPointer(7), null);
-  assert.equal(lifecycle.endKey("Enter"), null);
-  assert.deepEqual(lifecycle.endComposition(), { deferred: 2, renderCurrent: false });
+  assert.equal(endPointer?.(), null);
+  assert.equal(endKey?.(), null);
+  assert.deepEqual(endComposition?.(), { deferred: 2, renderCurrent: false });
   assert.equal(lifecycle.active, false);
 });
 
-test("interaction lifecycle cancellation recovers a missing compositionend", () => {
-  const lifecycle = new InteractionLifecycle<number>((_current, _candidate) => true);
-  lifecycle.beginComposition();
-  lifecycle.defer(4, false, true);
+test("a paused IME keeps the DOM stable until compositionend releases only the newest projection", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("compositionstart");
+    queueProjection(2);
+    queueProjection(3);
 
-  assert.deepEqual(lifecycle.cancel(), { deferred: 4, renderCurrent: false });
-  assert.equal(lifecycle.active, false);
+    windowTarget.advanceBy(60_000);
+    assert.equal(lifecycle.active, true);
+    assert.equal(appRoot.projection, "revision-1");
+    assert.equal(appRoot.replacements, 0);
+
+    documentTarget.dispatch("compositionend");
+    assert.equal(appRoot.projection, "revision-1", "the compositionend event settles after its input event turn");
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-3");
+    assert.deepEqual(applied, [3]);
+    windowTarget.advanceBy(60_000);
+    assert.deepEqual(applied, [3]);
+  });
+});
+
+test("a stationary pointer keeps the DOM stable until lost capture releases only the newest projection", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, input, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 7 });
+    queueProjection(2);
+    queueProjection(4);
+
+    windowTarget.advanceBy(60_000);
+    assert.equal(lifecycle.active, true);
+    assert.equal(appRoot.projection, "revision-1");
+    assert.equal(appRoot.replacements, 0);
+
+    documentTarget.dispatch("lostpointercapture", { target: input, pointerId: 7 });
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-4");
+    assert.deepEqual(applied, [4]);
+    windowTarget.advanceBy(60_000);
+    assert.deepEqual(applied, [4]);
+  });
+});
+
+test("a held key keeps the DOM stable until window blur explicitly recovers the lifecycle", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, input, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("keydown", {
+      target: input,
+      code: "ArrowDown",
+      isComposing: false,
+    });
+    queueProjection(5);
+
+    windowTarget.advanceBy(60_000);
+    assert.equal(lifecycle.active, true);
+    assert.equal(appRoot.projection, "revision-1");
+
+    windowTarget.dispatch("blur");
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-5");
+    assert.deepEqual(applied, [5]);
+  });
+});
+
+test("document visibility loss explicitly recovers a missing compositionend", () => {
+  withInteractionGate(({ documentTarget, appRoot, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("compositionstart");
+    queueProjection(6);
+    documentTarget.hidden = true;
+
+    documentTarget.dispatch("visibilitychange");
+
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-6");
+    assert.deepEqual(applied, [6]);
+  });
+});
+
+test("installed keyboard events admit BODY and HTML reading operations but reject unrelated and disabled targets", () => {
+  withInteractionGate(({
+    documentTarget,
+    windowTarget,
+    documentElement,
+    body,
+    unrelated,
+    disabledInput,
+    lifecycle,
+  }) => {
+    documentTarget.dispatch("keydown", { target: body, code: "PageDown", isComposing: false });
+    assert.equal(lifecycle.active, true, "BODY owns document-level reading keys");
+    documentTarget.dispatch("keyup", { target: body, code: "PageDown" });
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+
+    documentTarget.dispatch("keydown", { target: documentElement, code: "ArrowDown", isComposing: false });
+    assert.equal(lifecycle.active, true, "HTML owns document-level reading keys");
+    windowTarget.dispatch("blur");
+    assert.equal(lifecycle.active, false);
+
+    documentTarget.dispatch("keydown", { target: unrelated, code: "ArrowDown", isComposing: false });
+    assert.equal(lifecycle.active, false, "an unrelated element outside #app is not a document owner");
+    documentTarget.dispatch("keydown", { target: disabledInput, code: "Enter", isComposing: false });
+    assert.equal(lifecycle.active, false, "disabled controls remain outside keyboard admission");
+  });
+});
+
+test("delayed pointer termination cannot end a newer generation with the same pointer id", () => {
+  for (const termination of ["pointerup", "lostpointercapture"] as const) {
+    withInteractionGate(({ documentTarget, windowTarget, appRoot, input, lifecycle, applied, queueProjection }) => {
+      documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 9 });
+      queueProjection(2);
+      documentTarget.dispatch(termination, { target: input, pointerId: 9 });
+      documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 9 });
+      queueProjection(3);
+
+      windowTarget.advanceBy(0);
+      assert.equal(lifecycle.active, true, termination);
+      assert.equal(appRoot.projection, "revision-1", termination);
+      assert.deepEqual(applied, [], termination);
+
+      documentTarget.dispatch("pointerup", { target: input, pointerId: 9 });
+      windowTarget.advanceBy(0);
+      assert.equal(lifecycle.active, false, termination);
+      assert.equal(appRoot.projection, "revision-3", termination);
+      assert.deepEqual(applied, [3], termination);
+    });
+  }
+});
+
+test("delayed keyup cannot end a newer generation with the same key code", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, input, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("keydown", { target: input, code: "ArrowDown", isComposing: false });
+    queueProjection(2);
+    documentTarget.dispatch("keyup", { target: input, code: "ArrowDown" });
+    documentTarget.dispatch("keydown", { target: input, code: "ArrowDown", isComposing: false });
+    queueProjection(4);
+
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, true);
+    assert.equal(appRoot.projection, "revision-1");
+    assert.deepEqual(applied, []);
+
+    documentTarget.dispatch("keyup", { target: input, code: "ArrowDown" });
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-4");
+    assert.deepEqual(applied, [4]);
+  });
+});
+
+test("duplicate delayed compositionend callbacks cannot end a newer composition", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("compositionstart");
+    queueProjection(2);
+    documentTarget.dispatch("compositionend");
+    documentTarget.dispatch("compositionend");
+    documentTarget.dispatch("compositionstart");
+    queueProjection(5);
+
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, true);
+    assert.equal(appRoot.projection, "revision-1");
+    assert.deepEqual(applied, []);
+
+    documentTarget.dispatch("compositionend");
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-5");
+    assert.deepEqual(applied, [5]);
+  });
+});
+
+test("double termination releases a deferred projection exactly once", () => {
+  withInteractionGate(({ documentTarget, windowTarget, input, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 11 });
+    queueProjection(6);
+    documentTarget.dispatch("pointerup", { target: input, pointerId: 11 });
+    documentTarget.dispatch("lostpointercapture", { target: input, pointerId: 11 });
+
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.deepEqual(applied, [6]);
+    windowTarget.dispatch("blur");
+    assert.deepEqual(applied, [6]);
+  });
+});
+
+test("blur invalidates a queued end before the same owner begins again", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, input, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 13 });
+    queueProjection(2);
+    documentTarget.dispatch("pointerup", { target: input, pointerId: 13 });
+    windowTarget.dispatch("blur");
+    assert.deepEqual(applied, [2]);
+
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 13 });
+    queueProjection(7);
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, true);
+    assert.equal(appRoot.projection, "revision-2");
+    assert.deepEqual(applied, [2]);
+
+    documentTarget.dispatch("pointercancel", { target: input, pointerId: 13 });
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-7");
+    assert.deepEqual(applied, [2, 7]);
+  });
+});
+
+test("disposing the installed gate drops deferred state and cancels queued end callbacks", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, input, lifecycle, applied, queueProjection, dispose }) => {
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 15 });
+    queueProjection(8);
+    documentTarget.dispatch("pointerup", { target: input, pointerId: 15 });
+
+    dispose();
+    windowTarget.advanceBy(0);
+
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-1");
+    assert.deepEqual(applied, []);
+  });
 });
 
 test("non-control text selection, scrolling, and document keyboard reading start the lifecycle", () => {
