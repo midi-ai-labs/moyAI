@@ -1,6 +1,6 @@
 # moyAI Getting Started
 
-2026-07-16 時点のcurrent source向け最小手順。公開済みv0.7.0には検証中のcanonical runtime/storage cutoverをまだ含まない。正確なversionと機能は利用するrelease packageと製品READMEを確認する。
+2026-07-18 時点のv0.8.0 release向け最小手順。canonical runtime/storage cutover、Codex型planning、Responses transportを含む。正確なversionと機能は利用するrelease packageと製品READMEを確認する。
 
 ## 初回起動
 

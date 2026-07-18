@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.7.0"><img alt="Release" src="https://img.shields.io/badge/release-v0.7.0-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.8.0"><img alt="Release" src="https://img.shields.io/badge/release-v0.8.0-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.ja.md">日本語 README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.7.0">Download release</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.8.0">Download release</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -81,17 +81,20 @@ moyAI is designed around those constraints:
 
 The current beta release is available here:
 
-[**moyAI v0.7.0 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v0.7.0)
+[**moyAI v0.8.0 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v0.8.0)
 
-The canonical runtime/storage cutover described in this source tree is still being verified on its
-feature branch and is not part of the published v0.7.0 package until a later release is completed.
+v0.8.0 includes the canonical runtime/storage cutover, Codex-style planning, Responses transport,
+semantic compaction, and the Desktop interaction hardening described in this source tree.
 
 The Windows release zip includes:
 
 - `bin/moyai.exe` for CLI / TUI workflows
 - `bin/moyai-desktop.exe` for the Desktop app
+- `bin/moyai-cleanup.exe` for resetting user-wide moyAI AppData to first-run state
 - bundled `ui/desktop-web/dist/` assets
-- README files, license, release notes, config example, manifest, and SHA256 checksums
+- README files, license, release notes, config example, getting-started guide, and in-package SHA256 checksums
+
+The GitHub Release publishes the zip together with its external manifest and zip SHA256 sidecar.
 
 On the target Windows machine, you do not need npm, the Rust toolchain, internet access, or a local web dev server.
 
@@ -129,7 +132,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.7.0 -ManualGuiStResultsPath path\to\RESULTS.md
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.8.0 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
 
 Run packaging from the clean source commit for that release. If `v<version>` already exists, the
@@ -397,12 +400,12 @@ items; the process-local wake-up is a coalesced generation signal that carries n
 item identity. Best-effort harness recording disables only itself when initialization or writing
 fails; it does not override the user-visible run/event result.
 
-The feature-branch V33 upgrade losslessly backfills the legacy message graph into ordered canonical
+The V33 migration included in v0.8.0 losslessly backfills the legacy message graph into ordered canonical
 protocol items before dropping the legacy tables. V37 converts a raw tool call only when a missing
 provider-response identity can be recovered uniquely from canonical evidence in the same turn. With
 zero or multiple candidates, the entire upgrade transaction rolls back and leaves the database
 unchanged; it neither deletes the ambiguous turn nor introduces an unresolved current payload variant.
-Back up a database before testing this source-tree upgrade against existing data. V38 then maps any retired `auto_review` session value
+Back up the moyAI data directory before upgrading existing data. V38 then maps any retired `auto_review` session value
 one way to `default` and rebuilds the current storage domain with only `default` and `full_access`.
 V39 rewrites legacy terminal JSON into the discriminated outcome contract, removes retired durable
 retry/delta rows, and fails closed rather than inventing an interruption cause. V40 keeps only valid

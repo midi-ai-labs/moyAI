@@ -284,51 +284,89 @@ try {
   $notesTemplate = @'
 # moyAI v{0}
 
-This release module contains the Windows CLI and Tauri Desktop binaries.
+## 日本語
 
-## Files
+今回の中心は、計画と実行ループのCodex parityです。指示から外れにくく、同じ確認を繰り返しにくいように、turn設定、plan、履歴、tool結果の持ち主を整理しました。
 
-- `bin/moyai.exe`: CLI / TUI entrypoint
-- `bin/moyai-desktop.exe`: Desktop App entrypoint
-- `bin/moyai-cleanup.exe`: reset user-wide moyAI AppData to first-run state
-- `ui/desktop-web/dist/`: bundled Desktop web assets
-- `config.example.toml`: optional sample config
-- `README.md` / `README.ja.md`: usage notes
-- `docs/user/getting-started.md`: first-run setup and known limitations
+### 主な変更
 
-## Highlights
+- `update_plan`を正規の進捗表示として追加し、計画を実行開始の条件にはしない構成にしました。
+- turn開始時にmodel、provider、timeout、permissionなどを固定し、実行中の設定変更でactive turnが揺れないようにしました。
+- LM Studio Responses APIに対応しました。turn内では`previous_response_id`を使って継続し、reasoning summaryはruntime-onlyで扱います。
+- provider requestとSSE streamへ上限、deadline、phase診断を追加しました。timeoutやstream開始後の失敗で、同じ生成requestを自動再送しません。
+- conversationの正本をcanonical historyへ一本化し、assistant本文とtool call、terminal、Stop、recovery、multi-agentの状態遷移をより厳密にしました。
+- permissionは`default`と`full_access`の2種類に整理しました。`full_access`でもshell、network/service callなどは人間の確認が必要です。
+- context compactionを固定件数ではなくresponse/call-output単位で行う方式へ変更し、大きなitemや縮約できない場合も安全に扱います。
+- file編集、patch、search、directory traversalをbounded化し、外部から同時に変更されたfileを上書きしない仕組みを強化しました。
+- DesktopのSettings、Quick Chat、Stop、非同期応答、focus/selectionの競合を見直し、画面操作の安定性を高めました。
+- visible Desktop manual STを通過した証跡をrelease packageへ同梱します。
 
-- Thin agent core with a short Markdown prompt, plain tool results, and a small state surface.
-- Desktop GUI, CLI, and TUI entrypoints over the same Rust core.
-- Local-first LM Studio / OpenAI-compatible endpoint configuration.
-- Optional root-scoped multi-agent collaboration with separate child sessions, bounded delegation, tree-wide Stop, and a read-only Sub Agent inspector.
-- Desktop state ownership rebuilt around Rust semantic capabilities and frontend-local drafts while preserving the existing visual design.
-- Default and Full Access are the only runtime permission profiles. Full Access automatically allows only stable-handle-verified file operations inside the configured boundary; shell, network/service calls, and other external operations require explicit human confirmation.
-- Explicit provider catalog loading and availability diagnostics stay separate from cold start and generation, with bounded transport phases and deadlines for the configured external HTTP endpoint.
-- Workspace file editing, patching, search, directory inspection, shell execution, session history, and Markdown export.
-- Codex-compatible goal runtime with `/goal`, goal tools, request-local steering, status accounting, and continuation governed by goal state, optional token/elapsed budgets, cancellation, and typed terminal outcomes.
-- Codex 2026-07 context handling updates: workspace world-state context, local instruction discovery, bounded per-workspace skill discovery snapshots, bounded `SKILL.md` rereads when a skill is loaded, and the `current_time` tool.
-- Automatic semantic compaction over response/call-output units with prepared-request token targets, giant-item map/reduce, durable replacement lineage, unchanged history on no-progress, and explicit hard-limit errors.
-- Desktop token meter showing approximate `used / max` context tokens, including session reopen restoration from recorded diagnostics.
-- Desktop UX hardening for quick chat, live access-mode changes, hidden shell windows, composer autosize, and window controls.
-- The package includes a manual GUI ST artifact bound to this exact version and source commit.
-- Published release packages are gated by a visible Desktop GUI manual ST results artifact.
+### 更新時の注意
 
-## Quick Start
+- 既存DBはV44までmigrationされます。初回起動前にmoyAIのdata directoryをbackupしておくことをおすすめします。
+- generation transportの既定はResponses APIです。Chat Completionsが必要なproviderでは`provider_api_mode = "chat_completions"`を明示してください。
+- configの未知keyと廃止keyはerrorになります。`stream_max_retries`、`[model_providers.*]`、`session.auto_compact_*`が残っている場合は削除または置き換えてください。
+- 旧`auto_review` permissionは`default`へ一方向に移行します。
 
-1. Start a local OpenAI-compatible LLM endpoint.
+### クイックスタート
+
+1. OpenAI-compatibleなLLM endpointを起動します。
+2. `bin/moyai-desktop.exe`を実行します。
+3. `LLM URL`でURLとmodelを設定し、Quick ChatまたはProject workspaceから始めます。
+
+target PCにnpm、Rust toolchain、internet接続、local dev serverは不要です。
+
+### 既知の制限
+
+- 長いmulti-file taskの結果や速度は、使用するlocal LLMとstreamの安定性に左右されます。
+- LM Studioがtoken usageを返さない場合、metricsの`token_usage`は`null`になります。
+- malformedな`apply_patch`は通常のtool errorとしてmodelへ返し、自動修復は行いません。
+
+## English
+
+This release focuses on Codex planning parity. Turn configuration, plans, canonical history, and tool-result ownership have been clarified to make task execution more predictable and reduce unnecessary loops.
+
+### Highlights
+
+- Added canonical `update_plan` progress projection without making plans an execution gate.
+- Model, provider, deadlines, permissions, and other effective settings are captured once at turn admission.
+- Added LM Studio Responses API support with turn-scoped `previous_response_id` continuity and runtime-only reasoning summaries.
+- Added bounded provider requests and SSE streams, operation deadlines, and transport-phase diagnostics. Generation requests are not automatically replayed after response-start timeout or streaming failure.
+- Consolidated conversation state into canonical history with typed terminals and stricter Stop, recovery, and multi-agent transitions.
+- Simplified runtime permissions to `default` and `full_access`. Shell, network/service calls, and other external operations still require human confirmation under Full Access.
+- Reworked semantic compaction around response and call-output units, including safe handling of oversized items and no-progress results.
+- Hardened bounded file editing, patching, search, and traversal while preventing concurrent external replacements from being overwritten.
+- Improved Desktop Settings, Quick Chat, Stop, asynchronous response, focus, and selection lifecycle stability.
+- The package includes evidence from the visible Desktop manual ST gate.
+
+### Upgrade notes
+
+- Existing databases migrate through V44. Back up the moyAI data directory before the first launch.
+- Responses is now the default generation transport. Set `provider_api_mode = "chat_completions"` explicitly when required by the provider.
+- Unknown and retired configuration keys are rejected. Remove or replace `stream_max_retries`, `[model_providers.*]`, and `session.auto_compact_*` entries.
+- The retired `auto_review` permission value is migrated one way to `default`.
+
+### Quick Start
+
+1. Start an OpenAI-compatible LLM endpoint.
 2. Run `bin/moyai-desktop.exe`.
-3. Open `LLM URL`, set base URL and model, then send a Quick Chat or select a Project workspace.
+3. Configure the URL and model under `LLM URL`, then use Quick Chat or a Project workspace.
 
-The app stores user-wide config under the Windows user profile by default. No npm, Rust toolchain, internet access, or local dev server is required on the target machine.
+The target machine does not need npm, a Rust toolchain, internet access, or a local development server.
 
-To reset moyAI to its first-run state, close all moyAI windows and run `bin/moyai-cleanup.exe`.
+### Known limitations
 
-## Known Limitations
+- Long multi-file task quality and speed remain dependent on the local model and stream stability.
+- When LM Studio omits token usage, metrics record `token_usage: null`.
+- Malformed `apply_patch` input is returned as a normal tool error without an automatic repair layer.
 
-- Long multi-file documentation tasks remain model-dependent and may need retries, timeout adjustment, or task splitting.
-- LM Studio streaming responses may not include token usage; metrics record `token_usage: null` when the provider omits it.
-- Malformed `apply_patch` input is returned to the model as a plain tool error. moyAI intentionally does not add a repair layer.
+## 配布ファイル / Assets
+
+- `moyAI-v{0}-windows-x86_64.zip`
+- `moyAI-v{0}-windows-x86_64.manifest.json`
+- `moyAI-v{0}-windows-x86_64.zip.sha256`
+
+**Full Changelog**: https://github.com/midi-ai-labs/moyAI/compare/v0.7.0...v{0}
 '@
   $notes = $notesTemplate -f $Version
   Write-Utf8File (Join-Path $releaseRoot "RELEASE_NOTES.md") $notes
