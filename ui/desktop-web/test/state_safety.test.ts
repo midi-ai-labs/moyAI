@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { commandConflictState } from "../src/command_error.ts";
+import {
+  commandConflictState,
+  commandErrorInfo,
+  commandInternalState,
+} from "../src/command_error.ts";
 import {
   beginConfigMutation,
   configDraftAppliesTo,
@@ -11,12 +15,17 @@ import {
   reconcileConfigDraftTarget,
   updateConfigDraftValue,
 } from "../src/config_mutation.ts";
-import { isRegularModalOverlay, modalIsOpen, nextDialogFocusIndex } from "../src/modal_state.ts";
+import {
+  confirmationFocusSelectors,
+  isRegularModalOverlay,
+  modalIdentity,
+  modalIsOpen,
+  nextDialogFocusIndex,
+} from "../src/modal_state.ts";
 import {
   configCommitEnabled,
   navigationIsIdle,
   quickChatDeleteAction,
-  sessionMemoryActions,
   sessionRowCapabilities,
   sessionRowActionAvailable,
 } from "../src/navigation_state.ts";
@@ -29,6 +38,7 @@ import {
   rowMutationTargetStillMatches,
 } from "../src/row_target.ts";
 import type { DesktopWebState } from "../src/types.ts";
+import { humanizeError } from "../src/utils.ts";
 
 function dirtyDraft(draftTarget = target()) {
   return {
@@ -36,16 +46,16 @@ function dirtyDraft(draftTarget = target()) {
     configDraftValues: new Map([["model.model", "draft-value"]]),
     configDraftBaselineValues: new Map([["model.model", "baseline-value"]]),
     configDraftTarget: draftTarget,
-    configDraftRevision: 1,
-    nextConfigMutationGeneration: 1,
-    activeConfigMutationGeneration: null as number | null,
+    configDraftRevision: 1n,
+    nextConfigMutationGeneration: 1n,
+    activeConfigMutationGeneration: null as bigint | null,
   };
 }
 
 function target(
   workspacePath = "C:/workspace",
   sessionId: string | null = "session-a",
-  configGeneration = 1,
+  configGeneration = "1",
 ) {
   return { workspacePath, sessionId, configGeneration };
 }
@@ -54,7 +64,7 @@ test("failed config apply retains dirty state and drafts", () => {
   const draft = dirtyDraft();
   const request = beginConfigMutation(draft, target());
 
-  assert.equal(finishConfigMutation(draft, request, false, target()), true);
+  assert.equal(finishConfigMutation(draft, request, false, target(), target()), true);
 
   assert.equal(draft.configDirty, true);
   assert.deepEqual(Array.from(draft.configDraftValues), [["model.model", "draft-value"]]);
@@ -66,8 +76,8 @@ test("cancelled or invalid config import retains dirty state and drafts", () => 
   const cancelledRequest = beginConfigMutation(cancelled, target());
   const invalidRequest = beginConfigMutation(invalid, target("C:/provider"));
 
-  finishConfigMutation(cancelled, cancelledRequest, false, target());
-  finishConfigMutation(invalid, invalidRequest, false, target("C:/provider"));
+  finishConfigMutation(cancelled, cancelledRequest, false, target(), target());
+  finishConfigMutation(invalid, invalidRequest, false, target("C:/provider"), target("C:/provider"));
 
   assert.equal(cancelled.configDirty, true);
   assert.equal(invalid.configDirty, true);
@@ -80,7 +90,7 @@ test("successful config apply, save, or import clears dirty state and drafts", (
     const draft = dirtyDraft();
     const request = beginConfigMutation(draft, target());
 
-    finishConfigMutation(draft, request, true, target());
+    finishConfigMutation(draft, request, true, target(), target());
 
     assert.equal(draft.configDirty, false, operation);
     assert.equal(draft.configDraftValues.size, 0, operation);
@@ -92,7 +102,7 @@ test("config mutation accepts only the latest generation and preserves newer dra
   const stale = beginConfigMutation(draft, target());
   const latest = beginConfigMutation(draft, target());
 
-  assert.equal(finishConfigMutation(draft, stale, true, target()), false);
+  assert.equal(finishConfigMutation(draft, stale, true, target(), target()), false);
   assert.equal(draft.configDirty, true);
 
   updateConfigDraftValue(
@@ -102,7 +112,7 @@ test("config mutation accepts only the latest generation and preserves newer dra
     "model.model",
     "newer-value",
   );
-  assert.equal(finishConfigMutation(draft, latest, true, target()), true);
+  assert.equal(finishConfigMutation(draft, latest, true, target(), target()), true);
   assert.equal(draft.configDirty, true);
   assert.equal(draft.configDraftValues.get("model.model"), "newer-value");
 });
@@ -111,14 +121,14 @@ test("config mutation rejects a response after workspace, session, or generation
   const draft = dirtyDraft();
   const request = beginConfigMutation(draft, target());
 
-  assert.equal(finishConfigMutation(draft, request, true, target("C:/other")), false);
+  assert.equal(finishConfigMutation(draft, request, true, target(), target("C:/other")), false);
   assert.equal(draft.configDirty, true);
   assert.equal(draft.activeConfigMutationGeneration, null);
 
-  for (const changedTarget of [target("C:/workspace", "session-b"), target("C:/workspace", "session-a", 2)]) {
+  for (const changedTarget of [target("C:/workspace", "session-b"), target("C:/workspace", "session-a", "2")]) {
     const nextDraft = dirtyDraft();
     const nextRequest = beginConfigMutation(nextDraft, target());
-    assert.equal(finishConfigMutation(nextDraft, nextRequest, true, changedTarget), false);
+    assert.equal(finishConfigMutation(nextDraft, nextRequest, true, target(), changedTarget), false);
     assert.equal(nextDraft.configDirty, true);
   }
 });
@@ -140,7 +150,7 @@ test("config draft is discarded at a target barrier and cannot reappear after AB
 
 test("config mutation admission drops a draft owned by another target", () => {
   const draft = dirtyDraft();
-  const nextTarget = target("C:/workspace", "session-b", 2);
+  const nextTarget = target("C:/workspace", "session-b", "2");
 
   const request = beginConfigMutation(draft, nextTarget);
 
@@ -152,7 +162,7 @@ test("config mutation admission drops a draft owned by another target", () => {
 
 test("config draft edit binds to its creation target and same-target failures retain it", () => {
   const draft = dirtyDraft();
-  const current = target("C:/workspace", "session-a", 2);
+  const current = target("C:/workspace", "session-a", "2");
 
   reconcileConfigDraftTarget(draft, current);
   updateConfigDraftValue(
@@ -164,7 +174,7 @@ test("config draft edit binds to its creation target and same-target failures re
   );
   const request = beginConfigMutation(draft, current);
 
-  assert.equal(finishConfigMutation(draft, request, false, current), true);
+  assert.equal(finishConfigMutation(draft, request, false, current, current), true);
   assert.equal(configDraftAppliesTo(draft, current), true);
   assert.equal(draft.configDraftValues.get("model.model"), "generation-two");
 });
@@ -175,9 +185,9 @@ test("config mutation payload survives closing settings and remains draft-owned"
     configDraftValues: new Map<string, string>(),
     configDraftBaselineValues: new Map<string, string>(),
     configDraftTarget: null,
-    configDraftRevision: 0,
-    nextConfigMutationGeneration: 1,
-    activeConfigMutationGeneration: null as number | null,
+    configDraftRevision: 0n,
+    nextConfigMutationGeneration: 1n,
+    activeConfigMutationGeneration: null as bigint | null,
   };
   const current = target();
 
@@ -197,7 +207,7 @@ test("config mutation payload survives closing settings and remains draft-owned"
     { key: "permissions.access_mode", text: "default" },
   ]);
   const request = beginConfigMutation(draft, current);
-  assert.equal(finishConfigMutation(draft, request, false, current), true);
+  assert.equal(finishConfigMutation(draft, request, false, current, current), true);
   assert.equal(configMutationValues(draft, current)?.[0].text, "edited-after-close");
 });
 
@@ -270,25 +280,6 @@ test("session row capabilities use row state rather than the global archived-sea
   assert.equal(quickChatDeleteAction("not_loaded"), "delete-chat-session");
 });
 
-test("session memory actions are mutually exclusive from authoritative row state", () => {
-  assert.deepEqual(sessionMemoryActions("idle", "enabled"), {
-    enable: false,
-    disable: true,
-  });
-  assert.deepEqual(sessionMemoryActions("not_loaded", "disabled"), {
-    enable: true,
-    disable: false,
-  });
-  assert.deepEqual(sessionMemoryActions("system_error", "enabled"), {
-    enable: false,
-    disable: true,
-  });
-  assert.deepEqual(sessionMemoryActions("active", "disabled"), {
-    enable: false,
-    disable: false,
-  });
-});
-
 test("settings commit requires a draft except during initial setup", () => {
   assert.equal(configCommitEnabled(false, false, false), false);
   assert.equal(configCommitEnabled(false, true, false), true);
@@ -304,7 +295,61 @@ test("typed conflict carries a refresh projection while other errors stay outsid
   assert.equal(commandConflictState(conflict), state);
   assert.equal(commandConflictState(JSON.stringify(conflict))?.projection_revision, "8");
   assert.equal(commandConflictState({ kind: "internal", message: "bug", state }), null);
+  assert.equal(commandInternalState({ kind: "internal", message: "bug", state }), state);
+  assert.equal(commandInternalState(conflict), null);
   assert.equal(commandConflictState("transport closed"), null);
+});
+
+test("successful config settlement accepts the correlated post-mutation target that polling already applied", () => {
+  const draft = dirtyDraft();
+  const request = beginConfigMutation(draft, target());
+  const settled = target("C:/workspace", "session-a", "2");
+
+  assert.equal(finishConfigMutation(draft, request, true, settled, settled), true);
+  assert.equal(draft.configDirty, false);
+  assert.equal(draft.configDraftValues.size, 0);
+});
+
+test("config settlement cannot clear a draft after a target newer than its response won", () => {
+  const draft = dirtyDraft();
+  const request = beginConfigMutation(draft, target());
+  const settled = target("C:/workspace", "session-a", "2");
+  const newer = target("C:/workspace", "session-a", "3");
+
+  assert.equal(finishConfigMutation(draft, request, true, settled, newer), false);
+  assert.equal(draft.configDirty, true);
+});
+
+test("unknown and storage errors with provider model access keywords stay generic", () => {
+  const message = "storage connection refused while loading model 404: access denied";
+  for (const error of [
+    message,
+    { kind: "internal", category: "storage", code: "storage_failure", message },
+    { kind: "internal", category: "unknown", code: "unknown", message },
+  ]) {
+    const human = humanizeError(error);
+    assert.equal(human.title, "処理に失敗しました");
+    assert.equal(human.details, message);
+  }
+});
+
+test("typed command error codes select guidance without inspecting the message", () => {
+  const opaque = "opaque diagnostic";
+  assert.equal(humanizeError({ code: "provider_transport", message: opaque }).title, "LLM provider に接続できません");
+  assert.equal(humanizeError({ code: "model_unavailable", message: opaque }).title, "指定したモデルが見つかりません");
+  assert.equal(humanizeError({ code: "image_unsupported", message: opaque }).title, "このモデルは画像入力に対応していません");
+  assert.equal(humanizeError({ code: "permission_policy_denied", message: opaque }).title, "操作が許可されませんでした");
+  assert.deepEqual(commandErrorInfo(JSON.stringify({
+    kind: "internal",
+    category: "runtime",
+    code: "runtime_failure",
+    message: opaque,
+  })), {
+    kind: "internal",
+    category: "runtime",
+    code: "runtime_failure",
+    message: opaque,
+  });
 });
 
 test("a repeated-click conflict wins over the earlier command response by Rust revision", () => {
@@ -344,6 +389,26 @@ test("regular modal detection excludes menu popovers and contains focus cyclical
   assert.equal(nextDialogFocusIndex(-1, 0, false), -1);
 });
 
+test("permission modal identity changes by request without changing outer modal lifecycle", () => {
+  const requestA = { confirmation_visible: true, confirmation_id: "A", overlay: "none" };
+  const requestB = { confirmation_visible: true, confirmation_id: "B", overlay: "none" };
+  assert.equal(modalIdentity(requestA), "permission:A");
+  assert.equal(modalIdentity(requestB), "permission:B");
+  assert.notEqual(modalIdentity(requestA), modalIdentity(requestB));
+  assert.equal(modalIdentity({ confirmation_visible: false, confirmation_id: null, overlay: "config" }), "config");
+  assert.equal(modalIsOpen(requestA, false), true);
+  assert.equal(modalIsOpen(requestB, false), true);
+});
+
+test("pending permission focus targets the live status instead of disabled actions", () => {
+  assert.deepEqual(confirmationFocusSelectors(true), [".permission-decision-status"]);
+  assert.deepEqual(confirmationFocusSelectors(false), [
+    ".modal-actions button[autofocus]:not(:disabled)",
+    ".modal-actions button:not(:disabled)",
+    ".permission-decision-status",
+  ]);
+});
+
 test("navigation admission consumes the single Rust capability projection", () => {
   assert.equal(navigationIsIdle({ navigation_admission_open: true }), true);
   assert.equal(navigationIsIdle({ navigation_admission_open: false }), false);
@@ -355,9 +420,9 @@ test("reverting every field to its baseline automatically clears dirty state", (
     configDraftValues: new Map<string, string>(),
     configDraftBaselineValues: new Map<string, string>(),
     configDraftTarget: null,
-    configDraftRevision: 0,
-    nextConfigMutationGeneration: 1,
-    activeConfigMutationGeneration: null as number | null,
+    configDraftRevision: 0n,
+    nextConfigMutationGeneration: 1n,
+    activeConfigMutationGeneration: null as bigint | null,
   };
   const baseline = [{ key: "model.model", text: "model-a" }];
 
@@ -391,7 +456,6 @@ function rowState(ownerSessionId: string, sessionIds: string[]): DesktopWebState
       session_id: sessionId,
       loaded_status: "idle",
       archived: false,
-      memory_mode: "enabled",
     })),
     selected_session_index: sessionIds.indexOf(ownerSessionId),
   } as DesktopWebState;

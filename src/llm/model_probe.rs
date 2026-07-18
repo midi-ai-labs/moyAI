@@ -1,20 +1,17 @@
+use std::fmt;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use crate::config::{ProviderMetadataMode, ResolvedConfig};
+use crate::config::{ProviderEndpoint, ProviderMetadataMode, ResolvedConfig};
 use crate::error::LlmError;
-use crate::llm::dto::{
-    OpenAiChatRequest, OpenAiContent, OpenAiContentPart, OpenAiImageUrl, OpenAiMessage,
-};
-use crate::llm::openai_compat::{openai_tool_schema_json, provider_tool_choice_json};
-use crate::llm::{
-    ProviderToolChoice, ToolSchema, effective_parallel_tool_calls,
-    tool_surface_scoped_parallel_tool_calls_projection,
-};
+
+const PROVIDER_READINESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const PROVIDER_METADATA_RESPONSE_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct OpenAiModelsResponse {
@@ -32,8 +29,22 @@ pub struct ProviderModelInfo {
     pub supports_tools: Option<bool>,
     pub supports_reasoning: Option<bool>,
     pub max_parallel_predictions: Option<u32>,
-    pub loaded: bool,
+    pub load_state: ProviderModelLoadState,
     pub source: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderModelLoadState {
+    Loaded,
+    NotLoaded,
+    Unknown,
+}
+
+impl Default for ProviderModelLoadState {
+    fn default() -> Self {
+        Self::Unknown
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,49 +54,7 @@ pub enum ModelAvailabilityStatus {
     Fail,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolCallProbeReport {
-    pub probe: String,
-    pub status: ModelAvailabilityStatus,
-    pub tool_choice: String,
-    pub required_for_gate: bool,
-    pub finish_reason: Option<String>,
-    pub tool_call_received: bool,
-    pub tool_name: Option<String>,
-    pub tool_arguments: Option<String>,
-    pub arguments_valid: bool,
-    pub content: Option<String>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VisionProbeReport {
-    pub probe: String,
-    pub status: ModelAvailabilityStatus,
-    pub required_for_gate: bool,
-    pub image_content_sent: bool,
-    pub response_received: bool,
-    pub finish_reason: Option<String>,
-    pub content: Option<String>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelCapabilityKind {
-    ToolUse,
-    VisionInput,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelCapabilityOverride {
-    pub capability: ModelCapabilityKind,
-    pub metadata_value: Option<bool>,
-    pub effective_value: bool,
-    pub evidence_ref: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelAvailabilityReport {
     pub gate: String,
     pub status: ModelAvailabilityStatus,
@@ -97,19 +66,15 @@ pub struct ModelAvailabilityReport {
     pub native_present: bool,
     pub require_vision: bool,
     pub vision_capable: bool,
-    #[serde(default)]
-    pub vision_probe_passed: bool,
-    #[serde(default)]
-    pub vision_probes: Vec<VisionProbeReport>,
     pub tool_use_capable: Option<bool>,
-    #[serde(default)]
-    pub capability_overrides: Vec<ModelCapabilityOverride>,
-    pub tool_call_probe_passed: bool,
-    pub tool_call_probes: Vec<ToolCallProbeReport>,
     pub reasoning_capable: Option<bool>,
     pub context: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub max_parallel_predictions: Option<u32>,
+    #[serde(default)]
+    pub load_state: ProviderModelLoadState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_detail: Option<String>,
     pub matched_model: Option<ProviderModelInfo>,
     pub v1_models: Vec<String>,
     pub native_models: Vec<String>,
@@ -118,12 +83,46 @@ pub struct ModelAvailabilityReport {
     pub checked_at_ms: u64,
 }
 
-pub fn normalize_provider_base_url(input: &str) -> String {
-    let trimmed = input.trim().trim_end_matches('/');
-    match trimmed.strip_suffix("/v1") {
-        Some(prefix) if !prefix.is_empty() => prefix.to_string(),
-        _ => trimmed.to_string(),
+impl fmt::Debug for ModelAvailabilityReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModelAvailabilityReport")
+            .field("gate", &self.gate)
+            .field("status", &self.status)
+            .field("generated_by", &self.generated_by)
+            .field("model", &self.model)
+            .field(
+                "base_url",
+                &ProviderEndpoint::parse(&self.base_url)
+                    .map(|endpoint| endpoint.catalog_root().as_str().to_string())
+                    .unwrap_or_else(|_| "<invalid-provider-endpoint>".to_string()),
+            )
+            .field("provider_metadata_mode", &self.provider_metadata_mode)
+            .field("v1_present", &self.v1_present)
+            .field("native_present", &self.native_present)
+            .field("require_vision", &self.require_vision)
+            .field("vision_capable", &self.vision_capable)
+            .field("tool_use_capable", &self.tool_use_capable)
+            .field("reasoning_capable", &self.reasoning_capable)
+            .field("context", &self.context)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field("max_parallel_predictions", &self.max_parallel_predictions)
+            .field("load_state", &self.load_state)
+            .field("readiness_detail", &self.readiness_detail)
+            .field("matched_model", &self.matched_model)
+            .field("v1_models", &self.v1_models)
+            .field("native_models", &self.native_models)
+            .field("openai_error_present", &self.openai_error.is_some())
+            .field("native_error_present", &self.native_error.is_some())
+            .field("checked_at_ms", &self.checked_at_ms)
+            .finish()
     }
+}
+
+pub fn normalize_provider_base_url(input: &str) -> String {
+    ProviderEndpoint::parse(input)
+        .map(|endpoint| endpoint.catalog_root().as_str().to_string())
+        .unwrap_or_default()
 }
 
 pub async fn fetch_openai_models(
@@ -138,60 +137,26 @@ pub async fn fetch_provider_model_infos(
     config: &ResolvedConfig,
     base_url_input: &str,
 ) -> Result<Vec<ProviderModelInfo>, LlmError> {
-    let base_url = normalize_provider_base_url(base_url_input);
-    if base_url.is_empty() {
-        return Err(LlmError::Message("provider URL is empty".to_string()));
-    }
+    let base_url = ProviderEndpoint::parse(base_url_input)
+        .map_err(|error| LlmError::Message(error.to_string()))?
+        .catalog_root();
 
     let client = build_probe_client(config)?;
     let headers = build_probe_headers(config)?;
 
-    let mut models = std::collections::BTreeMap::new();
-    let mut first_error = None;
-    match fetch_openai_model_infos(&client, &base_url, headers.clone()).await {
-        Ok(openai_models) => {
-            for model in openai_models {
-                models.insert(model.id.clone(), model);
-            }
+    let mut models = match config.model.provider_metadata_mode {
+        ProviderMetadataMode::LmStudioNativeRequired => {
+            fetch_lmstudio_model_infos(&client, &base_url, headers).await?
         }
-        Err(error) => first_error = Some(error),
-    }
-
-    match fetch_lmstudio_model_infos(&client, &base_url, headers.clone()).await {
-        Ok(native_models) => {
-            for model in native_models {
-                models
-                    .entry(model.id.clone())
-                    .and_modify(|existing| existing.enrich_from(&model))
-                    .or_insert(model);
-            }
+        ProviderMetadataMode::OpenAiCompatibleOnly => {
+            fetch_openai_model_infos(&client, &base_url, headers).await?
         }
-        Err(error) if first_error.is_none() => first_error = Some(error),
-        Err(_) => {}
-    }
-    match fetch_vllm_mlx_model_infos(&client, &base_url, headers).await {
-        Ok(vllm_mlx_models) => {
-            for model in vllm_mlx_models {
-                models
-                    .entry(model.id.clone())
-                    .and_modify(|existing| existing.enrich_from(&model))
-                    .or_insert(model);
-            }
-        }
-        Err(error) if first_error.is_none() => first_error = Some(error),
-        Err(_) => {}
-    }
-
+    };
     if models.is_empty() {
-        return match first_error {
-            Some(error) => Err(error),
-            None => Err(LlmError::Message(
-                "provider returned an empty model list".to_string(),
-            )),
-        };
+        return Err(LlmError::Message(
+            "configured provider metadata endpoint returned an empty model list".to_string(),
+        ));
     }
-
-    let mut models = models.into_values().collect::<Vec<_>>();
     models.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(models)
 }
@@ -206,7 +171,12 @@ pub async fn check_model_availability(
         .unwrap_or(&config.model.model)
         .trim()
         .to_string();
-    let base_url = normalize_provider_base_url(base_url_override.unwrap_or(&config.model.base_url));
+    let endpoint = ProviderEndpoint::parse(base_url_override.unwrap_or(&config.model.base_url))
+        .map(|endpoint| endpoint.catalog_root());
+    let base_url = endpoint
+        .as_ref()
+        .map(|endpoint| endpoint.as_str().to_string())
+        .unwrap_or_else(|_| "<invalid-provider-endpoint>".to_string());
     let checked_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -215,7 +185,7 @@ pub async fn check_model_availability(
     let mut report = ModelAvailabilityReport {
         gate: "model_availability".to_string(),
         status: ModelAvailabilityStatus::Fail,
-        generated_by: "moyai_model_availability_v2".to_string(),
+        generated_by: "moyai_model_availability_v4_catalog_and_load_state".to_string(),
         model,
         base_url,
         provider_metadata_mode: config.model.provider_metadata_mode,
@@ -223,16 +193,13 @@ pub async fn check_model_availability(
         native_present: false,
         require_vision,
         vision_capable: false,
-        vision_probe_passed: false,
-        vision_probes: Vec::new(),
         tool_use_capable: None,
-        capability_overrides: Vec::new(),
-        tool_call_probe_passed: false,
-        tool_call_probes: Vec::new(),
         reasoning_capable: None,
         context: None,
         max_output_tokens: None,
         max_parallel_predictions: None,
+        load_state: ProviderModelLoadState::Unknown,
+        readiness_detail: None,
         matched_model: None,
         v1_models: Vec::new(),
         native_models: Vec::new(),
@@ -246,9 +213,18 @@ pub async fn check_model_availability(
         report.native_error = Some("configured model is empty".to_string());
         return report;
     }
+    let endpoint = match endpoint {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            let message = error.to_string();
+            report.openai_error = Some(message.clone());
+            report.native_error = Some(message);
+            return report;
+        }
+    };
     if report.base_url.is_empty() {
-        report.openai_error = Some("provider URL is empty".to_string());
-        report.native_error = Some("provider URL is empty".to_string());
+        report.openai_error = Some("provider endpoint must not be empty".to_string());
+        report.native_error = Some("provider endpoint must not be empty".to_string());
         return report;
     }
 
@@ -271,27 +247,28 @@ pub async fn check_model_availability(
         }
     };
 
-    let openai_models =
-        match fetch_openai_model_infos(&client, &report.base_url, headers.clone()).await {
-            Ok(models) => models,
-            Err(error) => {
-                report.openai_error = Some(error.to_string());
-                Vec::new()
-            }
-        };
-    let native_models =
-        match fetch_lmstudio_model_infos(&client, &report.base_url, headers.clone()).await {
-            Ok(models) => models,
-            Err(error) => {
-                report.native_error = Some(error.to_string());
-                Vec::new()
-            }
-        };
-    let vllm_mlx_models =
-        match fetch_vllm_mlx_model_infos(&client, &report.base_url, headers.clone()).await {
-            Ok(models) => models,
-            Err(_) => Vec::new(),
-        };
+    let (openai_models, native_models) = match report.provider_metadata_mode {
+        ProviderMetadataMode::OpenAiCompatibleOnly => {
+            let models = match fetch_openai_model_infos(&client, &endpoint, headers).await {
+                Ok(models) => models,
+                Err(error) => {
+                    report.openai_error = Some(error.to_string());
+                    Vec::new()
+                }
+            };
+            (models, Vec::new())
+        }
+        ProviderMetadataMode::LmStudioNativeRequired => {
+            let models = match fetch_lmstudio_model_infos(&client, &endpoint, headers).await {
+                Ok(models) => models,
+                Err(error) => {
+                    report.native_error = Some(error.to_string());
+                    Vec::new()
+                }
+            };
+            (Vec::new(), models)
+        }
+    };
 
     report.v1_present = openai_models.iter().any(|entry| entry.id == report.model);
     report.native_present = native_models.iter().any(|entry| entry.id == report.model);
@@ -304,7 +281,7 @@ pub async fn check_model_availability(
         .map(|entry| entry.id.clone())
         .collect::<Vec<_>>();
 
-    let mut matched_model = openai_models
+    let matched_model = openai_models
         .iter()
         .find(|entry| entry.id == report.model)
         .cloned()
@@ -313,25 +290,7 @@ pub async fn check_model_availability(
                 .iter()
                 .find(|entry| entry.id == report.model)
                 .cloned()
-        })
-        .or_else(|| {
-            vllm_mlx_models
-                .iter()
-                .find(|entry| entry.id == report.model)
-                .cloned()
         });
-    if let Some(existing) = matched_model.as_mut() {
-        if let Some(native) = native_models.iter().find(|entry| entry.id == report.model) {
-            existing.enrich_from(native);
-        }
-        if let Some(vllm_mlx) = vllm_mlx_models
-            .iter()
-            .find(|entry| entry.id == report.model)
-        {
-            existing.enrich_from(vllm_mlx);
-        }
-    }
-
     if let Some(model) = matched_model.as_ref() {
         report.vision_capable = model.supports_images.unwrap_or(false);
         report.tool_use_capable = model.supports_tools;
@@ -339,46 +298,9 @@ pub async fn check_model_availability(
         report.context = model.context_window;
         report.max_output_tokens = model.max_output_tokens;
         report.max_parallel_predictions = model.max_parallel_predictions;
+        report.load_state = model.load_state;
     }
     report.matched_model = matched_model;
-
-    if report.v1_present && report.require_vision {
-        let vision_probe =
-            run_vision_probe(&client, &report.base_url, headers.clone(), &report.model).await;
-        report.vision_probes = vec![vision_probe];
-        report.vision_probe_passed = report
-            .vision_probes
-            .iter()
-            .filter(|probe| probe.required_for_gate)
-            .all(|probe| matches!(probe.status, ModelAvailabilityStatus::Pass));
-        if report.vision_probe_passed {
-            apply_vision_probe_capability_evidence(&mut report);
-        } else {
-            report.vision_capable = false;
-        }
-    }
-
-    if report.v1_present {
-        report.tool_call_probes = run_tool_call_probe_suite(
-            &client,
-            &report.base_url,
-            headers,
-            &report.model,
-            report.provider_metadata_mode,
-            config.model.parallel_tool_calls,
-            report
-                .max_parallel_predictions
-                .unwrap_or(config.model.max_parallel_predictions),
-        )
-        .await;
-        report.tool_call_probe_passed = !report.tool_call_probes.is_empty()
-            && report
-                .tool_call_probes
-                .iter()
-                .filter(|probe| probe.required_for_gate)
-                .all(|probe| matches!(probe.status, ModelAvailabilityStatus::Pass));
-        apply_tool_call_probe_capability_evidence(&mut report);
-    }
 
     if model_availability_passes(
         report.provider_metadata_mode,
@@ -386,62 +308,35 @@ pub async fn check_model_availability(
         report.native_present,
         report.require_vision,
         report.vision_capable,
-        report.vision_probe_passed,
-        report.tool_call_probe_passed,
+        report.load_state,
     ) {
         report.status = ModelAvailabilityStatus::Pass;
+    } else {
+        report.readiness_detail = Some(model_readiness_failure_detail(&report));
     }
     report
 }
 
-fn apply_vision_probe_capability_evidence(report: &mut ModelAvailabilityReport) {
-    if !report.vision_probe_passed {
-        return;
-    }
-    let metadata_value = report
-        .matched_model
-        .as_ref()
-        .and_then(|model| model.supports_images);
-    if metadata_value != Some(true)
-        && !report.capability_overrides.iter().any(|override_record| {
-            override_record.capability == ModelCapabilityKind::VisionInput
-                && override_record.evidence_ref == "vision_probe_passed"
-        })
-    {
-        report.capability_overrides.push(ModelCapabilityOverride {
-            capability: ModelCapabilityKind::VisionInput,
-            metadata_value,
-            effective_value: true,
-            evidence_ref: "vision_probe_passed".to_string(),
-        });
-    }
-    report.vision_capable = true;
-    if let Some(model) = report.matched_model.as_mut() {
-        model.supports_images = Some(true);
-    }
-}
-
-fn apply_tool_call_probe_capability_evidence(report: &mut ModelAvailabilityReport) {
-    if !report.tool_call_probe_passed {
-        return;
-    }
-    let metadata_value = report.tool_use_capable;
-    if metadata_value != Some(true)
-        && !report.capability_overrides.iter().any(|override_record| {
-            override_record.capability == ModelCapabilityKind::ToolUse
-                && override_record.evidence_ref == "tool_call_probe_passed"
-        })
-    {
-        report.capability_overrides.push(ModelCapabilityOverride {
-            capability: ModelCapabilityKind::ToolUse,
-            metadata_value,
-            effective_value: true,
-            evidence_ref: "tool_call_probe_passed".to_string(),
-        });
-    }
-    report.tool_use_capable = Some(true);
-    if let Some(model) = report.matched_model.as_mut() {
-        model.supports_tools = Some(true);
+fn model_readiness_failure_detail(report: &ModelAvailabilityReport) -> String {
+    match report.provider_metadata_mode {
+        ProviderMetadataMode::LmStudioNativeRequired if report.native_present => {
+            match report.load_state {
+                ProviderModelLoadState::NotLoaded =>
+                    "model is registered in the LM Studio catalog, but no instance is currently loaded".to_string(),
+                ProviderModelLoadState::Unknown =>
+                    "model is registered in the LM Studio catalog, but the provider did not report instance load state".to_string(),
+                ProviderModelLoadState::Loaded if report.require_vision && !report.vision_capable =>
+                    "the loaded model does not advertise the required image capability".to_string(),
+                ProviderModelLoadState::Loaded =>
+                    "the loaded model did not satisfy the requested readiness contract".to_string(),
+            }
+        }
+        ProviderMetadataMode::OpenAiCompatibleOnly
+            if report.v1_present && report.require_vision && !report.vision_capable =>
+        {
+            "the registered model does not advertise the required image capability".to_string()
+        }
+        _ => "the configured model is not registered in the declared provider catalog".to_string(),
     }
 }
 
@@ -451,520 +346,29 @@ fn model_availability_passes(
     native_present: bool,
     require_vision: bool,
     vision_capable: bool,
-    vision_probe_passed: bool,
-    tool_call_probe_passed: bool,
+    load_state: ProviderModelLoadState,
 ) -> bool {
     let provider_ok = match provider_metadata_mode {
-        ProviderMetadataMode::LmStudioNativeRequired => v1_present && native_present,
+        ProviderMetadataMode::LmStudioNativeRequired => {
+            native_present && load_state == ProviderModelLoadState::Loaded
+        }
         ProviderMetadataMode::OpenAiCompatibleOnly => v1_present,
     };
-    let vision_ok = !require_vision || (vision_capable && vision_probe_passed);
-    provider_ok && vision_ok && tool_call_probe_passed
-}
-
-async fn run_vision_probe(
-    client: &reqwest::Client,
-    base_url: &str,
-    headers: HeaderMap,
-    model: &str,
-) -> VisionProbeReport {
-    let endpoint = format!("{}/v1/chat/completions", base_url);
-    let body = match vision_probe_request_body(model) {
-        Ok(body) => body,
-        Err(error) => {
-            return failed_vision_probe_report(format!(
-                "vision probe request could not be materialized: {error}"
-            ));
-        }
-    };
-
-    let response = match client
-        .post(&endpoint)
-        .headers(headers)
-        .json(&body)
-        .timeout(Duration::from_secs(120))
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            return failed_vision_probe_report(format!("vision probe request failed: {error}"));
-        }
-    };
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<response body unavailable>".to_string());
-        return failed_vision_probe_report(format!(
-            "vision probe request failed with status {}: {}",
-            status,
-            summarize_body(&body)
-        ));
-    }
-    let payload = match response.json::<Value>().await {
-        Ok(payload) => payload,
-        Err(error) => {
-            return failed_vision_probe_report(format!(
-                "vision probe response was not valid JSON: {error}"
-            ));
-        }
-    };
-    vision_probe_report_from_response(&payload)
-}
-
-fn vision_probe_request_body(model: &str) -> Result<Value, LlmError> {
-    const ONE_PIXEL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
-    let request = OpenAiChatRequest {
-        model: model.to_string(),
-        stream: false,
-        messages: vec![OpenAiMessage {
-            role: "user".to_string(),
-            content: Some(OpenAiContent::Parts(vec![
-                OpenAiContentPart::Text {
-                    text: "Reply with a short confirmation that you received this image."
-                        .to_string(),
-                },
-                OpenAiContentPart::ImageUrl {
-                    image_url: OpenAiImageUrl {
-                        url: format!("data:image/png;base64,{ONE_PIXEL_PNG_BASE64}"),
-                    },
-                },
-            ])),
-            tool_calls: None,
-            tool_call_id: None,
-        }],
-        max_tokens: Some(32),
-        temperature: Some(0.0),
-        top_p: None,
-        top_k: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        seed: None,
-        stop_sequences: Vec::new(),
-        tools: Vec::new(),
-        parallel_tool_calls: None,
-    };
-    serde_json::to_value(request)
-        .map_err(|error| LlmError::Message(format!("failed to serialize vision probe: {error}")))
-}
-
-fn vision_probe_report_from_response(payload: &Value) -> VisionProbeReport {
-    let choice = payload
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first());
-    let finish_reason = choice.and_then(|choice| string_field(choice, &["finish_reason"]));
-    let message = choice.and_then(|choice| choice.get("message"));
-    let content = message
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    let response_received = content
-        .as_deref()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    VisionProbeReport {
-        probe: "vision_input_image_url".to_string(),
-        status: if response_received {
-            ModelAvailabilityStatus::Pass
-        } else {
-            ModelAvailabilityStatus::Fail
-        },
-        required_for_gate: true,
-        image_content_sent: true,
-        response_received,
-        finish_reason,
-        content,
-        error: if response_received {
-            None
-        } else {
-            Some("expected non-empty assistant content after image input probe".to_string())
-        },
-    }
-}
-
-fn failed_vision_probe_report(error: String) -> VisionProbeReport {
-    VisionProbeReport {
-        probe: "vision_input_image_url".to_string(),
-        status: ModelAvailabilityStatus::Fail,
-        required_for_gate: true,
-        image_content_sent: false,
-        response_received: false,
-        finish_reason: None,
-        content: None,
-        error: Some(error),
-    }
-}
-
-async fn run_tool_call_probe_suite(
-    client: &reqwest::Client,
-    base_url: &str,
-    headers: HeaderMap,
-    model: &str,
-    provider_metadata_mode: ProviderMetadataMode,
-    parallel_tool_calls_enabled: bool,
-    max_parallel_predictions: u32,
-) -> Vec<ToolCallProbeReport> {
-    let probes = [
-        ToolCallProbeSpec {
-            probe: "tool_choice_required",
-            tool_choice_label: "required",
-            tool_choice: ProbeToolChoice::Runtime(ProviderToolChoice::Required),
-            strong_instruction: false,
-            required_for_gate: true,
-        },
-        ToolCallProbeSpec {
-            probe: "tool_choice_named",
-            tool_choice_label: "named_function",
-            tool_choice: ProbeToolChoice::Runtime(ProviderToolChoice::Named {
-                name: "echo_word".to_string(),
-            }),
-            strong_instruction: false,
-            required_for_gate: provider_metadata_mode == ProviderMetadataMode::OpenAiCompatibleOnly,
-        },
-        ToolCallProbeSpec {
-            probe: "tool_choice_auto_strong",
-            tool_choice_label: "auto",
-            tool_choice: ProbeToolChoice::Auto,
-            strong_instruction: true,
-            required_for_gate: true,
-        },
-    ];
-    let mut reports = Vec::with_capacity(probes.len());
-    for spec in probes {
-        reports.push(
-            run_tool_call_probe(
-                client,
-                base_url,
-                headers.clone(),
-                model,
-                provider_metadata_mode,
-                &spec,
-                parallel_tool_calls_enabled,
-                max_parallel_predictions,
-            )
-            .await,
-        );
-    }
-    reports
-}
-
-#[derive(Debug, Clone)]
-struct ToolCallProbeSpec {
-    probe: &'static str,
-    tool_choice_label: &'static str,
-    tool_choice: ProbeToolChoice,
-    strong_instruction: bool,
-    required_for_gate: bool,
-}
-
-#[derive(Debug, Clone)]
-enum ProbeToolChoice {
-    Runtime(ProviderToolChoice),
-    Auto,
-}
-
-async fn run_tool_call_probe(
-    client: &reqwest::Client,
-    base_url: &str,
-    headers: HeaderMap,
-    model: &str,
-    provider_metadata_mode: ProviderMetadataMode,
-    spec: &ToolCallProbeSpec,
-    parallel_tool_calls_enabled: bool,
-    max_parallel_predictions: u32,
-) -> ToolCallProbeReport {
-    let endpoint = format!("{}/v1/chat/completions", base_url);
-    let body = match tool_call_probe_request_body(
-        model,
-        provider_metadata_mode,
-        &spec.tool_choice,
-        spec.strong_instruction,
-        parallel_tool_calls_enabled,
-        max_parallel_predictions,
-    ) {
-        Ok(body) => body,
-        Err(error) => {
-            return failed_tool_call_probe_report(
-                spec.probe,
-                spec.tool_choice_label,
-                spec.required_for_gate,
-                format!("tool-call probe request could not be materialized: {error}"),
-            );
-        }
-    };
-
-    let response = match client
-        .post(&endpoint)
-        .headers(headers)
-        .json(&body)
-        .timeout(Duration::from_secs(120))
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            return failed_tool_call_probe_report(
-                spec.probe,
-                spec.tool_choice_label,
-                spec.required_for_gate,
-                format!("tool-call probe request failed: {error}"),
-            );
-        }
-    };
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<response body unavailable>".to_string());
-        return failed_tool_call_probe_report(
-            spec.probe,
-            spec.tool_choice_label,
-            spec.required_for_gate,
-            format!(
-                "tool-call probe request failed with status {}: {}",
-                status,
-                summarize_body(&body)
-            ),
-        );
-    }
-    let payload = match response.json::<Value>().await {
-        Ok(payload) => payload,
-        Err(error) => {
-            return failed_tool_call_probe_report(
-                spec.probe,
-                spec.tool_choice_label,
-                spec.required_for_gate,
-                format!("tool-call probe response was not valid JSON: {error}"),
-            );
-        }
-    };
-    tool_call_probe_report_from_response(
-        spec.probe,
-        spec.tool_choice_label,
-        spec.required_for_gate,
-        &payload,
-    )
-}
-
-fn tool_call_probe_request_body(
-    model: &str,
-    provider_metadata_mode: ProviderMetadataMode,
-    tool_choice: &ProbeToolChoice,
-    strong_instruction: bool,
-    parallel_tool_calls_enabled: bool,
-    max_parallel_predictions: u32,
-) -> Result<Value, LlmError> {
-    let messages = if strong_instruction {
-        json!([
-            {
-                "role": "system",
-                "content": "You are connected to tools. When a tool is available and the user requests using it, respond only by calling the tool. Never answer directly."
-            },
-            {
-                "role": "user",
-                "content": "Call echo_word with word ping now."
-            }
-        ])
-    } else {
-        json!([
-            {
-                "role": "user",
-                "content": "Call echo_word with word ping now."
-            }
-        ])
-    };
-    let echo_tool = echo_word_tool_schema();
-    let mut body = json!({
-        "model": model,
-        "stream": false,
-        "messages": messages,
-        "tools": [openai_tool_schema_json(&echo_tool)?],
-        "tool_choice": probe_tool_choice_json(tool_choice, provider_metadata_mode),
-        "temperature": 0,
-        "max_tokens": 128
-    });
-    if let Some(parallel_tool_calls) = tool_surface_scoped_parallel_tool_calls_projection(
-        1,
-        effective_parallel_tool_calls(1, parallel_tool_calls_enabled, max_parallel_predictions),
-    ) && let Value::Object(map) = &mut body
-    {
-        map.insert(
-            "parallel_tool_calls".to_string(),
-            Value::Bool(parallel_tool_calls),
-        );
-    }
-    Ok(body)
-}
-
-fn probe_tool_choice_json(
-    tool_choice: &ProbeToolChoice,
-    provider_metadata_mode: ProviderMetadataMode,
-) -> Value {
-    match tool_choice {
-        ProbeToolChoice::Runtime(choice) => {
-            provider_tool_choice_json(choice, provider_metadata_mode)
-        }
-        ProbeToolChoice::Auto => json!("auto"),
-    }
-}
-
-fn echo_word_tool_schema() -> ToolSchema {
-    ToolSchema {
-        name: "echo_word".to_string(),
-        description: "Echoes a single word for provider tool-call capability probing.".to_string(),
-        input_schema: json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "word": {
-                    "type": "string"
-                }
-            },
-            "required": ["word"]
-        }),
-        strict: false,
-    }
-}
-
-fn tool_call_probe_report_from_response(
-    probe: &str,
-    tool_choice_label: &str,
-    required_for_gate: bool,
-    payload: &Value,
-) -> ToolCallProbeReport {
-    let choice = payload
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|choices| choices.first());
-    let finish_reason = choice.and_then(|choice| string_field(choice, &["finish_reason"]));
-    let message = choice.and_then(|choice| choice.get("message"));
-    let content = message
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    let first_tool_call = message
-        .and_then(|message| message.get("tool_calls"))
-        .and_then(Value::as_array)
-        .and_then(|tool_calls| tool_calls.first());
-    let function = first_tool_call.and_then(|tool_call| tool_call.get("function"));
-    let tool_name = function.and_then(|function| string_field(function, &["name"]));
-    let tool_arguments = function
-        .and_then(|function| function.get("arguments"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    let arguments_valid = tool_arguments
-        .as_deref()
-        .map(echo_word_probe_arguments_valid)
-        .unwrap_or(false);
-    let tool_call_received = first_tool_call.is_some();
-    let passed = tool_call_received && tool_name.as_deref() == Some("echo_word") && arguments_valid;
-    ToolCallProbeReport {
-        probe: probe.to_string(),
-        status: if passed {
-            ModelAvailabilityStatus::Pass
-        } else {
-            ModelAvailabilityStatus::Fail
-        },
-        tool_choice: tool_choice_label.to_string(),
-        required_for_gate,
-        finish_reason,
-        tool_call_received,
-        tool_name,
-        tool_arguments,
-        arguments_valid,
-        content,
-        error: if passed {
-            None
-        } else {
-            Some("expected echo_word tool call with arguments {\"word\":\"ping\"}".to_string())
-        },
-    }
-}
-
-fn echo_word_probe_arguments_valid(arguments: &str) -> bool {
-    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(arguments) else {
-        return false;
-    };
-    object.len() == 1 && object.get("word").and_then(Value::as_str) == Some("ping")
-}
-
-pub fn model_probe_rejects_extra_tool_arguments_fixture_passes() -> bool {
-    let valid_payload = json!({
-        "choices": [{
-            "finish_reason": "tool_calls",
-            "message": {
-                "tool_calls": [{
-                    "function": {
-                        "name": "echo_word",
-                        "arguments": "{\"word\":\"ping\"}"
-                    }
-                }]
-            }
-        }]
-    });
-    let extra_payload = json!({
-        "choices": [{
-            "finish_reason": "tool_calls",
-            "message": {
-                "tool_calls": [{
-                    "function": {
-                        "name": "echo_word",
-                        "arguments": "{\"word\":\"ping\",\"extra\":\"accepted\"}"
-                    }
-                }]
-            }
-        }]
-    });
-    let valid = tool_call_probe_report_from_response("fixture", "required", true, &valid_payload);
-    let extra = tool_call_probe_report_from_response("fixture", "required", true, &extra_payload);
-
-    matches!(valid.status, ModelAvailabilityStatus::Pass)
-        && valid.arguments_valid
-        && matches!(extra.status, ModelAvailabilityStatus::Fail)
-        && !extra.arguments_valid
-        && extra.tool_call_received
-        && extra.tool_name.as_deref() == Some("echo_word")
-}
-
-fn failed_tool_call_probe_report(
-    probe: &str,
-    tool_choice_label: &str,
-    required_for_gate: bool,
-    error: String,
-) -> ToolCallProbeReport {
-    ToolCallProbeReport {
-        probe: probe.to_string(),
-        status: ModelAvailabilityStatus::Fail,
-        tool_choice: tool_choice_label.to_string(),
-        required_for_gate,
-        finish_reason: None,
-        tool_call_received: false,
-        tool_name: None,
-        tool_arguments: None,
-        arguments_valid: false,
-        content: None,
-        error: Some(error),
-    }
+    let vision_ok = !require_vision || vision_capable;
+    provider_ok && vision_ok
 }
 
 fn build_probe_client(config: &ResolvedConfig) -> Result<reqwest::Client, LlmError> {
     Ok(reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(config.model.connect_timeout_ms))
-        .timeout(Duration::from_millis(config.model.request_timeout_ms))
+        .timeout(PROVIDER_READINESS_REQUEST_TIMEOUT)
         .build()?)
 }
 
 fn build_probe_headers(config: &ResolvedConfig) -> Result<HeaderMap, LlmError> {
     let mut headers = HeaderMap::new();
-    if let Some(api_key) = config
-        .model
-        .api_key_env
-        .as_ref()
-        .and_then(|name| std::env::var(name).ok())
+    if let Some(api_key) =
+        crate::llm::resolve_api_key_from_env(config.model.api_key_env.as_deref())?
     {
         let value = HeaderValue::from_str(&format!("Bearer {api_key}"))
             .map_err(|error| LlmError::Message(format!("invalid API key header: {error}")))?;
@@ -998,8 +402,8 @@ pub fn apply_provider_model_info_to_config(
     if let Some(value) = model.supports_images {
         config.supports_images = value;
     }
-    if model.supports_tools == Some(true) {
-        config.supports_tools = true;
+    if let Some(value) = model.supports_tools {
+        config.supports_tools = value;
     }
     if let Some(value) = model.supports_reasoning {
         config.supports_reasoning = value;
@@ -1009,67 +413,136 @@ pub fn apply_provider_model_info_to_config(
     }
 }
 
-pub fn apply_model_availability_report_to_config(
-    config: &mut crate::config::model::ModelConfig,
+pub fn validate_model_availability_report(
+    config: &crate::config::model::ModelConfig,
     report: &ModelAvailabilityReport,
+    require_vision: bool,
 ) -> Result<(), LlmError> {
     if !matches!(report.status, ModelAvailabilityStatus::Pass) {
         return Err(LlmError::Message(format!(
-            "model availability gate did not pass for `{}` at `{}`",
-            report.model, report.base_url
+            "model availability gate did not pass for `{}`{}",
+            report.model,
+            report
+                .readiness_detail
+                .as_deref()
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default()
         )));
     }
     if config.model.trim() != report.model {
         return Err(LlmError::Message(format!(
-            "model availability report for `{}` cannot hydrate configured model `{}`",
+            "model availability report for `{}` does not match configured model `{}`",
             report.model, config.model
         )));
     }
-    let Some(model) = report.matched_model.as_ref() else {
-        return Err(LlmError::Message(format!(
-            "model availability report passed without matched model metadata for `{}`",
-            report.model
-        )));
-    };
-    apply_provider_model_info_to_config(config, model);
-    if report.tool_use_capable == Some(true) {
-        config.supports_tools = true;
-    }
-    if report.vision_capable {
-        config.supports_images = true;
-    }
-    if let Some(reasoning_capable) = report.reasoning_capable {
-        config.supports_reasoning = reasoning_capable;
-    }
-    if let Some(context_window) = report.context {
-        config.context_window = context_window;
-        config.extra_body_json = Some(extra_body_with_num_ctx(
-            config.extra_body_json.clone(),
-            context_window,
+    let configured_base_url = ProviderEndpoint::parse(&config.base_url)
+        .map_err(|error| LlmError::Message(error.to_string()))?
+        .catalog_root();
+    let report_base_url = ProviderEndpoint::parse(&report.base_url)
+        .map_err(|error| LlmError::Message(error.to_string()))?
+        .catalog_root();
+    if configured_base_url != report_base_url {
+        return Err(LlmError::Message(
+            "model availability report does not match the configured provider".to_string(),
         ));
     }
-    if let Some(max_output_tokens) = report.max_output_tokens {
-        config.max_output_tokens = max_output_tokens;
+    if config.provider_metadata_mode != report.provider_metadata_mode {
+        return Err(LlmError::Message(format!(
+            "model availability report metadata mode {:?} does not match configured mode {:?}",
+            report.provider_metadata_mode, config.provider_metadata_mode
+        )));
     }
-    if let Some(max_parallel_predictions) = report.max_parallel_predictions {
-        config.max_parallel_predictions = max_parallel_predictions.max(1);
+    if report.require_vision != require_vision {
+        return Err(LlmError::Message(format!(
+            "model availability report vision requirement {} does not match run requirement {}",
+            report.require_vision, require_vision
+        )));
+    }
+    let listed_in_v1 = report.v1_models.iter().any(|model| model == &report.model);
+    if report.v1_present != listed_in_v1 {
+        return Err(LlmError::Message(format!(
+            "model availability report for `{}` has inconsistent OpenAI-compatible catalog evidence",
+            report.model
+        )));
+    }
+    let listed_in_native = report
+        .native_models
+        .iter()
+        .any(|model| model == &report.model);
+    if report.native_present != listed_in_native {
+        return Err(LlmError::Message(format!(
+            "model availability report for `{}` has inconsistent LM Studio catalog evidence",
+            report.model
+        )));
+    }
+    if !model_availability_passes(
+        report.provider_metadata_mode,
+        report.v1_present,
+        report.native_present,
+        report.require_vision,
+        report.vision_capable,
+        report.load_state,
+    ) {
+        return Err(LlmError::Message(format!(
+            "model availability report for `{}` claims Pass without the required catalog, load-state, and vision evidence",
+            report.model
+        )));
+    }
+    let matched_model = report.matched_model.as_ref().ok_or_else(|| {
+        LlmError::Message(format!(
+            "model availability report passed without matched model metadata for `{}`",
+            report.model
+        ))
+    })?;
+    if matched_model.id != report.model {
+        return Err(LlmError::Message(format!(
+            "model availability report matched model `{}` does not match report model `{}`",
+            matched_model.id, report.model
+        )));
+    }
+    if matched_model.load_state != report.load_state {
+        return Err(LlmError::Message(format!(
+            "model availability report for `{}` has inconsistent load-state evidence",
+            report.model
+        )));
+    }
+    if report.vision_capable != matched_model.supports_images.unwrap_or(false)
+        || report.tool_use_capable != matched_model.supports_tools
+        || report.reasoning_capable != matched_model.supports_reasoning
+        || report.context != matched_model.context_window
+        || report.max_output_tokens != matched_model.max_output_tokens
+        || report.max_parallel_predictions != matched_model.max_parallel_predictions
+    {
+        return Err(LlmError::Message(format!(
+            "model availability report for `{}` has derived capability or limit fields that do not match the selected model evidence",
+            report.model
+        )));
+    }
+    if config.provider_metadata_mode == ProviderMetadataMode::LmStudioNativeRequired
+        && report.load_state != ProviderModelLoadState::Loaded
+    {
+        return Err(LlmError::Message(format!(
+            "model availability report for `{}` does not prove a loaded LM Studio instance",
+            report.model
+        )));
     }
     Ok(())
 }
 
 async fn fetch_openai_model_infos(
     client: &reqwest::Client,
-    base_url: &str,
+    base_url: &ProviderEndpoint,
     headers: HeaderMap,
 ) -> Result<Vec<ProviderModelInfo>, LlmError> {
-    let endpoint = format!("{}/v1/models", base_url);
-    let response = client.get(&endpoint).headers(headers).send().await?;
+    let endpoint = base_url
+        .join_api_path("v1/models")
+        .map_err(|error| LlmError::Message(error.to_string()))?;
+    let response = client.get(endpoint).headers(headers).send().await?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response
-            .text()
+        let body = bounded_provider_metadata_text(response)
             .await
-            .unwrap_or_else(|_| "<response body unavailable>".to_string());
+            .unwrap_or_else(|error| format!("<response body unavailable: {error}>"));
         return Err(LlmError::Message(format!(
             "model list request failed with status {}: {}",
             status,
@@ -1077,7 +550,8 @@ async fn fetch_openai_model_infos(
         )));
     }
 
-    let payload = response.json::<OpenAiModelsResponse>().await?;
+    let body = read_bounded_provider_metadata_body(response).await?;
+    let payload = serde_json::from_slice::<OpenAiModelsResponse>(&body)?;
     let mut models = parse_openai_compatible_model_infos(&payload);
     models.sort_by(|left, right| left.id.cmp(&right.id));
     models.dedup_by(|left, right| left.id == right.id);
@@ -1162,127 +636,73 @@ fn parse_openai_compatible_model_infos(payload: &OpenAiModelsResponse) -> Vec<Pr
                         "parallelPredictions",
                     ],
                 ),
-                loaded: false,
+                load_state: ProviderModelLoadState::Unknown,
                 source: "openai_compat".to_string(),
             })
         })
         .collect()
 }
 
-async fn fetch_vllm_mlx_model_infos(
-    client: &reqwest::Client,
-    base_url: &str,
-    headers: HeaderMap,
-) -> Result<Vec<ProviderModelInfo>, LlmError> {
-    let health_endpoint = format!("{}/health", base_url);
-    let health = client
-        .get(&health_endpoint)
-        .headers(headers.clone())
-        .send()
-        .await?;
-    if health.status().is_success() {
-        let payload = health.json::<Value>().await?;
-        let models = parse_vllm_mlx_health_model_infos(&payload);
-        if !models.is_empty() {
-            return Ok(models);
-        }
-    }
-
-    let status_endpoint = format!("{}/v1/status", base_url);
-    let status = client.get(&status_endpoint).headers(headers).send().await?;
-    if !status.status().is_success() {
-        return Ok(Vec::new());
-    }
-    let payload = status.json::<Value>().await?;
-    Ok(parse_vllm_mlx_status_model_infos(&payload))
-}
-
-fn parse_vllm_mlx_health_model_infos(payload: &Value) -> Vec<ProviderModelInfo> {
-    let loaded_model = string_field(payload, &["model_name", "model"]);
-    let model_loaded = payload
-        .get("model_loaded")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let mut ids = payload
-        .get("available_models")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    if let Some(model) = loaded_model.as_ref().map(|value| value.trim().to_string()) {
-        if !model.is_empty() && !ids.iter().any(|id| id == &model) {
-            ids.push(model);
-        }
-    }
-    ids.sort();
-    ids.dedup();
-    ids.into_iter()
-        .map(|id| ProviderModelInfo {
-            loaded: model_loaded
-                && loaded_model
-                    .as_deref()
-                    .map(|model| model.trim() == id)
-                    .unwrap_or(false),
-            id,
-            display_name: None,
-            context_window: None,
-            max_output_tokens: None,
-            supports_images: None,
-            supports_tools: None,
-            supports_reasoning: None,
-            max_parallel_predictions: None,
-            source: "vllm_mlx_health".to_string(),
-        })
-        .collect()
-}
-
-fn parse_vllm_mlx_status_model_infos(payload: &Value) -> Vec<ProviderModelInfo> {
-    let Some(model) = string_field(payload, &["model"]) else {
-        return Vec::new();
-    };
-    let model = model.trim();
-    if model.is_empty() {
-        return Vec::new();
-    }
-    vec![ProviderModelInfo {
-        id: model.to_string(),
-        display_name: None,
-        context_window: None,
-        max_output_tokens: None,
-        supports_images: None,
-        supports_tools: None,
-        supports_reasoning: None,
-        max_parallel_predictions: None,
-        loaded: true,
-        source: "vllm_mlx_status".to_string(),
-    }]
-}
-
 async fn fetch_lmstudio_model_infos(
     client: &reqwest::Client,
-    base_url: &str,
+    base_url: &ProviderEndpoint,
     headers: HeaderMap,
 ) -> Result<Vec<ProviderModelInfo>, LlmError> {
-    let endpoint = format!("{}/api/v1/models", base_url);
-    let response = client.get(&endpoint).headers(headers).send().await?;
+    let endpoint = base_url
+        .join_api_path("api/v1/models")
+        .map_err(|error| LlmError::Message(error.to_string()))?;
+    let response = client.get(endpoint).headers(headers).send().await?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response
-            .text()
+        let body = bounded_provider_metadata_text(response)
             .await
-            .unwrap_or_else(|_| "<response body unavailable>".to_string());
+            .unwrap_or_else(|error| format!("<response body unavailable: {error}>"));
         return Err(LlmError::Message(format!(
             "LM Studio model metadata request failed with status {}: {}",
             status,
             summarize_body(&body)
         )));
     }
-    let payload = response.json::<Value>().await?;
+    let body = read_bounded_provider_metadata_body(response).await?;
+    let payload = serde_json::from_slice::<Value>(&body)?;
     Ok(parse_lmstudio_model_infos(&payload))
+}
+
+async fn bounded_provider_metadata_text(response: reqwest::Response) -> Result<String, LlmError> {
+    let body = read_bounded_provider_metadata_body(response).await?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+async fn read_bounded_provider_metadata_body(
+    response: reqwest::Response,
+) -> Result<Vec<u8>, LlmError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > PROVIDER_METADATA_RESPONSE_LIMIT_BYTES as u64)
+    {
+        return Err(LlmError::Message(format!(
+            "provider metadata response exceeds the {} byte limit",
+            PROVIDER_METADATA_RESPONSE_LIMIT_BYTES
+        )));
+    }
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(PROVIDER_METADATA_RESPONSE_LIMIT_BYTES);
+    let mut body = Vec::with_capacity(initial_capacity);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > PROVIDER_METADATA_RESPONSE_LIMIT_BYTES {
+            return Err(LlmError::Message(format!(
+                "provider metadata response exceeds the {} byte limit",
+                PROVIDER_METADATA_RESPONSE_LIMIT_BYTES
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn parse_lmstudio_model_infos(payload: &Value) -> Vec<ProviderModelInfo> {
@@ -1311,6 +731,7 @@ fn parse_lmstudio_model_infos(payload: &Value) -> Vec<ProviderModelInfo> {
             continue;
         }
         let loaded_instance = preferred_loaded_instance(entry);
+        let load_state = lmstudio_model_load_state(entry);
         models.push(ProviderModelInfo {
             id: id.trim().to_string(),
             display_name: string_field(entry, &["display_name", "displayName", "name"]),
@@ -1410,7 +831,7 @@ fn parse_lmstudio_model_infos(payload: &Value) -> Vec<ProviderModelInfo> {
                         ],
                     )
                 }),
-            loaded: loaded_instance.is_some(),
+            load_state,
             source: "lmstudio_api".to_string(),
         });
     }
@@ -1425,6 +846,18 @@ fn preferred_loaded_instance(entry: &Value) -> Option<&Value> {
         .or_else(|| entry.get("loadedInstances"))
         .and_then(Value::as_array)
         .and_then(|instances| instances.first())
+}
+
+fn lmstudio_model_load_state(entry: &Value) -> ProviderModelLoadState {
+    match entry
+        .get("loaded_instances")
+        .or_else(|| entry.get("loadedInstances"))
+        .and_then(Value::as_array)
+    {
+        Some(instances) if instances.is_empty() => ProviderModelLoadState::NotLoaded,
+        Some(_) => ProviderModelLoadState::Loaded,
+        None => ProviderModelLoadState::Unknown,
+    }
 }
 
 fn string_field(value: &Value, names: &[&str]) -> Option<String> {
@@ -1481,30 +914,6 @@ pub fn extra_body_with_num_ctx(extra_body: Option<Value>, num_ctx: u32) -> Value
     }
 }
 
-impl ProviderModelInfo {
-    fn enrich_from(&mut self, other: &ProviderModelInfo) {
-        self.display_name = other
-            .display_name
-            .clone()
-            .or_else(|| self.display_name.clone());
-        self.context_window = other.context_window.or(self.context_window);
-        self.max_output_tokens = other.max_output_tokens.or(self.max_output_tokens);
-        self.supports_images = other.supports_images.or(self.supports_images);
-        self.supports_tools = other.supports_tools.or(self.supports_tools);
-        self.supports_reasoning = other.supports_reasoning.or(self.supports_reasoning);
-        self.max_parallel_predictions = other
-            .max_parallel_predictions
-            .or(self.max_parallel_predictions);
-        self.loaded = other.loaded || self.loaded;
-        if matches!(
-            other.source.as_str(),
-            "lmstudio_api" | "vllm_mlx_health" | "vllm_mlx_status"
-        ) {
-            self.source = other.source.clone();
-        }
-    }
-}
-
 fn summarize_body(body: &str) -> String {
     let trimmed = body.trim();
     if trimmed.chars().count() <= 200 {
@@ -1518,6 +927,178 @@ fn summarize_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_catalog_normalization_accepts_lm_studio_root_and_v1() {
+        assert_eq!(
+            normalize_provider_base_url("http://lm-studio.local:1234"),
+            "http://lm-studio.local:1234"
+        );
+        assert_eq!(
+            normalize_provider_base_url("http://lm-studio.local:1234/v1/"),
+            "http://lm-studio.local:1234"
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_rejects_secret_bearing_endpoint_before_network_and_debug() {
+        let config = ResolvedConfig::default();
+        let raw = "https://user:super-secret@provider.invalid/v1?api_key=hidden";
+
+        let report = check_model_availability(&config, None, Some(raw), false).await;
+
+        assert_eq!(report.status, ModelAvailabilityStatus::Fail);
+        assert_eq!(report.base_url, "<invalid-provider-endpoint>");
+        let serialized = serde_json::to_string(&report).expect("serialize report");
+        let debug = format!("{report:?}");
+        for diagnostic in [serialized, debug] {
+            assert!(!diagnostic.contains("super-secret"));
+            assert!(!diagnostic.contains("hidden"));
+            assert!(!diagnostic.contains(raw));
+        }
+
+        let mut malicious_report = passing_availability_report(&config.model, false);
+        malicious_report.base_url = raw.to_string();
+        malicious_report.openai_error = Some("server echoed super-secret".to_string());
+        let debug = format!("{malicious_report:?}");
+        assert!(!debug.contains("super-secret"));
+        assert!(!debug.contains("hidden"));
+    }
+
+    fn passing_availability_report(
+        config: &crate::config::model::ModelConfig,
+        require_vision: bool,
+    ) -> ModelAvailabilityReport {
+        let matched_model = ProviderModelInfo {
+            id: config.model.clone(),
+            display_name: Some("runtime provider model".to_string()),
+            context_window: Some(config.context_window.saturating_mul(2)),
+            max_output_tokens: Some(config.max_output_tokens.saturating_mul(2)),
+            supports_images: Some(true),
+            supports_tools: Some(true),
+            supports_reasoning: Some(true),
+            max_parallel_predictions: Some(config.max_parallel_predictions.saturating_add(3)),
+            load_state: ProviderModelLoadState::Loaded,
+            source: "test".to_string(),
+        };
+        ModelAvailabilityReport {
+            gate: "model_availability".to_string(),
+            status: ModelAvailabilityStatus::Pass,
+            generated_by: "test".to_string(),
+            model: config.model.trim().to_string(),
+            base_url: normalize_provider_base_url(&config.base_url),
+            provider_metadata_mode: config.provider_metadata_mode,
+            v1_present: true,
+            native_present: true,
+            require_vision,
+            vision_capable: matched_model.supports_images.unwrap_or(false),
+            tool_use_capable: Some(true),
+            reasoning_capable: Some(true),
+            context: matched_model.context_window,
+            max_output_tokens: matched_model.max_output_tokens,
+            max_parallel_predictions: matched_model.max_parallel_predictions,
+            load_state: matched_model.load_state,
+            readiness_detail: None,
+            matched_model: Some(matched_model),
+            v1_models: vec![config.model.trim().to_string()],
+            native_models: vec![config.model.trim().to_string()],
+            openai_error: None,
+            native_error: None,
+            checked_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn availability_report_validation_never_hydrates_product_config() {
+        let mut config = ResolvedConfig::default().model;
+        config.base_url = "http://provider.local/v1".to_string();
+        config.model = "configured-model".to_string();
+        config.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+        config.context_window = 4_096;
+        config.max_output_tokens = 512;
+        config.supports_tools = false;
+        config.supports_reasoning = false;
+        config.supports_images = false;
+        config.max_parallel_predictions = 1;
+        let before = serde_json::to_value(&config).expect("serialize config");
+        let report = passing_availability_report(&config, false);
+
+        validate_model_availability_report(&config, &report, false)
+            .expect("passing runtime projection");
+
+        assert_eq!(
+            serde_json::to_value(&config).expect("serialize config"),
+            before
+        );
+        assert_eq!(config.context_window, 4_096);
+        assert_eq!(config.max_output_tokens, 512);
+        assert!(!config.supports_tools);
+        assert!(!config.supports_reasoning);
+        assert!(!config.supports_images);
+        assert_eq!(config.max_parallel_predictions, 1);
+    }
+
+    #[test]
+    fn availability_report_validation_rejects_stale_or_incomplete_projection() {
+        let mut config = ResolvedConfig::default().model;
+        config.base_url = "http://provider.local".to_string();
+        config.model = "configured-model".to_string();
+        config.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+        let report = passing_availability_report(&config, false);
+
+        let mut stale_model = report.clone();
+        stale_model.model = "other-model".to_string();
+        assert!(validate_model_availability_report(&config, &stale_model, false).is_err());
+
+        let mut stale_provider = report.clone();
+        stale_provider.base_url = "http://other-provider.local".to_string();
+        assert!(validate_model_availability_report(&config, &stale_provider, false).is_err());
+
+        let mut stale_mode = report.clone();
+        stale_mode.provider_metadata_mode = ProviderMetadataMode::LmStudioNativeRequired;
+        assert!(validate_model_availability_report(&config, &stale_mode, false).is_err());
+
+        assert!(validate_model_availability_report(&config, &report, true).is_err());
+
+        let mut incomplete = report.clone();
+        incomplete.matched_model = None;
+        assert!(validate_model_availability_report(&config, &incomplete, false).is_err());
+
+        let mut mismatched_evidence = report.clone();
+        mismatched_evidence
+            .matched_model
+            .as_mut()
+            .expect("matched model evidence")
+            .id = "other-model".to_string();
+        assert!(validate_model_availability_report(&config, &mismatched_evidence, false).is_err());
+
+        let mut missing_catalog_entry = report.clone();
+        missing_catalog_entry.v1_models.clear();
+        assert!(
+            validate_model_availability_report(&config, &missing_catalog_entry, false).is_err()
+        );
+
+        let mut unproven_catalog_presence = report.clone();
+        unproven_catalog_presence.v1_present = false;
+        unproven_catalog_presence.v1_models.clear();
+        assert!(
+            validate_model_availability_report(&config, &unproven_catalog_presence, false).is_err()
+        );
+
+        let mut mismatched_projection = report.clone();
+        mismatched_projection.context = Some(1);
+        assert!(
+            validate_model_availability_report(&config, &mismatched_projection, false).is_err()
+        );
+
+        let mut vision_report = passing_availability_report(&config, true);
+        vision_report.vision_capable = false;
+        assert!(validate_model_availability_report(&config, &vision_report, true).is_err());
+
+        let mut failed = report;
+        failed.status = ModelAvailabilityStatus::Fail;
+        assert!(validate_model_availability_report(&config, &failed, false).is_err());
+    }
 
     #[test]
     fn lmstudio_parser_does_not_treat_model_max_context_as_hosting_context() {
@@ -1539,7 +1120,7 @@ mod tests {
         assert_eq!(models[0].id, "openai-compatible-fixture-model");
         assert_eq!(models[0].context_window, None);
         assert_eq!(models[0].max_output_tokens, None);
-        assert!(!models[0].loaded);
+        assert_eq!(models[0].load_state, ProviderModelLoadState::NotLoaded);
     }
 
     #[test]
@@ -1565,7 +1146,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].context_window, Some(131_072));
         assert_eq!(models[0].max_output_tokens, Some(8_192));
-        assert!(models[0].loaded);
+        assert_eq!(models[0].load_state, ProviderModelLoadState::Loaded);
     }
 
     #[test]
@@ -1593,6 +1174,28 @@ mod tests {
         assert_eq!(models[0].max_output_tokens, None);
         assert_eq!(config.context_window, 131_072);
         assert_eq!(config.max_output_tokens, 4_096);
+    }
+
+    #[test]
+    fn provider_model_info_explicit_false_disables_tools() {
+        let mut config = ResolvedConfig::default().model;
+        config.supports_tools = true;
+        let model = ProviderModelInfo {
+            id: "tool-less-model".to_string(),
+            display_name: None,
+            context_window: None,
+            max_output_tokens: None,
+            supports_images: None,
+            supports_tools: Some(false),
+            supports_reasoning: None,
+            max_parallel_predictions: None,
+            load_state: ProviderModelLoadState::Unknown,
+            source: "test".to_string(),
+        };
+
+        apply_provider_model_info_to_config(&mut config, &model);
+
+        assert!(!config.supports_tools);
     }
 
     #[tokio::test]
@@ -1647,6 +1250,7 @@ mod tests {
         assert_eq!(models[0].max_output_tokens, Some(4096));
         assert_eq!(models[0].supports_tools, Some(true));
         assert_eq!(models[0].supports_reasoning, Some(true));
+        assert_eq!(models[0].load_state, ProviderModelLoadState::Unknown);
 
         server.abort();
     }
@@ -1672,37 +1276,18 @@ mod tests {
         assert_eq!(models[0].max_output_tokens, Some(8_192));
         assert_eq!(models[0].supports_tools, Some(true));
         assert_eq!(models[0].supports_reasoning, Some(false));
+        assert_eq!(models[0].load_state, ProviderModelLoadState::Unknown);
     }
 
     #[test]
-    fn vllm_mlx_health_parser_marks_loaded_model_without_request_limits() {
-        let payload = serde_json::json!({
-            "status": "healthy",
-            "model_loaded": true,
-            "model_name": "openai-compatible-fixture-model",
-            "available_models": ["openai-compatible-fixture-model"],
-            "engine_type": "batched"
-        });
-
-        let models = parse_vllm_mlx_health_model_infos(&payload);
-
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "openai-compatible-fixture-model");
-        assert!(models[0].loaded);
-        assert_eq!(models[0].context_window, None);
-        assert_eq!(models[0].max_output_tokens, None);
-    }
-
-    #[test]
-    fn openai_compatible_only_availability_does_not_require_native_metadata() {
+    fn availability_uses_only_the_declared_metadata_dialect() {
         assert!(model_availability_passes(
             ProviderMetadataMode::OpenAiCompatibleOnly,
             true,
             false,
             false,
             false,
-            false,
-            true
+            ProviderModelLoadState::Unknown
         ));
         assert!(!model_availability_passes(
             ProviderMetadataMode::LmStudioNativeRequired,
@@ -1710,8 +1295,15 @@ mod tests {
             false,
             false,
             false,
+            ProviderModelLoadState::Loaded
+        ));
+        assert!(model_availability_passes(
+            ProviderMetadataMode::LmStudioNativeRequired,
             false,
-            true
+            true,
+            false,
+            false,
+            ProviderModelLoadState::Loaded
         ));
         assert!(!model_availability_passes(
             ProviderMetadataMode::OpenAiCompatibleOnly,
@@ -1719,8 +1311,7 @@ mod tests {
             false,
             true,
             false,
-            false,
-            true
+            ProviderModelLoadState::Unknown
         ));
         assert!(model_availability_passes(
             ProviderMetadataMode::OpenAiCompatibleOnly,
@@ -1728,130 +1319,87 @@ mod tests {
             false,
             true,
             true,
+            ProviderModelLoadState::Unknown
+        ));
+    }
+
+    #[test]
+    fn lmstudio_catalog_presence_does_not_claim_loaded_availability() {
+        assert!(!model_availability_passes(
+            ProviderMetadataMode::LmStudioNativeRequired,
+            false,
             true,
-            true
+            false,
+            false,
+            ProviderModelLoadState::NotLoaded,
         ));
         assert!(!model_availability_passes(
-            ProviderMetadataMode::OpenAiCompatibleOnly,
+            ProviderMetadataMode::LmStudioNativeRequired,
+            false,
             true,
             false,
             false,
-            false,
-            false,
-            false
+            ProviderModelLoadState::Unknown,
         ));
-    }
-
-    #[test]
-    fn tool_call_probe_report_accepts_openai_tool_calls() {
-        let payload = serde_json::json!({
-            "choices": [
-                {
-                    "finish_reason": "tool_calls",
-                    "message": {
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "id": "call_1",
-                                "type": "function",
-                                "function": {
-                                    "name": "echo_word",
-                                    "arguments": "{\"word\":\"ping\"}"
-                                }
-                            }
-                        ]
-                    }
-                }
-            ]
-        });
-
-        let report = tool_call_probe_report_from_response(
-            "tool_choice_required",
-            "required",
+        assert!(model_availability_passes(
+            ProviderMetadataMode::LmStudioNativeRequired,
+            false,
             true,
-            &payload,
-        );
+            false,
+            false,
+            ProviderModelLoadState::Loaded,
+        ));
 
-        assert_eq!(report.status, ModelAvailabilityStatus::Pass);
-        assert!(report.required_for_gate);
-        assert!(report.tool_call_received);
-        assert_eq!(report.tool_name.as_deref(), Some("echo_word"));
-        assert!(report.arguments_valid);
-        assert_eq!(report.finish_reason.as_deref(), Some("tool_calls"));
-    }
-
-    #[test]
-    fn tool_call_probe_report_rejects_plain_text_answers() {
-        let payload = serde_json::json!({
-            "choices": [
-                {
-                    "finish_reason": "stop",
-                    "message": {
-                        "role": "assistant",
-                        "content": "ping"
-                    }
-                }
-            ]
-        });
-
-        let report =
-            tool_call_probe_report_from_response("tool_choice_auto_strong", "auto", true, &payload);
-
-        assert_eq!(report.status, ModelAvailabilityStatus::Fail);
-        assert!(!report.tool_call_received);
-        assert_eq!(report.content.as_deref(), Some("ping"));
-        assert!(report.error.is_some());
-    }
-
-    #[test]
-    fn lm_studio_availability_gates_on_required_and_auto_named_probe_is_optional() {
-        let required = ToolCallProbeReport {
-            probe: "tool_choice_required".to_string(),
-            status: ModelAvailabilityStatus::Pass,
-            tool_choice: "required".to_string(),
-            required_for_gate: true,
-            finish_reason: Some("tool_calls".to_string()),
-            tool_call_received: true,
-            tool_name: Some("echo_word".to_string()),
-            tool_arguments: Some("{\"word\":\"ping\"}".to_string()),
-            arguments_valid: true,
-            content: None,
-            error: None,
-        };
-        let named = ToolCallProbeReport {
-            probe: "tool_choice_named".to_string(),
-            status: ModelAvailabilityStatus::Pass,
-            tool_choice: "named_function".to_string(),
-            required_for_gate: false,
-            finish_reason: Some("tool_calls".to_string()),
-            tool_call_received: true,
-            tool_name: Some("echo_word".to_string()),
-            tool_arguments: Some("{\"word\":\"ping\"}".to_string()),
-            arguments_valid: true,
-            content: None,
-            error: None,
-        };
-        let auto = ToolCallProbeReport {
-            probe: "tool_choice_auto_strong".to_string(),
-            status: ModelAvailabilityStatus::Pass,
-            tool_choice: "auto".to_string(),
-            required_for_gate: true,
-            finish_reason: Some("tool_calls".to_string()),
-            tool_call_received: true,
-            tool_name: Some("echo_word".to_string()),
-            tool_arguments: Some("{\"word\":\"ping\"}".to_string()),
-            arguments_valid: true,
-            content: None,
-            error: None,
-        };
-        let reports = [required, named, auto];
-
+        let config = ResolvedConfig::default().model;
+        let mut report = passing_availability_report(&config, false);
+        report.provider_metadata_mode = ProviderMetadataMode::LmStudioNativeRequired;
+        report.native_present = true;
+        report.load_state = ProviderModelLoadState::NotLoaded;
         assert!(
-            !reports.is_empty()
-                && reports
-                    .iter()
-                    .filter(|probe| probe.required_for_gate)
-                    .all(|probe| matches!(probe.status, ModelAvailabilityStatus::Pass))
+            model_readiness_failure_detail(&report).contains("registered")
+                && model_readiness_failure_detail(&report).contains("no instance")
         );
+        report.load_state = ProviderModelLoadState::Unknown;
+        assert!(model_readiness_failure_detail(&report).contains("did not report"));
+        report.native_present = false;
+        assert!(model_readiness_failure_detail(&report).contains("not registered"));
+    }
+
+    #[tokio::test]
+    async fn provider_catalog_rejects_a_chunked_body_above_the_transport_limit() {
+        use std::convert::Infallible;
+
+        use axum::{Router, body::Body, http::Response, routing::get};
+        use bytes::Bytes;
+        use futures_util::stream;
+
+        let app = Router::new().route(
+            "/v1/models",
+            get(|| async {
+                let half = PROVIDER_METADATA_RESPONSE_LIMIT_BYTES / 2 + 1;
+                let chunks = vec![
+                    Ok::<_, Infallible>(Bytes::from(vec![b' '; half])),
+                    Ok::<_, Infallible>(Bytes::from(vec![b' '; half])),
+                ];
+                Response::new(Body::from_stream(stream::iter(chunks)))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server");
+        });
+        let mut config = ResolvedConfig::default();
+        config.model.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+
+        let error = fetch_provider_model_infos(&config, &format!("http://{addr}"))
+            .await
+            .expect_err("oversized chunked catalog body must fail closed");
+
+        assert!(error.to_string().contains("exceeds the"));
+        assert!(error.to_string().contains("byte limit"));
+        server.abort();
     }
 }

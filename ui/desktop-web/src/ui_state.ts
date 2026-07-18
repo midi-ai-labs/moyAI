@@ -1,5 +1,6 @@
 import type { LocalConfirmation } from "./render.ts";
 import type { ConfigMutationTarget, DesktopWebState } from "./types.ts";
+import type { PermissionDecisionState } from "./decision_state.ts";
 
 export interface ProviderDraft {
   baseUrl: string;
@@ -26,6 +27,7 @@ export interface UiDraftState {
   imageRevision: number;
   workspaceRevision: number;
   reviewRevision: number;
+  reviewSyncedRevision: number;
   providerRevision: number;
   pendingRunSubmission: {
     owner: string;
@@ -55,9 +57,9 @@ export interface UiLocalState {
   configDraftValues: Map<string, string>;
   configDraftBaselineValues: Map<string, string>;
   configDraftTarget: ConfigMutationTarget | null;
-  configDraftRevision: number;
-  nextConfigMutationGeneration: number;
-  activeConfigMutationGeneration: number | null;
+  configDraftRevision: bigint;
+  nextConfigMutationGeneration: bigint;
+  activeConfigMutationGeneration: bigint | null;
   lastFocusedOverlay: string;
   focusPromptAfterRender: boolean;
   initialPromptFocusDone: boolean;
@@ -67,10 +69,8 @@ export interface UiLocalState {
   agentPaneOwnerIdentity: string;
   focusSelectedAgentAfterRender: boolean;
   attachmentTrayOpen: boolean;
-  permissionDecisionPending: boolean;
-  permissionDecisionAllow: boolean | null;
-  permissionDecisionConfirmationId: string | null;
-  permissionDecisionError: string;
+  permissionDecision: PermissionDecisionState | null;
+  nextPermissionSubmissionId: number;
   localConfirmationDecisionPending: boolean;
   localConfirmationDecisionError: string;
   recoverableError: UiRecoverableError | null;
@@ -102,6 +102,7 @@ export function createUiLocalState(): UiLocalState {
       imageRevision: 0,
       workspaceRevision: 0,
       reviewRevision: 0,
+      reviewSyncedRevision: 0,
       providerRevision: 0,
       pendingRunSubmission: null,
     },
@@ -112,8 +113,8 @@ export function createUiLocalState(): UiLocalState {
     configDraftValues: new Map(),
     configDraftBaselineValues: new Map(),
     configDraftTarget: null,
-    configDraftRevision: 0,
-    nextConfigMutationGeneration: 1,
+    configDraftRevision: 0n,
+    nextConfigMutationGeneration: 1n,
     activeConfigMutationGeneration: null,
     lastFocusedOverlay: "none",
     focusPromptAfterRender: false,
@@ -125,10 +126,8 @@ export function createUiLocalState(): UiLocalState {
     agentPaneOwnerIdentity: "",
     focusSelectedAgentAfterRender: false,
     attachmentTrayOpen: false,
-    permissionDecisionPending: false,
-    permissionDecisionAllow: null,
-    permissionDecisionConfirmationId: null,
-    permissionDecisionError: "",
+    permissionDecision: null,
+    nextPermissionSubmissionId: 1,
     localConfirmationDecisionPending: false,
     localConfirmationDecisionError: "",
     recoverableError: null,

@@ -3,10 +3,27 @@ use async_trait::async_trait;
 use crate::error::StorageError;
 
 use super::{
-    ChangeId, NewSession, ProjectId, ProjectRecord, SessionId, SessionMemoryMode,
-    SessionMemoryModeUpdate, SessionRecord, SessionSettingsPatch, SessionSettingsUpdate,
-    SessionStateSnapshot, SessionTitleUpdate, TodoItem,
+    ChangeId, NewSession, ProjectId, ProjectRecord, SessionId, SessionRecord, SessionSettingsPatch,
+    SessionSettingsUpdate, SessionTitleUpdate,
 };
+
+/// Maximum number of sessions returned by any one list/search/recovery page.
+///
+/// Keep this contract at the repository boundary so non-CLI consumers cannot
+/// accidentally turn a user-supplied limit into an unbounded SQLite result.
+pub const MAX_SESSION_PAGE_LIMIT: usize = 200;
+
+pub fn validate_session_page_limit(limit: usize) -> Result<(), String> {
+    if limit == 0 {
+        return Err("session page limit must be greater than zero".to_string());
+    }
+    if limit > MAX_SESSION_PAGE_LIMIT {
+        return Err(format!(
+            "session page limit {limit} exceeds the maximum {MAX_SESSION_PAGE_LIMIT}"
+        ));
+    }
+    Ok(())
+}
 
 #[async_trait(?Send)]
 pub trait SessionRepository: Send + Sync {
@@ -50,19 +67,7 @@ pub trait SessionRepository: Send + Sync {
         id: SessionId,
         title: &str,
     ) -> Result<SessionTitleUpdate, StorageError>;
-    async fn update_session_memory_mode(
-        &self,
-        id: SessionId,
-        mode: SessionMemoryMode,
-    ) -> Result<SessionMemoryModeUpdate, StorageError>;
     async fn delete_session(&self, id: SessionId) -> Result<(), StorageError>;
-    async fn get_state(&self, session_id: SessionId) -> Result<SessionStateSnapshot, StorageError>;
-    async fn update_todos(
-        &self,
-        session_id: SessionId,
-        todos: &[TodoItem],
-    ) -> Result<(), StorageError>;
-    async fn list_todos(&self, session_id: SessionId) -> Result<Vec<TodoItem>, StorageError>;
 }
 
 #[async_trait(?Send)]
@@ -83,7 +88,6 @@ pub trait ProjectRepository: Send + Sync {
 pub trait ChangeRepository: Send + Sync {
     async fn insert_changes(
         &self,
-        session_id: SessionId,
         changes: &[crate::edit::FileChange],
     ) -> Result<Vec<ChangeId>, StorageError>;
 }

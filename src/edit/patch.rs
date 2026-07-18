@@ -157,10 +157,6 @@ impl PatchParser {
         output.extend(original_lines[cursor..].iter().cloned());
         Ok(output.join("\n"))
     }
-
-    pub fn is_full_rewrite(hunks: &[PatchChunk]) -> bool {
-        hunks.len() == 1 && is_implicit_full_rewrite(&hunks[0])
-    }
 }
 
 fn normalize_patch_text(text: &str) -> String {

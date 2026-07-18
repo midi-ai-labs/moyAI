@@ -2,20 +2,24 @@ import { command } from "./api.ts";
 import {
   beginConfigMutation,
   configMutationPending,
-  discardConfigDraft,
   finishConfigMutation,
   type ConfigValueInput,
 } from "./config_mutation.ts";
-import { finishLocalDecision } from "./decision_state.ts";
+import { finishLocalDecision, type PermissionReviewDecision } from "./decision_state.ts";
 import {
   navigationIsIdle,
-  sessionMemoryActions,
   sessionActionIndex,
   sessionRowActionAvailable,
 } from "./navigation_state.ts";
 import { rowMutationArgs } from "./row_target.ts";
 import { runCanBeCancelled } from "./run_control.ts";
-import type { ConfigMutationTarget, DesktopWebState, ProjectRow, SessionRow } from "./types.ts";
+import type {
+  ConfigMutationTarget,
+  DesktopViewState,
+  DesktopWebState,
+  ProjectRow,
+  SessionRow,
+} from "./types.ts";
 import {
   openAgentPane,
   setArtifactPaneCollapsed,
@@ -24,8 +28,6 @@ import {
 } from "./ui_state.ts";
 import {
   composerCapabilities,
-  configDraftCommitOpen,
-  configDraftDiscardOpen,
   draftMutationTarget,
   providerCapabilities,
   providerDraftPayload,
@@ -47,14 +49,15 @@ export interface ActionContext {
   };
   uiState: UiLocalState;
   getProjection: () => DesktopWebState | null;
-  getViewState: () => DesktopWebState | null;
+  getViewState: () => DesktopViewState | null;
   acceptProjection: (state: DesktopWebState, render?: boolean) => void;
   rerender: () => void;
   mutate: (name: string, args?: Record<string, unknown>) => Promise<void>;
   recoverCommandConflict: (error: unknown) => boolean;
-  reportError: (message: string) => void;
+  reportError: (error: unknown) => void;
   prepareConfigMutation: (target: ConfigMutationTarget) => ConfigValueInput[] | null;
-  submitPermissionDecision: (allow: boolean) => Promise<void>;
+  prepareConfigSnapshot: (target: ConfigMutationTarget) => ConfigValueInput[] | null;
+  submitPermissionDecision: (decision: PermissionReviewDecision) => Promise<void>;
   setWindowMaximized: (maximized: boolean) => void;
 }
 
@@ -64,8 +67,8 @@ export interface ActionDefinition {
   shortcut?: string;
   menu?: ActionMenu;
   palette?: boolean;
-  enabled?: (state: DesktopWebState, payload: ActionPayload) => boolean;
-  run: (state: DesktopWebState, context: ActionContext, payload: ActionPayload) => void | Promise<void>;
+  enabled?: (state: DesktopViewState, payload: ActionPayload) => boolean;
+  run: (state: DesktopViewState, context: ActionContext, payload: ActionPayload) => void | Promise<void>;
 }
 
 function always(): boolean {
@@ -124,18 +127,6 @@ function targetSessionRestorable(state: DesktopWebState, payload: ActionPayload)
   return targetSessionNotBusy(state, payload) && row?.archived === true;
 }
 
-function targetSessionMemoryEnabled(state: DesktopWebState, payload: ActionPayload): boolean {
-  const row = targetSessionRow(state, payload);
-  return targetSessionNotBusy(state, payload)
-    && Boolean(row && sessionMemoryActions(row.loaded_status, row.memory_mode).disable);
-}
-
-function targetSessionMemoryDisabled(state: DesktopWebState, payload: ActionPayload): boolean {
-  const row = targetSessionRow(state, payload);
-  return targetSessionNotBusy(state, payload)
-    && Boolean(row && sessionMemoryActions(row.loaded_status, row.memory_mode).enable);
-}
-
 function targetQuickChatDeleteAvailable(state: DesktopWebState, payload: ActionPayload): boolean {
   const row = state.chat_session_rows[payload.index];
   return Boolean(row) && row.loaded_status !== "active" && navigationIsIdle(state);
@@ -148,7 +139,7 @@ async function runConfigMutation(
   if (configMutationPending(context.uiState)) return;
   const current = context.getViewState();
   if (!current) return;
-  if (!configDraftCommitOpen(context.uiState, current.startup.initial_setup_required)) return;
+  if (!current.config_draft.commit_enabled) return;
   const values = context.prepareConfigMutation(current.config_target);
   if (!values) return;
   const request = beginConfigMutation(context.uiState, current.config_target);
@@ -161,14 +152,64 @@ async function runConfigMutation(
       expectedTarget: request.target,
     });
   } catch (error) {
-    const finished = finishConfigMutation(context.uiState, request, false, context.getViewState()?.config_target ?? null);
+    const finished = finishConfigMutation(
+      context.uiState,
+      request,
+      false,
+      request.target,
+      context.getViewState()?.config_target ?? null,
+    );
     if (context.recoverCommandConflict(error)) return;
     if (!finished) return;
     context.rerender();
-    context.reportError(String(error));
+    context.reportError(error);
     return;
   }
-  if (!finishConfigMutation(context.uiState, request, succeeded, context.getViewState()?.config_target ?? null)) return;
+  if (!finishConfigMutation(
+    context.uiState,
+    request,
+    succeeded,
+    state.config_target,
+    context.getViewState()?.config_target ?? null,
+  )) return;
+  context.acceptProjection(state);
+}
+
+async function resetConfigDraft(context: ActionContext): Promise<void> {
+  if (configMutationPending(context.uiState)) return;
+  const current = context.getViewState();
+  if (!current?.config_draft.discard_enabled) return;
+  const values = context.prepareConfigSnapshot(current.config_target);
+  if (!values) return;
+  const request = beginConfigMutation(context.uiState, current.config_target);
+  context.rerender();
+  let state: DesktopWebState;
+  try {
+    state = await command<DesktopWebState>("reset_config_draft", {
+      values,
+      expectedTarget: request.target,
+    });
+  } catch (error) {
+    const finished = finishConfigMutation(
+      context.uiState,
+      request,
+      false,
+      request.target,
+      context.getViewState()?.config_target ?? null,
+    );
+    if (context.recoverCommandConflict(error)) return;
+    if (!finished) return;
+    context.rerender();
+    context.reportError(error);
+    return;
+  }
+  if (!finishConfigMutation(
+    context.uiState,
+    request,
+    true,
+    state.config_target,
+    context.getViewState()?.config_target ?? null,
+  )) return;
   context.acceptProjection(state);
 }
 
@@ -216,7 +257,9 @@ export const ACTIONS: ActionDefinition[] = [
     label: "実行停止",
     palette: true,
     enabled: runCanBeCancelled,
-    run: (_state, context) => context.mutate("cancel_run"),
+    run: (state, context) => context.mutate("cancel_run", {
+      expectedTarget: state.run_target,
+    }),
   },
   {
     id: "refresh",
@@ -317,20 +360,17 @@ export const ACTIONS: ActionDefinition[] = [
     label: "アクセスモード切替",
     shortcut: "F8",
     palette: true,
-    enabled: (state) => state.access_mode_mutation_enabled,
+    enabled: (state) => state.config_draft.access_mode_mutation_enabled,
     run: (state, context) => context.mutate("toggle_access_mode", {
       expectedTarget: state.access_target,
+      draftValues: context.prepareConfigSnapshot(state.config_target) ?? [],
     }),
   },
   {
     id: "discard-config-draft",
     label: "設定の変更を破棄",
-    enabled: (state) => state.config_draft_discard_enabled,
-    run: (_state, context) => {
-      if (!configDraftDiscardOpen(context.uiState)) return;
-      discardConfigDraft(context.uiState);
-      context.rerender();
-    },
+    enabled: (state) => state.config_draft.discard_enabled,
+    run: (_state, context) => resetConfigDraft(context),
   },
   {
     id: "toggle-session-archived-search",
@@ -402,20 +442,6 @@ export const ACTIONS: ActionDefinition[] = [
     palette: true,
     enabled: targetSessionActive,
     run: (state, context, payload) => runSessionRowMutation("interrupt_session", state, context, payload),
-  },
-  {
-    id: "enable-session-memory",
-    label: "セッション memory を有効化",
-    palette: true,
-    enabled: targetSessionMemoryDisabled,
-    run: (state, context, payload) => runSessionRowMutation("enable_session_memory", state, context, payload),
-  },
-  {
-    id: "disable-session-memory",
-    label: "セッション memory を無効化",
-    palette: true,
-    enabled: targetSessionMemoryEnabled,
-    run: (state, context, payload) => runSessionRowMutation("disable_session_memory", state, context, payload),
   },
   {
     id: "delete-session",
@@ -501,7 +527,6 @@ export const ACTIONS: ActionDefinition[] = [
       providerDraftPayload(
         context.uiState.drafts.provider,
         state.config_target,
-        state.config_owner_mutation_open,
       ),
     ),
   },
@@ -510,41 +535,41 @@ export const ACTIONS: ActionDefinition[] = [
     label: "Provider 設定を UI セッションに適用",
     palette: true,
     enabled: (state) => state.provider_apply_enabled,
-    run: (state, context) => context.mutate(
-      "apply_provider_session",
-      providerDraftPayload(
-        context.uiState.drafts.provider,
-        state.config_target,
-        state.config_owner_mutation_open,
-      ),
-    ),
+    run: (state, context) => {
+      const draftValues = context.prepareConfigSnapshot(state.config_target);
+      if (!draftValues) return;
+      return context.mutate(
+        "apply_provider_session",
+        providerDraftPayload(context.uiState.drafts.provider, state.config_target, draftValues),
+      );
+    },
   },
   {
     id: "save-provider-global",
     label: "Provider 設定をファイルに保存",
     palette: true,
     enabled: (state) => state.provider_apply_enabled,
-    run: (state, context) => context.mutate(
-      "save_provider_global",
-      providerDraftPayload(
-        context.uiState.drafts.provider,
-        state.config_target,
-        state.config_owner_mutation_open,
-      ),
-    ),
+    run: (state, context) => {
+      const draftValues = context.prepareConfigSnapshot(state.config_target);
+      if (!draftValues) return;
+      return context.mutate(
+        "save_provider_global",
+        providerDraftPayload(context.uiState.drafts.provider, state.config_target, draftValues),
+      );
+    },
   },
   {
     id: "apply-session-config",
     label: "編集中の設定を UI セッションに適用",
     palette: true,
-    enabled: (state) => state.config_draft_commit_enabled,
+    enabled: (state) => state.config_draft.commit_enabled,
     run: (_state, context) => runConfigMutation("apply_session_config", context),
   },
   {
     id: "save-global-config",
     label: "編集中の設定を設定ファイルに保存",
     palette: true,
-    enabled: (state) => state.config_draft_commit_enabled,
+    enabled: (state) => state.config_draft.commit_enabled,
     run: (_state, context) => runConfigMutation("save_global_config", context),
   },
   {
@@ -595,8 +620,8 @@ export const ACTIONS: ActionDefinition[] = [
   { id: "set-image", label: "画像を添付", palette: true, enabled: (state) => state.image_input_enabled, run: (state, context) => context.mutate("attach_image", { text: state.image_input, expectedTarget: draftMutationTarget(state) }) },
   { id: "browse-image", label: "画像を参照", palette: true, enabled: (state) => state.image_input_enabled, run: (state, context) => context.mutate("browse_image", { expectedTarget: draftMutationTarget(state) }) },
   { id: "clear-images", label: "添付を解除", palette: true, enabled: (state) => state.attached_images.length > 0, run: (state, context) => context.mutate("clear_images", { expectedTarget: draftMutationTarget(state) }) },
-  { id: "allow", label: "確認を許可", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.submitPermissionDecision(true) },
-  { id: "deny", label: "確認を拒否", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.submitPermissionDecision(false) },
+  { id: "approve-permission", label: "確認した操作を実行", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.submitPermissionDecision("approved") },
+  { id: "abort-permission", label: "操作を実行せず指示を変更", enabled: (state) => state.confirmation_visible, run: (_state, context) => context.submitPermissionDecision("abort") },
   { id: "minimize-window", label: "最小化", enabled: always, run: () => command("minimize_window") },
   {
     id: "toggle-maximize-window",
@@ -617,13 +642,13 @@ const NO_ACTION_PAYLOAD: ActionPayload = { index: -1, value: "" };
 
 export function actionEnabled(
   action: ActionDefinition,
-  state: DesktopWebState,
+  state: DesktopViewState,
   payload: ActionPayload = NO_ACTION_PAYLOAD,
 ): boolean {
   return action.enabled ? action.enabled(state, payload) : true;
 }
 
-export function menuActions(menu: ActionMenu, state: DesktopWebState): ActionDefinition[] {
+export function menuActions(menu: ActionMenu, state: DesktopViewState): ActionDefinition[] {
   return ACTIONS.filter((action) => action.menu === menu && actionEnabled(action, state));
 }
 
@@ -632,7 +657,7 @@ export function shortcutActions(): ActionDefinition[] {
 }
 
 export function paletteActions(
-  state: DesktopWebState,
+  state: DesktopViewState,
   configDraftAvailable = false,
 ): ActionDefinition[] {
   const query = state.local_search_text.trim().toLowerCase();
@@ -650,7 +675,7 @@ export function paletteActions(
 
 export async function dispatchRegisteredAction(
   id: string,
-  state: DesktopWebState,
+  state: DesktopViewState,
   context: ActionContext,
   payload: ActionPayload,
 ): Promise<boolean> {

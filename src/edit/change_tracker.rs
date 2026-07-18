@@ -59,39 +59,6 @@ impl ChangeSummary {
             ),
         }
     }
-
-    pub fn tool_feedback_text(&self, workspace_root: Option<&Utf8Path>) -> String {
-        match self.kind {
-            ChangeKind::Add => {
-                let path = render_display_path(self.path_after.as_ref(), workspace_root);
-                format!(
-                    "Added {path}\nThis successful ToolResult is completed FileChange evidence. The file now exists, and its current contents are established for this session. It is not a next-edit instruction."
-                )
-            }
-            ChangeKind::Update => {
-                let path = render_display_path(
-                    self.path_after.as_ref().or(self.path_before.as_ref()),
-                    workspace_root,
-                );
-                format!(
-                    "Updated {path}\nThis successful ToolResult is completed FileChange evidence. The file's current contents are established for this session. It is not a next-edit instruction."
-                )
-            }
-            ChangeKind::Delete => {
-                let path = render_display_path(self.path_before.as_ref(), workspace_root);
-                format!(
-                    "Deleted {path}\nThis successful ToolResult is completed FileChange evidence. The file removal is established for this session. It is not a next-edit instruction."
-                )
-            }
-            ChangeKind::Move => {
-                let before = render_display_path(self.path_before.as_ref(), workspace_root);
-                let after = render_display_path(self.path_after.as_ref(), workspace_root);
-                format!(
-                    "Moved {before} -> {after}\nThis successful ToolResult is completed FileChange evidence. The file move is established for this session. It is not a next-edit instruction."
-                )
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default)]

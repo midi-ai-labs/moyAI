@@ -4,12 +4,16 @@ use std::io::Write;
 use camino::{Utf8Path, Utf8PathBuf};
 use tempfile::NamedTempFile;
 
-use crate::config::loader::{acquire_global_config_write_lease, global_config_path};
+use crate::config::ProviderEndpoint;
+use crate::config::loader::{
+    acquire_global_config_write_lease, global_config_path, read_toml_utf8_bounded,
+};
+use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::model::{
     AccessMode, McpServerConfig, MultiAgentMode, PartialDoclingConfig, PartialFileGuardConfig,
     PartialInspectionConfig, PartialMcpConfig, PartialModelConfig, PartialMultiAgentConfig,
-    PartialPermissionsConfig, PartialResolvedConfig, PartialSessionConfig, PartialShellConfig,
-    PromptProfile, ProviderMetadataMode, ResolvedConfig,
+    PartialPermissionsConfig, PartialResolvedConfig, PartialShellConfig, ProviderMetadataMode,
+    ResolvedConfig,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +26,6 @@ pub enum ConfigSaveScope {
 pub enum ConfigField {
     BaseUrl,
     Model,
-    PromptProfile,
     ProviderMetadataMode,
     AccessMode,
     MultiAgentEnabled,
@@ -38,12 +41,10 @@ pub enum ConfigField {
     StopSequences,
     ContextWindow,
     MaxOutputTokens,
-    SessionMaxStepsPerTurn,
     RequestTimeoutMs,
     StreamIdleTimeoutMs,
     ConnectTimeoutMs,
     MaxRetries,
-    StreamMaxRetries,
     SupportsTools,
     SupportsReasoning,
     SupportsImages,
@@ -70,10 +71,9 @@ pub enum ConfigField {
 }
 
 impl ConfigField {
-    pub const ALL: [ConfigField; 47] = [
+    pub const ALL: [ConfigField; 44] = [
         ConfigField::BaseUrl,
         ConfigField::Model,
-        ConfigField::PromptProfile,
         ConfigField::ProviderMetadataMode,
         ConfigField::AccessMode,
         ConfigField::MultiAgentEnabled,
@@ -89,12 +89,10 @@ impl ConfigField {
         ConfigField::StopSequences,
         ConfigField::ContextWindow,
         ConfigField::MaxOutputTokens,
-        ConfigField::SessionMaxStepsPerTurn,
         ConfigField::RequestTimeoutMs,
         ConfigField::StreamIdleTimeoutMs,
         ConfigField::ConnectTimeoutMs,
         ConfigField::MaxRetries,
-        ConfigField::StreamMaxRetries,
         ConfigField::SupportsTools,
         ConfigField::SupportsReasoning,
         ConfigField::SupportsImages,
@@ -124,7 +122,6 @@ impl ConfigField {
         match self {
             ConfigField::BaseUrl => "model.base_url",
             ConfigField::Model => "model.model",
-            ConfigField::PromptProfile => "model.prompt_profile",
             ConfigField::ProviderMetadataMode => "model.provider_metadata_mode",
             ConfigField::AccessMode => "permissions.access_mode",
             ConfigField::MultiAgentEnabled => "multi_agent.enabled",
@@ -140,12 +137,10 @@ impl ConfigField {
             ConfigField::StopSequences => "model.stop_sequences",
             ConfigField::ContextWindow => "model.context_window",
             ConfigField::MaxOutputTokens => "model.max_output_tokens",
-            ConfigField::SessionMaxStepsPerTurn => "session.max_steps_per_turn",
             ConfigField::RequestTimeoutMs => "model.request_timeout_ms",
             ConfigField::StreamIdleTimeoutMs => "model.stream_idle_timeout_ms",
             ConfigField::ConnectTimeoutMs => "model.connect_timeout_ms",
             ConfigField::MaxRetries => "model.max_retries",
-            ConfigField::StreamMaxRetries => "model.stream_max_retries",
             ConfigField::SupportsTools => "model.supports_tools",
             ConfigField::SupportsReasoning => "model.supports_reasoning",
             ConfigField::SupportsImages => "model.supports_images",
@@ -180,7 +175,6 @@ impl ConfigField {
         match self {
             ConfigField::BaseUrl => Some("MOYAI_BASE_URL"),
             ConfigField::Model => Some("MOYAI_MODEL"),
-            ConfigField::PromptProfile => Some("MOYAI_PROMPT_PROFILE"),
             ConfigField::ProviderMetadataMode => Some("MOYAI_PROVIDER_METADATA_MODE"),
             ConfigField::AccessMode => Some("MOYAI_ACCESS_MODE"),
             ConfigField::MultiAgentEnabled => Some("MOYAI_MULTI_AGENT_ENABLED"),
@@ -196,12 +190,10 @@ impl ConfigField {
             ConfigField::StopSequences => Some("MOYAI_STOP_SEQUENCES"),
             ConfigField::ContextWindow => Some("MOYAI_CONTEXT_WINDOW"),
             ConfigField::MaxOutputTokens => Some("MOYAI_MAX_OUTPUT_TOKENS"),
-            ConfigField::SessionMaxStepsPerTurn => Some("MOYAI_MAX_STEPS_PER_TURN"),
             ConfigField::RequestTimeoutMs => Some("MOYAI_REQUEST_TIMEOUT_MS"),
             ConfigField::StreamIdleTimeoutMs => Some("MOYAI_STREAM_IDLE_TIMEOUT_MS"),
             ConfigField::ConnectTimeoutMs => Some("MOYAI_CONNECT_TIMEOUT_MS"),
             ConfigField::MaxRetries => Some("MOYAI_MAX_RETRIES"),
-            ConfigField::StreamMaxRetries => Some("MOYAI_STREAM_MAX_RETRIES"),
             ConfigField::SupportsTools => Some("MOYAI_SUPPORTS_TOOLS"),
             ConfigField::SupportsReasoning => Some("MOYAI_SUPPORTS_REASONING"),
             ConfigField::SupportsImages => Some("MOYAI_SUPPORTS_IMAGES"),
@@ -279,6 +271,37 @@ impl ConfigEditorState {
         }
     }
 
+    pub fn from_config_values(
+        config: &ResolvedConfig,
+        values: Vec<(String, String)>,
+    ) -> Result<Self, String> {
+        let mut candidate = Self::from_config(config);
+        candidate.replace_values_by_key(values)?;
+        Ok(candidate)
+    }
+
+    pub fn replace_values_by_key(&mut self, values: Vec<(String, String)>) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut updates = Vec::with_capacity(values.len());
+        for (key, value) in values {
+            if !seen.insert(key.clone()) {
+                return Err(format!("duplicate config field key: {key}"));
+            }
+            let index = self
+                .fields
+                .iter()
+                .position(|field| field.key.label() == key)
+                .ok_or_else(|| format!("unknown config field key: {key}"))?;
+            updates.push((index, value));
+        }
+        for (index, value) in updates {
+            let field = &mut self.fields[index];
+            field.dirty = field.value != value;
+            field.value = value;
+        }
+        Ok(())
+    }
+
     pub fn selected_field(&self) -> &ConfigFieldState {
         &self.fields[self.selected]
     }
@@ -307,8 +330,31 @@ impl ConfigEditorState {
         self.fields[self.selected].dirty = true;
     }
 
-    pub fn build_session_override(&self) -> Result<PartialResolvedConfig, String> {
-        parse_editor_patch(self)
+    pub fn build_resolved_config(&self, base: &ResolvedConfig) -> Result<ResolvedConfig, String> {
+        validate_complete_editor_values(self)?;
+        let mut config = apply_config_patch(base.clone(), parse_editor_patch(self)?);
+
+        for field in &self.fields {
+            if !field.value.trim().is_empty() {
+                continue;
+            }
+            match field.key {
+                ConfigField::Temperature => config.model.temperature = None,
+                ConfigField::TopP => config.model.top_p = None,
+                ConfigField::TopK => config.model.top_k = None,
+                ConfigField::PresencePenalty => config.model.presence_penalty = None,
+                ConfigField::FrequencyPenalty => config.model.frequency_penalty = None,
+                ConfigField::Seed => config.model.seed = None,
+                ConfigField::ExtraHeadersJson => config.model.extra_headers.clear(),
+                ConfigField::ExtraBodyJson => config.model.extra_body_json = None,
+                ConfigField::DoclingApiKeyEnv => config.docling.api_key_env = None,
+                ConfigField::DoclingHeadersJson => config.docling.headers.clear(),
+                ConfigField::McpServersJson => config.mcp.servers.clear(),
+                _ => {}
+            }
+        }
+
+        Ok(config)
     }
 
     pub fn save_scope(&self, _root: &Utf8Path, scope: ConfigSaveScope) -> Result<String, String> {
@@ -376,6 +422,7 @@ fn write_access_mode(
         "access_mode".to_string(),
         toml::Value::String(access_mode.as_str().to_string()),
     );
+    normalize_provider_endpoint_in_document(&mut existing)?;
     let text = toml::to_string_pretty(&existing).map_err(|error| error.to_string())?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -396,7 +443,8 @@ fn access_mode_from_document(document: &toml::Value) -> Result<AccessMode, Strin
         .ok_or_else(|| "permissions.access_mode must be a string".to_string())?;
     match value {
         "default" | "standard" => Ok(AccessMode::Default),
-        "auto_review" | "auto-review" => Ok(AccessMode::AutoReview),
+        // One-way normalization for user config written by the retired AI-review mode.
+        "auto_review" | "auto-review" => Ok(AccessMode::Default),
         "full_access" | "full-access" => Ok(AccessMode::FullAccess),
         _ => Err(format!("unknown permissions.access_mode `{value}`")),
     }
@@ -421,6 +469,7 @@ fn save_config_sections(path: &Utf8Path, editor: &ConfigEditorState) -> Result<(
     for field in dirty_fields {
         apply_dirty_toml_field(&mut existing, &patch, field)?;
     }
+    normalize_provider_endpoint_in_document(&mut existing)?;
     let text = toml::to_string_pretty(&existing).map_err(|error| error.to_string())?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -432,7 +481,7 @@ fn read_toml_document(path: &Utf8Path) -> Result<toml::Value, String> {
     if !path.exists() {
         return Ok(toml::Value::Table(toml::map::Map::new()));
     }
-    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let text = read_toml_utf8_bounded(path).map_err(|error| error.to_string())?;
     if text.trim().is_empty() {
         Ok(toml::Value::Table(toml::map::Map::new()))
     } else {
@@ -471,6 +520,24 @@ fn apply_dirty_toml_field(
     Ok(())
 }
 
+fn normalize_provider_endpoint_in_document(document: &mut toml::Value) -> Result<(), String> {
+    let Some(model) = document.get_mut("model") else {
+        return Ok(());
+    };
+    let model = model
+        .as_table_mut()
+        .ok_or_else(|| "global config section `model` must be a TOML table".to_string())?;
+    let Some(base_url) = model.get_mut("base_url") else {
+        return Ok(());
+    };
+    let raw = base_url
+        .as_str()
+        .ok_or_else(|| "model.base_url must be a string".to_string())?;
+    let endpoint = ProviderEndpoint::parse(raw).map_err(|error| error.to_string())?;
+    *base_url = toml::Value::String(endpoint.as_str().to_string());
+    Ok(())
+}
+
 fn persist_config_tempfile(path: &Utf8Path, text: &str) -> Result<(), String> {
     let parent = path
         .parent()
@@ -491,6 +558,36 @@ fn parse_editor_patch(editor: &ConfigEditorState) -> Result<PartialResolvedConfi
     parse_editor_patch_matching(editor, false)
 }
 
+fn validate_complete_editor_values(editor: &ConfigEditorState) -> Result<(), String> {
+    for field in &editor.fields {
+        if !field.value.trim().is_empty() || field_allows_empty_complete_value(field.key) {
+            continue;
+        }
+        return Err(format!("{} must not be empty", field.key.label()));
+    }
+    Ok(())
+}
+
+fn field_allows_empty_complete_value(field: ConfigField) -> bool {
+    matches!(
+        field,
+        ConfigField::Temperature
+            | ConfigField::TopP
+            | ConfigField::TopK
+            | ConfigField::PresencePenalty
+            | ConfigField::FrequencyPenalty
+            | ConfigField::Seed
+            | ConfigField::StopSequences
+            | ConfigField::ExtraHeadersJson
+            | ConfigField::ExtraBodyJson
+            | ConfigField::FileGuardBlockedReadExtensions
+            | ConfigField::FileGuardStructuredDocumentExtensions
+            | ConfigField::DoclingApiKeyEnv
+            | ConfigField::DoclingHeadersJson
+            | ConfigField::McpServersJson
+    )
+}
+
 fn parse_editor_patch_matching(
     editor: &ConfigEditorState,
     dirty_only: bool,
@@ -499,7 +596,6 @@ fn parse_editor_patch_matching(
     let mut model = PartialModelConfig::default();
     let mut permissions = PartialPermissionsConfig::default();
     let mut multi_agent = PartialMultiAgentConfig::default();
-    let mut session = PartialSessionConfig::default();
     let mut shell = PartialShellConfig::default();
     let mut inspection = PartialInspectionConfig::default();
     let mut file_guard = PartialFileGuardConfig::default();
@@ -512,14 +608,18 @@ fn parse_editor_patch_matching(
         }
         let text = field.value.trim();
         match field.key {
-            ConfigField::BaseUrl => model.base_url = parse_string(text),
-            ConfigField::Model => model.model = parse_string(text),
-            ConfigField::PromptProfile => {
-                model.prompt_profile = match parse_string(text) {
-                    Some(value) => Some(parse_prompt_profile(&value)?),
+            ConfigField::BaseUrl => {
+                model.base_url = match parse_string(text) {
+                    Some(value) => Some(
+                        ProviderEndpoint::parse(&value)
+                            .map_err(|error| error.to_string())?
+                            .as_str()
+                            .to_string(),
+                    ),
                     None => None,
                 }
             }
+            ConfigField::Model => model.model = parse_string(text),
             ConfigField::ProviderMetadataMode => {
                 model.provider_metadata_mode = match parse_string(text) {
                     Some(value) => Some(parse_provider_metadata_mode(&value)?),
@@ -554,12 +654,10 @@ fn parse_editor_patch_matching(
             ConfigField::StopSequences => model.stop_sequences = Some(parse_csv(text)),
             ConfigField::ContextWindow => model.context_window = parse_number(text)?,
             ConfigField::MaxOutputTokens => model.max_output_tokens = parse_number(text)?,
-            ConfigField::SessionMaxStepsPerTurn => session.max_steps_per_turn = parse_number(text)?,
             ConfigField::RequestTimeoutMs => model.request_timeout_ms = parse_number(text)?,
             ConfigField::StreamIdleTimeoutMs => model.stream_idle_timeout_ms = parse_number(text)?,
             ConfigField::ConnectTimeoutMs => model.connect_timeout_ms = parse_number(text)?,
             ConfigField::MaxRetries => model.max_retries = parse_number(text)?,
-            ConfigField::StreamMaxRetries => model.stream_max_retries = parse_number(text)?,
             ConfigField::SupportsTools => model.supports_tools = parse_bool(text)?,
             ConfigField::SupportsReasoning => model.supports_reasoning = parse_bool(text)?,
             ConfigField::SupportsImages => model.supports_images = parse_bool(text)?,
@@ -639,22 +737,12 @@ fn parse_editor_patch_matching(
     patch.model = Some(model);
     patch.permissions = Some(permissions);
     patch.multi_agent = Some(multi_agent);
-    patch.session = Some(session);
     patch.shell = Some(shell);
     patch.inspection = Some(inspection);
     patch.file_guard = Some(file_guard);
     patch.docling = Some(docling);
     patch.mcp = Some(mcp);
     Ok(patch)
-}
-
-fn parse_prompt_profile(value: &str) -> Result<PromptProfile, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "auto" => Ok(PromptProfile::Auto),
-        "default" => Ok(PromptProfile::Default),
-        "qwen" | "qwen_coder" | "qwen-coder" => Ok(PromptProfile::QwenCoder),
-        other => Err(format!("unsupported prompt_profile `{other}`")),
-    }
 }
 
 fn parse_provider_metadata_mode(value: &str) -> Result<ProviderMetadataMode, String> {
@@ -676,7 +764,7 @@ fn parse_provider_metadata_mode(value: &str) -> Result<ProviderMetadataMode, Str
 fn parse_access_mode(value: &str) -> Result<AccessMode, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "default" | "normal" => Ok(AccessMode::Default),
-        "auto_review" | "auto-review" | "autoreview" | "auto" => Ok(AccessMode::AutoReview),
+        "auto_review" | "auto-review" | "autoreview" | "auto" => Ok(AccessMode::Default),
         "full_access" | "full-access" | "full" => Ok(AccessMode::FullAccess),
         other => Err(format!("unsupported access_mode `{other}`")),
     }
@@ -735,18 +823,12 @@ fn field_value(key: ConfigField, config: &ResolvedConfig) -> String {
     match key {
         ConfigField::BaseUrl => config.model.base_url.clone(),
         ConfigField::Model => config.model.model.clone(),
-        ConfigField::PromptProfile => match config.model.prompt_profile {
-            PromptProfile::Auto => "auto".to_string(),
-            PromptProfile::Default => "default".to_string(),
-            PromptProfile::QwenCoder => "qwen_coder".to_string(),
-        },
         ConfigField::ProviderMetadataMode => match config.model.provider_metadata_mode {
             ProviderMetadataMode::LmStudioNativeRequired => "lm_studio_native_required".to_string(),
             ProviderMetadataMode::OpenAiCompatibleOnly => "openai_compatible_only".to_string(),
         },
         ConfigField::AccessMode => match config.permissions.access_mode {
             AccessMode::Default => "default".to_string(),
-            AccessMode::AutoReview => "auto_review".to_string(),
             AccessMode::FullAccess => "full_access".to_string(),
         },
         ConfigField::MultiAgentEnabled => config.multi_agent.enabled.to_string(),
@@ -788,12 +870,10 @@ fn field_value(key: ConfigField, config: &ResolvedConfig) -> String {
         ConfigField::StopSequences => config.model.stop_sequences.join(", "),
         ConfigField::ContextWindow => config.model.context_window.to_string(),
         ConfigField::MaxOutputTokens => config.model.max_output_tokens.to_string(),
-        ConfigField::SessionMaxStepsPerTurn => config.session.max_steps_per_turn.to_string(),
         ConfigField::RequestTimeoutMs => config.model.request_timeout_ms.to_string(),
         ConfigField::StreamIdleTimeoutMs => config.model.stream_idle_timeout_ms.to_string(),
         ConfigField::ConnectTimeoutMs => config.model.connect_timeout_ms.to_string(),
         ConfigField::MaxRetries => config.model.max_retries.to_string(),
-        ConfigField::StreamMaxRetries => config.model.stream_max_retries.to_string(),
         ConfigField::SupportsTools => config.model.supports_tools.to_string(),
         ConfigField::SupportsReasoning => config.model.supports_reasoning.to_string(),
         ConfigField::SupportsImages => config.model.supports_images.to_string(),
@@ -870,6 +950,102 @@ mod tests {
     use crate::config::{AccessMode, ProviderMetadataMode, ResolvedConfig};
 
     #[test]
+    fn config_editor_excludes_removed_model_behavior_guards() {
+        let editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+        let labels = editor
+            .fields
+            .iter()
+            .map(|field| field.key.label())
+            .collect::<Vec<_>>();
+
+        assert!(!labels.contains(&"model.prompt_profile"));
+        assert!(!labels.contains(&"session.max_steps_per_turn"));
+    }
+
+    #[test]
+    fn config_value_candidate_uses_stable_keys_and_rejects_invalid_batch_atomically() {
+        let config = ResolvedConfig::default();
+        let mut editor = ConfigEditorState::from_config(&config);
+        let original_model = editor
+            .fields
+            .iter()
+            .find(|field| field.key == ConfigField::Model)
+            .expect("model field")
+            .value
+            .clone();
+
+        let error = editor
+            .replace_values_by_key(vec![
+                ("model.model".to_string(), "changed-model".to_string()),
+                ("unknown.field".to_string(), "invalid".to_string()),
+            ])
+            .expect_err("unknown field must reject the full batch");
+        assert!(error.contains("unknown config field key"));
+        let model = editor
+            .fields
+            .iter()
+            .find(|field| field.key == ConfigField::Model)
+            .expect("model field");
+        assert_eq!(model.value, original_model);
+        assert!(!model.dirty);
+
+        let candidate = ConfigEditorState::from_config_values(
+            &config,
+            vec![("model.model".to_string(), "changed-model".to_string())],
+        )
+        .expect("known stable key");
+        let model = candidate
+            .fields
+            .iter()
+            .find(|field| field.key == ConfigField::Model)
+            .expect("model field");
+        assert_eq!(model.value, "changed-model");
+        assert!(model.dirty);
+    }
+
+    #[test]
+    fn complete_session_candidate_preserves_explicit_optional_absence() {
+        let mut base = ResolvedConfig::default();
+        base.model.temperature = Some(0.7);
+        base.model.extra_body_json = Some(serde_json::json!({"num_ctx": 32768}));
+        let candidate = ConfigEditorState::from_config_values(
+            &base,
+            vec![
+                (ConfigField::Temperature.label().to_string(), String::new()),
+                (
+                    ConfigField::ExtraBodyJson.label().to_string(),
+                    String::new(),
+                ),
+            ],
+        )
+        .expect("complete config values");
+
+        let resolved = candidate
+            .build_resolved_config(&base)
+            .expect("complete config candidate");
+
+        assert_eq!(resolved.model.temperature, None);
+        assert_eq!(resolved.model.extra_body_json, None);
+        assert_eq!(resolved.model.model, base.model.model);
+    }
+
+    #[test]
+    fn complete_session_candidate_rejects_missing_required_values() {
+        let base = ResolvedConfig::default();
+        let candidate = ConfigEditorState::from_config_values(
+            &base,
+            vec![(ConfigField::Model.label().to_string(), String::new())],
+        )
+        .expect("complete config values");
+
+        let error = candidate
+            .build_resolved_config(&base)
+            .expect_err("required model cannot be cleared");
+
+        assert_eq!(error, "model.model must not be empty");
+    }
+
+    #[test]
     fn config_editor_projects_provider_metadata_mode_patch() {
         let config = ResolvedConfig::default();
         let mut editor = ConfigEditorState::from_config(&config);
@@ -886,6 +1062,79 @@ mod tests {
             patch.model.and_then(|model| model.provider_metadata_mode),
             Some(ProviderMetadataMode::OpenAiCompatibleOnly)
         );
+    }
+
+    #[test]
+    fn config_editor_canonicalizes_lm_studio_endpoint_and_rejects_url_secrets() {
+        let config = ResolvedConfig::default();
+        let mut editor = ConfigEditorState::from_config(&config);
+        let field = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::BaseUrl)
+            .expect("provider endpoint field");
+        field.value = " http://lm-studio.local:1234/v1/ ".to_string();
+
+        let patch = parse_editor_patch(&editor).expect("valid LM Studio endpoint");
+        assert_eq!(
+            patch.model.and_then(|model| model.base_url),
+            Some("http://lm-studio.local:1234/v1".to_string())
+        );
+
+        for raw in [
+            "https://user:super-secret@provider.example/v1",
+            "https://provider.example/v1?api_key=hidden",
+            "https://provider.example/v1#hidden",
+        ] {
+            let mut editor = ConfigEditorState::from_config(&config);
+            let field = editor
+                .fields
+                .iter_mut()
+                .find(|field| field.key == ConfigField::BaseUrl)
+                .expect("provider endpoint field");
+            field.value = raw.to_string();
+            let error = parse_editor_patch(&editor).expect_err("reject secret endpoint");
+            assert!(!error.contains("super-secret"));
+            assert!(!error.contains("hidden"));
+            assert!(!error.contains(raw));
+        }
+    }
+
+    #[test]
+    fn global_config_writes_never_persist_an_invalid_provider_endpoint() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        let original = "[model]\nbase_url = \"http://provider.example\"\n";
+        std::fs::write(&path, original).expect("seed config");
+        let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+        let field = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::BaseUrl)
+            .expect("provider endpoint field");
+        field.value = "https://user:super-secret@provider.example/v1".to_string();
+        field.dirty = true;
+
+        let error = save_config_sections(&path, &editor).expect_err("reject invalid endpoint");
+
+        assert!(!error.contains("super-secret"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read config"),
+            original
+        );
+
+        std::fs::write(
+            &path,
+            "[model]\nbase_url = \"https://provider.example/v1?api_key=hidden\"\n",
+        )
+        .expect("seed invalid existing config");
+        let error = save_access_mode(&path, AccessMode::FullAccess)
+            .expect_err("unrelated save cannot preserve invalid endpoint");
+        assert!(!error.contains("hidden"));
+        let saved = std::fs::read_to_string(&path).expect("read unchanged config");
+        assert!(saved.contains("api_key=hidden"));
+        assert!(!saved.contains("full_access"));
     }
 
     #[test]
@@ -1007,7 +1256,6 @@ mod tests {
         .expect("seed config");
 
         for (mode, expected) in [
-            (AccessMode::AutoReview, "auto_review"),
             (AccessMode::FullAccess, "full_access"),
             (AccessMode::Default, "default"),
         ] {
@@ -1064,7 +1312,7 @@ mod tests {
                 .expect("first CAS")
         );
         assert!(
-            !compare_and_set_access_mode(&path, AccessMode::Default, AccessMode::AutoReview)
+            !compare_and_set_access_mode(&path, AccessMode::Default, AccessMode::Default)
                 .expect("stale CAS")
         );
 

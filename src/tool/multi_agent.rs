@@ -71,6 +71,7 @@ impl Tool for SpawnAgentTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::SpawnAgent,
+            effect: crate::tool::ToolEffectPolicy::mutation(),
             description: "Spawn an agent for a concrete, bounded task that can run independently alongside useful local work. The child has a canonical task path and the same workspace and permissions. This medium profile supports one child level, so only the root agent can spawn.",
             input_schema: json!({
                 "type": "object",
@@ -174,6 +175,7 @@ impl Tool for WaitAgentTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::WaitAgent,
+            effect: crate::tool::ToolEffectPolicy::read(),
             description: "Wait for a mailbox update from any live agent. The wait also ends early when new user input is steered into the active turn. Returns only an activity, interruption, or timeout summary, never hidden reasoning or message content.",
             input_schema: json!({
                 "type": "object",
@@ -226,6 +228,7 @@ impl Tool for InterruptAgentTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::InterruptAgent,
+            effect: crate::tool::ToolEffectPolicy::mutation(),
             description: "Interrupt an agent's current turn, if any, and return its previous status. The agent remains available for messages and follow-up tasks.",
             input_schema: json!({
                 "type": "object",
@@ -271,6 +274,7 @@ impl Tool for ListAgentsTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::ListAgents,
+            effect: crate::tool::ToolEffectPolicy::read(),
             description: "List live agents in the current root thread tree. Optionally filter by task-path prefix.",
             input_schema: json!({
                 "type": "object",
@@ -350,6 +354,7 @@ fn message_spec(
 ) -> ToolSpec {
     ToolSpec {
         name,
+        effect: crate::tool::ToolEffectPolicy::mutation(),
         description,
         input_schema: json!({
             "type": "object",
@@ -436,6 +441,7 @@ fn json_result(title: &str, output: Value, metadata: Value) -> Result<ToolResult
         truncated_output_path: None,
         recorded_changes: Vec::new(),
         change_summaries: Vec::new(),
+        _internal_file_lease: None,
     })
 }
 

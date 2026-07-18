@@ -5,10 +5,10 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crate::agent::{AgentLoop, PromptBuilder};
 use crate::app::{App, RunService};
 use crate::cli::{CliCommand, RunArgs};
-use crate::config::ConfigLoader;
+use crate::config::{ConfigLoader, ResolvedConfig};
 use crate::edit::{ChangeTracker, EditSafety, Formatter};
 use crate::error::AppBootstrapError;
-use crate::llm::OpenAiCompatClient;
+use crate::llm::{OpenAiCompatClient, resolve_api_key_from_env};
 use crate::runtime::SessionRuntimeEventHub;
 use crate::session::ProjectRepository;
 use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
@@ -63,6 +63,24 @@ impl AppBootstrap {
         fixed_workspace_root: bool,
     ) -> Result<App, AppBootstrapError> {
         let config = ConfigLoader::load(start_dir, run_args)?;
+        Self::build_with_resolved_config(start_dir, store, fixed_workspace_root, config).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn rebuild_for_directory_as_workspace_root_with_config(
+        start_dir: &Utf8Path,
+        store: StoreBundle,
+        config: ResolvedConfig,
+    ) -> Result<App, AppBootstrapError> {
+        Self::build_with_resolved_config(start_dir, store, true, config).await
+    }
+
+    async fn build_with_resolved_config(
+        start_dir: &Utf8Path,
+        store: StoreBundle,
+        fixed_workspace_root: bool,
+        config: ResolvedConfig,
+    ) -> Result<App, AppBootstrapError> {
         let workspace = if fixed_workspace_root {
             WorkspaceDiscovery::discover_fixed_root(start_dir, &config)?
         } else {
@@ -102,17 +120,8 @@ impl AppBootstrap {
             skills: crate::skill::SkillsService::new(),
         };
         let registry = ToolRegistry::core_agent_for_config(&config);
-        let api_key = config
-            .model
-            .api_key_env
-            .as_ref()
-            .and_then(|value| std::env::var(value).ok());
-        let llm = Arc::new(OpenAiCompatClient::new(
-            config.model.connect_timeout_ms,
-            config.model.request_timeout_ms,
-            config.model.max_retries,
-            api_key,
-        )?);
+        let api_key = resolve_api_key_from_env(config.model.api_key_env.as_deref())?;
+        let llm = Arc::new(OpenAiCompatClient::new(api_key));
         let agent_loop = AgentLoop::new(llm, registry, store.clone(), PromptBuilder, tool_services);
         let session_event_hub = SessionRuntimeEventHub::new(1024);
         let run_service = RunService::new(
@@ -164,8 +173,6 @@ fn command_directory(command: &CliCommand) -> Result<camino::Utf8PathBuf, AppBoo
         | CliCommand::SessionSettings(_)
         | CliCommand::SessionTitle(_)
         | CliCommand::SessionInterrupt(_)
-        | CliCommand::SessionCompact(_)
-        | CliCommand::SessionMemory(_)
         | CliCommand::SessionGoalGet(_)
         | CliCommand::SessionGoalSet(_)
         | CliCommand::SessionGoalClear(_)

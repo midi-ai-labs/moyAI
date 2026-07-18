@@ -15,6 +15,7 @@ impl Tool for CurrentTimeTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::CurrentTime,
+            effect: crate::tool::ToolEffectPolicy::read(),
             description: "Return the current local and UTC time for date-sensitive work.",
             input_schema: json!({
                 "type": "object",
@@ -48,6 +49,7 @@ impl Tool for CurrentTimeTool {
             truncated_output_path: None,
             recorded_changes: Vec::new(),
             change_summaries: Vec::new(),
+            _internal_file_lease: None,
         })
     }
 }

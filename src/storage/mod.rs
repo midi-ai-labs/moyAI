@@ -1,5 +1,9 @@
+use std::fs::{File, OpenOptions};
+use std::sync::Arc;
+
 use camino::Utf8PathBuf;
 use directories_next::ProjectDirs;
+use fs2::FileExt;
 
 use crate::error::StorageError;
 use crate::runtime::{ActiveRunRegistry, RunProcessLease};
@@ -20,6 +24,77 @@ pub struct StoragePaths {
     pub data_dir: Utf8PathBuf,
     pub database_path: Utf8PathBuf,
     pub truncation_dir: Utf8PathBuf,
+}
+
+const INTERNAL_FILE_MAINTENANCE_LOCK: &str = ".internal-files.lock";
+
+/// A cross-process shared lease held from creation of an internal file until its
+/// durable database reference has committed. Maintenance takes the exclusive
+/// counterpart, so it cannot observe the producer's in-between state.
+#[derive(Clone)]
+pub(crate) struct InternalFileProducerLease {
+    _inner: Arc<InternalFileProducerLeaseInner>,
+}
+
+struct InternalFileProducerLeaseInner {
+    file: File,
+}
+
+impl std::fmt::Debug for InternalFileProducerLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InternalFileProducerLease")
+            .finish_non_exhaustive()
+    }
+}
+
+impl InternalFileProducerLease {
+    pub(crate) fn acquire(paths: &StoragePaths) -> Result<Self, StorageError> {
+        let file = open_internal_file_maintenance_lock(paths)?;
+        FileExt::lock_shared(&file)?;
+        Ok(Self {
+            _inner: Arc::new(InternalFileProducerLeaseInner { file }),
+        })
+    }
+}
+
+impl Drop for InternalFileProducerLeaseInner {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+pub(crate) struct InternalFileMaintenanceLease {
+    file: File,
+}
+
+impl InternalFileMaintenanceLease {
+    pub(crate) fn acquire(paths: &StoragePaths) -> Result<Self, StorageError> {
+        let file = open_internal_file_maintenance_lock(paths)?;
+        FileExt::lock_exclusive(&file)?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for InternalFileMaintenanceLease {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn open_internal_file_maintenance_lock(paths: &StoragePaths) -> Result<File, StorageError> {
+    std::fs::create_dir_all(&paths.data_dir)?;
+    Ok(OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(
+            paths
+                .data_dir
+                .join(INTERNAL_FILE_MAINTENANCE_LOCK)
+                .as_std_path(),
+        )?)
 }
 
 impl StoragePaths {
@@ -115,10 +190,6 @@ impl StoreBundle {
 
     pub fn cleanup_orphan_internal_files(&self) -> Result<StorageMaintenanceReport, StorageError> {
         self.store.cleanup_orphan_internal_files()
-    }
-
-    pub fn checkpoint_and_vacuum(&self) -> Result<(), StorageError> {
-        self.store.checkpoint_and_vacuum()
     }
 
     pub fn paths(&self) -> &StoragePaths {

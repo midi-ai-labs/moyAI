@@ -1,19 +1,17 @@
 use std::collections::BTreeMap;
+use std::fmt;
 
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{AccessMode, ShellFamily};
-use crate::error::ErrorCategory;
 use crate::protocol::{
-    FileChangeEvidence, HistoryItem, HistoryItemId, ToolProgressEffect, TurnId, TurnItem,
+    HistoryItem, ModelResponseId, TurnId, TurnInterruptionCause, TurnItem, TurnTerminalOutcome,
 };
 use crate::tool::ToolName;
 
-use super::{
-    ChangeId, MessageId, PartId, ProjectId, ReviewScope, SessionId, SessionStateSnapshot,
-    ToolCallId,
-};
+use super::{ProjectId, SessionId, ToolCallId};
+use crate::workspace::ReviewScope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,7 +19,6 @@ pub enum SessionStatus {
     Idle,
     Running,
     Completed,
-    AwaitingUser,
     Cancelled,
     Failed,
 }
@@ -32,85 +29,8 @@ impl SessionStatus {
             Self::Idle => "idle",
             Self::Running => "running",
             Self::Completed => "completed",
-            Self::AwaitingUser => "awaiting_user",
             Self::Cancelled => "cancelled",
             Self::Failed => "failed",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionMemoryMode {
-    Enabled,
-    Disabled,
-}
-
-impl Default for SessionMemoryMode {
-    fn default() -> Self {
-        Self::Enabled
-    }
-}
-
-impl SessionMemoryMode {
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Enabled => "enabled",
-            Self::Disabled => "disabled",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "enabled" => Some(Self::Enabled),
-            "disabled" => Some(Self::Disabled),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageRole {
-    User,
-    Assistant,
-}
-
-impl MessageRole {
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::Assistant => "assistant",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PartKind {
-    Text,
-    Reasoning,
-    ToolCall,
-    ToolResult,
-    Image,
-    Error,
-    DiffSummary,
-    PromptDispatch,
-    RequestDiagnostics,
-}
-
-impl PartKind {
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Reasoning => "reasoning",
-            Self::ToolCall => "tool_call",
-            Self::ToolResult => "tool_result",
-            Self::Image => "image",
-            Self::Error => "error",
-            Self::DiffSummary => "diff_summary",
-            Self::PromptDispatch => "prompt_dispatch",
-            Self::RequestDiagnostics => "request_diagnostics",
         }
     }
 }
@@ -121,7 +41,22 @@ pub enum ToolCallStatus {
     Pending,
     Running,
     Completed,
+    Declined,
+    Cancelled,
     Failed,
+}
+
+impl ToolCallStatus {
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Declined => "declined",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,7 +93,7 @@ pub struct DispatchTransform {
     pub label: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: SessionId,
     pub project_id: ProjectId,
@@ -173,6 +108,26 @@ pub struct SessionRecord {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub completed_at_ms: Option<i64>,
+}
+
+impl fmt::Debug for SessionRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionRecord")
+            .field("id", &self.id)
+            .field("project_id", &self.project_id)
+            .field("title", &self.title)
+            .field("status", &self.status)
+            .field("cwd", &self.cwd)
+            .field("model", &self.model)
+            .field("base_url", &"<redacted provider endpoint>")
+            .field("access_mode", &self.access_mode)
+            .field("model_parameters", &self.model_parameters)
+            .field("created_at_ms", &self.created_at_ms)
+            .field("updated_at_ms", &self.updated_at_ms)
+            .field("completed_at_ms", &self.completed_at_ms)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,7 +161,7 @@ impl SessionModelParameters {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<Utf8PathBuf>,
@@ -226,6 +181,29 @@ pub struct SessionSettingsPatch {
     pub top_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+}
+
+impl fmt::Debug for SessionSettingsPatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionSettingsPatch")
+            .field("cwd", &self.cwd)
+            .field("model", &self.model)
+            .field(
+                "base_url",
+                &self
+                    .base_url
+                    .as_ref()
+                    .map(|_| "<redacted provider endpoint>"),
+            )
+            .field("access_mode", &self.access_mode)
+            .field("reset_model_parameters", &self.reset_model_parameters)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("top_k", &self.top_k)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .finish()
+    }
 }
 
 impl SessionSettingsPatch {
@@ -278,18 +256,10 @@ pub struct SessionTitleUpdate {
     pub changed: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionMemoryModeUpdate {
-    pub session: SessionRecord,
-    pub mode: SessionMemoryMode,
-    pub changed: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdleTurnRejectionReason {
     PendingTriggerTurn,
-    PlanMode,
     Busy,
 }
 
@@ -297,7 +267,6 @@ impl IdleTurnRejectionReason {
     pub fn key(self) -> &'static str {
         match self {
             Self::PendingTriggerTurn => "pending_trigger_turn",
-            Self::PlanMode => "plan_mode",
             Self::Busy => "busy",
         }
     }
@@ -427,14 +396,6 @@ pub struct SessionForkResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionCompactResult {
-    pub session: SessionRecord,
-    pub compaction_item_id: HistoryItemId,
-    pub summarized_history_items: usize,
-    pub retained_history_items: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectRecord {
     pub id: ProjectId,
     pub root_path: Utf8PathBuf,
@@ -442,31 +403,6 @@ pub struct ProjectRecord {
     pub vcs_kind: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MessageRecord {
-    pub id: MessageId,
-    pub session_id: SessionId,
-    pub role: MessageRole,
-    pub parent_message_id: Option<MessageId>,
-    pub sequence_no: i64,
-    pub created_at_ms: i64,
-    pub metadata: MessageMetadata,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum MessageMetadata {
-    User(UserMessageMeta),
-    Assistant(AssistantMessageMeta),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserMessageMeta {
-    pub cwd: Utf8PathBuf,
-    pub requested_model: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub editor_context: Option<EditorContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -481,91 +417,11 @@ pub struct EditorContext {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AssistantMessageMeta {
-    pub model: String,
-    pub base_url: String,
-    pub finish_reason: Option<FinishReason>,
-    pub token_usage: Option<TokenUsage>,
-    #[serde(default)]
-    pub summary: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TextPart {
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImagePart {
     pub source_path: Option<Utf8PathBuf>,
     pub mime_type: String,
     pub data_base64: String,
     pub byte_len: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReasoningPart {
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCallPart {
-    pub tool_call_id: ToolCallId,
-    pub tool_name: ToolName,
-    pub arguments_json: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_arguments_json: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub effective_arguments_json: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolResultPart {
-    pub tool_call_id: ToolCallId,
-    pub status: ToolCallStatus,
-    pub title: String,
-    pub summary: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub success: Option<bool>,
-    #[serde(default)]
-    pub progress_effect: ToolProgressEffect,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blocked_action: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result_hash: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCallRecord {
-    pub id: ToolCallId,
-    pub session_id: SessionId,
-    pub message_id: MessageId,
-    pub tool_name: ToolName,
-    pub status: ToolCallStatus,
-    pub arguments_json: String,
-    pub title: Option<String>,
-    pub metadata_json: serde_json::Value,
-    pub output_text: Option<String>,
-    pub truncated_output_path: Option<Utf8PathBuf>,
-    pub error_text: Option<String>,
-    pub started_at_ms: i64,
-    pub finished_at_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErrorPart {
-    pub category: ErrorCategory,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiffSummaryPart {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<ToolCallId>,
-    pub change_ids: Vec<ChangeId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub changes: Vec<FileChangeEvidence>,
-    pub summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -672,8 +528,6 @@ pub struct RequestToolSchemaDiagnostic {
     pub name: String,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub description_chars: usize,
-    #[serde(default)]
-    pub strict: bool,
     pub input_schema: serde_json::Value,
 }
 
@@ -695,80 +549,12 @@ pub struct RequestMessageDiagnostic {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RequestReplayPolicyDiagnostic {
-    pub policy: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub omitted_targets: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub active_targets: Vec<String>,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RequestControlEnvelopeDiagnostic {
-    pub envelope_id: String,
-    pub projection_id: String,
-    pub dispatch_policy: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_verification_commands: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_tools: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub forbidden_tools: Vec<String>,
-    pub validation_status: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub validation_issues: Vec<RequestControlEnvelopeIssueDiagnostic>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub open_obligations: Vec<RequestControlObligationDiagnostic>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub surface_projections: Vec<RequestControlSurfaceDiagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RequestControlEnvelopeIssueDiagnostic {
-    pub code: String,
-    pub severity: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RequestControlObligationDiagnostic {
-    pub obligation_id: String,
-    pub kind: String,
-    pub summary: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub targets: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_actions: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub verification_commands: Vec<String>,
-    pub status: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RequestControlSurfaceDiagnostic {
-    pub surface: String,
-    pub projection_id: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_tools: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub forbidden_tools: Vec<String>,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestDiagnosticsPart {
     pub provider: String,
     pub model_name: String,
     pub base_url: String,
     pub request_timeout_ms: u64,
     pub stream_idle_timeout_ms: u64,
-    #[serde(default)]
-    pub stream_max_retries: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configured_max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -797,253 +583,8 @@ pub struct RequestDiagnosticsPart {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_schemas: Vec<RequestToolSchemaDiagnostic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_decision: Option<TurnDecisionDiagnostic>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control_envelope: Option<RequestControlEnvelopeDiagnostic>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub replay_policies: Vec<RequestReplayPolicyDiagnostic>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<crate::context::ContextWindowTokenStatus>,
     pub messages: Vec<RequestMessageDiagnostic>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TurnDecisionDiagnostic {
-    pub route: String,
-    pub process_phase: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_work_kind: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_work_summary: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub active_targets: Vec<Utf8PathBuf>,
-    #[serde(default)]
-    pub verification_pending: bool,
-    #[serde(default)]
-    pub closeout_ready: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_verification_commands: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub policy_targets: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_tools: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub warnings: Vec<TurnDecisionWarning>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repair_lane: Option<RepairLaneDiagnostic>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepairLaneDiagnostic {
-    pub subtype: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_target: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_tools: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub forbidden_tools: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub missing_symbol: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub public_state_assertions: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub public_missing_attributes: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contract_reconciliation: Option<ContractReconciliationDiagnostic>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation_template: Option<RepairOperationTemplate>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification_cluster: Option<VerificationFailureCluster>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repair_intent: Option<RepairIntentDiagnostic>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repair_control_snapshot: Option<RepairControlSnapshotDiagnostic>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContractReconciliationDiagnostic {
-    pub owner: String,
-    #[serde(default)]
-    pub strict_contract_active: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub requirement_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_target: Option<String>,
-    #[serde(default)]
-    pub source_repair_allowed: bool,
-    #[serde(default)]
-    pub test_repair_allowed: bool,
-    pub reason: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepairOperationTemplate {
-    pub operation_id: String,
-    pub operation_kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exact_target: Option<String>,
-    pub source_test_ownership: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_edit_surface: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub forbidden_stale_tools: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification_rerun_condition: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence_markers: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sibling_obligations: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repair_intent: Option<RepairIntentDiagnostic>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepairIntentDiagnostic {
-    pub repair_owner: String,
-    pub rollback_depth: String,
-    pub recovery_action: String,
-    pub required_edit_intent: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_evidence: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub progress_evidence: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub forbidden_directions: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepairControlSnapshotDiagnostic {
-    pub admitted: bool,
-    pub admission_reason: String,
-    pub repair_subtype: String,
-    pub repair_owner: String,
-    pub selected_recovery_action: String,
-    pub rollback_depth: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_target: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_surface_snapshot: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub hard_invariants: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub recovery_choices: Vec<RepairRecoveryChoiceDiagnostic>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub forbidden_actions: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub progress_evidence: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification_rerun_condition: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification_cluster_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepairRecoveryChoiceDiagnostic {
-    pub recovery_action: String,
-    pub rollback_depth: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_tools: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_evidence: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub forbidden_directions: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub progress_evidence: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerificationFailureEvidence {
-    pub evidence_kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subtype: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub symbol: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_site: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exception: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub observed: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub public_state_assertions: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub public_missing_attributes: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence_markers: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sibling_obligations: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub requirement_refs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub source_refs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub test_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerificationFailureCluster {
-    pub cluster_id: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub failing_labels: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub primary_failure: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence: Vec<VerificationFailureEvidence>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sibling_obligations: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub source_refs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub test_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompletedTodoEvidenceState {
-    pub status: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub contradicted_todos: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub missing_evidence_todos: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolNoProgressSignature {
-    pub result_hash: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blocked_action: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_surface_snapshot: Vec<String>,
-    #[serde(default)]
-    pub repeat_count: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TurnDecisionWarning {
-    pub code: String,
-    pub severity: TurnDecisionWarningSeverity,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnDecisionWarningSeverity {
-    Info,
-    Warning,
-    Error,
 }
 
 fn is_zero_usize(value: &usize) -> bool {
@@ -1087,13 +628,29 @@ pub struct CanonicalRuntimeEventPage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalSessionRead {
     pub session: SessionRecord,
-    pub state: SessionStateSnapshot,
     pub history: CanonicalHistoryPage,
     pub turns: CanonicalTurnPage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_sequence_no: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalSessionFence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub append_position: Option<i64>,
+    pub history_count: usize,
+    pub turn_count: usize,
+    pub runtime_event_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanonicalSessionSnapshot {
+    pub read: CanonicalSessionRead,
+    pub fence: CanonicalSessionFence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1122,8 +679,6 @@ pub struct LoadedSessionSummary {
     pub loaded_status: LoadedSessionStatus,
     #[serde(default)]
     pub archived: bool,
-    #[serde(default)]
-    pub memory_mode: SessionMemoryMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1147,20 +702,7 @@ pub struct RunningSessionRejoin {
     pub read: CanonicalSessionRead,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum MessagePart {
-    Text(TextPart),
-    Image(ImagePart),
-    Reasoning(ReasoningPart),
-    ToolCall(ToolCallPart),
-    ToolResult(ToolResultPart),
-    Error(ErrorPart),
-    DiffSummary(DiffSummaryPart),
-    PromptDispatch(PromptDispatchPart),
-    RequestDiagnostics(RequestDiagnosticsPart),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NewSession {
     pub project_id: ProjectId,
     pub title: String,
@@ -1170,39 +712,18 @@ pub struct NewSession {
     pub access_mode: AccessMode,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NewMessage {
-    pub session_id: SessionId,
-    pub parent_message_id: Option<MessageId>,
-    pub role: MessageRole,
-    pub metadata: MessageMetadata,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NewPart {
-    pub kind: PartKind,
-    pub payload: MessagePart,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartRecord {
-    pub id: PartId,
-    pub message_id: MessageId,
-    pub sequence_no: i64,
-    pub kind: PartKind,
-    pub payload: MessagePart,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Transcript {
-    pub session: SessionRecord,
-    pub messages: Vec<TranscriptMessage>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranscriptMessage {
-    pub record: MessageRecord,
-    pub parts: Vec<PartRecord>,
+impl fmt::Debug for NewSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewSession")
+            .field("project_id", &self.project_id)
+            .field("title", &self.title)
+            .field("cwd", &self.cwd)
+            .field("model", &self.model)
+            .field("base_url", &"<redacted provider endpoint>")
+            .field("access_mode", &self.access_mode)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1212,7 +733,7 @@ pub enum SessionSelector {
     Latest,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SessionStartRequest {
     pub selector: SessionSelector,
     pub title: Option<String>,
@@ -1220,6 +741,20 @@ pub struct SessionStartRequest {
     pub model: String,
     pub base_url: String,
     pub access_mode: AccessMode,
+}
+
+impl fmt::Debug for SessionStartRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionStartRequest")
+            .field("selector", &self.selector)
+            .field("title", &self.title)
+            .field("cwd", &self.cwd)
+            .field("model", &self.model)
+            .field("base_url", &"<redacted provider endpoint>")
+            .field("access_mode", &self.access_mode)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1230,15 +765,71 @@ pub struct SessionContext {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSummary {
-    pub session_id: SessionId,
-    pub assistant_message_id: Option<MessageId>,
-    pub status: SessionStatus,
-    pub finish_reason: Option<FinishReason>,
-    pub tool_call_count: usize,
-    pub failed_tool_count: usize,
-    pub change_count: usize,
-    #[serde(default)]
-    pub metrics: RunMetrics,
+    session_id: SessionId,
+    turn_id: TurnId,
+    terminal: DurableTurnTerminal,
+}
+
+impl RunSummary {
+    pub fn from_terminal(
+        session_id: SessionId,
+        turn_id: TurnId,
+        terminal: DurableTurnTerminal,
+    ) -> Self {
+        Self {
+            session_id,
+            turn_id,
+            terminal,
+        }
+    }
+
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub const fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    pub const fn terminal(&self) -> &DurableTurnTerminal {
+        &self.terminal
+    }
+
+    pub fn into_terminal(self) -> DurableTurnTerminal {
+        self.terminal
+    }
+
+    pub const fn status(&self) -> SessionStatus {
+        self.terminal.session_status()
+    }
+
+    pub const fn finish_reason(&self) -> FinishReason {
+        self.terminal.finish_reason()
+    }
+
+    pub const fn interruption_cause(&self) -> Option<TurnInterruptionCause> {
+        self.terminal.interruption_cause()
+    }
+
+    pub const fn final_response_id(&self) -> Option<ModelResponseId> {
+        self.terminal.final_response_id
+    }
+
+    pub const fn tool_call_count(&self) -> usize {
+        self.terminal.tool_call_count
+    }
+
+    pub const fn failed_tool_count(&self) -> usize {
+        self.terminal.failed_tool_count
+    }
+
+    pub const fn change_count(&self) -> usize {
+        self.terminal.change_count
+    }
+
+    pub const fn metrics(&self) -> &RunMetrics {
+        &self.terminal.metrics
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1258,10 +849,55 @@ pub struct RunMetrics {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableTurnTerminal {
+    pub outcome: TurnTerminalOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_response_id: Option<ModelResponseId>,
+    #[serde(default)]
+    pub tool_call_count: usize,
+    #[serde(default)]
+    pub failed_tool_count: usize,
+    #[serde(default)]
+    pub change_count: usize,
+    #[serde(default)]
+    pub metrics: RunMetrics,
+}
+
+impl DurableTurnTerminal {
+    pub const fn session_status(&self) -> SessionStatus {
+        self.outcome.session_status()
+    }
+
+    pub const fn finish_reason(&self) -> FinishReason {
+        self.outcome.finish_reason()
+    }
+
+    pub const fn interruption_cause(&self) -> Option<TurnInterruptionCause> {
+        self.outcome.interruption_cause()
+    }
+
+    pub fn summary(&self) -> &str {
+        self.outcome.summary()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RunConfigSnapshot {
     pub model: String,
     pub base_url: String,
-    pub access_mode: String,
+    pub access_mode: AccessMode,
+}
+
+impl fmt::Debug for RunConfigSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RunConfigSnapshot")
+            .field("model", &self.model)
+            .field("base_url", &"<redacted provider endpoint>")
+            .field("access_mode", &self.access_mode)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1283,25 +919,19 @@ pub enum RunEvent {
         session_id: SessionId,
         title: String,
     },
-    UserMessageStored {
-        message_id: MessageId,
-    },
     UserTurnStored {
         session_id: SessionId,
-        message_id: MessageId,
         turn: Box<crate::protocol::UserTurn>,
-    },
-    AssistantStarted {
-        message_id: MessageId,
-        model: String,
-    },
-    ControlEnvelopePrepared {
-        session_id: SessionId,
-        envelope: crate::protocol::TurnControlEnvelope,
     },
     ModelRequestPrepared {
         session_id: SessionId,
         diagnostics: RequestDiagnosticsPart,
+    },
+    /// Typed, low-volume provider lifecycle telemetry. This is emitted only
+    /// through the runtime event path and is never canonical conversation history.
+    ProviderPhase {
+        response_id: ModelResponseId,
+        event: crate::llm::ProviderPhaseEvent,
     },
     WorldStateUpdated {
         session_id: SessionId,
@@ -1309,25 +939,44 @@ pub enum RunEvent {
         rendered: String,
     },
     TextDelta {
-        message_id: MessageId,
+        response_id: ModelResponseId,
         delta: String,
     },
-    ReasoningDelta {
-        message_id: MessageId,
+    AssistantMessageCommitted {
+        response_id: ModelResponseId,
+        text: String,
+    },
+    /// Provider-confirmed reasoning summary streamed to clients only.
+    ReasoningSummaryDelta {
+        response_id: ModelResponseId,
         delta: String,
     },
     ToolCallPending {
         tool_call_id: ToolCallId,
-        tool: ToolName,
-        title: String,
-        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
-        metadata: serde_json::Value,
+        response_id: ModelResponseId,
+        model_call_id: String,
+        tool_name: String,
+        arguments_json: String,
     },
     ToolCallCompleted {
         tool_call_id: ToolCallId,
         tool: ToolName,
         title: String,
         summary: String,
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        metadata: serde_json::Value,
+    },
+    ToolCallDeclined {
+        tool_call_id: ToolCallId,
+        tool: ToolName,
+        reason: String,
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        metadata: serde_json::Value,
+    },
+    ToolCallCancelled {
+        tool_call_id: ToolCallId,
+        tool: ToolName,
+        reason: String,
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         metadata: serde_json::Value,
     },
@@ -1338,26 +987,15 @@ pub enum RunEvent {
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         metadata: serde_json::Value,
     },
-    ToolProposalRejected {
-        tool_call_id: ToolCallId,
-        proposal: crate::protocol::RejectedToolProposal,
-    },
-    CandidateRepairEditRecorded {
-        tool_call_id: ToolCallId,
-        candidate: crate::protocol::CandidateRepairEdit,
-    },
     FileChangesRecorded {
         tool_call_id: ToolCallId,
         changes: Vec<crate::edit::ChangeSummary>,
     },
     CompactionCompleted {
-        message_id: MessageId,
         summarized_messages: usize,
         summary: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         replacement_item_ids: Vec<crate::protocol::HistoryItemId>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        continuation: Option<crate::session::ContinuationContract>,
     },
     PermissionRequested {
         tool_call_id: ToolCallId,
@@ -1369,40 +1007,13 @@ pub enum RunEvent {
         tool: ToolName,
         approved: bool,
     },
-    RetryScheduled {
-        session_id: SessionId,
-        attempt: u8,
-        message: String,
-        next_retry_at_ms: i64,
-    },
     RecoverableRuntimeFeedback {
         session_id: SessionId,
-        message_id: MessageId,
         message: String,
     },
-    StateUpdated {
+    TurnTerminal {
         session_id: SessionId,
-        state: SessionStateSnapshot,
-    },
-    LifecycleGuardUpdated {
-        session_id: SessionId,
-        snapshot: crate::protocol::LifecycleGuardSnapshot,
-    },
-    SessionCompleted {
-        session_id: SessionId,
-        finish_reason: Option<FinishReason>,
-    },
-    SessionAwaitingUser {
-        session_id: SessionId,
-        finish_reason: Option<FinishReason>,
-    },
-    SessionInterrupted {
-        session_id: SessionId,
-        reason: String,
-    },
-    SessionFailed {
-        session_id: SessionId,
-        message: String,
+        terminal: Box<DurableTurnTerminal>,
     },
 }
 
@@ -1412,26 +1023,19 @@ impl RunEvent {
             Self::SessionStarted { session_id, .. }
             | Self::SessionTitleUpdated { session_id, .. }
             | Self::UserTurnStored { session_id, .. }
-            | Self::ControlEnvelopePrepared { session_id, .. }
             | Self::ModelRequestPrepared { session_id, .. }
             | Self::WorldStateUpdated { session_id, .. }
-            | Self::RetryScheduled { session_id, .. }
             | Self::RecoverableRuntimeFeedback { session_id, .. }
-            | Self::StateUpdated { session_id, .. }
-            | Self::LifecycleGuardUpdated { session_id, .. }
-            | Self::SessionCompleted { session_id, .. }
-            | Self::SessionAwaitingUser { session_id, .. }
-            | Self::SessionInterrupted { session_id, .. }
-            | Self::SessionFailed { session_id, .. } => Some(*session_id),
-            Self::UserMessageStored { .. }
-            | Self::AssistantStarted { .. }
-            | Self::TextDelta { .. }
-            | Self::ReasoningDelta { .. }
+            | Self::TurnTerminal { session_id, .. } => Some(*session_id),
+            Self::TextDelta { .. }
+            | Self::ProviderPhase { .. }
+            | Self::AssistantMessageCommitted { .. }
+            | Self::ReasoningSummaryDelta { .. }
             | Self::ToolCallPending { .. }
             | Self::ToolCallCompleted { .. }
+            | Self::ToolCallDeclined { .. }
+            | Self::ToolCallCancelled { .. }
             | Self::ToolCallFailed { .. }
-            | Self::ToolProposalRejected { .. }
-            | Self::CandidateRepairEditRecorded { .. }
             | Self::FileChangesRecorded { .. }
             | Self::CompactionCompleted { .. }
             | Self::PermissionRequested { .. }

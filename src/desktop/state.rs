@@ -1,10 +1,8 @@
-use crate::protocol::TurnItem;
+use crate::protocol::{HistoryItem, HistoryItemPayload, TurnInterruptionCause};
 use crate::session::{
-    ProjectId, PromptDispatchPart, SessionId, SessionRecord, SessionStateSnapshot, SessionStatus,
-    TodoItem, Transcript, latest_context_window_from_transcript,
+    CanonicalSessionRead, ProjectId, PromptDispatchPart, SessionId, SessionStatus,
 };
-use crate::tool::PermissionRequest;
-use crate::tui::state::{AppState, RunStatus};
+use crate::tui::state::{AppState, RunProgressPhase, RunStatus};
 
 use super::async_ops::{
     DesktopAsyncOperationId, DesktopAsyncOperationKind, DesktopAsyncOperationRegistry,
@@ -19,11 +17,44 @@ use super::startup::DesktopStartupState;
 use super::view_state::DesktopViewState;
 use crate::config::ProviderMetadataMode;
 use crate::config::ResolvedConfig;
-use crate::llm::{ModelAvailabilityReport, ProviderModelInfo, normalize_provider_base_url};
+use crate::llm::{ProviderModelInfo, ProviderModelLoadState, normalize_provider_base_url};
+use tokio_util::sync::CancellationToken;
 
 pub const MIN_WINDOW_OPACITY_PERCENT: i32 = 50;
 pub const MAX_WINDOW_OPACITY_PERCENT: i32 = 100;
 pub const DEFAULT_WINDOW_OPACITY_PERCENT: i32 = 96;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopStatusCode {
+    Plain,
+    ProviderTransport,
+    ModelUnavailable,
+    ImageUnsupported,
+    PermissionPolicyDenied,
+    ApprovalAborted,
+    UserStopped,
+    AgentInterrupted,
+    TreeStopped,
+}
+
+impl DesktopStatusCode {
+    pub fn from_interruption(cause: TurnInterruptionCause) -> Self {
+        match cause {
+            TurnInterruptionCause::ApprovalAborted => Self::ApprovalAborted,
+            TurnInterruptionCause::UserStop => Self::UserStopped,
+            TurnInterruptionCause::AgentInterrupted => Self::AgentInterrupted,
+            TurnInterruptionCause::TreeStopped => Self::TreeStopped,
+        }
+    }
+
+    pub fn is_terminal_interruption(self) -> bool {
+        matches!(
+            self,
+            Self::ApprovalAborted | Self::UserStopped | Self::AgentInterrupted | Self::TreeStopped
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopOverlay {
@@ -52,7 +83,8 @@ pub struct DesktopState {
     pub navigation: DesktopNavigationState,
     pub view: DesktopViewState,
     pub startup: DesktopStartupState,
-    pub permission_request_id: Option<u64>,
+    pub status_code: DesktopStatusCode,
+    prompt_enhance_cancellation: Option<(u64, CancellationToken)>,
 }
 
 impl DesktopState {
@@ -68,7 +100,8 @@ impl DesktopState {
             navigation: DesktopNavigationState::default(),
             view: DesktopViewState::default(),
             startup: DesktopStartupState::ready(),
-            permission_request_id: None,
+            status_code: DesktopStatusCode::Plain,
+            prompt_enhance_cancellation: None,
         }
         .with_provider_fields()
     }
@@ -85,69 +118,13 @@ impl DesktopState {
             workspace_root,
             &self.provider_config.effective_config,
         );
-        if self.startup.status == super::startup::DesktopStartupStatus::Loading {
-            self.view
-                .async_operations
-                .begin_unique(DesktopAsyncOperationKind::StartupReadinessCheck);
-        } else {
-            self.view
-                .async_operations
-                .finish_kind(DesktopAsyncOperationKind::StartupReadinessCheck);
-        }
         self.apply_startup_overlay();
     }
 
-    pub fn finish_startup_provider_model_load(&mut self, report: &ModelAvailabilityReport) {
-        self.startup.complete_model_availability(report);
-        self.sync_startup_readiness_operation();
-        self.apply_startup_overlay();
-    }
-
-    pub fn fail_startup_provider_model_load(&mut self, message: impl Into<String>) {
-        self.startup.fail_provider_availability(message);
-        self.sync_startup_readiness_operation();
-        self.apply_startup_overlay();
-    }
-
-    pub fn finish_startup_docling_check(&mut self, base_url: &str) {
-        self.startup.complete_docling_check(base_url);
-        self.sync_startup_readiness_operation();
-        self.apply_startup_overlay();
-    }
-
-    pub fn fail_startup_docling_check(&mut self, message: impl Into<String>) {
-        self.startup.fail_docling_check(message);
-        self.sync_startup_readiness_operation();
-        self.apply_startup_overlay();
-    }
-
-    pub fn retarget_startup_readiness_for_config_change(&mut self) -> bool {
-        if self.startup.status == super::startup::DesktopStartupStatus::Ready {
-            return false;
-        }
-        self.startup.begin_provider_availability(
-            &self.provider_config.effective_config.model.base_url,
-            &self.provider_config.effective_config.model.model,
-        );
+    pub fn refresh_startup_config_status(&mut self) {
         self.startup
-            .begin_docling_check(&self.provider_config.effective_config);
-        self.sync_startup_readiness_operation();
+            .refresh_config(&self.provider_config.effective_config);
         self.apply_startup_overlay();
-        true
-    }
-
-    pub fn startup_provider_readiness_pending(&self) -> bool {
-        self.startup.checks.iter().any(|check| {
-            check.key == "provider"
-                && check.status == super::startup::DesktopStartupCheckStatus::Pending
-        })
-    }
-
-    pub fn startup_docling_readiness_pending(&self) -> bool {
-        self.startup.checks.iter().any(|check| {
-            check.key == "docling"
-                && check.status == super::startup::DesktopStartupCheckStatus::Pending
-        })
     }
 
     pub fn replace_snapshot(&mut self, mut snapshot: DesktopSnapshot) {
@@ -384,6 +361,12 @@ impl DesktopState {
             .begin_unique(DesktopAsyncOperationKind::SnapshotRefresh);
     }
 
+    pub fn snapshot_refresh_pending(&self) -> bool {
+        self.view
+            .async_operations
+            .is_pending(DesktopAsyncOperationKind::SnapshotRefresh)
+    }
+
     pub fn finish_snapshot_refresh(&mut self) {
         self.view
             .async_operations
@@ -483,6 +466,22 @@ impl DesktopState {
             .begin_unique(DesktopAsyncOperationKind::AccessModePersistence)
     }
 
+    pub fn begin_steer_submission(&mut self) -> DesktopAsyncOperationId {
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::SteerSubmission)
+    }
+
+    pub fn finish_steer_submission(&mut self, operation_id: DesktopAsyncOperationId) -> bool {
+        self.view.async_operations.finish(operation_id)
+    }
+
+    pub fn steer_submission_pending(&self) -> bool {
+        self.view
+            .async_operations
+            .is_pending(DesktopAsyncOperationKind::SteerSubmission)
+    }
+
     pub fn finish_access_mode_persistence(
         &mut self,
         operation_id: DesktopAsyncOperationId,
@@ -551,6 +550,10 @@ impl DesktopState {
                 .view
                 .async_operations
                 .is_pending(DesktopAsyncOperationKind::AccessModePersistence)
+            || self
+                .view
+                .async_operations
+                .is_pending(DesktopAsyncOperationKind::SteerSubmission)
     }
 
     pub fn begin_history_export(&mut self) {
@@ -565,23 +568,8 @@ impl DesktopState {
             .finish_kind(DesktopAsyncOperationKind::HistoryExport);
     }
 
-    pub fn begin_current_todo_refresh(&mut self) {
-        self.view
-            .async_operations
-            .begin_unique(DesktopAsyncOperationKind::CurrentTodoRefresh);
-    }
-
-    pub fn finish_current_todo_refresh(&mut self) {
-        self.view
-            .async_operations
-            .finish_kind(DesktopAsyncOperationKind::CurrentTodoRefresh);
-    }
-
     pub fn async_polling_required(&self) -> bool {
-        self.view.async_operations.polling_required()
-            || self.is_busy()
-            || self.app_state.permission.is_some()
-            || self.startup.status == super::startup::DesktopStartupStatus::Loading
+        self.view.async_operations.polling_required() || self.is_busy()
     }
 
     pub fn pending_async_operation_keys(&self) -> Vec<String> {
@@ -604,24 +592,6 @@ impl DesktopState {
         self.view
             .async_operations
             .finish_kind(DesktopAsyncOperationKind::SessionLoad);
-    }
-
-    fn sync_startup_readiness_operation(&mut self) {
-        if self.startup.status == super::startup::DesktopStartupStatus::Loading {
-            if !self
-                .view
-                .async_operations
-                .is_pending(DesktopAsyncOperationKind::StartupReadinessCheck)
-            {
-                self.view
-                    .async_operations
-                    .begin_unique(DesktopAsyncOperationKind::StartupReadinessCheck);
-            }
-        } else {
-            self.view
-                .async_operations
-                .finish_kind(DesktopAsyncOperationKind::StartupReadinessCheck);
-        }
     }
 
     pub fn selected_session_title(&self) -> String {
@@ -676,7 +646,6 @@ impl DesktopState {
                 transcript_text: "チャットはまだありません。".to_string(),
                 transcript_rows: vec![crate::desktop::models::DesktopTranscriptRow {
                     row_kind: crate::desktop::models::DesktopTranscriptRowKind::EmptyPlaceholder,
-                    kind: "empty_placeholder".to_string(),
                     step: "00".to_string(),
                     title: "チャットはありません".to_string(),
                     body: if self.selected_project_id().is_some() {
@@ -694,8 +663,6 @@ impl DesktopState {
                 progress_text: "待機中\nフェーズ: 準備完了\n手順: 実行中の作業はありません"
                     .to_string(),
                 run_status_text: "待機中".to_string(),
-                confirmation_text: String::new(),
-                confirmation_visible: false,
                 artifacts: Vec::new(),
                 file_changes: Vec::new(),
                 file_change_summary_text: "ファイル変更はまだありません。".to_string(),
@@ -839,34 +806,20 @@ impl DesktopState {
         target_changed
     }
 
-    pub fn load_open_session(
-        &mut self,
-        session: &SessionRecord,
-        transcript: &Transcript,
-        turn_items: &[TurnItem],
-        state: SessionStateSnapshot,
-        todos: Vec<TodoItem>,
-        turn_page_offset: usize,
-        turn_page_limit: usize,
-        turn_page_total: usize,
-        turn_page_has_more: bool,
-    ) {
+    pub fn load_open_session(&mut self, read: &CanonicalSessionRead) {
+        let session = &read.session;
+        let turn_items = &read.turns.items;
         self.provider_config.update_access_mode(session.access_mode);
         self.bind_composer_to_loaded_session(session.id);
-        let open_session = OpenSessionView::from_loaded(
-            session,
-            transcript,
-            turn_items,
-            state.clone(),
-            todos.clone(),
-            turn_page_offset,
-            turn_page_limit,
-            turn_page_total,
-            turn_page_has_more,
-        );
-        self.app_state
-            .load_turn_items(session, turn_items, state, todos);
-        if let Some(context_window) = latest_context_window_from_transcript(transcript) {
+        let open_session = OpenSessionView::from_loaded(read);
+        self.app_state.load_turn_items(session, turn_items);
+        self.status_code = self
+            .app_state
+            .interruption_cause
+            .map(DesktopStatusCode::from_interruption)
+            .unwrap_or(DesktopStatusCode::Plain);
+        if let Some(context_window) = latest_context_window_from_history_items(&read.history.items)
+        {
             self.app_state.latest_context_window = Some(context_window);
         }
         self.open_session = Some(open_session);
@@ -882,30 +835,16 @@ impl DesktopState {
         self.view.artifact_selected_index = 0;
     }
 
-    pub fn refresh_open_session_projection(
-        &mut self,
-        session: &SessionRecord,
-        transcript: &Transcript,
-        turn_items: &[TurnItem],
-        state: SessionStateSnapshot,
-        todos: Vec<TodoItem>,
-        turn_page_offset: usize,
-        turn_page_limit: usize,
-        turn_page_total: usize,
-        turn_page_has_more: bool,
-    ) {
-        let open_session = OpenSessionView::from_loaded(
-            session,
-            transcript,
-            turn_items,
-            state,
-            todos,
-            turn_page_offset,
-            turn_page_limit,
-            turn_page_total,
-            turn_page_has_more,
-        );
+    pub fn refresh_open_session_projection(&mut self, read: &CanonicalSessionRead) {
+        let session = &read.session;
+        let turn_items = &read.turns.items;
+        let open_session = OpenSessionView::from_loaded(read);
         let detail = open_session.stored_detail().clone();
+        self.app_state.refresh_plan_from_turn_items(turn_items);
+        if let Some(context_window) = latest_context_window_from_history_items(&read.history.items)
+        {
+            self.app_state.latest_context_window = Some(context_window);
+        }
         self.open_session = Some(open_session);
         self.snapshot.replace_detail(detail);
         self.update_session_row_title(session.id, &session.title);
@@ -914,6 +853,13 @@ impl DesktopState {
 
     pub fn apply_run_event(&mut self, event: &crate::session::RunEvent) {
         self.app_state.apply_run_event(event);
+        self.status_code = match event {
+            crate::session::RunEvent::TurnTerminal { terminal, .. } => terminal
+                .interruption_cause()
+                .map(DesktopStatusCode::from_interruption)
+                .unwrap_or(DesktopStatusCode::Plain),
+            _ => DesktopStatusCode::Plain,
+        };
         match event {
             crate::session::RunEvent::SessionStarted { session_id, title } => {
                 self.update_session_row_title(*session_id, title);
@@ -922,17 +868,11 @@ impl DesktopState {
             crate::session::RunEvent::SessionTitleUpdated { session_id, title } => {
                 self.update_session_row_title(*session_id, title);
             }
-            crate::session::RunEvent::SessionCompleted { session_id, .. } => {
-                self.update_session_row_status(*session_id, SessionStatus::Completed);
-            }
-            crate::session::RunEvent::SessionAwaitingUser { session_id, .. } => {
-                self.update_session_row_status(*session_id, SessionStatus::AwaitingUser);
-            }
-            crate::session::RunEvent::SessionInterrupted { session_id, .. } => {
-                self.update_session_row_status(*session_id, SessionStatus::Cancelled);
-            }
-            crate::session::RunEvent::SessionFailed { session_id, .. } => {
-                self.update_session_row_status(*session_id, SessionStatus::Failed);
+            crate::session::RunEvent::TurnTerminal {
+                session_id,
+                terminal,
+            } => {
+                self.update_session_row_status(*session_id, terminal.session_status());
             }
             _ => {}
         }
@@ -964,43 +904,32 @@ impl DesktopState {
         }
     }
 
-    pub fn set_permission(&mut self, request_id: u64, request: &PermissionRequest) {
-        self.permission_request_id = Some(request_id);
-        self.app_state.set_permission(request);
-    }
-
-    pub fn clear_permission(&mut self) {
-        self.permission_request_id = None;
-        self.app_state.clear_permission();
-    }
-
-    pub fn mark_run_cancellation_requested(&mut self, reason: &str, status_message: &str) {
-        self.app_state.run_status = RunStatus::Cancelled;
-        self.permission_request_id = None;
-        self.app_state.permission = None;
-        self.app_state.status_message = Some(status_message.to_string());
-        self.app_state.progress.status = "Cancelled".to_string();
-        self.app_state.progress.current_phase = "terminal".to_string();
-        self.app_state.progress.active_step = reason.to_string();
-        if let Some(session_id) = self.app_state.current_session_id {
-            for row in self
-                .snapshot
-                .session_rows
-                .iter_mut()
-                .chain(self.snapshot.chat_session_rows.iter_mut())
-            {
-                if row.session_id == session_id {
-                    row.set_status(SessionStatus::Cancelled);
-                }
-            }
+    pub fn mark_run_stop_requested(&mut self, reason: &str, status_message: &str) {
+        // Dispatching Stop is not the durable terminal. Keep the run active until the matching
+        // TurnTerminal projection arrives so navigation and new admission remain closed while the
+        // worker settles cancellation.
+        if !matches!(self.app_state.run_status, RunStatus::Running) {
+            return;
         }
+        self.app_state.status_message = Some(status_message.to_string());
+        self.app_state.progress.status = "Stopping".to_string();
+        self.app_state.progress.current_phase = RunProgressPhase::StopRequested;
+        self.app_state.progress.active_step = reason.to_string();
     }
 
-    pub fn push_local_prompt_dispatch(&mut self, prompt_dispatch: &PromptDispatchPart) {
-        self.app_state.push_local_prompt_dispatch(prompt_dispatch);
+    pub fn apply_durable_prompt_dispatch(&mut self, prompt_dispatch: &PromptDispatchPart) {
+        self.app_state
+            .apply_durable_prompt_dispatch(prompt_dispatch);
     }
 
-    pub fn begin_prompt_enhance(&mut self, request_id: u64, raw_prompt: &str) {
+    pub fn begin_prompt_enhance(
+        &mut self,
+        request_id: u64,
+        raw_prompt: &str,
+        cancellation: CancellationToken,
+    ) {
+        self.cancel_prompt_enhance_transport();
+        self.prompt_enhance_cancellation = Some((request_id, cancellation));
         self.view
             .async_operations
             .begin_unique(DesktopAsyncOperationKind::PromptEnhance);
@@ -1014,6 +943,7 @@ impl DesktopState {
             .app_state
             .finish_prompt_enhance(request_id, draft.clone());
         if finished {
+            self.finish_prompt_enhance_transport(request_id);
             self.view
                 .async_operations
                 .finish_kind(DesktopAsyncOperationKind::PromptEnhance);
@@ -1045,6 +975,7 @@ impl DesktopState {
     }
 
     pub fn cancel_prompt_review(&mut self) {
+        self.cancel_prompt_enhance_transport();
         self.view
             .async_operations
             .finish_kind(DesktopAsyncOperationKind::PromptEnhance);
@@ -1061,6 +992,20 @@ impl DesktopState {
 
     pub fn set_status_message(&mut self, message: impl Into<String>) {
         self.app_state.status_message = Some(message.into());
+        self.status_code = DesktopStatusCode::Plain;
+    }
+
+    pub fn set_typed_status_message(
+        &mut self,
+        code: DesktopStatusCode,
+        message: impl Into<String>,
+    ) {
+        self.app_state.status_message = Some(message.into());
+        self.status_code = code;
+    }
+
+    pub fn set_status_message_preserving_code(&mut self, message: impl Into<String>) {
+        self.app_state.status_message = Some(message.into());
     }
 
     pub fn start_new_chat(&mut self) {
@@ -1069,7 +1014,9 @@ impl DesktopState {
             return;
         }
         self.snapshot.selected_session_index = self.snapshot.session_rows.len();
-        self.rebind_composer_owner(None);
+        self.cancel_prompt_review();
+        self.composer
+            .reset_owner(&self.snapshot.workspace_path, None);
         self.app_state = AppState::default();
         self.open_session = None;
         self.view.artifact_selected_index = 0;
@@ -1077,17 +1024,27 @@ impl DesktopState {
         self.set_status_message("new chat ready");
     }
 
+    fn finish_prompt_enhance_transport(&mut self, request_id: u64) {
+        if self
+            .prompt_enhance_cancellation
+            .as_ref()
+            .is_some_and(|(active_request_id, _)| *active_request_id == request_id)
+        {
+            self.prompt_enhance_cancellation = None;
+        }
+    }
+
+    fn cancel_prompt_enhance_transport(&mut self) {
+        if let Some((_, cancellation)) = self.prompt_enhance_cancellation.take() {
+            cancellation.cancel();
+        }
+    }
+
     pub fn reset_effective_config(&mut self, config: ResolvedConfig) {
         self.provider_config.replace_effective_config(config);
     }
 
     pub fn show_config_editor(&mut self) {
-        self.provider_config.config_value_text = self
-            .provider_config
-            .config_editor
-            .selected_field()
-            .value
-            .clone();
         self.view.startup_overlay_forced = false;
         self.view.overlay = DesktopOverlay::ConfigEditor;
     }
@@ -1182,63 +1139,6 @@ impl DesktopState {
         self.startup.requires_initial_setup() && self.startup.action_overlay == Some(overlay)
     }
 
-    pub fn set_config_selection(&mut self, index: usize) {
-        if index < self.provider_config.config_editor.fields.len() {
-            self.provider_config.config_editor.selected = index;
-            self.provider_config.config_value_text = self
-                .provider_config
-                .config_editor
-                .selected_field()
-                .value
-                .clone();
-        }
-    }
-
-    pub fn set_config_value(&mut self, value: String) {
-        self.provider_config.config_value_text = value.clone();
-        if let Some(field) = self
-            .provider_config
-            .config_editor
-            .fields
-            .get_mut(self.provider_config.config_editor.selected)
-        {
-            field.value = value;
-        }
-    }
-
-    pub fn set_config_values_by_key(
-        &mut self,
-        values: Vec<(String, String)>,
-    ) -> Result<(), String> {
-        let mut seen = std::collections::HashSet::new();
-        let mut updates = Vec::with_capacity(values.len());
-        for (key, value) in values {
-            if !seen.insert(key.clone()) {
-                return Err(format!("duplicate config field key: {key}"));
-            }
-            let index = self
-                .provider_config
-                .config_editor
-                .fields
-                .iter()
-                .position(|field| field.key.label() == key)
-                .ok_or_else(|| format!("unknown config field key: {key}"))?;
-            updates.push((index, value));
-        }
-        for (index, value) in updates {
-            let field = &mut self.provider_config.config_editor.fields[index];
-            field.dirty |= field.value != value;
-            field.value = value;
-        }
-        self.provider_config.config_value_text = self
-            .provider_config
-            .config_editor
-            .selected_field()
-            .value
-            .clone();
-        Ok(())
-    }
-
     pub fn begin_provider_model_load(&mut self, normalized_base_url: String) {
         self.provider_config.provider_base_url_input = normalized_base_url;
         self.provider_config.provider_loading = true;
@@ -1309,29 +1209,12 @@ impl DesktopState {
             .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
         self.provider_config.provider_loaded_base_url = None;
         let message = message.into();
-        let lower = message.to_ascii_lowercase();
-        let (title, hint) = if lower.contains("error sending request")
-            || lower.contains("connection refused")
-            || lower.contains("failed to connect")
-        {
-            (
-                "LLM provider に接続できません",
-                "LM Studio が起動しているか、Base URL が http://127.0.0.1:1234 のように到達可能なURLになっているか確認してください。",
-            )
-        } else if lower.contains("model") && (lower.contains("not found") || lower.contains("404"))
-        {
-            (
-                "指定したモデルが見つかりません",
-                "Provider設定でモデル一覧を読み込み、現在ロード済みのモデルを選択してください。",
-            )
-        } else {
-            (
-                "処理に失敗しました",
-                "設定と対象ワークスペースを確認してください。原因の切り分けには技術詳細を参照してください。",
-            )
-        };
-        self.provider_config
-            .set_status(DesktopProviderStatusKind::Error, title, hint, message);
+        self.provider_config.set_status(
+            DesktopProviderStatusKind::Error,
+            "Providerモデル一覧を読み込めません",
+            "Base URL と Provider の稼働状態を確認し、もう一度モデル一覧を読み込んでください。",
+            message,
+        );
         self.provider_config.provider_models = ensure_current_model(
             self.provider_config.provider_models.clone(),
             &self.provider_config.effective_config.model.model,
@@ -1471,10 +1354,7 @@ impl DesktopState {
     }
 
     pub fn is_busy(&self) -> bool {
-        matches!(
-            self.app_state.run_status,
-            RunStatus::Running | RunStatus::Confirming
-        )
+        matches!(self.app_state.run_status, RunStatus::Running)
     }
 
     pub fn can_open_session(&self) -> bool {
@@ -1564,6 +1444,17 @@ impl DesktopState {
     }
 }
 
+fn latest_context_window_from_history_items(
+    items: &[HistoryItem],
+) -> Option<crate::context::ContextWindowTokenStatus> {
+    items.iter().rev().find_map(|item| match &item.payload {
+        HistoryItemPayload::RequestDiagnostics { diagnostics } => {
+            diagnostics.context_window.clone()
+        }
+        _ => None,
+    })
+}
+
 fn truncate_for_search(value: &str, max_chars: usize) -> String {
     let count = value.chars().count();
     if count <= max_chars {
@@ -1617,7 +1508,7 @@ fn provider_info_from_config(config: &ResolvedConfig) -> ProviderModelInfo {
         supports_tools: Some(config.model.supports_tools),
         supports_reasoning: Some(config.model.supports_reasoning),
         max_parallel_predictions: Some(config.model.max_parallel_predictions),
-        loaded: false,
+        load_state: ProviderModelLoadState::Unknown,
         source: "config".to_string(),
     }
 }
@@ -1654,12 +1545,10 @@ mod tests {
     use super::*;
     use crate::config::AccessMode;
     use crate::desktop::models::{DesktopProjectRow, DesktopSessionRow};
-    use crate::llm::ModelAvailabilityStatus;
     use crate::session::ProjectId;
     use crate::session::{
-        AssistantMessageMeta, MessageId, MessageMetadata, MessagePart, MessageRecord, MessageRole,
-        PartId, PartKind, PartRecord, RequestDiagnosticsPart, SessionModelParameters, TextPart,
-        Transcript, TranscriptMessage,
+        CanonicalHistoryPage, CanonicalTurnPage, RequestDiagnosticsPart, SessionModelParameters,
+        SessionRecord,
     };
 
     fn snapshot(
@@ -1719,122 +1608,95 @@ mod tests {
         }
     }
 
-    fn transcript_with_context_window(
+    fn canonical_read(
         session: &SessionRecord,
-        context_window: crate::context::ContextWindowTokenStatus,
-    ) -> Transcript {
-        let user_message_id = MessageId::new();
-        let diagnostics_message_id = MessageId::new();
-        Transcript {
+        history_items: Vec<HistoryItem>,
+        turn_items: Vec<crate::protocol::TurnItem>,
+    ) -> CanonicalSessionRead {
+        let latest_turn_id = history_items
+            .iter()
+            .rev()
+            .find_map(HistoryItem::turn_id)
+            .or_else(|| turn_items.last().map(|item| item.turn_id));
+        CanonicalSessionRead {
             session: session.clone(),
-            messages: vec![
-                TranscriptMessage {
-                    record: MessageRecord {
-                        id: user_message_id,
-                        session_id: session.id,
-                        role: MessageRole::User,
-                        parent_message_id: None,
-                        sequence_no: 1,
-                        created_at_ms: 1,
-                        metadata: MessageMetadata::User(crate::session::UserMessageMeta {
-                            cwd: session.cwd.clone(),
-                            requested_model: Some(session.model.clone()),
-                            editor_context: None,
-                        }),
-                    },
-                    parts: vec![PartRecord {
-                        id: PartId::new(),
-                        message_id: user_message_id,
-                        sequence_no: 1,
-                        kind: PartKind::Text,
-                        payload: MessagePart::Text(TextPart {
-                            text: "hello".to_string(),
-                        }),
-                    }],
-                },
-                TranscriptMessage {
-                    record: MessageRecord {
-                        id: diagnostics_message_id,
-                        session_id: session.id,
-                        role: MessageRole::Assistant,
-                        parent_message_id: None,
-                        sequence_no: 2,
-                        created_at_ms: 2,
-                        metadata: MessageMetadata::Assistant(AssistantMessageMeta {
-                            model: session.model.clone(),
-                            base_url: session.base_url.clone(),
-                            finish_reason: None,
-                            token_usage: None,
-                            summary: false,
-                        }),
-                    },
-                    parts: vec![PartRecord {
-                        id: PartId::new(),
-                        message_id: diagnostics_message_id,
-                        sequence_no: 1,
-                        kind: PartKind::RequestDiagnostics,
-                        payload: MessagePart::RequestDiagnostics(RequestDiagnosticsPart {
-                            provider: "openai_compat".to_string(),
-                            model_name: session.model.clone(),
-                            base_url: session.base_url.clone(),
-                            request_timeout_ms: 30_000,
-                            stream_idle_timeout_ms: 30_000,
-                            stream_max_retries: 0,
-                            configured_max_output_tokens: Some(8_192),
-                            effective_max_output_tokens: Some(8_192),
-                            output_budget_reason: None,
-                            supports_tools: Some(true),
-                            supports_reasoning: Some(false),
-                            supports_images: Some(false),
-                            system_prompt_chars: 0,
-                            tool_count: 0,
-                            tool_choice: Some("auto".to_string()),
-                            parallel_tool_calls: Some(false),
-                            provider_message_count: 0,
-                            image_count: 0,
-                            image_bytes: 0,
-                            tool_names: Vec::new(),
-                            tool_schemas: Vec::new(),
-                            turn_decision: None,
-                            control_envelope: None,
-                            replay_policies: Vec::new(),
-                            context_window: Some(context_window),
-                            messages: Vec::new(),
-                        }),
-                    }],
-                },
-            ],
+            history: CanonicalHistoryPage {
+                session: session.clone(),
+                offset: 0,
+                limit: usize::MAX,
+                total: history_items.len(),
+                has_more: false,
+                items: history_items,
+            },
+            turns: CanonicalTurnPage {
+                session: session.clone(),
+                offset: 0,
+                limit: 50,
+                total: turn_items.len(),
+                has_more: false,
+                items: turn_items,
+            },
+            latest_turn_id,
+            active_turn_id: None,
+            active_turn_sequence_no: None,
         }
     }
 
-    fn passing_model_report(config: &ResolvedConfig) -> ModelAvailabilityReport {
-        ModelAvailabilityReport {
-            gate: "model_availability".to_string(),
-            status: ModelAvailabilityStatus::Pass,
-            generated_by: "desktop_state_test".to_string(),
-            model: config.model.model.clone(),
-            base_url: config.model.base_url.clone(),
-            provider_metadata_mode: config.model.provider_metadata_mode,
-            v1_present: true,
-            native_present: true,
-            require_vision: false,
-            vision_capable: false,
-            vision_probe_passed: false,
-            vision_probes: Vec::new(),
-            tool_use_capable: Some(true),
-            capability_overrides: Vec::new(),
-            tool_call_probe_passed: true,
-            tool_call_probes: Vec::new(),
-            reasoning_capable: Some(false),
-            context: Some(config.model.context_window),
-            max_output_tokens: Some(config.model.max_output_tokens),
-            max_parallel_predictions: Some(config.model.max_parallel_predictions),
-            matched_model: None,
-            v1_models: Vec::new(),
-            native_models: Vec::new(),
-            openai_error: None,
-            native_error: None,
-            checked_at_ms: 0,
+    fn terminal_event(
+        session_id: SessionId,
+        outcome: crate::protocol::TurnTerminalOutcome,
+    ) -> crate::session::RunEvent {
+        crate::session::RunEvent::TurnTerminal {
+            session_id,
+            terminal: Box::new(crate::session::DurableTurnTerminal {
+                outcome,
+                final_response_id: None,
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            }),
+        }
+    }
+
+    fn diagnostics_history_item(
+        session: &SessionRecord,
+        context_window: Option<crate::context::ContextWindowTokenStatus>,
+    ) -> HistoryItem {
+        HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id: session.id,
+            scope: crate::protocol::HistoryScope::Turn {
+                turn_id: crate::protocol::TurnId::new(),
+            },
+            sequence_no: 1,
+            created_at_ms: 1,
+            payload: HistoryItemPayload::RequestDiagnostics {
+                diagnostics: RequestDiagnosticsPart {
+                    provider: "openai_compat".to_string(),
+                    model_name: session.model.clone(),
+                    base_url: session.base_url.clone(),
+                    request_timeout_ms: 30_000,
+                    stream_idle_timeout_ms: 30_000,
+                    configured_max_output_tokens: Some(8_192),
+                    effective_max_output_tokens: Some(8_192),
+                    output_budget_reason: None,
+                    supports_tools: Some(true),
+                    supports_reasoning: Some(false),
+                    supports_images: Some(false),
+                    system_prompt_chars: 0,
+                    tool_count: 0,
+                    tool_choice: Some("auto".to_string()),
+                    parallel_tool_calls: Some(false),
+                    provider_message_count: 0,
+                    image_count: 0,
+                    image_bytes: 0,
+                    tool_names: Vec::new(),
+                    tool_schemas: Vec::new(),
+                    context_window,
+                    messages: Vec::new(),
+                },
+            },
         }
     }
 
@@ -1863,11 +1725,15 @@ mod tests {
     }
 
     #[test]
-    fn load_open_session_restores_latest_context_window_from_transcript() {
+    fn load_open_session_restores_latest_context_window_from_canonical_history() {
         let session_id = SessionId::new();
         let session = session_record(session_id);
         let status = context_window_status(2_100);
-        let transcript = transcript_with_context_window(&session, status.clone());
+        let read = canonical_read(
+            &session,
+            vec![diagnostics_history_item(&session, Some(status.clone()))],
+            Vec::new(),
+        );
         let mut state = DesktopState::new(
             snapshot(
                 vec![session_row(session_id, "opened", SessionStatus::Completed)],
@@ -1876,19 +1742,26 @@ mod tests {
             ResolvedConfig::default(),
         );
 
-        state.load_open_session(
-            &session,
-            &transcript,
-            &[],
-            SessionStateSnapshot::default(),
-            Vec::new(),
-            0,
-            0,
-            0,
-            false,
-        );
+        state.load_open_session(&read);
 
         assert_eq!(state.app_state.latest_context_window, Some(status));
+    }
+
+    #[test]
+    fn canonical_history_context_window_uses_last_measured_diagnostics() {
+        let session = session_record(SessionId::new());
+        let earlier = context_window_status(1_200);
+        let latest_measured = context_window_status(2_400);
+        let items = vec![
+            diagnostics_history_item(&session, Some(earlier)),
+            diagnostics_history_item(&session, Some(latest_measured.clone())),
+            diagnostics_history_item(&session, None),
+        ];
+
+        assert_eq!(
+            latest_context_window_from_history_items(&items),
+            Some(latest_measured)
+        );
     }
 
     #[test]
@@ -1912,7 +1785,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_provider_catalog_does_not_complete_startup_readiness() {
+    fn startup_uses_config_only_and_catalog_remains_an_explicit_operation() {
         let mut config = ResolvedConfig::default();
         config.model.base_url = "http://127.0.0.1:1234".to_string();
         config.model.model = "qwen/qwen3.6-35b-a3b".to_string();
@@ -1920,32 +1793,35 @@ mod tests {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
 
         state.begin_startup(true, None, camino::Utf8Path::new("C:/workspace"));
-        state.fail_startup_provider_model_load("provider failed");
-
-        assert_eq!(state.view.overlay, DesktopOverlay::ProviderEditor);
-        assert!(state.view.startup_overlay_forced);
-
-        state.begin_provider_model_load(config.model.base_url.clone());
-        assert_eq!(
-            state.startup.status,
-            super::super::startup::DesktopStartupStatus::RequiresProvider
-        );
-        state.finish_provider_model_load(initial_provider_model_infos(&config));
-        assert!(state.can_apply_provider_selection());
-        assert_eq!(
-            state.startup.status,
-            super::super::startup::DesktopStartupStatus::RequiresProvider
-        );
-        assert_eq!(state.view.overlay, DesktopOverlay::ProviderEditor);
-
-        state.finish_startup_provider_model_load(&passing_model_report(&config));
-
         assert_eq!(
             state.startup.status,
             super::super::startup::DesktopStartupStatus::Ready
         );
-        assert_eq!(state.view.overlay, DesktopOverlay::None);
-        assert!(!state.view.startup_overlay_forced);
+        assert!(!state.async_polling_required());
+        assert!(
+            !state
+                .pending_async_operation_keys()
+                .iter()
+                .any(|key| key == "startup_readiness_check")
+        );
+
+        state.begin_provider_model_load(config.model.base_url.clone());
+        assert!(state.provider_model_load_pending());
+        assert!(state.async_polling_required());
+        state.finish_provider_model_load(initial_provider_model_infos(&config));
+        assert!(state.can_apply_provider_selection());
+        assert_eq!(
+            state
+                .selected_provider_model_info()
+                .expect("config-derived provider model")
+                .load_state,
+            ProviderModelLoadState::Unknown
+        );
+        assert_eq!(
+            state.startup.status,
+            super::super::startup::DesktopStartupStatus::Ready
+        );
+        assert!(!state.async_polling_required());
     }
 
     #[test]
@@ -1981,50 +1857,132 @@ mod tests {
     }
 
     #[test]
-    fn startup_config_retarget_is_pending_without_catalog_and_ready_is_terminal() {
+    fn typed_terminal_outcome_matches_between_live_event_and_rehydrate() {
+        for cause in [
+            crate::protocol::TurnInterruptionCause::ApprovalAborted,
+            crate::protocol::TurnInterruptionCause::UserStop,
+        ] {
+            let session_id = SessionId::new();
+            let mut session = session_record(session_id);
+            session.status = SessionStatus::Cancelled;
+
+            let mut live = DesktopState::new(
+                snapshot(
+                    vec![session_row(
+                        session_id,
+                        &session.title,
+                        SessionStatus::Running,
+                    )],
+                    0,
+                ),
+                ResolvedConfig::default(),
+            );
+            live.app_state.current_session_id = Some(session_id);
+            live.apply_run_event(&terminal_event(
+                session_id,
+                crate::protocol::TurnTerminalOutcome::Interrupted { cause },
+            ));
+
+            let terminal = crate::protocol::TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id: crate::protocol::TurnId::new(),
+                source_item_id: None,
+                sequence_no: 1,
+                payload: crate::protocol::TurnItemPayload::Terminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Interrupted { cause },
+                },
+            };
+            let read = canonical_read(&session, Vec::new(), vec![terminal]);
+            let mut rehydrated = DesktopState::new(
+                snapshot(
+                    vec![session_row(
+                        session_id,
+                        &session.title,
+                        SessionStatus::Cancelled,
+                    )],
+                    0,
+                ),
+                ResolvedConfig::default(),
+            );
+            rehydrated.load_open_session(&read);
+
+            assert_eq!(rehydrated.status_code, live.status_code);
+            assert_eq!(
+                rehydrated.app_state.status_message,
+                live.app_state.status_message
+            );
+        }
+    }
+
+    #[test]
+    fn provider_catalog_failure_uses_operation_type_not_error_keywords() {
+        let messages = [
+            "storage connection refused while loading model 404: access denied",
+            "plain provider diagnostic",
+        ];
+        for message in messages {
+            let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+            state.begin_provider_model_load("http://127.0.0.1:1234".to_string());
+            state.fail_provider_model_load(message);
+
+            assert_eq!(
+                state.provider_config.provider_status.title,
+                "Providerモデル一覧を読み込めません"
+            );
+            assert_eq!(state.provider_config.provider_status.details, message);
+            assert!(
+                !state
+                    .provider_config
+                    .provider_status
+                    .title
+                    .contains("モデルが見つかりません")
+            );
+            assert!(
+                !state
+                    .provider_config
+                    .provider_status
+                    .title
+                    .contains("許可されません")
+            );
+        }
+    }
+
+    #[test]
+    fn startup_config_refresh_is_local_and_never_creates_async_work() {
         let mut config = ResolvedConfig::default();
-        config.model.base_url = "http://127.0.0.1:1234".to_string();
+        config.model.base_url = String::new();
         config.model.model = "model-a".to_string();
         config.docling.enabled = false;
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
         state.begin_startup(true, None, camino::Utf8Path::new("C:/workspace"));
-        state.fail_startup_provider_model_load("provider failed");
+        assert_eq!(
+            state.startup.status,
+            super::super::startup::DesktopStartupStatus::RequiresProvider
+        );
+        assert!(!state.async_polling_required());
 
+        config.model.base_url = "http://127.0.0.1:1234".to_string();
         config.model.model = "model-b".to_string();
         state.reset_effective_config(config.clone());
-        assert!(state.retarget_startup_readiness_for_config_change());
-        assert!(state.startup_provider_readiness_pending());
+        state.refresh_startup_config_status();
         assert!(!state.provider_model_load_pending());
         assert_eq!(
             state.startup.status,
-            super::super::startup::DesktopStartupStatus::Loading
-        );
-
-        state.finish_startup_provider_model_load(&passing_model_report(&config));
-        assert_eq!(
-            state.startup.status,
             super::super::startup::DesktopStartupStatus::Ready
         );
-        let mut later_edit = config;
-        later_edit.model.model = "model-c".to_string();
-        state.reset_effective_config(later_edit);
-        assert!(!state.retarget_startup_readiness_for_config_change());
-        assert_eq!(
-            state.startup.status,
-            super::super::startup::DesktopStartupStatus::Ready
-        );
+        assert!(!state.async_polling_required());
     }
 
     #[test]
     fn configured_provider_startup_overlay_can_be_closed() {
         let mut config = ResolvedConfig::default();
-        config.model.base_url = "http://127.0.0.1:1234".to_string();
+        config.model.base_url = String::new();
         config.model.model = "qwen/qwen3.6-35b-a3b".to_string();
         config.docling.enabled = false;
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), config);
 
         state.begin_startup(true, None, camino::Utf8Path::new("C:/workspace"));
-        state.fail_startup_provider_model_load("provider failed");
 
         assert_eq!(state.view.overlay, DesktopOverlay::ProviderEditor);
         assert!(!state.startup.requires_initial_setup());
@@ -2044,7 +2002,6 @@ mod tests {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
 
         state.begin_startup(false, None, camino::Utf8Path::new("C:/workspace"));
-        state.finish_startup_provider_model_load(&passing_model_report(&config));
 
         assert_eq!(
             state.startup.status,
@@ -2145,7 +2102,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_request_terminalizes_busy_projection_and_row_label() {
+    fn stop_request_stays_non_terminal_until_turn_terminal_arrives() {
         let session_id = SessionId::new();
         let mut state = DesktopState::new(
             snapshot(
@@ -2157,14 +2114,20 @@ mod tests {
         state.app_state.current_session_id = Some(session_id);
         state.app_state.run_status = RunStatus::Running;
 
-        state.mark_run_cancellation_requested("run cancelled by user", "停止しました。");
+        state.mark_run_stop_requested("run cancellation requested", "停止を要求しました。");
 
-        assert!(!state.is_busy());
-        assert_eq!(state.app_state.run_status, RunStatus::Cancelled);
+        assert!(state.is_busy());
+        assert_eq!(state.app_state.run_status, RunStatus::Running);
+        assert_eq!(state.app_state.interruption_cause, None);
+        assert_eq!(state.status_code, DesktopStatusCode::Plain);
+        assert_eq!(
+            state.app_state.progress.current_phase,
+            RunProgressPhase::StopRequested
+        );
         let short_id = session_id.to_string().chars().take(8).collect::<String>();
         assert_eq!(
             state.snapshot.session_rows[0].label,
-            format!("Long task [停止済み] {short_id}")
+            format!("Long task [実行中] {short_id}")
         );
     }
 
@@ -2186,10 +2149,10 @@ mod tests {
         state.app_state.current_session_title = "docx/xlsx要約".to_string();
         state.app_state.run_status = RunStatus::Running;
 
-        state.apply_run_event(&crate::session::RunEvent::SessionCompleted {
+        state.apply_run_event(&terminal_event(
             session_id,
-            finish_reason: None,
-        });
+            crate::protocol::TurnTerminalOutcome::Completed,
+        ));
 
         assert_eq!(state.app_state.run_status, RunStatus::Completed);
         let short_id = session_id.to_string().chars().take(8).collect::<String>();
@@ -2269,6 +2232,13 @@ mod tests {
 
         assert!(!state.finish_project_delete_mutation(project_delete_id));
         assert!(!state.background_mutation_pending());
+
+        let steer_id = state.begin_steer_submission();
+        assert!(state.steer_submission_pending());
+        assert!(state.background_mutation_pending());
+        assert!(state.finish_steer_submission(steer_id));
+        assert!(!state.steer_submission_pending());
+        assert!(!state.background_mutation_pending());
     }
 
     #[test]
@@ -2296,7 +2266,9 @@ mod tests {
     fn snapshot_and_turn_page_operations_keep_async_polling_alive() {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
 
+        assert!(!state.snapshot_refresh_pending());
         state.begin_snapshot_refresh();
+        assert!(state.snapshot_refresh_pending());
         assert!(state.async_polling_required());
         assert!(
             state
@@ -2304,6 +2276,7 @@ mod tests {
                 .contains(&"snapshot_refresh".to_string())
         );
         state.finish_snapshot_refresh();
+        assert!(!state.snapshot_refresh_pending());
 
         state.begin_turn_page_load();
         assert!(state.async_polling_required());
@@ -2362,9 +2335,9 @@ mod tests {
     fn stale_prompt_enhance_result_does_not_clear_new_operation() {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
 
-        state.begin_prompt_enhance(1, "first");
+        state.begin_prompt_enhance(1, "first", CancellationToken::new());
         assert!(state.prompt_enhance_pending());
-        state.begin_prompt_enhance(2, "second");
+        state.begin_prompt_enhance(2, "second", CancellationToken::new());
 
         assert!(!state.finish_prompt_enhance(1, "old draft".to_string()));
         assert!(
@@ -2386,6 +2359,22 @@ mod tests {
                 .contains(&"prompt_enhance".to_string())
         );
         assert!(!state.prompt_enhance_pending());
+    }
+
+    #[test]
+    fn same_owner_new_chat_cancels_prompt_enhance_and_advances_owner() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        let cancellation = CancellationToken::new();
+        let generation = state.composer.owner_generation();
+        state.begin_prompt_enhance(3, "stale", cancellation.clone());
+
+        state.start_new_chat();
+
+        assert!(cancellation.is_cancelled());
+        assert!(!state.prompt_enhance_pending());
+        assert!(state.app_state.prompt_review.is_none());
+        assert!(state.composer.owner_generation() > generation);
+        assert!(!state.finish_prompt_enhance(3, "late".to_string()));
     }
 
     #[test]
@@ -2419,7 +2408,7 @@ mod tests {
     #[test]
     fn closing_prompt_review_is_terminal_and_late_result_cannot_reopen_it() {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
-        state.begin_prompt_enhance(7, "draft me");
+        state.begin_prompt_enhance(7, "draft me", CancellationToken::new());
         assert_eq!(state.view.overlay, DesktopOverlay::PromptReview);
 
         state.hide_overlay();
@@ -2439,7 +2428,7 @@ mod tests {
     #[test]
     fn closed_prompt_review_does_not_leak_async_owner_across_navigation() {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
-        state.begin_prompt_enhance(9, "draft before navigation");
+        state.begin_prompt_enhance(9, "draft before navigation", CancellationToken::new());
         state.hide_overlay();
         let session_id = SessionId::new();
         let navigation_id = state.begin_session_load(session_id);
@@ -2453,55 +2442,6 @@ mod tests {
                 .contains(&"prompt_enhance".to_string())
         );
         assert_eq!(state.view.overlay, DesktopOverlay::None);
-    }
-
-    #[test]
-    fn config_values_use_stable_keys_and_reject_invalid_batch_atomically() {
-        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
-        let original_model = state
-            .provider_config
-            .config_editor
-            .fields
-            .iter()
-            .find(|field| field.key.label() == "model.model")
-            .expect("model field")
-            .value
-            .clone();
-
-        let error = state
-            .set_config_values_by_key(vec![
-                ("model.model".to_string(), "changed-model".to_string()),
-                ("unknown.field".to_string(), "invalid".to_string()),
-            ])
-            .expect_err("unknown field must reject the full batch");
-        assert!(error.contains("unknown config field key"));
-        assert_eq!(
-            state
-                .provider_config
-                .config_editor
-                .fields
-                .iter()
-                .find(|field| field.key.label() == "model.model")
-                .expect("model field")
-                .value,
-            original_model
-        );
-
-        state
-            .set_config_values_by_key(vec![(
-                "model.model".to_string(),
-                "changed-model".to_string(),
-            )])
-            .expect("known stable key");
-        let model = state
-            .provider_config
-            .config_editor
-            .fields
-            .iter()
-            .find(|field| field.key.label() == "model.model")
-            .expect("model field");
-        assert_eq!(model.value, "changed-model");
-        assert!(model.dirty);
     }
 
     #[test]

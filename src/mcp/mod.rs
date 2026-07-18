@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -6,6 +8,7 @@ use serde_json::{Value, json};
 
 use crate::config::{McpConfig, McpServerConfig};
 use crate::error::ToolError;
+use crate::tool::ToolEffectClass;
 use crate::tool::truncate::clip_text_with_ellipsis;
 
 pub const MCP_TOOLS_LIST_DESCRIPTOR_SCHEMA_VALIDATION_MARKER: &str =
@@ -15,10 +18,74 @@ const MAX_MCP_RESPONSE_BYTES: usize = 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolDescriptor {
     pub name: String,
+    pub effect: ToolEffectClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<McpToolAnnotations>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolAnnotations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+}
+
+/// Returns the configured effect for a concrete MCP call. Listing tools is a
+/// read operation. A call is read-capable only when its exact server/tool route
+/// says so; missing or malformed routing information fails closed.
+pub fn effect_for_raw_call(config: &McpConfig, raw_arguments: &Value) -> ToolEffectClass {
+    let Some(server_id) = raw_arguments.get("server_id").and_then(Value::as_str) else {
+        return ToolEffectClass::Destructive;
+    };
+    let tool_name = raw_arguments
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let Some(tool_name) = tool_name else {
+        return ToolEffectClass::Read;
+    };
+    config
+        .servers
+        .iter()
+        .find(|server| server.id == server_id && server.enabled)
+        .map(|server| configured_tool_effect(server, tool_name))
+        .unwrap_or(ToolEffectClass::Destructive)
+}
+
+fn configured_tool_effect(server: &McpServerConfig, tool_name: &str) -> ToolEffectClass {
+    let mut matches = server
+        .tool_routes
+        .iter()
+        .filter(|route| route.name == tool_name);
+    let Some(route) = matches.next() else {
+        return ToolEffectClass::Destructive;
+    };
+    if matches.next().is_some() {
+        return ToolEffectClass::Destructive;
+    }
+    route.effect
+}
+
+pub fn can_route_effect(config: &McpConfig, effect: ToolEffectClass) -> bool {
+    config
+        .servers
+        .iter()
+        .filter(|server| server.enabled)
+        .any(|server| {
+            effect == ToolEffectClass::Read
+                || server
+                    .tool_routes
+                    .iter()
+                    .any(|route| configured_tool_effect(server, &route.name) == effect)
+                || (effect == ToolEffectClass::Destructive && server.tool_routes.is_empty())
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +108,7 @@ pub enum McpOperationResult {
 pub struct McpClient {
     config: McpConfig,
     http: reqwest::Client,
+    resolved_endpoints: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl McpClient {
@@ -48,6 +116,7 @@ impl McpClient {
         Self {
             config,
             http: reqwest::Client::new(),
+            resolved_endpoints: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -58,32 +127,31 @@ impl McpClient {
     pub async fn list_tools(
         &self,
         server_id: &str,
-        route: &str,
+        mut effect_checkpoint: impl FnMut() -> Result<(), ToolError>,
     ) -> Result<McpOperationResult, ToolError> {
         if !self.config.enabled {
             return Err(ToolError::Message("mcp is disabled by config".to_string()));
         }
         let server = self.server(server_id)?;
-        self.ensure_route_allowed(server, route)?;
 
         let (endpoint, response) = self
-            .post_json_with_fallback(
-                server,
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "tools/list",
-                    "params": {}
-                }),
-            )
+            .resolve_endpoint_with_tools_list(server, &mut effect_checkpoint)
             .await?;
-        let tools = parse_tools(&response)?;
-        let filtered = if server.tool_allowlist.is_empty() {
+        let mut tools = parse_tools(&response)?;
+        for tool in &mut tools {
+            tool.effect = configured_tool_effect(server, &tool.name);
+        }
+        let filtered = if server.tool_routes.is_empty() {
             tools
         } else {
             tools
                 .into_iter()
-                .filter(|tool| server.tool_allowlist.iter().any(|name| name == &tool.name))
+                .filter(|tool| {
+                    server
+                        .tool_routes
+                        .iter()
+                        .any(|route| route.name == tool.name)
+                })
                 .collect()
         };
         Ok(McpOperationResult::ToolsListed {
@@ -96,17 +164,19 @@ impl McpClient {
     pub async fn call_tool(
         &self,
         server_id: &str,
-        route: &str,
         tool_name: &str,
         arguments: Value,
+        mut effect_checkpoint: impl FnMut() -> Result<(), ToolError>,
     ) -> Result<McpOperationResult, ToolError> {
         if !self.config.enabled {
             return Err(ToolError::Message("mcp is disabled by config".to_string()));
         }
         let server = self.server(server_id)?;
-        self.ensure_route_allowed(server, route)?;
-        if !server.tool_allowlist.is_empty()
-            && !server.tool_allowlist.iter().any(|name| name == tool_name)
+        if !server.tool_routes.is_empty()
+            && !server
+                .tool_routes
+                .iter()
+                .any(|route| route.name == tool_name)
         {
             return Err(ToolError::Message(format!(
                 "mcp server `{}` does not allow tool `{tool_name}` in current config",
@@ -114,9 +184,35 @@ impl McpClient {
             )));
         }
 
-        let (endpoint, response) = self
-            .post_json_with_fallback(
+        let endpoint = if let Some(endpoint) = self
+            .resolved_endpoints
+            .lock()
+            .await
+            .get(&server.id)
+            .cloned()
+        {
+            endpoint
+        } else {
+            let (endpoint, response) = self
+                .resolve_endpoint_with_tools_list(server, &mut effect_checkpoint)
+                .await?;
+            let tools = parse_tools(&response)?;
+            if !tools.iter().any(|tool| tool.name == tool_name) {
+                return Err(ToolError::Message(format!(
+                    "mcp server `{}` did not advertise tool `{tool_name}` during endpoint resolution",
+                    server.id
+                )));
+            }
+            endpoint
+        };
+        // The effectful request has exactly one transport boundary. Endpoint
+        // discovery is completed by a read-only tools/list call before this
+        // point, so an ambiguous HTTP failure can never replay tools/call at a
+        // fallback URL.
+        let response = self
+            .post_json(
                 server,
+                &endpoint,
                 json!({
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -126,6 +222,7 @@ impl McpClient {
                         "arguments": arguments,
                     }
                 }),
+                &mut effect_checkpoint,
             )
             .await?;
         if let Some(error) = response.get("error") {
@@ -162,26 +259,12 @@ impl McpClient {
         Ok(server)
     }
 
-    fn ensure_route_allowed(&self, server: &McpServerConfig, route: &str) -> Result<(), ToolError> {
-        if server.route_allowlist.is_empty()
-            || server
-                .route_allowlist
-                .iter()
-                .any(|allowed| allowed.eq_ignore_ascii_case(route))
-        {
-            return Ok(());
-        }
-        Err(ToolError::Message(format!(
-            "mcp server `{}` is not enabled for route `{route}`",
-            server.id
-        )))
-    }
-
     async fn post_json(
         &self,
         server: &McpServerConfig,
         endpoint: &str,
         payload: Value,
+        effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
     ) -> Result<Value, ToolError> {
         let mut request = self
             .http
@@ -193,8 +276,12 @@ impl McpClient {
             request = request.header(name, value);
         }
 
+        let request = request.body(payload.to_string());
+        // Re-check the typed run owner at every actual send boundary. Endpoint
+        // discovery may issue multiple read-only tools/list requests, while a
+        // tools/call request reaches this boundary exactly once.
+        effect_checkpoint()?;
         let response = request
-            .body(payload.to_string())
             .send()
             .await
             .map_err(|error| ToolError::Message(format!("mcp request failed: {error}")))?;
@@ -233,10 +320,10 @@ impl McpClient {
         parse_json_or_sse(&body)
     }
 
-    async fn post_json_with_fallback(
+    async fn resolve_endpoint_with_tools_list(
         &self,
         server: &McpServerConfig,
-        payload: Value,
+        effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
     ) -> Result<(String, Value), ToolError> {
         let endpoints = endpoint_candidates(&server.base_url);
         if endpoints.is_empty() {
@@ -246,8 +333,28 @@ impl McpClient {
         }
         let mut last_error = None;
         for endpoint in endpoints {
-            match self.post_json(server, &endpoint, payload.clone()).await {
-                Ok(response) => return Ok((endpoint, response)),
+            match self
+                .post_json(
+                    server,
+                    &endpoint,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "tools/list",
+                        "params": {}
+                    }),
+                    effect_checkpoint,
+                )
+                .await
+            {
+                Ok(response) => {
+                    parse_tools(&response)?;
+                    self.resolved_endpoints
+                        .lock()
+                        .await
+                        .insert(server.id.clone(), endpoint.clone());
+                    return Ok((endpoint, response));
+                }
                 Err(error) => last_error = Some(error),
             }
         }
@@ -359,8 +466,17 @@ fn parse_tool_descriptor(index: usize, tool: &Value) -> Result<McpToolDescriptor
     };
     Ok(McpToolDescriptor {
         name: name.to_string(),
+        effect: ToolEffectClass::Destructive,
         description: description.map(str::to_string),
         input_schema: tool.get("inputSchema").cloned(),
+        annotations: match tool.get("annotations") {
+            Some(value) => Some(serde_json::from_value(value.clone()).map_err(|error| {
+                ToolError::Message(format!(
+                    "mcp tools/list descriptor `{name}` has invalid `annotations`: {error}"
+                ))
+            })?),
+            None => None,
+        },
     })
 }
 
@@ -476,7 +592,115 @@ pub fn mcp_tools_list_rejects_malformed_tool_descriptors_fixture_passes() -> boo
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::Json;
+    use axum::Router;
+    use axum::http::StatusCode;
+    use axum::routing::{any, post};
+
     use super::*;
+
+    fn routed_config() -> McpConfig {
+        McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                id: "fixture".to_string(),
+                enabled: true,
+                transport: crate::config::McpTransportKind::Http,
+                base_url: "http://mcp.invalid".to_string(),
+                timeout_ms: 2_000,
+                tool_routes: vec![
+                    crate::config::McpToolRouteConfig {
+                        name: "inspect".to_string(),
+                        effect: ToolEffectClass::Read,
+                    },
+                    crate::config::McpToolRouteConfig {
+                        name: "change".to_string(),
+                        effect: ToolEffectClass::Mutation,
+                    },
+                ],
+                headers: BTreeMap::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn configured_routes_are_the_only_read_authority_for_mcp_calls() {
+        let config = routed_config();
+        assert_eq!(
+            effect_for_raw_call(
+                &config,
+                &json!({"server_id": "fixture", "tool_name": "inspect"}),
+            ),
+            ToolEffectClass::Read
+        );
+        assert_eq!(
+            effect_for_raw_call(
+                &config,
+                &json!({"server_id": "fixture", "tool_name": "change"}),
+            ),
+            ToolEffectClass::Mutation
+        );
+        for arguments in [
+            json!({"server_id": "fixture", "tool_name": "unknown"}),
+            json!({"server_id": "missing", "tool_name": "inspect"}),
+            json!({"tool_name": "inspect"}),
+        ] {
+            assert_eq!(
+                effect_for_raw_call(&config, &arguments),
+                ToolEffectClass::Destructive
+            );
+        }
+        assert_eq!(
+            effect_for_raw_call(&config, &json!({"server_id": "fixture"})),
+            ToolEffectClass::Read
+        );
+
+        let mut ambiguous = config;
+        ambiguous.servers[0]
+            .tool_routes
+            .push(crate::config::McpToolRouteConfig {
+                name: "inspect".to_string(),
+                effect: ToolEffectClass::Destructive,
+            });
+        assert_eq!(
+            effect_for_raw_call(
+                &ambiguous,
+                &json!({"server_id": "fixture", "tool_name": "inspect"}),
+            ),
+            ToolEffectClass::Destructive
+        );
+    }
+
+    #[test]
+    fn remote_read_only_hint_does_not_promote_an_unconfigured_route() {
+        let tools = parse_tools(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [{
+                    "name": "remote_claims_read",
+                    "annotations": {
+                        "readOnlyHint": true,
+                        "destructiveHint": false
+                    }
+                }]
+            }
+        }))
+        .expect("descriptor");
+
+        assert_eq!(tools[0].effect, ToolEffectClass::Destructive);
+        assert_eq!(
+            tools[0]
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.read_only_hint),
+            Some(true)
+        );
+    }
 
     #[test]
     fn streamed_response_limit_is_enforced_without_content_length() {
@@ -487,5 +711,140 @@ mod tests {
 
         assert_eq!(body.len(), MAX_MCP_RESPONSE_BYTES);
         assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[tokio::test]
+    async fn fallback_endpoint_rechecks_typed_effect_admission_before_second_send() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let handler_count = Arc::clone(&request_count);
+        let app = Router::new().fallback(any(move || {
+            let handler_count = Arc::clone(&handler_count);
+            async move {
+                handler_count.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NOT_FOUND
+            }
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve MCP fixture");
+        });
+
+        let client = McpClient::new(McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                id: "fixture".to_string(),
+                enabled: true,
+                transport: crate::config::McpTransportKind::Http,
+                base_url: format!("http://{address}"),
+                timeout_ms: 2_000,
+                tool_routes: Vec::new(),
+                headers: BTreeMap::new(),
+            }],
+        });
+        let mut checkpoints = 0;
+        let error = client
+            .list_tools("fixture", || {
+                checkpoints += 1;
+                if checkpoints == 1 {
+                    Ok(())
+                } else {
+                    Err(ToolError::RunInterrupted)
+                }
+            })
+            .await
+            .expect_err("the typed terminal owner must reject the fallback send");
+
+        assert!(matches!(error, ToolError::RunInterrupted));
+        assert_eq!(checkpoints, 2);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tool_call_uses_one_resolved_endpoint_and_never_falls_back_after_send() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let root_tool_calls = Arc::new(AtomicUsize::new(0));
+        let mcp_tool_calls = Arc::new(AtomicUsize::new(0));
+        let root_calls = Arc::clone(&root_tool_calls);
+        let mcp_calls = Arc::clone(&mcp_tool_calls);
+        let app = Router::new()
+            .route(
+                "/",
+                post(move |Json(payload): Json<Value>| {
+                    let root_calls = Arc::clone(&root_calls);
+                    async move {
+                        if payload["method"] == "tools/call" {
+                            root_calls.fetch_add(1, Ordering::SeqCst);
+                        }
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({"error": "not an MCP endpoint"})),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/mcp",
+                post(move |Json(payload): Json<Value>| {
+                    let mcp_calls = Arc::clone(&mcp_calls);
+                    async move {
+                        if payload["method"] == "tools/list" {
+                            (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "jsonrpc": "2.0",
+                                    "id": 1,
+                                    "result": {"tools": [{"name": "change"}]}
+                                })),
+                            )
+                        } else {
+                            mcp_calls.fetch_add(1, Ordering::SeqCst);
+                            (
+                                StatusCode::BAD_GATEWAY,
+                                Json(json!({"error": "ambiguous upstream failure"})),
+                            )
+                        }
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve MCP fixture");
+        });
+
+        let client = McpClient::new(McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                id: "fixture".to_string(),
+                enabled: true,
+                transport: crate::config::McpTransportKind::Http,
+                base_url: format!("http://{address}"),
+                timeout_ms: 2_000,
+                tool_routes: vec![crate::config::McpToolRouteConfig {
+                    name: "change".to_string(),
+                    effect: ToolEffectClass::Mutation,
+                }],
+                headers: BTreeMap::new(),
+            }],
+        });
+        let mut checkpoints = 0;
+        let error = client
+            .call_tool("fixture", "change", json!({"value": 1}), || {
+                checkpoints += 1;
+                Ok(())
+            })
+            .await
+            .expect_err("ambiguous tools/call failure must be returned without replay");
+
+        assert!(error.to_string().contains("HTTP 502"));
+        assert_eq!(checkpoints, 3, "two read probes plus one tools/call");
+        assert_eq!(mcp_tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(root_tool_calls.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 }

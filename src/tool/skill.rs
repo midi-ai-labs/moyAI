@@ -20,6 +20,7 @@ impl Tool for SkillTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: ToolName::Skill,
+            effect: crate::tool::ToolEffectPolicy::read(),
             description: "Load a local SKILL.md by name when the current task matches an available workspace skill.",
             input_schema: json!({
                 "type": "object",
@@ -76,44 +77,44 @@ impl Tool for SkillTool {
                     .replace('\\', "/")
             })
             .collect::<Vec<_>>();
-        let output_text = [
-            format!("<skill_content name=\"{}\">", loaded.manifest.name),
-            format!("# Skill: {}", loaded.manifest.name),
-            String::new(),
-            loaded.content.trim().to_string(),
-            String::new(),
+        let chunks = [
             format!(
-                "Base directory for this skill: {}",
-                loaded.manifest.base_dir
+                "<skill_content name=\"{}\" base_dir=\"{}\">",
+                loaded.manifest.name, loaded.manifest.base_dir
             ),
-            "Relative paths in this skill are resolved from the base directory above.".to_string(),
-            "Sampled related files:".to_string(),
-            if sampled_files.is_empty() {
-                "(none)".to_string()
-            } else {
-                sampled_files
-                    .iter()
-                    .map(|file| format!("- {file}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            },
+            loaded.content.trim().to_string(),
+            format!(
+                "<sampled_files>{}</sampled_files>",
+                if sampled_files.is_empty() {
+                    "none".to_string()
+                } else {
+                    sampled_files.join(", ")
+                }
+            ),
             "</skill_content>".to_string(),
-        ]
-        .join("\n");
+        ];
+        let preview = ctx.services.truncator.preview_chunks(
+            chunks,
+            "\n",
+            &ctx.config.tool_output,
+            &ctx.services.storage_paths,
+        )?;
 
         Ok(ToolResult {
             title: format!("Loaded skill {}", loaded.manifest.name),
-            output_text,
+            output_text: preview.preview_text,
             metadata: json!({
                 "name": loaded.manifest.name,
                 "description": loaded.manifest.description,
                 "path": loaded.manifest.path,
                 "base_dir": loaded.manifest.base_dir,
                 "sampled_files": sampled_files,
+                "truncated": preview.truncated,
             }),
-            truncated_output_path: None,
+            truncated_output_path: preview.truncated_output_path,
             recorded_changes: Vec::new(),
             change_summaries: Vec::new(),
+            _internal_file_lease: preview.internal_file_lease,
         })
     }
 }

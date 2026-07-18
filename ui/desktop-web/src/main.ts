@@ -1,11 +1,12 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { command } from "./api";
 import { agentActivityRowsChanged } from "./agent_activity";
-import { commandConflictState } from "./command_error";
+import { commandConflictState, commandInternalState } from "./command_error";
 import type { ActionContext } from "./actions";
 import {
   installGlobalKeyboardShortcuts,
   prepareConfigMutation,
+  prepareConfigSnapshot,
   wireEvents,
 } from "./events";
 import {
@@ -22,27 +23,30 @@ import {
   renderTopbar,
   setRenderContext,
 } from "./render";
-import type { DesktopWebState } from "./types";
+import type { DesktopViewState, DesktopWebState } from "./types";
 import { createUiLocalState, reconcileAgentPaneState } from "./ui_state";
 import {
   InteractionLifecycle,
   type InteractionRelease,
-  shouldBeginKeyboardInteraction,
-  shouldBeginPointerInteraction,
+  installInteractionEventGate,
 } from "./interaction_lifecycle";
 import {
   appliedProjectionRevision,
   deferredProjectionCandidatePreferred,
   projectionUpdateAccepted,
 } from "./projection_state";
-import { modalIsOpen } from "./modal_state";
+import { modalIdentity, modalIsOpen } from "./modal_state";
 import { autoRefreshAllowed, runtimePollingRequired } from "./polling_state";
 import {
   beginPermissionDecision,
   failPermissionDecision,
   finishLocalDecision,
   finishPermissionDecision,
+  permissionDecisionShouldFocusComposer,
   permissionDecisionResponseAccepted,
+  reconcilePermissionDecision,
+  recoverPermissionDecisionFromConflict,
+  type PermissionReviewDecision,
 } from "./decision_state";
 import { escapeHtml, humanizeError } from "./utils";
 import {
@@ -53,10 +57,6 @@ import { rowMutationTargetStillMatches } from "./row_target";
 import {
   acknowledgeDraftMutation,
   captureDraftMutation,
-  configDraftEditOpen,
-  configDraftCommitOpen,
-  configDraftDiscardOpen,
-  configOwnerMutationOpen,
   type DraftMutationSnapshot,
   mutationAdmissionOpen,
   mutationChangesConfigOwner,
@@ -71,7 +71,7 @@ import "./styles.css";
 const app = document.querySelector<HTMLDivElement>("#app");
 const desktopWindow = getCurrentWindow();
 let currentState: DesktopWebState | null = null;
-let lastRenderedState: DesktopWebState | null = null;
+let lastRenderedState: DesktopViewState | null = null;
 let polling = false;
 let previousSessionKey = "";
 let lastRenderedLocalConfirmationPending = false;
@@ -80,7 +80,6 @@ let splashTimer: number | null = null;
 const splashStartedAt = performance.now();
 const SPLASH_MIN_VISIBLE_MS = 5000;
 const THREAD_END_THRESHOLD_PX = 96;
-const INTERACTION_INACTIVITY_RECOVERY_MS = 5 * 60_000;
 const uiState = createUiLocalState();
 
 interface StateUpdate {
@@ -103,7 +102,6 @@ const interactionLifecycle = new InteractionLifecycle<StateUpdate>((current, can
 let nextStateSequence = 1;
 let lastAppliedStateSequence = 0;
 let lastAppliedProjectionRevision = "0";
-let interactionWatchdog: number | null = null;
 const modalScrollReturnStack: ScrollSnapshot[][] = [];
 const modalDetailsReturnStack: DetailSnapshot[][] = [];
 const modalFocusReturnStack: Array<FocusSnapshot | null> = [];
@@ -125,13 +123,18 @@ const eventContext: ActionContext = {
   recoverCommandConflict,
   reportError,
   prepareConfigMutation: (target) => prepareConfigMutation(eventContext, target),
+  prepareConfigSnapshot: (target) => prepareConfigSnapshot(eventContext, target),
   submitPermissionDecision,
   setWindowMaximized,
 };
 
-installPointerRenderGate();
-installKeyboardStateGate();
-installCompositionStateGate();
+installInteractionEventGate({
+  documentTarget: document,
+  windowTarget: window,
+  appRoot,
+  lifecycle: interactionLifecycle,
+  finish: finishInteraction,
+});
 installWindowMaximizedSync();
 void refresh();
 window.setInterval(() => {
@@ -154,7 +157,7 @@ async function refresh(): Promise<void> {
   try {
     render(await command<DesktopWebState>("desktop_state"));
   } catch (error) {
-    reportError(String(error));
+    reportError(error);
   } finally {
     polling = false;
   }
@@ -181,7 +184,7 @@ async function mutate(name: string, args?: Record<string, unknown>): Promise<voi
     if (currentState && currentState !== state) acceptState(currentState, true);
   } catch (error) {
     rejectDraftMutation(uiState, name, draftSnapshot);
-    if (!recoverCommandConflict(error)) reportError(String(error));
+    if (!recoverCommandConflict(error)) reportError(error);
   } finally {
     if (startsRun) {
       uiState.runStartMutationPending = false;
@@ -237,6 +240,7 @@ function requiresRenderForStateChange(previous: DesktopWebState, state: DesktopW
     previous.run_phase !== state.run_phase ||
     previous.run_active_step !== state.run_active_step ||
     previous.latest_tool_summary !== state.latest_tool_summary ||
+    JSON.stringify(previous.plan) !== JSON.stringify(state.plan) ||
     previous.progress_text !== state.progress_text ||
     previous.tool_status_text !== state.tool_status_text ||
     previous.token_meter_label !== state.token_meter_label ||
@@ -275,10 +279,10 @@ function requiresRenderForStateChange(previous: DesktopWebState, state: DesktopW
     previous.provider_selected_model_summary.join("\u0000") !== state.provider_selected_model_summary.join("\u0000") ||
     previous.provider_model_ids.join("\u0000") !== state.provider_model_ids.join("\u0000") ||
     previous.provider_apply_enabled !== state.provider_apply_enabled ||
+    JSON.stringify(previous.config_draft_capabilities) !== JSON.stringify(state.config_draft_capabilities) ||
     previous.config_target.workspacePath !== state.config_target.workspacePath ||
     previous.config_target.sessionId !== state.config_target.sessionId ||
     previous.config_target.configGeneration !== state.config_target.configGeneration ||
-    previous.config_feedback_text !== state.config_feedback_text ||
     previous.review_status_text !== state.review_status_text ||
     previous.send_enhanced_enabled !== state.send_enhanced_enabled ||
     previous.send_raw_enabled !== state.send_raw_enabled ||
@@ -350,11 +354,11 @@ function applyStateUpdate(update: StateUpdate): void {
   }
 }
 
-function renderCommitted(state: DesktopWebState, mutationName: string | null): void {
+function renderCommitted(state: DesktopViewState, mutationName: string | null): void {
   const elapsedSplashMs = performance.now() - splashStartedAt;
-  if (!splashDismissed && shouldShowSplash(state, elapsedSplashMs)) {
+  if (!splashDismissed && shouldShowSplash(elapsedSplashMs)) {
     appRoot.innerHTML = renderStartupSplash(state, elapsedSplashMs, SPLASH_MIN_VISIBLE_MS);
-    scheduleSplashReveal(state, elapsedSplashMs);
+    scheduleSplashReveal(elapsedSplashMs);
     lastRenderedState = state;
     return;
   }
@@ -416,10 +420,10 @@ function renderCommitted(state: DesktopWebState, mutationName: string | null): v
     attachmentTrayOpen: uiState.attachmentTrayOpen,
     configDirty: configDraftAppliesTo(uiState, state.config_target),
     configMutationPending: configMutationPending(uiState),
-    configOwnerMutationOpen: configOwnerMutationOpen(uiState),
-    configDraftEditOpen: configDraftEditOpen(uiState),
-    configDraftDiscardOpen: configDraftDiscardOpen(uiState),
-    configDraftCommitOpen: configDraftCommitOpen(uiState, state.startup.initial_setup_required),
+    configOwnerMutationOpen: state.config_draft.external_owner_mutation_open,
+    configDraftEditOpen: state.config_draft.edit_enabled,
+    configDraftDiscardOpen: state.config_draft.discard_enabled,
+    configDraftCommitOpen: state.config_draft.commit_enabled,
   });
   const preservedTitlebar = document.querySelector<HTMLElement>(".app-titlebar");
   preservedTitlebar?.remove();
@@ -448,7 +452,7 @@ function renderCommitted(state: DesktopWebState, mutationName: string | null): v
           )
         : ""
     }
-    ${state.confirmation_visible ? renderConfirmation(state) : ""}
+    ${state.confirmation_visible ? renderConfirmation(state, uiState.permissionDecision) : ""}
     ${!state.confirmation_visible && !localConfirmationPending && state.overlay !== "none" ? renderOverlay(state) : ""}
     ${backgroundInert ? "" : renderRecoverableError()}
   `;
@@ -477,12 +481,6 @@ function renderCommitted(state: DesktopWebState, mutationName: string | null): v
   restoreFocusSnapshot(focusSnapshot);
   wireEvents(state, eventContext);
   focusSelectedAgentAfterRender();
-  if (state.confirmation_visible && uiState.permissionDecisionPending && uiState.permissionDecisionAllow !== null) {
-    setPermissionDecisionPendingUi(uiState.permissionDecisionAllow);
-  } else if (state.confirmation_visible && uiState.permissionDecisionError) {
-    const status = document.querySelector<HTMLElement>(".permission-decision-status");
-    if (status) status.textContent = uiState.permissionDecisionError;
-  }
   if (
     modalClosing &&
     !focusSnapshot &&
@@ -510,12 +508,12 @@ function focusSelectedAgentAfterRender(): void {
   });
 }
 
-function shouldShowSplash(state: DesktopWebState, elapsedMs: number): boolean {
-  return state.startup.status === "loading" || elapsedMs < SPLASH_MIN_VISIBLE_MS;
+function shouldShowSplash(elapsedMs: number): boolean {
+  return elapsedMs < SPLASH_MIN_VISIBLE_MS;
 }
 
-function scheduleSplashReveal(state: DesktopWebState, elapsedMs: number): void {
-  if (state.startup.status === "loading" || elapsedMs >= SPLASH_MIN_VISIBLE_MS || splashTimer !== null) {
+function scheduleSplashReveal(elapsedMs: number): void {
+  if (elapsedMs >= SPLASH_MIN_VISIBLE_MS || splashTimer !== null) {
     return;
   }
   splashTimer = window.setTimeout(() => {
@@ -548,13 +546,10 @@ function reconcileUiLocalState(previous: DesktopWebState | null, state: DesktopW
     uiState.pendingLocalConfirmation = null;
     finishLocalDecision(uiState);
   }
-  if (
-    !state.confirmation_visible
-    || (uiState.permissionDecisionPending
-      && state.confirmation_id !== uiState.permissionDecisionConfirmationId)
-  ) {
-    finishPermissionDecision(uiState);
-  }
+  reconcilePermissionDecision(
+    uiState,
+    state.confirmation_visible ? state.confirmation_id : null,
+  );
 }
 
 function focusPromptIfRequested(state: DesktopWebState): void {
@@ -600,7 +595,7 @@ const STABLE_LIST_SCROLL_SELECTORS = [".project-list", ".chat-list", ".artifact-
 const MODAL_SCROLL_SELECTORS = [".modal", ".settings-content", ".settings-nav", ".select-list"];
 
 function captureFocusSnapshot(previous: DesktopWebState | null, state: DesktopWebState): FocusSnapshot | null {
-  if (!previous || previous.overlay !== state.overlay || previous.confirmation_visible !== state.confirmation_visible) {
+  if (!previous || modalIdentity(previous) !== modalIdentity(state)) {
     return null;
   }
   return captureCurrentFocusSnapshot();
@@ -718,10 +713,6 @@ function selectedArtifactIdentity(state: DesktopWebState): string {
   return state.artifact_rows[state.selected_artifact_index]?.path ?? "none";
 }
 
-function modalIdentity(state: DesktopWebState): string {
-  return state.confirmation_visible ? "permission" : state.overlay;
-}
-
 function isModalOpening(previous: DesktopWebState, state: DesktopWebState): boolean {
   return (
     (!previous.confirmation_visible && state.confirmation_visible) ||
@@ -736,113 +727,8 @@ function isModalClosing(previous: DesktopWebState, state: DesktopWebState): bool
   );
 }
 
-function installPointerRenderGate(): void {
-  document.addEventListener(
-    "pointerdown",
-    (event) => {
-      const target = event.target;
-      if (!(target instanceof Element) || !shouldBeginPointerInteraction(event.button, appRoot.contains(target))) return;
-      const directOwner = target.closest<HTMLElement>(
-        'input, textarea, select, summary, [contenteditable="true"]',
-      );
-      const action = target.closest<HTMLElement>("[data-action]");
-      const owner = directOwner ?? action;
-      if (!interactionLifecycle.beginPointer(event.pointerId)) return;
-      if (owner && !owner.matches(":disabled")) {
-        try {
-          owner.setPointerCapture(event.pointerId);
-        } catch {
-          // Text selection, native scrollbars, and synthetic pointer events may not support capture.
-        }
-      }
-      armInteractionWatchdog();
-    },
-    true,
-  );
-  document.addEventListener(
-    "pointerup",
-    (event) => window.setTimeout(() => finishInteraction(interactionLifecycle.endPointer(event.pointerId)), 0),
-    true,
-  );
-  document.addEventListener("pointermove", () => {
-    if (interactionLifecycle.active) armInteractionWatchdog();
-  }, true);
-  document.addEventListener("pointercancel", (event) => finishInteraction(interactionLifecycle.endPointer(event.pointerId)), true);
-  document.addEventListener(
-    "lostpointercapture",
-    (event) => window.setTimeout(() => finishInteraction(interactionLifecycle.endPointer(event.pointerId)), 0),
-    true,
-  );
-  window.addEventListener("blur", cancelInteractionLifecycle);
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) cancelInteractionLifecycle();
-  });
-}
-
-function installKeyboardStateGate(): void {
-  document.addEventListener(
-    "keydown",
-    (event) => {
-      const target = event.target;
-      if (!(target instanceof Element)) return;
-      const disabledOwner = target.closest<HTMLElement>(":disabled");
-      if (!shouldBeginKeyboardInteraction(
-        event.isComposing,
-        event.code,
-        appRoot.contains(target),
-        disabledOwner !== null,
-      )) return;
-      interactionLifecycle.beginKey(event.code);
-      armInteractionWatchdog();
-    },
-    true,
-  );
-  document.addEventListener(
-    "keyup",
-    (event) => {
-      window.setTimeout(() => finishInteraction(interactionLifecycle.endKey(event.code)), 0);
-    },
-    true,
-  );
-  window.addEventListener("blur", cancelInteractionLifecycle);
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) cancelInteractionLifecycle();
-  });
-}
-
-function installCompositionStateGate(): void {
-  document.addEventListener("compositionstart", () => {
-    interactionLifecycle.beginComposition();
-    armInteractionWatchdog();
-  }, true);
-  document.addEventListener("compositionend", () => {
-    window.setTimeout(() => finishInteraction(interactionLifecycle.endComposition()), 0);
-  }, true);
-  document.addEventListener("compositionupdate", armInteractionWatchdog, true);
-  document.addEventListener("input", (event) => {
-    if ((event as InputEvent).isComposing) armInteractionWatchdog();
-  }, true);
-  window.addEventListener("blur", cancelInteractionLifecycle);
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) cancelInteractionLifecycle();
-  });
-}
-
-function armInteractionWatchdog(): void {
-  if (interactionWatchdog !== null) window.clearTimeout(interactionWatchdog);
-  interactionWatchdog = window.setTimeout(cancelInteractionLifecycle, INTERACTION_INACTIVITY_RECOVERY_MS);
-}
-
-function cancelInteractionLifecycle(): void {
-  finishInteraction(interactionLifecycle.cancel());
-}
-
 function finishInteraction(release: InteractionRelease<StateUpdate> | null): void {
   if (!release) return;
-  if (interactionWatchdog !== null) {
-    window.clearTimeout(interactionWatchdog);
-    interactionWatchdog = null;
-  }
   if (release.deferred && deferredStateUpdateStillAccepted(release.deferred)) {
     applyStateUpdate({ ...release.deferred, render: release.deferred.render || release.renderCurrent });
   } else if (release.renderCurrent && currentState) {
@@ -850,37 +736,67 @@ function finishInteraction(release: InteractionRelease<StateUpdate> | null): voi
   }
 }
 
-async function submitPermissionDecision(allow: boolean): Promise<void> {
-  const confirmationId = currentState?.confirmation_id ?? null;
-  if (confirmationId === null || !beginPermissionDecision(uiState, confirmationId, allow)) return;
-  setPermissionDecisionPendingUi(allow);
+async function submitPermissionDecision(decision: PermissionReviewDecision): Promise<void> {
+  const confirmationId = currentState?.confirmation_visible
+    ? currentState.confirmation_id
+    : null;
+  const submission = beginPermissionDecision(uiState, confirmationId, decision);
+  if (submission === null) return;
+  if (currentState) render(currentState);
   try {
-    const state = await command<DesktopWebState>("answer_permission", { allow, confirmationId });
-    if (!permissionDecisionResponseAccepted(confirmationId, state.confirmation_visible, state.confirmation_id)) {
-      failPermissionDecision(uiState, "決定を反映できませんでした。もう一度お試しください。");
+    const state = await command<DesktopWebState>("answer_permission", {
+      decision,
+      confirmationId: submission.requestId,
+    });
+    let settlementApplied = false;
+    if (
+      !permissionDecisionResponseAccepted(
+        submission.requestId,
+        state.confirmation_visible,
+        state.confirmation_id,
+      )
+    ) {
+      failPermissionDecision(
+        uiState,
+        submission,
+        "決定を反映できませんでした。もう一度お試しください。",
+      );
     } else {
-      finishPermissionDecision(uiState);
+      settlementApplied = finishPermissionDecision(uiState, submission);
+    }
+    if (permissionDecisionShouldFocusComposer(submission, settlementApplied, state.confirmation_visible)) {
+      uiState.focusPromptAfterRender = true;
     }
     acceptState(state, true, "answer_permission", true);
-  } catch {
-    failPermissionDecision(uiState, "決定を反映できませんでした。もう一度お試しください。");
-    if (currentState) render(currentState);
-  }
-}
-
-function setPermissionDecisionPendingUi(allow: boolean): void {
-  const dialog = document.querySelector<HTMLElement>(".confirmation[role='alertdialog']");
-  dialog?.setAttribute("aria-busy", "true");
-  document.querySelectorAll<HTMLButtonElement>("[data-permission-action]").forEach((button) => {
-    button.disabled = true;
-  });
-  const selected = document.querySelector<HTMLButtonElement>(`[data-action="${allow ? "allow" : "deny"}"]`);
-  if (selected) selected.textContent = allow ? "許可しています…" : "拒否しています…";
-  const status = document.querySelector<HTMLElement>(".permission-decision-status");
-  if (status) {
-    status.textContent = allow ? "許可を反映しています。" : "拒否を反映しています。";
-    status.tabIndex = 0;
-    status.focus({ preventScroll: true });
+  } catch (error) {
+    const conflictState = commandConflictState(error);
+    if (conflictState) {
+      const recovered = recoverPermissionDecisionFromConflict(
+        uiState,
+        submission,
+        conflictState.confirmation_visible ? conflictState.confirmation_id : null,
+      );
+      if (recovered && conflictState.confirmation_visible) {
+        const active = document.activeElement;
+        if (active instanceof HTMLElement) active.blur();
+        uiState.lastFocusedOverlay = "none";
+      }
+      acceptState(conflictState, true, "command_conflict");
+      return;
+    }
+    const failureState = commandInternalState(error);
+    if (failureState) {
+      finishPermissionDecision(uiState, submission);
+      acceptState(failureState, true, "answer_permission_failure", true);
+      return;
+    }
+    if (failPermissionDecision(
+      uiState,
+      submission,
+      "決定を反映できませんでした。もう一度お試しください。",
+    )) {
+      if (currentState) render(currentState);
+    }
   }
 }
 
@@ -926,7 +842,7 @@ function localConfirmationStillTargetsRow(
 }
 
 function isTerminalRunStatus(status: DesktopWebState["run_status_key"]): boolean {
-  return status === "completed" || status === "awaiting_user" || status === "cancelled" || status === "failed";
+  return status === "completed" || status === "cancelled" || status === "failed";
 }
 
 function isThreadNearEnd(thread: HTMLElement): boolean {
@@ -967,8 +883,8 @@ function shouldDeferAutoRefresh(): boolean {
   return interactionLifecycle.active;
 }
 
-function reportError(message: string): void {
-  const error = humanizeError(message);
+function reportError(value: unknown): void {
+  const error = humanizeError(value);
   if (currentState) {
     uiState.recoverableError = error;
     acceptState(currentState, true);

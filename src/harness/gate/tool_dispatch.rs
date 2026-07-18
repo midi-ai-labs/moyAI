@@ -5,10 +5,14 @@ pub fn evaluate(events: &[HarnessEvent]) -> GateEvaluation {
     let has_tool_or_model = events.iter().any(|event| {
         matches!(
             event.kind,
-            HarnessEventKind::ModelRequestSent
+            HarnessEventKind::ModelRequestPrepared
+                | HarnessEventKind::ModelRequestSent
                 | HarnessEventKind::ToolDispatchRequested
                 | HarnessEventKind::ToolExecuted
                 | HarnessEventKind::ToolDispatchDenied
+                | HarnessEventKind::ToolDeclined
+                | HarnessEventKind::ToolCancelled
+                | HarnessEventKind::ToolFailed
                 | HarnessEventKind::PermissionRequested
                 | HarnessEventKind::PermissionResolved
         )

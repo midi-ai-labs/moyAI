@@ -1,16 +1,10 @@
 use camino::Utf8PathBuf;
-use tokio_util::sync::CancellationToken;
 
 use crate::cli::OutputMode;
 use crate::config::AccessMode;
 use crate::error::StorageError;
-use crate::protocol::ProtocolEventStore;
-use crate::runtime::{
-    LiveConfigOverrides, SessionRuntimeEventHub, SessionRuntimeEventSubscription,
-};
-use crate::session::{
-    EditorContext, PromptDispatchPart, SessionId, SessionMemoryMode, ThreadGoalStatus,
-};
+use crate::runtime::{SessionRuntimeEventHub, SessionRuntimeEventSubscription};
+use crate::session::{EditorContext, PromptDispatchPart, SessionId, ThreadGoalStatus};
 
 #[derive(Debug, Clone)]
 pub enum ReviewRequest {
@@ -44,29 +38,61 @@ impl App {
         let backfill = self
             .store
             .protocol_event_store()
-            .list_runtime_events_for_session(session_id)?;
-        Ok(subscriber.with_backfill(backfill))
+            .latest_runtime_event_page_for_session(
+                session_id,
+                crate::protocol::MAX_PROTOCOL_PAGE_LIMIT,
+            )?;
+        Ok(subscriber.with_bounded_backfill_page(backfill.items, backfill.offset))
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+pub enum RunConfigInput {
+    Layered {
+        model: String,
+        base_url: String,
+        config_override: Option<crate::config::model::PartialResolvedConfig>,
+    },
+    Resolved(crate::config::ResolvedConfig),
+}
+
+impl std::fmt::Debug for RunConfigInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Layered {
+                model,
+                config_override,
+                ..
+            } => formatter
+                .debug_struct("LayeredRunConfig")
+                .field("model", model)
+                .field("base_url", &"<redacted provider endpoint>")
+                .field("config_override", config_override)
+                .finish(),
+            Self::Resolved(config) => formatter
+                .debug_struct("ResolvedRunConfig")
+                .field("model", &config.model.model)
+                .field("base_url", &"<redacted provider endpoint>")
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct RunRequest {
     pub prompt: String,
     pub session_id: Option<SessionId>,
     pub continue_last: bool,
     pub title: Option<String>,
     pub cwd: Utf8PathBuf,
-    pub model: String,
-    pub base_url: String,
-    pub config_override: Option<crate::config::model::PartialResolvedConfig>,
+    pub config: RunConfigInput,
     pub output_mode: OutputMode,
-    pub show_reasoning: bool,
+    pub show_reasoning_summary: bool,
     pub prompt_dispatch: Option<PromptDispatchPart>,
     pub editor_context: Option<EditorContext>,
     pub review_request: Option<ReviewRequest>,
     pub image_paths: Vec<Utf8PathBuf>,
-    pub cancel: CancellationToken,
-    pub live_config: Option<LiveConfigOverrides>,
+    pub run_control: crate::runtime::RunControl,
     /// Cloneable permission channel inherited by child agent sessions.
     pub agent_confirmation: Option<crate::cli::SharedConfirmationPrompt>,
     /// Internal identity for a child turn. User-owned surface requests always leave this unset.
@@ -100,7 +126,7 @@ pub struct SessionArchiveRequest {
     pub archived: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionSettingsUpdateRequest {
     pub session_id: SessionId,
     pub cwd: Option<Utf8PathBuf>,
@@ -123,19 +149,6 @@ pub struct SessionTitleUpdateRequest {
 #[derive(Debug, Clone)]
 pub struct SessionInterruptRequest {
     pub session_id: SessionId,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct SessionCompactRequest {
-    pub session_id: SessionId,
-    pub keep_recent: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct SessionMemoryRequest {
-    pub session_id: SessionId,
-    pub mode: SessionMemoryMode,
 }
 
 #[derive(Debug, Clone)]
@@ -160,13 +173,61 @@ pub struct SessionGoalClearRequest {
 pub struct SessionIdleAdmissionRequest {
     pub session_id: SessionId,
     pub pending_trigger_turn: bool,
-    pub plan_mode: bool,
+}
+
+impl std::fmt::Debug for SessionSettingsUpdateRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionSettingsUpdateRequest")
+            .field("session_id", &self.session_id)
+            .field("cwd", &self.cwd)
+            .field("model", &self.model)
+            .field(
+                "base_url",
+                &self
+                    .base_url
+                    .as_ref()
+                    .map(|_| "<redacted provider endpoint>"),
+            )
+            .field("access_mode", &self.access_mode)
+            .field("reset_model_parameters", &self.reset_model_parameters)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("top_k", &self.top_k)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RunRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunRequest")
+            .field("prompt_chars", &self.prompt.chars().count())
+            .field("session_id", &self.session_id)
+            .field("continue_last", &self.continue_last)
+            .field("title", &self.title)
+            .field("cwd", &self.cwd)
+            .field("config", &self.config)
+            .field("output_mode", &self.output_mode)
+            .field("show_reasoning_summary", &self.show_reasoning_summary)
+            .field("prompt_dispatch_present", &self.prompt_dispatch.is_some())
+            .field("editor_context_present", &self.editor_context.is_some())
+            .field("review_request", &self.review_request)
+            .field("image_count", &self.image_paths.len())
+            .field("run_control", &self.run_control)
+            .field(
+                "agent_confirmation_present",
+                &self.agent_confirmation.is_some(),
+            )
+            .field("agent_context", &self.agent_context)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct SessionShowRequest {
     pub session_id: SessionId,
-    pub show_reasoning: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -248,8 +309,6 @@ pub enum AppCommand {
     SessionSettingsUpdate(SessionSettingsUpdateRequest),
     SessionTitleUpdate(SessionTitleUpdateRequest),
     SessionInterrupt(SessionInterruptRequest),
-    SessionCompact(SessionCompactRequest),
-    SessionMemory(SessionMemoryRequest),
     SessionGoalGet(SessionGoalGetRequest),
     SessionGoalSet(SessionGoalSetRequest),
     SessionGoalClear(SessionGoalClearRequest),

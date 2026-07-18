@@ -10,7 +10,15 @@ import {
 } from "./render_agent_activity.ts";
 import { agentActivitySummary } from "./agent_activity.ts";
 import { runCanBeCancelled, runSurfaceActive } from "./run_control.ts";
-import type { ConfigFieldProjection, DesktopWebState, FileChangeRow, ProjectRow, SessionRow, TranscriptRow } from "./types.ts";
+import type {
+  ConfigFieldProjection,
+  DesktopViewState,
+  DesktopWebState,
+  FileChangeRow,
+  ProjectRow,
+  SessionRow,
+  TranscriptRow,
+} from "./types.ts";
 import type { ArtifactPaneMode } from "./ui_state.ts";
 import { displayAccessLabel, escapeHtml, fileName, goalSlashCommandHint, shortenPath } from "./utils.ts";
 import { providerCapabilities } from "./view_state.ts";
@@ -95,13 +103,11 @@ export function setRenderContext(context: RenderContext): void {
 export function renderStartupSplash(state: DesktopWebState, elapsedMs: number, minVisibleMs: number): string {
   const remainingMs = Math.max(0, minVisibleMs - elapsedMs);
   const progressLabel =
-    state.startup.status === "loading"
-      ? "確認中"
-      : remainingMs > 0
-        ? "起動中"
-        : state.startup.status === "ready"
-          ? "準備完了"
-          : "確認が必要";
+    remainingMs > 0
+      ? "起動中"
+      : state.startup.status === "ready"
+        ? "準備完了"
+        : "確認が必要";
   return `
     <div class="splash-screen">
       <div class="splash-core">
@@ -337,7 +343,7 @@ export function renderSidebar(state: DesktopWebState): string {
   `;
 }
 
-export function renderTopbar(state: DesktopWebState): string {
+export function renderTopbar(state: DesktopViewState): string {
   const workspaceLabel = state.selected_project_index >= 0 ? shortenPath(state.workspace_path) : "プロジェクトなし";
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
   const exportDisabled = !state.history_export_enabled || !navigationIsIdle(state);
@@ -370,7 +376,7 @@ export function renderTopbar(state: DesktopWebState): string {
           <button data-action="show-provider" title="${escapeHtml(state.provider_label)}">
             <span>${escapeHtml(state.model_label)}</span><small>${escapeHtml(state.provider_label)}</small>
           </button>
-          <button data-action="toggle-access" title="アクセス権限" aria-disabled="${state.access_mode_mutation_enabled ? "false" : "true"}" ${state.access_mode_mutation_enabled ? "" : "disabled"}>${escapeHtml(displayAccessLabel(state.access_label))}</button>
+           <button data-action="toggle-access" title="アクセス権限" aria-disabled="${state.config_draft.access_mode_mutation_enabled ? "false" : "true"}" ${state.config_draft.access_mode_mutation_enabled ? "" : "disabled"}>${escapeHtml(displayAccessLabel(state.access_label))}</button>
           ${
             turnPageVisible
               ? `<span class="turn-page-chip">${turnPageStart}-${turnPageEnd}/${state.turn_page_total}</span>
@@ -436,16 +442,15 @@ function renderEmptyThread(state: DesktopWebState): string {
 }
 
 function renderTranscriptCard(row: TranscriptRow): string {
-  const rowKind = transcriptRowKind(row);
+  const rowKind = row.row_kind;
   if (rowKind.startsWith("work_summary")) {
     return renderWorkSummaryCard(row);
   }
   if (rowKind === "file_changes") {
     return renderFileChangesTranscriptCard(row);
   }
-  const legacyClass = row.kind && row.kind !== rowKind ? ` ${escapeHtml(row.kind)}` : "";
   return `
-    <article class="message ${escapeHtml(rowKind)}${legacyClass}">
+    <article class="message ${escapeHtml(rowKind)}">
       <div class="message-step">${escapeHtml(row.step)}</div>
       <div class="message-body">
         <h2>${escapeHtml(row.title)}</h2>
@@ -494,10 +499,11 @@ function renderTranscriptFileChangeTable(changes: FileChangeRow[]): string {
 }
 
 function renderWorkSummaryCard(row: TranscriptRow): string {
-  const rowKind = transcriptRowKind(row);
+  const rowKind = row.row_kind;
   const running = rowKind === "work_summary_running";
-  const open = running ? "open" : "";
-  const statusText = running ? "実行中" : "作業サマリ";
+  const incomplete = rowKind === "work_summary_incomplete";
+  const open = running || incomplete ? "open" : "";
+  const statusText = running ? "実行中" : incomplete ? "状態未確定" : "作業サマリ";
   const summary = extractMarkdownSections(row.body, ["作業サマリ", "完了"]);
   const history = removeMarkdownSections(row.body, ["作業サマリ", "完了"]);
   const visibleSummary = !running && summary.trim().length > 0 ? summary : "";
@@ -553,17 +559,30 @@ function removeMarkdownSections(body: string, headings: string[]): string {
   return result.join("\n").trim();
 }
 
+export function composerSendTitle(
+  state: Pick<DesktopWebState, "composer_submit_mode" | "navigation_loading" | "agent_tree_active" | "busy">,
+  prompt: string,
+): string {
+  if (state.composer_submit_mode !== "blocked") {
+    if (prompt.trim().length === 0) return "依頼文を入力してください";
+    return state.composer_submit_mode === "steer"
+      ? "実行中のタスクへ追加指示を送信"
+      : "送信";
+  }
+  return state.navigation_loading
+      ? "画面の切り替え完了後に送信できます"
+      : state.agent_tree_active
+        ? "Sub Agentの完了または停止後に送信できます"
+        : state.busy
+          ? "実行中は送信できません"
+          : prompt.trim().length === 0
+            ? "依頼文を入力してください"
+            : "現在は送信できません";
+}
+
 export function renderComposer(state: DesktopWebState): string {
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
-  const sendTitle = state.navigation_loading
-    ? "画面の切り替え完了後に送信できます"
-    : state.agent_tree_active
-      ? "Sub Agentの完了または停止後に送信できます"
-    : state.busy
-      ? "実行中は送信できません"
-      : state.draft_prompt.trim().length === 0
-        ? "依頼文を入力してください"
-        : "送信";
+  const sendTitle = composerSendTitle(state, state.draft_prompt);
   const enhanceTitle = state.navigation_loading
     ? "画面の切り替え完了後にEnhanceできます"
     : state.agent_tree_active
@@ -660,6 +679,33 @@ function attachmentThumbnailSrc(path: string): string {
   }
 }
 
+function planStepStatusLabel(status: "pending" | "in_progress" | "completed"): string {
+  if (status === "completed") return "完了";
+  if (status === "in_progress") return "進行中";
+  return "未着手";
+}
+
+export function renderPlanProjection(state: DesktopWebState): string {
+  const plan = state.plan;
+  if (!plan || (plan.steps.length === 0 && !(plan.explanation ?? "").trim())) return "";
+  return `
+    <section class="output-file-section" aria-label="作業計画">
+      <div class="output-section-heading">
+        <strong>計画</strong>
+        <small>${plan.steps.length}件</small>
+      </div>
+      ${plan.explanation?.trim() ? `<p>${escapeHtml(plan.explanation.trim())}</p>` : ""}
+      <ol class="plan-list">
+        ${plan.steps
+          .map(
+            (step) => `<li data-plan-status="${step.status}"><span>${escapeHtml(planStepStatusLabel(step.status))}</span> ${escapeHtml(step.step)}</li>`,
+          )
+          .join("")}
+      </ol>
+    </section>
+  `;
+}
+
 export function renderArtifactPane(state: DesktopWebState): string {
   if (artifactPaneCollapsed) {
     return `
@@ -699,6 +745,7 @@ export function renderArtifactPane(state: DesktopWebState): string {
         </div>
       </div>
       ${renderSubAgentSummaryTrigger(state)}
+      ${renderPlanProjection(state)}
       <section class="output-file-section" aria-label="ファイル出力">
         <div class="output-section-heading">
           <strong>ファイル</strong>
@@ -746,7 +793,7 @@ export function renderArtifactPane(state: DesktopWebState): string {
   `;
 }
 
-export function renderOverlay(state: DesktopWebState): string {
+export function renderOverlay(state: DesktopViewState): string {
   if (state.overlay === "provider") return renderProviderOverlay(state);
   if (state.overlay === "config") return renderConfigOverlay(state);
   if (state.overlay === "workspace") return renderWorkspaceOverlay(state);
@@ -772,7 +819,7 @@ export function renderOverlay(state: DesktopWebState): string {
   return "";
 }
 
-function renderProviderOverlay(state: DesktopWebState): string {
+function renderProviderOverlay(state: DesktopViewState): string {
   const selectedSummary = state.provider_selected_model_summary.length > 0 ? state.provider_selected_model_summary : ["モデル metadata は未取得です。"];
   const providerStatus = providerStatusView(state);
   const setupRequired = startupSetupRequired(state);
@@ -862,10 +909,6 @@ function providerStatusView(state: DesktopWebState): { kind: string; title: stri
   };
 }
 
-function transcriptRowKind(row: TranscriptRow): TranscriptRow["row_kind"] {
-  return row.row_kind || (row.kind as TranscriptRow["row_kind"]);
-}
-
 function renderConfigOverlay(state: DesktopWebState): string {
   const setupRequired = startupSetupRequired(state);
   const title = setupRequired ? "初期設定" : "Preferences";
@@ -910,7 +953,7 @@ function renderConfigOverlay(state: DesktopWebState): string {
                 ${renderConfigTextField(state, "model.model", "Model")}
               </div>
               ${renderConfigEnumField(state, "model.provider_metadata_mode", "Provider mode", {
-                lm_studio_native_required: "LM Studio native",
+                lm_studio_native_required: "LM Studio metadata API",
                 openai_compatible_only: "OpenAI compatible",
               })}
             </section>
@@ -933,7 +976,6 @@ function renderConfigOverlay(state: DesktopWebState): string {
               <h3>Permissions</h3>
               ${renderConfigEnumField(state, "permissions.access_mode", "Access mode", {
                 default: "標準",
-                auto_review: "自動レビュー",
                 full_access: "フルアクセス",
               })}
             </section>
@@ -1016,7 +1058,6 @@ function renderConfigOverlay(state: DesktopWebState): string {
                     .join("")}
                 </div>
               </details>
-              <pre class="feedback">${escapeHtml(state.config_feedback_text)}</pre>
             </section>
           </div>
         </div>
@@ -1146,7 +1187,7 @@ function renderPromptReviewOverlay(state: DesktopWebState): string {
   `;
 }
 
-function renderCommandPalette(state: DesktopWebState): string {
+function renderCommandPalette(state: DesktopViewState): string {
   const actions = paletteActions(state, configDirty && !configMutationInFlight);
   return `
     <div class="modal-backdrop" data-action="close-overlay">

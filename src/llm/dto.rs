@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct OpenAiChatRequest {
     pub model: String,
     pub stream: bool,
+    pub n: u32,
     pub messages: Vec<OpenAiMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
@@ -83,8 +84,6 @@ pub struct OpenAiFunctionSchema {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,8 +112,6 @@ pub struct OpenAiChoice {
 #[derive(Debug, Default, Deserialize)]
 pub struct OpenAiDelta {
     pub content: Option<String>,
-    #[serde(alias = "reasoning_content")]
-    pub reasoning: Option<String>,
     pub tool_calls: Option<Vec<OpenAiToolCallDelta>>,
 }
 
@@ -137,4 +134,19 @@ pub struct OpenAiUsage {
     pub completion_tokens: u32,
     pub total_tokens: u32,
     pub reasoning_tokens: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_present_value")]
+    pub completion_tokens_details: Option<OpenAiCompletionTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OpenAiCompletionTokensDetails {
+    pub reasoning_tokens: Option<u32>,
+}
+
+fn deserialize_present_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }

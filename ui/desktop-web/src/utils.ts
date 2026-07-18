@@ -1,3 +1,4 @@
+import { commandErrorInfo } from "./command_error.ts";
 import type { ConfigFieldProjection } from "./types.ts";
 
 export function fileName(path: string): string {
@@ -77,7 +78,6 @@ export function shortenPath(path: string): string {
 
 export function displayAccessLabel(label: string): string {
   if (label === "default") return "標準";
-  if (label === "auto_review") return "自動レビュー";
   if (label === "full_access") return "フルアクセス";
   return label;
 }
@@ -100,35 +100,43 @@ export interface HumanError {
   details: string;
 }
 
-export function humanizeError(message: string): HumanError {
-  const text = message.trim();
-  const lower = text.toLowerCase();
-  if (lower.includes("error sending request") || lower.includes("connection refused") || lower.includes("failed to connect")) {
-    return {
-      title: "LLM provider に接続できません",
-      hint: "LM Studio が起動しているか、Base URL が http://127.0.0.1:1234 のように到達可能なURLになっているか確認してください。",
-      details: text,
-    };
+export function humanizeError(error: unknown): HumanError {
+  const info = commandErrorInfo(error);
+  const details = info.message.trim();
+  switch (info.code) {
+    case "provider_transport":
+      return {
+        title: "LLM provider に接続できません",
+        hint: "Provider が起動しているか、Base URL が到達可能か確認してください。",
+        details,
+      };
+    case "model_unavailable":
+      return {
+        title: "指定したモデルが見つかりません",
+        hint: "Provider設定でモデル一覧を読み込み、利用可能なモデルを選択してください。",
+        details,
+      };
+    case "image_unsupported":
+      return {
+        title: "このモデルは画像入力に対応していません",
+        hint: "画像対応モデルを選択するか、画像添付を解除してください。",
+        details,
+      };
+    case "permission_policy_denied":
+      return {
+        title: "操作が許可されませんでした",
+        hint: "アクセスモードと操作対象を確認してください。",
+        details,
+      };
+    case "unknown":
+    case "runtime_failure":
+    case "storage_failure":
+      return {
+        title: "処理に失敗しました",
+        hint: "設定と対象ワークスペースを確認してください。原因の切り分けには技術詳細を参照してください。",
+        details,
+      };
   }
-  if (lower.includes("model") && (lower.includes("not found") || lower.includes("404"))) {
-    return {
-      title: "指定したモデルが見つかりません",
-      hint: "Provider設定でモデル一覧を読み込み、現在ロード済みのモデルを選択してください。",
-      details: text,
-    };
-  }
-  if (lower.includes("permission") || lower.includes("denied") || lower.includes("access")) {
-    return {
-      title: "操作が許可されませんでした",
-      hint: "アクセスモードと対象ファイルの場所を確認してください。必要なら確認ダイアログで許可してください。",
-      details: text,
-    };
-  }
-  return {
-    title: "処理に失敗しました",
-    hint: "設定と対象ワークスペースを確認してください。原因の切り分けには技術詳細を参照してください。",
-    details: text,
-  };
 }
 
 export function escapeHtml(value: string): string {

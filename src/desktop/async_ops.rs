@@ -1,16 +1,12 @@
-use std::collections::HashMap;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DesktopAsyncOperationKind {
     AgentRun,
     SnapshotRefresh,
-    StartupReadinessCheck,
     ProviderModelCatalogLoad,
     WorkspaceLoad,
     SessionLoad,
     TurnPageLoad,
     TerminalRunRefresh,
-    CurrentTodoRefresh,
     HistoryExport,
     ProjectDelete,
     SessionDelete,
@@ -19,6 +15,7 @@ pub enum DesktopAsyncOperationKind {
     SessionMaintenance,
     SessionSearch,
     PromptEnhance,
+    SteerSubmission,
     AccessModePersistence,
 }
 
@@ -27,13 +24,11 @@ impl DesktopAsyncOperationKind {
         match self {
             Self::AgentRun => "agent_run",
             Self::SnapshotRefresh => "snapshot_refresh",
-            Self::StartupReadinessCheck => "startup_readiness_check",
             Self::ProviderModelCatalogLoad => "provider_model_catalog_load",
             Self::WorkspaceLoad => "workspace_load",
             Self::SessionLoad => "session_load",
             Self::TurnPageLoad => "turn_page_load",
             Self::TerminalRunRefresh => "terminal_run_refresh",
-            Self::CurrentTodoRefresh => "current_todo_refresh",
             Self::HistoryExport => "history_export",
             Self::ProjectDelete => "project_delete",
             Self::SessionDelete => "session_delete",
@@ -42,6 +37,7 @@ impl DesktopAsyncOperationKind {
             Self::SessionMaintenance => "session_maintenance",
             Self::SessionSearch => "session_search",
             Self::PromptEnhance => "prompt_enhance",
+            Self::SteerSubmission => "steer_submission",
             Self::AccessModePersistence => "access_mode_persistence",
         }
     }
@@ -120,55 +116,131 @@ impl<T: PartialEq> LatestRequestTracker<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionSearchCompletion {
-    pub operation_id: DesktopAsyncOperationId,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSearchDispatch<T> {
+    pub request_id: SessionSearchRequestId,
+    pub target: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSearchAdmission<T> {
+    pub dispatch: Option<SessionSearchDispatch<T>>,
+    pub superseded_operation_id: Option<DesktopAsyncOperationId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSearchCompletion<T> {
+    pub operation_id: Option<DesktopAsyncOperationId>,
     pub is_latest: bool,
+    pub next_dispatch: Option<SessionSearchDispatch<T>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct SessionSearchRequestTracker {
-    next_id: u64,
-    latest: Option<SessionSearchRequestId>,
-    pending: HashMap<SessionSearchRequestId, DesktopAsyncOperationId>,
+struct TrackedSessionSearch<T> {
+    request_id: SessionSearchRequestId,
+    operation_id: Option<DesktopAsyncOperationId>,
+    target: T,
 }
 
-impl Default for SessionSearchRequestTracker {
-    fn default() -> Self {
-        Self {
-            next_id: 1,
-            latest: None,
-            pending: HashMap::new(),
+impl<T: Clone> TrackedSessionSearch<T> {
+    fn dispatch(&self) -> SessionSearchDispatch<T> {
+        SessionSearchDispatch {
+            request_id: self.request_id,
+            target: self.target.clone(),
         }
     }
 }
 
-impl SessionSearchRequestTracker {
-    pub fn begin(&mut self, operation_id: DesktopAsyncOperationId) -> SessionSearchRequestId {
+#[derive(Debug, Clone)]
+pub struct SessionSearchRequestTracker<T> {
+    next_id: u64,
+    running: Option<TrackedSessionSearch<T>>,
+    queued: Option<TrackedSessionSearch<T>>,
+}
+
+impl<T> Default for SessionSearchRequestTracker<T> {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            running: None,
+            queued: None,
+        }
+    }
+}
+
+impl<T: Clone> SessionSearchRequestTracker<T> {
+    pub fn begin(
+        &mut self,
+        operation_id: DesktopAsyncOperationId,
+        target: T,
+    ) -> SessionSearchAdmission<T> {
         let request_id = SessionSearchRequestId(self.next_id);
         self.next_id = self.next_id.saturating_add(1).max(1);
-        self.latest = Some(request_id);
-        self.pending.insert(request_id, operation_id);
-        request_id
+        let request = TrackedSessionSearch {
+            request_id,
+            operation_id: Some(operation_id),
+            target,
+        };
+        if self.running.is_none() {
+            let dispatch = request.dispatch();
+            self.running = Some(request);
+            return SessionSearchAdmission {
+                dispatch: Some(dispatch),
+                superseded_operation_id: None,
+            };
+        }
+
+        let superseded_operation_id = self
+            .queued
+            .replace(request)
+            .and_then(|queued| queued.operation_id);
+        SessionSearchAdmission {
+            dispatch: None,
+            superseded_operation_id,
+        }
     }
 
     pub fn finish(
         &mut self,
         request_id: SessionSearchRequestId,
-    ) -> Option<SessionSearchCompletion> {
-        let operation_id = self.pending.remove(&request_id)?;
+    ) -> Option<SessionSearchCompletion<T>> {
+        if self.running.as_ref()?.request_id != request_id {
+            return None;
+        }
+        let completed = self.running.take()?;
+        let next = self.queued.take();
+        let next_dispatch = next.as_ref().map(TrackedSessionSearch::dispatch);
+        self.running = next;
         Some(SessionSearchCompletion {
-            operation_id,
-            is_latest: self.latest == Some(request_id),
+            operation_id: completed.operation_id,
+            is_latest: completed.operation_id.is_some() && self.running.is_none(),
+            next_dispatch,
         })
     }
 
     pub fn clear(&mut self) -> Vec<DesktopAsyncOperationId> {
-        self.latest = None;
-        self.pending
-            .drain()
-            .map(|(_, operation_id)| operation_id)
-            .collect()
+        let mut operation_ids = Vec::with_capacity(2);
+        if let Some(running) = self.running.as_mut()
+            && let Some(operation_id) = running.operation_id.take()
+        {
+            operation_ids.push(operation_id);
+        }
+        if let Some(queued) = self.queued.take()
+            && let Some(operation_id) = queued.operation_id
+        {
+            operation_ids.push(operation_id);
+        }
+        operation_ids
+    }
+
+    #[cfg(test)]
+    fn running_request_id(&self) -> Option<SessionSearchRequestId> {
+        self.running.as_ref().map(|request| request.request_id)
+    }
+
+    #[cfg(test)]
+    fn queued_request_id(&self) -> Option<SessionSearchRequestId> {
+        self.queued.as_ref().map(|request| request.request_id)
     }
 }
 
@@ -299,28 +371,123 @@ mod tests {
     }
 
     #[test]
-    fn session_search_tracker_keeps_all_work_counted_and_only_applies_newest() {
+    fn session_search_tracker_bounds_work_to_one_running_and_one_latest_queued() {
         let mut registry = DesktopAsyncOperationRegistry::default();
         let mut tracker = SessionSearchRequestTracker::default();
-        let first = tracker.begin(registry.begin(DesktopAsyncOperationKind::SessionSearch));
-        let latest = tracker.begin(registry.begin(DesktopAsyncOperationKind::SessionSearch));
+        let first = tracker.begin(
+            registry.begin(DesktopAsyncOperationKind::SessionSearch),
+            "a".to_string(),
+        );
+        let first_dispatch = first.dispatch.expect("first request starts immediately");
+        assert_eq!(first.superseded_operation_id, None);
 
-        let latest_completion = tracker.finish(latest).expect("latest request is pending");
+        let second = tracker.begin(
+            registry.begin(DesktopAsyncOperationKind::SessionSearch),
+            "ab".to_string(),
+        );
+        assert_eq!(second.dispatch, None);
+        assert_eq!(second.superseded_operation_id, None);
+        let second_request_id = tracker.queued_request_id().expect("second request queued");
+
+        let latest_operation = registry.begin(DesktopAsyncOperationKind::SessionSearch);
+        let latest = tracker.begin(latest_operation, "abc".to_string());
+        assert_eq!(latest.dispatch, None);
+        assert!(
+            registry.finish(
+                latest
+                    .superseded_operation_id
+                    .expect("second request is superseded")
+            )
+        );
+        assert_eq!(registry.count(DesktopAsyncOperationKind::SessionSearch), 2);
+        assert_ne!(tracker.queued_request_id(), Some(second_request_id));
+
+        assert_eq!(tracker.finish(second_request_id), None);
+        let first_completion = tracker
+            .finish(first_dispatch.request_id)
+            .expect("running request completes");
+        assert!(!first_completion.is_latest);
+        assert!(
+            registry.finish(
+                first_completion
+                    .operation_id
+                    .expect("running operation remains counted")
+            )
+        );
+        let latest_dispatch = first_completion
+            .next_dispatch
+            .expect("latest queued request starts next");
+        assert_eq!(latest_dispatch.target, "abc");
+        assert_eq!(
+            tracker.running_request_id(),
+            Some(latest_dispatch.request_id)
+        );
+
+        let latest_completion = tracker
+            .finish(latest_dispatch.request_id)
+            .expect("latest request completes");
         assert!(latest_completion.is_latest);
-        assert!(registry.finish(latest_completion.operation_id));
-        assert!(registry.is_pending(DesktopAsyncOperationKind::SessionSearch));
-
-        let stale_completion = tracker.finish(first).expect("first request is pending");
-        assert!(!stale_completion.is_latest);
-        assert!(registry.finish(stale_completion.operation_id));
+        assert_eq!(latest_completion.next_dispatch, None);
+        assert!(
+            registry.finish(
+                latest_completion
+                    .operation_id
+                    .expect("latest operation remains counted")
+            )
+        );
         assert!(!registry.is_pending(DesktopAsyncOperationKind::SessionSearch));
+    }
 
-        let abandoned = tracker.begin(registry.begin(DesktopAsyncOperationKind::SessionSearch));
+    #[test]
+    fn clearing_session_search_invalidates_running_without_admitting_a_second_worker() {
+        let mut registry = DesktopAsyncOperationRegistry::default();
+        let mut tracker = SessionSearchRequestTracker::default();
+        let abandoned = tracker.begin(
+            registry.begin(DesktopAsyncOperationKind::SessionSearch),
+            "old".to_string(),
+        );
+        let abandoned_dispatch = abandoned.dispatch.expect("old request starts");
+        let obsolete = tracker.begin(
+            registry.begin(DesktopAsyncOperationKind::SessionSearch),
+            "obsolete".to_string(),
+        );
+        assert_eq!(obsolete.dispatch, None);
+        assert_eq!(registry.count(DesktopAsyncOperationKind::SessionSearch), 2);
+        let mut cleared = 0;
         for operation_id in tracker.clear() {
             assert!(registry.finish(operation_id));
+            cleared += 1;
         }
-        assert_eq!(tracker.finish(abandoned), None);
+        assert_eq!(cleared, 2);
         assert!(!registry.is_pending(DesktopAsyncOperationKind::SessionSearch));
+
+        let replacement = tracker.begin(
+            registry.begin(DesktopAsyncOperationKind::SessionSearch),
+            "new".to_string(),
+        );
+        assert_eq!(replacement.dispatch, None);
+        assert!(tracker.queued_request_id().is_some());
+
+        let abandoned_completion = tracker
+            .finish(abandoned_dispatch.request_id)
+            .expect("invalidated worker still settles its slot");
+        assert_eq!(abandoned_completion.operation_id, None);
+        assert!(!abandoned_completion.is_latest);
+        let replacement_dispatch = abandoned_completion
+            .next_dispatch
+            .expect("replacement starts after old worker settles");
+        assert_eq!(replacement_dispatch.target, "new");
+        let replacement_completion = tracker
+            .finish(replacement_dispatch.request_id)
+            .expect("replacement completes");
+        assert!(replacement_completion.is_latest);
+        assert!(
+            registry.finish(
+                replacement_completion
+                    .operation_id
+                    .expect("replacement operation is counted")
+            )
+        );
     }
 
     #[test]

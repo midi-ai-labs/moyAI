@@ -5,6 +5,8 @@ pub mod safety;
 
 pub(crate) use change_tracker::path_for_change_storage;
 pub use change_tracker::{ChangeSummary, ChangeTracker, FileChange};
-pub use formatter::{Formatter, FormatterExecutionOptions};
+pub use formatter::{Formatter, FormatterExecutionOptions, ResolvedFormatterInvocation};
 pub use patch::{PatchChunk, PatchLine, PatchOperation, PatchParser};
+pub(crate) use safety::CommittedFileMutation;
+pub(crate) use safety::ensure_edit_read_limit;
 pub use safety::{EditSafety, FileContentIdentity, FileReadStamp, read_file_with_identity};

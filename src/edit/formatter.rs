@@ -1,44 +1,69 @@
-use std::process::Stdio;
-
 use camino::{Utf8Path, Utf8PathBuf};
 use globset::{Glob, GlobSetBuilder};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{FormatConfig, FormatterRule, NewlineStyle};
 use crate::error::EditError;
-use crate::tool::truncate::{BoundedPipeOutput, read_pipe_bounded};
+use crate::tool::process::{ManagedProcess, ManagedProcessOutput};
 
 #[derive(Debug, Clone)]
-pub struct Formatter {
-    config: FormatConfig,
-}
+pub struct Formatter;
 
 #[derive(Debug, Clone)]
 pub struct FormatterExecutionOptions {
-    pub workspace_root: Utf8PathBuf,
     pub timeout_ms: u64,
     pub max_output_bytes: usize,
     pub cancel: CancellationToken,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedFormatterInvocation {
+    target: Utf8PathBuf,
+    working_directory: Utf8PathBuf,
+    command: Vec<String>,
+}
+
+impl ResolvedFormatterInvocation {
+    pub fn target(&self) -> &Utf8Path {
+        &self.target
+    }
+
+    pub fn working_directory(&self) -> &Utf8Path {
+        &self.working_directory
+    }
+
+    pub fn command(&self) -> &[String] {
+        &self.command
+    }
+
+    pub fn permission_detail(&self) -> String {
+        let argv = serde_json::to_string(&self.command)
+            .expect("formatter command strings must serialize as JSON");
+        format!(
+            "configured formatter: target={} cwd={} argv={argv}",
+            self.target, self.working_directory
+        )
+    }
+}
+
 impl Formatter {
-    pub fn new(config: FormatConfig) -> Self {
-        Self { config }
+    pub fn new(_config: FormatConfig) -> Self {
+        Self
     }
 
     pub fn normalize_text(
         &self,
+        config: &FormatConfig,
         _path: &Utf8Path,
         original: Option<&str>,
         edited: String,
     ) -> Result<String, EditError> {
         let newline = if let Some(value) = original {
             if value.contains("\r\n") { "\r\n" } else { "\n" }
-        } else if matches!(self.config.default_newline, NewlineStyle::Crlf) {
+        } else if matches!(config.default_newline, NewlineStyle::Crlf) {
             "\r\n"
         } else {
             "\n"
@@ -51,7 +76,7 @@ impl Formatter {
             .collect::<Vec<_>>()
             .join(newline);
 
-        if self.config.ensure_trailing_newline
+        if config.ensure_trailing_newline
             && !normalized.is_empty()
             && !normalized.ends_with(newline)
         {
@@ -61,46 +86,52 @@ impl Formatter {
         Ok(normalized)
     }
 
-    pub async fn format_if_configured(
-        &self,
+    pub fn resolve_invocation(
+        config: &FormatConfig,
         path: &Utf8Path,
+        workspace_root: &Utf8Path,
+    ) -> Result<Option<ResolvedFormatterInvocation>, EditError> {
+        let Some(rule) = matching_rule(config, path)? else {
+            return Ok(None);
+        };
+        if rule.command.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ResolvedFormatterInvocation {
+            target: path.to_path_buf(),
+            working_directory: formatter_working_directory(path, workspace_root).to_path_buf(),
+            command: rule.command.clone(),
+        }))
+    }
+
+    pub async fn format_resolved(
+        &self,
+        invocation: &ResolvedFormatterInvocation,
         text: String,
         options: FormatterExecutionOptions,
     ) -> Result<String, EditError> {
-        let Some(rule) = self.matching_rule(path)? else {
-            return Ok(text);
-        };
-
-        if rule.command.is_empty() {
-            return Ok(text);
+        if options.cancel.is_cancelled() {
+            return Err(EditError::Message(format!(
+                "formatter `{}` cancelled by user",
+                invocation.command.join(" ")
+            )));
         }
 
-        let mut command = Command::new(&rule.command[0]);
-        command.args(&rule.command[1..]);
-        command.stdin(Stdio::piped());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        command.current_dir(formatter_working_directory(path, &options.workspace_root));
-        command.kill_on_drop(true);
-
-        let mut child = command.spawn()?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| EditError::Message("formatter stdout was not captured".to_string()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| EditError::Message("formatter stderr was not captured".to_string()))?;
+        let mut command = Command::new(&invocation.command[0]);
+        command.args(&invocation.command[1..]);
+        command.stdin(std::process::Stdio::piped());
+        command.current_dir(&invocation.working_directory);
         let output_limit = options.max_output_bytes.max(1);
-        let stdout_task = tokio::spawn(read_pipe_bounded(stdout, output_limit));
-        let stderr_task = tokio::spawn(read_pipe_bounded(stderr, output_limit));
+        let mut process = ManagedProcess::spawn(command, false, output_limit).await?;
         let deadline = Instant::now() + Duration::from_millis(options.timeout_ms.max(1));
 
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| EditError::Message("formatter stdin was not captured".to_string()))?;
+        let Some(mut stdin) = process.take_stdin() else {
+            let cleanup = process.terminate().await;
+            return Err(formatter_cleanup_error(
+                "formatter stdin was not captured".to_string(),
+                &cleanup,
+            ));
+        };
         let input_result = tokio::select! {
             _ = options.cancel.cancelled() => Err(FormatterStop::Cancelled),
             result = timeout_at(deadline, stdin.write_all(text.as_bytes())) => match result {
@@ -110,45 +141,53 @@ impl Formatter {
         };
         drop(stdin);
         if let Err(stop) = input_result {
-            terminate_formatter(&mut child).await;
-            let _ = join_formatter_pipe(stdout_task, "stdout").await;
-            let _ = join_formatter_pipe(stderr_task, "stderr").await;
-            return Err(stop.into_edit_error(&rule.command, options.timeout_ms));
+            let cleanup = process.terminate().await;
+            return Err(stop.into_edit_error(&invocation.command, options.timeout_ms, &cleanup));
         }
 
-        let status = tokio::select! {
-            _ = options.cancel.cancelled() => {
-                terminate_formatter(&mut child).await;
-                return Err(EditError::Message(format!(
-                    "formatter `{}` cancelled by user",
-                    rule.command.join(" ")
-                )));
-            }
-            result = timeout_at(deadline, child.wait()) => match result {
-                Ok(result) => result?,
-                Err(_) => {
-                    terminate_formatter(&mut child).await;
-                    return Err(EditError::Message(format!(
-                        "formatter `{}` timed out after {} ms",
-                        rule.command.join(" "),
-                        options.timeout_ms
-                    )));
-                }
+        let wait_result = tokio::select! {
+            _ = options.cancel.cancelled() => Err(FormatterStop::Cancelled),
+            result = timeout_at(deadline, process.wait()) => match result {
+                Ok(result) => result.map_err(EditError::from).map_err(FormatterStop::Error),
+                Err(_) => Err(FormatterStop::TimedOut),
             }
         };
-        let stdout = join_formatter_pipe(stdout_task, "stdout").await?;
-        let stderr = join_formatter_pipe(stderr_task, "stderr").await?;
+        let completed = match wait_result {
+            Ok(status) => process.finish_after_exit(status).await,
+            Err(stop) => {
+                let cleanup = process.terminate().await;
+                return Err(stop.into_edit_error(
+                    &invocation.command,
+                    options.timeout_ms,
+                    &cleanup,
+                ));
+            }
+        };
+        if let Some(error) = completed.cleanup_error() {
+            return Err(EditError::Message(format!(
+                "formatter `{}` cleanup failed: {error}",
+                invocation.command.join(" ")
+            )));
+        }
+        let status = completed.status.ok_or_else(|| {
+            EditError::Message(format!(
+                "formatter `{}` exited without a status",
+                invocation.command.join(" ")
+            ))
+        })?;
+        let stdout = completed.stdout;
+        let stderr = completed.stderr;
         if stdout.truncated || stderr.truncated {
             return Err(EditError::Message(format!(
                 "formatter `{}` output exceeded the {} byte capture limit",
-                rule.command.join(" "),
+                invocation.command.join(" "),
                 output_limit
             )));
         }
         if !status.success() {
             return Err(EditError::Message(format!(
                 "formatter `{}` failed: {}",
-                rule.command.join(" "),
+                invocation.command.join(" "),
                 String::from_utf8_lossy(&stderr.bytes)
             )));
         }
@@ -156,24 +195,26 @@ impl Formatter {
         String::from_utf8(stdout.bytes)
             .map_err(|error| EditError::Message(format!("formatter output is not UTF-8: {error}")))
     }
+}
 
-    fn matching_rule(&self, path: &Utf8Path) -> Result<Option<&FormatterRule>, EditError> {
-        for rule in &self.config.commands {
-            let mut builder = GlobSetBuilder::new();
-            builder.add(
-                Glob::new(&rule.glob).map_err(|error| {
-                    EditError::Message(format!("invalid formatter glob: {error}"))
-                })?,
-            );
-            let glob = builder.build().map_err(|error| {
-                EditError::Message(format!("failed to compile formatter glob: {error}"))
-            })?;
-            if glob.is_match(path.as_str()) {
-                return Ok(Some(rule));
-            }
+fn matching_rule<'a>(
+    config: &'a FormatConfig,
+    path: &Utf8Path,
+) -> Result<Option<&'a FormatterRule>, EditError> {
+    for rule in &config.commands {
+        let mut builder = GlobSetBuilder::new();
+        builder.add(
+            Glob::new(&rule.glob)
+                .map_err(|error| EditError::Message(format!("invalid formatter glob: {error}")))?,
+        );
+        let glob = builder.build().map_err(|error| {
+            EditError::Message(format!("failed to compile formatter glob: {error}"))
+        })?;
+        if glob.is_match(path.as_str()) {
+            return Ok(Some(rule));
         }
-        Ok(None)
     }
+    Ok(None)
 }
 
 #[derive(Debug)]
@@ -184,8 +225,13 @@ enum FormatterStop {
 }
 
 impl FormatterStop {
-    fn into_edit_error(self, command: &[String], timeout_ms: u64) -> EditError {
-        match self {
+    fn into_edit_error(
+        self,
+        command: &[String],
+        timeout_ms: u64,
+        cleanup: &ManagedProcessOutput,
+    ) -> EditError {
+        let error = match self {
             Self::Cancelled => EditError::Message(format!(
                 "formatter `{}` cancelled by user",
                 command.join(" ")
@@ -195,7 +241,22 @@ impl FormatterStop {
                 command.join(" ")
             )),
             Self::Error(error) => error,
+        };
+        match cleanup.cleanup_error() {
+            Some(cleanup_error) => EditError::Message(format!(
+                "{error}; subprocess cleanup failed: {cleanup_error}"
+            )),
+            None => error,
         }
+    }
+}
+
+fn formatter_cleanup_error(message: String, cleanup: &ManagedProcessOutput) -> EditError {
+    match cleanup.cleanup_error() {
+        Some(cleanup_error) => EditError::Message(format!(
+            "{message}; subprocess cleanup failed: {cleanup_error}"
+        )),
+        None => EditError::Message(message),
     }
 }
 
@@ -208,43 +269,44 @@ fn formatter_working_directory<'a>(
         .unwrap_or(workspace_root)
 }
 
-async fn terminate_formatter(child: &mut tokio::process::Child) {
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
-
-async fn join_formatter_pipe(
-    task: JoinHandle<Result<BoundedPipeOutput, std::io::Error>>,
-    label: &str,
-) -> Result<BoundedPipeOutput, EditError> {
-    task.await
-        .map_err(|error| EditError::Message(format!("failed to join formatter {label}: {error}")))?
-        .map_err(EditError::from)
-}
-
 #[cfg(test)]
 mod tests {
     use camino::Utf8PathBuf;
+    use tokio::time::{Duration, Instant, sleep_until, timeout};
     use tokio_util::sync::CancellationToken;
 
     use crate::config::{FormatConfig, FormatterRule, NewlineStyle};
 
-    use super::{Formatter, FormatterExecutionOptions, formatter_working_directory};
+    use super::{
+        Formatter, FormatterExecutionOptions, ResolvedFormatterInvocation,
+        formatter_working_directory,
+    };
 
-    fn formatter(command: Vec<String>) -> Formatter {
-        Formatter::new(FormatConfig {
+    fn formatter_config(command: Vec<String>) -> FormatConfig {
+        FormatConfig {
             default_newline: NewlineStyle::Lf,
             ensure_trailing_newline: true,
             commands: vec![FormatterRule {
                 glob: "**/*.txt".to_string(),
                 command,
             }],
-        })
+        }
     }
 
-    fn options(workspace_root: Utf8PathBuf) -> FormatterExecutionOptions {
+    fn resolved_formatter(
+        command: Vec<String>,
+        target: &camino::Utf8Path,
+        workspace_root: &camino::Utf8Path,
+    ) -> (Formatter, ResolvedFormatterInvocation) {
+        let config = formatter_config(command);
+        let invocation = Formatter::resolve_invocation(&config, target, workspace_root)
+            .expect("resolve formatter")
+            .expect("matching formatter");
+        (Formatter::new(config), invocation)
+    }
+
+    fn options() -> FormatterExecutionOptions {
         FormatterExecutionOptions {
-            workspace_root,
             timeout_ms: 2_000,
             max_output_bytes: 1_024,
             cancel: CancellationToken::new(),
@@ -268,17 +330,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolved_invocation_owns_the_approved_command_and_working_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let target = root.join("missing/file.txt");
+        let approved = vec!["approved-formatter".to_string(), "--fix".to_string()];
+        let mut config = formatter_config(approved.clone());
+
+        let invocation = Formatter::resolve_invocation(&config, &target, &root)
+            .expect("resolve formatter")
+            .expect("matching formatter");
+        config.commands[0].command = vec!["replacement-formatter".to_string()];
+        std::fs::create_dir_all(target.parent().expect("target parent"))
+            .expect("create target parent after approval");
+
+        assert_eq!(invocation.target(), target);
+        assert_eq!(invocation.working_directory(), root);
+        assert_eq!(invocation.command(), approved);
+        assert!(
+            invocation
+                .permission_detail()
+                .contains("approved-formatter")
+        );
+        assert!(
+            !invocation
+                .permission_detail()
+                .contains("replacement-formatter")
+        );
+    }
+
     #[tokio::test]
     async fn cancellation_is_propagated_to_formatter() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let mut execution = options(root.clone());
+        let mut execution = options();
         execution.cancel = cancel;
+        let target = root.join("file.txt");
+        let (formatter, invocation) = resolved_formatter(wait_command(), &target, &root);
 
-        let error = formatter(wait_command())
-            .format_if_configured(&root.join("file.txt"), "input".to_string(), execution)
+        let error = formatter
+            .format_resolved(&invocation, "input".to_string(), execution)
             .await
             .expect_err("cancelled formatter must fail");
 
@@ -289,11 +383,13 @@ mod tests {
     async fn formatter_timeout_terminates_process() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
-        let mut execution = options(root.clone());
+        let mut execution = options();
         execution.timeout_ms = 50;
+        let target = root.join("file.txt");
+        let (formatter, invocation) = resolved_formatter(wait_command(), &target, &root);
 
-        let error = formatter(wait_command())
-            .format_if_configured(&root.join("file.txt"), "input".to_string(), execution)
+        let error = formatter
+            .format_resolved(&invocation, "input".to_string(), execution)
             .await
             .expect_err("timed out formatter must fail");
 
@@ -301,18 +397,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn formatter_cancellation_terminates_grandchild_before_delayed_effect() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let target = root.join("file.txt");
+        let ready = root.join("grandchild-ready.txt");
+        let marker = root.join("grandchild-effect.txt");
+        std::fs::write(&target, "original").expect("write target fixture");
+        let cancel = CancellationToken::new();
+        let mut execution = options();
+        execution.timeout_ms = 30_000;
+        execution.cancel = cancel.clone();
+        let (formatter, invocation) = resolved_formatter(
+            delayed_grandchild_command(&marker, &ready, 1_500),
+            &target,
+            &root,
+        );
+        let task = tokio::spawn(async move {
+            formatter
+                .format_resolved(&invocation, "input".to_string(), execution)
+                .await
+        });
+
+        wait_for_file(&ready).await;
+        let marker_deadline = Instant::now() + Duration::from_millis(2_200);
+        cancel.cancel();
+        let error = timeout(
+            crate::tool::process::MANAGED_PROCESS_CLEANUP_GRACE + Duration::from_secs(2),
+            task,
+        )
+        .await
+        .expect("formatter cancellation cleanup must be bounded")
+        .expect("join formatter task")
+        .expect_err("cancelled formatter must fail");
+        sleep_until(marker_deadline).await;
+
+        assert!(error.to_string().contains("cancelled by user"));
+        assert!(ready.exists(), "fixture never launched its grandchild");
+        assert!(
+            !marker.exists(),
+            "formatter grandchild survived cancellation and applied a delayed effect"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read unchanged target"),
+            "original"
+        );
+    }
+
+    #[tokio::test]
+    async fn formatter_timeout_terminates_grandchild_before_delayed_effect() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let target = root.join("file.txt");
+        let ready = root.join("grandchild-ready.txt");
+        let marker = root.join("grandchild-effect.txt");
+        std::fs::write(&target, "original").expect("write target fixture");
+        let (timeout_ms, effect_delay_ms, observation_ms) = timeout_grandchild_timing();
+        let mut execution = options();
+        execution.timeout_ms = timeout_ms;
+        let (formatter, invocation) = resolved_formatter(
+            delayed_grandchild_command(&marker, &ready, effect_delay_ms),
+            &target,
+            &root,
+        );
+
+        let error = timeout(
+            crate::tool::process::MANAGED_PROCESS_CLEANUP_GRACE + Duration::from_secs(2),
+            formatter.format_resolved(&invocation, "input".to_string(), execution),
+        )
+        .await
+        .expect("formatter timeout cleanup must be bounded")
+        .expect_err("timed out formatter must fail");
+        assert!(ready.exists(), "fixture never launched its grandchild");
+        let marker_deadline = Instant::now() + Duration::from_millis(observation_ms);
+        sleep_until(marker_deadline).await;
+
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("timed out after {timeout_ms} ms"))
+        );
+        assert!(
+            !marker.exists(),
+            "formatter grandchild survived timeout and applied a delayed effect"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read unchanged target"),
+            "original"
+        );
+    }
+
+    #[tokio::test]
     async fn formatter_output_capture_is_bounded() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
-        let mut execution = options(root.clone());
+        let mut execution = options();
         execution.max_output_bytes = 32;
+        let target = root.join("file.txt");
+        let (formatter, invocation) = resolved_formatter(large_output_command(), &target, &root);
 
-        let error = formatter(large_output_command())
-            .format_if_configured(&root.join("file.txt"), "input".to_string(), execution)
+        let error = formatter
+            .format_resolved(&invocation, "input".to_string(), execution)
             .await
             .expect_err("oversized formatter output must fail");
 
         assert!(error.to_string().contains("32 byte capture limit"));
+    }
+
+    async fn wait_for_file(path: &Utf8PathBuf) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for formatter fixture {path}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(windows)]
+    fn timeout_grandchild_timing() -> (u64, u64, u64) {
+        // The formatter deadline starts before the outer PowerShell process has
+        // initialized. Under a parallel Windows test load, that startup plus
+        // Start-Process can legitimately exceed a sub-second deadline before
+        // the fixture creates its grandchild. Keep the delayed effect beyond
+        // the formatter deadline, and observe for a full delay after cleanup.
+        (3_000, 4_000, 4_700)
+    }
+
+    #[cfg(not(windows))]
+    fn timeout_grandchild_timing() -> (u64, u64, u64) {
+        (750, 1_500, 2_200)
+    }
+
+    #[cfg(windows)]
+    fn delayed_grandchild_command(
+        marker: &Utf8PathBuf,
+        ready: &Utf8PathBuf,
+        effect_delay_ms: u64,
+    ) -> Vec<String> {
+        use base64::Engine as _;
+
+        let marker = marker.as_str().replace('\'', "''");
+        let ready = ready.as_str().replace('\'', "''");
+        let child_script = format!(
+            "Start-Sleep -Milliseconds {effect_delay_ms}; [IO.File]::WriteAllText('{marker}', 'leaked')"
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(
+            child_script
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        let parent_script = format!(
+            "$child = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','{encoded}') -WindowStyle Hidden -PassThru; [IO.File]::WriteAllText('{ready}', $child.Id.ToString()); Start-Sleep -Seconds 30"
+        );
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            parent_script,
+        ]
+    }
+
+    #[cfg(not(windows))]
+    fn delayed_grandchild_command(
+        marker: &Utf8PathBuf,
+        ready: &Utf8PathBuf,
+        effect_delay_ms: u64,
+    ) -> Vec<String> {
+        let effect_delay = format!("{}.{:03}", effect_delay_ms / 1_000, effect_delay_ms % 1_000);
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "(sleep {effect_delay}; printf leaked > \"$1\") & printf ready > \"$2\"; cat >/dev/null; sleep 30"
+            ),
+            "formatter-fixture".to_string(),
+            marker.to_string(),
+            ready.to_string(),
+        ]
     }
 
     #[cfg(windows)]

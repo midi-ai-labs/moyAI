@@ -31,7 +31,6 @@ test("agent rows retain spawn order and derive all counts from status", () => {
     agentRow("/root/pending", 3, "pending_init"),
     agentRow("/root/error", 4, "errored"),
     agentRow("/root/interrupted", 5, "interrupted"),
-    agentRow("/root/missing", 6, "not_found"),
     agentRow("/root/stopped", 7, "shutdown"),
   ];
   const originalOrder = rows.map((row) => row.agent_path);
@@ -44,20 +43,19 @@ test("agent rows retain spawn order and derive all counts from status", () => {
       "/root/pending",
       "/root/error",
       "/root/interrupted",
-      "/root/missing",
       "/root/stopped",
     ],
   );
   assert.deepEqual(rows.map((row) => row.agent_path), originalOrder, "projection rows are not mutated");
   assert.deepEqual(agentActivityCounts(rows), {
-    total: 7,
+    total: 6,
     active: 2,
     completed: 1,
-    attention: 3,
+    attention: 2,
     stopped: 1,
     updated: 1,
   });
-  assert.equal(agentActivitySummary(rows, true), "2件作業中 · 1件完了 · 3件要確認 · 1件停止");
+  assert.equal(agentActivitySummary(rows, true), "2件作業中 · 1件完了 · 2件要確認 · 1件停止");
   assert.equal(agentActivitySummary([], true), "Sub Agentを準備中");
 });
 
@@ -173,7 +171,7 @@ test("agent pane selection is frontend-local and resets at owner or row boundari
   const active = agentRow("/root/active", 2, "running");
   const state = {
     workspace_path: "C:/workspace",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session" },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: 1 },
     agent_activity_rows: [first, active],
   } as DesktopWebState;
   const ui = createUiLocalState();
@@ -216,7 +214,7 @@ test("agent pane selection is frontend-local and resets at owner or row boundari
   openAgentPane(ui, state, "/root/first");
   reconcileAgentPaneState(ui, {
     ...state,
-    draft_target: { workspacePath: "C:/workspace", sessionId: "other-root-session" },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "other-root-session", ownerGeneration: 2 },
   });
   assert.equal(ui.artifactPaneMode, "output");
   assert.equal(ui.selectedAgentPath, null);
@@ -224,6 +222,8 @@ test("agent pane selection is frontend-local and resets at owner or row boundari
 
 test("permission confirmation identifies the requesting Sub Agent and stays compatible when absent", () => {
   const state = {
+    confirmation_visible: true,
+    confirmation_id: "request-42",
     confirmation_text: "",
     confirmation: {
       summary: "shellを実行します",
@@ -240,6 +240,10 @@ test("permission confirmation identifies the requesting Sub Agent and stays comp
   assert.match(rendered, /&lt;Review Agent&gt;/);
   assert.match(rendered, /\/root\/review/);
   assert.doesNotMatch(rendered, /<Review Agent>/);
+  assert.match(rendered, /data-action="abort-permission"[^>]+autofocus>実行せず、指示を変更する/);
+  assert.match(rendered, /data-action="approve-permission"[^>]*>実行する/);
+  assert.match(rendered, /現在のタスクを停止し、次の指示を待ちます/);
+  assert.match(rendered, /data-permission-id="request-42"/);
 
   state.confirmation = {
     summary: "従来の確認",
@@ -251,13 +255,91 @@ test("permission confirmation identifies the requesting Sub Agent and stays comp
   assert.doesNotMatch(renderConfirmation(state), /要求元/);
 });
 
-test("run cancellation remains available while only the child agent tree is active", () => {
-  assert.equal(runCanBeCancelled({ busy: false, confirmation_visible: false, agent_tree_active: false }), false);
-  assert.equal(runCanBeCancelled({ busy: true, confirmation_visible: false, agent_tree_active: false }), true);
-  assert.equal(runCanBeCancelled({ busy: false, confirmation_visible: true, agent_tree_active: false }), true);
-  assert.equal(runCanBeCancelled({ busy: false, confirmation_visible: false, agent_tree_active: true }), true);
+test("permission rendering is declarative, request-owned, and gives each new request a safe focus target", () => {
+  const state = {
+    confirmation_visible: true,
+    confirmation_id: "B",
+    confirmation_text: "確認",
+    confirmation: {
+      summary: "shellを実行します",
+      details: ["npm test"],
+      targets: ["workspace"],
+      outside_workspace: false,
+      risks: [],
+    },
+  } as DesktopWebState;
+
+  const submitting = renderConfirmation(state, {
+    phase: "submitting",
+    requestId: "B",
+    submissionId: 7,
+    decision: "abort",
+  });
+  assert.match(submitting, /data-permission-id="B"[^>]+aria-busy="true"/);
+  assert.equal(submitting.match(/data-permission-action[^>]+disabled/g)?.length, 2);
+  assert.match(submitting, /現在のタスクを停止しています/);
+  assert.match(submitting, /停止しています…/);
+  assert.doesNotMatch(submitting, /data-permission-action[^>]+autofocus/);
+
+  const failed = renderConfirmation(state, {
+    phase: "failed",
+    requestId: "B",
+    error: "再試行 <B>",
+  });
+  assert.match(failed, /再試行 &lt;B&gt;/);
+  assert.match(failed, /data-focus-key="permission:B:abort" autofocus/);
+  assert.doesNotMatch(failed, /aria-busy="true"/);
+
+  const newRequest = renderConfirmation(state, {
+    phase: "failed",
+    requestId: "A",
+    error: "stale A error",
+  });
+  assert.doesNotMatch(newRequest, /stale A error/);
+  assert.match(newRequest, /data-focus-key="permission:B:abort" autofocus/);
+  assert.match(newRequest, /現在のタスクを停止し、次の指示を待ちます/);
+});
+
+test("permission actions send typed approve and abort decisions", async () => {
+  const state = { confirmation_visible: true } as DesktopWebState;
+  const decisions: string[] = [];
+  const context = {
+    submitPermissionDecision: async (decision: string) => {
+      decisions.push(decision);
+    },
+  } as unknown as ActionContext;
+
+  await actionById("approve-permission")?.run(state, context, { index: -1, value: "" });
+  await actionById("abort-permission")?.run(state, context, { index: -1, value: "" });
+
+  assert.deepEqual(decisions, ["approved", "abort"]);
+});
+
+test("run cancellation remains available while only the child agent tree is active and carries its owner", async () => {
+  assert.equal(runCanBeCancelled({ can_cancel_run: false }), false);
+  assert.equal(runCanBeCancelled({ can_cancel_run: true }), true);
   assert.equal(runSurfaceActive({ busy: false, agent_tree_active: true }), true);
   assert.equal(runSurfaceActive({ busy: false, agent_tree_active: false }), false);
+
+  const expectedTarget = {
+    workspacePath: "C:/workspace",
+    sessionId: "root-session",
+    runtimeOwnerToken: "tree:17",
+  };
+  let dispatched: { name: string; args?: Record<string, unknown> } | null = null;
+  await actionById("cancel-run")?.run(
+    { can_cancel_run: true, run_target: expectedTarget } as DesktopWebState,
+    {
+      mutate: async (name: string, args?: Record<string, unknown>) => {
+        dispatched = { name, args };
+      },
+    } as unknown as ActionContext,
+    { index: -1, value: "" },
+  );
+  assert.deepEqual(dispatched, {
+    name: "cancel_run",
+    args: { expectedTarget },
+  });
 });
 
 function agentRow(

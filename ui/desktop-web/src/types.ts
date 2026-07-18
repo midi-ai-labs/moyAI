@@ -5,20 +5,18 @@ export interface TranscriptRow {
     | "empty_placeholder"
     | "user"
     | "assistant"
-    | "reasoning"
+    | "reasoning_summary"
     | "editing"
     | "tool"
-    | "summary"
     | "diff"
     | "system"
     | "error"
     | "work_summary_running"
+    | "work_summary_incomplete"
     | "work_summary_completed"
     | "work_summary_failed"
     | "work_summary_cancelled"
-    | "work_summary_awaiting_user"
     | "file_changes";
-  kind: string;
   step: string;
   title: string;
   body: string;
@@ -34,10 +32,9 @@ export interface ProjectRow {
 export interface SessionRow {
   session_id: RowId;
   title: string;
-  status: "idle" | "running" | "completed" | "awaiting_user" | "cancelled" | "failed";
+  status: "idle" | "running" | "completed" | "cancelled" | "failed";
   loaded_status: "not_loaded" | "idle" | "active" | "system_error";
   archived: boolean;
-  memory_mode: "enabled" | "disabled";
   active_turn_id?: RowId | null;
   active_turn_sequence_no?: number | null;
   pending_permission_requests: number;
@@ -66,8 +63,7 @@ export type AgentStatus =
   | "interrupted"
   | "completed"
   | "errored"
-  | "shutdown"
-  | "not_found";
+  | "shutdown";
 
 export interface AgentActivityRow {
   agent_path: string;
@@ -81,7 +77,7 @@ export interface AgentActivityRow {
   updated: boolean;
 }
 
-export type RunStatusKey = "idle" | "running" | "confirming" | "completed" | "awaiting_user" | "cancelled" | "failed";
+export type RunStatusKey = "idle" | "running" | "completed" | "cancelled" | "failed";
 
 export interface PermissionProjection {
   summary: string;
@@ -96,12 +92,12 @@ export interface PermissionProjection {
 export interface StartupCheckProjection {
   key: string;
   label: string;
-  status: "pending" | "pass" | "warning" | "fail";
+  status: "pass" | "warning" | "fail";
   message: string;
 }
 
 export interface StartupProjection {
-  status: "loading" | "ready" | "requires_config" | "requires_provider";
+  status: "ready" | "requires_config" | "requires_provider";
   title: string;
   message: string;
   detail: string;
@@ -124,18 +120,38 @@ export interface ConfigFieldProjection {
 export interface ConfigMutationTarget {
   workspacePath: string;
   sessionId: string | null;
-  configGeneration: number;
+  configGeneration: string;
 }
 
 export interface AccessModeMutationTarget extends ConfigMutationTarget {
-  accessMode: "default" | "auto_review" | "full_access";
+  accessMode: "default" | "full_access";
   runtimeOwnerToken: string;
-  configOwnerMutationOpen: boolean;
+}
+
+export interface ConfigDraftCapabilityProjection {
+  dirty: boolean;
+  edit_enabled: boolean;
+  discard_enabled: boolean;
+  commit_enabled: boolean;
+  external_owner_mutation_open: boolean;
+  access_mode_mutation_enabled: boolean;
+}
+
+export interface ConfigDraftCapabilitiesProjection {
+  clean: ConfigDraftCapabilityProjection;
+  dirty: ConfigDraftCapabilityProjection;
 }
 
 export interface DraftActionTarget {
   workspacePath: string;
   sessionId: string | null;
+  ownerGeneration: number;
+}
+
+export interface RunMutationTarget {
+  workspacePath: string;
+  sessionId: string | null;
+  runtimeOwnerToken: string;
 }
 
 export interface SessionSearchTarget {
@@ -150,12 +166,37 @@ export interface ProviderStatusProjection {
   details: string;
 }
 
+export type DesktopStatusCode =
+  | "plain"
+  | "provider_transport"
+  | "model_unavailable"
+  | "image_unsupported"
+  | "permission_policy_denied"
+  | "approval_aborted"
+  | "user_stopped"
+  | "agent_interrupted"
+  | "tree_stopped";
+
 export interface RowMutationTarget {
   workspacePath: string;
   ownerProjectId: string | null;
   ownerSessionId: string | null;
   rowId: string;
 }
+
+export type PlanStepStatus = "pending" | "in_progress" | "completed";
+
+export interface PlanStepProjection {
+  step: string;
+  status: PlanStepStatus;
+}
+
+export interface PlanProjection {
+  explanation: string | null;
+  steps: PlanStepProjection[];
+}
+
+export type ComposerSubmitMode = "new_request" | "steer" | "blocked";
 
 export interface DesktopWebState {
   projection_revision: string;
@@ -164,20 +205,18 @@ export interface DesktopWebState {
   model_label: string;
   access_label: string;
   access_target: AccessModeMutationTarget;
-  access_mode_mutation_enabled: boolean;
-  config_owner_mutation_open: boolean;
-  config_draft_dirty: boolean;
-  config_draft_discard_enabled: boolean;
-  config_draft_commit_enabled: boolean;
+  config_draft_capabilities: ConfigDraftCapabilitiesProjection;
   current_session_label: string;
   selected_session_title: string;
   status_message: string;
   status_detail: string;
+  status_code: DesktopStatusCode;
   run_status_key: RunStatusKey;
   run_status_text: string;
   run_phase: string;
   run_active_step: string;
   latest_tool_summary: string;
+  plan: PlanProjection | null;
   progress_text: string;
   tool_status_text: string;
   token_meter_label: string;
@@ -193,7 +232,10 @@ export interface DesktopWebState {
   draft_prompt: string;
   image_input: string;
   attached_images: string[];
+  composer_submit_mode: ComposerSubmitMode;
   can_submit: boolean;
+  can_cancel_run: boolean;
+  run_target: RunMutationTarget;
   busy: boolean;
   async_polling_required: boolean;
   pending_async_operations: string[];
@@ -240,11 +282,6 @@ export interface DesktopWebState {
   provider_loading: boolean;
   provider_apply_enabled: boolean;
   config_fields: ConfigFieldProjection[];
-  config_items: string[];
-  selected_config_index: number;
-  config_field_title: string;
-  config_value_text: string;
-  config_feedback_text: string;
   config_target: ConfigMutationTarget;
   workspace_input: string;
   review_raw_text: string;
@@ -256,4 +293,8 @@ export interface DesktopWebState {
   enhance_enabled: boolean;
   image_input_enabled: boolean;
   window_opacity_percent: number;
+}
+
+export interface DesktopViewState extends DesktopWebState {
+  config_draft: ConfigDraftCapabilityProjection;
 }

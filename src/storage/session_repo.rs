@@ -1,28 +1,26 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use crate::config::AccessMode;
+use crate::config::{AccessMode, ProviderEndpoint};
 use crate::error::StorageError;
 use crate::protocol::{
-    HistoryItem, HistoryItemId, HistoryItemPayload, RuntimeEvent, RuntimeEventId, RuntimeEventMsg,
-    SteerTurn, ToolProgressEffect, TurnId, TurnItem, TurnItemId, TurnItemPayload,
-    TurnTerminalStatus, UserTurn, VerificationRunResult, VerificationRunStatus,
-    fork_canonical_items_in_transaction, insert_event_bundle_in_transaction,
-    latest_turn_position_for_session, project_protocol_run_event,
+    CanonicalProtocolSnapshot, HistoryItem, HistoryItemId, HistoryItemPayload,
+    InterAgentCommunication, ModelResponseId, ProtocolPageRequest, RuntimeEvent, RuntimeEventId,
+    RuntimeEventMsg, SteerTurn, TurnId, TurnItem, TurnItemId, TurnItemPayload, TurnTerminalOutcome,
+    UserTurn, canonical_protocol_snapshot_from_connection, fork_canonical_items_in_transaction,
+    insert_idle_inter_agent_history_in_transaction,
+    insert_session_owned_event_bundle_in_transaction, latest_protocol_turn_ids_in_transaction,
+    project_inter_agent_communication, project_protocol_run_event,
 };
-use crate::runtime::{Clock, SystemClock};
+use crate::runtime::{AgentPath, Clock, SystemClock};
 use crate::session::{
-    CompletionState, DiffSummaryPart, FailureKind, FailureState, MessageId, MessageMetadata,
-    MessagePart, MessageRecord, MessageRole, NewMessage, NewPart, NewSession, PartKind, PartRecord,
-    ProcessPhase, ProjectId, RunEvent, SessionForkResult, SessionId, SessionMemoryMode,
-    SessionMemoryModeUpdate, SessionModelParameters, SessionRecord, SessionRepository,
-    SessionSettingsPatch, SessionSettingsUpdate, SessionSpawnEdge, SessionStateSnapshot,
-    SessionStatus, SessionTitleUpdate, TaskRoute, ThreadGoal, ThreadGoalStatus, TodoItem, TodoKind,
-    TodoPriority, TodoStatus, ToolCallId, ToolCallPart, ToolCallRecord, ToolCallStatus,
-    ToolResultPart, Transcript, TranscriptMessage, VerificationState,
+    AdmissionId, DurableTurnTerminal, NewSession, ProjectId, RunEvent, SessionForkResult,
+    SessionId, SessionModelParameters, SessionRecord, SessionRepository, SessionSettingsPatch,
+    SessionSettingsUpdate, SessionSpawnEdge, SessionStatus, SessionTitleUpdate, ThreadGoal,
+    ThreadGoalStatus, ToolCallId, ToolCallStatus, validate_session_page_limit,
     validate_thread_goal_objective,
 };
 
@@ -31,9 +29,222 @@ pub const RUN_ADMISSION_HEARTBEAT_INTERVAL_MS: u64 = 5_000;
 const EXPIRED_RUN_RECOVERY_REASON: &str =
     "run owner lease expired before the owner acknowledged shutdown";
 
+/// Capability proving that a protocol bundle is being inserted from the
+/// session repository's atomic state-owner transaction. Its private field
+/// prevents generic runtime/projection code from constructing this authority.
+pub(crate) struct SessionProtocolWriteAuthority(());
+
+const SESSION_PROTOCOL_WRITE_AUTHORITY: SessionProtocolWriteAuthority =
+    SessionProtocolWriteAuthority(());
+
+#[derive(Debug, Clone)]
+pub struct PendingToolCallWrite {
+    pub id: ToolCallId,
+    pub model_call_id: String,
+    pub tool_name: String,
+    pub arguments_json: String,
+    pub protocol_sequence_no: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelResponseWrite {
+    pub response_id: ModelResponseId,
+    pub assistant_text: Option<String>,
+    pub assistant_protocol_sequence_no: Option<i64>,
+    pub tool_calls: Vec<PendingToolCallWrite>,
+}
+
 #[derive(Clone)]
 pub struct SqliteSessionRepository {
     connection: Arc<Mutex<Connection>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DurableRunAdmission {
+    admission_id: AdmissionId,
+    turn_id: TurnId,
+    lease_expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunningSessionTerminalTarget {
+    admission_id: AdmissionId,
+    turn_id: TurnId,
+}
+
+impl RunningSessionTerminalTarget {
+    fn from_admission(admission: DurableRunAdmission) -> Self {
+        Self {
+            admission_id: admission.admission_id,
+            turn_id: admission.turn_id,
+        }
+    }
+
+    fn matches(self, admission: DurableRunAdmission) -> bool {
+        self.admission_id == admission.admission_id && self.turn_id == admission.turn_id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableSessionStopState {
+    Idle,
+    Running(RunningSessionTerminalTarget),
+    Terminal(SessionStatus),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RunningSessionRecoveryCandidate {
+    pub session: SessionRecord,
+    pub terminal_target: RunningSessionTerminalTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalOwnerGuard {
+    Admitted {
+        admission_id: AdmissionId,
+        turn_id: TurnId,
+    },
+    Captured(RunningSessionTerminalTarget),
+}
+
+impl DurableRunAdmission {
+    fn is_fresh_at(self, now_ms: i64) -> bool {
+        self.lease_expires_at_ms > normalize_run_lease_now_ms(now_ms)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValidatedSessionRuntimeState {
+    status: SessionStatus,
+    admission: Option<DurableRunAdmission>,
+}
+
+impl ValidatedSessionRuntimeState {
+    fn fresh_admission_at(self, now_ms: i64) -> Option<DurableRunAdmission> {
+        self.admission
+            .filter(|admission| admission.is_fresh_at(now_ms))
+    }
+
+    fn fresh_running_turn_at(self, now_ms: i64) -> Option<TurnId> {
+        (self.status == SessionStatus::Running)
+            .then(|| self.fresh_admission_at(now_ms))
+            .flatten()
+            .map(|admission| admission.turn_id)
+    }
+
+    fn blocks_mutation_at(self, now_ms: i64) -> bool {
+        self.status == SessionStatus::Running || self.fresh_admission_at(now_ms).is_some()
+    }
+
+    fn stop_state(self) -> DurableSessionStopState {
+        match self.status {
+            SessionStatus::Idle => DurableSessionStopState::Idle,
+            SessionStatus::Running => {
+                DurableSessionStopState::Running(RunningSessionTerminalTarget::from_admission(
+                    self.admission
+                        .expect("running session admission validated before stop projection"),
+                ))
+            }
+            SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed => {
+                DurableSessionStopState::Terminal(self.status)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RawSessionRuntimeState {
+    status: String,
+    active_run_id: Option<String>,
+    active_turn_id: Option<String>,
+    active_run_lease_expires_at_ms: Option<i64>,
+    terminal_count: i64,
+    terminal_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionProjectionState {
+    pub session: SessionRecord,
+    pub archived: bool,
+    pub active_turn_id: Option<TurnId>,
+    pub active_turn_sequence_no: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CanonicalSessionStorageSnapshot {
+    pub session: SessionRecord,
+    pub protocol: CanonicalProtocolSnapshot,
+    pub active_turn_position: Option<(TurnId, i64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectChildRunAdmissionState {
+    pub edge: SessionSpawnEdge,
+    pub blocks_new_root_turn: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedThreadGoal {
+    pub goal_id: String,
+    pub goal: ThreadGoal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedTurnSnapshot {
+    pub admission_id: AdmissionId,
+    pub goal: Option<AdmittedThreadGoal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveGoalTurnAdmission {
+    Admitted(AdmittedTurnSnapshot),
+    GoalInactive,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TurnGoalAdmissionChange {
+    Preserve,
+    SetObjective(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnGoalAdmissionRequirement {
+    Any,
+    Active,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnAdmissionRequest {
+    turn_id: TurnId,
+    goal_change: TurnGoalAdmissionChange,
+    goal_requirement: TurnGoalAdmissionRequirement,
+}
+
+impl TurnAdmissionRequest {
+    fn preserve_goal(turn_id: TurnId) -> Self {
+        Self {
+            turn_id,
+            goal_change: TurnGoalAdmissionChange::Preserve,
+            goal_requirement: TurnGoalAdmissionRequirement::Any,
+        }
+    }
+
+    fn require_active_goal(turn_id: TurnId) -> Self {
+        Self {
+            turn_id,
+            goal_change: TurnGoalAdmissionChange::Preserve,
+            goal_requirement: TurnGoalAdmissionRequirement::Active,
+        }
+    }
+
+    fn set_goal_objective(turn_id: TurnId, objective: impl Into<String>) -> Self {
+        Self {
+            turn_id,
+            goal_change: TurnGoalAdmissionChange::SetObjective(objective.into()),
+            goal_requirement: TurnGoalAdmissionRequirement::Any,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,13 +252,14 @@ pub enum AdmittedTerminalCommit {
     Applied,
     AlreadyTerminalizedBySameAdmission,
     UnseenSteer { expected: usize, actual: usize },
+    UnseenAgentCommunication { expected: usize, actual: usize },
     NotOwned,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum RunAdmissionLeaseRenewalOutcome {
     Renewed,
-    GracefulTerminal,
+    Terminal(crate::session::model::DurableTurnTerminal),
     SupersededOrExpired,
 }
 
@@ -77,6 +289,14 @@ impl SqliteSessionRepository {
         agent_path: &str,
         task_name: &str,
     ) -> Result<SessionSpawnEdge, StorageError> {
+        validate_flat_session_spawn_edge(
+            root_session_id,
+            parent_session_id,
+            child_session_id,
+            agent_path,
+            task_name,
+        )
+        .map_err(StorageError::Message)?;
         let edge = SessionSpawnEdge {
             root_session_id,
             parent_session_id,
@@ -141,25 +361,54 @@ impl SqliteSessionRepository {
             .map_err(StorageError::from)
     }
 
-    pub async fn list_direct_child_spawn_edges(
+    /// Reads every retained direct child and its validated durable runtime state in one SQL
+    /// snapshot. The caller may combine this semantic projection with its process-local run
+    /// registry without issuing one query per child.
+    pub async fn list_direct_child_run_admission_states(
         &self,
-        parent_session_id: SessionId,
-    ) -> Result<Vec<SessionSpawnEdge>, StorageError> {
+        root_session_id: SessionId,
+    ) -> Result<Vec<DirectChildRunAdmissionState>, StorageError> {
+        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT root_session_id, parent_session_id, child_session_id,
-                    agent_path, task_name, created_at_ms
-             FROM session_spawn_edges
-             WHERE parent_session_id = ?1
-             ORDER BY created_at_ms ASC, child_session_id ASC",
+            "SELECT edge.root_session_id, edge.parent_session_id, edge.child_session_id,
+                     edge.agent_path, edge.task_name, edge.created_at_ms,
+                     child.status, child.active_run_id, child.active_turn_id,
+                     child.active_run_lease_expires_at_ms,
+                     (SELECT COUNT(*)
+                      FROM protocol_runtime_events AS terminal_event
+                      WHERE terminal_event.session_id = child.id
+                        AND terminal_event.turn_id = child.active_turn_id
+                        AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
+                     (SELECT terminal_event.msg_json
+                      FROM protocol_runtime_events AS terminal_event
+                      WHERE terminal_event.session_id = child.id
+                        AND terminal_event.turn_id = child.active_turn_id
+                        AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
+                      ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC
+                      LIMIT 1)
+              FROM session_spawn_edges AS edge
+             INNER JOIN sessions AS child ON child.id = edge.child_session_id
+             WHERE edge.root_session_id = ?1
+             ORDER BY edge.created_at_ms ASC, edge.child_session_id ASC",
         )?;
-        statement
-            .query_map(
-                params![parent_session_id.to_string()],
-                session_spawn_edge_from_row,
-            )?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StorageError::from)
+        let rows = statement
+            .query_map(params![root_session_id.to_string()], |row| {
+                Ok((
+                    session_spawn_edge_from_row(row)?,
+                    raw_session_runtime_state_from_row(row, 6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(edge, raw)| {
+                let runtime_state = validate_raw_session_runtime_state(edge.child_session_id, raw)?;
+                Ok(DirectChildRunAdmissionState {
+                    edge,
+                    blocks_new_root_turn: runtime_state.blocks_mutation_at(now),
+                })
+            })
+            .collect()
     }
 
     pub async fn compare_and_set_root_session_access_mode(
@@ -224,32 +473,95 @@ impl SqliteSessionRepository {
         }))
     }
 
-    pub async fn list_running_sessions_for_recovery(
-        &self,
-    ) -> Result<Vec<SessionRecord>, StorageError> {
+    pub async fn running_session_recovery_fence(&self) -> Result<Option<SessionId>, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let mut statement = connection.prepare(
-            "SELECT id FROM sessions
-             WHERE status IN ('running', 'awaiting_user')
-             ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC",
-        )?;
-        let ids = statement
-            .query_map([], |row| row.get::<_, String>(0))?
+        connection
+            .query_row(
+                "SELECT id
+                 FROM sessions
+                 WHERE status = 'running'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| parse_session_id_column(row, 0),
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    pub(crate) async fn running_session_recovery_page(
+        &self,
+        after: Option<SessionId>,
+        through: SessionId,
+        limit: usize,
+    ) -> Result<Vec<RunningSessionRecoveryCandidate>, StorageError> {
+        let limit = sqlite_limit(limit)?;
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let (sql, after_text) = match after {
+            Some(after) => (
+                 "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
+                         model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                         status, active_run_id, active_turn_id, active_run_lease_expires_at_ms,
+                         (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
+                          WHERE terminal_event.session_id = sessions.id
+                            AND terminal_event.turn_id = sessions.active_turn_id
+                            AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
+                         (SELECT terminal_event.msg_json FROM protocol_runtime_events AS terminal_event
+                          WHERE terminal_event.session_id = sessions.id
+                            AND terminal_event.turn_id = sessions.active_turn_id
+                            AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
+                          ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC LIMIT 1)
+                  FROM sessions
+                 WHERE status = 'running' AND id > ?1 AND id <= ?2
+                 ORDER BY id ASC
+                 LIMIT ?3",
+                Some(after.to_string()),
+            ),
+            None => (
+                 "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
+                         model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                         status, active_run_id, active_turn_id, active_run_lease_expires_at_ms,
+                         (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
+                          WHERE terminal_event.session_id = sessions.id
+                            AND terminal_event.turn_id = sessions.active_turn_id
+                            AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
+                         (SELECT terminal_event.msg_json FROM protocol_runtime_events AS terminal_event
+                          WHERE terminal_event.session_id = sessions.id
+                            AND terminal_event.turn_id = sessions.active_turn_id
+                            AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
+                          ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC LIMIT 1)
+                  FROM sessions
+                 WHERE status = 'running' AND id <= ?2
+                 ORDER BY id ASC
+                 LIMIT ?3",
+                None,
+            ),
+        };
+        let mut statement = connection.prepare(sql)?;
+        let rows = statement
+            .query_map(params![after_text, through.to_string(), limit], |row| {
+                Ok((
+                    session_record_with_identity_from_row(row)?,
+                    raw_session_runtime_state_from_row(row, 12)?,
+                ))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-        drop(connection);
-        let mut sessions = Vec::with_capacity(ids.len());
-        for value in ids {
-            sessions.push(
-                self.get_session(
-                    value
-                        .parse::<SessionId>()
-                        .map_err(|error| StorageError::Message(error.to_string()))?,
-                )
-                .await?,
-            );
-        }
-        Ok(sessions)
+        rows.into_iter()
+            .map(|(session, raw)| {
+                let runtime_state = validate_raw_session_runtime_state(session.id, raw)?;
+                let DurableSessionStopState::Running(terminal_target) = runtime_state.stop_state()
+                else {
+                    return Err(StorageError::Message(format!(
+                        "running-session recovery query returned non-running session {}",
+                        session.id
+                    )));
+                };
+                Ok(RunningSessionRecoveryCandidate {
+                    session,
+                    terminal_target,
+                })
+            })
+            .collect()
     }
 
     pub async fn delete_session_tree(
@@ -267,35 +579,42 @@ impl SqliteSessionRepository {
             transaction.commit()?;
             return Ok(Vec::new());
         }
-        let mut statement = transaction.prepare(
-            "SELECT parent_session_id, child_session_id
-             FROM session_spawn_edges
-             ORDER BY created_at_ms ASC, child_session_id ASC",
-        )?;
-        let relationships = statement
-            .query_map([], |row| {
-                Ok((
-                    parse_session_id_column(row, 0)?,
-                    parse_session_id_column(row, 1)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-
-        let mut children = HashMap::<SessionId, Vec<SessionId>>::new();
-        for (parent_session_id, child_session_id) in relationships {
-            children
-                .entry(parent_session_id)
-                .or_default()
-                .push(child_session_id);
-        }
-        let mut deleted_session_ids = Vec::new();
-        collect_session_tree_postorder(
+        if let Some(active_session_id) = active_session_for_mutation_branch(
+            &transaction,
             session_id,
-            &children,
-            &mut HashSet::new(),
-            &mut deleted_session_ids,
-        );
+            true,
+            normalize_run_lease_now_ms(SystemClock::now_ms()),
+        )? {
+            return Err(StorageError::Message(format!(
+                "session {session_id} has active agent-tree session {active_session_id}; stop the agent tree before deleting it"
+            )));
+        }
+        let is_direct_child = transaction
+            .query_row(
+                "SELECT 1 FROM session_spawn_edges WHERE child_session_id = ?1",
+                params![session_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        let mut deleted_session_ids = if is_direct_child {
+            Vec::new()
+        } else {
+            let mut statement = transaction.prepare(
+                "SELECT child_session_id
+                 FROM session_spawn_edges
+                 WHERE root_session_id = ?1
+                 ORDER BY created_at_ms ASC, child_session_id ASC",
+            )?;
+            let children = statement
+                .query_map(params![session_id.to_string()], |row| {
+                    parse_session_id_column(row, 0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            children
+        };
+        deleted_session_ids.push(session_id);
 
         for deleted_session_id in &deleted_session_ids {
             delete_session_rows(&transaction, *deleted_session_id)?;
@@ -315,24 +634,75 @@ impl SqliteSessionRepository {
             .map_err(StorageError::from)
     }
 
+    pub(crate) async fn canonical_session_protocol_snapshot(
+        &self,
+        session_id: SessionId,
+        history: ProtocolPageRequest,
+        turns: ProtocolPageRequest,
+    ) -> Result<CanonicalSessionStorageSnapshot, StorageError> {
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let session = session_record_from_connection(&transaction, session_id)?;
+        let protocol =
+            canonical_protocol_snapshot_from_connection(&transaction, session_id, history, turns)?;
+        let runtime_state = session_runtime_state_from_connection(&transaction, session_id)?
+            .expect("session record loaded in the same transaction");
+        let active_turn_position = if runtime_state.status == SessionStatus::Running {
+            let turn_id = runtime_state
+                .admission
+                .expect("running admission validated before canonical snapshot")
+                .turn_id;
+            let sequence_no = transaction
+                .query_row(
+                    "SELECT next_sequence_no
+                 FROM protocol_turn_sequence_allocators
+                 WHERE session_id = ?1 AND turn_id = ?2",
+                    params![session_id.to_string(), turn_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            Some((turn_id, sequence_no))
+        } else {
+            None
+        };
+        transaction.commit()?;
+        Ok(CanonicalSessionStorageSnapshot {
+            session,
+            protocol,
+            active_turn_position,
+        })
+    }
+
     pub async fn session_projection_state(
         &self,
         session_id: SessionId,
-    ) -> Result<(bool, SessionMemoryMode), StorageError> {
+    ) -> Result<SessionProjectionState, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection
-            .query_row(
-                "SELECT archived_at_ms IS NOT NULL, memory_mode
-                 FROM sessions WHERE id = ?1",
-                params![session_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, bool>(0)?,
-                        parse_memory_mode(&row.get::<_, String>(1)?),
-                    ))
-                },
-            )
-            .map_err(StorageError::from)
+        let mut statement = connection.prepare(
+            "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
+                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    archived_at_ms IS NOT NULL, active_run_id, active_turn_id,
+                    active_run_lease_expires_at_ms,
+                    (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
+                    (SELECT terminal_event.msg_json FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
+                     ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC LIMIT 1),
+                    (SELECT allocator.next_sequence_no
+                     FROM protocol_turn_sequence_allocators AS allocator
+                     WHERE allocator.session_id = sessions.id
+                       AND allocator.turn_id = sessions.active_turn_id)
+             FROM sessions
+             WHERE id = ?1",
+        )?;
+        let row =
+            statement.query_row(params![session_id.to_string()], session_projection_from_row)?;
+        validate_session_projection_state(row)
     }
 
     pub async fn list_sessions_with_projection_state(
@@ -340,7 +710,7 @@ impl SqliteSessionRepository {
         project_id: ProjectId,
         limit: usize,
         include_archived: bool,
-    ) -> Result<Vec<(SessionRecord, bool, SessionMemoryMode)>, StorageError> {
+    ) -> Result<Vec<SessionProjectionState>, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let archived_filter = if include_archived {
             ""
@@ -348,9 +718,23 @@ impl SqliteSessionRepository {
             " AND archived_at_ms IS NULL"
         };
         let sql = format!(
-            "SELECT id, title, status, cwd_path, model_name, base_url, access_mode,
+            "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
                     model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
-                    archived_at_ms IS NOT NULL, memory_mode
+                    archived_at_ms IS NOT NULL, active_run_id, active_turn_id,
+                    active_run_lease_expires_at_ms,
+                    (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
+                    (SELECT terminal_event.msg_json FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
+                     ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC LIMIT 1),
+                    (SELECT allocator.next_sequence_no
+                     FROM protocol_turn_sequence_allocators AS allocator
+                     WHERE allocator.session_id = sessions.id
+                       AND allocator.turn_id = sessions.active_turn_id)
              FROM sessions
              WHERE project_id = ?1{archived_filter}
                AND NOT EXISTS (
@@ -362,41 +746,14 @@ impl SqliteSessionRepository {
         );
         let mut statement = connection.prepare(&sql)?;
         let rows = statement
-            .query_map(params![project_id.to_string(), limit as i64], |row| {
-                let id = row
-                    .get::<_, String>(0)?
-                    .parse::<SessionId>()
-                    .map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?;
-                Ok((
-                    SessionRecord {
-                        id,
-                        project_id,
-                        title: row.get(1)?,
-                        status: parse_status(&row.get::<_, String>(2)?),
-                        cwd: row.get::<_, String>(3)?.into(),
-                        model: row.get(4)?,
-                        base_url: row.get(5)?,
-                        access_mode: parse_access_mode(&row.get::<_, String>(6)?),
-                        model_parameters: parse_session_model_parameters(
-                            &row.get::<_, String>(7)?,
-                            7,
-                        )?,
-                        created_at_ms: row.get(8)?,
-                        updated_at_ms: row.get(9)?,
-                        completed_at_ms: row.get(10)?,
-                    },
-                    row.get::<_, bool>(11)?,
-                    parse_memory_mode(&row.get::<_, String>(12)?),
-                ))
-            })?
+            .query_map(
+                params![project_id.to_string(), sqlite_limit(limit)?],
+                session_projection_from_row,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        rows.into_iter()
+            .map(validate_session_projection_state)
+            .collect()
     }
 
     pub async fn search_sessions_with_projection_state(
@@ -405,7 +762,7 @@ impl SqliteSessionRepository {
         query: &str,
         limit: usize,
         include_archived: bool,
-    ) -> Result<Vec<(SessionRecord, bool, SessionMemoryMode)>, StorageError> {
+    ) -> Result<Vec<SessionProjectionState>, StorageError> {
         let normalized = format!(
             "%{}%",
             escape_like_literal(&query.trim().to_ascii_lowercase())
@@ -417,9 +774,23 @@ impl SqliteSessionRepository {
             " AND archived_at_ms IS NULL"
         };
         let sql = format!(
-            "SELECT id, title, status, cwd_path, model_name, base_url, access_mode,
+            "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
                     model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
-                    archived_at_ms IS NOT NULL, memory_mode
+                    archived_at_ms IS NOT NULL, active_run_id, active_turn_id,
+                    active_run_lease_expires_at_ms,
+                    (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
+                    (SELECT terminal_event.msg_json FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
+                     ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC LIMIT 1),
+                    (SELECT allocator.next_sequence_no
+                     FROM protocol_turn_sequence_allocators AS allocator
+                     WHERE allocator.session_id = sessions.id
+                       AND allocator.turn_id = sessions.active_turn_id)
              FROM sessions
              WHERE project_id = ?1{archived_filter}
                AND NOT EXISTS (
@@ -439,192 +810,105 @@ impl SqliteSessionRepository {
         let mut statement = connection.prepare(&sql)?;
         let rows = statement
             .query_map(
-                params![project_id.to_string(), normalized, limit as i64],
-                |row| {
-                    let id = row
-                        .get::<_, String>(0)?
-                        .parse::<SessionId>()
-                        .map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?;
-                    Ok((
-                        SessionRecord {
-                            id,
-                            project_id,
-                            title: row.get(1)?,
-                            status: parse_status(&row.get::<_, String>(2)?),
-                            cwd: row.get::<_, String>(3)?.into(),
-                            model: row.get(4)?,
-                            base_url: row.get(5)?,
-                            access_mode: parse_access_mode(&row.get::<_, String>(6)?),
-                            model_parameters: parse_session_model_parameters(
-                                &row.get::<_, String>(7)?,
-                                7,
-                            )?,
-                            created_at_ms: row.get(8)?,
-                            updated_at_ms: row.get(9)?,
-                            completed_at_ms: row.get(10)?,
-                        },
-                        row.get::<_, bool>(11)?,
-                        parse_memory_mode(&row.get::<_, String>(12)?),
-                    ))
-                },
+                params![project_id.to_string(), normalized, sqlite_limit(limit)?],
+                session_projection_from_row,
             )?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        rows.into_iter()
+            .map(validate_session_projection_state)
+            .collect()
     }
 
-    pub async fn insert_tool_call(
+    pub async fn session_owns_truncated_output(
         &self,
         session_id: SessionId,
-        message_id: MessageId,
-        tool_name: &str,
-        arguments_json: &str,
-        title: Option<&str>,
-        metadata_json: serde_json::Value,
-    ) -> Result<ToolCallRecord, StorageError> {
-        let id = ToolCallId::new();
-        let started_at_ms = SystemClock::now_ms();
+        path: &camino::Utf8Path,
+    ) -> Result<bool, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.execute(
-            "INSERT INTO tool_calls (id, session_id, message_id, tool_name, status, arguments_json, title, metadata_json, output_text, truncated_output_path, error_text, started_at_ms, finished_at_ms)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, NULL, NULL, NULL, ?8, NULL)",
-            params![
-                id.to_string(),
-                session_id.to_string(),
-                message_id.to_string(),
-                tool_name,
-                arguments_json,
-                title,
-                serde_json::to_string(&metadata_json)?,
-                started_at_ms
-            ],
+        let owned = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM tool_calls AS tool
+                 INNER JOIN protocol_history_items AS history
+                    ON history.id = tool.history_item_id
+                 WHERE history.session_id = ?1
+                   AND tool.truncated_output_path = ?2
+             )",
+            params![session_id.to_string(), path.as_str()],
+            |row| row.get::<_, bool>(0),
         )?;
-        Ok(ToolCallRecord {
-            id,
-            session_id,
-            message_id,
-            tool_name: parse_tool_name(tool_name),
-            status: ToolCallStatus::Pending,
-            arguments_json: arguments_json.to_string(),
-            title: title.map(|value| value.to_string()),
-            metadata_json,
-            output_text: None,
-            truncated_output_path: None,
-            error_text: None,
-            started_at_ms,
-            finished_at_ms: None,
-        })
+        Ok(owned)
     }
 
-    pub async fn mark_tool_call_running(
-        &self,
-        tool_call_id: ToolCallId,
-    ) -> Result<(), StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.execute(
-            "UPDATE tool_calls SET status = 'running' WHERE id = ?1",
-            params![tool_call_id.to_string()],
-        )?;
-        Ok(())
-    }
-
-    pub async fn complete_tool_call(
-        &self,
-        tool_call_id: ToolCallId,
-        title: &str,
-        metadata_json: serde_json::Value,
-        output_text: &str,
-        truncated_output_path: Option<&camino::Utf8Path>,
-    ) -> Result<(), StorageError> {
-        let finished_at_ms = SystemClock::now_ms();
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.execute(
-            "UPDATE tool_calls
-             SET status = 'completed',
-                 title = ?2,
-                 metadata_json = ?3,
-                 output_text = ?4,
-                 truncated_output_path = ?5,
-                 error_text = NULL,
-                 finished_at_ms = ?6
-             WHERE id = ?1",
-            params![
-                tool_call_id.to_string(),
-                title,
-                serde_json::to_string(&metadata_json)?,
-                output_text,
-                truncated_output_path.map(|value| value.as_str()),
-                finished_at_ms
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub async fn fail_tool_call(
-        &self,
-        tool_call_id: ToolCallId,
-        error_text: &str,
-    ) -> Result<(), StorageError> {
-        let finished_at_ms = SystemClock::now_ms();
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.execute(
-            "UPDATE tool_calls
-             SET status = 'failed',
-                 error_text = ?2,
-                 finished_at_ms = ?3
-             WHERE id = ?1",
-            params![tool_call_id.to_string(), error_text, finished_at_ms],
-        )?;
-        Ok(())
-    }
-
-    pub async fn fail_unfinished_tool_calls(
+    pub async fn rollback_session_transaction(
         &self,
         session_id: SessionId,
-        error_text: &str,
-    ) -> Result<(), StorageError> {
-        let finished_at_ms = SystemClock::now_ms();
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        fail_unfinished_tool_calls_in_connection(
-            &connection,
-            session_id,
-            error_text,
-            finished_at_ms,
-        )?;
-        Ok(())
-    }
-
-    pub async fn update_message_metadata(
-        &self,
-        message_id: MessageId,
-        metadata: &MessageMetadata,
-    ) -> Result<(), StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.execute(
-            "UPDATE messages SET metadata_json = ?2 WHERE id = ?1",
-            params![message_id.to_string(), serde_json::to_string(metadata)?],
-        )?;
-        Ok(())
-    }
-
-    pub async fn reset_state_after_protocol_rollback(
-        &self,
-        session_id: SessionId,
-        state: &SessionStateSnapshot,
-    ) -> Result<SessionRecord, StorageError> {
+        num_turns: usize,
+    ) -> Result<crate::session::SessionRollbackResult, StorageError> {
+        if num_turns == 0 {
+            return Err(StorageError::Message(
+                "session rollback turn count must be greater than zero".to_string(),
+            ));
+        }
         let now = normalize_run_lease_now_ms(SystemClock::now_ms());
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "DELETE FROM session_todos WHERE session_id = ?1",
-            params![session_id.to_string()],
-        )?;
-        upsert_session_state_row(&transaction, session_id, state, now)?;
+
+        session_record_from_connection(&transaction, session_id)?;
+        let root_session_id = transaction
+            .query_row(
+                "SELECT root_session_id
+                 FROM session_spawn_edges
+                 WHERE child_session_id = ?1",
+                params![session_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| {
+                value
+                    .parse::<SessionId>()
+                    .map_err(|error| StorageError::Message(error.to_string()))
+            })
+            .transpose()?
+            .unwrap_or(session_id);
+        let active_tree_session =
+            active_session_for_mutation_branch(&transaction, root_session_id, true, now)?;
+        if let Some(active_tree_session) = active_tree_session {
+            return Err(StorageError::Message(format!(
+                "session {session_id} belongs to agent tree {root_session_id}, which still has active session {active_tree_session}; stop the complete agent tree before rollback"
+            )));
+        }
+
+        let dropped_turn_ids =
+            latest_protocol_turn_ids_in_transaction(&transaction, session_id, num_turns)?;
+        if dropped_turn_ids.len() < num_turns {
+            return Err(StorageError::Message(format!(
+                "cannot rollback {num_turns} turn(s); session {session_id} only has {} canonical turn(s)",
+                dropped_turn_ids.len()
+            )));
+        }
+        for turn_id in &dropped_turn_ids {
+            transaction.execute(
+                "DELETE FROM protocol_turn_items WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+            )?;
+            transaction.execute(
+                "DELETE FROM protocol_history_items WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+            )?;
+            transaction.execute(
+                "DELETE FROM protocol_runtime_events WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+            )?;
+            transaction.execute(
+                "DELETE FROM protocol_item_append_order WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+            )?;
+            transaction.execute(
+                "DELETE FROM protocol_turn_sequence_allocators WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id.to_string(), turn_id.to_string()],
+            )?;
+        }
         transaction.execute(
             "UPDATE sessions
              SET status = 'idle', updated_at_ms = ?2, completed_at_ms = NULL,
@@ -633,55 +917,18 @@ impl SqliteSessionRepository {
              WHERE id = ?1",
             params![session_id.to_string(), now],
         )?;
+        let remaining_history_items = transaction.query_row(
+            "SELECT COUNT(*) FROM protocol_history_items WHERE session_id = ?1",
+            params![session_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        let session = session_record_from_connection(&transaction, session_id)?;
         transaction.commit()?;
-        drop(connection);
-        self.get_session(session_id).await
-    }
-
-    pub async fn copy_session_state_and_todos(
-        &self,
-        source_session_id: SessionId,
-        target_session_id: SessionId,
-    ) -> Result<(), StorageError> {
-        if source_session_id == target_session_id {
-            return Err(StorageError::Message(
-                "cannot copy session state into the same session".to_string(),
-            ));
-        }
-        let state = self.get_state(source_session_id).await?;
-        let todos = self.list_todos(source_session_id).await?;
-        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        upsert_session_state_row(&transaction, target_session_id, &state, now)?;
-        transaction.execute(
-            "DELETE FROM session_todos WHERE session_id = ?1",
-            params![target_session_id.to_string()],
-        )?;
-        for (position, todo) in todos.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO session_todos (
-                     session_id, todo_id, position, content, kind, status, priority, targets_json,
-                     depends_on_json, success_criteria_json, blocked_by_json
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    target_session_id.to_string(),
-                    todo.id.to_string(),
-                    position as i64,
-                    todo.content,
-                    todo_kind_text(todo.kind),
-                    todo_status_text(todo.status),
-                    todo_priority_text(todo.priority),
-                    serde_json::to_string(&todo.targets)?,
-                    serde_json::to_string(&todo.depends_on)?,
-                    serde_json::to_string(&todo.success_criteria)?,
-                    serde_json::to_string(&todo.blocked_by)?
-                ],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
+        Ok(crate::session::SessionRollbackResult {
+            session,
+            dropped_turn_ids,
+            remaining_history_items,
+        })
     }
 
     pub async fn fork_session_snapshot(
@@ -692,10 +939,10 @@ impl SqliteSessionRepository {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let source = session_record_from_connection(&transaction, source_session_id)?;
-        let source_was_active = matches!(
-            source.status,
-            SessionStatus::Running | SessionStatus::AwaitingUser
-        );
+        let source_was_active = source.status == SessionStatus::Running;
+        let source_runtime_state =
+            session_runtime_state_from_connection(&transaction, source_session_id)?
+                .expect("source session loaded in the same transaction");
         let title = title
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.trim().to_string())
@@ -705,10 +952,10 @@ impl SqliteSessionRepository {
         let inserted = transaction.execute(
             "INSERT INTO sessions (
                  id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
-                 memory_mode, model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms
+                 model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms
              )
              SELECT ?2, project_id, ?3, 'idle', cwd_path, model_name, base_url, access_mode,
-                    memory_mode, model_parameters_json, ?4, ?4, NULL
+                    model_parameters_json, ?4, ?4, NULL
              FROM sessions WHERE id = ?1",
             params![
                 source_session_id.to_string(),
@@ -723,63 +970,20 @@ impl SqliteSessionRepository {
             )));
         }
 
-        let copied_state = transaction.execute(
-            "INSERT INTO session_state (
-                 session_id, task_route, phase, review_scope_json, active_todo_id,
-                 active_targets_json, contract_refs_json, failure_kind, failure_summary,
-                 failure_tool_name, failure_targets_json, verification_todo_id,
-                 verification_commands_json, verification_failures_json,
-                 verification_evidence_summary, completion_closeout_ready,
-                 completion_open_work_count, completion_verification_pending,
-                 completion_route_contract_pending, completion_blocked_reason,
-                 completion_route_contract_summary, docs_route_state_json,
-                 implementation_handoff_json, verification_failure_cluster_json,
-                 verification_requirement_refs_json, token_accounting_json, updated_at_ms
-             )
-             SELECT ?2, task_route, phase, review_scope_json, active_todo_id,
-                    active_targets_json, contract_refs_json, failure_kind, failure_summary,
-                    failure_tool_name, failure_targets_json, verification_todo_id,
-                    verification_commands_json, verification_failures_json,
-                    verification_evidence_summary, completion_closeout_ready,
-                    completion_open_work_count, completion_verification_pending,
-                    completion_route_contract_pending, completion_blocked_reason,
-                    completion_route_contract_summary, docs_route_state_json,
-                    implementation_handoff_json, verification_failure_cluster_json,
-                    verification_requirement_refs_json, token_accounting_json, ?3
-             FROM session_state WHERE session_id = ?1",
-            params![
-                source_session_id.to_string(),
-                target_session_id.to_string(),
-                now
-            ],
-        )?;
-        if copied_state == 0 {
-            upsert_session_state_row(
-                &transaction,
-                target_session_id,
-                &SessionStateSnapshot::default(),
-                now,
-            )?;
-        }
-        transaction.execute(
-            "INSERT INTO session_todos (
-                 session_id, todo_id, position, content, kind, status, priority, targets_json,
-                 depends_on_json, success_criteria_json, blocked_by_json
-             )
-             SELECT ?2, todo_id, position, content, kind, status, priority, targets_json,
-                    depends_on_json, success_criteria_json, blocked_by_json
-             FROM session_todos WHERE session_id = ?1",
-            params![source_session_id.to_string(), target_session_id.to_string()],
-        )?;
         let (copied_history_items, copied_turn_items) = fork_canonical_items_in_transaction(
             &transaction,
             source_session_id,
             target_session_id,
         )?;
         if source_was_active {
+            let snapshot_turn_id = source_runtime_state
+                .admission
+                .expect("running source admission validated before snapshot creation")
+                .turn_id;
             append_interrupted_live_snapshot_marker_in_transaction(
                 &transaction,
                 target_session_id,
+                snapshot_turn_id,
                 "forked from active live session snapshot",
             )?;
         }
@@ -792,19 +996,6 @@ impl SqliteSessionRepository {
             copied_turn_items,
             interrupted_live_snapshot: source_was_active,
         })
-    }
-
-    pub async fn get_session_memory_mode(
-        &self,
-        id: SessionId,
-    ) -> Result<SessionMemoryMode, StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let value: String = connection.query_row(
-            "SELECT memory_mode FROM sessions WHERE id = ?1",
-            params![id.to_string()],
-            |row| row.get(0),
-        )?;
-        Ok(parse_memory_mode(&value))
     }
 
     pub async fn get_thread_goal(
@@ -1082,269 +1273,101 @@ impl SqliteSessionRepository {
         thread_id: SessionId,
     ) -> Result<Option<StoredThreadGoal>, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let row = connection
-            .query_row(
-                "SELECT thread_id, goal_id, objective, status, token_budget, tokens_used,
-                        time_used_seconds, created_at_ms, updated_at_ms
-                 FROM thread_goals
-                 WHERE thread_id = ?1",
-                params![thread_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, i64>(7)?,
-                        row.get::<_, i64>(8)?,
-                    ))
-                },
-            )
-            .optional()?;
-        row.map(stored_thread_goal_from_row).transpose()
+        stored_thread_goal_from_connection(&connection, thread_id)
     }
 
-    pub async fn append_user_message_with_protocol_bundle(
+    pub async fn append_user_turn_with_protocol_bundle(
         &self,
-        draft: NewMessage,
-        admission_id: &str,
-        parts: Vec<NewPart>,
-        initial_state: &SessionStateSnapshot,
+        session_id: SessionId,
+        admission_id: AdmissionId,
         turn: &UserTurn,
         protocol_turn_id: TurnId,
         protocol_sequence_no: i64,
-    ) -> Result<MessageRecord, StorageError> {
-        let id = MessageId::new();
-        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
-        let metadata_json = serde_json::to_string(&draft.metadata)?;
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let activated = transaction.execute(
-            "UPDATE sessions
-             SET status = 'running',
-                 updated_at_ms = ?4,
-                 completed_at_ms = NULL,
-                 active_turn_id = ?3
-             WHERE id = ?1
-               AND active_run_id = ?2
-               AND status = 'running'
-               AND active_turn_id IS NULL
-               AND active_run_lease_expires_at_ms > ?5",
-            params![
-                draft.session_id.to_string(),
-                admission_id,
-                protocol_turn_id.to_string(),
-                now,
-                now
-            ],
-        )? == 1;
-        if !activated {
+    ) -> Result<(), StorageError> {
+        if turn.turn_id != protocol_turn_id {
             return Err(StorageError::Message(format!(
-                "run admission {admission_id} no longer owns session {} while storing its user turn",
-                draft.session_id
+                "user turn identity mismatch: payload turn {} writer turn {protocol_turn_id}",
+                turn.turn_id
             )));
         }
-        let sequence_no = next_message_sequence_in_transaction(&transaction, draft.session_id)?;
-
-        transaction.execute(
-            "DELETE FROM session_todos WHERE session_id = ?1",
-            params![draft.session_id.to_string()],
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_active_admission_in_transaction(
+            &transaction,
+            session_id,
+            admission_id,
+            protocol_turn_id,
         )?;
-        upsert_session_state_row(&transaction, draft.session_id, initial_state, now)?;
-        transaction.execute(
-            "INSERT INTO messages (id, session_id, parent_message_id, role, sequence_no, metadata_json, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                id.to_string(),
-                draft.session_id.to_string(),
-                draft.parent_message_id.map(|value| value.to_string()),
-                match draft.role {
-                    MessageRole::User => "user",
-                    MessageRole::Assistant => "assistant",
-                },
-                sequence_no,
-                metadata_json,
-                now
-            ],
-        )?;
-        for (part_sequence_no, part) in parts.into_iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO message_parts (id, message_id, sequence_no, part_kind, payload_json, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    crate::session::PartId::new().to_string(),
-                    id.to_string(),
-                    part_sequence_no as i64,
-                    part_kind_text(part.kind),
-                    serde_json::to_string(&part.payload)?,
-                    now
-                ],
-            )?;
-        }
-        let run_event = crate::session::RunEvent::UserTurnStored {
-            session_id: draft.session_id,
-            message_id: id,
+        let event = RunEvent::UserTurnStored {
+            session_id,
             turn: Box::new(turn.clone()),
         };
         let projection = project_protocol_run_event(
-            &run_event,
-            Some(draft.session_id),
+            &event,
+            Some(session_id),
             protocol_turn_id,
             protocol_sequence_no,
         )
         .ok_or_else(|| {
-            StorageError::Message("UserTurnStored did not produce protocol projection".to_string())
+            StorageError::Message("UserTurnStored did not produce a protocol bundle".to_string())
         })?;
-        crate::protocol::insert_event_bundle_in_transaction(
+        let stored = insert_session_owned_event_bundle_in_transaction(
+            &SESSION_PROTOCOL_WRITE_AUTHORITY,
             &transaction,
             &projection.runtime_event,
             projection.history_item.as_ref(),
             projection.turn_item.as_ref(),
         )?;
+        let _history_item = stored.history_item.ok_or_else(|| {
+            StorageError::Message(
+                "UserTurnStored protocol bundle omitted its canonical history item".to_string(),
+            )
+        })?;
         transaction.commit()?;
-
-        Ok(MessageRecord {
-            id,
-            session_id: draft.session_id,
-            role: draft.role,
-            parent_message_id: draft.parent_message_id,
-            sequence_no,
-            created_at_ms: now,
-            metadata: draft.metadata,
-        })
+        Ok(())
     }
 
-    pub async fn append_assistant_message_with_protocol_start(
-        &self,
-        draft: NewMessage,
-        admission_id: &str,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-        model: String,
-    ) -> Result<(MessageRecord, RunEvent), StorageError> {
-        let id = MessageId::new();
-        let now = SystemClock.now_ms();
-        let metadata_json = serde_json::to_string(&draft.metadata)?;
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_active_admission_in_transaction(
-            &transaction,
-            draft.session_id,
-            admission_id,
-            protocol_turn_id,
-        )?;
-        let sequence_no = next_message_sequence_in_transaction(&transaction, draft.session_id)?;
-        transaction.execute(
-            "INSERT INTO messages (id, session_id, parent_message_id, role, sequence_no, metadata_json, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                id.to_string(),
-                draft.session_id.to_string(),
-                draft.parent_message_id.map(|value| value.to_string()),
-                match draft.role {
-                    MessageRole::User => "user",
-                    MessageRole::Assistant => "assistant",
-                },
-                sequence_no,
-                metadata_json,
-                now
-            ],
-        )?;
-        let event = RunEvent::AssistantStarted {
-            message_id: id,
-            model,
-        };
-        insert_protocol_projection_if_requested(
-            &transaction,
-            &event,
-            Some(draft.session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
-        )?;
-        transaction.commit()?;
-        Ok((
-            MessageRecord {
-                id,
-                session_id: draft.session_id,
-                role: draft.role,
-                parent_message_id: draft.parent_message_id,
-                sequence_no,
-                created_at_ms: now,
-                metadata: draft.metadata,
-            },
-            event,
-        ))
-    }
-
-    pub async fn append_message_with_parts_and_protocol_event(
-        &self,
-        draft: NewMessage,
-        parts: Vec<NewPart>,
-        event_factory: impl FnOnce(MessageId) -> RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-    ) -> Result<(MessageRecord, RunEvent), StorageError> {
-        let id = MessageId::new();
-        let now = SystemClock.now_ms();
-        let metadata_json = serde_json::to_string(&draft.metadata)?;
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        let sequence_no = next_message_sequence_in_transaction(&transaction, draft.session_id)?;
-        transaction.execute(
-            "INSERT INTO messages (id, session_id, parent_message_id, role, sequence_no, metadata_json, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                id.to_string(),
-                draft.session_id.to_string(),
-                draft.parent_message_id.map(|value| value.to_string()),
-                match draft.role {
-                    MessageRole::User => "user",
-                    MessageRole::Assistant => "assistant",
-                },
-                sequence_no,
-                metadata_json,
-                now
-            ],
-        )?;
-        for part in parts {
-            insert_part_in_transaction(&transaction, id, part)?;
-        }
-        let event = event_factory(id);
-        insert_protocol_projection_if_requested(
-            &transaction,
-            &event,
-            Some(draft.session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
-        )?;
-        transaction.commit()?;
-        Ok((
-            MessageRecord {
-                id,
-                session_id: draft.session_id,
-                role: draft.role,
-                parent_message_id: draft.parent_message_id,
-                sequence_no,
-                created_at_ms: now,
-                metadata: draft.metadata,
-            },
-            event,
-        ))
-    }
-
-    pub async fn append_part_with_protocol_bundle(
+    pub async fn commit_admitted_compaction_with_protocol_bundle(
         &self,
         session_id: SessionId,
-        admission_id: &str,
-        message_id: MessageId,
-        part: NewPart,
+        admission_id: AdmissionId,
         event: &RunEvent,
         protocol_turn_id: TurnId,
         protocol_sequence_no: Option<i64>,
-    ) -> Result<PartRecord, StorageError> {
+    ) -> Result<(), StorageError> {
+        let RunEvent::CompactionCompleted {
+            summarized_messages,
+            summary,
+            replacement_item_ids,
+        } = event
+        else {
+            return Err(StorageError::Message(
+                "compaction writer requires a CompactionCompleted event".to_string(),
+            ));
+        };
+        if replacement_item_ids.is_empty() {
+            return Err(StorageError::Message(
+                "compaction must replace at least one canonical history item".to_string(),
+            ));
+        }
+        if *summarized_messages != replacement_item_ids.len() {
+            return Err(StorageError::Message(format!(
+                "compaction count mismatch: summarized {summarized_messages} messages but supplied {} replacement ids",
+                replacement_item_ids.len()
+            )));
+        }
+        if summary.trim().is_empty() {
+            return Err(StorageError::Message(
+                "compaction summary must not be empty".to_string(),
+            ));
+        }
+        let unique_replacements = replacement_item_ids.iter().copied().collect::<HashSet<_>>();
+        if unique_replacements.len() != replacement_item_ids.len() {
+            return Err(StorageError::Message(
+                "compaction replacement ids must be unique".to_string(),
+            ));
+        }
+
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_active_admission_in_transaction(
@@ -1353,208 +1376,320 @@ impl SqliteSessionRepository {
             admission_id,
             protocol_turn_id,
         )?;
-        let record = insert_part_in_transaction(&transaction, message_id, part)?;
-        insert_protocol_projection_if_requested(
-            &transaction,
-            event,
-            Some(session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
-        )?;
-        transaction.commit()?;
-        Ok(record)
-    }
-
-    pub async fn update_state_with_protocol_event(
-        &self,
-        session_id: SessionId,
-        state: &SessionStateSnapshot,
-        event: &RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-    ) -> Result<(), StorageError> {
-        let now = SystemClock.now_ms();
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        upsert_session_state_row(&transaction, session_id, state, now)?;
-        insert_protocol_projection_if_requested(
-            &transaction,
-            event,
-            Some(session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub async fn update_session_title_with_protocol_event(
-        &self,
-        session_id: SessionId,
-        title: &str,
-        event: &RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-    ) -> Result<(), StorageError> {
-        let now = SystemClock.now_ms();
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        transaction.execute(
-            "UPDATE sessions SET title = ?2, updated_at_ms = ?3 WHERE id = ?1",
-            params![session_id.to_string(), title, now],
-        )?;
-        insert_protocol_projection_if_requested(
-            &transaction,
-            event,
-            Some(session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub async fn set_status_with_protocol_event(
-        &self,
-        session_id: SessionId,
-        status: SessionStatus,
-        event: &RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-    ) -> Result<(), StorageError> {
-        let now = SystemClock.now_ms();
-        let status_text = match status {
-            SessionStatus::Idle => "idle",
-            SessionStatus::Running => "running",
-            SessionStatus::Completed => "completed",
-            SessionStatus::AwaitingUser => "awaiting_user",
-            SessionStatus::Cancelled => "cancelled",
-            SessionStatus::Failed => "failed",
+        {
+            let mut statement = transaction.prepare(
+                "SELECT 1
+                 FROM protocol_history_items
+                 WHERE id = ?1 AND session_id = ?2",
+            )?;
+            for replacement_item_id in replacement_item_ids {
+                let exists = statement
+                    .query_row(
+                        params![replacement_item_id.to_string(), session_id.to_string()],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !exists {
+                    return Err(StorageError::Message(format!(
+                        "compaction replacement item {replacement_item_id} does not belong to session {session_id}"
+                    )));
+                }
+            }
+        }
+        let sequence_no = match protocol_sequence_no {
+            Some(sequence_no) => sequence_no,
+            None => resolve_terminal_protocol_sequence_in_transaction(
+                &transaction,
+                session_id,
+                protocol_turn_id,
+                None,
+            )?,
         };
-        let completed_at_ms = if matches!(
-            status,
-            SessionStatus::Completed
-                | SessionStatus::AwaitingUser
-                | SessionStatus::Cancelled
-                | SessionStatus::Failed
-        ) {
-            Some(now)
+        let projection =
+            project_protocol_run_event(event, Some(session_id), protocol_turn_id, sequence_no)
+                .ok_or_else(|| {
+                    StorageError::Message(
+                        "CompactionCompleted did not produce a protocol bundle".to_string(),
+                    )
+                })?;
+        let stored = insert_session_owned_event_bundle_in_transaction(
+            &SESSION_PROTOCOL_WRITE_AUTHORITY,
+            &transaction,
+            &projection.runtime_event,
+            projection.history_item.as_ref(),
+            projection.turn_item.as_ref(),
+        )?;
+        if stored.history_item.is_none() {
+            return Err(StorageError::Message(
+                "CompactionCompleted protocol bundle omitted canonical history".to_string(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn append_inter_agent_communication_with_protocol_bundle(
+        &self,
+        session_id: SessionId,
+        communication: InterAgentCommunication,
+        require_active_recipient: bool,
+    ) -> Result<HistoryItemId, StorageError> {
+        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(runtime_state) = session_runtime_state_from_connection(&transaction, session_id)?
+        else {
+            return Err(StorageError::Message(format!(
+                "inter-agent communication target session {session_id} does not exist"
+            )));
+        };
+        let active_turn_id = if runtime_state.status == SessionStatus::Running {
+            let admission = runtime_state
+                .admission
+                .expect("running recipient admission validated before mail append");
+            if !admission.is_fresh_at(now) {
+                return Err(StorageError::Message(format!(
+                    "run admission lease expired for recipient session {session_id}"
+                )));
+            }
+            Some(admission.turn_id)
         } else {
             None
         };
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        transaction.execute(
+        let has_active_admission = active_turn_id.is_some();
+        if require_active_recipient && !has_active_admission {
+            return Err(StorageError::Message(format!(
+                "recipient session {session_id} became terminal before inter-agent communication could be committed"
+            )));
+        }
+        let history_item_id = match active_turn_id {
+            Some(turn_id) => {
+                let projection =
+                    project_inter_agent_communication(session_id, turn_id, 0, communication);
+                insert_session_owned_event_bundle_in_transaction(
+                    &SESSION_PROTOCOL_WRITE_AUTHORITY,
+                    &transaction,
+                    &projection.runtime_event,
+                    projection.history_item.as_ref(),
+                    projection.turn_item.as_ref(),
+                )?
+                .history_item
+                .ok_or_else(|| {
+                    StorageError::Message(
+                        "inter-agent communication projection omitted canonical history"
+                            .to_string(),
+                    )
+                })?
+                .id
+            }
+            None => insert_idle_inter_agent_history_in_transaction(
+                &SESSION_PROTOCOL_WRITE_AUTHORITY,
+                &transaction,
+                session_id,
+                communication,
+            )?,
+        };
+        transaction.commit()?;
+        Ok(history_item_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_raw_runtime_state_for_corruption_test(
+        &self,
+        session_id: SessionId,
+        status: &str,
+        active_run_id: Option<&str>,
+        active_turn_id: Option<&str>,
+        lease_expires_at_ms: Option<i64>,
+    ) -> Result<(), StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
             "UPDATE sessions
              SET status = ?2,
-                 updated_at_ms = ?3,
-                 completed_at_ms = ?4
+                 active_run_id = ?3,
+                 active_turn_id = ?4,
+                 active_run_lease_expires_at_ms = ?5
              WHERE id = ?1",
-            params![session_id.to_string(), status_text, now, completed_at_ms],
+            params![
+                session_id.to_string(),
+                status,
+                active_run_id,
+                active_turn_id,
+                lease_expires_at_ms
+            ],
         )?;
-        insert_protocol_projection_if_requested(
-            &transaction,
-            event,
-            Some(session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
-        )?;
-        transaction.commit()?;
         Ok(())
     }
 
-    pub async fn admit_session_run(
+    pub async fn admit_session_turn(
         &self,
         session_id: SessionId,
-    ) -> Result<Option<String>, StorageError> {
-        self.admit_session_run_at(
+        turn_id: TurnId,
+    ) -> Result<Option<AdmittedTurnSnapshot>, StorageError> {
+        match self
+            .admit_session_turn_request_at(
+                session_id,
+                TurnAdmissionRequest::preserve_goal(turn_id),
+                SystemClock::now_ms(),
+                RUN_ADMISSION_LEASE_DURATION_MS,
+            )
+            .await?
+        {
+            ActiveGoalTurnAdmission::Admitted(snapshot) => Ok(Some(snapshot)),
+            ActiveGoalTurnAdmission::Unavailable => Ok(None),
+            ActiveGoalTurnAdmission::GoalInactive => {
+                unreachable!("unconditional admission cannot reject an inactive goal")
+            }
+        }
+    }
+
+    pub async fn admit_active_goal_continuation_turn(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<ActiveGoalTurnAdmission, StorageError> {
+        self.admit_session_turn_request_at(
             session_id,
+            TurnAdmissionRequest::require_active_goal(turn_id),
             SystemClock::now_ms(),
             RUN_ADMISSION_LEASE_DURATION_MS,
         )
         .await
     }
 
-    pub async fn admit_session_run_at(
+    pub async fn admit_session_turn_with_goal_objective(
         &self,
         session_id: SessionId,
+        turn_id: TurnId,
+        objective: impl Into<String>,
+    ) -> Result<Option<AdmittedTurnSnapshot>, StorageError> {
+        match self
+            .admit_session_turn_request_at(
+                session_id,
+                TurnAdmissionRequest::set_goal_objective(turn_id, objective),
+                SystemClock::now_ms(),
+                RUN_ADMISSION_LEASE_DURATION_MS,
+            )
+            .await?
+        {
+            ActiveGoalTurnAdmission::Admitted(snapshot) => Ok(Some(snapshot)),
+            ActiveGoalTurnAdmission::Unavailable => Ok(None),
+            ActiveGoalTurnAdmission::GoalInactive => {
+                unreachable!("goal-setting admission cannot reject an inactive goal")
+            }
+        }
+    }
+
+    pub async fn admit_session_turn_at(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
         now_ms: i64,
         lease_duration_ms: i64,
-    ) -> Result<Option<String>, StorageError> {
-        let admission_id = ulid::Ulid::new().to_string();
+    ) -> Result<Option<AdmittedTurnSnapshot>, StorageError> {
+        match self
+            .admit_session_turn_request_at(
+                session_id,
+                TurnAdmissionRequest::preserve_goal(turn_id),
+                now_ms,
+                lease_duration_ms,
+            )
+            .await?
+        {
+            ActiveGoalTurnAdmission::Admitted(snapshot) => Ok(Some(snapshot)),
+            ActiveGoalTurnAdmission::Unavailable => Ok(None),
+            ActiveGoalTurnAdmission::GoalInactive => {
+                unreachable!("unconditional admission cannot reject an inactive goal")
+            }
+        }
+    }
+
+    async fn admit_session_turn_request_at(
+        &self,
+        session_id: SessionId,
+        request: TurnAdmissionRequest,
+        now_ms: i64,
+        lease_duration_ms: i64,
+    ) -> Result<ActiveGoalTurnAdmission, StorageError> {
+        if let TurnGoalAdmissionChange::SetObjective(objective) = &request.goal_change {
+            validate_goal_objective_and_budget(objective, None)?;
+        }
+        let admission_id = AdmissionId::new();
         let now = normalize_run_lease_now_ms(now_ms);
         let lease_expires_at_ms = run_lease_expiry_ms(now, lease_duration_ms);
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = transaction
-            .query_row(
-                "SELECT status, active_run_id, active_turn_id,
-                        active_run_lease_expires_at_ms
-                 FROM sessions
-                 WHERE id = ?1",
-                params![session_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((status, active_run_id, active_turn_id, lease_expires_at_ms_current)) = current
+        let Some(runtime_state) = session_runtime_state_from_connection(&transaction, session_id)?
         else {
             transaction.commit()?;
-            return Ok(None);
+            return Ok(ActiveGoalTurnAdmission::Unavailable);
         };
-        if active_run_id.is_some() {
-            if run_lease_is_fresh(lease_expires_at_ms_current, now) {
+        if let Some(durable_admission) = runtime_state.admission {
+            if durable_admission.is_fresh_at(now) {
                 transaction.commit()?;
-                return Ok(None);
+                return Ok(ActiveGoalTurnAdmission::Unavailable);
             }
             recover_expired_run_admission_in_transaction(
                 &transaction,
                 session_id,
-                &status,
-                active_turn_id.as_deref(),
-                now,
-            )?;
-        } else if matches!(status.as_str(), "running" | "awaiting_user") {
-            recover_expired_run_admission_in_transaction(
-                &transaction,
-                session_id,
-                &status,
-                active_turn_id.as_deref(),
+                runtime_state.status,
+                durable_admission,
                 now,
             )?;
         }
+        if request.goal_requirement == TurnGoalAdmissionRequirement::Active {
+            let active_goal = stored_thread_goal_from_connection(&transaction, session_id)?
+                .filter(|stored| stored.goal.status == ThreadGoalStatus::Active);
+            if active_goal.is_none() {
+                transaction.commit()?;
+                return Ok(ActiveGoalTurnAdmission::GoalInactive);
+            }
+        }
+        ensure_turn_identity_unused_in_transaction(&transaction, session_id, request.turn_id)?;
         let admitted = transaction.execute(
             "UPDATE sessions
              SET status = 'running',
                  updated_at_ms = ?2,
-                 completed_at_ms = NULL,
-                 active_run_id = ?3,
-                 active_turn_id = NULL,
-                 active_run_lease_expires_at_ms = ?4
-             WHERE id = ?1
-               AND active_run_id IS NULL
-               AND status IN ('idle', 'completed', 'cancelled', 'failed')",
+                  completed_at_ms = NULL,
+                  active_run_id = ?3,
+                  active_turn_id = ?4,
+                  active_run_lease_expires_at_ms = ?5
+              WHERE id = ?1
+                AND active_run_id IS NULL
+                AND status IN ('idle', 'completed', 'cancelled', 'failed')",
             params![
                 session_id.to_string(),
                 now,
-                admission_id,
+                admission_id.to_string(),
+                request.turn_id.to_string(),
                 lease_expires_at_ms
             ],
         )? == 1;
+        if !admitted {
+            transaction.commit()?;
+            return Ok(ActiveGoalTurnAdmission::Unavailable);
+        }
+        if let TurnGoalAdmissionChange::SetObjective(objective) = &request.goal_change {
+            set_thread_goal_objective_in_transaction(&transaction, session_id, objective, now)?;
+        }
+        let goal = stored_thread_goal_from_connection(&transaction, session_id)?.map(|stored| {
+            AdmittedThreadGoal {
+                goal_id: stored.goal_id,
+                goal: stored.goal,
+            }
+        });
         transaction.commit()?;
-        Ok(admitted.then_some(admission_id))
+        Ok(ActiveGoalTurnAdmission::Admitted(AdmittedTurnSnapshot {
+            admission_id,
+            goal,
+        }))
     }
 
     pub async fn renew_admitted_run_lease(
         &self,
         session_id: SessionId,
-        admission_id: &str,
+        admission_id: AdmissionId,
         turn_id: TurnId,
     ) -> Result<RunAdmissionLeaseRenewalOutcome, StorageError> {
         self.renew_admitted_run_lease_at(
@@ -1570,76 +1705,83 @@ impl SqliteSessionRepository {
     pub async fn renew_admitted_run_lease_at(
         &self,
         session_id: SessionId,
-        admission_id: &str,
+        admission_id: AdmissionId,
         turn_id: TurnId,
         now_ms: i64,
         lease_duration_ms: i64,
     ) -> Result<RunAdmissionLeaseRenewalOutcome, StorageError> {
         let now = normalize_run_lease_now_ms(now_ms);
         let requested_expiry = run_lease_expiry_ms(now, lease_duration_ms);
+        let admission_id_text = admission_id.to_string();
+        let turn_id_text = turn_id.to_string();
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let state = transaction
-            .query_row(
-                "SELECT status, active_run_id, active_turn_id,
-                        active_run_lease_expires_at_ms
-                 FROM sessions
-                 WHERE id = ?1",
-                params![session_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                    ))
-                },
-            )
-            .optional()?;
+        let state = session_runtime_state_from_connection(&transaction, session_id)?;
         let outcome = match state {
-            Some((status, active_run_id, active_turn_id, lease_expires_at_ms))
-                if active_run_id.as_deref() == Some(admission_id)
-                    && active_turn_id
-                        .as_deref()
-                        .is_none_or(|active_turn_id| active_turn_id == turn_id.to_string())
-                    && run_lease_is_fresh(lease_expires_at_ms, now)
-                    && matches!(status.as_str(), "running" | "awaiting_user") =>
+            Some(runtime_state) if runtime_state.status == SessionStatus::Running => {
+                let active_admission = runtime_state
+                    .admission
+                    .expect("running session admission validated before lease renewal");
+                if !active_admission.is_fresh_at(now)
+                    || active_admission.admission_id != admission_id
+                    || active_admission.turn_id != turn_id
+                {
+                    RunAdmissionLeaseRenewalOutcome::SupersededOrExpired
+                } else {
+                    let renewed = transaction.execute(
+                        "UPDATE sessions
+                         SET active_run_lease_expires_at_ms = MAX(
+                                 active_run_lease_expires_at_ms,
+                                 ?4
+                             )
+                          WHERE id = ?1
+                            AND active_run_id = ?2
+                            AND active_turn_id = ?3
+                            AND active_run_lease_expires_at_ms > ?5
+                            AND status = 'running'",
+                        params![
+                            session_id.to_string(),
+                            admission_id_text,
+                            turn_id_text,
+                            requested_expiry,
+                            now
+                        ],
+                    )?;
+                    if renewed == 1 {
+                        RunAdmissionLeaseRenewalOutcome::Renewed
+                    } else {
+                        RunAdmissionLeaseRenewalOutcome::SupersededOrExpired
+                    }
+                }
+            }
+            Some(runtime_state)
+                if matches!(
+                    runtime_state.status,
+                    SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                ) =>
             {
-                let renewed = transaction.execute(
-                    "UPDATE sessions
-                     SET active_run_lease_expires_at_ms = MAX(
-                             active_run_lease_expires_at_ms,
-                             ?4
-                         )
-                     WHERE id = ?1
-                       AND active_run_id = ?2
-                       AND (active_turn_id IS NULL OR active_turn_id = ?3)
-                       AND active_run_lease_expires_at_ms > ?5
-                       AND status IN ('running', 'awaiting_user')",
-                    params![
-                        session_id.to_string(),
-                        admission_id,
-                        turn_id.to_string(),
-                        requested_expiry,
-                        now
-                    ],
-                )?;
-                if renewed == 1 {
-                    RunAdmissionLeaseRenewalOutcome::Renewed
+                let retained_admission = runtime_state.admission;
+                if let Some(retained_admission) = retained_admission {
+                    let terminal = terminal_for_retained_admission_in_connection(
+                        &transaction,
+                        session_id,
+                        runtime_state.status,
+                        retained_admission,
+                    )?;
+                    if retained_admission.admission_id == admission_id
+                        && retained_admission.turn_id == turn_id
+                    {
+                        RunAdmissionLeaseRenewalOutcome::Terminal(terminal)
+                    } else {
+                        RunAdmissionLeaseRenewalOutcome::SupersededOrExpired
+                    }
+                } else if let Some(terminal) =
+                    terminal_for_turn_in_connection(&transaction, session_id, turn_id)?
+                {
+                    RunAdmissionLeaseRenewalOutcome::Terminal(terminal)
                 } else {
                     RunAdmissionLeaseRenewalOutcome::SupersededOrExpired
                 }
-            }
-            Some((status, active_run_id, active_turn_id, lease_expires_at_ms))
-                if matches!(status.as_str(), "completed" | "cancelled" | "failed")
-                    && ((active_run_id.as_deref() == Some(admission_id)
-                        && active_turn_id.as_deref().is_none_or(|active_turn_id| {
-                            active_turn_id == turn_id.to_string()
-                        })
-                        && run_lease_is_fresh(lease_expires_at_ms, now))
-                        || active_run_id.is_none()) =>
-            {
-                RunAdmissionLeaseRenewalOutcome::GracefulTerminal
             }
             _ => RunAdmissionLeaseRenewalOutcome::SupersededOrExpired,
         };
@@ -1647,41 +1789,10 @@ impl SqliteSessionRepository {
         Ok(outcome)
     }
 
-    pub async fn try_admit_session_run(&self, session_id: SessionId) -> Result<bool, StorageError> {
-        Ok(self.admit_session_run(session_id).await?.is_some())
-    }
-
-    pub async fn activate_admitted_turn(
-        &self,
-        session_id: SessionId,
-        admission_id: &str,
-        turn_id: TurnId,
-    ) -> Result<bool, StorageError> {
-        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let activated = connection.execute(
-            "UPDATE sessions
-             SET active_turn_id = ?3, updated_at_ms = ?4
-             WHERE id = ?1
-               AND active_run_id = ?2
-               AND status = 'running'
-               AND (active_turn_id IS NULL OR active_turn_id = ?3)
-               AND active_run_lease_expires_at_ms > ?5",
-            params![
-                session_id.to_string(),
-                admission_id,
-                turn_id.to_string(),
-                now,
-                now
-            ],
-        )? == 1;
-        Ok(activated)
-    }
-
     pub async fn admitted_run_status(
         &self,
         session_id: SessionId,
-        admission_id: &str,
+        admission_id: AdmissionId,
         turn_id: TurnId,
     ) -> Result<Option<SessionStatus>, StorageError> {
         self.admitted_run_status_at(session_id, admission_id, turn_id, SystemClock::now_ms())
@@ -1691,107 +1802,43 @@ impl SqliteSessionRepository {
     pub async fn admitted_run_status_at(
         &self,
         session_id: SessionId,
-        admission_id: &str,
+        admission_id: AdmissionId,
         turn_id: TurnId,
         now_ms: i64,
     ) -> Result<Option<SessionStatus>, StorageError> {
         let now = normalize_run_lease_now_ms(now_ms);
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let status = connection
-            .query_row(
-                "SELECT status
-                 FROM sessions
-                 WHERE id = ?1
-                   AND active_run_id = ?2
-                   AND active_turn_id = ?3
-                   AND active_run_lease_expires_at_ms > ?4",
-                params![
-                    session_id.to_string(),
-                    admission_id,
-                    turn_id.to_string(),
-                    now
-                ],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|status| parse_status(&status));
-        Ok(status)
+        let Some(runtime_state) = session_runtime_state_from_connection(&connection, session_id)?
+        else {
+            return Ok(None);
+        };
+        Ok(runtime_state
+            .fresh_admission_at(now)
+            .filter(|admission| {
+                admission.admission_id == admission_id && admission.turn_id == turn_id
+            })
+            .map(|_| runtime_state.status))
     }
 
-    pub async fn corroborated_terminal_status_for_turn(
+    pub async fn durable_terminal_for_turn(
         &self,
         session_id: SessionId,
         turn_id: TurnId,
-    ) -> Result<Option<SessionStatus>, StorageError> {
+    ) -> Result<Option<crate::session::model::DurableTurnTerminal>, StorageError> {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction()?;
-        let session_status = transaction
-            .query_row(
-                "SELECT status FROM sessions WHERE id = ?1",
-                params![session_id.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|status| parse_status(&status));
-        let Some(session_status) = session_status else {
+        let session_exists = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            params![session_id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !session_exists {
             transaction.commit()?;
             return Ok(None);
-        };
-        let mut statement = transaction.prepare(
-            "SELECT msg_json
-             FROM protocol_runtime_events
-             WHERE session_id = ?1 AND turn_id = ?2
-             ORDER BY sequence_no DESC, rowid DESC",
-        )?;
-        let rows = statement.query_map(
-            params![session_id.to_string(), turn_id.to_string()],
-            |row| row.get::<_, String>(0),
-        )?;
-        let mut protocol_terminal_status = None;
-        for row in rows {
-            let msg = serde_json::from_str::<RuntimeEventMsg>(&row?)?;
-            protocol_terminal_status = match msg {
-                RuntimeEventMsg::TurnCompleted { .. } => Some(SessionStatus::Completed),
-                RuntimeEventMsg::TurnAwaitingUser { .. } => Some(SessionStatus::AwaitingUser),
-                RuntimeEventMsg::TurnInterrupted { .. } => Some(SessionStatus::Cancelled),
-                RuntimeEventMsg::TurnFailed { .. } => Some(SessionStatus::Failed),
-                _ => None,
-            };
-            if protocol_terminal_status.is_some() {
-                break;
-            }
         }
-        drop(statement);
+        let protocol_terminal = terminal_for_turn_in_connection(&transaction, session_id, turn_id)?;
         transaction.commit()?;
-        Ok(protocol_terminal_status.filter(|status| *status == session_status))
-    }
-
-    pub async fn active_turn_for_session(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<TurnId>, StorageError> {
-        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let turn_id = connection
-            .query_row(
-                "SELECT active_turn_id
-                 FROM sessions
-                 WHERE id = ?1
-                   AND active_run_id IS NOT NULL
-                   AND active_turn_id IS NOT NULL
-                   AND active_run_lease_expires_at_ms > ?2
-                   AND status IN ('running', 'awaiting_user')",
-                params![session_id.to_string(), now],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|value| {
-                value
-                    .parse::<TurnId>()
-                    .map_err(|error| StorageError::Message(error.to_string()))
-            })
-            .transpose()?;
-        Ok(turn_id)
+        Ok(protocol_terminal)
     }
 
     pub async fn has_fresh_run_admission(
@@ -1809,119 +1856,113 @@ impl SqliteSessionRepository {
     ) -> Result<bool, StorageError> {
         let now = normalize_run_lease_now_ms(now_ms);
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let fresh = connection
-            .query_row(
-                "SELECT 1
-                 FROM sessions
-                 WHERE id = ?1
-                   AND active_run_id IS NOT NULL
-                   AND active_run_lease_expires_at_ms > ?2",
-                params![session_id.to_string(), now],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        Ok(fresh)
+        let Some(runtime_state) = session_runtime_state_from_connection(&connection, session_id)?
+        else {
+            return Ok(false);
+        };
+        Ok(runtime_state.fresh_admission_at(now).is_some())
     }
 
-    pub async fn list_admitted_turn_steers(
+    pub async fn fresh_running_turn_for_session(
         &self,
         session_id: SessionId,
-        admission_id: &str,
-        turn_id: TurnId,
-    ) -> Result<Option<Vec<HistoryItem>>, StorageError> {
-        self.list_admitted_turn_steers_at(session_id, admission_id, turn_id, SystemClock::now_ms())
-            .await
-    }
-
-    pub async fn list_admitted_turn_steers_at(
-        &self,
-        session_id: SessionId,
-        admission_id: &str,
-        turn_id: TurnId,
-        now_ms: i64,
-    ) -> Result<Option<Vec<HistoryItem>>, StorageError> {
-        let now = normalize_run_lease_now_ms(now_ms);
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owned = transaction
-            .query_row(
-                "SELECT 1
-                 FROM sessions
-                 WHERE id = ?1
-                   AND active_run_id = ?2
-                   AND active_turn_id = ?3
-                   AND active_run_lease_expires_at_ms > ?4
-                   AND status IN ('running', 'awaiting_user')",
-                params![
-                    session_id.to_string(),
-                    admission_id,
-                    turn_id.to_string(),
-                    now
-                ],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if !owned {
-            transaction.commit()?;
+    ) -> Result<Option<TurnId>, StorageError> {
+        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let Some(runtime_state) = session_runtime_state_from_connection(&connection, session_id)?
+        else {
             return Ok(None);
-        }
-        let mut statement = transaction.prepare(
-            "SELECT id, sequence_no, payload_json, created_at_ms
-             FROM protocol_history_items
-             WHERE session_id = ?1 AND turn_id = ?2
-             ORDER BY sequence_no ASC",
-        )?;
-        let rows = statement.query_map(
-            params![session_id.to_string(), turn_id.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
-        )?;
-        let mut steers = Vec::new();
-        for row in rows {
-            let (id, sequence_no, payload_json, created_at_ms) = row?;
-            let payload = serde_json::from_str::<HistoryItemPayload>(&payload_json)?;
-            if matches!(payload, HistoryItemPayload::SteerTurn { .. }) {
-                steers.push(HistoryItem {
-                    id: id.parse::<HistoryItemId>().map_err(|error| {
-                        StorageError::Message(format!("invalid steer history id: {error}"))
-                    })?,
-                    session_id,
-                    turn_id,
-                    sequence_no,
-                    created_at_ms,
-                    payload,
-                });
+        };
+        Ok(runtime_state.fresh_running_turn_at(now))
+    }
+
+    pub async fn session_blocks_mutation(
+        &self,
+        session_id: SessionId,
+    ) -> Result<bool, StorageError> {
+        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let Some(runtime_state) = session_runtime_state_from_connection(&connection, session_id)?
+        else {
+            return Ok(false);
+        };
+        Ok(runtime_state.blocks_mutation_at(now))
+    }
+
+    pub(crate) async fn durable_session_stop_state(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<DurableSessionStopState>, StorageError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        Ok(
+            session_runtime_state_from_connection(&connection, session_id)?
+                .map(ValidatedSessionRuntimeState::stop_state),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn captured_running_terminal_target(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<RunningSessionTerminalTarget>, StorageError> {
+        Ok(match self.durable_session_stop_state(session_id).await? {
+            Some(DurableSessionStopState::Running(target)) => Some(target),
+            Some(DurableSessionStopState::Idle | DurableSessionStopState::Terminal(_)) | None => {
+                None
             }
-        }
-        drop(statement);
-        transaction.commit()?;
-        Ok(Some(steers))
+        })
+    }
+
+    pub async fn mutation_blocker_in_session_tree(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionId>, StorageError> {
+        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        active_session_for_mutation_branch(&connection, session_id, true, now)
     }
 
     pub async fn release_stopped_run_admission(
         &self,
         session_id: SessionId,
-        admission_id: &str,
+        admission_id: AdmissionId,
     ) -> Result<bool, StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let released = connection.execute(
-            "UPDATE sessions
-             SET active_run_id = NULL,
-                 active_turn_id = NULL,
-                 active_run_lease_expires_at_ms = NULL
-             WHERE id = ?1
-               AND active_run_id = ?2
-               AND status NOT IN ('running', 'awaiting_user')",
-            params![session_id.to_string(), admission_id],
-        )? == 1;
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state = session_runtime_state_from_connection(&transaction, session_id)?;
+        let released = match state {
+            Some(runtime_state)
+                if runtime_state.status != SessionStatus::Running
+                    && runtime_state.admission.is_some() =>
+            {
+                let admission = runtime_state
+                    .admission
+                    .expect("terminal retained admission matched above");
+                if admission.admission_id != admission_id {
+                    false
+                } else {
+                    transaction.execute(
+                        "UPDATE sessions
+                         SET active_run_id = NULL,
+                             active_turn_id = NULL,
+                             active_run_lease_expires_at_ms = NULL
+                         WHERE id = ?1
+                           AND active_run_id = ?2
+                           AND active_turn_id = ?3
+                           AND active_run_lease_expires_at_ms = ?4
+                           AND status != 'running'",
+                        params![
+                            session_id.to_string(),
+                            admission.admission_id.to_string(),
+                            admission.turn_id.to_string(),
+                            admission.lease_expires_at_ms,
+                        ],
+                    )? == 1
+                }
+            }
+            _ => false,
+        };
+        transaction.commit()?;
         Ok(released)
     }
 
@@ -1933,48 +1974,23 @@ impl SqliteSessionRepository {
         let now = normalize_run_lease_now_ms(SystemClock::now_ms());
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let state = transaction
-            .query_row(
-                "SELECT status, active_run_id, active_turn_id,
-                        active_run_lease_expires_at_ms
-                 FROM sessions
-                 WHERE id = ?1",
-                params![session_id.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                    ))
-                },
-            )
-            .optional()?
+        let runtime_state = session_runtime_state_from_connection(&transaction, session_id)?
             .ok_or_else(|| StorageError::Message(format!("session {session_id} was not found")))?;
-        let (status, active_run_id, active_turn_id, lease_expires_at_ms) = state;
-        if !matches!(status.as_str(), "running" | "awaiting_user") {
+        if runtime_state.status != SessionStatus::Running {
             return Err(StorageError::Message(format!(
-                "no active running turn to steer for session {session_id}; current status is {status}"
+                "no active running turn to steer for session {session_id}; current status is {}",
+                runtime_state.status.key()
             )));
         }
-        if active_run_id.is_none() {
-            return Err(StorageError::Message(format!(
-                "running session {session_id} has no durable run admission owner"
-            )));
-        }
-        if !run_lease_is_fresh(lease_expires_at_ms, now) {
+        let durable_admission = runtime_state
+            .admission
+            .expect("running steer target admission validated before freshness check");
+        if !durable_admission.is_fresh_at(now) {
             return Err(StorageError::Message(format!(
                 "run admission lease expired for session {session_id}"
             )));
         }
-        let active_turn_id = active_turn_id
-            .ok_or_else(|| {
-                StorageError::Message(format!(
-                    "running session {session_id} has not published its active turn yet"
-                ))
-            })?
-            .parse::<TurnId>()
-            .map_err(|error| StorageError::Message(error.to_string()))?;
+        let active_turn_id = durable_admission.turn_id;
         if active_turn_id != steer.expected_turn_id {
             return Err(StorageError::Message(format!(
                 "expected active turn id `{}` but current active turn id is `{active_turn_id}`",
@@ -1985,7 +2001,9 @@ impl SqliteSessionRepository {
         let history_item = HistoryItem {
             id: HistoryItemId::new(),
             session_id,
-            turn_id: active_turn_id,
+            scope: crate::protocol::HistoryScope::Turn {
+                turn_id: active_turn_id,
+            },
             sequence_no: 0,
             created_at_ms: now,
             payload: HistoryItemPayload::SteerTurn {
@@ -2014,7 +2032,8 @@ impl SqliteSessionRepository {
                 client_user_message_id: steer.client_user_message_id.clone(),
             },
         };
-        let stored = insert_event_bundle_in_transaction(
+        let stored = insert_session_owned_event_bundle_in_transaction(
+            &SESSION_PROTOCOL_WRITE_AUTHORITY,
             &transaction,
             &event,
             Some(&history_item),
@@ -2031,274 +2050,268 @@ impl SqliteSessionRepository {
         &self,
         project_id: ProjectId,
     ) -> Result<Option<SessionId>, StorageError> {
-        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let session_id = connection
-            .query_row(
-                "SELECT id FROM sessions
-                 WHERE project_id = ?1
-                   AND status IN ('running', 'awaiting_user')
-                   AND active_run_lease_expires_at_ms > ?2
-                 ORDER BY updated_at_ms DESC, id DESC
-                 LIMIT 1",
-                params![project_id.to_string(), now],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map(|value| {
-                value
-                    .parse::<SessionId>()
-                    .map_err(|error| StorageError::Message(error.to_string()))
-            })
-            .transpose()?;
-        Ok(session_id)
+        mutation_blocker_for_project_in_connection(&connection, project_id, SystemClock::now_ms())
     }
 
-    pub async fn terminalize_active_session_with_protocol_event(
+    pub(crate) async fn terminalize_captured_running_session_with_protocol_event(
         &self,
         session_id: SessionId,
-        status: SessionStatus,
+        event: &RunEvent,
+        target: RunningSessionTerminalTarget,
+    ) -> Result<bool, StorageError> {
+        Ok(self
+            .terminalize_turn_with_protocol_event_guarded(
+                session_id,
+                event,
+                TerminalOwnerGuard::Captured(target),
+                None,
+                true,
+                None,
+                None,
+                None,
+            )
+            .await?
+            .was_applied())
+    }
+
+    pub(crate) async fn recover_captured_running_session_with_protocol_event(
+        &self,
+        session_id: SessionId,
+        event: &RunEvent,
+        target: RunningSessionTerminalTarget,
+    ) -> Result<bool, StorageError> {
+        Ok(self
+            .terminalize_turn_with_protocol_event_guarded(
+                session_id,
+                event,
+                TerminalOwnerGuard::Captured(target),
+                None,
+                false,
+                None,
+                None,
+                None,
+            )
+            .await?
+            .was_applied())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn terminalize_admitted_turn_with_protocol_event(
+        &self,
+        session_id: SessionId,
+        admission_id: AdmissionId,
         event: &RunEvent,
         protocol_turn_id: TurnId,
         protocol_sequence_no: Option<i64>,
-    ) -> Result<bool, StorageError> {
-        self.terminalize_active_session_with_protocol_event_inner(
+        expected_seen_steer_count: Option<usize>,
+        expected_seen_agent_communication_count: Option<usize>,
+        expected_active_goal_id_to_block: Option<&str>,
+    ) -> Result<AdmittedTerminalCommit, StorageError> {
+        self.terminalize_turn_with_protocol_event_guarded(
             session_id,
-            status,
             event,
-            protocol_turn_id,
+            TerminalOwnerGuard::Admitted {
+                admission_id,
+                turn_id: protocol_turn_id,
+            },
             protocol_sequence_no,
             false,
+            expected_seen_steer_count,
+            expected_seen_agent_communication_count,
+            expected_active_goal_id_to_block,
         )
         .await
     }
 
-    /// Recovers an active session after its process owner is known to be gone.
-    ///
-    /// The caller must hold the session process lease. Unlike an external stop,
-    /// orphan recovery clears the durable run admission in the same transaction
-    /// so the recovered session can be admitted again immediately.
-    pub async fn recover_orphaned_active_session_with_protocol_event(
+    #[allow(clippy::too_many_arguments)]
+    async fn terminalize_turn_with_protocol_event_guarded(
         &self,
         session_id: SessionId,
-        status: SessionStatus,
         event: &RunEvent,
-        protocol_turn_id: TurnId,
+        owner_guard: TerminalOwnerGuard,
         protocol_sequence_no: Option<i64>,
-    ) -> Result<bool, StorageError> {
-        if status == SessionStatus::AwaitingUser {
-            return Err(StorageError::Message(
-                "orphan recovery requires a terminal status".to_string(),
-            ));
+        retain_active_admission: bool,
+        expected_seen_steer_count: Option<usize>,
+        expected_seen_agent_communication_count: Option<usize>,
+        expected_active_goal_id_to_block: Option<&str>,
+    ) -> Result<AdmittedTerminalCommit, StorageError> {
+        let terminal = validate_terminal_event(session_id, event)?;
+        let status = terminal.session_status();
+        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let Some(runtime_state) = session_runtime_state_from_connection(&transaction, session_id)?
+        else {
+            transaction.commit()?;
+            return Ok(AdmittedTerminalCommit::NotOwned);
+        };
+        let Some(durable_admission) = runtime_state.admission else {
+            transaction.commit()?;
+            return Ok(AdmittedTerminalCommit::NotOwned);
+        };
+        let admitted_guard = matches!(owner_guard, TerminalOwnerGuard::Admitted { .. });
+        let owner_matches = match owner_guard {
+            TerminalOwnerGuard::Admitted {
+                admission_id,
+                turn_id,
+            } => {
+                durable_admission.admission_id == admission_id
+                    && durable_admission.turn_id == turn_id
+                    && durable_admission.is_fresh_at(now)
+            }
+            TerminalOwnerGuard::Captured(target) => target.matches(durable_admission),
+        };
+        if !owner_matches {
+            transaction.commit()?;
+            return Ok(AdmittedTerminalCommit::NotOwned);
         }
-        self.terminalize_active_session_with_protocol_event_inner(
+        let protocol_turn_id = durable_admission.turn_id;
+        let admission_id_text = durable_admission.admission_id.to_string();
+        if runtime_state.status != SessionStatus::Running {
+            terminal_for_retained_admission_in_connection(
+                &transaction,
+                session_id,
+                runtime_state.status,
+                durable_admission,
+            )?;
+            if admitted_guard {
+                transaction.execute(
+                    "UPDATE sessions
+                     SET active_run_id = NULL,
+                         active_turn_id = NULL,
+                         active_run_lease_expires_at_ms = NULL
+                     WHERE id = ?1
+                       AND active_run_id = ?2
+                       AND active_turn_id = ?3
+                       AND active_run_lease_expires_at_ms = ?4",
+                    params![
+                        session_id.to_string(),
+                        admission_id_text,
+                        protocol_turn_id.to_string(),
+                        durable_admission.lease_expires_at_ms,
+                    ],
+                )?;
+                transaction.commit()?;
+                return Ok(AdmittedTerminalCommit::AlreadyTerminalizedBySameAdmission);
+            }
+            transaction.commit()?;
+            return Ok(AdmittedTerminalCommit::NotOwned);
+        }
+        if terminal_for_turn_in_connection(&transaction, session_id, protocol_turn_id)?.is_some() {
+            return Err(StorageError::Message(format!(
+                "running session {session_id} active turn {protocol_turn_id} already has a durable terminal"
+            )));
+        }
+
+        if let Some(expected) = expected_seen_steer_count {
+            let actual = count_steer_history_items(&transaction, session_id)?;
+            if actual != expected {
+                transaction.commit()?;
+                return Ok(AdmittedTerminalCommit::UnseenSteer { expected, actual });
+            }
+        }
+        if let Some(expected) = expected_seen_agent_communication_count {
+            let actual = count_agent_communication_history_items(&transaction, session_id)?;
+            if actual != expected {
+                transaction.commit()?;
+                return Ok(AdmittedTerminalCommit::UnseenAgentCommunication { expected, actual });
+            }
+        }
+
+        let status_text = session_status_text(status);
+        let clear_admission = !retain_active_admission;
+        let terminalized = if clear_admission {
+            transaction.execute(
+                "UPDATE sessions
+                 SET status = ?5,
+                     updated_at_ms = ?6,
+                     completed_at_ms = ?6,
+                     active_run_id = NULL,
+                     active_turn_id = NULL,
+                     active_run_lease_expires_at_ms = NULL
+                 WHERE id = ?1
+                   AND active_run_id = ?2
+                   AND active_turn_id = ?3
+                   AND active_run_lease_expires_at_ms = ?4
+                   AND status = 'running'",
+                params![
+                    session_id.to_string(),
+                    admission_id_text,
+                    protocol_turn_id.to_string(),
+                    durable_admission.lease_expires_at_ms,
+                    status_text,
+                    now,
+                ],
+            )? == 1
+        } else {
+            transaction.execute(
+                "UPDATE sessions
+                 SET status = ?5, updated_at_ms = ?6, completed_at_ms = ?6
+                 WHERE id = ?1
+                   AND active_run_id = ?2
+                   AND active_turn_id = ?3
+                   AND active_run_lease_expires_at_ms = ?4
+                   AND status = 'running'",
+                params![
+                    session_id.to_string(),
+                    admission_id_text,
+                    protocol_turn_id.to_string(),
+                    durable_admission.lease_expires_at_ms,
+                    status_text,
+                    now,
+                ],
+            )? == 1
+        };
+        if !terminalized {
+            transaction.commit()?;
+            return Ok(AdmittedTerminalCommit::NotOwned);
+        }
+
+        if status == SessionStatus::Failed
+            && let Some(expected_goal_id) = expected_active_goal_id_to_block
+        {
+            transaction.execute(
+                "UPDATE thread_goals
+                 SET status = 'blocked', updated_at_ms = MAX(updated_at_ms + 1, ?3)
+                 WHERE thread_id = ?1 AND goal_id = ?2 AND status = 'active'",
+                params![session_id.to_string(), expected_goal_id, now],
+            )?;
+        }
+
+        let protocol_sequence_no = resolve_terminal_protocol_sequence_in_transaction(
+            &transaction,
             session_id,
-            status,
+            protocol_turn_id,
+            protocol_sequence_no,
+        )?;
+        let terminal_sequence_no = settle_unfinished_tool_calls_for_terminal_event(
+            &transaction,
+            session_id,
             event,
             protocol_turn_id,
             protocol_sequence_no,
-            true,
-        )
-        .await
-    }
-
-    async fn terminalize_active_session_with_protocol_event_inner(
-        &self,
-        session_id: SessionId,
-        status: SessionStatus,
-        event: &RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-        clear_run_admission: bool,
-    ) -> Result<bool, StorageError> {
-        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
-        let status_text = match status {
-            SessionStatus::Completed => "completed",
-            SessionStatus::AwaitingUser => "awaiting_user",
-            SessionStatus::Cancelled => "cancelled",
-            SessionStatus::Failed => "failed",
-            SessionStatus::Idle | SessionStatus::Running => {
-                return Err(StorageError::Message(
-                    "active session terminalization requires a terminal status".to_string(),
-                ));
-            }
-        };
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let protocol_sequence_no = match protocol_sequence_no {
-            Some(sequence_no) => sequence_no,
-            None => latest_turn_position_for_session(&transaction, session_id)?
-                .filter(|(turn_id, _)| *turn_id == protocol_turn_id)
-                .map(|(_, sequence_no)| sequence_no)
-                .unwrap_or(0),
-        };
-        let terminalized = if clear_run_admission {
-            transaction.execute(
-                "UPDATE sessions
-                 SET status = ?2,
-                     updated_at_ms = ?3,
-                     completed_at_ms = ?3,
-                     active_run_id = NULL,
-                     active_turn_id = NULL,
-                     active_run_lease_expires_at_ms = NULL
-                 WHERE id = ?1
-                   AND status IN ('running', 'awaiting_user')
-                   AND (active_turn_id IS NULL OR active_turn_id = ?4)",
-                params![
-                    session_id.to_string(),
-                    status_text,
-                    now,
-                    protocol_turn_id.to_string()
-                ],
-            )?
-        } else {
-            transaction.execute(
-                "UPDATE sessions
-                 SET status = ?2, updated_at_ms = ?3, completed_at_ms = ?3
-                 WHERE id = ?1
-                   AND status IN ('running', 'awaiting_user')
-                   AND (active_turn_id IS NULL OR active_turn_id = ?4)",
-                params![
-                    session_id.to_string(),
-                    status_text,
-                    now,
-                    protocol_turn_id.to_string()
-                ],
-            )?
-        } == 1;
-        if terminalized {
-            if status != SessionStatus::AwaitingUser {
-                fail_unfinished_tool_calls_in_connection(
-                    &transaction,
-                    session_id,
-                    unfinished_tool_reason_for_event(event),
-                    now,
-                )?;
-            }
-            insert_protocol_projection_if_requested(
-                &transaction,
-                event,
-                Some(session_id),
-                protocol_turn_id,
-                Some(protocol_sequence_no),
-            )?;
-        }
-        transaction.commit()?;
-        Ok(terminalized)
-    }
-
-    pub async fn terminalize_admitted_session_with_protocol_event(
-        &self,
-        session_id: SessionId,
-        admission_id: &str,
-        status: SessionStatus,
-        event: &RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-    ) -> Result<bool, StorageError> {
-        let now = normalize_run_lease_now_ms(SystemClock::now_ms());
-        let status_text = terminal_status_text(status)?;
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current_state = transaction
-            .query_row(
-                "SELECT status, active_turn_id, active_run_lease_expires_at_ms
-                 FROM sessions
-                 WHERE id = ?1 AND active_run_id = ?2",
-                params![session_id.to_string(), admission_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((current_status, active_turn_id, lease_expires_at_ms)) = current_state else {
-            transaction.commit()?;
-            return Ok(false);
-        };
-        if !run_lease_is_fresh(lease_expires_at_ms, now) {
-            transaction.commit()?;
-            return Ok(false);
-        }
-        if active_turn_id
-            .as_deref()
-            .is_some_and(|active_turn_id| active_turn_id != protocol_turn_id.to_string())
-        {
-            transaction.commit()?;
-            return Ok(false);
-        }
-        let was_active = matches!(current_status.as_str(), "running" | "awaiting_user");
-        if !was_active {
-            transaction.execute(
-                "UPDATE sessions
-                 SET active_run_id = NULL,
-                     active_turn_id = NULL,
-                     active_run_lease_expires_at_ms = NULL
-                 WHERE id = ?1 AND active_run_id = ?2",
-                params![session_id.to_string(), admission_id],
-            )?;
-            fail_unfinished_tool_calls_in_connection(
-                &transaction,
-                session_id,
-                unfinished_tool_reason_for_event(event),
-                now,
-            )?;
-            transaction.commit()?;
-            return Ok(true);
-        }
-        if status == SessionStatus::AwaitingUser {
-            transaction.execute(
-                "UPDATE sessions
-                 SET status = ?3, updated_at_ms = ?4, completed_at_ms = ?4
-                 WHERE id = ?1 AND active_run_id = ?2",
-                params![session_id.to_string(), admission_id, status_text, now],
-            )?;
-        } else {
-            transaction.execute(
-                "UPDATE sessions
-                 SET status = ?3,
-                     updated_at_ms = ?4,
-                     completed_at_ms = ?4,
-                     active_run_id = NULL,
-                     active_turn_id = NULL,
-                     active_run_lease_expires_at_ms = NULL
-                 WHERE id = ?1 AND active_run_id = ?2",
-                params![session_id.to_string(), admission_id, status_text, now],
-            )?;
-            fail_unfinished_tool_calls_in_connection(
-                &transaction,
-                session_id,
-                unfinished_tool_reason_for_event(event),
-                now,
-            )?;
-        }
+            now,
+        )?;
         insert_protocol_projection_if_requested(
             &transaction,
             event,
             Some(session_id),
             protocol_turn_id,
-            Some(protocol_sequence_no.unwrap_or(0)),
+            Some(terminal_sequence_no),
         )?;
         transaction.commit()?;
-        Ok(true)
+        Ok(AdmittedTerminalCommit::Applied)
     }
 
-    pub async fn record_pending_tool_call_with_protocol_bundle(
+    pub async fn record_model_response_with_protocol_bundle(
         &self,
         session_id: SessionId,
-        admission_id: &str,
-        message_id: MessageId,
-        tool_name: &str,
-        arguments_json: &str,
-        title: Option<&str>,
-        metadata_json: serde_json::Value,
+        admission_id: AdmissionId,
         protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-    ) -> Result<(ToolCallRecord, RunEvent), StorageError> {
-        let id = ToolCallId::new();
+        response: ModelResponseWrite,
+    ) -> Result<Vec<RunEvent>, StorageError> {
         let started_at_ms = SystemClock::now_ms();
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2308,78 +2321,87 @@ impl SqliteSessionRepository {
             admission_id,
             protocol_turn_id,
         )?;
-        transaction.execute(
-            "INSERT INTO tool_calls (id, session_id, message_id, tool_name, status, arguments_json, title, metadata_json, output_text, truncated_output_path, error_text, started_at_ms, finished_at_ms)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, NULL, NULL, NULL, ?8, NULL)",
-            params![
-                id.to_string(),
-                session_id.to_string(),
-                message_id.to_string(),
-                tool_name,
-                arguments_json,
-                title,
-                serde_json::to_string(&metadata_json)?,
-                started_at_ms
-            ],
-        )?;
-        let parsed_tool_name = parse_tool_name(tool_name);
-        let event = RunEvent::ToolCallPending {
-            tool_call_id: id,
-            tool: parsed_tool_name,
-            title: title.unwrap_or(tool_name).to_string(),
-            metadata: metadata_json.clone(),
-        };
-        insert_protocol_projection_if_requested(
+        let mut next_fallback_sequence_no = resolve_terminal_protocol_sequence_in_transaction(
             &transaction,
-            &event,
-            Some(session_id),
+            session_id,
             protocol_turn_id,
-            protocol_sequence_no,
+            None,
         )?;
-        insert_part_in_transaction(
-            &transaction,
-            message_id,
-            NewPart {
-                kind: PartKind::ToolCall,
-                payload: MessagePart::ToolCall(ToolCallPart {
-                    tool_call_id: id,
-                    tool_name: parsed_tool_name,
-                    arguments_json: arguments_json.to_string(),
-                    model_arguments_json: metadata_json
-                        .get("tool_route")
-                        .and_then(|route| route.get("original_arguments_json"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string),
-                    effective_arguments_json: Some(arguments_json.to_string()),
-                }),
-            },
-        )?;
+        let mut events = Vec::with_capacity(response.tool_calls.len().saturating_add(1));
+        if let Some(text) = response.assistant_text.filter(|text| !text.is_empty()) {
+            let sequence_no = response
+                .assistant_protocol_sequence_no
+                .unwrap_or(next_fallback_sequence_no);
+            next_fallback_sequence_no =
+                next_fallback_sequence_no.max(sequence_no.saturating_add(1));
+            let event = RunEvent::AssistantMessageCommitted {
+                response_id: response.response_id,
+                text,
+            };
+            insert_protocol_projection_if_requested(
+                &transaction,
+                &event,
+                Some(session_id),
+                protocol_turn_id,
+                Some(sequence_no),
+            )?;
+            events.push(event);
+        }
+        for call in response.tool_calls {
+            let sequence_no = call
+                .protocol_sequence_no
+                .unwrap_or(next_fallback_sequence_no);
+            next_fallback_sequence_no =
+                next_fallback_sequence_no.max(sequence_no.saturating_add(1));
+            let event = RunEvent::ToolCallPending {
+                tool_call_id: call.id,
+                response_id: response.response_id,
+                model_call_id: call.model_call_id,
+                tool_name: call.tool_name,
+                arguments_json: call.arguments_json,
+            };
+            let projection =
+                project_protocol_run_event(&event, Some(session_id), protocol_turn_id, sequence_no)
+                    .ok_or_else(|| {
+                        StorageError::Message(
+                            "ToolCallPending did not produce a protocol bundle".to_string(),
+                        )
+                    })?;
+            let stored = insert_session_owned_event_bundle_in_transaction(
+                &SESSION_PROTOCOL_WRITE_AUTHORITY,
+                &transaction,
+                &projection.runtime_event,
+                projection.history_item.as_ref(),
+                projection.turn_item.as_ref(),
+            )?;
+            let history_item = stored.history_item.ok_or_else(|| {
+                StorageError::Message(
+                    "ToolCallPending protocol bundle omitted its canonical history item"
+                        .to_string(),
+                )
+            })?;
+            validate_canonical_tool_call_payload(&history_item, call.id)?;
+            transaction.execute(
+                "INSERT INTO tool_calls
+                 (id, history_item_id, status, truncated_output_path, started_at_ms, finished_at_ms)
+                 VALUES (?1, ?2, 'pending', NULL, ?3, NULL)",
+                params![
+                    call.id.to_string(),
+                    history_item.id.to_string(),
+                    started_at_ms,
+                ],
+            )?;
+            events.push(event);
+        }
         transaction.commit()?;
-        Ok((
-            ToolCallRecord {
-                id,
-                session_id,
-                message_id,
-                tool_name: parsed_tool_name,
-                status: ToolCallStatus::Pending,
-                arguments_json: arguments_json.to_string(),
-                title: title.map(|value| value.to_string()),
-                metadata_json,
-                output_text: None,
-                truncated_output_path: None,
-                error_text: None,
-                started_at_ms,
-                finished_at_ms: None,
-            },
-            event,
-        ))
+        Ok(events)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn complete_tool_call_with_protocol_bundle(
         &self,
         session_id: SessionId,
-        admission_id: &str,
-        message_id: MessageId,
+        admission_id: AdmissionId,
         tool_call_id: ToolCallId,
         tool_name: crate::tool::ToolName,
         title: &str,
@@ -2388,190 +2410,228 @@ impl SqliteSessionRepository {
         truncated_output_path: Option<&camino::Utf8Path>,
         protocol_turn_id: TurnId,
         protocol_sequence_no: Option<i64>,
-    ) -> Result<RunEvent, StorageError> {
-        let finished_at_ms = SystemClock::now_ms();
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_active_admission_in_transaction(
-            &transaction,
-            session_id,
-            admission_id,
-            protocol_turn_id,
-        )?;
-        transaction.execute(
-            "UPDATE tool_calls
-             SET status = 'completed',
-                 title = ?2,
-                 metadata_json = ?3,
-                 output_text = ?4,
-                 truncated_output_path = ?5,
-                 error_text = NULL,
-                 finished_at_ms = ?6
-             WHERE id = ?1",
-            params![
-                tool_call_id.to_string(),
+    ) -> Result<Option<RunEvent>, StorageError> {
+        Ok(self
+            .settle_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                tool_call_id,
+                tool_name,
+                ToolCallStatus::Completed,
                 title,
-                serde_json::to_string(&metadata_json)?,
+                metadata_json,
                 output_text,
-                truncated_output_path.map(|value| value.as_str()),
-                finished_at_ms
-            ],
-        )?;
-        let event = RunEvent::ToolCallCompleted {
-            tool_call_id,
-            tool: tool_name,
-            title: title.to_string(),
-            summary: output_text.to_string(),
-            metadata: metadata_json.clone(),
-        };
-        insert_protocol_projection_if_requested(
-            &transaction,
-            &event,
-            Some(session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
-        )?;
-        insert_part_in_transaction(
-            &transaction,
-            message_id,
-            NewPart {
-                kind: PartKind::ToolResult,
-                payload: MessagePart::ToolResult(ToolResultPart {
-                    tool_call_id,
-                    status: ToolCallStatus::Completed,
-                    title: title.to_string(),
-                    summary: output_text.to_string(),
-                    success: tool_success_from_metadata(&metadata_json),
-                    progress_effect: tool_progress_effect_from_metadata(&metadata_json),
-                    blocked_action: metadata_string(&metadata_json, &["blocked_action"]),
-                    result_hash: metadata_string(
-                        &metadata_json,
-                        &["tool_feedback_envelope", "result_hash"],
-                    )
-                    .or_else(|| metadata_string(&metadata_json, &["result_hash"])),
-                }),
-            },
-        )?;
-        transaction.commit()?;
-        Ok(event)
+                truncated_output_path,
+                None,
+                Vec::new(),
+                protocol_turn_id,
+                protocol_sequence_no,
+                None,
+            )
+            .await?
+            .map(|(tool_event, _)| tool_event))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn complete_tool_call_with_file_changes_protocol_bundle(
         &self,
         session_id: SessionId,
-        admission_id: &str,
-        message_id: MessageId,
+        admission_id: AdmissionId,
         tool_call_id: ToolCallId,
         tool_name: crate::tool::ToolName,
         title: &str,
         metadata_json: serde_json::Value,
         output_text: &str,
         truncated_output_path: Option<&camino::Utf8Path>,
-        diff_summary: DiffSummaryPart,
         file_changes: Vec<crate::edit::ChangeSummary>,
         protocol_turn_id: TurnId,
         tool_output_sequence_no: Option<i64>,
         file_changes_sequence_no: Option<i64>,
-    ) -> Result<(RunEvent, RunEvent), StorageError> {
-        validate_file_change_protocol_bundle(tool_call_id, &diff_summary, &file_changes)?;
-        let finished_at_ms = SystemClock::now_ms();
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_active_admission_in_transaction(
-            &transaction,
-            session_id,
-            admission_id,
-            protocol_turn_id,
-        )?;
-        transaction.execute(
-            "UPDATE tool_calls
-             SET status = 'completed',
-                 title = ?2,
-                 metadata_json = ?3,
-                 output_text = ?4,
-                 truncated_output_path = ?5,
-                 error_text = NULL,
-                 finished_at_ms = ?6
-             WHERE id = ?1",
-            params![
-                tool_call_id.to_string(),
+    ) -> Result<Option<(RunEvent, RunEvent)>, StorageError> {
+        Ok(self
+            .settle_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                tool_call_id,
+                tool_name,
+                ToolCallStatus::Completed,
                 title,
-                serde_json::to_string(&metadata_json)?,
+                metadata_json,
                 output_text,
-                truncated_output_path.map(|value| value.as_str()),
-                finished_at_ms
-            ],
-        )?;
-        let tool_output_event = RunEvent::ToolCallCompleted {
-            tool_call_id,
-            tool: tool_name,
-            title: title.to_string(),
-            summary: output_text.to_string(),
-            metadata: metadata_json.clone(),
-        };
-        let file_changes_event = RunEvent::FileChangesRecorded {
-            tool_call_id,
-            changes: file_changes,
-        };
-        insert_protocol_projection_if_requested(
-            &transaction,
-            &tool_output_event,
-            Some(session_id),
-            protocol_turn_id,
-            tool_output_sequence_no,
-        )?;
-        insert_part_in_transaction(
-            &transaction,
-            message_id,
-            NewPart {
-                kind: PartKind::ToolResult,
-                payload: MessagePart::ToolResult(ToolResultPart {
-                    tool_call_id,
-                    status: ToolCallStatus::Completed,
-                    title: title.to_string(),
-                    summary: output_text.to_string(),
-                    success: tool_success_from_metadata(&metadata_json),
-                    progress_effect: tool_progress_effect_from_metadata(&metadata_json),
-                    blocked_action: metadata_string(&metadata_json, &["blocked_action"]),
-                    result_hash: metadata_string(
-                        &metadata_json,
-                        &["tool_feedback_envelope", "result_hash"],
-                    )
-                    .or_else(|| metadata_string(&metadata_json, &["result_hash"])),
-                }),
-            },
-        )?;
-        insert_part_in_transaction(
-            &transaction,
-            message_id,
-            NewPart {
-                kind: PartKind::DiffSummary,
-                payload: MessagePart::DiffSummary(diff_summary),
-            },
-        )?;
-        insert_protocol_projection_if_requested(
-            &transaction,
-            &file_changes_event,
-            Some(session_id),
-            protocol_turn_id,
-            file_changes_sequence_no,
-        )?;
-        transaction.commit()?;
-        Ok((tool_output_event, file_changes_event))
+                truncated_output_path,
+                None,
+                file_changes,
+                protocol_turn_id,
+                tool_output_sequence_no,
+                file_changes_sequence_no,
+            )
+            .await?
+            .map(|(tool_event, file_event)| {
+                (
+                    tool_event,
+                    file_event.expect("file-change settlement includes file event"),
+                )
+            }))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn settle_executed_tool_call_with_file_changes_protocol_bundle(
+        &self,
+        session_id: SessionId,
+        admission_id: AdmissionId,
+        tool_call_id: ToolCallId,
+        tool_name: crate::tool::ToolName,
+        title: &str,
+        metadata_json: serde_json::Value,
+        output_text: &str,
+        truncated_output_path: Option<&camino::Utf8Path>,
+        status: ToolCallStatus,
+        reason: &str,
+        file_changes: Vec<crate::edit::ChangeSummary>,
+        protocol_turn_id: TurnId,
+        tool_output_sequence_no: Option<i64>,
+        file_changes_sequence_no: Option<i64>,
+    ) -> Result<Option<(RunEvent, RunEvent)>, StorageError> {
+        if !matches!(status, ToolCallStatus::Cancelled | ToolCallStatus::Failed) {
+            return Err(StorageError::Message(format!(
+                "executed tool terminal settlement requires cancelled or failed status, got {}",
+                status.key()
+            )));
+        }
+        Ok(self
+            .settle_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                tool_call_id,
+                tool_name,
+                status,
+                title,
+                metadata_json,
+                output_text,
+                truncated_output_path,
+                Some(reason),
+                file_changes,
+                protocol_turn_id,
+                tool_output_sequence_no,
+                file_changes_sequence_no,
+            )
+            .await?
+            .map(|(tool_event, file_event)| {
+                (
+                    tool_event,
+                    file_event.expect("file-change settlement includes file event"),
+                )
+            }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn fail_tool_call_with_protocol_bundle(
         &self,
         session_id: SessionId,
-        admission_id: &str,
-        message_id: MessageId,
+        admission_id: AdmissionId,
         tool_call_id: ToolCallId,
         tool_name: crate::tool::ToolName,
         error_text: &str,
         metadata_json: serde_json::Value,
         protocol_turn_id: TurnId,
         protocol_sequence_no: Option<i64>,
-    ) -> Result<RunEvent, StorageError> {
+    ) -> Result<Option<RunEvent>, StorageError> {
+        Ok(self
+            .settle_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                tool_call_id,
+                tool_name,
+                ToolCallStatus::Failed,
+                "Tool failed",
+                metadata_json,
+                error_text,
+                None,
+                Some(error_text),
+                Vec::new(),
+                protocol_turn_id,
+                protocol_sequence_no,
+                None,
+            )
+            .await?
+            .map(|(tool_event, _)| tool_event))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn settle_tool_call_without_execution_with_protocol_bundle(
+        &self,
+        session_id: SessionId,
+        admission_id: AdmissionId,
+        tool_call_id: ToolCallId,
+        tool_name: crate::tool::ToolName,
+        status: ToolCallStatus,
+        reason: &str,
+        metadata_json: serde_json::Value,
+        protocol_turn_id: TurnId,
+        protocol_sequence_no: Option<i64>,
+    ) -> Result<Option<RunEvent>, StorageError> {
+        if !matches!(status, ToolCallStatus::Declined | ToolCallStatus::Cancelled) {
+            return Err(StorageError::Message(format!(
+                "tool call non-execution settlement requires declined or cancelled status, got {}",
+                status.key()
+            )));
+        }
+        let title = match status {
+            ToolCallStatus::Declined => "Tool declined",
+            ToolCallStatus::Cancelled => "Tool cancelled",
+            _ => unreachable!(),
+        };
+        Ok(self
+            .settle_tool_call_with_protocol_bundle(
+                session_id,
+                admission_id,
+                tool_call_id,
+                tool_name,
+                status,
+                title,
+                metadata_json,
+                reason,
+                None,
+                None,
+                Vec::new(),
+                protocol_turn_id,
+                protocol_sequence_no,
+                None,
+            )
+            .await?
+            .map(|(tool_event, _)| tool_event))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_tool_call_with_protocol_bundle(
+        &self,
+        session_id: SessionId,
+        admission_id: AdmissionId,
+        tool_call_id: ToolCallId,
+        tool_name: crate::tool::ToolName,
+        status: ToolCallStatus,
+        title: &str,
+        metadata_json: serde_json::Value,
+        output_text: &str,
+        truncated_output_path: Option<&camino::Utf8Path>,
+        error_text: Option<&str>,
+        file_changes: Vec<crate::edit::ChangeSummary>,
+        protocol_turn_id: TurnId,
+        tool_output_sequence_no: Option<i64>,
+        file_changes_sequence_no: Option<i64>,
+    ) -> Result<Option<(RunEvent, Option<RunEvent>)>, StorageError> {
+        if !matches!(
+            status,
+            ToolCallStatus::Completed
+                | ToolCallStatus::Declined
+                | ToolCallStatus::Cancelled
+                | ToolCallStatus::Failed
+        ) {
+            return Err(StorageError::Message(format!(
+                "tool settlement requires a terminal status, got {}",
+                status.key()
+            )));
+        }
         let finished_at_ms = SystemClock::now_ms();
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2581,412 +2641,107 @@ impl SqliteSessionRepository {
             admission_id,
             protocol_turn_id,
         )?;
-        transaction.execute(
-            "UPDATE tool_calls
-             SET status = 'failed',
-                 error_text = ?2,
-                 finished_at_ms = ?3
-             WHERE id = ?1",
-            params![tool_call_id.to_string(), error_text, finished_at_ms],
-        )?;
-        let event = RunEvent::ToolCallFailed {
-            tool_call_id,
-            tool: tool_name,
-            error: error_text.to_string(),
-            metadata: metadata_json.clone(),
-        };
-        insert_protocol_projection_if_requested(
+        validate_canonical_tool_call_in_transaction(
             &transaction,
-            &event,
-            Some(session_id),
-            protocol_turn_id,
-            protocol_sequence_no,
-        )?;
-        insert_part_in_transaction(
-            &transaction,
-            message_id,
-            NewPart {
-                kind: PartKind::ToolResult,
-                payload: MessagePart::ToolResult(ToolResultPart {
-                    tool_call_id,
-                    status: ToolCallStatus::Failed,
-                    title: "Tool failed".to_string(),
-                    summary: error_text.to_string(),
-                    success: Some(false),
-                    progress_effect: ToolProgressEffect::Blocked,
-                    blocked_action: metadata_string(&metadata_json, &["blocked_action"]),
-                    result_hash: metadata_string(
-                        &metadata_json,
-                        &["tool_feedback_envelope", "result_hash"],
-                    )
-                    .or_else(|| metadata_string(&metadata_json, &["result_hash"])),
-                }),
-            },
-        )?;
-        transaction.commit()?;
-        Ok(event)
-    }
-
-    pub async fn update_message_metadata_and_status_with_protocol_event(
-        &self,
-        session_id: SessionId,
-        message_id: MessageId,
-        metadata: &MessageMetadata,
-        status: SessionStatus,
-        event: &RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-    ) -> Result<bool, StorageError> {
-        Ok(self
-            .update_message_metadata_and_status_with_protocol_event_guarded(
-                session_id,
-                message_id,
-                metadata,
-                status,
-                event,
-                protocol_turn_id,
-                protocol_sequence_no,
-                None,
-                None,
-                None,
-            )
-            .await?
-            .was_applied())
-    }
-
-    pub async fn update_admitted_message_metadata_and_status_with_protocol_event(
-        &self,
-        session_id: SessionId,
-        admission_id: &str,
-        message_id: MessageId,
-        metadata: &MessageMetadata,
-        status: SessionStatus,
-        event: &RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-        expected_seen_steer_count: Option<usize>,
-        expected_active_goal_id_to_block: Option<&str>,
-    ) -> Result<AdmittedTerminalCommit, StorageError> {
-        self.update_message_metadata_and_status_with_protocol_event_guarded(
             session_id,
-            message_id,
-            metadata,
-            status,
-            event,
             protocol_turn_id,
-            protocol_sequence_no,
-            Some(admission_id),
-            expected_seen_steer_count,
-            expected_active_goal_id_to_block,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn update_message_metadata_and_status_with_protocol_event_guarded(
-        &self,
-        session_id: SessionId,
-        message_id: MessageId,
-        metadata: &MessageMetadata,
-        status: SessionStatus,
-        event: &RunEvent,
-        protocol_turn_id: TurnId,
-        protocol_sequence_no: Option<i64>,
-        admission_id: Option<&str>,
-        expected_seen_steer_count: Option<usize>,
-        expected_active_goal_id_to_block: Option<&str>,
-    ) -> Result<AdmittedTerminalCommit, StorageError> {
-        let now = SystemClock.now_ms();
-        let status_text = session_status_text(status);
-        let completed_at_ms = if matches!(
-            status,
-            SessionStatus::Completed
-                | SessionStatus::AwaitingUser
-                | SessionStatus::Cancelled
-                | SessionStatus::Failed
-        ) {
-            Some(now)
-        } else {
-            None
-        };
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current_status = if let Some(admission_id) = admission_id {
-            let owned_state = transaction
-                .query_row(
-                    "SELECT status, active_run_lease_expires_at_ms
-                     FROM sessions
-                     WHERE id = ?1 AND active_run_id = ?2 AND active_turn_id = ?3",
-                    params![
-                        session_id.to_string(),
-                        admission_id,
-                        protocol_turn_id.to_string()
-                    ],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
-                )
-                .optional()?;
-            let Some((owned_status, lease_expires_at_ms)) = owned_state else {
-                transaction.commit()?;
-                return Ok(AdmittedTerminalCommit::NotOwned);
-            };
-            if !run_lease_is_fresh(lease_expires_at_ms, now) {
-                transaction.commit()?;
-                return Ok(AdmittedTerminalCommit::NotOwned);
-            }
-            if !matches!(owned_status.as_str(), "running" | "awaiting_user") {
-                transaction.execute(
-                    "UPDATE messages SET metadata_json = ?2 WHERE id = ?1",
-                    params![message_id.to_string(), serde_json::to_string(metadata)?],
-                )?;
-                transaction.execute(
-                    "UPDATE sessions
-                     SET active_run_id = NULL,
-                         active_turn_id = NULL,
-                         active_run_lease_expires_at_ms = NULL
-                     WHERE id = ?1 AND active_run_id = ?2 AND active_turn_id = ?3",
-                    params![
-                        session_id.to_string(),
-                        admission_id,
-                        protocol_turn_id.to_string()
-                    ],
-                )?;
-                fail_unfinished_tool_calls_in_connection(
-                    &transaction,
-                    session_id,
-                    unfinished_tool_reason_for_event(event),
-                    now,
-                )?;
-                transaction.commit()?;
-                return Ok(AdmittedTerminalCommit::AlreadyTerminalizedBySameAdmission);
-            }
-            Some(owned_status)
-        } else {
-            transaction
-                .query_row(
-                    "SELECT status FROM sessions WHERE id = ?1",
-                    params![session_id.to_string()],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-        };
-        if !current_status
-            .as_deref()
-            .is_some_and(|value| matches!(value, "running" | "awaiting_user"))
-        {
-            transaction.commit()?;
-            return Ok(AdmittedTerminalCommit::NotOwned);
-        }
-        let steer_count_mismatch = match expected_seen_steer_count {
-            Some(expected) => {
-                let actual = count_steer_history_items(&transaction, session_id)?;
-                (actual != expected).then_some((expected, actual))
-            }
-            None => None,
-        };
-        if let Some((expected, actual)) = steer_count_mismatch {
-            transaction.commit()?;
-            return Ok(AdmittedTerminalCommit::UnseenSteer { expected, actual });
-        }
-        let terminalized = if let Some(admission_id) = admission_id {
-            if status == SessionStatus::AwaitingUser {
-                transaction.execute(
-                    "UPDATE sessions
-                     SET status = ?4, updated_at_ms = ?5, completed_at_ms = ?6
-                     WHERE id = ?1
-                       AND active_run_id = ?2
-                       AND active_turn_id = ?3
-                       AND active_run_lease_expires_at_ms > ?7
-                       AND status IN ('running', 'awaiting_user')",
-                    params![
-                        session_id.to_string(),
-                        admission_id,
-                        protocol_turn_id.to_string(),
-                        status_text,
-                        now,
-                        completed_at_ms,
-                        now
-                    ],
-                )? == 1
-            } else {
-                transaction.execute(
-                    "UPDATE sessions
-                     SET status = ?4,
-                         updated_at_ms = ?5,
-                         completed_at_ms = ?6,
-                         active_run_id = NULL,
-                         active_turn_id = NULL,
-                         active_run_lease_expires_at_ms = NULL
-                     WHERE id = ?1
-                       AND active_run_id = ?2
-                       AND active_turn_id = ?3
-                       AND active_run_lease_expires_at_ms > ?7
-                       AND status IN ('running', 'awaiting_user')",
-                    params![
-                        session_id.to_string(),
-                        admission_id,
-                        protocol_turn_id.to_string(),
-                        status_text,
-                        now,
-                        completed_at_ms,
-                        now
-                    ],
-                )? == 1
-            }
-        } else {
-            transaction.execute(
-                "UPDATE sessions
-                 SET status = ?2,
-                     updated_at_ms = ?3,
-                     completed_at_ms = ?4,
-                     active_run_id = NULL,
-                     active_turn_id = NULL,
-                     active_run_lease_expires_at_ms = NULL
-                 WHERE id = ?1 AND status IN ('running', 'awaiting_user')",
-                params![session_id.to_string(), status_text, now, completed_at_ms],
-            )? == 1
-        };
-        if !terminalized {
-            transaction.commit()?;
-            return Ok(AdmittedTerminalCommit::NotOwned);
-        }
-        transaction.execute(
-            "UPDATE messages SET metadata_json = ?2 WHERE id = ?1",
-            params![message_id.to_string(), serde_json::to_string(metadata)?],
+            tool_call_id,
+            tool_name,
         )?;
-        if status == SessionStatus::Failed
-            && let Some(expected_goal_id) = expected_active_goal_id_to_block
-        {
-            transaction.execute(
-                "UPDATE thread_goals
-                 SET status = 'blocked',
-                     updated_at_ms = MAX(updated_at_ms + 1, ?3)
-                 WHERE thread_id = ?1
-                   AND goal_id = ?2
-                   AND status = 'active'",
-                params![session_id.to_string(), expected_goal_id, now],
-            )?;
+        validate_persisted_file_change_ownership(&transaction, tool_call_id, &file_changes)?;
+        let applied = transaction.execute(
+            "UPDATE tool_calls
+             SET status = ?2,
+                 truncated_output_path = ?3,
+                 finished_at_ms = ?4
+             WHERE id = ?1
+               AND history_item_id IN (
+                   SELECT id FROM protocol_history_items
+                   WHERE session_id = ?5 AND turn_id = ?6
+               )
+               AND status IN ('pending', 'running')",
+            params![
+                tool_call_id.to_string(),
+                status.key(),
+                truncated_output_path.map(|value| value.as_str()),
+                finished_at_ms,
+                session_id.to_string(),
+                protocol_turn_id.to_string(),
+            ],
+        )? == 1;
+        if !applied {
+            transaction.commit()?;
+            return Ok(None);
         }
-        if status != SessionStatus::AwaitingUser {
-            fail_unfinished_tool_calls_in_connection(
-                &transaction,
-                session_id,
-                unfinished_tool_reason_for_event(event),
-                now,
-            )?;
-        }
+        let tool_event = match status {
+            ToolCallStatus::Completed => RunEvent::ToolCallCompleted {
+                tool_call_id,
+                tool: tool_name,
+                title: title.to_string(),
+                summary: output_text.to_string(),
+                metadata: metadata_json,
+            },
+            ToolCallStatus::Declined => RunEvent::ToolCallDeclined {
+                tool_call_id,
+                tool: tool_name,
+                reason: output_text.to_string(),
+                metadata: metadata_json,
+            },
+            ToolCallStatus::Cancelled => RunEvent::ToolCallCancelled {
+                tool_call_id,
+                tool: tool_name,
+                reason: error_text.unwrap_or(output_text).to_string(),
+                metadata: metadata_json,
+            },
+            ToolCallStatus::Failed => RunEvent::ToolCallFailed {
+                tool_call_id,
+                tool: tool_name,
+                error: error_text.unwrap_or(output_text).to_string(),
+                metadata: metadata_json,
+            },
+            ToolCallStatus::Pending | ToolCallStatus::Running => unreachable!(),
+        };
         insert_protocol_projection_if_requested(
             &transaction,
-            event,
+            &tool_event,
             Some(session_id),
             protocol_turn_id,
-            Some(protocol_sequence_no.unwrap_or(0)),
+            tool_output_sequence_no,
         )?;
-        transaction.commit()?;
-        Ok(AdmittedTerminalCommit::Applied)
-    }
-
-    pub async fn compatibility_transcript(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Transcript, StorageError> {
-        let session = self.get_session(session_id).await?;
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let mut stmt = connection.prepare(
-            "SELECT id, role, parent_message_id, sequence_no, metadata_json, created_at_ms
-             FROM messages WHERE session_id = ?1 ORDER BY sequence_no ASC",
-        )?;
-        let message_rows = stmt
-            .query_map(params![session_id.to_string()], |row| {
-                let id_text: String = row.get(0)?;
-                let role_text: String = row.get(1)?;
-                let metadata_json: String = row.get(4)?;
-                Ok(MessageRecord {
-                    id: id_text.parse().map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    session_id,
-                    role: if role_text == "user" {
-                        MessageRole::User
-                    } else {
-                        MessageRole::Assistant
-                    },
-                    parent_message_id: row
-                        .get::<_, Option<String>>(2)?
-                        .map(|value| value.parse())
-                        .transpose()
-                        .map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                2,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?,
-                    sequence_no: row.get(3)?,
-                    metadata: serde_json::from_str(&metadata_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            4,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    created_at_ms: row.get(5)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut messages = Vec::new();
-        for record in message_rows {
-            let mut part_stmt = connection.prepare(
-                "SELECT id, sequence_no, part_kind, payload_json
-                 FROM message_parts WHERE message_id = ?1 ORDER BY sequence_no ASC",
+        let file_event = if file_changes.is_empty() {
+            None
+        } else {
+            let event = RunEvent::FileChangesRecorded {
+                tool_call_id,
+                changes: file_changes,
+            };
+            insert_protocol_projection_if_requested(
+                &transaction,
+                &event,
+                Some(session_id),
+                protocol_turn_id,
+                file_changes_sequence_no,
             )?;
-            let parts = part_stmt
-                .query_map(params![record.id.to_string()], |row| {
-                    let id_text: String = row.get(0)?;
-                    let kind_text: String = row.get(2)?;
-                    let payload_json: String = row.get(3)?;
-                    let payload = serde_json::from_str(&payload_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?;
-                    Ok(PartRecord {
-                        id: id_text.parse().map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?,
-                        message_id: record.id,
-                        sequence_no: row.get(1)?,
-                        kind: parse_part_kind(&kind_text),
-                        payload,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            messages.push(TranscriptMessage { record, parts });
-        }
-
-        Ok(Transcript { session, messages })
+            Some(event)
+        };
+        transaction.commit()?;
+        Ok(Some((tool_event, file_event)))
     }
 }
 
 #[async_trait(?Send)]
 impl SessionRepository for SqliteSessionRepository {
     async fn create_session(&self, draft: NewSession) -> Result<SessionRecord, StorageError> {
+        let base_url = ProviderEndpoint::parse(&draft.base_url)
+            .map_err(|error| StorageError::Message(error.to_string()))?
+            .as_str()
+            .to_string();
         let id = SessionId::new();
         let now = SystemClock.now_ms();
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection.execute(
-            "INSERT INTO sessions (id, project_id, title, status, cwd_path, model_name, base_url, access_mode, memory_mode, model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'enabled', '{}', ?9, ?10, NULL)",
+            "INSERT INTO sessions (id, project_id, title, status, cwd_path, model_name, base_url, access_mode, model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '{}', ?9, ?10, NULL)",
             params![
                 id.to_string(),
                 draft.project_id.to_string(),
@@ -2994,13 +2749,12 @@ impl SessionRepository for SqliteSessionRepository {
                 "idle",
                 draft.cwd.as_str(),
                 draft.model,
-                draft.base_url,
+                base_url,
                 draft.access_mode.as_str(),
                 now,
                 now
             ],
         )?;
-        upsert_session_state_row(&connection, id, &SessionStateSnapshot::default(), now)?;
         drop(connection);
         self.get_session(id).await
     }
@@ -3015,9 +2769,21 @@ impl SessionRepository for SqliteSessionRepository {
         project_id: crate::session::ProjectId,
     ) -> Result<Option<SessionRecord>, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let id: Option<String> = connection
+        let row = connection
             .query_row(
-                "SELECT id FROM sessions
+                "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
+                        model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                        status, active_run_id, active_turn_id, active_run_lease_expires_at_ms,
+                        (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
+                         WHERE terminal_event.session_id = sessions.id
+                           AND terminal_event.turn_id = sessions.active_turn_id
+                           AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
+                        (SELECT terminal_event.msg_json FROM protocol_runtime_events AS terminal_event
+                         WHERE terminal_event.session_id = sessions.id
+                           AND terminal_event.turn_id = sessions.active_turn_id
+                           AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
+                         ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC LIMIT 1)
+                 FROM sessions
                  WHERE project_id = ?1 AND archived_at_ms IS NULL
                    AND NOT EXISTS (
                        SELECT 1 FROM session_spawn_edges
@@ -3026,21 +2792,11 @@ impl SessionRepository for SqliteSessionRepository {
                  ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
                  LIMIT 1",
                 params![project_id.to_string()],
-                |row| row.get(0),
+                session_record_with_raw_runtime_state_from_row,
             )
             .optional()?;
-        drop(connection);
-        match id {
-            Some(value) => self
-                .get_session(
-                    value
-                        .parse::<SessionId>()
-                        .map_err(|error| StorageError::Message(error.to_string()))?,
-                )
-                .await
-                .map(Some),
-            None => Ok(None),
-        }
+        let mut sessions = validate_session_record_rows(row.into_iter().collect())?;
+        Ok(sessions.pop())
     }
 
     async fn list_sessions(
@@ -3065,7 +2821,19 @@ impl SessionRepository for SqliteSessionRepository {
             " AND archived_at_ms IS NULL"
         };
         let sql = format!(
-            "SELECT id FROM sessions
+            "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
+                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    status, active_run_id, active_turn_id, active_run_lease_expires_at_ms,
+                    (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
+                    (SELECT terminal_event.msg_json FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
+                     ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC LIMIT 1)
+             FROM sessions
              WHERE project_id = ?1{archived_filter}
                AND NOT EXISTS (
                    SELECT 1 FROM session_spawn_edges
@@ -3075,31 +2843,32 @@ impl SessionRepository for SqliteSessionRepository {
              LIMIT ?2"
         );
         let mut statement = connection.prepare(&sql)?;
-        let ids = statement
-            .query_map(params![project_id.to_string(), limit as i64], |row| {
-                row.get::<_, String>(0)
-            })?
+        let rows = statement
+            .query_map(
+                params![project_id.to_string(), sqlite_limit(limit)?],
+                session_record_with_raw_runtime_state_from_row,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
-        drop(connection);
-        let mut sessions = Vec::new();
-        for value in ids {
-            sessions.push(
-                self.get_session(
-                    value
-                        .parse::<SessionId>()
-                        .map_err(|error| StorageError::Message(error.to_string()))?,
-                )
-                .await?,
-            );
-        }
-        Ok(sessions)
+        validate_session_record_rows(rows)
     }
 
     async fn list_recent_sessions(&self, limit: usize) -> Result<Vec<SessionRecord>, StorageError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT id FROM sessions
+            "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
+                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    status, active_run_id, active_turn_id, active_run_lease_expires_at_ms,
+                    (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
+                    (SELECT terminal_event.msg_json FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
+                     ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC LIMIT 1)
+             FROM sessions
              WHERE archived_at_ms IS NULL
                AND NOT EXISTS (
                    SELECT 1 FROM session_spawn_edges
@@ -3108,23 +2877,14 @@ impl SessionRepository for SqliteSessionRepository {
              ORDER BY updated_at_ms DESC, created_at_ms DESC, id DESC
              LIMIT ?1",
         )?;
-        let ids = statement
-            .query_map(params![limit as i64], |row| row.get::<_, String>(0))?
+        let rows = statement
+            .query_map(
+                params![sqlite_limit(limit)?],
+                session_record_with_raw_runtime_state_from_row,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
-        drop(connection);
-        let mut sessions = Vec::new();
-        for value in ids {
-            sessions.push(
-                self.get_session(
-                    value
-                        .parse::<SessionId>()
-                        .map_err(|error| StorageError::Message(error.to_string()))?,
-                )
-                .await?,
-            );
-        }
-        Ok(sessions)
+        validate_session_record_rows(rows)
     }
 
     async fn search_sessions(
@@ -3145,7 +2905,19 @@ impl SessionRepository for SqliteSessionRepository {
             " AND archived_at_ms IS NULL"
         };
         let sql = format!(
-            "SELECT id FROM sessions
+            "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
+                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    status, active_run_id, active_turn_id, active_run_lease_expires_at_ms,
+                    (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
+                    (SELECT terminal_event.msg_json FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
+                     ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC LIMIT 1)
+             FROM sessions
              WHERE project_id = ?1{archived_filter}
                AND NOT EXISTS (
                    SELECT 1 FROM session_spawn_edges
@@ -3162,26 +2934,14 @@ impl SessionRepository for SqliteSessionRepository {
              LIMIT ?3"
         );
         let mut statement = connection.prepare(&sql)?;
-        let ids = statement
+        let rows = statement
             .query_map(
-                params![project_id.to_string(), normalized, limit as i64],
-                |row| row.get::<_, String>(0),
+                params![project_id.to_string(), normalized, sqlite_limit(limit)?],
+                session_record_with_raw_runtime_state_from_row,
             )?
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
-        drop(connection);
-        let mut sessions = Vec::new();
-        for value in ids {
-            sessions.push(
-                self.get_session(
-                    value
-                        .parse::<SessionId>()
-                        .map_err(|error| StorageError::Message(error.to_string()))?,
-                )
-                .await?,
-            );
-        }
-        Ok(sessions)
+        validate_session_record_rows(rows)
     }
 
     async fn set_session_archived(
@@ -3191,34 +2951,32 @@ impl SessionRepository for SqliteSessionRepository {
     ) -> Result<SessionRecord, StorageError> {
         let now = SystemClock::now_ms();
         let archived_at_ms = archived.then_some(now);
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let changed = if archived {
-            connection.execute(
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if archived
+            && let Some(active_session_id) =
+                active_session_for_mutation_branch(&transaction, id, true, now)?
+        {
+            return Err(StorageError::Message(format!(
+                "session {id} has active agent-tree session {active_session_id}; stop the agent tree before archiving it"
+            )));
+        }
+        if archived {
+            transaction.execute(
                 "UPDATE sessions
                  SET archived_at_ms = ?2, updated_at_ms = ?3
-                 WHERE id = ?1 AND status NOT IN ('running', 'awaiting_user')",
+                 WHERE id = ?1",
                 params![id.to_string(), archived_at_ms, now],
-            )?
+            )?;
         } else {
-            connection.execute(
+            transaction.execute(
                 "UPDATE sessions SET archived_at_ms = NULL, updated_at_ms = ?2 WHERE id = ?1",
                 params![id.to_string(), now],
-            )?
-        };
-        drop(connection);
-        if changed == 0 && archived {
-            let current = self.get_session(id).await?;
-            if matches!(
-                current.status,
-                SessionStatus::Running | SessionStatus::AwaitingUser
-            ) {
-                return Err(StorageError::Message(format!(
-                    "session {} is active; stop it before archiving it",
-                    current.id
-                )));
-            }
+            )?;
         }
-        self.get_session(id).await
+        let session = session_record_from_connection(&transaction, id)?;
+        transaction.commit()?;
+        Ok(session)
     }
 
     async fn update_session_settings(
@@ -3226,69 +2984,62 @@ impl SessionRepository for SqliteSessionRepository {
         id: SessionId,
         patch: &SessionSettingsPatch,
     ) -> Result<SessionSettingsUpdate, StorageError> {
-        for _ in 0..8 {
-            let current = self.get_session(id).await?;
-            let next_cwd = patch.cwd.clone().unwrap_or_else(|| current.cwd.clone());
-            let next_model = patch.model.clone().unwrap_or_else(|| current.model.clone());
-            let next_base_url = patch
-                .base_url
-                .clone()
-                .unwrap_or_else(|| current.base_url.clone());
-            let next_access_mode = patch.access_mode.unwrap_or(current.access_mode);
-            let next_model_parameters = patch.apply_to_model_parameters(&current.model_parameters);
-            let changed = next_cwd != current.cwd
-                || next_model != current.model
-                || next_base_url != current.base_url
-                || next_access_mode != current.access_mode
-                || next_model_parameters != current.model_parameters;
-            if !changed {
-                return Ok(SessionSettingsUpdate {
-                    session: current,
-                    changed: false,
-                });
-            }
-            if matches!(
-                current.status,
-                SessionStatus::Running | SessionStatus::AwaitingUser
-            ) {
-                return Err(StorageError::Message(format!(
-                    "session {} is {}; settings update requires an idle or terminal session",
-                    current.id,
-                    current.status.key()
-                )));
-            }
-            let now = SystemClock::now_ms().max(current.updated_at_ms.saturating_add(1));
-            let connection = self.connection.lock().expect("sqlite mutex poisoned");
-            let updated = connection.execute(
-                "UPDATE sessions
-                 SET cwd_path = ?2, model_name = ?3, base_url = ?4, access_mode = ?5,
-                     model_parameters_json = ?6, updated_at_ms = ?7
-                 WHERE id = ?1
-                   AND updated_at_ms = ?8
-                   AND status NOT IN ('running', 'awaiting_user')",
-                params![
-                    id.to_string(),
-                    next_cwd.as_str(),
-                    next_model,
-                    next_base_url,
-                    next_access_mode.as_str(),
-                    serde_json::to_string(&next_model_parameters)?,
-                    now,
-                    current.updated_at_ms
-                ],
-            )?;
-            drop(connection);
-            if updated == 1 {
-                return Ok(SessionSettingsUpdate {
-                    session: self.get_session(id).await?,
-                    changed: true,
-                });
-            }
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = session_record_from_connection(&transaction, id)?;
+        let next_cwd = patch.cwd.clone().unwrap_or_else(|| current.cwd.clone());
+        let next_model = patch.model.clone().unwrap_or_else(|| current.model.clone());
+        let next_base_url = patch
+            .base_url
+            .clone()
+            .unwrap_or_else(|| current.base_url.clone());
+        let next_base_url = ProviderEndpoint::parse(&next_base_url)
+            .map_err(|error| StorageError::Message(error.to_string()))?
+            .as_str()
+            .to_string();
+        let next_access_mode = patch.access_mode.unwrap_or(current.access_mode);
+        let next_model_parameters = patch.apply_to_model_parameters(&current.model_parameters);
+        let changed = next_cwd != current.cwd
+            || next_model != current.model
+            || next_base_url != current.base_url
+            || next_access_mode != current.access_mode
+            || next_model_parameters != current.model_parameters;
+        if !changed {
+            transaction.commit()?;
+            return Ok(SessionSettingsUpdate {
+                session: current,
+                changed: false,
+            });
         }
-        Err(StorageError::Message(
-            "session settings changed repeatedly while applying an update; retry the operation"
-                .to_string(),
-        ))
+        if let Some(active_session_id) =
+            active_session_for_mutation_branch(&transaction, id, false, SystemClock::now_ms())?
+        {
+            return Err(StorageError::Message(format!(
+                "session {active_session_id} is active; settings update requires an idle or terminal session"
+            )));
+        }
+        let now = SystemClock::now_ms().max(current.updated_at_ms.saturating_add(1));
+        transaction.execute(
+            "UPDATE sessions
+             SET cwd_path = ?2, model_name = ?3, base_url = ?4, access_mode = ?5,
+                 model_parameters_json = ?6, updated_at_ms = ?7
+             WHERE id = ?1",
+            params![
+                id.to_string(),
+                next_cwd.as_str(),
+                next_model,
+                next_base_url,
+                next_access_mode.as_str(),
+                serde_json::to_string(&next_model_parameters)?,
+                now,
+            ],
+        )?;
+        let session = session_record_from_connection(&transaction, id)?;
+        transaction.commit()?;
+        Ok(SessionSettingsUpdate {
+            session,
+            changed: true,
+        })
     }
 
     async fn update_session_title(
@@ -3316,331 +3067,110 @@ impl SessionRepository for SqliteSessionRepository {
         })
     }
 
-    async fn update_session_memory_mode(
-        &self,
-        id: SessionId,
-        mode: SessionMemoryMode,
-    ) -> Result<SessionMemoryModeUpdate, StorageError> {
-        let current = self.get_session(id).await?;
-        let current_mode = self.get_session_memory_mode(id).await?;
-        if current_mode == mode {
-            return Ok(SessionMemoryModeUpdate {
-                session: current,
-                mode,
-                changed: false,
-            });
-        }
-        let now = SystemClock::now_ms();
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        connection.execute(
-            "UPDATE sessions SET memory_mode = ?2, updated_at_ms = ?3 WHERE id = ?1",
-            params![id.to_string(), mode.key(), now],
-        )?;
-        drop(connection);
-        Ok(SessionMemoryModeUpdate {
-            session: self.get_session(id).await?,
-            mode,
-            changed: true,
-        })
-    }
-
     async fn delete_session(&self, id: SessionId) -> Result<(), StorageError> {
         self.delete_session_tree(id).await?;
         Ok(())
     }
+}
 
-    async fn get_state(&self, session_id: SessionId) -> Result<SessionStateSnapshot, StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let row = connection
-            .query_row(
-                "SELECT task_route, phase, review_scope_json, active_todo_id, active_targets_json, contract_refs_json, failure_kind, failure_summary, failure_tool_name, failure_targets_json,
-                        verification_todo_id, verification_commands_json, verification_failures_json, verification_evidence_summary,
-                        completion_closeout_ready, completion_open_work_count, completion_verification_pending, completion_route_contract_pending,
-                        completion_blocked_reason, completion_route_contract_summary, docs_route_state_json, implementation_handoff_json,
-                        verification_failure_cluster_json, verification_requirement_refs_json, token_accounting_json
-                 FROM session_state
-                 WHERE session_id = ?1",
-                params![session_id.to_string()],
-                |row| {
-                    let active_todo_id = row
-                        .get::<_, Option<String>>(3)?
-                        .map(|value| value.parse())
-                        .transpose()
-                        .map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                3,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?;
-                    let failure_kind = row
-                        .get::<_, Option<String>>(6)?
-                        .map(|value| parse_failure_kind(&value))
-                        .transpose()?;
-                    let failure_tool_name = row
-                        .get::<_, Option<String>>(8)?
-                        .map(|value| parse_tool_name(&value));
-                    let verification_todo_id = row
-                        .get::<_, Option<String>>(10)?
-                        .map(|value| value.parse())
-                        .transpose()
-                        .map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                10,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?;
-                    let review_scope_json: String = row.get(2)?;
-                    let active_targets_json: String = row.get(4)?;
-                    let contract_refs_json: String = row.get(5)?;
-                    let failure_targets_json: String = row.get(9)?;
-                    let verification_commands_json: String = row.get(11)?;
-                    let verification_failures_json: String = row.get(12)?;
-                    let docs_route_state_json: String = row.get(20)?;
-                    let implementation_handoff_json: String = row.get(21)?;
-                    let verification_failure_cluster_json: String = row.get(22)?;
-                    let verification_requirement_refs_json: String = row.get(23)?;
-                    let token_accounting_json: String = row.get(24)?;
-                    let failure = match failure_kind {
-                        Some(kind) => Some(FailureState {
-                            kind,
-                            summary: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                            tool_name: failure_tool_name,
-                            targets: serde_json::from_str(&failure_targets_json).map_err(
-                                |error| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        9,
-                                        rusqlite::types::Type::Text,
-                                        Box::new(error),
-                                    )
-                                },
-                            )?,
-                        }),
-                        None => None,
-                    };
-                    Ok(SessionStateSnapshot {
-                        route: parse_task_route(&row.get::<_, String>(0)?)?,
-                        process_phase: parse_process_phase(&row.get::<_, String>(1)?)?,
-                        review_scope: serde_json::from_str(&review_scope_json).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                2,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?,
-                        active_todo_id,
-                        active_targets: serde_json::from_str(&active_targets_json).map_err(
-                            |error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    4,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            },
-                        )?,
-                        contract_refs: serde_json::from_str(&contract_refs_json).map_err(
-                            |error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    5,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            },
-                        )?,
-                        failure,
-                        verification: VerificationState {
-                            pending_todo_id: verification_todo_id,
-                            required_commands: serde_json::from_str(&verification_commands_json)
-                                .map_err(|error| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        11,
-                                        rusqlite::types::Type::Text,
-                                        Box::new(error),
-                                    )
-                                })?,
-                            failing_labels: serde_json::from_str(&verification_failures_json)
-                                .map_err(|error| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        12,
-                                        rusqlite::types::Type::Text,
-                                        Box::new(error),
-                                    )
-                                })?,
-                            last_evidence_summary: row.get(13)?,
-                            failure_cluster: serde_json::from_str(
-                                &verification_failure_cluster_json,
-                            )
-                            .map_err(|error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    22,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            })?,
-                            requirement_refs: serde_json::from_str(
-                                &verification_requirement_refs_json,
-                            )
-                            .map_err(|error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    23,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            })?,
-                        },
-                        completion: CompletionState {
-                            closeout_ready: row.get::<_, i64>(14)? != 0,
-                            open_work_count: row.get::<_, i64>(15)? as usize,
-                            verification_pending: row.get::<_, i64>(16)? != 0,
-                            route_contract_pending: row.get::<_, i64>(17)? != 0,
-                            blocked_reason: row.get(18)?,
-                            route_contract_summary: row.get(19)?,
-                        },
-                        token_accounting: serde_json::from_str(&token_accounting_json).map_err(
-                            |error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    24,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            },
-                        )?,
-                        docs_route: serde_json::from_str(&docs_route_state_json).map_err(
-                            |error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    20,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            },
-                        )?,
-                        implementation_handoff: serde_json::from_str(&implementation_handoff_json)
-                            .map_err(|error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    21,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(error),
-                                )
-                            })?,
-                    })
-                },
-            )
-            .optional()?;
-
-        match row {
-            Some(state) => Ok(state),
-            None => {
-                let state = SessionStateSnapshot::default();
-                upsert_session_state_row(&connection, session_id, &state, SystemClock::now_ms())?;
-                Ok(state)
-            }
+pub(crate) fn mutation_blocker_for_project_in_connection(
+    connection: &Connection,
+    project_id: ProjectId,
+    now_ms: i64,
+) -> Result<Option<SessionId>, StorageError> {
+    let now_ms = normalize_run_lease_now_ms(now_ms);
+    let mut statement = connection.prepare(
+        "SELECT id, status, active_run_id, active_turn_id,
+                active_run_lease_expires_at_ms,
+                (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
+                 WHERE terminal_event.session_id = sessions.id
+                   AND terminal_event.turn_id = sessions.active_turn_id
+                   AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
+                (SELECT terminal_event.msg_json FROM protocol_runtime_events AS terminal_event
+                 WHERE terminal_event.session_id = sessions.id
+                   AND terminal_event.turn_id = sessions.active_turn_id
+                   AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
+                 ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC LIMIT 1)
+         FROM sessions
+         WHERE project_id = ?1
+           AND (
+               status = 'running'
+               OR status NOT IN ('idle', 'completed', 'cancelled', 'failed')
+               OR active_run_id IS NOT NULL
+               OR active_turn_id IS NOT NULL
+               OR active_run_lease_expires_at_ms IS NOT NULL
+           )
+         ORDER BY updated_at_ms DESC, id DESC",
+    )?;
+    let mut rows = statement.query(params![project_id.to_string()])?;
+    let mut first_blocker = None;
+    while let Some(row) = rows.next()? {
+        let session_id = parse_session_id_column(row, 0)?;
+        let runtime_state = validate_raw_session_runtime_state(
+            session_id,
+            raw_session_runtime_state_from_row(row, 1)?,
+        )?;
+        if first_blocker.is_none() && runtime_state.blocks_mutation_at(now_ms) {
+            first_blocker = Some(session_id);
         }
     }
+    Ok(first_blocker)
+}
 
-    async fn update_todos(
-        &self,
-        session_id: SessionId,
-        todos: &[TodoItem],
-    ) -> Result<(), StorageError> {
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM session_todos WHERE session_id = ?1",
+fn active_session_for_mutation_branch(
+    connection: &Connection,
+    session_id: SessionId,
+    include_direct_children: bool,
+    now_ms: i64,
+) -> Result<Option<SessionId>, StorageError> {
+    let is_direct_child = connection
+        .query_row(
+            "SELECT 1 FROM session_spawn_edges WHERE child_session_id = ?1",
             params![session_id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    let include_direct_children = include_direct_children && !is_direct_child;
+    let mut statement = connection.prepare(
+        "SELECT session.id, session.status, session.active_run_id,
+                session.active_turn_id, session.active_run_lease_expires_at_ms,
+                (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
+                 WHERE terminal_event.session_id = session.id
+                   AND terminal_event.turn_id = session.active_turn_id
+                   AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
+                (SELECT terminal_event.msg_json FROM protocol_runtime_events AS terminal_event
+                 WHERE terminal_event.session_id = session.id
+                   AND terminal_event.turn_id = session.active_turn_id
+                   AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
+                 ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC LIMIT 1)
+         FROM sessions AS session
+         WHERE (
+                session.id = ?1
+                OR (
+                    ?2
+                    AND session.id IN (
+                        SELECT child_session_id
+                        FROM session_spawn_edges
+                        WHERE root_session_id = ?1
+                    )
+                )
+               )
+         ORDER BY CASE WHEN session.id = ?1 THEN 0 ELSE 1 END, session.id ASC",
+    )?;
+    let mut rows = statement.query(params![session_id.to_string(), include_direct_children])?;
+    let mut first_blocker = None;
+    while let Some(row) = rows.next()? {
+        let candidate_session_id = parse_session_id_column(row, 0)?;
+        let runtime_state = validate_raw_session_runtime_state(
+            candidate_session_id,
+            raw_session_runtime_state_from_row(row, 1)?,
         )?;
-        for (position, todo) in todos.iter().enumerate() {
-            transaction.execute(
-                "INSERT INTO session_todos (
-                     session_id, todo_id, position, content, kind, status, priority, targets_json,
-                     depends_on_json, success_criteria_json, blocked_by_json
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    session_id.to_string(),
-                    todo.id.to_string(),
-                    position as i64,
-                    todo.content,
-                    todo_kind_text(todo.kind),
-                    todo_status_text(todo.status),
-                    todo_priority_text(todo.priority),
-                    serde_json::to_string(&todo.targets)?,
-                    serde_json::to_string(&todo.depends_on)?,
-                    serde_json::to_string(&todo.success_criteria)?,
-                    serde_json::to_string(&todo.blocked_by)?
-                ],
-            )?;
+        if first_blocker.is_none() && runtime_state.blocks_mutation_at(now_ms) {
+            first_blocker = Some(candidate_session_id);
         }
-        transaction.commit()?;
-        Ok(())
     }
-
-    async fn list_todos(&self, session_id: SessionId) -> Result<Vec<TodoItem>, StorageError> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let mut statement = connection.prepare(
-            "SELECT todo_id, content, kind, status, priority, targets_json, depends_on_json,
-                    success_criteria_json, blocked_by_json
-             FROM session_todos
-             WHERE session_id = ?1
-             ORDER BY position ASC",
-        )?;
-        let todos = statement
-            .query_map(params![session_id.to_string()], |row| {
-                let todo_id_text: String = row.get(0)?;
-                let kind_text: String = row.get(2)?;
-                let status_text: String = row.get(3)?;
-                let priority_text: String = row.get(4)?;
-                let targets_json: String = row.get(5)?;
-                let depends_on_json: String = row.get(6)?;
-                let success_criteria_json: String = row.get(7)?;
-                let blocked_by_json: String = row.get(8)?;
-                Ok(TodoItem {
-                    id: todo_id_text.parse().map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    content: row.get(1)?,
-                    kind: parse_todo_kind(&kind_text),
-                    status: parse_todo_status(&status_text),
-                    priority: parse_todo_priority(&priority_text),
-                    targets: serde_json::from_str(&targets_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            5,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    depends_on: serde_json::from_str(&depends_on_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            6,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    success_criteria: serde_json::from_str(&success_criteria_json).map_err(
-                        |error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                7,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        },
-                    )?,
-                    blocked_by: serde_json::from_str(&blocked_by_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            8,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(todos)
-    }
+    Ok(first_blocker)
 }
 
 fn parse_session_id_column(
@@ -3658,112 +3188,400 @@ fn parse_session_id_column(
         })
 }
 
+fn session_record_with_identity_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SessionRecord> {
+    Ok(SessionRecord {
+        id: parse_session_id_column(row, 0)?,
+        project_id: row
+            .get::<_, String>(1)?
+            .parse::<ProjectId>()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        title: row.get(2)?,
+        status: parse_status_column(row, 3)?,
+        cwd: row.get::<_, String>(4)?.into(),
+        model: row.get(5)?,
+        base_url: parse_provider_endpoint_column(row, 6)?,
+        access_mode: parse_access_mode_column(row, 7)?,
+        model_parameters: parse_session_model_parameters(&row.get::<_, String>(8)?, 8)?,
+        created_at_ms: row.get(9)?,
+        updated_at_ms: row.get(10)?,
+        completed_at_ms: row.get(11)?,
+    })
+}
+
+fn session_record_with_raw_runtime_state_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(SessionRecord, RawSessionRuntimeState)> {
+    let session = session_record_with_identity_from_row(row)?;
+    let raw = raw_session_runtime_state_from_row(row, 12)?;
+    Ok((session, raw))
+}
+
+fn validate_session_record_rows(
+    rows: Vec<(SessionRecord, RawSessionRuntimeState)>,
+) -> Result<Vec<SessionRecord>, StorageError> {
+    rows.into_iter()
+        .map(|(session, raw)| {
+            validate_raw_session_runtime_state(session.id, raw)?;
+            Ok(session)
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct RawSessionProjectionState {
+    session: SessionRecord,
+    archived: bool,
+    active_run_id: Option<String>,
+    active_turn_id: Option<String>,
+    active_run_lease_expires_at_ms: Option<i64>,
+    terminal_count: i64,
+    terminal_json: Option<String>,
+    active_turn_sequence_no: Option<i64>,
+}
+
+fn session_projection_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RawSessionProjectionState> {
+    Ok(RawSessionProjectionState {
+        session: session_record_with_identity_from_row(row)?,
+        archived: row.get(12)?,
+        active_run_id: row.get(13)?,
+        active_turn_id: row.get(14)?,
+        active_run_lease_expires_at_ms: row.get(15)?,
+        terminal_count: row.get(16)?,
+        terminal_json: row.get(17)?,
+        active_turn_sequence_no: row.get(18)?,
+    })
+}
+
+fn validate_session_projection_state(
+    raw: RawSessionProjectionState,
+) -> Result<SessionProjectionState, StorageError> {
+    let runtime_state = validate_raw_session_runtime_state(
+        raw.session.id,
+        RawSessionRuntimeState {
+            status: session_status_text(raw.session.status).to_string(),
+            active_run_id: raw.active_run_id,
+            active_turn_id: raw.active_turn_id,
+            active_run_lease_expires_at_ms: raw.active_run_lease_expires_at_ms,
+            terminal_count: raw.terminal_count,
+            terminal_json: raw.terminal_json,
+        },
+    )?;
+    let (active_turn_id, active_turn_sequence_no) =
+        if runtime_state.status == SessionStatus::Running {
+            let active_turn_id = runtime_state
+                .admission
+                .expect("running session projection admission validated before projection")
+                .turn_id;
+            (
+                Some(active_turn_id),
+                Some(raw.active_turn_sequence_no.unwrap_or(0)),
+            )
+        } else {
+            (None, None)
+        };
+    Ok(SessionProjectionState {
+        session: raw.session,
+        archived: raw.archived,
+        active_turn_id,
+        active_turn_sequence_no,
+    })
+}
+
+fn sqlite_limit(limit: usize) -> Result<i64, StorageError> {
+    validate_session_page_limit(limit).map_err(StorageError::Message)?;
+    Ok(limit as i64)
+}
+
 fn session_record_from_connection(
     connection: &Connection,
     id: SessionId,
 ) -> Result<SessionRecord, StorageError> {
-    connection
+    let (
+        session,
+        active_run_id,
+        active_turn_id,
+        active_run_lease_expires_at_ms,
+        terminal_count,
+        terminal_json,
+    ) = connection
         .query_row(
             "SELECT project_id, title, status, cwd_path, model_name, base_url, access_mode,
-                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms
+                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    active_run_id, active_turn_id, active_run_lease_expires_at_ms,
+                    (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
+                    (SELECT terminal_event.msg_json FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
+                     ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC LIMIT 1)
              FROM sessions WHERE id = ?1",
             params![id.to_string()],
             |row| {
-                Ok(SessionRecord {
-                    id,
-                    project_id: row.get::<_, String>(0)?.parse().map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
-                    title: row.get(1)?,
-                    status: parse_status(&row.get::<_, String>(2)?),
-                    cwd: row.get::<_, String>(3)?.into(),
-                    model: row.get(4)?,
-                    base_url: row.get(5)?,
-                    access_mode: parse_access_mode(&row.get::<_, String>(6)?),
-                    model_parameters: parse_session_model_parameters(&row.get::<_, String>(7)?, 7)?,
-                    created_at_ms: row.get(8)?,
-                    updated_at_ms: row.get(9)?,
-                    completed_at_ms: row.get(10)?,
-                })
+                Ok((
+                    SessionRecord {
+                        id,
+                        project_id: row.get::<_, String>(0)?.parse().map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                        title: row.get(1)?,
+                        status: parse_status_column(row, 2)?,
+                        cwd: row.get::<_, String>(3)?.into(),
+                        model: row.get(4)?,
+                        base_url: parse_provider_endpoint_column(row, 5)?,
+                        access_mode: parse_access_mode_column(row, 6)?,
+                        model_parameters: parse_session_model_parameters(
+                            &row.get::<_, String>(7)?,
+                            7,
+                        )?,
+                        created_at_ms: row.get(8)?,
+                        updated_at_ms: row.get(9)?,
+                        completed_at_ms: row.get(10)?,
+                    },
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<i64>>(13)?,
+                    row.get::<_, i64>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                ))
             },
         )
-        .map_err(StorageError::from)
+        .map_err(StorageError::from)?;
+    validate_raw_session_runtime_state(
+        id,
+        RawSessionRuntimeState {
+            status: session_status_text(session.status).to_string(),
+            active_run_id,
+            active_turn_id,
+            active_run_lease_expires_at_ms,
+            terminal_count,
+            terminal_json,
+        },
+    )?;
+    Ok(session)
+}
+
+fn parse_provider_endpoint_column(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<String> {
+    let raw = row.get::<_, String>(index)?;
+    ProviderEndpoint::parse(&raw)
+        .map(|endpoint| endpoint.as_str().to_string())
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
 }
 
 fn append_interrupted_live_snapshot_marker_in_transaction(
     transaction: &Transaction<'_>,
     session_id: SessionId,
+    turn_id: TurnId,
     reason: &str,
 ) -> Result<(), StorageError> {
-    let (turn_id, sequence_no) = latest_turn_position_for_session(transaction, session_id)?
-        .unwrap_or_else(|| (TurnId::new(), 0));
-    let now = SystemClock::now_ms();
-    let history_item = HistoryItem {
-        id: HistoryItemId::new(),
-        session_id,
-        turn_id,
-        sequence_no,
-        created_at_ms: now,
-        payload: HistoryItemPayload::Error {
-            message_id: None,
-            message: reason.to_string(),
-        },
-    };
-    let turn_item = TurnItem {
-        id: TurnItemId::new(),
-        session_id,
-        turn_id,
-        source_item_id: Some(history_item.id),
-        sequence_no,
-        payload: TurnItemPayload::Terminal {
-            status: TurnTerminalStatus::Interrupted,
-            summary: reason.to_string(),
-        },
-    };
-    let event = RuntimeEvent {
-        id: RuntimeEventId::new(),
-        session_id,
-        turn_id,
-        sequence_no,
-        created_at_ms: now,
-        msg: RuntimeEventMsg::TurnInterrupted {
+    let snapshot = canonical_turn_snapshot_in_transaction(transaction, session_id, turn_id)?;
+    let mut sequence_no =
+        resolve_terminal_protocol_sequence_in_transaction(transaction, session_id, turn_id, None)?;
+    for (call_id, tool) in snapshot.unsettled_tool_calls {
+        let event = RunEvent::ToolCallCancelled {
+            tool_call_id: call_id,
+            tool,
             reason: reason.to_string(),
-        },
+            metadata: serde_json::Value::Null,
+        };
+        insert_protocol_projection_if_requested(
+            transaction,
+            &event,
+            Some(session_id),
+            turn_id,
+            Some(sequence_no),
+        )?;
+        sequence_no = sequence_no.saturating_add(1);
+    }
+    let event = RunEvent::TurnTerminal {
+        session_id,
+        terminal: Box::new(crate::session::model::DurableTurnTerminal {
+            outcome: TurnTerminalOutcome::Interrupted {
+                cause: crate::protocol::TurnInterruptionCause::AgentInterrupted,
+            },
+            final_response_id: snapshot.final_response_id,
+            tool_call_count: snapshot.tool_call_count,
+            failed_tool_count: snapshot.failed_tool_count,
+            change_count: snapshot.change_count,
+            metrics: Default::default(),
+        }),
     };
-    insert_event_bundle_in_transaction(transaction, &event, Some(&history_item), Some(&turn_item))?;
+    let projection = project_protocol_run_event(&event, Some(session_id), turn_id, sequence_no)
+        .ok_or_else(|| {
+            StorageError::Message("fork terminal marker did not produce a protocol bundle".into())
+        })?;
+    insert_session_owned_event_bundle_in_transaction(
+        &SESSION_PROTOCOL_WRITE_AUTHORITY,
+        transaction,
+        &projection.runtime_event,
+        projection.history_item.as_ref(),
+        projection.turn_item.as_ref(),
+    )?;
     Ok(())
 }
 
+#[derive(Debug)]
+struct CanonicalTurnSnapshot {
+    final_response_id: Option<ModelResponseId>,
+    tool_call_count: usize,
+    failed_tool_count: usize,
+    change_count: usize,
+    unsettled_tool_calls: Vec<(ToolCallId, crate::tool::ToolName)>,
+}
+
+fn canonical_turn_snapshot_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    turn_id: TurnId,
+) -> Result<CanonicalTurnSnapshot, StorageError> {
+    let payloads = {
+        let mut statement = transaction.prepare(
+            "SELECT payload_json
+             FROM protocol_history_items
+             WHERE session_id = ?1 AND turn_id = ?2
+               AND json_extract(payload_json, '$.kind') IN (
+                   'assistant_message', 'tool_call', 'tool_output', 'file_change'
+               )
+             ORDER BY sequence_no ASC, id ASC",
+        )?;
+        statement
+            .query_map(
+                params![session_id.to_string(), turn_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut final_response_id = None;
+    let mut tool_calls = Vec::<(ToolCallId, crate::tool::ToolName)>::new();
+    let mut settled_tool_calls = HashSet::<ToolCallId>::new();
+    let mut failed_tool_count = 0usize;
+    let mut change_count = 0usize;
+    for payload_json in payloads {
+        match serde_json::from_str::<HistoryItemPayload>(&payload_json)? {
+            HistoryItemPayload::AssistantMessage { response_id, .. } => {
+                final_response_id = Some(response_id);
+            }
+            HistoryItemPayload::ToolCall {
+                call_id,
+                response_id,
+                tool_name,
+                ..
+            } => {
+                final_response_id = Some(response_id);
+                tool_calls.push((call_id, crate::tool::ToolName::parse(&tool_name)));
+            }
+            HistoryItemPayload::ToolOutput {
+                call_id, status, ..
+            } => {
+                settled_tool_calls.insert(call_id);
+                if status == crate::protocol::ToolLifecycleStatus::Failed {
+                    failed_tool_count = failed_tool_count.saturating_add(1);
+                }
+            }
+            HistoryItemPayload::FileChange {
+                change_ids,
+                changes,
+                ..
+            } => {
+                change_count = change_count.saturating_add(change_ids.len().max(changes.len()));
+            }
+            _ => {}
+        }
+    }
+    let tool_call_count = tool_calls.len();
+    let unsettled_tool_calls = tool_calls
+        .into_iter()
+        .filter(|(call_id, _)| !settled_tool_calls.contains(call_id))
+        .collect();
+    Ok(CanonicalTurnSnapshot {
+        final_response_id,
+        tool_call_count,
+        failed_tool_count,
+        change_count,
+        unsettled_tool_calls,
+    })
+}
+
 fn session_spawn_edge_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSpawnEdge> {
-    Ok(SessionSpawnEdge {
+    let edge = SessionSpawnEdge {
         root_session_id: parse_session_id_column(row, 0)?,
         parent_session_id: parse_session_id_column(row, 1)?,
         child_session_id: parse_session_id_column(row, 2)?,
         agent_path: row.get(3)?,
         task_name: row.get(4)?,
         created_at_ms: row.get(5)?,
-    })
+    };
+    validate_flat_session_spawn_edge(
+        edge.root_session_id,
+        edge.parent_session_id,
+        edge.child_session_id,
+        &edge.agent_path,
+        &edge.task_name,
+    )
+    .map_err(|message| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            )),
+        )
+    })?;
+    Ok(edge)
 }
 
-fn collect_session_tree_postorder(
-    session_id: SessionId,
-    children: &HashMap<SessionId, Vec<SessionId>>,
-    visited: &mut HashSet<SessionId>,
-    result: &mut Vec<SessionId>,
-) {
-    if !visited.insert(session_id) {
-        return;
+fn validate_flat_session_spawn_edge(
+    root_session_id: SessionId,
+    parent_session_id: SessionId,
+    child_session_id: SessionId,
+    agent_path: &str,
+    task_name: &str,
+) -> Result<(), String> {
+    if parent_session_id != root_session_id {
+        return Err(format!(
+            "spawn parent session {parent_session_id} is not root session {root_session_id}; only root → direct-child lineage is supported"
+        ));
     }
-    if let Some(child_session_ids) = children.get(&session_id) {
-        for child_session_id in child_session_ids {
-            collect_session_tree_postorder(*child_session_id, children, visited, result);
-        }
+    if child_session_id == root_session_id {
+        return Err(format!(
+            "root session {root_session_id} cannot also be its own child session"
+        ));
     }
-    result.push(session_id);
+    let expected_path = AgentPath::root()
+        .join(task_name)
+        .map_err(|error| format!("invalid direct-child task name `{task_name}`: {error}"))?;
+    if expected_path.as_str() != agent_path {
+        return Err(format!(
+            "spawn edge path `{agent_path}` does not match canonical direct-child path `{expected_path}`"
+        ));
+    }
+    Ok(())
 }
 
 fn delete_session_rows(
@@ -3820,51 +3638,261 @@ fn delete_session_rows(
         "DELETE FROM protocol_turn_sequence_allocators WHERE session_id = ?1",
         params![session_id],
     )?;
-    transaction.execute(
-        "DELETE FROM file_changes WHERE session_id = ?1",
-        params![session_id],
-    )?;
-    transaction.execute(
-        "DELETE FROM tool_calls WHERE session_id = ?1",
-        params![session_id],
-    )?;
-    transaction.execute(
-        "DELETE FROM message_parts
-         WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)",
-        params![session_id],
-    )?;
-    transaction.execute(
-        "DELETE FROM messages WHERE session_id = ?1",
-        params![session_id],
-    )?;
-    transaction.execute(
-        "DELETE FROM session_todos WHERE session_id = ?1",
-        params![session_id],
-    )?;
-    transaction.execute(
-        "DELETE FROM session_state WHERE session_id = ?1",
-        params![session_id],
-    )?;
     transaction.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
     Ok(())
 }
 
-fn parse_status(value: &str) -> SessionStatus {
-    match value {
-        "idle" => SessionStatus::Idle,
-        "running" => SessionStatus::Running,
-        "completed" => SessionStatus::Completed,
-        "awaiting_user" => SessionStatus::AwaitingUser,
-        "cancelled" => SessionStatus::Cancelled,
-        "failed" => SessionStatus::Failed,
-        _ => SessionStatus::Failed,
+fn validate_terminal_event(
+    target_session_id: SessionId,
+    event: &RunEvent,
+) -> Result<&crate::session::model::DurableTurnTerminal, StorageError> {
+    let RunEvent::TurnTerminal {
+        session_id,
+        terminal,
+    } = event
+    else {
+        return Err(StorageError::Message(
+            "terminal session mutation requires RunEvent::TurnTerminal".to_string(),
+        ));
+    };
+    if *session_id != target_session_id {
+        return Err(StorageError::Message(format!(
+            "terminal event belongs to session {session_id}, not target session {target_session_id}"
+        )));
     }
+    if terminal.failed_tool_count > terminal.tool_call_count {
+        return Err(StorageError::Message(format!(
+            "TurnTerminal failed tool count {} exceeds total tool count {}",
+            terminal.failed_tool_count, terminal.tool_call_count
+        )));
+    }
+    Ok(terminal)
+}
+
+fn terminal_for_turn_in_connection(
+    connection: &Connection,
+    session_id: SessionId,
+    turn_id: TurnId,
+) -> Result<Option<crate::session::model::DurableTurnTerminal>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT msg_json
+         FROM protocol_runtime_events
+         WHERE session_id = ?1 AND turn_id = ?2
+           AND json_extract(msg_json, '$.kind') = 'turn_terminal'
+         ORDER BY sequence_no DESC, rowid DESC
+         LIMIT 2",
+    )?;
+    let mut rows = statement.query_map(
+        params![session_id.to_string(), turn_id.to_string()],
+        |row| row.get::<_, String>(0),
+    )?;
+    let Some(row) = rows.next() else {
+        return Ok(None);
+    };
+    let RuntimeEventMsg::TurnTerminal { terminal } =
+        serde_json::from_str::<RuntimeEventMsg>(&row?)?
+    else {
+        return Err(StorageError::Message(
+            "terminal runtime-event discriminator did not decode as TurnTerminal".to_string(),
+        ));
+    };
+    if rows.next().transpose()?.is_some() {
+        return Err(StorageError::Message(format!(
+            "multiple durable terminals exist for session {session_id} turn {turn_id}"
+        )));
+    }
+    Ok(Some(*terminal))
+}
+
+fn terminal_for_retained_admission_in_connection(
+    connection: &Connection,
+    session_id: SessionId,
+    session_status: SessionStatus,
+    admission: DurableRunAdmission,
+) -> Result<DurableTurnTerminal, StorageError> {
+    let terminal = terminal_for_turn_in_connection(connection, session_id, admission.turn_id)?
+        .ok_or_else(|| {
+            StorageError::Message(format!(
+                "terminal session {session_id} retained admission {} for turn {} without a durable terminal",
+                admission.admission_id, admission.turn_id
+            ))
+        })?;
+    if terminal.session_status() != session_status {
+        return Err(StorageError::Message(format!(
+            "session {session_id} status {} contradicts durable terminal status {} for turn {}",
+            session_status_text(session_status),
+            session_status_text(terminal.session_status()),
+            admission.turn_id
+        )));
+    }
+    Ok(terminal)
+}
+
+fn validate_retained_admission_terminal_state_in_connection(
+    connection: &Connection,
+    session_id: SessionId,
+    runtime_state: ValidatedSessionRuntimeState,
+) -> Result<Option<DurableTurnTerminal>, StorageError> {
+    let Some(admission) = runtime_state.admission else {
+        return Ok(None);
+    };
+    match runtime_state.status {
+        SessionStatus::Running => {
+            if terminal_for_turn_in_connection(connection, session_id, admission.turn_id)?.is_some()
+            {
+                return Err(StorageError::Message(format!(
+                    "running session {session_id} active turn {} already has a durable terminal",
+                    admission.turn_id
+                )));
+            }
+            Ok(None)
+        }
+        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed => {
+            terminal_for_retained_admission_in_connection(
+                connection,
+                session_id,
+                runtime_state.status,
+                admission,
+            )
+            .map(Some)
+        }
+        SessionStatus::Idle => Err(StorageError::Message(format!(
+            "idle session {session_id} unexpectedly retains a durable run admission"
+        ))),
+    }
+}
+
+fn parse_status(value: &str) -> Result<SessionStatus, StorageError> {
+    match value {
+        "idle" => Ok(SessionStatus::Idle),
+        "running" => Ok(SessionStatus::Running),
+        "completed" => Ok(SessionStatus::Completed),
+        "cancelled" => Ok(SessionStatus::Cancelled),
+        "failed" => Ok(SessionStatus::Failed),
+        _ => Err(StorageError::Message(format!(
+            "unknown persisted session status `{value}`"
+        ))),
+    }
+}
+
+fn parse_status_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<SessionStatus> {
+    let value = row.get::<_, String>(index)?;
+    parse_status(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
 }
 
 struct StoredThreadGoal {
     goal: ThreadGoal,
     goal_id: String,
     updated_at_ms: i64,
+}
+
+fn stored_thread_goal_from_connection(
+    connection: &Connection,
+    thread_id: SessionId,
+) -> Result<Option<StoredThreadGoal>, StorageError> {
+    let row = connection
+        .query_row(
+            "SELECT thread_id, goal_id, objective, status, token_budget, tokens_used,
+                    time_used_seconds, created_at_ms, updated_at_ms
+             FROM thread_goals
+             WHERE thread_id = ?1",
+            params![thread_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(stored_thread_goal_from_row).transpose()
+}
+
+fn set_thread_goal_objective_in_transaction(
+    transaction: &Transaction<'_>,
+    thread_id: SessionId,
+    objective: &str,
+    now_ms: i64,
+) -> Result<(), StorageError> {
+    let objective = objective.trim();
+    let stored = stored_thread_goal_from_connection(transaction, thread_id)?;
+    match stored {
+        Some(stored) => {
+            validate_goal_objective_and_budget(objective, stored.goal.token_budget)?;
+            let elapsed_seconds = if matches!(
+                stored.goal.status,
+                ThreadGoalStatus::Active | ThreadGoalStatus::BudgetLimited
+            ) {
+                now_ms.saturating_sub(stored.updated_at_ms).max(0) / 1_000
+            } else {
+                0
+            };
+            let time_used_seconds = stored
+                .goal
+                .time_used_seconds
+                .saturating_add(elapsed_seconds);
+            let status = status_after_budget_limit(
+                ThreadGoalStatus::Active,
+                stored.goal.tokens_used,
+                stored.goal.token_budget,
+            );
+            let updated_at_ms = now_ms.max(stored.updated_at_ms.saturating_add(1));
+            let changed = transaction.execute(
+                "UPDATE thread_goals
+                 SET objective = ?2,
+                     status = ?3,
+                     time_used_seconds = ?4,
+                     updated_at_ms = ?5
+                 WHERE thread_id = ?1
+                   AND goal_id = ?6
+                   AND updated_at_ms = ?7",
+                params![
+                    thread_id.to_string(),
+                    objective,
+                    status.as_db_str(),
+                    time_used_seconds,
+                    updated_at_ms,
+                    stored.goal_id,
+                    stored.updated_at_ms,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StorageError::Message(
+                    "thread goal changed while admitting its owning turn".to_string(),
+                ));
+            }
+        }
+        None => {
+            validate_goal_objective_and_budget(objective, None)?;
+            transaction.execute(
+                "INSERT INTO thread_goals (
+                     thread_id, goal_id, objective, status, token_budget, tokens_used,
+                     time_used_seconds, created_at_ms, updated_at_ms
+                 )
+                 VALUES (?1, ?2, ?3, 'active', NULL, 0, 0, ?4, ?4)",
+                params![
+                    thread_id.to_string(),
+                    ulid::Ulid::new().to_string(),
+                    objective,
+                    now_ms,
+                ],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn stored_thread_goal_from_row(
@@ -3938,12 +3966,20 @@ fn status_after_budget_limit(
     }
 }
 
-fn parse_access_mode(value: &str) -> AccessMode {
-    AccessMode::parse(value).unwrap_or(AccessMode::Default)
-}
-
-fn parse_memory_mode(value: &str) -> SessionMemoryMode {
-    SessionMemoryMode::parse(value).unwrap_or(SessionMemoryMode::Enabled)
+fn parse_access_mode_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<AccessMode> {
+    let value = row.get::<_, String>(index)?;
+    match value.as_str() {
+        "default" => Ok(AccessMode::Default),
+        "full_access" => Ok(AccessMode::FullAccess),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown persisted access mode `{value}`"),
+            )),
+        )),
+    }
 }
 
 fn parse_session_model_parameters(
@@ -3959,88 +3995,6 @@ fn parse_session_model_parameters(
     })
 }
 
-fn parse_part_kind(value: &str) -> PartKind {
-    match value {
-        "text" => PartKind::Text,
-        "reasoning" => PartKind::Reasoning,
-        "tool_call" => PartKind::ToolCall,
-        "tool_result" => PartKind::ToolResult,
-        "image" => PartKind::Image,
-        "error" => PartKind::Error,
-        "diff_summary" => PartKind::DiffSummary,
-        "prompt_dispatch" => PartKind::PromptDispatch,
-        "request_diagnostics" => PartKind::RequestDiagnostics,
-        _ => PartKind::Error,
-    }
-}
-
-fn part_kind_text(value: PartKind) -> &'static str {
-    match value {
-        PartKind::Text => "text",
-        PartKind::Reasoning => "reasoning",
-        PartKind::ToolCall => "tool_call",
-        PartKind::ToolResult => "tool_result",
-        PartKind::Image => "image",
-        PartKind::Error => "error",
-        PartKind::DiffSummary => "diff_summary",
-        PartKind::PromptDispatch => "prompt_dispatch",
-        PartKind::RequestDiagnostics => "request_diagnostics",
-    }
-}
-
-fn next_message_sequence_in_transaction(
-    transaction: &rusqlite::Transaction<'_>,
-    session_id: SessionId,
-) -> Result<i64, StorageError> {
-    let value: Option<i64> = transaction.query_row(
-        "SELECT MAX(sequence_no) FROM messages WHERE session_id = ?1",
-        params![session_id.to_string()],
-        |row| row.get::<_, Option<i64>>(0),
-    )?;
-    Ok(value.unwrap_or(0) + 1)
-}
-
-fn next_part_sequence_in_transaction(
-    transaction: &rusqlite::Transaction<'_>,
-    message_id: MessageId,
-) -> Result<i64, StorageError> {
-    let value: Option<i64> = transaction.query_row(
-        "SELECT MAX(sequence_no) FROM message_parts WHERE message_id = ?1",
-        params![message_id.to_string()],
-        |row| row.get::<_, Option<i64>>(0),
-    )?;
-    Ok(value.unwrap_or(0) + 1)
-}
-
-fn insert_part_in_transaction(
-    transaction: &rusqlite::Transaction<'_>,
-    message_id: MessageId,
-    part: NewPart,
-) -> Result<PartRecord, StorageError> {
-    let id = crate::session::PartId::new();
-    let now = SystemClock.now_ms();
-    let sequence_no = next_part_sequence_in_transaction(transaction, message_id)?;
-    transaction.execute(
-        "INSERT INTO message_parts (id, message_id, sequence_no, part_kind, payload_json, created_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            id.to_string(),
-            message_id.to_string(),
-            sequence_no,
-            part_kind_text(part.kind),
-            serde_json::to_string(&part.payload)?,
-            now
-        ],
-    )?;
-    Ok(PartRecord {
-        id,
-        message_id,
-        sequence_no,
-        kind: part.kind,
-        payload: part.payload,
-    })
-}
-
 fn insert_protocol_projection_if_requested(
     transaction: &rusqlite::Transaction<'_>,
     event: &RunEvent,
@@ -4048,9 +4002,7 @@ fn insert_protocol_projection_if_requested(
     protocol_turn_id: TurnId,
     protocol_sequence_no: Option<i64>,
 ) -> Result<(), StorageError> {
-    let Some(protocol_sequence_no) = protocol_sequence_no else {
-        return Ok(());
-    };
+    let protocol_sequence_no = protocol_sequence_no.unwrap_or(0);
     let Some(projection) = project_protocol_run_event(
         event,
         fallback_session_id,
@@ -4059,7 +4011,8 @@ fn insert_protocol_projection_if_requested(
     ) else {
         return Ok(());
     };
-    crate::protocol::insert_event_bundle_in_transaction(
+    crate::protocol::insert_session_owned_event_bundle_in_transaction(
+        &SESSION_PROTOCOL_WRITE_AUTHORITY,
         transaction,
         &projection.runtime_event,
         projection.history_item.as_ref(),
@@ -4068,447 +4021,712 @@ fn insert_protocol_projection_if_requested(
     Ok(())
 }
 
-fn tool_success_from_metadata(metadata: &serde_json::Value) -> Option<bool> {
-    if let Some(success) = metadata
-        .get("success")
-        .or_else(|| {
-            metadata
-                .get("tool_feedback_envelope")
-                .and_then(|feedback| feedback.get("success"))
-        })
-        .and_then(serde_json::Value::as_bool)
-    {
-        return Some(success);
-    }
-    if let Some(run) = metadata
-        .get("verification_run_result")
-        .and_then(|value| serde_json::from_value::<VerificationRunResult>(value.clone()).ok())
-    {
-        return Some(matches!(run.status, VerificationRunStatus::Passed));
-    }
-    Some(!matches!(
-        tool_progress_effect_from_metadata(metadata),
-        ToolProgressEffect::NoProgress
-            | ToolProgressEffect::Blocked
-            | ToolProgressEffect::VerificationFailed
-    ))
-}
-
-fn tool_progress_effect_from_metadata(metadata: &serde_json::Value) -> ToolProgressEffect {
-    if let Some(run) = metadata
-        .get("verification_run_result")
-        .and_then(|value| serde_json::from_value::<VerificationRunResult>(value.clone()).ok())
-    {
-        return match run.status {
-            VerificationRunStatus::Passed => ToolProgressEffect::VerificationPassed,
-            VerificationRunStatus::Failed | VerificationRunStatus::TimedOut => {
-                ToolProgressEffect::VerificationFailed
-            }
-            VerificationRunStatus::NotVerification => ToolProgressEffect::Unknown,
-        };
-    }
-    metadata
-        .get("tool_feedback_envelope")
-        .and_then(|feedback| feedback.get("progress_effect"))
-        .or_else(|| metadata.get("progress_effect"))
-        .and_then(serde_json::Value::as_str)
-        .map(|value| match value {
-            "made_progress" | "progress" => ToolProgressEffect::MadeProgress,
-            "no_progress" => ToolProgressEffect::NoProgress,
-            "blocked" => ToolProgressEffect::Blocked,
-            "verification_passed" => ToolProgressEffect::VerificationPassed,
-            "verification_failed" => ToolProgressEffect::VerificationFailed,
-            _ => ToolProgressEffect::Unknown,
-        })
-        .unwrap_or(ToolProgressEffect::Unknown)
-}
-
-fn metadata_string(metadata: &serde_json::Value, path: &[&str]) -> Option<String> {
-    let mut value = metadata;
-    for key in path {
-        value = value.get(*key)?;
-    }
-    value.as_str().map(ToString::to_string)
-}
-
-fn upsert_session_state_row(
-    connection: &Connection,
-    session_id: SessionId,
-    state: &SessionStateSnapshot,
-    updated_at_ms: i64,
-) -> Result<(), StorageError> {
-    let failure_kind = state
-        .failure
-        .as_ref()
-        .map(|value| failure_kind_text(value.kind));
-    let failure_summary = state.failure.as_ref().map(|value| value.summary.as_str());
-    let failure_tool_name = state
-        .failure
-        .as_ref()
-        .and_then(|value| value.tool_name)
-        .map(tool_name_text);
-    let failure_targets_json = serde_json::to_string(
-        &state
-            .failure
-            .as_ref()
-            .map(|value| value.targets.as_slice())
-            .unwrap_or(&[]),
-    )?;
-    let contract_refs_json = serde_json::to_string(&state.contract_refs)?;
-    let review_scope_json = serde_json::to_string(&state.review_scope)?;
-    let docs_route_state_json = serde_json::to_string(&state.docs_route)?;
-    let implementation_handoff_json = serde_json::to_string(&state.implementation_handoff)?;
-    let verification_failure_cluster_json =
-        serde_json::to_string(&state.verification.failure_cluster)?;
-    let verification_requirement_refs_json =
-        serde_json::to_string(&state.verification.requirement_refs)?;
-    let token_accounting_json = serde_json::to_string(&state.token_accounting)?;
-    connection.execute(
-        "INSERT INTO session_state (
-             session_id, task_route, phase, review_scope_json, active_todo_id, active_targets_json, contract_refs_json, failure_kind, failure_summary, failure_tool_name,
-             failure_targets_json, verification_todo_id, verification_commands_json, verification_failures_json,
-             verification_evidence_summary, completion_closeout_ready, completion_open_work_count,
-             completion_verification_pending, completion_route_contract_pending, completion_blocked_reason, completion_route_contract_summary,
-             docs_route_state_json, implementation_handoff_json, verification_failure_cluster_json, verification_requirement_refs_json, token_accounting_json, updated_at_ms
-         )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
-         ON CONFLICT(session_id) DO UPDATE SET
-             task_route = excluded.task_route,
-             phase = excluded.phase,
-             review_scope_json = excluded.review_scope_json,
-             active_todo_id = excluded.active_todo_id,
-             active_targets_json = excluded.active_targets_json,
-             contract_refs_json = excluded.contract_refs_json,
-             failure_kind = excluded.failure_kind,
-             failure_summary = excluded.failure_summary,
-             failure_tool_name = excluded.failure_tool_name,
-             failure_targets_json = excluded.failure_targets_json,
-             verification_todo_id = excluded.verification_todo_id,
-             verification_commands_json = excluded.verification_commands_json,
-             verification_failures_json = excluded.verification_failures_json,
-             verification_evidence_summary = excluded.verification_evidence_summary,
-             completion_closeout_ready = excluded.completion_closeout_ready,
-             completion_open_work_count = excluded.completion_open_work_count,
-             completion_verification_pending = excluded.completion_verification_pending,
-             completion_route_contract_pending = excluded.completion_route_contract_pending,
-             completion_blocked_reason = excluded.completion_blocked_reason,
-             completion_route_contract_summary = excluded.completion_route_contract_summary,
-             docs_route_state_json = excluded.docs_route_state_json,
-             implementation_handoff_json = excluded.implementation_handoff_json,
-             verification_failure_cluster_json = excluded.verification_failure_cluster_json,
-             verification_requirement_refs_json = excluded.verification_requirement_refs_json,
-             token_accounting_json = excluded.token_accounting_json,
-             updated_at_ms = excluded.updated_at_ms",
-        params![
-            session_id.to_string(),
-            task_route_text(state.route),
-            process_phase_text(state.process_phase),
-            review_scope_json,
-            state.active_todo_id.map(|value| value.to_string()),
-            serde_json::to_string(&state.active_targets)?,
-            contract_refs_json,
-            failure_kind,
-            failure_summary,
-            failure_tool_name,
-            failure_targets_json,
-            state.verification.pending_todo_id.map(|value| value.to_string()),
-            serde_json::to_string(&state.verification.required_commands)?,
-            serde_json::to_string(&state.verification.failing_labels)?,
-            state.verification.last_evidence_summary,
-            state.completion.closeout_ready as i64,
-            state.completion.open_work_count as i64,
-            state.completion.verification_pending as i64,
-            state.completion.route_contract_pending as i64,
-            state.completion.blocked_reason,
-            state.completion.route_contract_summary,
-            docs_route_state_json,
-            implementation_handoff_json,
-            verification_failure_cluster_json,
-            verification_requirement_refs_json,
-            token_accounting_json,
-            updated_at_ms
-        ],
-    )?;
-    Ok(())
-}
-
-fn validate_file_change_protocol_bundle(
+fn validate_canonical_tool_call_payload(
+    history_item: &HistoryItem,
     tool_call_id: ToolCallId,
-    diff_summary: &DiffSummaryPart,
+) -> Result<(), StorageError> {
+    match &history_item.payload {
+        HistoryItemPayload::ToolCall { call_id, .. } if *call_id == tool_call_id => Ok(()),
+        HistoryItemPayload::ToolCall { call_id, .. } => Err(StorageError::Message(format!(
+            "canonical tool call identity mismatch: expected {tool_call_id} got {call_id}",
+        ))),
+        _ => Err(StorageError::Message(
+            "tool sidecar must reference a canonical ToolCall history item".to_string(),
+        )),
+    }
+}
+
+fn validate_canonical_tool_call_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    turn_id: TurnId,
+    tool_call_id: ToolCallId,
+    tool_name: crate::tool::ToolName,
+) -> Result<HistoryItemId, StorageError> {
+    let stored = transaction
+        .query_row(
+            "SELECT history.id, history.sequence_no, history.payload_json, history.created_at_ms
+             FROM tool_calls AS tool
+             INNER JOIN protocol_history_items AS history
+                ON history.id = tool.history_item_id
+             WHERE tool.id = ?1 AND history.session_id = ?2 AND history.turn_id = ?3",
+            params![
+                tool_call_id.to_string(),
+                session_id.to_string(),
+                turn_id.to_string(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((history_item_id, sequence_no, payload_json, created_at_ms)) = stored else {
+        return Err(StorageError::Message(format!(
+            "tool call {tool_call_id} is not owned by session {session_id} turn {turn_id}"
+        )));
+    };
+    let history_item = HistoryItem {
+        id: history_item_id.parse::<HistoryItemId>().map_err(|error| {
+            StorageError::Message(format!("invalid tool history item id: {error}"))
+        })?,
+        session_id,
+        scope: crate::protocol::HistoryScope::Turn { turn_id },
+        sequence_no,
+        created_at_ms,
+        payload: serde_json::from_str(&payload_json)?,
+    };
+    validate_canonical_tool_call_payload(&history_item, tool_call_id)?;
+    let HistoryItemPayload::ToolCall {
+        tool_name: stored_tool_name,
+        ..
+    } = &history_item.payload
+    else {
+        unreachable!("canonical payload validation accepted a non-tool-call item");
+    };
+    let stored_tool = crate::tool::ToolName::parse(stored_tool_name);
+    if stored_tool != tool_name {
+        return Err(StorageError::Message(format!(
+            "canonical tool call name mismatch: expected {tool_name} got raw `{stored_tool_name}` ({stored_tool})"
+        )));
+    }
+    Ok(history_item.id)
+}
+
+fn validate_persisted_file_change_ownership(
+    transaction: &Transaction<'_>,
+    tool_call_id: ToolCallId,
     file_changes: &[crate::edit::ChangeSummary],
 ) -> Result<(), StorageError> {
-    if file_changes.is_empty() {
-        return Err(StorageError::Message(
-            "content-changing tool completion requires file change evidence".to_string(),
-        ));
-    }
-    if diff_summary.summary.trim().is_empty() {
-        return Err(StorageError::Message(
-            "content-changing tool completion requires a diff summary".to_string(),
-        ));
-    }
-    if diff_summary.tool_call_id != Some(tool_call_id) {
-        return Err(StorageError::Message(
-            "diff summary tool call id must match tool completion owner".to_string(),
-        ));
-    }
-    let change_ids = file_changes
-        .iter()
-        .map(|change| change.change_id)
-        .collect::<Vec<_>>();
-    if diff_summary.change_ids != change_ids {
-        return Err(StorageError::Message(
-            "diff summary change ids must match file change evidence".to_string(),
-        ));
-    }
-    if diff_summary.changes.len() != file_changes.len() {
-        return Err(StorageError::Message(
-            "diff summary evidence count must match file change evidence".to_string(),
-        ));
-    }
-    for (index, (evidence, change)) in diff_summary
-        .changes
-        .iter()
-        .zip(file_changes.iter())
-        .enumerate()
-    {
-        if evidence.change_id != change.change_id
-            || evidence.kind != change.kind
-            || evidence.path_before != change.path_before
-            || evidence.path_after != change.path_after
-        {
+    let mut seen = HashSet::with_capacity(file_changes.len());
+    let tool_call_id_text = tool_call_id.to_string();
+    for change in file_changes {
+        if !seen.insert(change.change_id) {
             return Err(StorageError::Message(format!(
-                "diff summary evidence at index {index} must match file change evidence"
+                "file change {} is duplicated in one tool settlement",
+                change.change_id
             )));
         }
-        if evidence.summary.trim().is_empty() {
+        let owner = transaction
+            .query_row(
+                "SELECT tool_call_id FROM file_changes WHERE id = ?1",
+                params![change.change_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if owner.as_deref() != Some(tool_call_id_text.as_str()) {
             return Err(StorageError::Message(format!(
-                "diff summary evidence at index {index} requires a summary"
+                "file change {} is not durable evidence for tool call {tool_call_id}",
+                change.change_id
             )));
         }
     }
     Ok(())
 }
 
-fn parse_tool_name(value: &str) -> crate::tool::ToolName {
-    match value {
-        "list" => crate::tool::ToolName::List,
-        "glob" => crate::tool::ToolName::Glob,
-        "grep" => crate::tool::ToolName::Grep,
-        "read" => crate::tool::ToolName::Read,
-        "inspect_directory" => crate::tool::ToolName::InspectDirectory,
-        "apply_patch" => crate::tool::ToolName::ApplyPatch,
-        "write" => crate::tool::ToolName::Write,
-        "shell" => crate::tool::ToolName::Shell,
-        "current_time" => crate::tool::ToolName::CurrentTime,
-        "skill" => crate::tool::ToolName::Skill,
-        "docling_convert" => crate::tool::ToolName::DoclingConvert,
-        "mcp_call" => crate::tool::ToolName::McpCall,
-        "todowrite" => crate::tool::ToolName::TodoWrite,
-        "get_goal" => crate::tool::ToolName::GetGoal,
-        "create_goal" => crate::tool::ToolName::CreateGoal,
-        "update_goal" => crate::tool::ToolName::UpdateGoal,
-        "spawn_agent" => crate::tool::ToolName::SpawnAgent,
-        "send_message" => crate::tool::ToolName::SendMessage,
-        "followup_task" => crate::tool::ToolName::FollowupTask,
-        "wait_agent" => crate::tool::ToolName::WaitAgent,
-        "interrupt_agent" => crate::tool::ToolName::InterruptAgent,
-        "list_agents" => crate::tool::ToolName::ListAgents,
-        "invalid" => crate::tool::ToolName::Invalid,
-        _ => crate::tool::ToolName::Invalid,
+fn session_status_text(status: SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Idle => "idle",
+        SessionStatus::Running => "running",
+        SessionStatus::Completed => "completed",
+        SessionStatus::Cancelled => "cancelled",
+        SessionStatus::Failed => "failed",
     }
 }
 
-fn tool_name_text(value: crate::tool::ToolName) -> &'static str {
-    match value {
-        crate::tool::ToolName::List => "list",
-        crate::tool::ToolName::Glob => "glob",
-        crate::tool::ToolName::Grep => "grep",
-        crate::tool::ToolName::Read => "read",
-        crate::tool::ToolName::InspectDirectory => "inspect_directory",
-        crate::tool::ToolName::ApplyPatch => "apply_patch",
-        crate::tool::ToolName::Write => "write",
-        crate::tool::ToolName::Shell => "shell",
-        crate::tool::ToolName::CurrentTime => "current_time",
-        crate::tool::ToolName::Skill => "skill",
-        crate::tool::ToolName::DoclingConvert => "docling_convert",
-        crate::tool::ToolName::McpCall => "mcp_call",
-        crate::tool::ToolName::TodoWrite => "todowrite",
-        crate::tool::ToolName::GetGoal => "get_goal",
-        crate::tool::ToolName::CreateGoal => "create_goal",
-        crate::tool::ToolName::UpdateGoal => "update_goal",
-        crate::tool::ToolName::SpawnAgent => "spawn_agent",
-        crate::tool::ToolName::SendMessage => "send_message",
-        crate::tool::ToolName::FollowupTask => "followup_task",
-        crate::tool::ToolName::WaitAgent => "wait_agent",
-        crate::tool::ToolName::InterruptAgent => "interrupt_agent",
-        crate::tool::ToolName::ListAgents => "list_agents",
-        crate::tool::ToolName::Invalid => "invalid",
+fn raw_session_runtime_state_from_row(
+    row: &rusqlite::Row<'_>,
+    first_column: usize,
+) -> rusqlite::Result<RawSessionRuntimeState> {
+    Ok(RawSessionRuntimeState {
+        status: row.get(first_column)?,
+        active_run_id: row.get(first_column + 1)?,
+        active_turn_id: row.get(first_column + 2)?,
+        active_run_lease_expires_at_ms: row.get(first_column + 3)?,
+        terminal_count: row.get(first_column + 4)?,
+        terminal_json: row.get(first_column + 5)?,
+    })
+}
+
+fn validate_raw_session_runtime_state(
+    session_id: SessionId,
+    raw: RawSessionRuntimeState,
+) -> Result<ValidatedSessionRuntimeState, StorageError> {
+    let runtime_state = parse_session_runtime_state(
+        session_id,
+        &raw.status,
+        raw.active_run_id.as_deref(),
+        raw.active_turn_id.as_deref(),
+        raw.active_run_lease_expires_at_ms,
+    )?;
+    let terminal = terminal_from_same_statement_evidence(
+        session_id,
+        runtime_state.admission.map(|admission| admission.turn_id),
+        raw.terminal_count,
+        raw.terminal_json.as_deref(),
+    )?;
+    if let Some(admission) = runtime_state.admission {
+        match runtime_state.status {
+            SessionStatus::Running if terminal.is_some() => {
+                return Err(StorageError::Message(format!(
+                    "running session {session_id} active turn {} already has a durable terminal",
+                    admission.turn_id
+                )));
+            }
+            SessionStatus::Running => {}
+            SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed => {
+                let terminal = terminal.ok_or_else(|| {
+                    StorageError::Message(format!(
+                        "terminal session {session_id} retained admission {} for turn {} without a durable terminal",
+                        admission.admission_id, admission.turn_id
+                    ))
+                })?;
+                if terminal.session_status() != runtime_state.status {
+                    return Err(StorageError::Message(format!(
+                        "session {session_id} status {} contradicts durable terminal status {} for turn {}",
+                        session_status_text(runtime_state.status),
+                        session_status_text(terminal.session_status()),
+                        admission.turn_id
+                    )));
+                }
+            }
+            SessionStatus::Idle => {
+                return Err(StorageError::Message(format!(
+                    "idle session {session_id} unexpectedly retains a durable run admission"
+                )));
+            }
+        }
+    }
+    Ok(runtime_state)
+}
+
+fn terminal_from_same_statement_evidence(
+    session_id: SessionId,
+    turn_id: Option<TurnId>,
+    terminal_count: i64,
+    terminal_json: Option<&str>,
+) -> Result<Option<DurableTurnTerminal>, StorageError> {
+    let turn_label = turn_id
+        .map(|turn_id| turn_id.to_string())
+        .unwrap_or_else(|| "<none>".to_string());
+    match (terminal_count, terminal_json) {
+        (0, None) => Ok(None),
+        (1, Some(terminal_json)) => {
+            let RuntimeEventMsg::TurnTerminal { terminal } =
+                serde_json::from_str::<RuntimeEventMsg>(terminal_json)?
+            else {
+                return Err(StorageError::Message(
+                    "terminal runtime-event discriminator did not decode as TurnTerminal"
+                        .to_string(),
+                ));
+            };
+            Ok(Some(*terminal))
+        }
+        (count, _) if count > 1 => Err(StorageError::Message(format!(
+            "multiple durable terminals exist for session {session_id} turn {turn_label}"
+        ))),
+        (count, _) => Err(StorageError::Message(format!(
+            "terminal evidence count/payload mismatch for session {session_id} turn {turn_label}: count {count}"
+        ))),
     }
 }
 
-fn parse_task_route(value: &str) -> Result<TaskRoute, rusqlite::Error> {
-    match value {
-        "code" => Ok(TaskRoute::Code),
-        "docs" => Ok(TaskRoute::Docs),
-        "review" => Ok(TaskRoute::Review),
-        "debug" => Ok(TaskRoute::Debug),
-        "ask" => Ok(TaskRoute::Ask),
-        "summary" => Ok(TaskRoute::Summary),
-        _ => Err(rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                "invalid task route `{value}`"
-            )),
-        )),
+fn session_runtime_state_from_connection(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<Option<ValidatedSessionRuntimeState>, StorageError> {
+    let raw = connection
+        .query_row(
+            "SELECT status, active_run_id, active_turn_id, active_run_lease_expires_at_ms,
+                    (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'),
+                    (SELECT terminal_event.msg_json FROM protocol_runtime_events AS terminal_event
+                     WHERE terminal_event.session_id = sessions.id
+                       AND terminal_event.turn_id = sessions.active_turn_id
+                       AND json_extract(terminal_event.msg_json, '$.kind') = 'turn_terminal'
+                     ORDER BY terminal_event.sequence_no DESC, terminal_event.rowid DESC LIMIT 1)
+             FROM sessions
+             WHERE id = ?1",
+            params![session_id.to_string()],
+            |row| raw_session_runtime_state_from_row(row, 0),
+        )
+        .optional()?;
+    raw.map(|raw| validate_raw_session_runtime_state(session_id, raw))
+        .transpose()
+}
+
+fn ensure_turn_identity_unused_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    turn_id: TurnId,
+) -> Result<(), StorageError> {
+    let used = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM protocol_history_items
+             WHERE session_id = ?1 AND scope_kind = 'turn' AND turn_id = ?2
+             UNION ALL
+             SELECT 1
+             FROM protocol_turn_items
+             WHERE session_id = ?1 AND turn_id = ?2
+             UNION ALL
+             SELECT 1
+             FROM protocol_runtime_events
+             WHERE session_id = ?1 AND turn_id = ?2
+             UNION ALL
+             SELECT 1
+             FROM protocol_item_append_order
+             WHERE session_id = ?1 AND scope_kind = 'turn' AND turn_id = ?2
+             UNION ALL
+             SELECT 1
+             FROM protocol_turn_sequence_allocators
+             WHERE session_id = ?1 AND turn_id = ?2
+             LIMIT 1
+         )",
+        params![session_id.to_string(), turn_id.to_string()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if used {
+        return Err(StorageError::Message(format!(
+            "turn identity {turn_id} has already been used by session {session_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_session_runtime_state(
+    session_id: SessionId,
+    status: &str,
+    active_run_id: Option<&str>,
+    active_turn_id: Option<&str>,
+    lease_expires_at_ms: Option<i64>,
+) -> Result<ValidatedSessionRuntimeState, StorageError> {
+    let status = parse_status(status)?;
+    let admission = match (active_run_id, active_turn_id, lease_expires_at_ms) {
+        (None, None, None) if status != SessionStatus::Running => None,
+        (None, None, None) => {
+            return Err(StorageError::Message(format!(
+                "running session {session_id} has no durable run admission or active turn"
+            )));
+        }
+        (Some(run_id), Some(turn_id), Some(lease_expires_at_ms)) if lease_expires_at_ms > 0 => {
+            if status == SessionStatus::Idle {
+                return Err(StorageError::Message(format!(
+                    "idle session {session_id} unexpectedly retains a durable run admission"
+                )));
+            }
+            let admission_id = run_id.parse::<AdmissionId>().map_err(|_| {
+                StorageError::Message(format!(
+                    "session {session_id} has an invalid durable run admission identity"
+                ))
+            })?;
+            let turn_id = turn_id.parse::<TurnId>().map_err(|_| {
+                StorageError::Message(format!(
+                    "session {session_id} has an invalid durable active turn identity"
+                ))
+            })?;
+            Some(DurableRunAdmission {
+                admission_id,
+                turn_id,
+                lease_expires_at_ms,
+            })
+        }
+        _ => {
+            return Err(StorageError::Message(format!(
+                "session {session_id} has an incomplete durable run admission"
+            )));
+        }
+    };
+    Ok(ValidatedSessionRuntimeState { status, admission })
+}
+
+fn count_steer_history_items(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+) -> Result<usize, StorageError> {
+    count_history_items_by_kind(transaction, session_id, "steer_turn")
+}
+
+fn count_agent_communication_history_items(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+) -> Result<usize, StorageError> {
+    count_history_items_by_kind(transaction, session_id, "inter_agent_communication")
+}
+
+fn count_history_items_by_kind(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    kind: &'static str,
+) -> Result<usize, StorageError> {
+    let count = transaction.query_row(
+        "SELECT COUNT(*)
+         FROM protocol_history_items
+         WHERE session_id = ?1
+           AND json_extract(payload_json, '$.kind') = ?2",
+        params![session_id.to_string(), kind],
+        |row| row.get::<_, i64>(0),
+    )?;
+    usize::try_from(count).map_err(|_| {
+        StorageError::Message(format!(
+            "history item count for kind `{kind}` exceeds this platform's range"
+        ))
+    })
+}
+
+pub(crate) fn normalize_run_lease_now_ms(now_ms: i64) -> i64 {
+    now_ms.clamp(0, i64::MAX - 1)
+}
+
+fn run_lease_expiry_ms(now_ms: i64, lease_duration_ms: i64) -> i64 {
+    normalize_run_lease_now_ms(now_ms).saturating_add(lease_duration_ms.max(1))
+}
+
+fn recover_expired_run_admission_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    current_status: SessionStatus,
+    recovery_admission: DurableRunAdmission,
+    now_ms: i64,
+) -> Result<(), StorageError> {
+    let recovery_turn_id = recovery_admission.turn_id;
+    let was_active = current_status == SessionStatus::Running;
+    validate_retained_admission_terminal_state_in_connection(
+        transaction,
+        session_id,
+        ValidatedSessionRuntimeState {
+            status: current_status,
+            admission: Some(recovery_admission),
+        },
+    )?;
+    if was_active {
+        transaction.execute(
+            "UPDATE sessions
+             SET status = 'failed',
+                 updated_at_ms = ?2,
+                 completed_at_ms = ?2,
+                 active_run_id = NULL,
+                 active_turn_id = NULL,
+                 active_run_lease_expires_at_ms = NULL
+             WHERE id = ?1",
+            params![session_id.to_string(), now_ms],
+        )?;
+    } else {
+        transaction.execute(
+            "UPDATE sessions
+             SET updated_at_ms = MAX(updated_at_ms, ?2),
+                 active_run_id = NULL,
+                 active_turn_id = NULL,
+                 active_run_lease_expires_at_ms = NULL
+             WHERE id = ?1",
+            params![session_id.to_string(), now_ms],
+        )?;
+    }
+    if was_active {
+        let turn_id = recovery_turn_id;
+        let snapshot = canonical_turn_snapshot_in_transaction(transaction, session_id, turn_id)?;
+        let recoverable_unfinished_count =
+            count_unfinished_tool_calls_for_turn_in_transaction(transaction, session_id, turn_id)?;
+        let event = RunEvent::TurnTerminal {
+            session_id,
+            terminal: Box::new(crate::session::model::DurableTurnTerminal {
+                outcome: TurnTerminalOutcome::Failed {
+                    error: EXPIRED_RUN_RECOVERY_REASON.to_string(),
+                },
+                final_response_id: snapshot.final_response_id,
+                tool_call_count: snapshot.tool_call_count,
+                failed_tool_count: snapshot
+                    .failed_tool_count
+                    .saturating_add(recoverable_unfinished_count),
+                change_count: snapshot.change_count,
+                metrics: Default::default(),
+            }),
+        };
+        let recovery_sequence_no = resolve_terminal_protocol_sequence_in_transaction(
+            transaction,
+            session_id,
+            turn_id,
+            None,
+        )?;
+        let terminal_sequence_no = settle_unfinished_tool_calls_for_terminal_event(
+            transaction,
+            session_id,
+            &event,
+            turn_id,
+            recovery_sequence_no,
+            now_ms,
+        )?;
+        insert_protocol_projection_if_requested(
+            transaction,
+            &event,
+            Some(session_id),
+            turn_id,
+            Some(terminal_sequence_no),
+        )?;
+    }
+    // A terminal session already settled the tools owned by this turn. Expiry only releases
+    // the stale admission; it must not reclassify first-writer terminal outcomes.
+    Ok(())
+}
+
+pub(crate) fn fresh_active_admission_matches_in_connection(
+    connection: &Connection,
+    session_id: SessionId,
+    admission_id: AdmissionId,
+    turn_id: TurnId,
+    now_ms: i64,
+) -> Result<bool, StorageError> {
+    let now = normalize_run_lease_now_ms(now_ms);
+    Ok(
+        session_runtime_state_from_connection(connection, session_id)?
+            .filter(|runtime_state| runtime_state.status == SessionStatus::Running)
+            .and_then(|runtime_state| runtime_state.fresh_admission_at(now))
+            .is_some_and(|admission| {
+                admission.admission_id == admission_id && admission.turn_id == turn_id
+            }),
+    )
+}
+
+fn require_active_admission_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    admission_id: AdmissionId,
+    turn_id: TurnId,
+) -> Result<(), StorageError> {
+    let owned = fresh_active_admission_matches_in_connection(
+        transaction,
+        session_id,
+        admission_id,
+        turn_id,
+        SystemClock::now_ms(),
+    )?;
+    if owned {
+        Ok(())
+    } else {
+        Err(StorageError::Message(format!(
+            "run admission {admission_id} no longer owns active turn {turn_id} for session {session_id}"
+        )))
     }
 }
 
-fn task_route_text(value: TaskRoute) -> &'static str {
-    match value {
-        TaskRoute::Code => "code",
-        TaskRoute::Docs => "docs",
-        TaskRoute::Review => "review",
-        TaskRoute::Debug => "debug",
-        TaskRoute::Ask => "ask",
-        TaskRoute::Summary => "summary",
-    }
+fn count_unfinished_tool_calls_for_turn_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    turn_id: TurnId,
+) -> Result<usize, StorageError> {
+    let count = transaction.query_row(
+        "SELECT COUNT(*)
+         FROM tool_calls AS tool
+         INNER JOIN protocol_history_items AS history
+            ON history.id = tool.history_item_id
+         WHERE history.session_id = ?1
+           AND history.turn_id = ?2
+           AND tool.status IN ('pending', 'running')",
+        params![session_id.to_string(), turn_id.to_string()],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(count as usize)
 }
 
-fn parse_process_phase(value: &str) -> Result<ProcessPhase, rusqlite::Error> {
-    match value {
-        "discovery" | "planning" => Ok(ProcessPhase::Discover),
-        "editing" => Ok(ProcessPhase::Author),
-        "verifying" => Ok(ProcessPhase::Verify),
-        "repairing" => Ok(ProcessPhase::Repair),
-        "completing" => Ok(ProcessPhase::Closeout),
-        _ => Err(rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                "invalid process phase `{value}`"
-            )),
-        )),
+fn resolve_terminal_protocol_sequence_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    protocol_turn_id: TurnId,
+    requested_sequence_no: Option<i64>,
+) -> Result<i64, StorageError> {
+    if let Some(sequence_no) = requested_sequence_no {
+        return Ok(sequence_no);
     }
+    let max_sequence_no = transaction.query_row(
+        "SELECT MAX(sequence_no)
+         FROM (
+           SELECT sequence_no
+           FROM protocol_runtime_events
+           WHERE session_id = ?1 AND turn_id = ?2
+           UNION ALL
+           SELECT sequence_no
+           FROM protocol_history_items
+           WHERE session_id = ?1 AND turn_id = ?2
+           UNION ALL
+           SELECT sequence_no
+           FROM protocol_turn_items
+           WHERE session_id = ?1 AND turn_id = ?2
+         )",
+        params![session_id.to_string(), protocol_turn_id.to_string()],
+        |row| row.get::<_, Option<i64>>(0),
+    )?;
+    Ok(max_sequence_no.unwrap_or(-1).saturating_add(1))
 }
 
-fn process_phase_text(value: ProcessPhase) -> &'static str {
-    match value {
-        ProcessPhase::Discover => "discovery",
-        ProcessPhase::Author => "editing",
-        ProcessPhase::Verify => "verifying",
-        ProcessPhase::Repair => "repairing",
-        ProcessPhase::Closeout => "completing",
+fn settle_unfinished_tool_calls_for_terminal_event(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    event: &RunEvent,
+    protocol_turn_id: TurnId,
+    protocol_sequence_no: i64,
+    finished_at_ms: i64,
+) -> Result<i64, StorageError> {
+    let terminal = validate_terminal_event(session_id, event)?;
+    let (status, reason) = match &terminal.outcome {
+        TurnTerminalOutcome::Interrupted { .. } => (
+            ToolCallStatus::Cancelled,
+            if terminal.summary().trim().is_empty() {
+                "turn interrupted before the tool call finished"
+            } else {
+                terminal.summary()
+            },
+        ),
+        TurnTerminalOutcome::Failed { .. } => (
+            ToolCallStatus::Failed,
+            if terminal.summary().trim().is_empty() {
+                "turn failed before the tool call finished"
+            } else {
+                terminal.summary()
+            },
+        ),
+        TurnTerminalOutcome::Completed => (
+            ToolCallStatus::Cancelled,
+            "turn completed before the tool call finished",
+        ),
+    };
+
+    let unfinished = {
+        let mut statement = transaction.prepare(
+            "SELECT tool.id, history.payload_json
+             FROM tool_calls AS tool
+             INNER JOIN protocol_history_items AS history
+                ON history.id = tool.history_item_id
+             WHERE history.session_id = ?1
+               AND history.turn_id = ?2
+               AND tool.status IN ('pending', 'running')
+             ORDER BY tool.started_at_ms ASC, tool.id ASC",
+        )?;
+        statement
+            .query_map(
+                params![session_id.to_string(), protocol_turn_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let mut next_sequence_no = protocol_sequence_no;
+    for (tool_call_id, payload_json) in unfinished {
+        let tool_call_id = tool_call_id.parse::<ToolCallId>().map_err(|error| {
+            StorageError::Message(format!("invalid durable tool call id: {error}"))
+        })?;
+        let payload = serde_json::from_str::<HistoryItemPayload>(&payload_json)?;
+        let HistoryItemPayload::ToolCall {
+            call_id, tool_name, ..
+        } = payload
+        else {
+            return Err(StorageError::Message(format!(
+                "tool sidecar {tool_call_id} does not reference a canonical ToolCall item"
+            )));
+        };
+        if call_id != tool_call_id {
+            return Err(StorageError::Message(format!(
+                "tool sidecar id {tool_call_id} contradicts canonical call id {call_id}"
+            )));
+        }
+        let tool = crate::tool::ToolName::parse(&tool_name);
+        let applied = match status {
+            ToolCallStatus::Cancelled => transaction.execute(
+                "UPDATE tool_calls
+                 SET status = 'cancelled', finished_at_ms = ?2
+                 WHERE id = ?1
+                   AND history_item_id IN (
+                       SELECT id FROM protocol_history_items
+                       WHERE session_id = ?3 AND turn_id = ?4
+                   )
+                   AND status IN ('pending', 'running')",
+                params![
+                    tool_call_id.to_string(),
+                    finished_at_ms,
+                    session_id.to_string(),
+                    protocol_turn_id.to_string(),
+                ],
+            )?,
+            ToolCallStatus::Failed => transaction.execute(
+                "UPDATE tool_calls
+                 SET status = 'failed', finished_at_ms = ?2
+                 WHERE id = ?1
+                   AND history_item_id IN (
+                       SELECT id FROM protocol_history_items
+                       WHERE session_id = ?3 AND turn_id = ?4
+                   )
+                   AND status IN ('pending', 'running')",
+                params![
+                    tool_call_id.to_string(),
+                    finished_at_ms,
+                    session_id.to_string(),
+                    protocol_turn_id.to_string(),
+                ],
+            )?,
+            _ => unreachable!("terminal sweep only cancels or fails unfinished tools"),
+        } == 1;
+        if !applied {
+            continue;
+        }
+        let tool_event = match status {
+            ToolCallStatus::Cancelled => RunEvent::ToolCallCancelled {
+                tool_call_id,
+                tool,
+                reason: reason.to_string(),
+                metadata: serde_json::Value::Null,
+            },
+            ToolCallStatus::Failed => RunEvent::ToolCallFailed {
+                tool_call_id,
+                tool,
+                error: reason.to_string(),
+                metadata: serde_json::Value::Null,
+            },
+            _ => unreachable!("terminal sweep only cancels or fails unfinished tools"),
+        };
+        insert_protocol_projection_if_requested(
+            transaction,
+            &tool_event,
+            Some(session_id),
+            protocol_turn_id,
+            Some(next_sequence_no),
+        )?;
+        next_sequence_no = next_sequence_no.saturating_add(1);
     }
+    Ok(next_sequence_no)
 }
 
-fn parse_failure_kind(value: &str) -> Result<FailureKind, rusqlite::Error> {
-    match value {
-        "invalid_tool" => Ok(FailureKind::InvalidTool),
-        "tool_execution" => Ok(FailureKind::ToolExecution),
-        "patch_mismatch" => Ok(FailureKind::PatchMismatch),
-        "verification_failed" => Ok(FailureKind::VerificationFailed),
-        "context_overflow" => Ok(FailureKind::ContextOverflow),
-        "provider_retryable" => Ok(FailureKind::ProviderRetryable),
-        "provider_fatal" => Ok(FailureKind::ProviderFatal),
-        "completion_drift" => Ok(FailureKind::CompletionDrift),
-        _ => Err(rusqlite::Error::FromSqlConversionFailure(
-            3,
-            rusqlite::types::Type::Text,
-            Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                "invalid failure kind `{value}`"
-            )),
-        )),
+fn escape_like_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
     }
-}
-
-fn failure_kind_text(value: FailureKind) -> &'static str {
-    match value {
-        FailureKind::InvalidTool => "invalid_tool",
-        FailureKind::ToolExecution => "tool_execution",
-        FailureKind::PatchMismatch => "patch_mismatch",
-        FailureKind::VerificationFailed => "verification_failed",
-        FailureKind::ContextOverflow => "context_overflow",
-        FailureKind::ProviderRetryable => "provider_retryable",
-        FailureKind::ProviderFatal => "provider_fatal",
-        FailureKind::CompletionDrift => "completion_drift",
-    }
-}
-
-fn parse_todo_status(value: &str) -> TodoStatus {
-    match value {
-        "pending" => TodoStatus::Pending,
-        "in_progress" => TodoStatus::InProgress,
-        "blocked" => TodoStatus::Blocked,
-        "completed" => TodoStatus::Completed,
-        "cancelled" => TodoStatus::Cancelled,
-        _ => TodoStatus::Pending,
-    }
-}
-
-fn todo_status_text(value: TodoStatus) -> &'static str {
-    match value {
-        TodoStatus::Pending => "pending",
-        TodoStatus::InProgress => "in_progress",
-        TodoStatus::Blocked => "blocked",
-        TodoStatus::Completed => "completed",
-        TodoStatus::Cancelled => "cancelled",
-    }
-}
-
-fn parse_todo_kind(value: &str) -> TodoKind {
-    match value {
-        "verification" => TodoKind::Verification,
-        "repair" => TodoKind::Repair,
-        "completion" => TodoKind::Completion,
-        _ => TodoKind::Work,
-    }
-}
-
-fn todo_kind_text(value: TodoKind) -> &'static str {
-    match value {
-        TodoKind::Work => "work",
-        TodoKind::Verification => "verification",
-        TodoKind::Repair => "repair",
-        TodoKind::Completion => "completion",
-    }
-}
-
-fn parse_todo_priority(value: &str) -> TodoPriority {
-    match value {
-        "high" => TodoPriority::High,
-        "medium" => TodoPriority::Medium,
-        "low" => TodoPriority::Low,
-        _ => TodoPriority::Medium,
-    }
-}
-
-fn todo_priority_text(value: TodoPriority) -> &'static str {
-    match value {
-        TodoPriority::High => "high",
-        TodoPriority::Medium => "medium",
-        TodoPriority::Low => "low",
-    }
+    escaped
 }
 
 #[cfg(test)]
 mod tests {
     use camino::Utf8PathBuf;
-    use std::sync::{Arc, Barrier};
 
     use super::*;
     use crate::config::AccessMode;
-    use crate::protocol::{ContentPart, ProtocolEventStore, UserInputItem};
-    use crate::session::{
-        AssistantMessageMeta, FinishReason, NewSession, ProjectId, ProjectRepository,
-        SessionRepository,
+    use crate::protocol::{
+        ContentPart, InterAgentCommunication, ModeKind, ProtocolEventStore, ToolLifecycleStatus,
+        UserInputItem,
     };
+    use crate::session::{ChangeId, ChangeKind, ChangeRepository, NewSession, ProjectRepository};
     use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
 
     async fn test_repo() -> (StoreBundle, SessionId) {
         let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 data dir");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 path");
         let paths = StoragePaths {
             database_path: data_dir.join("moyai.sqlite3"),
             truncation_dir: data_dir.join("truncation"),
@@ -4538,2480 +4756,2905 @@ mod tests {
         (store, session.id)
     }
 
-    fn session_draft_from(template: &SessionRecord, title: &str) -> NewSession {
-        NewSession {
-            project_id: template.project_id,
-            title: title.to_string(),
-            cwd: template.cwd.clone(),
-            model: template.model.clone(),
-            base_url: template.base_url.clone(),
-            access_mode: template.access_mode,
-        }
-    }
-
-    async fn active_turn_fixture() -> (StoreBundle, SessionId, String, TurnId, MessageRecord) {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let admission_id = repo
-            .admit_session_run(session_id)
+    async fn create_sibling_session(
+        store: &StoreBundle,
+        root_session_id: SessionId,
+        title: &str,
+    ) -> SessionRecord {
+        let root = store
+            .session_repo()
+            .get_session(root_session_id)
             .await
-            .expect("admit run")
-            .expect("run admitted");
-        let turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &admission_id, turn_id)
-                .await
-                .expect("activate turn")
-        );
+            .expect("root session");
         store
-            .protocol_event_store()
-            .append_history_item(&HistoryItem {
-                id: HistoryItemId::new(),
-                session_id,
-                turn_id,
-                sequence_no: 0,
-                created_at_ms: SystemClock.now_ms(),
-                payload: HistoryItemPayload::Message {
-                    message_id: None,
-                    role: MessageRole::User,
-                    content: vec![ContentPart::Text {
-                        text: "initial request".to_string(),
-                    }],
-                },
+            .session_repo()
+            .create_session(NewSession {
+                project_id: root.project_id,
+                title: title.to_string(),
+                cwd: root.cwd,
+                model: root.model,
+                base_url: root.base_url,
+                access_mode: root.access_mode,
             })
-            .expect("record active turn");
-        let (assistant, _) = repo
-            .append_assistant_message_with_protocol_start(
-                NewMessage {
-                    session_id,
-                    parent_message_id: None,
-                    role: MessageRole::Assistant,
-                    metadata: MessageMetadata::Assistant(AssistantMessageMeta {
-                        model: "model".to_string(),
-                        base_url: "http://localhost:1234".to_string(),
-                        finish_reason: None,
-                        token_usage: None,
-                        summary: false,
-                    }),
-                },
-                &admission_id,
-                turn_id,
-                None,
-                "model".to_string(),
-            )
             .await
-            .expect("assistant");
-        (store, session_id, admission_id, turn_id, assistant)
-    }
-
-    fn test_assistant_metadata(finish_reason: Option<FinishReason>) -> MessageMetadata {
-        MessageMetadata::Assistant(AssistantMessageMeta {
-            model: "model".to_string(),
-            base_url: "http://localhost:1234".to_string(),
-            finish_reason,
-            token_usage: None,
-            summary: false,
-        })
-    }
-
-    fn stored_run_lease_expiry(repo: &SqliteSessionRepository, session_id: SessionId) -> i64 {
-        repo.connection
-            .lock()
-            .expect("sqlite mutex")
-            .query_row(
-                "SELECT active_run_lease_expires_at_ms FROM sessions WHERE id = ?1",
-                params![session_id.to_string()],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("stored run lease expiry")
+            .expect("sibling session")
     }
 
     #[tokio::test]
-    async fn heartbeat_extends_lease_without_shortening_on_clock_rollback() {
+    async fn spawn_edge_repository_accepts_only_flat_root_children() {
+        let (store, root_session_id) = test_repo().await;
+        let direct = create_sibling_session(&store, root_session_id, "direct").await;
+        let rejected = create_sibling_session(&store, root_session_id, "rejected").await;
+        let repository = store.session_repo();
+
+        let inserted = repository
+            .insert_session_spawn_edge(
+                root_session_id,
+                root_session_id,
+                direct.id,
+                "/root/direct",
+                "direct",
+            )
+            .await
+            .expect("direct edge");
+        assert_eq!(inserted.parent_session_id, root_session_id);
+        assert_eq!(inserted.agent_path, "/root/direct");
+
+        let cases = [
+            (
+                direct.id,
+                rejected.id,
+                "/root/rejected",
+                "rejected",
+                "only root → direct-child lineage",
+            ),
+            (
+                root_session_id,
+                rejected.id,
+                "/root/direct/rejected",
+                "rejected",
+                "does not match canonical direct-child path",
+            ),
+            (
+                root_session_id,
+                rejected.id,
+                "/root/BadName",
+                "BadName",
+                "invalid direct-child task name",
+            ),
+            (
+                root_session_id,
+                root_session_id,
+                "/root/self",
+                "self",
+                "cannot also be its own child",
+            ),
+        ];
+        for (parent_session_id, child_session_id, path, task_name, expected) in cases {
+            let error = repository
+                .insert_session_spawn_edge(
+                    root_session_id,
+                    parent_session_id,
+                    child_session_id,
+                    path,
+                    task_name,
+                )
+                .await
+                .expect_err("invalid edge must fail before SQLite mutation");
+            assert!(
+                error.to_string().contains(expected),
+                "unexpected error: {error}"
+            );
+        }
+
+        assert_eq!(
+            repository
+                .list_session_spawn_edges(root_session_id)
+                .await
+                .expect("flat edges"),
+            vec![inserted]
+        );
+        let initial_states = repository
+            .list_direct_child_run_admission_states(root_session_id)
+            .await
+            .expect("initial direct child states");
+        assert_eq!(initial_states.len(), 1);
+        assert!(!initial_states[0].blocks_new_root_turn);
+        repository
+            .admit_session_turn(direct.id, TurnId::new())
+            .await
+            .expect("child admission")
+            .expect("child admitted");
+        let admitted_states = repository
+            .list_direct_child_run_admission_states(root_session_id)
+            .await
+            .expect("admitted direct child states");
+        assert_eq!(admitted_states.len(), 1);
+        assert!(admitted_states[0].blocks_new_root_turn);
+        assert!(
+            repository.get_session(rejected.id).await.is_ok(),
+            "a rejected edge must not delete the independent session"
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_mutations_fail_closed_for_durable_active_tree_state() {
+        let (store, root_session_id) = test_repo().await;
+        let child = create_sibling_session(&store, root_session_id, "active_child").await;
+        let repository = store.session_repo();
+        repository
+            .insert_session_spawn_edge(
+                root_session_id,
+                root_session_id,
+                child.id,
+                "/root/active_child",
+                "active_child",
+            )
+            .await
+            .expect("child edge");
+        repository
+            .admit_session_turn(child.id, TurnId::new())
+            .await
+            .expect("child admission")
+            .expect("child admitted");
+
+        let archive_error = repository
+            .set_session_archived(root_session_id, true)
+            .await
+            .expect_err("active child must block repository-level root archive");
+        assert!(archive_error.to_string().contains(&child.id.to_string()));
+        let delete_error = repository
+            .delete_session_tree(root_session_id)
+            .await
+            .expect_err("active child must block repository-level tree delete");
+        assert!(delete_error.to_string().contains(&child.id.to_string()));
+        let settings_error = repository
+            .update_session_settings(
+                child.id,
+                &SessionSettingsPatch {
+                    model: Some("changed-model".to_string()),
+                    ..SessionSettingsPatch::default()
+                },
+            )
+            .await
+            .expect_err("active target must block repository-level settings mutation");
+        assert!(settings_error.to_string().contains("active"));
+        assert!(repository.get_session(root_session_id).await.is_ok());
+        assert!(repository.get_session(child.id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn runtime_state_contract_rejects_partial_and_impossible_owners_across_readers() {
         let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let project_id = repository
+            .get_session(session_id)
+            .await
+            .expect("initial session")
+            .project_id;
+        let admission_id = AdmissionId::new();
+        let turn_id = TurnId::new();
+        let lease_expires_at_ms = normalize_run_lease_now_ms(SystemClock::now_ms()) + 60_000;
+        let admission_id_text = admission_id.to_string();
+        let turn_id_text = turn_id.to_string();
+        let cases = [
+            ("running without owner", "running", None, None, None),
+            (
+                "running partial owner",
+                "running",
+                Some(admission_id_text.as_str()),
+                None,
+                Some(lease_expires_at_ms),
+            ),
+            (
+                "terminal partial owner",
+                "completed",
+                None,
+                Some(turn_id_text.as_str()),
+                Some(lease_expires_at_ms),
+            ),
+            (
+                "idle retained owner",
+                "idle",
+                Some(admission_id_text.as_str()),
+                Some(turn_id_text.as_str()),
+                Some(lease_expires_at_ms),
+            ),
+            (
+                "invalid admission identity",
+                "running",
+                Some("not-an-admission"),
+                Some(turn_id_text.as_str()),
+                Some(lease_expires_at_ms),
+            ),
+            (
+                "invalid turn identity",
+                "running",
+                Some(admission_id_text.as_str()),
+                Some("not-a-turn"),
+                Some(lease_expires_at_ms),
+            ),
+            (
+                "nonpositive lease",
+                "running",
+                Some(admission_id_text.as_str()),
+                Some(turn_id_text.as_str()),
+                Some(0),
+            ),
+        ];
+
+        for (label, status, active_run_id, active_turn_id, lease_expires_at_ms) in cases {
+            {
+                let connection = repository.connection.lock().expect("sqlite mutex poisoned");
+                connection
+                    .execute(
+                        "UPDATE sessions
+                         SET status = ?2,
+                             active_run_id = ?3,
+                             active_turn_id = ?4,
+                             active_run_lease_expires_at_ms = ?5
+                         WHERE id = ?1",
+                        params![
+                            session_id.to_string(),
+                            status,
+                            active_run_id,
+                            active_turn_id,
+                            lease_expires_at_ms,
+                        ],
+                    )
+                    .expect("inject invalid runtime state");
+            }
+
+            assert!(repository.get_session(session_id).await.is_err(), "{label}");
+            assert!(
+                repository.latest_session(project_id).await.is_err(),
+                "{label}"
+            );
+            assert!(
+                repository
+                    .session_projection_state(session_id)
+                    .await
+                    .is_err(),
+                "{label}"
+            );
+            assert!(
+                repository.list_sessions(project_id, 10).await.is_err(),
+                "{label}"
+            );
+            assert!(
+                repository
+                    .has_fresh_run_admission(session_id)
+                    .await
+                    .is_err(),
+                "{label}"
+            );
+            assert!(
+                repository
+                    .fresh_running_turn_for_session(session_id)
+                    .await
+                    .is_err(),
+                "{label}"
+            );
+            assert!(
+                repository
+                    .session_blocks_mutation(session_id)
+                    .await
+                    .is_err(),
+                "{label}"
+            );
+            assert!(
+                repository
+                    .mutation_blocker_in_session_tree(session_id)
+                    .await
+                    .is_err(),
+                "{label}"
+            );
+            assert!(
+                repository
+                    .active_session_for_project(project_id)
+                    .await
+                    .is_err(),
+                "{label}"
+            );
+            assert!(
+                repository
+                    .admitted_run_status_at(
+                        session_id,
+                        admission_id,
+                        turn_id,
+                        SystemClock::now_ms(),
+                    )
+                    .await
+                    .is_err(),
+                "{label}"
+            );
+            assert!(
+                repository
+                    .renew_admitted_run_lease_at(
+                        session_id,
+                        admission_id,
+                        turn_id,
+                        SystemClock::now_ms(),
+                        RUN_ADMISSION_LEASE_DURATION_MS,
+                    )
+                    .await
+                    .is_err(),
+                "{label}"
+            );
+            assert!(
+                repository
+                    .release_stopped_run_admission(session_id, admission_id)
+                    .await
+                    .is_err(),
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn project_and_tree_gates_validate_later_corrupt_rows_after_a_valid_blocker() {
+        let (store, root_session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let project_id = repository
+            .get_session(root_session_id)
+            .await
+            .expect("root session")
+            .project_id;
+        let child = create_sibling_session(&store, root_session_id, "corrupt_child").await;
+        repository
+            .insert_session_spawn_edge(
+                root_session_id,
+                root_session_id,
+                child.id,
+                "/root/corrupt_child",
+                "corrupt_child",
+            )
+            .await
+            .expect("child edge");
+        let corrupt_admission_id = AdmissionId::new().to_string();
+        repository
+            .inject_raw_runtime_state_for_corruption_test(
+                child.id,
+                "completed",
+                Some(&corrupt_admission_id),
+                None,
+                None,
+            )
+            .expect("inject later corrupt child");
+        repository
+            .admit_session_turn(root_session_id, TurnId::new())
+            .await
+            .expect("root admission")
+            .expect("root admitted");
+        {
+            let connection = repository.connection.lock().expect("sqlite mutex");
+            connection
+                .execute(
+                    "UPDATE sessions SET updated_at_ms = ?2 WHERE id = ?1",
+                    params![root_session_id.to_string(), i64::MAX - 1],
+                )
+                .expect("order valid blocker before corrupt child");
+        }
+
+        let tree_error = repository
+            .mutation_blocker_in_session_tree(root_session_id)
+            .await
+            .expect_err("tree gate must validate the later corrupt child");
+        assert!(
+            tree_error
+                .to_string()
+                .contains("incomplete durable run admission")
+        );
+        let project_error = repository
+            .active_session_for_project(project_id)
+            .await
+            .expect_err("project gate must validate the later corrupt child");
+        assert!(
+            project_error
+                .to_string()
+                .contains("incomplete durable run admission")
+        );
+    }
+
+    #[tokio::test]
+    async fn project_gate_includes_unknown_status_rows_without_owner_columns() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let project_id = repository
+            .get_session(session_id)
+            .await
+            .expect("session")
+            .project_id;
+        {
+            let connection = repository.connection.lock().expect("sqlite mutex");
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON")
+                .expect("enable corruption fixture");
+            connection
+                .execute(
+                    "UPDATE sessions SET status = 'unknown_status' WHERE id = ?1",
+                    params![session_id.to_string()],
+                )
+                .expect("inject unknown status");
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = OFF")
+                .expect("restore constraints");
+        }
+
+        let error = repository
+            .active_session_for_project(project_id)
+            .await
+            .expect_err("unknown status must be decoded and rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown persisted session status")
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_access_mode_is_fail_closed_instead_of_defaulting() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        {
+            let connection = repository.connection.lock().expect("sqlite mutex");
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON")
+                .expect("enable corruption fixture");
+            connection
+                .execute(
+                    "UPDATE sessions SET access_mode = 'unknown_access' WHERE id = ?1",
+                    params![session_id.to_string()],
+                )
+                .expect("inject unknown access mode");
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = OFF")
+                .expect("restore constraints");
+        }
+
+        let error = repository
+            .get_session(session_id)
+            .await
+            .expect_err("unknown persisted access mode must fail closed");
+        assert!(error.to_string().contains("unknown persisted access mode"));
+    }
+
+    async fn active_turn(store: &StoreBundle, session_id: SessionId) -> (AdmissionId, TurnId) {
         let repo = store.session_repo();
         let turn_id = TurnId::new();
         let admission_id = repo
-            .admit_session_run_at(session_id, 1_000, 100)
+            .admit_session_turn(session_id, turn_id)
             .await
             .expect("admit")
-            .expect("admitted");
-        assert_eq!(stored_run_lease_expiry(&repo, session_id), 1_100);
-        assert_eq!(
-            repo.renew_admitted_run_lease_at(session_id, &admission_id, turn_id, 1_050, 100,)
-                .await
-                .expect("heartbeat"),
-            RunAdmissionLeaseRenewalOutcome::Renewed
-        );
-        assert_eq!(stored_run_lease_expiry(&repo, session_id), 1_150);
-        assert_eq!(
-            repo.renew_admitted_run_lease_at(session_id, &admission_id, turn_id, 900, 100,)
-                .await
-                .expect("rollback heartbeat"),
-            RunAdmissionLeaseRenewalOutcome::Renewed
-        );
-        assert_eq!(stored_run_lease_expiry(&repo, session_id), 1_150);
-        assert!(
-            repo.admit_session_run_at(session_id, 1_149, 100)
-                .await
-                .expect("pre-expiry admission")
-                .is_none()
-        );
-        assert!(
-            repo.admit_session_run_at(session_id, 1_150, 100)
-                .await
-                .expect("post-expiry admission")
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn terminal_owner_clear_is_a_graceful_heartbeat_outcome() {
-        let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        assert_eq!(
-            repo.update_admitted_message_metadata_and_status_with_protocol_event(
-                session_id,
-                &admission_id,
-                assistant.id,
-                &test_assistant_metadata(Some(FinishReason::Stop)),
-                SessionStatus::Completed,
-                &RunEvent::SessionCompleted {
-                    session_id,
-                    finish_reason: Some(FinishReason::Stop),
-                },
-                turn_id,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect("terminal commit"),
-            AdmittedTerminalCommit::Applied
-        );
-        assert_eq!(
-            repo.renew_admitted_run_lease(session_id, &admission_id, turn_id)
-                .await
-                .expect("post-terminal heartbeat"),
-            RunAdmissionLeaseRenewalOutcome::GracefulTerminal
-        );
-    }
-
-    #[tokio::test]
-    async fn lease_clock_edges_are_clamped_and_overflow_safe() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let first_admission = repo
-            .admit_session_run_at(session_id, -10, 0)
-            .await
-            .expect("negative clock admission")
-            .expect("admitted");
-        assert_eq!(stored_run_lease_expiry(&repo, session_id), 1);
-        assert!(
-            repo.has_fresh_run_admission_at(session_id, 0)
-                .await
-                .expect("fresh at clamped zero")
-        );
-        assert!(
-            !repo
-                .has_fresh_run_admission_at(session_id, 1)
-                .await
-                .expect("expired at exact boundary")
-        );
-        assert_eq!(
-            repo.renew_admitted_run_lease_at(session_id, &first_admission, TurnId::new(), 1, 100,)
-                .await
-                .expect("expired heartbeat rejected"),
-            RunAdmissionLeaseRenewalOutcome::SupersededOrExpired
-        );
-        repo.admit_session_run_at(session_id, i64::MAX, i64::MAX)
-            .await
-            .expect("overflow-safe reclaim")
-            .expect("reclaimed");
-        assert_eq!(stored_run_lease_expiry(&repo, session_id), i64::MAX);
-        assert!(
-            repo.has_fresh_run_admission_at(session_id, i64::MAX)
-                .await
-                .expect("saturated lease remains fresh")
-        );
-    }
-
-    #[tokio::test]
-    async fn expired_owner_recovery_covers_active_and_terminal_statuses() {
-        for expired_status in [
-            SessionStatus::Running,
-            SessionStatus::AwaitingUser,
-            SessionStatus::Cancelled,
-            SessionStatus::Failed,
-        ] {
-            let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-            let repo = store.session_repo();
-            let tool_call = repo
-                .insert_tool_call(
-                    session_id,
-                    assistant.id,
-                    "shell",
-                    "{}",
-                    Some("crashed tool"),
-                    serde_json::Value::Null,
-                )
-                .await
-                .expect("pending tool");
-            match expired_status {
-                SessionStatus::Running => {}
-                SessionStatus::AwaitingUser => {
-                    assert!(
-                        repo.terminalize_admitted_session_with_protocol_event(
-                            session_id,
-                            &admission_id,
-                            SessionStatus::AwaitingUser,
-                            &RunEvent::SessionAwaitingUser {
-                                session_id,
-                                finish_reason: Some(FinishReason::ToolCall),
-                            },
-                            turn_id,
-                            None,
-                        )
-                        .await
-                        .expect("awaiting user")
-                    );
-                }
-                SessionStatus::Cancelled => {
-                    assert!(
-                        repo.terminalize_active_session_with_protocol_event(
-                            session_id,
-                            SessionStatus::Cancelled,
-                            &RunEvent::SessionInterrupted {
-                                session_id,
-                                reason: "external cancellation".to_string(),
-                            },
-                            turn_id,
-                            None,
-                        )
-                        .await
-                        .expect("external cancellation")
-                    );
-                }
-                SessionStatus::Failed => {
-                    assert!(
-                        repo.terminalize_active_session_with_protocol_event(
-                            session_id,
-                            SessionStatus::Failed,
-                            &RunEvent::SessionFailed {
-                                session_id,
-                                message: "external failure".to_string(),
-                            },
-                            turn_id,
-                            None,
-                        )
-                        .await
-                        .expect("external failure")
-                    );
-                }
-                SessionStatus::Idle | SessionStatus::Completed => unreachable!(),
-            }
-            let lease_expiry = stored_run_lease_expiry(&repo, session_id);
-            assert!(
-                repo.admit_session_run_at(
-                    session_id,
-                    lease_expiry.saturating_sub(1),
-                    RUN_ADMISSION_LEASE_DURATION_MS,
-                )
-                .await
-                .expect("pre-expiry admission")
-                .is_none(),
-                "fresh {expired_status:?} owner must not be reclaimed"
-            );
-            let replacement = repo
-                .admit_session_run_at(session_id, lease_expiry, RUN_ADMISSION_LEASE_DURATION_MS)
-                .await
-                .expect("expired owner recovery")
-                .expect("replacement admission");
-            assert_ne!(replacement, admission_id);
-            assert_eq!(
-                repo.get_session(session_id)
-                    .await
-                    .expect("recovered session")
-                    .status,
-                SessionStatus::Running
-            );
-            let tool_status = repo
-                .connection
-                .lock()
-                .expect("sqlite mutex")
-                .query_row(
-                    "SELECT status FROM tool_calls WHERE id = ?1",
-                    params![tool_call.id.to_string()],
-                    |row| row.get::<_, String>(0),
-                )
-                .expect("tool status");
-            assert_eq!(tool_status, "failed");
-            let expired_interrupts = store
-                .protocol_event_store()
-                .list_runtime_events(session_id, turn_id)
-                .expect("runtime events")
-                .into_iter()
-                .filter(|event| {
-                    matches!(
-                        &event.msg,
-                        RuntimeEventMsg::TurnInterrupted { reason }
-                            if reason == EXPIRED_RUN_RECOVERY_REASON
-                    )
-                })
-                .count();
-            let expected_expired_interrupts = usize::from(matches!(
-                expired_status,
-                SessionStatus::Running | SessionStatus::AwaitingUser
-            ));
-            assert_eq!(expired_interrupts, expected_expired_interrupts);
-        }
-    }
-
-    #[tokio::test]
-    async fn pre_turn_expiry_does_not_attribute_recovery_to_the_previous_turn() {
-        let (store, session_id) = test_repo().await;
-        let previous_turn_id = TurnId::new();
-        let previous_event = RuntimeEvent {
-            id: RuntimeEventId::new(),
+            .expect("admitted")
+            .admission_id;
+        repo.append_user_turn_with_protocol_bundle(
             session_id,
-            turn_id: previous_turn_id,
-            sequence_no: 0,
-            created_at_ms: 900,
-            msg: RuntimeEventMsg::Warning {
-                message: "previous turn is complete".to_string(),
+            admission_id,
+            &UserTurn {
+                turn_id,
+                items: vec![UserInputItem::Text {
+                    text: "canonical request".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
             },
-        };
-        store
-            .protocol_event_store()
-            .append_runtime_event(&previous_event)
-            .expect("previous turn event");
-        let repo = store.session_repo();
-        let crashed_admission = repo
-            .admit_session_run_at(session_id, 1_000, 100)
-            .await
-            .expect("crashed admission")
-            .expect("admitted before publishing a turn");
-        let replacement = repo
-            .admit_session_run_at(session_id, 1_100, 100)
-            .await
-            .expect("expired recovery")
-            .expect("replacement admission");
-
-        assert_ne!(replacement, crashed_admission);
-        let previous_turn_events = store
-            .protocol_event_store()
-            .list_runtime_events(session_id, previous_turn_id)
-            .expect("previous turn events");
-        assert_eq!(previous_turn_events.len(), 1);
-        assert_eq!(previous_turn_events[0].id, previous_event.id);
-        assert!(matches!(
-            &previous_turn_events[0].msg,
-            RuntimeEventMsg::Warning { message } if message == "previous turn is complete"
-        ));
-    }
-
-    #[tokio::test]
-    async fn expired_lease_fences_owner_reads_heartbeats_and_protocol_writes() {
-        let (store, session_id, admission_id, turn_id, _) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        let lease_expiry = stored_run_lease_expiry(&repo, session_id);
-        assert_eq!(
-            repo.admitted_run_status_at(session_id, &admission_id, turn_id, lease_expiry)
-                .await
-                .expect("status guard"),
-            None
-        );
-        assert!(
-            repo.list_admitted_turn_steers_at(session_id, &admission_id, turn_id, lease_expiry,)
-                .await
-                .expect("mailbox guard")
-                .is_none()
-        );
-        assert_eq!(
-            repo.renew_admitted_run_lease_at(
-                session_id,
-                &admission_id,
-                turn_id,
-                lease_expiry,
-                RUN_ADMISSION_LEASE_DURATION_MS,
-            )
-            .await
-            .expect("heartbeat guard"),
-            RunAdmissionLeaseRenewalOutcome::SupersededOrExpired
-        );
-        let late_event = RuntimeEvent {
-            id: RuntimeEventId::new(),
-            session_id,
             turn_id,
-            sequence_no: 0,
-            created_at_ms: lease_expiry,
-            msg: RuntimeEventMsg::Warning {
-                message: "late expired owner write".to_string(),
-            },
+            0,
+        )
+        .await
+        .expect("user turn");
+        (admission_id, turn_id)
+    }
+
+    #[tokio::test]
+    async fn failed_steer_transaction_is_invisible_and_retry_commits_once() {
+        let (store, session_id) = test_repo().await;
+        let (_, turn_id) = active_turn(&store, session_id).await;
+        let repository = store.session_repo();
+        repository
+            .connection
+            .lock()
+            .expect("sqlite mutex")
+            .execute_batch(
+                "CREATE TRIGGER abort_steer_history
+                 BEFORE INSERT ON protocol_history_items
+                 WHEN json_extract(NEW.payload_json, '$.kind') = 'steer_turn'
+                 BEGIN SELECT RAISE(ABORT, 'injected steer history failure'); END;",
+            )
+            .expect("failure trigger");
+        let steer = SteerTurn {
+            expected_turn_id: turn_id,
+            items: vec![UserInputItem::Text {
+                text: "retry this steer".to_string(),
+            }],
+            additional_context: Default::default(),
+            client_user_message_id: Some("retry-steer".to_string()),
         };
+
+        repository
+            .accept_active_turn_steer(session_id, &steer)
+            .await
+            .expect_err("injected transaction failure");
         assert!(
             store
                 .protocol_event_store()
-                .append_admitted_event_bundle_allocating_at(
-                    &admission_id,
-                    &late_event,
-                    None,
-                    None,
-                    lease_expiry,
-                )
-                .expect("protocol write guard")
-                .is_none()
+                .list_history_items(session_id, turn_id)
+                .expect("history after failure")
+                .iter()
+                .all(|item| !matches!(item.payload, HistoryItemPayload::SteerTurn { .. }))
         );
+        assert!(
+            store
+                .protocol_event_store()
+                .list_runtime_events(session_id, turn_id)
+                .expect("events after failure")
+                .iter()
+                .all(|event| !matches!(event.msg, RuntimeEventMsg::SteerInputAccepted { .. }))
+        );
+        assert!(
+            store
+                .protocol_event_store()
+                .list_turn_items(session_id, turn_id)
+                .expect("turn items after failure")
+                .iter()
+                .all(|item| !matches!(item.payload, TurnItemPayload::SteerMessage { .. }))
+        );
+
+        repository
+            .connection
+            .lock()
+            .expect("sqlite mutex")
+            .execute_batch("DROP TRIGGER abort_steer_history;")
+            .expect("drop failure trigger");
+        let committed_id = repository
+            .accept_active_turn_steer(session_id, &steer)
+            .await
+            .expect("retry steer");
+        let committed = store
+            .protocol_event_store()
+            .list_history_items(session_id, turn_id)
+            .expect("history after retry")
+            .into_iter()
+            .filter(|item| matches!(item.payload, HistoryItemPayload::SteerTurn { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].id, committed_id);
     }
 
-    #[tokio::test]
-    async fn deleting_session_removes_protocol_allocator_rows() {
-        let (store, session_id) = test_repo().await;
-        let turn_id = TurnId::new();
+    async fn expire_and_recover_run(store: &StoreBundle, session_id: SessionId) -> AdmissionId {
+        let recovery_now = SystemClock::now_ms()
+            .saturating_add(RUN_ADMISSION_LEASE_DURATION_MS)
+            .saturating_add(1_000);
         store
-            .protocol_event_store()
-            .append_runtime_event(&RuntimeEvent {
-                id: RuntimeEventId::new(),
+            .session_repo()
+            .admit_session_turn_at(
                 session_id,
-                turn_id,
-                sequence_no: 0,
-                created_at_ms: SystemClock.now_ms(),
-                msg: RuntimeEventMsg::Warning {
-                    message: "delete allocator".to_string(),
-                },
-            })
-            .expect("event");
-        let repo = store.session_repo();
-        repo.delete_session(session_id)
+                TurnId::new(),
+                recovery_now,
+                RUN_ADMISSION_LEASE_DURATION_MS,
+            )
             .await
-            .expect("delete session");
-        let allocator_rows = repo
+            .expect("recover expired admission")
+            .expect("admit replacement run")
+            .admission_id
+    }
+
+    fn completed_terminal(session_id: SessionId) -> RunEvent {
+        RunEvent::TurnTerminal {
+            session_id,
+            terminal: Box::new(crate::session::model::DurableTurnTerminal {
+                outcome: TurnTerminalOutcome::Completed,
+                final_response_id: Some(ModelResponseId::new()),
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            }),
+        }
+    }
+
+    async fn completed_turn_with_retained_admission(
+        store: &StoreBundle,
+        session_id: SessionId,
+    ) -> (AdmissionId, TurnId) {
+        let repository = store.session_repo();
+        let (admission_id, turn_id) = active_turn(store, session_id).await;
+        let target = repository
+            .captured_running_terminal_target(session_id)
+            .await
+            .expect("capture terminal target")
+            .expect("running terminal target");
+        assert!(
+            repository
+                .terminalize_captured_running_session_with_protocol_event(
+                    session_id,
+                    &completed_terminal(session_id),
+                    target,
+                )
+                .await
+                .expect("terminalize while retaining admission")
+        );
+        (admission_id, turn_id)
+    }
+
+    fn delete_terminal_runtime_event_for_corruption_test(
+        store: &StoreBundle,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) {
+        store
+            .session_repo()
+            .connection
+            .lock()
+            .expect("sqlite mutex")
+            .execute(
+                "DELETE FROM protocol_runtime_events
+                 WHERE session_id = ?1
+                   AND turn_id = ?2
+                   AND json_extract(msg_json, '$.kind') = 'turn_terminal'",
+                params![session_id.to_string(), turn_id.to_string()],
+            )
+            .expect("delete terminal corruption fixture");
+    }
+
+    fn inject_duplicate_terminal_runtime_event_for_corruption_test(
+        store: &StoreBundle,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) {
+        let duplicate = project_protocol_run_event(
+            &failed_terminal(session_id, "duplicate terminal"),
+            Some(session_id),
+            turn_id,
+            100,
+        )
+        .expect("duplicate projection")
+        .runtime_event;
+        let duplicate_json = serde_json::to_string(&duplicate.msg).expect("duplicate JSON");
+        let repository = store.session_repo();
+        let connection = repository.connection.lock().expect("sqlite mutex");
+        connection
+            .execute_batch("DROP INDEX idx_protocol_runtime_events_unique_turn_terminal")
+            .expect("remove unique terminal index for corruption fixture");
+        connection
+            .execute(
+                "INSERT INTO protocol_runtime_events
+                 (id, session_id, turn_id, sequence_no, msg_json, payload_sha256, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'corrupt-fixture', ?6)",
+                params![
+                    duplicate.id.to_string(),
+                    session_id.to_string(),
+                    turn_id.to_string(),
+                    duplicate.sequence_no,
+                    duplicate_json,
+                    duplicate.created_at_ms,
+                ],
+            )
+            .expect("inject duplicate terminal");
+    }
+
+    fn failed_terminal(session_id: SessionId, error: &str) -> RunEvent {
+        RunEvent::TurnTerminal {
+            session_id,
+            terminal: Box::new(crate::session::model::DurableTurnTerminal {
+                outcome: TurnTerminalOutcome::Failed {
+                    error: error.to_string(),
+                },
+                final_response_id: None,
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            }),
+        }
+    }
+
+    fn stored_admission_state(
+        store: &StoreBundle,
+        session_id: SessionId,
+    ) -> (String, Option<String>, Option<String>, Option<i64>) {
+        store
+            .session_repo()
             .connection
             .lock()
             .expect("sqlite mutex")
             .query_row(
-                "SELECT COUNT(*) FROM protocol_turn_sequence_allocators WHERE session_id = ?1",
+                "SELECT status, active_run_id, active_turn_id, active_run_lease_expires_at_ms
+                 FROM sessions WHERE id = ?1",
                 params![session_id.to_string()],
-                |row| row.get::<_, i64>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
             )
-            .expect("allocator count");
-        assert_eq!(allocator_rows, 0);
+            .expect("stored admission state")
     }
 
     #[tokio::test]
-    async fn thread_goal_insert_replaces_only_completed_goal() {
+    async fn new_and_resumed_turns_admit_run_and_turn_as_one_owner() {
         let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
+        let repository = store.session_repo();
+        let first_turn_id = TurnId::new();
+        let first_admission_id = repository
+            .admit_session_turn(session_id, first_turn_id)
+            .await
+            .expect("first admission")
+            .expect("first turn admitted")
+            .admission_id;
 
-        let first = repo
-            .insert_thread_goal(
+        let first_state = stored_admission_state(&store, session_id);
+        assert_eq!(first_state.0, "running");
+        assert_eq!(first_state.1, Some(first_admission_id.to_string()));
+        assert_eq!(first_state.2, Some(first_turn_id.to_string()));
+        assert!(first_state.3.is_some());
+
+        let terminal = completed_terminal(session_id);
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    first_admission_id,
+                    &terminal,
+                    first_turn_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("terminal commit"),
+            AdmittedTerminalCommit::Applied
+        );
+
+        let resumed_turn_id = TurnId::new();
+        let resumed_admission_id = repository
+            .admit_session_turn(session_id, resumed_turn_id)
+            .await
+            .expect("resumed admission")
+            .expect("resumed turn admitted")
+            .admission_id;
+        let resumed_state = stored_admission_state(&store, session_id);
+        assert_eq!(resumed_state.0, "running");
+        assert_eq!(resumed_state.1, Some(resumed_admission_id.to_string()));
+        assert_eq!(resumed_state.2, Some(resumed_turn_id.to_string()));
+        assert!(resumed_state.3.is_some());
+    }
+
+    #[tokio::test]
+    async fn admission_rejects_every_prior_turn_identity_trace() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let (admission_id, used_turn_id) = active_turn(&store, session_id).await;
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    admission_id,
+                    &completed_terminal(session_id),
+                    used_turn_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("terminalize used turn"),
+            AdmittedTerminalCommit::Applied
+        );
+
+        let reused_error = repository
+            .admit_session_turn(session_id, used_turn_id)
+            .await
+            .expect_err("canonical turn identity must never be reusable");
+        assert!(reused_error.to_string().contains("has already been used"));
+
+        let allocator_only_turn_id = TurnId::new();
+        {
+            let connection = repository.connection.lock().expect("sqlite mutex");
+            connection
+                .execute(
+                    "INSERT INTO protocol_turn_sequence_allocators
+                     (session_id, turn_id, next_sequence_no)
+                     VALUES (?1, ?2, 0)",
+                    params![session_id.to_string(), allocator_only_turn_id.to_string()],
+                )
+                .expect("inject orphan allocator trace");
+        }
+        let allocator_error = repository
+            .admit_session_turn(session_id, allocator_only_turn_id)
+            .await
+            .expect_err("allocator trace must fence turn identity reuse");
+        assert!(
+            allocator_error
+                .to_string()
+                .contains("has already been used")
+        );
+        assert!(
+            !repository
+                .has_fresh_run_admission(session_id)
+                .await
+                .expect("no admission after collisions")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_lease_outcome_is_exact_to_the_requested_nonreusable_turn() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let (first_admission_id, first_turn_id) = active_turn(&store, session_id).await;
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    first_admission_id,
+                    &completed_terminal(session_id),
+                    first_turn_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("complete first turn"),
+            AdmittedTerminalCommit::Applied
+        );
+        let (second_admission_id, second_turn_id) = active_turn(&store, session_id).await;
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    second_admission_id,
+                    &failed_terminal(session_id, "second failed"),
+                    second_turn_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("fail second turn"),
+            AdmittedTerminalCommit::Applied
+        );
+
+        assert!(matches!(
+            repository
+                .renew_admitted_run_lease(session_id, first_admission_id, first_turn_id)
+                .await
+                .expect("first terminal lease outcome"),
+            RunAdmissionLeaseRenewalOutcome::Terminal(terminal)
+                if terminal.session_status() == SessionStatus::Completed
+        ));
+        assert!(matches!(
+            repository
+                .renew_admitted_run_lease(session_id, AdmissionId::new(), TurnId::new(),)
+                .await
+                .expect("unrelated terminal lease outcome"),
+            RunAdmissionLeaseRenewalOutcome::SupersededOrExpired
+        ));
+    }
+
+    #[tokio::test]
+    async fn retained_terminal_corruption_cannot_be_hidden_or_release_its_owner() {
+        let (renew_store, renew_session_id) = test_repo().await;
+        let renew_repository = renew_store.session_repo();
+        let (renew_admission_id, renew_turn_id) =
+            completed_turn_with_retained_admission(&renew_store, renew_session_id).await;
+        delete_terminal_runtime_event_for_corruption_test(
+            &renew_store,
+            renew_session_id,
+            renew_turn_id,
+        );
+        let renew_before = stored_admission_state(&renew_store, renew_session_id);
+        let status_error = renew_repository
+            .admitted_run_status_at(
+                renew_session_id,
+                renew_admission_id,
+                renew_turn_id,
+                SystemClock::now_ms(),
+            )
+            .await
+            .expect_err("single-session reader must reject a missing retained terminal");
+        assert!(
+            status_error
+                .to_string()
+                .contains("without a durable terminal")
+        );
+        let renewal_error = renew_repository
+            .renew_admitted_run_lease(renew_session_id, AdmissionId::new(), TurnId::new())
+            .await
+            .expect_err("wrong caller must not hide a missing retained terminal");
+        assert!(
+            renewal_error
+                .to_string()
+                .contains("without a durable terminal")
+        );
+        assert_eq!(
+            stored_admission_state(&renew_store, renew_session_id),
+            renew_before
+        );
+        let wrong_release_error = renew_repository
+            .release_stopped_run_admission(renew_session_id, AdmissionId::new())
+            .await
+            .expect_err("wrong release caller must not hide a missing retained terminal");
+        assert!(
+            wrong_release_error
+                .to_string()
+                .contains("without a durable terminal")
+        );
+        assert_eq!(
+            stored_admission_state(&renew_store, renew_session_id),
+            renew_before
+        );
+
+        let (release_store, release_session_id) = test_repo().await;
+        let release_repository = release_store.session_repo();
+        let (release_admission_id, release_turn_id) =
+            completed_turn_with_retained_admission(&release_store, release_session_id).await;
+        delete_terminal_runtime_event_for_corruption_test(
+            &release_store,
+            release_session_id,
+            release_turn_id,
+        );
+        let release_before = stored_admission_state(&release_store, release_session_id);
+        let release_error = release_repository
+            .release_stopped_run_admission(release_session_id, release_admission_id)
+            .await
+            .expect_err("release must validate the retained terminal first");
+        assert!(
+            release_error
+                .to_string()
+                .contains("without a durable terminal")
+        );
+        assert_eq!(
+            stored_admission_state(&release_store, release_session_id),
+            release_before
+        );
+
+        let (recovery_store, recovery_session_id) = test_repo().await;
+        let recovery_repository = recovery_store.session_repo();
+        let (recovery_admission_id, recovery_turn_id) =
+            completed_turn_with_retained_admission(&recovery_store, recovery_session_id).await;
+        recovery_repository
+            .inject_raw_runtime_state_for_corruption_test(
+                recovery_session_id,
+                "completed",
+                Some(&recovery_admission_id.to_string()),
+                Some(&recovery_turn_id.to_string()),
+                Some(1),
+            )
+            .expect("expire retained terminal owner");
+        delete_terminal_runtime_event_for_corruption_test(
+            &recovery_store,
+            recovery_session_id,
+            recovery_turn_id,
+        );
+        let recovery_before = stored_admission_state(&recovery_store, recovery_session_id);
+        let replacement_turn_id = TurnId::new();
+        let recovery_error = recovery_repository
+            .admit_session_turn_at(
+                recovery_session_id,
+                replacement_turn_id,
+                2,
+                RUN_ADMISSION_LEASE_DURATION_MS,
+            )
+            .await
+            .expect_err("expired recovery must validate the retained terminal first");
+        assert!(
+            recovery_error
+                .to_string()
+                .contains("without a durable terminal")
+        );
+        assert_eq!(
+            stored_admission_state(&recovery_store, recovery_session_id),
+            recovery_before
+        );
+        assert!(
+            recovery_repository
+                .durable_terminal_for_turn(recovery_session_id, replacement_turn_id)
+                .await
+                .expect("replacement terminal lookup")
+                .is_none()
+        );
+        let same_turn_error = recovery_repository
+            .admit_session_turn_at(
+                recovery_session_id,
+                recovery_turn_id,
+                2,
+                RUN_ADMISSION_LEASE_DURATION_MS,
+            )
+            .await
+            .expect_err("corrupt retained identity must not become reusable");
+        assert!(
+            same_turn_error
+                .to_string()
+                .contains("without a durable terminal")
+        );
+        assert_eq!(
+            stored_admission_state(&recovery_store, recovery_session_id),
+            recovery_before
+        );
+
+        let (mismatch_store, mismatch_session_id) = test_repo().await;
+        let mismatch_repository = mismatch_store.session_repo();
+        let (mismatch_admission_id, mismatch_turn_id) =
+            completed_turn_with_retained_admission(&mismatch_store, mismatch_session_id).await;
+        let mismatch_lease = stored_admission_state(&mismatch_store, mismatch_session_id)
+            .3
+            .expect("retained lease");
+        mismatch_repository
+            .inject_raw_runtime_state_for_corruption_test(
+                mismatch_session_id,
+                "failed",
+                Some(&mismatch_admission_id.to_string()),
+                Some(&mismatch_turn_id.to_string()),
+                Some(mismatch_lease),
+            )
+            .expect("inject terminal status mismatch");
+        let mismatch_before = stored_admission_state(&mismatch_store, mismatch_session_id);
+        let mismatch_status_error = mismatch_repository
+            .admitted_run_status_at(
+                mismatch_session_id,
+                mismatch_admission_id,
+                mismatch_turn_id,
+                SystemClock::now_ms(),
+            )
+            .await
+            .expect_err("single-session reader must reject a terminal status mismatch");
+        assert!(
+            mismatch_status_error
+                .to_string()
+                .contains("contradicts durable terminal status")
+        );
+        let mismatch_error = mismatch_repository
+            .renew_admitted_run_lease(mismatch_session_id, AdmissionId::new(), TurnId::new())
+            .await
+            .expect_err("wrong caller must not hide a terminal status mismatch");
+        assert!(
+            mismatch_error
+                .to_string()
+                .contains("contradicts durable terminal status")
+        );
+        assert_eq!(
+            stored_admission_state(&mismatch_store, mismatch_session_id),
+            mismatch_before
+        );
+        let mismatch_release_error = mismatch_repository
+            .release_stopped_run_admission(mismatch_session_id, mismatch_admission_id)
+            .await
+            .expect_err("release must reject a terminal status mismatch");
+        assert!(
+            mismatch_release_error
+                .to_string()
+                .contains("contradicts durable terminal status")
+        );
+        assert_eq!(
+            stored_admission_state(&mismatch_store, mismatch_session_id),
+            mismatch_before
+        );
+        mismatch_repository
+            .inject_raw_runtime_state_for_corruption_test(
+                mismatch_session_id,
+                "failed",
+                Some(&mismatch_admission_id.to_string()),
+                Some(&mismatch_turn_id.to_string()),
+                Some(1),
+            )
+            .expect("expire mismatched terminal owner");
+        let expired_mismatch_before = stored_admission_state(&mismatch_store, mismatch_session_id);
+        let mismatch_recovery_error = mismatch_repository
+            .admit_session_turn_at(
+                mismatch_session_id,
+                TurnId::new(),
+                2,
+                RUN_ADMISSION_LEASE_DURATION_MS,
+            )
+            .await
+            .expect_err("expired recovery must reject a terminal status mismatch");
+        assert!(
+            mismatch_recovery_error
+                .to_string()
+                .contains("contradicts durable terminal status")
+        );
+        assert_eq!(
+            stored_admission_state(&mismatch_store, mismatch_session_id),
+            expired_mismatch_before
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_retained_terminal_blocks_renewal_release_and_recovery() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let (admission_id, turn_id) =
+            completed_turn_with_retained_admission(&store, session_id).await;
+        inject_duplicate_terminal_runtime_event_for_corruption_test(&store, session_id, turn_id);
+        let before = stored_admission_state(&store, session_id);
+
+        let status_error = repository
+            .admitted_run_status_at(session_id, admission_id, turn_id, SystemClock::now_ms())
+            .await
+            .expect_err("single-session reader must reject duplicate terminals");
+        assert!(
+            status_error
+                .to_string()
+                .contains("multiple durable terminals")
+        );
+
+        let renewal_error = repository
+            .renew_admitted_run_lease(session_id, AdmissionId::new(), TurnId::new())
+            .await
+            .expect_err("duplicate terminal must be detected before owner comparison");
+        assert!(
+            renewal_error
+                .to_string()
+                .contains("multiple durable terminals")
+        );
+        assert_eq!(stored_admission_state(&store, session_id), before);
+
+        let release_error = repository
+            .release_stopped_run_admission(session_id, admission_id)
+            .await
+            .expect_err("duplicate terminal must block owner release");
+        assert!(
+            release_error
+                .to_string()
+                .contains("multiple durable terminals")
+        );
+        assert_eq!(stored_admission_state(&store, session_id), before);
+
+        repository
+            .inject_raw_runtime_state_for_corruption_test(
                 session_id,
-                "ship the goal",
+                "completed",
+                Some(&admission_id.to_string()),
+                Some(&turn_id.to_string()),
+                Some(1),
+            )
+            .expect("expire duplicate terminal owner");
+        let expired_before = stored_admission_state(&store, session_id);
+        let recovery_error = repository
+            .admit_session_turn_at(
+                session_id,
+                TurnId::new(),
+                2,
+                RUN_ADMISSION_LEASE_DURATION_MS,
+            )
+            .await
+            .expect_err("duplicate terminal must block expired-owner recovery");
+        assert!(
+            recovery_error
+                .to_string()
+                .contains("multiple durable terminals")
+        );
+        assert_eq!(stored_admission_state(&store, session_id), expired_before);
+    }
+
+    #[tokio::test]
+    async fn valid_retained_terminal_can_be_observed_released_or_replaced() {
+        let (release_store, release_session_id) = test_repo().await;
+        let release_repository = release_store.session_repo();
+        let (release_admission_id, release_turn_id) =
+            completed_turn_with_retained_admission(&release_store, release_session_id).await;
+        assert!(matches!(
+            release_repository
+                .renew_admitted_run_lease(
+                    release_session_id,
+                    release_admission_id,
+                    release_turn_id,
+                )
+                .await
+                .expect("typed retained terminal"),
+            RunAdmissionLeaseRenewalOutcome::Terminal(terminal)
+                if terminal.session_status() == SessionStatus::Completed
+        ));
+        assert!(
+            release_repository
+                .release_stopped_run_admission(release_session_id, release_admission_id)
+                .await
+                .expect("release valid retained terminal")
+        );
+        assert_eq!(
+            stored_admission_state(&release_store, release_session_id),
+            ("completed".to_string(), None, None, None)
+        );
+
+        let (replace_store, replace_session_id) = test_repo().await;
+        let replace_repository = replace_store.session_repo();
+        let (replace_admission_id, replace_turn_id) =
+            completed_turn_with_retained_admission(&replace_store, replace_session_id).await;
+        replace_repository
+            .inject_raw_runtime_state_for_corruption_test(
+                replace_session_id,
+                "completed",
+                Some(&replace_admission_id.to_string()),
+                Some(&replace_turn_id.to_string()),
+                Some(1),
+            )
+            .expect("expire valid retained terminal owner");
+        let replacement_turn_id = TurnId::new();
+        let replacement = replace_repository
+            .admit_session_turn_at(
+                replace_session_id,
+                replacement_turn_id,
+                2,
+                RUN_ADMISSION_LEASE_DURATION_MS,
+            )
+            .await
+            .expect("replace valid expired retained owner")
+            .expect("replacement admission");
+        let replaced_state = stored_admission_state(&replace_store, replace_session_id);
+        assert_eq!(replaced_state.0, "running");
+        assert_eq!(replaced_state.1, Some(replacement.admission_id.to_string()));
+        assert_eq!(replaced_state.2, Some(replacement_turn_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn running_session_with_a_terminal_is_reported_as_corrupt() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let project_id = repository
+            .get_session(session_id)
+            .await
+            .expect("session before corruption")
+            .project_id;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let terminal_event = completed_terminal(session_id);
+        let projection = project_protocol_run_event(&terminal_event, Some(session_id), turn_id, 1)
+            .expect("terminal projection");
+        {
+            let mut connection = repository.connection.lock().expect("sqlite mutex");
+            let transaction = connection.transaction().expect("transaction");
+            insert_session_owned_event_bundle_in_transaction(
+                &SESSION_PROTOCOL_WRITE_AUTHORITY,
+                &transaction,
+                &projection.runtime_event,
+                projection.history_item.as_ref(),
+                projection.turn_item.as_ref(),
+            )
+            .expect("inject terminal before status CAS");
+            transaction.commit().expect("commit corrupt fixture");
+        }
+        let corrupt_state = stored_admission_state(&store, session_id);
+        let protocol_before = (
+            store
+                .protocol_event_store()
+                .list_history_items(session_id, turn_id)
+                .expect("history before rejected write")
+                .len(),
+            store
+                .protocol_event_store()
+                .list_runtime_events(session_id, turn_id)
+                .expect("runtime before rejected write")
+                .len(),
+            store
+                .protocol_event_store()
+                .list_turn_items(session_id, turn_id)
+                .expect("turn items before rejected write")
+                .len(),
+        );
+
+        let response_error = repository
+            .record_model_response_with_protocol_bundle(
+                session_id,
+                admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id: ModelResponseId::new(),
+                    assistant_text: Some("must not commit after terminal".to_string()),
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("active-admission writer must reject running plus terminal corruption");
+        assert!(
+            response_error
+                .to_string()
+                .contains("already has a durable terminal")
+        );
+        let protocol_after = (
+            store
+                .protocol_event_store()
+                .list_history_items(session_id, turn_id)
+                .expect("history after rejected write")
+                .len(),
+            store
+                .protocol_event_store()
+                .list_runtime_events(session_id, turn_id)
+                .expect("runtime after rejected write")
+                .len(),
+            store
+                .protocol_event_store()
+                .list_turn_items(session_id, turn_id)
+                .expect("turn items after rejected write")
+                .len(),
+        );
+        assert_eq!(protocol_after, protocol_before);
+        assert!(repository.get_session(session_id).await.is_err());
+        assert!(
+            repository
+                .active_session_for_project(project_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            repository
+                .mutation_blocker_in_session_tree(session_id)
+                .await
+                .is_err()
+        );
+
+        let admission_error = repository
+            .admit_session_turn(session_id, TurnId::new())
+            .await
+            .expect_err("running terminal must fail admission integrity checks");
+        assert!(
+            admission_error
+                .to_string()
+                .contains("already has a durable terminal")
+        );
+        assert_eq!(stored_admission_state(&store, session_id), corrupt_state);
+
+        let renewal_error = repository
+            .renew_admitted_run_lease(session_id, admission_id, turn_id)
+            .await
+            .expect_err("running terminal must fail renewal integrity checks");
+        assert!(
+            renewal_error
+                .to_string()
+                .contains("already has a durable terminal")
+        );
+        let release_error = repository
+            .release_stopped_run_admission(session_id, admission_id)
+            .await
+            .expect_err("running terminal must fail release integrity checks");
+        assert!(
+            release_error
+                .to_string()
+                .contains("already has a durable terminal")
+        );
+        assert_eq!(stored_admission_state(&store, session_id), corrupt_state);
+        let terminal_error = repository
+            .terminalize_admitted_turn_with_protocol_event(
+                session_id,
+                admission_id,
+                &terminal_event,
+                turn_id,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("running terminal must not masquerade as an idempotent commit");
+        assert!(
+            terminal_error
+                .to_string()
+                .contains("already has a durable terminal")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_reader_rejects_multiple_rows_even_if_the_index_is_corrupted() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    admission_id,
+                    &completed_terminal(session_id),
+                    turn_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("first terminal"),
+            AdmittedTerminalCommit::Applied
+        );
+        let duplicate = project_protocol_run_event(
+            &failed_terminal(session_id, "duplicate terminal"),
+            Some(session_id),
+            turn_id,
+            100,
+        )
+        .expect("duplicate projection")
+        .runtime_event;
+        let duplicate_json = serde_json::to_string(&duplicate.msg).expect("duplicate JSON");
+        {
+            let connection = repository.connection.lock().expect("sqlite mutex");
+            connection
+                .execute_batch("DROP INDEX idx_protocol_runtime_events_unique_turn_terminal")
+                .expect("remove index for corruption fixture");
+            connection
+                .execute(
+                    "INSERT INTO protocol_runtime_events
+                     (id, session_id, turn_id, sequence_no, msg_json, payload_sha256, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'corrupt-fixture', ?6)",
+                    params![
+                        duplicate.id.to_string(),
+                        session_id.to_string(),
+                        turn_id.to_string(),
+                        duplicate.sequence_no,
+                        duplicate_json,
+                        duplicate.created_at_ms,
+                    ],
+                )
+                .expect("inject duplicate terminal");
+        }
+
+        let error = repository
+            .durable_terminal_for_turn(session_id, turn_id)
+            .await
+            .expect_err("duplicate durable terminal must fail closed");
+        assert!(error.to_string().contains("multiple durable terminals"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_admission_commits_exactly_one_run_and_turn_owner() {
+        let (store, session_id) = test_repo().await;
+        let first_repository = store.session_repo();
+        let second_repository = store.session_repo();
+        let first_turn_id = TurnId::new();
+        let second_turn_id = TurnId::new();
+        let (first, second) = tokio::join!(
+            first_repository.admit_session_turn(session_id, first_turn_id),
+            second_repository.admit_session_turn(session_id, second_turn_id),
+        );
+        let first = first.expect("first admission attempt");
+        let second = second.expect("second admission attempt");
+        let (winning_admission_id, winning_turn_id) = match (first, second) {
+            (Some(admission), None) => (admission.admission_id, first_turn_id),
+            (None, Some(admission)) => (admission.admission_id, second_turn_id),
+            outcome => panic!("expected one admitted turn, got {outcome:?}"),
+        };
+
+        let state = stored_admission_state(&store, session_id);
+        assert_eq!(state.0, "running");
+        assert_eq!(state.1, Some(winning_admission_id.to_string()));
+        assert_eq!(state.2, Some(winning_turn_id.to_string()));
+        assert!(state.3.is_some());
+    }
+
+    #[tokio::test]
+    async fn goal_change_admission_captures_one_immutable_goal_owner() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        repository
+            .replace_thread_goal(
+                session_id,
+                "old objective",
                 ThreadGoalStatus::Active,
                 Some(100),
             )
             .await
-            .expect("insert first")
-            .expect("first goal");
-        assert_eq!(first.status, ThreadGoalStatus::Active);
-        assert_eq!(first.token_budget, Some(100));
+            .expect("initial goal");
+        let (_, original_goal_id) = repository
+            .get_thread_goal_with_id(session_id)
+            .await
+            .expect("read initial goal")
+            .expect("stored initial goal");
 
-        let refused = repo
-            .insert_thread_goal(
+        let turn_id = TurnId::new();
+        let admission = repository
+            .admit_session_turn_with_goal_objective(session_id, turn_id, "admitted objective")
+            .await
+            .expect("atomic admission")
+            .expect("turn admitted");
+        let captured = admission.goal.expect("captured goal");
+        assert_eq!(captured.goal_id, original_goal_id);
+        assert_eq!(captured.goal.objective, "admitted objective");
+        assert_eq!(captured.goal.status, ThreadGoalStatus::Active);
+
+        repository
+            .replace_thread_goal(
                 session_id,
-                "replace too early",
+                "replacement after admission",
                 ThreadGoalStatus::Active,
                 None,
             )
             .await
-            .expect("insert unfinished");
-        assert!(refused.is_none());
-
-        repo.update_thread_goal(session_id, None, Some(ThreadGoalStatus::Complete), None)
-            .await
-            .expect("complete")
-            .expect("completed goal");
-        let replaced = repo
-            .insert_thread_goal(session_id, "next goal", ThreadGoalStatus::Active, None)
-            .await
-            .expect("insert next")
-            .expect("next goal");
-        assert_eq!(replaced.objective, "next goal");
-        assert_eq!(replaced.tokens_used, 0);
-        assert_eq!(replaced.token_budget, None);
-    }
-
-    #[tokio::test]
-    async fn thread_goal_accounting_marks_budget_limited() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        repo.replace_thread_goal(
-            session_id,
-            "stay within budget",
-            ThreadGoalStatus::Active,
-            Some(5),
-        )
-        .await
-        .expect("replace");
-
-        let updated = repo
-            .account_thread_goal_usage(session_id, 7)
-            .await
-            .expect("account")
-            .expect("goal");
-
-        assert_eq!(updated.tokens_used, 7);
-        assert_eq!(updated.status, ThreadGoalStatus::BudgetLimited);
-    }
-
-    #[tokio::test]
-    async fn thread_goal_expected_id_prevents_stale_accounting_and_update() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        repo.replace_thread_goal(session_id, "first", ThreadGoalStatus::Active, Some(100))
-            .await
-            .expect("first");
-        let (_first_goal, first_goal_id) = repo
+            .expect("replace after admission");
+        let (replacement, replacement_goal_id) = repository
             .get_thread_goal_with_id(session_id)
             .await
-            .expect("first id")
-            .expect("first goal");
+            .expect("replacement read")
+            .expect("replacement goal");
+        assert_ne!(replacement_goal_id, captured.goal_id);
+        assert_eq!(captured.goal.objective, "admitted objective");
 
-        repo.replace_thread_goal(session_id, "second", ThreadGoalStatus::Active, Some(100))
+        repository
+            .account_thread_goal_usage_for_goal(session_id, 25, Some(captured.goal_id.as_str()))
             .await
-            .expect("second");
-        repo.account_thread_goal_usage_for_goal(session_id, 10, Some(first_goal_id.as_str()))
-            .await
-            .expect("stale account");
-        repo.update_thread_goal_for_goal(
-            session_id,
-            None,
-            Some(ThreadGoalStatus::Blocked),
-            None,
-            Some(first_goal_id.as_str()),
-        )
-        .await
-        .expect("stale update");
-
-        let current = repo
+            .expect("stale captured usage is ignored");
+        let current = repository
             .get_thread_goal(session_id)
             .await
-            .expect("current")
-            .expect("goal");
-        assert_eq!(current.objective, "second");
-        assert_eq!(current.status, ThreadGoalStatus::Active);
+            .expect("current goal")
+            .expect("current goal exists");
+        assert_eq!(current.objective, replacement.objective);
         assert_eq!(current.tokens_used, 0);
     }
 
     #[tokio::test]
-    async fn session_search_treats_like_wildcards_as_literal_text() {
+    async fn active_goal_continuation_admission_is_atomic_and_inactive_is_side_effect_free() {
         let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let session = repo.get_session(session_id).await.expect("session");
-        repo.update_session_title(session_id, "100%_literal")
-            .await
-            .expect("title");
-        repo.create_session(NewSession {
-            project_id: session.project_id,
-            title: "plain title".to_string(),
-            cwd: session.cwd,
-            model: session.model,
-            base_url: session.base_url,
-            access_mode: session.access_mode,
-        })
-        .await
-        .expect("plain session");
-
-        let matches = repo
-            .search_sessions(session.project_id, "%_", 10, true)
-            .await
-            .expect("search");
-
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].id, session_id);
-    }
-
-    #[tokio::test]
-    async fn spawn_edges_preserve_explicit_child_access_but_hide_children_from_discovery() {
-        let (store, root_session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let root = repo
-            .get_session(root_session_id)
-            .await
-            .expect("root session");
-        let child = repo
-            .create_session(session_draft_from(&root, "child research"))
-            .await
-            .expect("child session");
-        let grandchild = repo
-            .create_session(session_draft_from(&root, "child nested review"))
-            .await
-            .expect("grandchild session");
-        repo.insert_session_spawn_edge(root.id, root.id, child.id, "/root/research", "research")
-            .await
-            .expect("child edge");
-        repo.insert_session_spawn_edge(
-            root.id,
-            child.id,
-            grandchild.id,
-            "/root/research/review",
-            "review",
-        )
-        .await
-        .expect("grandchild edge");
-
-        let tree = repo.list_session_spawn_edges(root.id).await.expect("tree");
-        assert_eq!(tree.len(), 2);
-        assert!(tree.iter().any(|edge| edge.child_session_id == child.id));
-        assert!(
-            tree.iter()
-                .any(|edge| edge.child_session_id == grandchild.id)
-        );
-        let direct_children = repo
-            .list_direct_child_spawn_edges(root.id)
-            .await
-            .expect("direct children");
-        assert_eq!(direct_children.len(), 1);
-        assert_eq!(direct_children[0].child_session_id, child.id);
-        assert_eq!(
-            repo.session_spawn_edge_for_child(grandchild.id)
-                .await
-                .expect("edge lookup")
-                .expect("grandchild edge")
-                .agent_path,
-            "/root/research/review"
-        );
-
-        assert_eq!(
-            repo.get_session(child.id).await.expect("explicit child").id,
-            child.id
-        );
-        assert_eq!(
-            repo.latest_session(root.project_id)
-                .await
-                .expect("latest")
-                .expect("root latest")
-                .id,
-            root.id
-        );
-        assert_eq!(
-            repo.list_sessions(root.project_id, 10)
-                .await
-                .expect("list")
-                .iter()
-                .map(|session| session.id)
-                .collect::<Vec<_>>(),
-            vec![root.id]
-        );
-        assert_eq!(
-            repo.list_recent_sessions(10)
-                .await
-                .expect("recent")
-                .iter()
-                .map(|session| session.id)
-                .collect::<Vec<_>>(),
-            vec![root.id]
-        );
-        assert!(
-            repo.search_sessions(root.project_id, "child", 10, true)
-                .await
-                .expect("search")
-                .is_empty()
-        );
-        assert_eq!(
-            repo.list_sessions_with_projection_state(root.project_id, 10, true)
-                .await
-                .expect("projected list")
-                .len(),
-            1
-        );
-        assert!(
-            repo.search_sessions_with_projection_state(root.project_id, "child", 10, true)
-                .await
-                .expect("projected search")
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn delete_session_tree_deletes_descendants_postorder_and_preserves_other_sessions() {
-        let (store, root_session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let root = repo
-            .get_session(root_session_id)
-            .await
-            .expect("root session");
-        let child = repo
-            .create_session(session_draft_from(&root, "child"))
-            .await
-            .expect("child session");
-        let grandchild = repo
-            .create_session(session_draft_from(&root, "grandchild"))
-            .await
-            .expect("grandchild session");
-        let unrelated = repo
-            .create_session(session_draft_from(&root, "unrelated"))
-            .await
-            .expect("unrelated session");
-        repo.insert_session_spawn_edge(root.id, root.id, child.id, "/root/child", "child")
-            .await
-            .expect("child edge");
-        repo.insert_session_spawn_edge(
-            root.id,
-            child.id,
-            grandchild.id,
-            "/root/child/grandchild",
-            "grandchild",
-        )
-        .await
-        .expect("grandchild edge");
-
-        let deleted = repo
-            .delete_session_tree(root.id)
-            .await
-            .expect("delete tree");
-
-        assert_eq!(deleted, vec![grandchild.id, child.id, root.id]);
-        assert!(repo.get_session(root.id).await.is_err());
-        assert!(repo.get_session(child.id).await.is_err());
-        assert!(repo.get_session(grandchild.id).await.is_err());
-        assert_eq!(
-            repo.get_session(unrelated.id)
-                .await
-                .expect("unrelated remains")
-                .id,
-            unrelated.id
-        );
-        assert!(
-            repo.list_session_spawn_edges(root.id)
-                .await
-                .expect("empty tree")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn multi_agent_tool_names_round_trip_through_storage_text() {
-        let tools = [
-            crate::tool::ToolName::SpawnAgent,
-            crate::tool::ToolName::SendMessage,
-            crate::tool::ToolName::FollowupTask,
-            crate::tool::ToolName::WaitAgent,
-            crate::tool::ToolName::InterruptAgent,
-            crate::tool::ToolName::ListAgents,
-        ];
-
-        for tool in tools {
-            assert_eq!(parse_tool_name(tool_name_text(tool)), tool);
-        }
-    }
-
-    #[test]
-    fn concurrent_goal_update_and_usage_accounting_do_not_lose_each_other() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (store, session_id) = runtime.block_on(test_repo());
-        runtime
-            .block_on(store.session_repo().replace_thread_goal(
+        let repository = store.session_repo();
+        repository
+            .replace_thread_goal(
                 session_id,
-                "initial objective",
+                "continue until verified",
                 ThreadGoalStatus::Active,
-                Some(100),
-            ))
-            .expect("goal");
-        let initial_updated_at = store
-            .session_repo()
-            .get_stored_thread_goal(session_id)
-            .expect("stored goal")
-            .expect("goal")
-            .updated_at_ms;
-        let paths = store.paths().clone();
-        drop(store);
-        let barrier = Arc::new(Barrier::new(3));
-        let final_paths = paths.clone();
-        let update_paths = paths.clone();
-        let update_barrier = Arc::clone(&barrier);
-        let update = std::thread::spawn(move || {
-            let store = SqliteStore::open(&update_paths).expect("update store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("update runtime");
-            update_barrier.wait();
-            runtime
-                .block_on(store.session_repo().update_thread_goal(
-                    session_id,
-                    Some("updated objective"),
-                    None,
-                    None,
-                ))
-                .expect("update goal");
-        });
-        let usage_barrier = Arc::clone(&barrier);
-        let usage = std::thread::spawn(move || {
-            let store = SqliteStore::open(&paths).expect("usage store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("usage runtime");
-            usage_barrier.wait();
-            runtime
-                .block_on(
-                    store
-                        .session_repo()
-                        .account_thread_goal_usage(session_id, 7),
-                )
-                .expect("account usage");
-        });
-        barrier.wait();
-        update.join().expect("update thread");
-        usage.join().expect("usage thread");
-        let store = SqliteStore::open(&final_paths).expect("final store");
-        let stored = store
-            .session_repo()
-            .get_stored_thread_goal(session_id)
-            .expect("final goal")
-            .expect("goal");
-
-        assert_eq!(stored.goal.objective, "updated objective");
-        assert_eq!(stored.goal.tokens_used, 7);
-        assert!(stored.updated_at_ms >= initial_updated_at.saturating_add(2));
-    }
-
-    #[test]
-    fn concurrent_disjoint_session_settings_updates_are_merged() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 data dir");
-        let paths = StoragePaths {
-            database_path: data_dir.join("moyai.sqlite3"),
-            truncation_dir: data_dir.join("truncation"),
-            data_dir: data_dir.clone(),
-        };
-        let sqlite = SqliteStore::open(&paths).expect("store");
-        sqlite.migrate().expect("migrate");
-        let store = StoreBundle::new(sqlite);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (session_id, initial_updated_at) = runtime.block_on(async {
-            let project_id = ProjectId::new();
-            store
-                .project_repo()
-                .upsert_project(project_id, &data_dir, "test", "none")
-                .await
-                .expect("project");
-            let session = store
-                .session_repo()
-                .create_session(NewSession {
-                    project_id,
-                    title: "settings race".to_string(),
-                    cwd: data_dir,
-                    model: "initial-model".to_string(),
-                    base_url: "http://initial".to_string(),
-                    access_mode: AccessMode::Default,
-                })
-                .await
-                .expect("session");
-            (session.id, session.updated_at_ms)
-        });
-        drop(store);
-        let barrier = Arc::new(Barrier::new(3));
-        let final_paths = paths.clone();
-        let model_paths = paths.clone();
-        let model_barrier = Arc::clone(&barrier);
-        let model_update = std::thread::spawn(move || {
-            let store = SqliteStore::open(&model_paths).expect("model store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("model runtime");
-            model_barrier.wait();
-            runtime
-                .block_on(store.session_repo().update_session_settings(
-                    session_id,
-                    &SessionSettingsPatch {
-                        model: Some("updated-model".to_string()),
-                        ..SessionSettingsPatch::default()
-                    },
-                ))
-                .expect("model update");
-        });
-        let base_barrier = Arc::clone(&barrier);
-        let base_update = std::thread::spawn(move || {
-            let store = SqliteStore::open(&paths).expect("base store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("base runtime");
-            base_barrier.wait();
-            runtime
-                .block_on(store.session_repo().update_session_settings(
-                    session_id,
-                    &SessionSettingsPatch {
-                        base_url: Some("http://updated".to_string()),
-                        ..SessionSettingsPatch::default()
-                    },
-                ))
-                .expect("base update");
-        });
-        barrier.wait();
-        model_update.join().expect("model thread");
-        base_update.join().expect("base thread");
-        let store = SqliteStore::open(&final_paths).expect("final store");
-        let final_session = runtime
-            .block_on(store.session_repo().get_session(session_id))
-            .expect("final session");
-
-        assert_eq!(final_session.model, "updated-model");
-        assert_eq!(final_session.base_url, "http://updated");
-        assert!(final_session.updated_at_ms >= initial_updated_at.saturating_add(2));
-    }
-
-    #[test]
-    fn concurrent_database_admission_allows_one_run_across_connections() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 data dir");
-        let paths = StoragePaths {
-            database_path: data_dir.join("moyai.sqlite3"),
-            truncation_dir: data_dir.join("truncation"),
-            data_dir: data_dir.clone(),
-        };
-        let sqlite = SqliteStore::open(&paths).expect("store");
-        sqlite.migrate().expect("migrate");
-        let setup = StoreBundle::new(sqlite);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let session_id = runtime.block_on(async {
-            let project_id = ProjectId::new();
-            setup
-                .project_repo()
-                .upsert_project(project_id, &data_dir, "test", "none")
-                .await
-                .expect("project");
-            setup
-                .session_repo()
-                .create_session(NewSession {
-                    project_id,
-                    title: "race".to_string(),
-                    cwd: data_dir,
-                    model: "model".to_string(),
-                    base_url: "http://localhost:1234".to_string(),
-                    access_mode: AccessMode::Default,
-                })
-                .await
-                .expect("session")
-                .id
-        });
-        drop(setup);
-        let barrier = Arc::new(Barrier::new(3));
-        let mut workers = Vec::new();
-        for _ in 0..2 {
-            let paths = paths.clone();
-            let barrier = Arc::clone(&barrier);
-            workers.push(std::thread::spawn(move || {
-                let store = SqliteStore::open(&paths).expect("worker store");
-                let repo = store.session_repo();
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("worker runtime");
-                barrier.wait();
-                runtime
-                    .block_on(repo.try_admit_session_run(session_id))
-                    .expect("admission")
-            }));
-        }
-        barrier.wait();
-        let admitted = workers
-            .into_iter()
-            .map(|worker| worker.join().expect("worker"))
-            .filter(|admitted| *admitted)
-            .count();
-
-        assert_eq!(admitted, 1);
-    }
-
-    #[test]
-    fn lease_reclaim_is_linearized_across_connections() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (store, session_id) = runtime.block_on(test_repo());
-        let paths = store.paths().clone();
-        let repo = store.session_repo();
-        runtime
-            .block_on(repo.admit_session_run_at(session_id, 10_000, 100))
-            .expect("initial admission")
-            .expect("initial owner");
-
-        let fresh_barrier = Arc::new(Barrier::new(3));
-        let mut fresh_workers = Vec::new();
-        for _ in 0..2 {
-            let paths = paths.clone();
-            let barrier = Arc::clone(&fresh_barrier);
-            fresh_workers.push(std::thread::spawn(move || {
-                let store = SqliteStore::open(&paths).expect("fresh worker store");
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("fresh worker runtime");
-                barrier.wait();
-                runtime
-                    .block_on(
-                        store
-                            .session_repo()
-                            .admit_session_run_at(session_id, 10_099, 100),
-                    )
-                    .expect("fresh admission result")
-            }));
-        }
-        fresh_barrier.wait();
-        assert!(
-            fresh_workers
-                .into_iter()
-                .all(|worker| worker.join().expect("fresh worker").is_none())
-        );
-
-        let expired_barrier = Arc::new(Barrier::new(3));
-        let mut expired_workers = Vec::new();
-        for _ in 0..2 {
-            let paths = paths.clone();
-            let barrier = Arc::clone(&expired_barrier);
-            expired_workers.push(std::thread::spawn(move || {
-                let store = SqliteStore::open(&paths).expect("expired worker store");
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("expired worker runtime");
-                barrier.wait();
-                runtime
-                    .block_on(
-                        store
-                            .session_repo()
-                            .admit_session_run_at(session_id, 10_100, 100),
-                    )
-                    .expect("expired admission result")
-            }));
-        }
-        expired_barrier.wait();
-        let reclaimed = expired_workers
-            .into_iter()
-            .map(|worker| worker.join().expect("expired worker"))
-            .filter(Option::is_some)
-            .count();
-        assert_eq!(reclaimed, 1);
-    }
-
-    #[test]
-    fn live_process_lock_blocks_reclaim_even_after_database_lease_expiry() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (store, session_id) = runtime.block_on(test_repo());
-        let paths = store.paths().clone();
-        let live_process_guard = store
-            .try_acquire_run_process_lease(session_id)
-            .expect("live process lock");
-        runtime
-            .block_on(
-                store
-                    .session_repo()
-                    .admit_session_run_at(session_id, 5_000, 100),
-            )
-            .expect("database admission")
-            .expect("database owner");
-        let other_process = StoreBundle::new(SqliteStore::open(&paths).expect("other store"));
-
-        assert!(
-            other_process
-                .try_acquire_run_process_lease(session_id)
-                .is_err()
-        );
-        drop(live_process_guard);
-        let _replacement_process_guard = other_process
-            .try_acquire_run_process_lease(session_id)
-            .expect("lock released after owner exit");
-        assert!(
-            runtime
-                .block_on(
-                    other_process
-                        .session_repo()
-                        .admit_session_run_at(session_id, 5_100, 100),
-                )
-                .expect("expired database reclaim")
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn completion_waits_for_an_accepted_unseen_steer() {
-        let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        let steer = SteerTurn {
-            expected_turn_id: turn_id,
-            items: vec![UserInputItem::Text {
-                text: "change the final answer".to_string(),
-            }],
-            additional_context: Default::default(),
-            client_user_message_id: Some("accepted-before-complete".to_string()),
-        };
-        repo.accept_active_turn_steer(session_id, &steer)
-            .await
-            .expect("accept steer");
-        let completed = RunEvent::SessionCompleted {
-            session_id,
-            finish_reason: Some(FinishReason::Stop),
-        };
-        let metadata = MessageMetadata::Assistant(AssistantMessageMeta {
-            model: "model".to_string(),
-            base_url: "http://localhost:1234".to_string(),
-            finish_reason: Some(FinishReason::Stop),
-            token_usage: None,
-            summary: false,
-        });
-
-        assert_eq!(
-            repo.update_admitted_message_metadata_and_status_with_protocol_event(
-                session_id,
-                &admission_id,
-                assistant.id,
-                &metadata,
-                SessionStatus::Completed,
-                &completed,
-                turn_id,
-                Some(1),
-                Some(0),
                 None,
             )
             .await
-            .expect("reject completion before steer drain"),
-            AdmittedTerminalCommit::UnseenSteer {
+            .expect("active goal");
+
+        let admitted_turn_id = TurnId::new();
+        let admitted = match repository
+            .admit_active_goal_continuation_turn(session_id, admitted_turn_id)
+            .await
+            .expect("active-goal admission")
+        {
+            ActiveGoalTurnAdmission::Admitted(snapshot) => snapshot,
+            outcome => panic!("active goal was not admitted: {outcome:?}"),
+        };
+        assert_eq!(
+            admitted.goal.as_ref().map(|goal| goal.goal.status),
+            Some(ThreadGoalStatus::Active)
+        );
+        let terminal = completed_terminal(session_id);
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    admitted.admission_id,
+                    &terminal,
+                    admitted_turn_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("terminalize continuation"),
+            AdmittedTerminalCommit::Applied
+        );
+
+        repository
+            .update_thread_goal(session_id, None, Some(ThreadGoalStatus::Paused), None)
+            .await
+            .expect("pause goal")
+            .expect("goal retained");
+        let before = stored_admission_state(&store, session_id);
+        assert!(matches!(
+            repository
+                .admit_active_goal_continuation_turn(session_id, TurnId::new())
+                .await
+                .expect("inactive-goal admission"),
+            ActiveGoalTurnAdmission::GoalInactive
+        ));
+        assert_eq!(stored_admission_state(&store, session_id), before);
+        assert!(
+            !repository
+                .has_fresh_run_admission(session_id)
+                .await
+                .expect("no inactive-goal admission")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_goal_change_admission_does_not_mutate_goal() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        repository
+            .replace_thread_goal(
+                session_id,
+                "owned objective",
+                ThreadGoalStatus::Active,
+                None,
+            )
+            .await
+            .expect("initial goal");
+        repository
+            .admit_session_turn(session_id, TurnId::new())
+            .await
+            .expect("first admission")
+            .expect("first owner");
+
+        assert!(
+            repository
+                .admit_session_turn_with_goal_objective(
+                    session_id,
+                    TurnId::new(),
+                    "must not be stored",
+                )
+                .await
+                .expect("rejected admission")
+                .is_none()
+        );
+        let goal = repository
+            .get_thread_goal(session_id)
+            .await
+            .expect("goal read")
+            .expect("goal retained");
+        assert_eq!(goal.objective, "owned objective");
+    }
+
+    #[tokio::test]
+    async fn expired_owner_is_recovered_before_atomic_replacement_admission() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let admitted_at_ms = SystemClock::now_ms();
+        let expired_turn_id = TurnId::new();
+        let expired_admission_id = repository
+            .admit_session_turn_at(session_id, expired_turn_id, admitted_at_ms, 100)
+            .await
+            .expect("expired owner setup")
+            .expect("expired owner admitted");
+        let replacement_turn_id = TurnId::new();
+        let replacement_admission_id = repository
+            .admit_session_turn_at(
+                session_id,
+                replacement_turn_id,
+                admitted_at_ms.saturating_add(101),
+                RUN_ADMISSION_LEASE_DURATION_MS,
+            )
+            .await
+            .expect("replacement admission")
+            .expect("replacement admitted");
+
+        let state = stored_admission_state(&store, session_id);
+        assert_eq!(state.0, "running");
+        assert_eq!(
+            state.1,
+            Some(replacement_admission_id.admission_id.to_string())
+        );
+        assert_eq!(state.2, Some(replacement_turn_id.to_string()));
+        assert!(matches!(
+            repository
+                .renew_admitted_run_lease_at(
+                    session_id,
+                    expired_admission_id.admission_id,
+                    expired_turn_id,
+                    admitted_at_ms.saturating_add(102),
+                    RUN_ADMISSION_LEASE_DURATION_MS,
+                )
+                .await
+                .expect("stale owner renewal"),
+            RunAdmissionLeaseRenewalOutcome::SupersededOrExpired
+        ));
+        assert_eq!(
+            repository
+                .durable_terminal_for_turn(session_id, expired_turn_id)
+                .await
+                .expect("recovery terminal")
+                .map(|terminal| terminal.session_status()),
+            Some(SessionStatus::Failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_user_turn_is_the_only_durable_message_contract() {
+        let (store, session_id) = test_repo().await;
+        let (_, turn_id) = active_turn(&store, session_id).await;
+        let history = store
+            .protocol_event_store()
+            .list_history_items(session_id, turn_id)
+            .expect("history");
+        assert!(matches!(
+            history.as_slice(),
+            [HistoryItem {
+                payload: HistoryItemPayload::UserTurn { content, .. },
+                ..
+            }] if matches!(content.as_slice(), [ContentPart::Text { text }] if text == "canonical request")
+        ));
+        let repo = store.session_repo();
+        let connection = repo.connection.lock().expect("sqlite mutex");
+        for retired in ["messages", "message_parts"] {
+            let exists = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                    params![retired],
+                    |row| row.get::<_, bool>(0),
+                )
+                .expect("schema query");
+            assert!(!exists, "retired table {retired} must not exist after V33");
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_tool_sidecar_and_canonical_history_are_one_atomic_bundle() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let repo = store.session_repo();
+        repo.connection
+            .lock()
+            .expect("sqlite mutex")
+            .execute_batch(
+                "CREATE TRIGGER abort_tool_sidecar
+                 BEFORE INSERT ON tool_calls
+                 BEGIN SELECT RAISE(ABORT, 'injected sidecar failure'); END;",
+            )
+            .expect("trigger");
+        let result = repo
+            .record_model_response_with_protocol_bundle(
+                session_id,
+                admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id: ModelResponseId::new(),
+                    assistant_text: Some("I will run the command.".to_string()),
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: vec![PendingToolCallWrite {
+                        id: ToolCallId::new(),
+                        model_call_id: "model-call-1".to_string(),
+                        tool_name: "shell".to_string(),
+                        arguments_json: serde_json::json!({"command": "echo ok"}).to_string(),
+                        protocol_sequence_no: None,
+                    }],
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        let history = store
+            .protocol_event_store()
+            .list_history_items(session_id, turn_id)
+            .expect("history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item.payload,
+                        HistoryItemPayload::AssistantMessage { .. }
+                            | HistoryItemPayload::ToolCall { .. }
+                    )
+                })
+                .count(),
+            0,
+            "failed sidecar insert must roll back the complete model response bundle"
+        );
+        assert_eq!(
+            store
+                .protocol_event_store()
+                .list_runtime_events(session_id, turn_id)
+                .expect("runtime events")
+                .iter()
+                .filter(|event| matches!(event.msg, RuntimeEventMsg::ToolLifecycle { .. }))
+                .count(),
+            0,
+            "failed sidecar insert must roll back its runtime projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_tool_call_preserves_unknown_name_and_invalid_provider_json_verbatim() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let response_id = ModelResponseId::new();
+        let call_id = ToolCallId::new();
+        let raw_tool_name = "provider_tool_not_in_router".to_string();
+        let raw_arguments_json = "{not-json}".to_string();
+        let events = store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session_id,
+                admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id,
+                    assistant_text: None,
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: vec![PendingToolCallWrite {
+                        id: call_id,
+                        model_call_id: "provider-call-raw".to_string(),
+                        tool_name: raw_tool_name.clone(),
+                        arguments_json: raw_arguments_json.clone(),
+                        protocol_sequence_no: None,
+                    }],
+                },
+            )
+            .await
+            .expect("raw pending tool call");
+
+        assert!(matches!(
+            events.as_slice(),
+            [RunEvent::ToolCallPending {
+                tool_call_id: stored_call_id,
+                response_id: stored_response_id,
+                model_call_id,
+                tool_name,
+                arguments_json,
+            }] if *stored_call_id == call_id
+                && *stored_response_id == response_id
+                && model_call_id == "provider-call-raw"
+                && tool_name == &raw_tool_name
+                && arguments_json == &raw_arguments_json
+        ));
+        let history = store
+            .protocol_event_store()
+            .list_history_items(session_id, turn_id)
+            .expect("canonical raw history");
+        assert!(history.iter().any(|item| matches!(
+            &item.payload,
+            HistoryItemPayload::ToolCall {
+                call_id: stored_call_id,
+                response_id: stored_response_id,
+                model_call_id,
+                tool_name,
+                arguments_json,
+            } if *stored_call_id == call_id
+                && *stored_response_id == response_id
+                && model_call_id == "provider-call-raw"
+                && tool_name == &raw_tool_name
+                && arguments_json == &raw_arguments_json
+        )));
+        let sidecar = store
+            .session_repo()
+            .connection
+            .lock()
+            .expect("sqlite mutex")
+            .query_row(
+                "SELECT status, history_item_id FROM tool_calls WHERE id = ?1",
+                [call_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("minimal pending sidecar");
+        assert_eq!(sidecar.0, "pending");
+        assert!(history.iter().any(|item| item.id.to_string() == sidecar.1));
+    }
+
+    #[tokio::test]
+    async fn complete_model_response_bundle_commits_all_calls_before_execution() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let response_id = ModelResponseId::new();
+        let first_call_id = ToolCallId::new();
+        let second_call_id = ToolCallId::new();
+        let events = store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session_id,
+                admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id,
+                    assistant_text: Some("I will inspect both inputs.".to_string()),
+                    assistant_protocol_sequence_no: Some(0),
+                    tool_calls: vec![
+                        PendingToolCallWrite {
+                            id: first_call_id,
+                            model_call_id: "provider-call-a".to_string(),
+                            tool_name: "read".to_string(),
+                            arguments_json: serde_json::json!({"path": "a.txt"}).to_string(),
+                            protocol_sequence_no: Some(1),
+                        },
+                        PendingToolCallWrite {
+                            id: second_call_id,
+                            model_call_id: "provider-call-b".to_string(),
+                            tool_name: "read".to_string(),
+                            arguments_json: serde_json::json!({"path": "b.txt"}).to_string(),
+                            protocol_sequence_no: Some(2),
+                        },
+                    ],
+                },
+            )
+            .await
+            .expect("model response bundle");
+        assert_eq!(events.len(), 3);
+
+        let history = store
+            .protocol_event_store()
+            .list_history_items(session_id, turn_id)
+            .expect("history");
+        let response_history = history
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.payload,
+                    HistoryItemPayload::AssistantMessage { .. }
+                        | HistoryItemPayload::ToolCall { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            response_history.as_slice(),
+            [
+                HistoryItem {
+                    payload: HistoryItemPayload::AssistantMessage { response_id: stored, .. },
+                    ..
+                },
+                HistoryItem {
+                    payload: HistoryItemPayload::ToolCall { call_id: first, response_id: first_response, .. },
+                    ..
+                },
+                HistoryItem {
+                    payload: HistoryItemPayload::ToolCall { call_id: second, response_id: second_response, .. },
+                    ..
+                }
+            ] if *stored == response_id
+                && *first == first_call_id
+                && *second == second_call_id
+                && *first_response == response_id
+                && *second_response == response_id
+        ));
+        let sidecar_count = store
+            .session_repo()
+            .connection
+            .lock()
+            .expect("sqlite mutex")
+            .query_row("SELECT COUNT(*) FROM tool_calls", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("sidecar count");
+        assert_eq!(sidecar_count, 2);
+    }
+
+    #[tokio::test]
+    async fn rollback_is_one_transaction_and_preserves_session_scoped_mode() {
+        let (store, session_id) = test_repo().await;
+        let protocol = store.protocol_event_store();
+        protocol
+            .set_collaboration_mode(session_id, ModeKind::Plan)
+            .expect("store plan mode")
+            .expect("plan instruction");
+        let (admission_id, real_turn) = active_turn(&store, session_id).await;
+        protocol
+            .set_collaboration_mode(session_id, ModeKind::Default)
+            .expect("store default mode")
+            .expect("default instruction");
+        assert_eq!(
+            store
+                .session_repo()
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    admission_id,
+                    &completed_terminal(session_id),
+                    real_turn,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("terminal"),
+            AdmittedTerminalCommit::Applied
+        );
+
+        store
+            .session_repo()
+            .connection
+            .lock()
+            .expect("sqlite mutex")
+            .execute_batch(
+                "CREATE TRIGGER abort_session_rollback
+                 BEFORE UPDATE OF status ON sessions
+                 BEGIN SELECT RAISE(ABORT, 'injected rollback reset failure'); END;",
+            )
+            .expect("rollback failure trigger");
+        assert!(
+            store
+                .session_repo()
+                .rollback_session_transaction(session_id, 1)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            protocol
+                .list_history_items_for_session(session_id)
+                .expect("history after failed rollback")
+                .len(),
+            3,
+            "a reset failure must roll turn deletion back while retaining session state"
+        );
+        store
+            .session_repo()
+            .connection
+            .lock()
+            .expect("sqlite mutex")
+            .execute_batch("DROP TRIGGER abort_session_rollback;")
+            .expect("drop rollback failure trigger");
+
+        let result = store
+            .session_repo()
+            .rollback_session_transaction(session_id, 1)
+            .await
+            .expect("rollback latest turn");
+        assert_eq!(result.dropped_turn_ids, vec![real_turn]);
+        assert_eq!(result.remaining_history_items, 2);
+        assert_eq!(result.session.status, SessionStatus::Idle);
+        assert_eq!(
+            protocol
+                .collaboration_mode_for_session(session_id)
+                .expect("mode after rollback"),
+            ModeKind::Default
+        );
+        let repository = store.session_repo();
+        let connection = repository.connection.lock().expect("sqlite mutex");
+        for table in [
+            "protocol_runtime_events",
+            "protocol_history_items",
+            "protocol_turn_items",
+            "protocol_item_append_order",
+            "protocol_turn_sequence_allocators",
+        ] {
+            let sql =
+                format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1 AND turn_id = ?2");
+            let count = connection
+                .query_row(
+                    &sql,
+                    params![session_id.to_string(), real_turn.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("rolled-back table count");
+            assert_eq!(count, 0, "{table} retained rolled-back turn state");
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_rejects_an_active_admission_anywhere_in_the_root_tree() {
+        let (store, root_session_id) = test_repo().await;
+        let root = store
+            .session_repo()
+            .get_session(root_session_id)
+            .await
+            .expect("root session");
+        let child = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: root.project_id,
+                title: "child".to_string(),
+                cwd: root.cwd.clone(),
+                model: root.model.clone(),
+                base_url: root.base_url.clone(),
+                access_mode: root.access_mode,
+            })
+            .await
+            .expect("child session");
+        store
+            .session_repo()
+            .insert_session_spawn_edge(
+                root_session_id,
+                root_session_id,
+                child.id,
+                "/root/child",
+                "child",
+            )
+            .await
+            .expect("spawn edge");
+        store
+            .protocol_event_store()
+            .set_collaboration_mode(root_session_id, ModeKind::Plan)
+            .expect("root history")
+            .expect("root mode item");
+        store
+            .session_repo()
+            .admit_session_turn(child.id, TurnId::new())
+            .await
+            .expect("child admission")
+            .expect("child admitted");
+
+        let error = store
+            .session_repo()
+            .rollback_session_transaction(root_session_id, 1)
+            .await
+            .expect_err("active child must block root rollback");
+        assert!(error.to_string().contains(&child.id.to_string()));
+        assert_eq!(
+            store
+                .protocol_event_store()
+                .list_history_items_for_session(root_session_id)
+                .expect("retained root history")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn active_fork_settles_unfinished_calls_before_its_interrupted_terminal() {
+        let (store, source_session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, source_session_id).await;
+        let response_id = ModelResponseId::new();
+        let call_id = ToolCallId::new();
+        store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                source_session_id,
+                admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id,
+                    assistant_text: Some("I will inspect the file.".to_string()),
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: vec![PendingToolCallWrite {
+                        id: call_id,
+                        model_call_id: "provider-call".to_string(),
+                        tool_name: "read".to_string(),
+                        arguments_json: serde_json::json!({"path": "README.md"}).to_string(),
+                        protocol_sequence_no: None,
+                    }],
+                },
+            )
+            .await
+            .expect("pending response");
+
+        let fork = store
+            .session_repo()
+            .fork_session_snapshot(source_session_id, Some("snapshot".to_string()))
+            .await
+            .expect("active snapshot fork");
+        assert!(fork.interrupted_live_snapshot);
+        let forked_history = store
+            .protocol_event_store()
+            .list_history_items(fork.forked_session.id, turn_id)
+            .expect("forked history");
+        assert!(forked_history.iter().any(|item| matches!(
+            item.payload,
+            HistoryItemPayload::ToolOutput {
+                call_id: stored_call_id,
+                status: ToolLifecycleStatus::Cancelled,
+                ..
+            } if stored_call_id == call_id
+        )));
+        let terminal = store
+            .session_repo()
+            .durable_terminal_for_turn(fork.forked_session.id, turn_id)
+            .await
+            .expect("fork terminal read")
+            .expect("fork terminal");
+        assert!(matches!(
+            terminal.outcome,
+            TurnTerminalOutcome::Interrupted { .. }
+        ));
+        assert_eq!(terminal.final_response_id, Some(response_id));
+        assert_eq!(terminal.tool_call_count, 1);
+        assert_eq!(terminal.failed_tool_count, 0);
+        assert_eq!(terminal.change_count, 0);
+        let forked_turn_items = store
+            .protocol_event_store()
+            .list_turn_items(fork.forked_session.id, turn_id)
+            .expect("forked turn items");
+        let cancelled_position = forked_turn_items
+            .iter()
+            .position(|item| {
+                matches!(
+                    item.payload,
+                    TurnItemPayload::ToolStatus {
+                        call_id: stored_call_id,
+                        status: ToolLifecycleStatus::Cancelled,
+                        ..
+                    } if stored_call_id == call_id
+                )
+            })
+            .expect("cancelled projection");
+        let terminal_position = forked_turn_items
+            .iter()
+            .position(|item| matches!(item.payload, TurnItemPayload::Terminal { .. }))
+            .expect("terminal projection");
+        assert!(cancelled_position < terminal_position);
+    }
+
+    #[tokio::test]
+    async fn active_fork_rejects_a_source_without_an_active_turn() {
+        let (store, source_session_id) = test_repo().await;
+        store
+            .session_repo()
+            .inject_raw_runtime_state_for_corruption_test(
+                source_session_id,
+                "running",
+                None,
+                None,
+                None,
+            )
+            .expect("create impossible running source fixture");
+
+        let error = store
+            .session_repo()
+            .fork_session_snapshot(source_session_id, Some("invalid snapshot".to_string()))
+            .await
+            .expect_err("fork must fail closed without an active turn");
+
+        assert!(error.to_string().contains("durable run admission"));
+    }
+
+    #[tokio::test]
+    async fn expired_admission_recovery_derives_terminal_after_user_turn_crash() {
+        let (store, session_id) = test_repo().await;
+        let (_, turn_id) = active_turn(&store, session_id).await;
+        expire_and_recover_run(&store, session_id).await;
+
+        let terminal = store
+            .session_repo()
+            .durable_terminal_for_turn(session_id, turn_id)
+            .await
+            .expect("terminal read")
+            .expect("recovery terminal");
+        assert_eq!(terminal.final_response_id, None);
+        assert_eq!(terminal.tool_call_count, 0);
+        assert_eq!(terminal.failed_tool_count, 0);
+        assert_eq!(terminal.change_count, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_admission_recovery_derives_response_and_failed_pending_call() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let response_id = ModelResponseId::new();
+        let call_id = ToolCallId::new();
+        store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session_id,
+                admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id,
+                    assistant_text: Some("Calling the tool.".to_string()),
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: vec![PendingToolCallWrite {
+                        id: call_id,
+                        model_call_id: "provider-call".to_string(),
+                        tool_name: "read".to_string(),
+                        arguments_json: serde_json::json!({"path": "README.md"}).to_string(),
+                        protocol_sequence_no: None,
+                    }],
+                },
+            )
+            .await
+            .expect("model response");
+        expire_and_recover_run(&store, session_id).await;
+
+        let terminal = store
+            .session_repo()
+            .durable_terminal_for_turn(session_id, turn_id)
+            .await
+            .expect("terminal read")
+            .expect("recovery terminal");
+        assert_eq!(terminal.final_response_id, Some(response_id));
+        assert_eq!(terminal.tool_call_count, 1);
+        assert_eq!(terminal.failed_tool_count, 1);
+        assert_eq!(terminal.change_count, 0);
+        assert!(
+            store
+                .protocol_event_store()
+                .list_history_items(session_id, turn_id)
+                .expect("recovered history")
+                .iter()
+                .any(|item| matches!(
+                    item.payload,
+                    HistoryItemPayload::ToolOutput {
+                        call_id: stored_call_id,
+                        status: ToolLifecycleStatus::Failed,
+                        ..
+                    } if stored_call_id == call_id
+                ))
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_admission_recovery_derives_completed_tool_and_change_counts() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let response_id = ModelResponseId::new();
+        let call_id = ToolCallId::new();
+        store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session_id,
+                admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id,
+                    assistant_text: None,
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: vec![PendingToolCallWrite {
+                        id: call_id,
+                        model_call_id: "provider-call".to_string(),
+                        tool_name: "apply_patch".to_string(),
+                        arguments_json: serde_json::json!({"patch": "test"}).to_string(),
+                        protocol_sequence_no: None,
+                    }],
+                },
+            )
+            .await
+            .expect("model response");
+        let durable_changes = vec![
+            crate::edit::FileChange {
+                id: ChangeId::new(),
+                tool_call_id: call_id,
+                kind: ChangeKind::Update,
+                path_before: Some("a.txt".into()),
+                path_after: Some("a.txt".into()),
+                before_sha256: Some("before-a".to_string()),
+                after_sha256: Some("after-a".to_string()),
+                diff_text: "a changed".to_string(),
+                summary: "updated a.txt".to_string(),
+                created_at_ms: 1,
+            },
+            crate::edit::FileChange {
+                id: ChangeId::new(),
+                tool_call_id: call_id,
+                kind: ChangeKind::Add,
+                path_before: None,
+                path_after: Some("b.txt".into()),
+                before_sha256: None,
+                after_sha256: Some("after-b".to_string()),
+                diff_text: "b added".to_string(),
+                summary: "added b.txt".to_string(),
+                created_at_ms: 1,
+            },
+        ];
+        store
+            .change_repo()
+            .insert_changes(&durable_changes)
+            .await
+            .expect("durable file-change evidence");
+        let changes = durable_changes
+            .iter()
+            .map(|change| crate::edit::ChangeSummary {
+                change_id: change.id,
+                kind: change.kind,
+                path_before: change.path_before.clone(),
+                path_after: change.path_after.clone(),
+            })
+            .collect();
+        store
+            .session_repo()
+            .complete_tool_call_with_file_changes_protocol_bundle(
+                session_id,
+                admission_id,
+                call_id,
+                crate::tool::ToolName::ApplyPatch,
+                "apply_patch",
+                serde_json::json!({"success": true}),
+                "updated files",
+                None,
+                changes,
+                turn_id,
+                None,
+                None,
+            )
+            .await
+            .expect("tool settlement")
+            .expect("tool settled with canonical changes");
+        expire_and_recover_run(&store, session_id).await;
+
+        let terminal = store
+            .session_repo()
+            .durable_terminal_for_turn(session_id, turn_id)
+            .await
+            .expect("terminal read")
+            .expect("recovery terminal");
+        assert_eq!(terminal.final_response_id, Some(response_id));
+        assert_eq!(terminal.tool_call_count, 1);
+        assert_eq!(terminal.failed_tool_count, 0);
+        assert_eq!(terminal.change_count, 2);
+    }
+
+    #[tokio::test]
+    async fn terminal_cas_observes_committed_agent_mail_and_active_append_loses_to_terminal() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        store
+            .session_repo()
+            .append_inter_agent_communication_with_protocol_bundle(
+                session_id,
+                InterAgentCommunication {
+                    author: "/root/worker".to_string(),
+                    recipient: "/root".to_string(),
+                    content: "new evidence".to_string(),
+                    trigger_turn: false,
+                },
+                true,
+            )
+            .expect("active mail append");
+        let active_mail = store
+            .protocol_event_store()
+            .list_history_items(session_id, turn_id)
+            .expect("active turn history")
+            .into_iter()
+            .find(|item| {
+                matches!(
+                    item.payload,
+                    HistoryItemPayload::InterAgentCommunication { .. }
+                )
+            })
+            .expect("active mail history");
+        assert_eq!(
+            active_mail.scope,
+            crate::protocol::HistoryScope::Turn { turn_id }
+        );
+        let terminal = completed_terminal(session_id);
+        assert_eq!(
+            store
+                .session_repo()
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    admission_id,
+                    &terminal,
+                    turn_id,
+                    None,
+                    Some(0),
+                    Some(0),
+                    None,
+                )
+                .await
+                .expect("terminal CAS"),
+            AdmittedTerminalCommit::UnseenAgentCommunication {
                 expected: 0,
                 actual: 1,
             }
         );
         assert_eq!(
-            repo.get_session(session_id).await.expect("running").status,
-            SessionStatus::Running
-        );
-        assert_eq!(
-            repo.update_admitted_message_metadata_and_status_with_protocol_event(
-                session_id,
-                &admission_id,
-                assistant.id,
-                &metadata,
-                SessionStatus::Completed,
-                &completed,
-                turn_id,
-                Some(2),
-                Some(1),
-                None,
-            )
-            .await
-            .expect("complete after steer drain"),
-            AdmittedTerminalCommit::Applied
-        );
-    }
-
-    #[test]
-    fn concurrent_steer_acceptance_and_completion_have_one_linearized_winner() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (store, session_id, admission_id, turn_id, assistant) =
-            runtime.block_on(active_turn_fixture());
-        let paths = store.paths().clone();
-        drop(store);
-        let barrier = Arc::new(Barrier::new(3));
-
-        let completion_paths = paths.clone();
-        let completion_barrier = Arc::clone(&barrier);
-        let completion_admission_id = admission_id.clone();
-        let completion = std::thread::spawn(move || {
-            let store = SqliteStore::open(&completion_paths).expect("completion store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("completion runtime");
-            let event = RunEvent::SessionCompleted {
-                session_id,
-                finish_reason: Some(FinishReason::Stop),
-            };
-            let metadata = MessageMetadata::Assistant(AssistantMessageMeta {
-                model: "model".to_string(),
-                base_url: "http://localhost:1234".to_string(),
-                finish_reason: Some(FinishReason::Stop),
-                token_usage: None,
-                summary: false,
-            });
-            completion_barrier.wait();
-            runtime.block_on(
-                store
-                    .session_repo()
-                    .update_admitted_message_metadata_and_status_with_protocol_event(
-                        session_id,
-                        &completion_admission_id,
-                        assistant.id,
-                        &metadata,
-                        SessionStatus::Completed,
-                        &event,
-                        turn_id,
-                        Some(1),
-                        Some(0),
-                        None,
-                    ),
-            )
-        });
-
-        let steer_paths = paths.clone();
-        let steer_barrier = Arc::clone(&barrier);
-        let steer = std::thread::spawn(move || {
-            let store = SqliteStore::open(&steer_paths).expect("steer store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("steer runtime");
-            let steer = SteerTurn {
-                expected_turn_id: turn_id,
-                items: vec![UserInputItem::Text {
-                    text: "race the final answer".to_string(),
-                }],
-                additional_context: Default::default(),
-                client_user_message_id: Some("barrier-race".to_string()),
-            };
-            steer_barrier.wait();
-            runtime.block_on(
-                store
-                    .session_repo()
-                    .accept_active_turn_steer(session_id, &steer),
-            )
-        });
-
-        barrier.wait();
-        let completion_applied = completion
-            .join()
-            .expect("completion thread")
-            .expect("completion result");
-        let steer_result = steer.join().expect("steer thread");
-        let final_store = SqliteStore::open(&paths).expect("final store");
-        let final_repo = final_store.session_repo();
-        let final_session = runtime
-            .block_on(final_repo.get_session(session_id))
-            .expect("final session");
-        let history = final_store
-            .protocol_event_store()
-            .list_history_items_for_session(session_id)
-            .expect("final history");
-        let accepted_steer_count = history
-            .iter()
-            .filter(|item| matches!(&item.payload, HistoryItemPayload::SteerTurn { .. }))
-            .count();
-
-        match (completion_applied, steer_result) {
-            (AdmittedTerminalCommit::Applied, Err(_)) => {
-                assert_eq!(final_session.status, SessionStatus::Completed);
-                assert_eq!(accepted_steer_count, 0);
-            }
-            (AdmittedTerminalCommit::UnseenSteer { .. }, Ok(_)) => {
-                assert_eq!(final_session.status, SessionStatus::Running);
-                assert_eq!(accepted_steer_count, 1);
-            }
-            (completion_applied, steer_result) => panic!(
-                "completion and steer were not linearized: completion={completion_applied:?}, steer={steer_result:?}"
-            ),
-        }
-    }
-
-    #[tokio::test]
-    async fn admission_does_not_publish_an_old_turn_as_steer_target() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let old_turn_id = TurnId::new();
-        store
-            .protocol_event_store()
-            .append_history_item(&HistoryItem {
-                id: HistoryItemId::new(),
-                session_id,
-                turn_id: old_turn_id,
-                sequence_no: 0,
-                created_at_ms: SystemClock.now_ms(),
-                payload: HistoryItemPayload::Message {
-                    message_id: None,
-                    role: MessageRole::User,
-                    content: vec![ContentPart::Text {
-                        text: "old turn".to_string(),
-                    }],
-                },
-            })
-            .expect("old turn history");
-        let admission_id = repo
-            .admit_session_run(session_id)
-            .await
-            .expect("admit")
-            .expect("admitted");
-        let old_turn_steer = SteerTurn {
-            expected_turn_id: old_turn_id,
-            items: vec![UserInputItem::Text {
-                text: "must not attach to old turn".to_string(),
-            }],
-            additional_context: Default::default(),
-            client_user_message_id: None,
-        };
-        assert!(
-            repo.accept_active_turn_steer(session_id, &old_turn_steer)
-                .await
-                .is_err()
-        );
-
-        let new_turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &admission_id, new_turn_id)
-                .await
-                .expect("activate new turn")
-        );
-        assert!(
-            repo.accept_active_turn_steer(session_id, &old_turn_steer)
-                .await
-                .is_err()
-        );
-        let new_turn_steer = SteerTurn {
-            expected_turn_id: new_turn_id,
-            ..old_turn_steer
-        };
-        repo.accept_active_turn_steer(session_id, &new_turn_steer)
-            .await
-            .expect("new turn steer");
-    }
-
-    #[tokio::test]
-    async fn awaiting_user_retains_owner_and_blocks_replacement_admission() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let admission_id = repo
-            .admit_session_run(session_id)
-            .await
-            .expect("admit")
-            .expect("admitted");
-        let turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &admission_id, turn_id)
-                .await
-                .expect("activate turn")
-        );
-        assert!(
-            repo.terminalize_admitted_session_with_protocol_event(
-                session_id,
-                &admission_id,
-                SessionStatus::AwaitingUser,
-                &RunEvent::SessionAwaitingUser {
+            store
+                .session_repo()
+                .terminalize_admitted_turn_with_protocol_event(
                     session_id,
-                    finish_reason: Some(FinishReason::ToolCall),
-                },
-                turn_id,
-                None,
-            )
-            .await
-            .expect("awaiting user")
-        );
-        assert!(
-            repo.admit_session_run(session_id)
-                .await
-                .expect("replacement admission")
-                .is_none()
-        );
-        assert_eq!(
-            repo.admitted_run_status(session_id, &admission_id, turn_id)
-                .await
-                .expect("owned status"),
-            Some(SessionStatus::AwaitingUser)
-        );
-    }
-
-    #[tokio::test]
-    async fn admitted_terminalization_rejects_a_different_turn() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let admission_id = repo
-            .admit_session_run(session_id)
-            .await
-            .expect("admit")
-            .expect("admitted");
-        let turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &admission_id, turn_id)
-                .await
-                .expect("activate turn")
-        );
-        assert!(
-            !repo
-                .terminalize_admitted_session_with_protocol_event(
-                    session_id,
-                    &admission_id,
-                    SessionStatus::Failed,
-                    &RunEvent::SessionFailed {
-                        session_id,
-                        message: "wrong turn".to_string(),
-                    },
-                    TurnId::new(),
+                    admission_id,
+                    &terminal,
+                    turn_id,
+                    None,
+                    Some(0),
+                    Some(1),
                     None,
                 )
                 .await
-                .expect("wrong turn rejected")
+                .expect("terminal retry"),
+            AdmittedTerminalCommit::Applied
         );
+        let append_after_terminal = store
+            .session_repo()
+            .append_inter_agent_communication_with_protocol_bundle(
+                session_id,
+                InterAgentCommunication {
+                    author: "/root/worker".to_string(),
+                    recipient: "/root".to_string(),
+                    content: "too late".to_string(),
+                    trigger_turn: false,
+                },
+                true,
+            );
+        assert!(append_after_terminal.is_err());
         assert_eq!(
-            repo.get_session(session_id).await.expect("session").status,
-            SessionStatus::Running
+            store
+                .protocol_event_store()
+                .list_history_items_for_session(session_id)
+                .expect("history")
+                .iter()
+                .filter(|item| matches!(
+                    item.payload,
+                    HistoryItemPayload::InterAgentCommunication { .. }
+                ))
+                .count(),
+            1
         );
     }
 
     #[tokio::test]
-    async fn terminal_commit_fails_unfinished_tools_before_releasing_owner() {
-        let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        let tool_call = repo
-            .insert_tool_call(
-                session_id,
-                assistant.id,
-                "shell",
-                "{}",
-                Some("pending"),
-                serde_json::Value::Null,
-            )
-            .await
-            .expect("pending tool");
-        let event = RunEvent::SessionFailed {
-            session_id,
-            message: "agent failure".to_string(),
-        };
+    async fn communication_for_an_inactive_recipient_is_session_scoped() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, completed_turn_id) = active_turn(&store, session_id).await;
         assert_eq!(
-            repo.update_admitted_message_metadata_and_status_with_protocol_event(
+            store
+                .session_repo()
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    admission_id,
+                    &completed_terminal(session_id),
+                    completed_turn_id,
+                    None,
+                    Some(0),
+                    Some(0),
+                    None,
+                )
+                .await
+                .expect("terminal"),
+            AdmittedTerminalCommit::Applied
+        );
+
+        let communication_id = store
+            .session_repo()
+            .append_inter_agent_communication_with_protocol_bundle(
                 session_id,
-                &admission_id,
-                assistant.id,
-                &test_assistant_metadata(Some(FinishReason::Error)),
-                SessionStatus::Failed,
+                InterAgentCommunication {
+                    author: "/root/worker".to_string(),
+                    recipient: "/root".to_string(),
+                    content: "evidence for a future continuation".to_string(),
+                    trigger_turn: false,
+                },
+                false,
+            )
+            .expect("inactive recipient communication");
+        let communication = store
+            .protocol_event_store()
+            .list_history_items_for_session(session_id)
+            .expect("history")
+            .into_iter()
+            .find(|item| item.id == communication_id)
+            .expect("communication item");
+
+        assert_eq!(communication.scope, crate::protocol::HistoryScope::Session);
+        assert_eq!(communication.turn_id(), None);
+        assert!(matches!(
+            communication.payload,
+            HistoryItemPayload::InterAgentCommunication { .. }
+        ));
+        assert!(
+            store
+                .session_repo()
+                .durable_terminal_for_turn(session_id, completed_turn_id)
+                .await
+                .expect("terminal read")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_targets_only_real_turns_and_preserves_all_idle_mail() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, completed_turn_id) = active_turn(&store, session_id).await;
+        assert_eq!(
+            store
+                .session_repo()
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    admission_id,
+                    &completed_terminal(session_id),
+                    completed_turn_id,
+                    None,
+                    Some(0),
+                    Some(0),
+                    None,
+                )
+                .await
+                .expect("terminal"),
+            AdmittedTerminalCommit::Applied
+        );
+        let first_mail_id = store
+            .session_repo()
+            .append_inter_agent_communication_with_protocol_bundle(
+                session_id,
+                InterAgentCommunication {
+                    author: "/root/worker-a".to_string(),
+                    recipient: "/root".to_string(),
+                    content: "first future evidence".to_string(),
+                    trigger_turn: false,
+                },
+                false,
+            )
+            .expect("first inactive mail");
+        let second_mail_id = store
+            .session_repo()
+            .append_inter_agent_communication_with_protocol_bundle(
+                session_id,
+                InterAgentCommunication {
+                    author: "/root/worker-b".to_string(),
+                    recipient: "/root".to_string(),
+                    content: "second future evidence".to_string(),
+                    trigger_turn: false,
+                },
+                false,
+            )
+            .expect("second inactive mail");
+        let rolled_back = store
+            .session_repo()
+            .rollback_session_transaction(session_id, 1)
+            .await
+            .expect("rollback latest real turn");
+        let after = store
+            .protocol_event_store()
+            .list_history_items_for_session(session_id)
+            .expect("history after rollback");
+
+        assert_eq!(rolled_back.dropped_turn_ids, vec![completed_turn_id]);
+        assert!(after.iter().any(|item| item.id == first_mail_id));
+        assert!(after.iter().any(|item| item.id == second_mail_id));
+        assert!(
+            store
+                .session_repo()
+                .durable_terminal_for_turn(session_id, completed_turn_id)
+                .await
+                .expect("completed terminal read")
+                .is_none(),
+            "rollback must remove the selected real turn without consuming session mail"
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_terminal_is_first_writer_and_is_rehydrated_as_one_typed_value() {
+        let (store, session_id) = test_repo().await;
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let repo = store.session_repo();
+        let event = completed_terminal(session_id);
+        assert_eq!(
+            repo.terminalize_admitted_turn_with_protocol_event(
+                session_id,
+                admission_id,
                 &event,
                 turn_id,
                 None,
                 None,
                 None,
+                None,
             )
             .await
-            .expect("terminal commit"),
+            .expect("terminalize"),
             AdmittedTerminalCommit::Applied
         );
-        let tool_status = repo
-            .connection
-            .lock()
-            .expect("sqlite mutex")
-            .query_row(
-                "SELECT status FROM tool_calls WHERE id = ?1",
-                params![tool_call.id.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .expect("tool status");
-        assert_eq!(tool_status, "failed");
-    }
-
-    #[tokio::test]
-    async fn externally_stopped_admission_cannot_block_the_active_goal() {
-        let (store, session_id, admission_id, turn_id, assistant) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        repo.replace_thread_goal(
-            session_id,
-            "keep goal active after external stop",
-            ThreadGoalStatus::Active,
-            None,
-        )
-        .await
-        .expect("goal");
-        let (_, goal_id) = repo
-            .get_thread_goal_with_id(session_id)
+        let durable = repo
+            .durable_terminal_for_turn(session_id, turn_id)
             .await
-            .expect("goal read")
-            .expect("stored goal");
-        assert!(
-            repo.terminalize_active_session_with_protocol_event(
-                session_id,
-                SessionStatus::Cancelled,
-                &RunEvent::SessionInterrupted {
-                    session_id,
-                    reason: "external stop".to_string(),
-                },
-                turn_id,
-                None,
-            )
-            .await
-            .expect("external stop")
-        );
-
+            .expect("read terminal")
+            .expect("terminal");
+        assert!(matches!(durable.outcome, TurnTerminalOutcome::Completed));
+        assert_eq!(durable.summary(), "completed");
         assert_eq!(
-            repo.update_admitted_message_metadata_and_status_with_protocol_event(
-                session_id,
-                &admission_id,
-                assistant.id,
-                &test_assistant_metadata(Some(FinishReason::Error)),
-                SessionStatus::Failed,
-                &RunEvent::SessionFailed {
-                    session_id,
-                    message: "late agent failure".to_string(),
-                },
-                turn_id,
-                None,
-                None,
-                Some(&goal_id),
-            )
-            .await
-            .expect("late failure acknowledgement"),
-            AdmittedTerminalCommit::AlreadyTerminalizedBySameAdmission
-        );
-        assert_eq!(
-            repo.get_thread_goal(session_id)
-                .await
-                .expect("goal after stop")
-                .expect("goal remains")
-                .status,
-            ThreadGoalStatus::Active
-        );
-    }
-
-    #[tokio::test]
-    async fn stopped_owner_cannot_drain_a_later_turn_steer() {
-        let (store, session_id, first_admission, first_turn_id, _) = active_turn_fixture().await;
-        let repo = store.session_repo();
-        assert!(
-            repo.terminalize_active_session_with_protocol_event(
-                session_id,
-                SessionStatus::Cancelled,
-                &RunEvent::SessionInterrupted {
-                    session_id,
-                    reason: "stop first".to_string(),
-                },
-                first_turn_id,
-                None,
-            )
-            .await
-            .expect("interrupt first")
-        );
-        assert!(
-            repo.list_admitted_turn_steers(session_id, &first_admission, first_turn_id)
-                .await
-                .expect("old mailbox")
-                .is_none()
-        );
-        assert!(
             store
                 .protocol_event_store()
-                .append_admitted_event_bundle_allocating(
-                    &first_admission,
-                    &RuntimeEvent {
-                        id: RuntimeEventId::new(),
-                        session_id,
-                        turn_id: first_turn_id,
-                        sequence_no: 0,
-                        created_at_ms: SystemClock.now_ms(),
-                        msg: RuntimeEventMsg::Warning {
-                            message: "late old-owner event".to_string(),
-                        },
-                    },
+                .list_runtime_events(session_id, turn_id)
+                .expect("events")
+                .iter()
+                .filter(|event| matches!(event.msg, RuntimeEventMsg::TurnTerminal { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            repo.terminalize_admitted_turn_with_protocol_event(
+                session_id,
+                admission_id,
+                &completed_terminal(session_id),
+                turn_id,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("second terminal attempt"),
+            AdmittedTerminalCommit::NotOwned
+        );
+        assert_eq!(
+            repo.durable_terminal_for_turn(session_id, turn_id)
+                .await
+                .expect("read terminal")
+                .expect("terminal")
+                .summary(),
+            "completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_terminal_target_cannot_terminalize_a_replacement_turn() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let (first_admission_id, first_turn_id) = active_turn(&store, session_id).await;
+        let first_target = repository
+            .captured_running_terminal_target(session_id)
+            .await
+            .expect("capture first target")
+            .expect("first running target");
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    first_admission_id,
+                    &completed_terminal(session_id),
+                    first_turn_id,
+                    None,
+                    None,
                     None,
                     None,
                 )
-                .expect("late event guard")
-                .is_none()
-        );
-        assert!(
-            repo.admit_session_run(session_id)
                 .await
-                .expect("blocked admission")
-                .is_none()
+                .expect("complete first turn"),
+            AdmittedTerminalCommit::Applied
         );
-        assert!(
-            repo.release_stopped_run_admission(session_id, &first_admission)
-                .await
-                .expect("release stopped owner")
-        );
-        let second_admission = repo
-            .admit_session_run(session_id)
-            .await
-            .expect("second admission")
-            .expect("second admitted");
+
         let second_turn_id = TurnId::new();
+        repository
+            .admit_session_turn(session_id, second_turn_id)
+            .await
+            .expect("replacement admission")
+            .expect("replacement admitted");
         assert!(
-            repo.activate_admitted_turn(session_id, &second_admission, second_turn_id)
+            !repository
+                .terminalize_captured_running_session_with_protocol_event(
+                    session_id,
+                    &failed_terminal(session_id, "stale stop target"),
+                    first_target,
+                )
                 .await
-                .expect("activate second turn")
-        );
-        repo.accept_active_turn_steer(
-            session_id,
-            &SteerTurn {
-                expected_turn_id: second_turn_id,
-                items: vec![UserInputItem::Text {
-                    text: "second steer".to_string(),
-                }],
-                additional_context: Default::default(),
-                client_user_message_id: None,
-            },
-        )
-        .await
-        .expect("second steer");
-        assert!(
-            repo.list_admitted_turn_steers(session_id, &first_admission, first_turn_id)
-                .await
-                .expect("old mailbox after readmit")
-                .is_none()
+                .expect("stale target is a clean CAS miss")
         );
         assert_eq!(
-            repo.list_admitted_turn_steers(session_id, &second_admission, second_turn_id)
+            repository
+                .fresh_running_turn_for_session(session_id)
                 .await
-                .expect("new mailbox")
-                .expect("new owner")
-                .len(),
-            1
+                .expect("replacement turn"),
+            Some(second_turn_id)
+        );
+        assert!(
+            repository
+                .durable_terminal_for_turn(session_id, second_turn_id)
+                .await
+                .expect("replacement terminal lookup")
+                .is_none()
         );
     }
 
-    #[test]
-    fn concurrent_interrupt_never_allows_readmission_before_owner_acknowledgement() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (store, session_id, admission_id, turn_id, _) = runtime.block_on(active_turn_fixture());
-        let paths = store.paths().clone();
-        drop(store);
-        let barrier = Arc::new(Barrier::new(3));
-
-        let interrupt_paths = paths.clone();
-        let interrupt_barrier = Arc::clone(&barrier);
-        let interrupt = std::thread::spawn(move || {
-            let store = SqliteStore::open(&interrupt_paths).expect("interrupt store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("interrupt runtime");
-            interrupt_barrier.wait();
-            runtime.block_on(
-                store
-                    .session_repo()
-                    .terminalize_active_session_with_protocol_event(
-                        session_id,
-                        SessionStatus::Cancelled,
-                        &RunEvent::SessionInterrupted {
-                            session_id,
-                            reason: "cross-process stop".to_string(),
-                        },
-                        turn_id,
-                        None,
-                    ),
-            )
-        });
-        let admission_paths = paths.clone();
-        let admission_barrier = Arc::clone(&barrier);
-        let replacement = std::thread::spawn(move || {
-            let store = SqliteStore::open(&admission_paths).expect("admission store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("admission runtime");
-            admission_barrier.wait();
-            runtime.block_on(store.session_repo().admit_session_run(session_id))
-        });
-        barrier.wait();
+    #[tokio::test]
+    async fn captured_terminal_target_survives_same_owner_lease_renewal() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let (admission_id, turn_id) = active_turn(&store, session_id).await;
+        let target = repository
+            .captured_running_terminal_target(session_id)
+            .await
+            .expect("capture target")
+            .expect("running target");
+        assert!(matches!(
+            repository
+                .renew_admitted_run_lease_at(
+                    session_id,
+                    admission_id,
+                    turn_id,
+                    SystemClock::now_ms(),
+                    RUN_ADMISSION_LEASE_DURATION_MS * 4,
+                )
+                .await
+                .expect("renew same owner"),
+            RunAdmissionLeaseRenewalOutcome::Renewed
+        ));
         assert!(
-            interrupt
-                .join()
-                .expect("interrupt worker")
-                .expect("interrupt result")
+            repository
+                .terminalize_captured_running_session_with_protocol_event(
+                    session_id,
+                    &failed_terminal(session_id, "stop after renewal"),
+                    target,
+                )
+                .await
+                .expect("terminalize renewed owner")
         );
         assert!(
-            replacement
-                .join()
-                .expect("admission worker")
-                .expect("admission result")
+            repository
+                .durable_terminal_for_turn(session_id, turn_id)
+                .await
+                .expect("terminal lookup")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_recovery_requires_the_captured_matching_owner() {
+        let (store, null_turn_session_id) = test_repo().await;
+        let repository = store.session_repo();
+        repository
+            .inject_raw_runtime_state_for_corruption_test(
+                null_turn_session_id,
+                "running",
+                None,
+                None,
+                None,
+            )
+            .expect("create turnless running fixture");
+        let recovered_turn_id = TurnId::new();
+        let error = repository
+            .captured_running_terminal_target(null_turn_session_id)
+            .await
+            .expect_err("turnless recovery must fail closed");
+        assert!(error.to_string().contains("durable run admission"));
+        assert!(
+            repository.get_session(null_turn_session_id).await.is_err(),
+            "ordinary reads must reject the same invalid owner state"
+        );
+        assert!(
+            repository
+                .durable_terminal_for_turn(null_turn_session_id, recovered_turn_id)
+                .await
+                .expect("turnless terminal lookup")
                 .is_none()
         );
 
-        let final_store = SqliteStore::open(&paths).expect("final store");
-        let final_repo = final_store.session_repo();
+        let (store, owned_session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let (_admission_id, active_turn_id) = active_turn(&store, owned_session_id).await;
+        let owned_target = repository
+            .captured_running_terminal_target(owned_session_id)
+            .await
+            .expect("capture owned target")
+            .expect("owned running target");
+        let foreign_session =
+            create_sibling_session(&store, owned_session_id, "foreign owner").await;
+        let (_foreign_admission_id, foreign_turn_id) =
+            active_turn(&store, foreign_session.id).await;
+        let foreign_target = repository
+            .captured_running_terminal_target(foreign_session.id)
+            .await
+            .expect("capture foreign target")
+            .expect("foreign running target");
+        assert_ne!(foreign_turn_id, active_turn_id);
         assert!(
-            runtime
-                .block_on(final_repo.release_stopped_run_admission(session_id, &admission_id))
-                .expect("owner acknowledgement")
+            !repository
+                .terminalize_captured_running_session_with_protocol_event(
+                    owned_session_id,
+                    &failed_terminal(owned_session_id, "foreign turn"),
+                    foreign_target,
+                )
+                .await
+                .expect("reject foreign recovery turn")
+        );
+        assert_eq!(
+            repository
+                .get_session(owned_session_id)
+                .await
+                .expect("owned session")
+                .status,
+            SessionStatus::Running
         );
         assert!(
-            runtime
-                .block_on(final_repo.admit_session_run(session_id))
-                .expect("post-ack admission")
+            repository
+                .durable_terminal_for_turn(owned_session_id, foreign_turn_id)
+                .await
+                .expect("foreign terminal lookup")
+                .is_none()
+        );
+        assert!(
+            repository
+                .recover_captured_running_session_with_protocol_event(
+                    owned_session_id,
+                    &failed_terminal(owned_session_id, "orphaned run"),
+                    owned_target,
+                )
+                .await
+                .expect("recover the exact durable active turn")
+        );
+        assert_eq!(
+            repository
+                .get_session(owned_session_id)
+                .await
+                .expect("recovered session")
+                .status,
+            SessionStatus::Failed
+        );
+        assert!(
+            repository
+                .durable_terminal_for_turn(owned_session_id, active_turn_id)
+                .await
+                .expect("active terminal lookup")
                 .is_some()
         );
     }
 
     #[test]
-    fn concurrent_steer_and_runtime_event_share_the_database_allocator() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let (store, session_id, _, turn_id, _) = runtime.block_on(active_turn_fixture());
-        let paths = store.paths().clone();
-        drop(store);
-        let warning = RuntimeEvent {
-            id: RuntimeEventId::new(),
+    fn terminal_writer_rejects_non_terminal_events_and_invalid_counts() {
+        let session_id = SessionId::new();
+        let non_terminal = RunEvent::SessionStarted {
             session_id,
-            turn_id,
-            sequence_no: 0,
-            created_at_ms: SystemClock.now_ms(),
-            msg: RuntimeEventMsg::Warning {
-                message: "race with steer".to_string(),
-            },
+            title: "test".to_string(),
         };
-        let warning_id = warning.id;
-        let barrier = Arc::new(Barrier::new(3));
-
-        let event_paths = paths.clone();
-        let event_barrier = Arc::clone(&barrier);
-        let event_worker = std::thread::spawn(move || {
-            let store = SqliteStore::open(&event_paths).expect("event store");
-            event_barrier.wait();
-            store.protocol_event_store().append_runtime_event(&warning)
-        });
-        let steer_paths = paths.clone();
-        let steer_barrier = Arc::clone(&barrier);
-        let steer_worker = std::thread::spawn(move || {
-            let store = SqliteStore::open(&steer_paths).expect("steer store");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("steer runtime");
-            steer_barrier.wait();
-            runtime.block_on(store.session_repo().accept_active_turn_steer(
-                session_id,
-                &SteerTurn {
-                    expected_turn_id: turn_id,
-                    items: vec![UserInputItem::Text {
-                        text: "allocator race".to_string(),
-                    }],
-                    additional_context: Default::default(),
-                    client_user_message_id: Some("allocator-race".to_string()),
-                },
-            ))
-        });
-        barrier.wait();
-        event_worker
-            .join()
-            .expect("event worker")
-            .expect("event append");
-        steer_worker
-            .join()
-            .expect("steer worker")
-            .expect("steer append");
-
-        let final_store = SqliteStore::open(&paths).expect("final store");
-        let events = final_store
-            .protocol_event_store()
-            .list_runtime_events(session_id, turn_id)
-            .expect("events");
-        let warning_sequence = events
-            .iter()
-            .find(|event| event.id == warning_id)
-            .expect("warning id preserved")
-            .sequence_no;
-        let steer_sequence = events
-            .iter()
-            .find(|event| matches!(event.msg, RuntimeEventMsg::SteerInputAccepted { .. }))
-            .expect("steer event")
-            .sequence_no;
-        assert_ne!(warning_sequence, steer_sequence);
-    }
-
-    #[tokio::test]
-    async fn stale_admission_cannot_terminalize_a_newer_run() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let first_admission = repo
-            .admit_session_run(session_id)
-            .await
-            .expect("first admission")
-            .expect("first admitted");
-        let first_turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &first_admission, first_turn_id)
-                .await
-                .expect("activate first turn")
-        );
-        assert!(
-            repo.terminalize_active_session_with_protocol_event(
-                session_id,
-                SessionStatus::Cancelled,
-                &RunEvent::SessionInterrupted {
-                    session_id,
-                    reason: "replace run".to_string(),
-                },
-                first_turn_id,
-                None,
-            )
-            .await
-            .expect("cancel first")
-        );
-        assert!(
-            repo.admit_session_run(session_id)
-                .await
-                .expect("blocked second admission")
-                .is_none(),
-            "an interrupted run retains its admission until the matching owner acknowledges stop"
-        );
-
-        assert!(
-            repo.terminalize_admitted_session_with_protocol_event(
-                session_id,
-                &first_admission,
-                SessionStatus::Cancelled,
-                &RunEvent::SessionInterrupted {
-                    session_id,
-                    reason: "owner acknowledged stop".to_string(),
-                },
-                first_turn_id,
-                None,
-            )
-            .await
-            .expect("first owner acknowledgement")
-        );
-        let second_admission = repo
-            .admit_session_run(session_id)
-            .await
-            .expect("second admission")
-            .expect("second admitted after acknowledgement");
-        let second_turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &second_admission, second_turn_id)
-                .await
-                .expect("activate second turn")
-        );
-        assert!(
-            !repo
-                .terminalize_admitted_session_with_protocol_event(
-                    session_id,
-                    &first_admission,
-                    SessionStatus::Failed,
-                    &RunEvent::SessionFailed {
-                        session_id,
-                        message: "stale cleanup".to_string(),
-                    },
-                    first_turn_id,
-                    None,
-                )
-                .await
-                .expect("stale cleanup rejected")
-        );
-        assert_eq!(
-            repo.get_session(session_id).await.expect("new run").status,
-            SessionStatus::Running
-        );
-        assert!(
-            repo.terminalize_admitted_session_with_protocol_event(
-                session_id,
-                &second_admission,
-                SessionStatus::Failed,
-                &RunEvent::SessionFailed {
-                    session_id,
-                    message: "current cleanup".to_string(),
-                },
-                second_turn_id,
-                None,
-            )
-            .await
-            .expect("current cleanup")
-        );
-    }
-
-    #[tokio::test]
-    async fn completed_commit_cannot_overwrite_an_interrupted_session() {
-        let (store, session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let admission_id = repo
-            .admit_session_run(session_id)
-            .await
-            .expect("admit")
-            .expect("admitted");
-        let turn_id = TurnId::new();
-        assert!(
-            repo.activate_admitted_turn(session_id, &admission_id, turn_id)
-                .await
-                .expect("activate turn")
-        );
-        let (assistant, _) = repo
-            .append_assistant_message_with_protocol_start(
-                NewMessage {
-                    session_id,
-                    parent_message_id: None,
-                    role: MessageRole::Assistant,
-                    metadata: MessageMetadata::Assistant(AssistantMessageMeta {
-                        model: "model".to_string(),
-                        base_url: "http://localhost:1234".to_string(),
-                        finish_reason: None,
-                        token_usage: None,
-                        summary: false,
-                    }),
-                },
-                &admission_id,
-                turn_id,
-                None,
-                "model".to_string(),
-            )
-            .await
-            .expect("assistant");
-        let interrupted = RunEvent::SessionInterrupted {
+        assert!(validate_terminal_event(session_id, &non_terminal).is_err());
+        let invalid_counts = RunEvent::TurnTerminal {
             session_id,
-            reason: "stop".to_string(),
+            terminal: Box::new(crate::session::model::DurableTurnTerminal {
+                outcome: TurnTerminalOutcome::Interrupted {
+                    cause: crate::protocol::TurnInterruptionCause::UserStop,
+                },
+                final_response_id: None,
+                tool_call_count: 0,
+                failed_tool_count: 1,
+                change_count: 0,
+                metrics: Default::default(),
+            }),
         };
-        assert!(
-            repo.terminalize_active_session_with_protocol_event(
-                session_id,
-                SessionStatus::Cancelled,
-                &interrupted,
-                turn_id,
-                None,
-            )
-            .await
-            .expect("interrupt")
-        );
-        let completed = RunEvent::SessionCompleted {
-            session_id,
-            finish_reason: Some(FinishReason::Stop),
-        };
-        let completion_applied = repo
-            .update_message_metadata_and_status_with_protocol_event(
-                session_id,
-                assistant.id,
-                &MessageMetadata::Assistant(AssistantMessageMeta {
-                    model: "model".to_string(),
-                    base_url: "http://localhost:1234".to_string(),
-                    finish_reason: Some(FinishReason::Stop),
-                    token_usage: None,
-                    summary: false,
-                }),
-                SessionStatus::Completed,
-                &completed,
-                turn_id,
-                None,
-            )
-            .await
-            .expect("complete attempt");
-
-        assert!(!completion_applied);
-        assert_eq!(
-            repo.get_session(session_id).await.expect("session").status,
-            SessionStatus::Cancelled
-        );
+        assert!(validate_terminal_event(session_id, &invalid_counts).is_err());
     }
-
-    #[tokio::test]
-    async fn fork_snapshot_rolls_back_the_target_when_a_late_copy_step_fails() {
-        let (store, source_session_id) = test_repo().await;
-        let repo = store.session_repo();
-        repo.connection
-            .lock()
-            .expect("sqlite mutex poisoned")
-            .execute_batch(&format!(
-                "CREATE TRIGGER abort_fork_state
-                 BEFORE INSERT ON session_state
-                 WHEN NEW.session_id <> '{}'
-                 BEGIN
-                     SELECT RAISE(ABORT, 'injected fork state failure');
-                 END;",
-                source_session_id
-            ))
-            .expect("failure trigger");
-
-        let error = repo
-            .fork_session_snapshot(source_session_id, Some("atomic fork".to_string()))
-            .await
-            .expect_err("late fork failure must abort the transaction");
-
-        assert!(error.to_string().contains("injected fork state failure"));
-        let session_count = repo
-            .connection
-            .lock()
-            .expect("sqlite mutex poisoned")
-            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect("session count");
-        assert_eq!(session_count, 1, "the target session must not leak");
-    }
-
-    #[tokio::test]
-    async fn fork_snapshot_rolls_back_when_the_final_active_marker_fails() {
-        let (store, source_session_id) = test_repo().await;
-        let repo = store.session_repo();
-        repo.admit_session_run(source_session_id)
-            .await
-            .expect("admit source")
-            .expect("source admission");
-        store
-            .protocol_event_store()
-            .append_history_item(&HistoryItem {
-                id: HistoryItemId::new(),
-                session_id: source_session_id,
-                turn_id: TurnId::new(),
-                sequence_no: 0,
-                created_at_ms: 1,
-                payload: HistoryItemPayload::Message {
-                    message_id: None,
-                    role: MessageRole::User,
-                    content: vec![ContentPart::Text {
-                        text: "copy before final marker".to_string(),
-                    }],
-                },
-            })
-            .expect("source history");
-        repo.connection
-            .lock()
-            .expect("sqlite mutex poisoned")
-            .execute_batch(&format!(
-                "CREATE TRIGGER abort_fork_terminal_marker
-                 BEFORE INSERT ON protocol_runtime_events
-                 WHEN NEW.session_id <> '{}'
-                 BEGIN
-                     SELECT RAISE(ABORT, 'injected final marker failure');
-                 END;",
-                source_session_id
-            ))
-            .expect("marker failure trigger");
-
-        let error = repo
-            .fork_session_snapshot(source_session_id, Some("active fork".to_string()))
-            .await
-            .expect_err("final marker failure must abort the entire fork");
-
-        assert!(error.to_string().contains("injected final marker failure"));
-        let connection = repo.connection.lock().expect("sqlite mutex poisoned");
-        let session_count = connection
-            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect("session count");
-        let leaked_history = connection
-            .query_row(
-                "SELECT COUNT(*) FROM protocol_history_items WHERE session_id <> ?1",
-                params![source_session_id.to_string()],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("leaked history count");
-        let leaked_allocators = connection
-            .query_row(
-                "SELECT COUNT(*) FROM protocol_turn_sequence_allocators WHERE session_id <> ?1",
-                params![source_session_id.to_string()],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("leaked allocator count");
-        assert_eq!(session_count, 1, "the target session must roll back");
-        assert_eq!(leaked_history, 0, "copied history must roll back");
-        assert_eq!(leaked_allocators, 0, "fork allocators must roll back");
-    }
-
-    #[tokio::test]
-    async fn fork_snapshot_copies_session_settings_memory_and_protocol_together() {
-        let (store, source_session_id) = test_repo().await;
-        let repo = store.session_repo();
-        repo.update_session_settings(
-            source_session_id,
-            &SessionSettingsPatch {
-                temperature: Some(0.25),
-                max_output_tokens: Some(2048),
-                ..SessionSettingsPatch::default()
-            },
-        )
-        .await
-        .expect("source settings");
-        repo.update_session_memory_mode(source_session_id, SessionMemoryMode::Disabled)
-            .await
-            .expect("source memory mode");
-        let turn_id = TurnId::new();
-        store
-            .protocol_event_store()
-            .append_history_item(&HistoryItem {
-                id: HistoryItemId::new(),
-                session_id: source_session_id,
-                turn_id,
-                sequence_no: 0,
-                created_at_ms: 1,
-                payload: HistoryItemPayload::Message {
-                    message_id: None,
-                    role: MessageRole::User,
-                    content: vec![ContentPart::Text {
-                        text: "snapshot source".to_string(),
-                    }],
-                },
-            })
-            .expect("source history");
-
-        let fork = repo
-            .fork_session_snapshot(source_session_id, Some("snapshot fork".to_string()))
-            .await
-            .expect("fork snapshot");
-
-        assert_eq!(fork.forked_session.title, "snapshot fork");
-        assert_eq!(fork.forked_session.status, SessionStatus::Idle);
-        assert_eq!(fork.forked_session.model_parameters.temperature, Some(0.25));
-        assert_eq!(
-            fork.forked_session.model_parameters.max_output_tokens,
-            Some(2048)
-        );
-        assert_eq!(
-            repo.get_session_memory_mode(fork.forked_session.id)
-                .await
-                .expect("fork memory mode"),
-            SessionMemoryMode::Disabled
-        );
-        assert_eq!(fork.copied_history_items, 1);
-        assert_eq!(fork.copied_turn_items, 0);
-        assert_eq!(
-            store
-                .protocol_event_store()
-                .list_history_items_for_session(fork.forked_session.id)
-                .expect("fork history")
-                .len(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn active_root_access_cas_preserves_run_and_unrelated_settings_and_rejects_stale_child() {
-        let (store, root_session_id) = test_repo().await;
-        let repo = store.session_repo();
-        let prepared = repo
-            .update_session_settings(
-                root_session_id,
-                &SessionSettingsPatch {
-                    model: Some("root-model".to_string()),
-                    base_url: Some("http://root-provider.invalid".to_string()),
-                    access_mode: Some(AccessMode::Default),
-                    temperature: Some(0.25),
-                    max_output_tokens: Some(2048),
-                    ..SessionSettingsPatch::default()
-                },
-            )
-            .await
-            .expect("prepare root settings")
-            .session;
-        repo.update_session_memory_mode(root_session_id, SessionMemoryMode::Disabled)
-            .await
-            .expect("prepare root memory mode");
-        let admission_id = repo
-            .admit_session_run(root_session_id)
-            .await
-            .expect("admit root")
-            .expect("root admitted");
-
-        let update = repo
-            .compare_and_set_root_session_access_mode(
-                root_session_id,
-                AccessMode::Default,
-                AccessMode::FullAccess,
-            )
-            .await
-            .expect("active root access update")
-            .expect("expected access owner");
-        assert!(update.changed);
-        assert_eq!(update.session.status, SessionStatus::Running);
-        assert_eq!(update.session.access_mode, AccessMode::FullAccess);
-        assert_eq!(update.session.project_id, prepared.project_id);
-        assert_eq!(update.session.title, prepared.title);
-        assert_eq!(update.session.cwd, prepared.cwd);
-        assert_eq!(update.session.model, prepared.model);
-        assert_eq!(update.session.base_url, prepared.base_url);
-        assert_eq!(
-            update.session.model_parameters, prepared.model_parameters,
-            "the access-only boundary must not rewrite model settings"
-        );
-        assert_eq!(
-            repo.get_session_memory_mode(root_session_id)
-                .await
-                .expect("root memory mode"),
-            SessionMemoryMode::Disabled
-        );
-        assert!(
-            repo.has_fresh_run_admission(root_session_id)
-                .await
-                .expect("root admission retained")
-        );
-        assert_eq!(
-            repo.admitted_run_status_at(
-                root_session_id,
-                &admission_id,
-                TurnId::new(),
-                SystemClock::now_ms(),
-            )
-            .await
-            .expect("admission status before turn"),
-            None,
-            "a pre-turn admission remains owned but has no active turn identity"
-        );
-
-        assert!(
-            repo.compare_and_set_root_session_access_mode(
-                root_session_id,
-                AccessMode::Default,
-                AccessMode::AutoReview,
-            )
-            .await
-            .expect("stale access CAS")
-            .is_none(),
-            "a stale expected access owner must not overwrite the active root"
-        );
-        assert_eq!(
-            repo.get_session(root_session_id)
-                .await
-                .expect("root after stale CAS")
-                .access_mode,
-            AccessMode::FullAccess
-        );
-        assert!(
-            repo.update_session_settings(
-                root_session_id,
-                &SessionSettingsPatch {
-                    model: Some("forbidden-active-model-change".to_string()),
-                    ..SessionSettingsPatch::default()
-                },
-            )
-            .await
-            .is_err(),
-            "general settings remain forbidden while the root is active"
-        );
-
-        let child = repo
-            .create_session(NewSession {
-                project_id: prepared.project_id,
-                title: "child".to_string(),
-                cwd: prepared.cwd,
-                model: prepared.model,
-                base_url: prepared.base_url,
-                access_mode: AccessMode::Default,
-            })
-            .await
-            .expect("child session");
-        repo.insert_session_spawn_edge(
-            root_session_id,
-            root_session_id,
-            child.id,
-            "/root/child",
-            "child",
-        )
-        .await
-        .expect("child edge");
-        let child_error = repo
-            .compare_and_set_root_session_access_mode(
-                child.id,
-                AccessMode::Default,
-                AccessMode::FullAccess,
-            )
-            .await
-            .expect_err("child cannot impersonate the root access owner");
-        assert!(child_error.to_string().contains("child agent session"));
-        assert_eq!(
-            repo.get_session(child.id)
-                .await
-                .expect("unchanged child")
-                .access_mode,
-            AccessMode::Default
-        );
-    }
-}
-
-fn session_status_text(status: SessionStatus) -> &'static str {
-    match status {
-        SessionStatus::Idle => "idle",
-        SessionStatus::Running => "running",
-        SessionStatus::Completed => "completed",
-        SessionStatus::AwaitingUser => "awaiting_user",
-        SessionStatus::Cancelled => "cancelled",
-        SessionStatus::Failed => "failed",
-    }
-}
-
-fn terminal_status_text(status: SessionStatus) -> Result<&'static str, StorageError> {
-    match status {
-        SessionStatus::Completed => Ok("completed"),
-        SessionStatus::AwaitingUser => Ok("awaiting_user"),
-        SessionStatus::Cancelled => Ok("cancelled"),
-        SessionStatus::Failed => Ok("failed"),
-        SessionStatus::Idle | SessionStatus::Running => Err(StorageError::Message(
-            "active session terminalization requires a terminal status".to_string(),
-        )),
-    }
-}
-
-fn count_steer_history_items(
-    transaction: &Transaction<'_>,
-    session_id: SessionId,
-) -> Result<usize, StorageError> {
-    let mut statement = transaction
-        .prepare("SELECT payload_json FROM protocol_history_items WHERE session_id = ?1")?;
-    let rows = statement.query_map(params![session_id.to_string()], |row| {
-        row.get::<_, String>(0)
-    })?;
-    let mut count = 0;
-    for row in rows {
-        let payload = serde_json::from_str::<HistoryItemPayload>(&row?)?;
-        if matches!(payload, HistoryItemPayload::SteerTurn { .. }) {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-pub(crate) fn normalize_run_lease_now_ms(now_ms: i64) -> i64 {
-    now_ms.clamp(0, i64::MAX - 1)
-}
-
-fn run_lease_expiry_ms(now_ms: i64, lease_duration_ms: i64) -> i64 {
-    normalize_run_lease_now_ms(now_ms).saturating_add(lease_duration_ms.max(1))
-}
-
-fn run_lease_is_fresh(lease_expires_at_ms: Option<i64>, now_ms: i64) -> bool {
-    lease_expires_at_ms
-        .is_some_and(|expires_at_ms| expires_at_ms > normalize_run_lease_now_ms(now_ms))
-}
-
-fn recover_expired_run_admission_in_transaction(
-    transaction: &Transaction<'_>,
-    session_id: SessionId,
-    current_status: &str,
-    active_turn_id: Option<&str>,
-    now_ms: i64,
-) -> Result<(), StorageError> {
-    let was_active = matches!(current_status, "running" | "awaiting_user");
-    let active_turn_id = active_turn_id
-        .map(|value| {
-            value
-                .parse::<TurnId>()
-                .map_err(|error| StorageError::Message(error.to_string()))
-        })
-        .transpose()?;
-    let recovery_turn_id = active_turn_id;
-    if was_active {
-        transaction.execute(
-            "UPDATE sessions
-             SET status = 'cancelled',
-                 updated_at_ms = ?2,
-                 completed_at_ms = ?2,
-                 active_run_id = NULL,
-                 active_turn_id = NULL,
-                 active_run_lease_expires_at_ms = NULL
-             WHERE id = ?1",
-            params![session_id.to_string(), now_ms],
-        )?;
-    } else {
-        transaction.execute(
-            "UPDATE sessions
-             SET updated_at_ms = MAX(updated_at_ms, ?2),
-                 active_run_id = NULL,
-                 active_turn_id = NULL,
-                 active_run_lease_expires_at_ms = NULL
-             WHERE id = ?1",
-            params![session_id.to_string(), now_ms],
-        )?;
-    }
-    fail_unfinished_tool_calls_in_connection(
-        transaction,
-        session_id,
-        EXPIRED_RUN_RECOVERY_REASON,
-        now_ms,
-    )?;
-    if was_active && let Some(turn_id) = recovery_turn_id {
-        insert_protocol_projection_if_requested(
-            transaction,
-            &RunEvent::SessionInterrupted {
-                session_id,
-                reason: EXPIRED_RUN_RECOVERY_REASON.to_string(),
-            },
-            Some(session_id),
-            turn_id,
-            Some(0),
-        )?;
-    }
-    Ok(())
-}
-
-fn require_active_admission_in_transaction(
-    transaction: &Transaction<'_>,
-    session_id: SessionId,
-    admission_id: &str,
-    turn_id: TurnId,
-) -> Result<(), StorageError> {
-    let now = normalize_run_lease_now_ms(SystemClock::now_ms());
-    let owned = transaction
-        .query_row(
-            "SELECT 1
-             FROM sessions
-             WHERE id = ?1
-               AND active_run_id = ?2
-               AND active_turn_id = ?3
-               AND active_run_lease_expires_at_ms > ?4
-               AND status IN ('running', 'awaiting_user')",
-            params![
-                session_id.to_string(),
-                admission_id,
-                turn_id.to_string(),
-                now
-            ],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if owned {
-        Ok(())
-    } else {
-        Err(StorageError::Message(format!(
-            "run admission {admission_id} no longer owns active turn {turn_id} for session {session_id}"
-        )))
-    }
-}
-
-fn fail_unfinished_tool_calls_in_connection(
-    connection: &Connection,
-    session_id: SessionId,
-    error_text: &str,
-    finished_at_ms: i64,
-) -> Result<(), StorageError> {
-    connection.execute(
-        "UPDATE tool_calls
-         SET status = 'failed',
-             error_text = COALESCE(error_text, ?2),
-             finished_at_ms = COALESCE(finished_at_ms, ?3)
-         WHERE session_id = ?1 AND status IN ('pending', 'running')",
-        params![session_id.to_string(), error_text, finished_at_ms],
-    )?;
-    Ok(())
-}
-
-fn unfinished_tool_reason_for_event(event: &RunEvent) -> &str {
-    match event {
-        RunEvent::SessionInterrupted { reason, .. } => reason,
-        RunEvent::SessionFailed { message, .. } => message,
-        RunEvent::SessionCompleted { .. } => "run completed before a tool call finished",
-        RunEvent::SessionAwaitingUser { .. } => "run paused before a tool call finished",
-        _ => "run terminalized before a tool call finished",
-    }
-}
-
-fn escape_like_literal(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        if matches!(character, '\\' | '%' | '_') {
-            escaped.push('\\');
-        }
-        escaped.push(character);
-    }
-    escaped
 }

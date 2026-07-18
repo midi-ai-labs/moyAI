@@ -35,11 +35,9 @@ macro_rules! typed_id {
 
 typed_id!(ProjectId);
 typed_id!(SessionId);
-typed_id!(MessageId);
-typed_id!(PartId);
+typed_id!(AdmissionId);
 typed_id!(ToolCallId);
 typed_id!(ChangeId);
-typed_id!(TodoId);
 
 fn stable_ulid(input: &str) -> Ulid {
     let mut hasher = Sha256::new();
@@ -51,24 +49,6 @@ fn stable_ulid(input: &str) -> Ulid {
 }
 
 impl ProjectId {
-    pub fn from_stable_input(input: &str) -> Self {
-        Self(stable_ulid(input))
-    }
-}
-
-impl MessageId {
-    pub fn from_stable_input(input: &str) -> Self {
-        Self(stable_ulid(input))
-    }
-}
-
-impl PartId {
-    pub fn from_stable_input(input: &str) -> Self {
-        Self(stable_ulid(input))
-    }
-}
-
-impl TodoId {
     pub fn from_stable_input(input: &str) -> Self {
         Self(stable_ulid(input))
     }

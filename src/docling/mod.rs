@@ -2,16 +2,33 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use futures_util::StreamExt;
 use reqwest::multipart::{Form, Part};
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 
 use crate::config::DoclingConfig;
-use crate::error::ToolError;
+use crate::error::{DoclingLimitSurface, ToolError};
 use crate::tool::truncate::clip_text_with_ellipsis;
 
-#[derive(Debug, Clone)]
+pub const MAX_DOCLING_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_DOCLING_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Debug)]
+pub struct DoclingLocalInput {
+    pub path: Utf8PathBuf,
+    pub file: std::fs::File,
+}
+
+impl DoclingLocalInput {
+    pub fn from_validated_handle(path: Utf8PathBuf, file: std::fs::File) -> Self {
+        Self { path, file }
+    }
+}
+
+#[derive(Debug)]
 pub struct DoclingConvertRequest {
-    pub path: Option<Utf8PathBuf>,
+    pub local_input: Option<DoclingLocalInput>,
     pub source_url: Option<String>,
     pub from_formats: Vec<String>,
     pub to_formats: Vec<String>,
@@ -51,7 +68,8 @@ impl DoclingClient {
 
     pub async fn convert(
         &self,
-        request: DoclingConvertRequest,
+        mut request: DoclingConvertRequest,
+        mut effect_checkpoint: impl FnMut() -> Result<(), ToolError>,
     ) -> Result<DoclingConvertResult, ToolError> {
         if !self.config.enabled {
             return Err(ToolError::Message(
@@ -59,16 +77,23 @@ impl DoclingClient {
             ));
         }
 
+        let local_input = request.local_input.take();
         match (
-            request.path.as_ref(),
+            local_input,
             request
                 .source_url
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty()),
         ) {
-            (Some(path), None) => self.convert_file(path, &request).await,
-            (None, Some(source_url)) => self.convert_source(source_url, &request).await,
+            (Some(input), None) => {
+                self.convert_file(input, &request, &mut effect_checkpoint)
+                    .await
+            }
+            (None, Some(source_url)) => {
+                self.convert_source(source_url, &request, &mut effect_checkpoint)
+                    .await
+            }
             (Some(_), Some(_)) => Err(ToolError::Message(
                 "docling_convert accepts exactly one of `path` or `source_url`".to_string(),
             )),
@@ -78,60 +103,32 @@ impl DoclingClient {
         }
     }
 
-    pub async fn probe_readiness(&self) -> Result<(), ToolError> {
-        if !self.config.enabled {
-            return Err(ToolError::Message(
-                "docling is disabled by config".to_string(),
-            ));
-        }
-        let base_url = normalize_docling_base_url(&self.config.base_url);
-        if base_url.is_empty() {
-            return Err(ToolError::Message("docling base_url is empty".to_string()));
-        }
-        for suffix in ["/health", "/ready"] {
-            let endpoint = endpoint(&base_url, suffix);
-            let response = self
-                .request_builder(&endpoint, reqwest::Method::GET)?
-                .send()
-                .await
-                .map_err(|error| ToolError::Message(format!("docling probe failed: {error}")))?;
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            if !status.is_success() {
-                return Err(ToolError::Message(format!(
-                    "docling probe `{endpoint}` failed with HTTP {}: {}",
-                    status.as_u16(),
-                    compact_body(&body)
-                )));
-            }
-        }
-        Ok(())
-    }
-
     async fn convert_file(
         &self,
-        path: &Utf8Path,
+        input: DoclingLocalInput,
         request: &DoclingConvertRequest,
+        effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
     ) -> Result<DoclingConvertResult, ToolError> {
         let endpoint = endpoint(&self.config.base_url, "/v1/convert/file");
-        let bytes = tokio::fs::read(path.as_std_path())
-            .await
-            .map_err(|error| ToolError::Message(format!("failed to read `{path}`: {error}")))?;
+        let path = input.path;
+        let bytes = read_docling_input_bounded(input.file, &path, MAX_DOCLING_INPUT_BYTES).await?;
         let file_name = path
             .file_name()
             .map(str::to_string)
             .unwrap_or_else(|| "document".to_string());
         let part = Part::bytes(bytes)
             .file_name(file_name)
-            .mime_str(mime_for_path(path))
+            .mime_str(mime_for_path(&path))
             .map_err(|error| ToolError::Message(format!("failed to prepare upload: {error}")))?;
 
         let mut form = Form::new().part("files", part);
         form = append_convert_form_fields(form, request);
 
-        let body = self
+        let request = self
             .request_builder(&endpoint, reqwest::Method::POST)?
-            .multipart(form)
+            .multipart(form);
+        effect_checkpoint()?;
+        let body = request
             .send()
             .await
             .map_err(|error| ToolError::Message(format!("docling request failed: {error}")))?;
@@ -142,6 +139,7 @@ impl DoclingClient {
         &self,
         source_url: &str,
         request: &DoclingConvertRequest,
+        effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
     ) -> Result<DoclingConvertResult, ToolError> {
         let endpoint = endpoint(&self.config.base_url, "/v1/convert/source");
         let mut options = serde_json::Map::new();
@@ -185,10 +183,12 @@ impl DoclingClient {
             "options": Value::Object(options),
         });
 
-        let body = self
+        let request = self
             .request_builder(&endpoint, reqwest::Method::POST)?
             .header("Content-Type", "application/json")
-            .body(documents.to_string())
+            .body(documents.to_string());
+        effect_checkpoint()?;
+        let body = request
             .send()
             .await
             .map_err(|error| ToolError::Message(format!("docling request failed: {error}")))?;
@@ -205,12 +205,9 @@ impl DoclingClient {
             .request(method, endpoint)
             .timeout(Duration::from_millis(self.config.timeout_ms))
             .header("Accept", "application/json");
-        if let Some(api_key) = self
-            .config
-            .api_key_env
-            .as_deref()
-            .and_then(|key| std::env::var(key).ok())
-            .filter(|value| !value.is_empty())
+        if let Some(api_key) =
+            crate::llm::resolve_api_key_from_env(self.config.api_key_env.as_deref())
+                .map_err(|error| ToolError::Message(error.to_string()))?
         {
             request = request.header("X-Api-Key", api_key);
         }
@@ -223,10 +220,6 @@ impl DoclingClient {
 
 pub fn normalize_docling_base_url(base_url: &str) -> String {
     base_url.trim().trim_end_matches('/').to_string()
-}
-
-pub async fn probe_docling_readiness(config: DoclingConfig) -> Result<(), ToolError> {
-    DoclingClient::new(config).probe_readiness().await
 }
 
 fn append_convert_form_fields(mut form: Form, request: &DoclingConvertRequest) -> Form {
@@ -255,10 +248,8 @@ async fn parse_convert_response(
     response: reqwest::Response,
 ) -> Result<DoclingConvertResult, ToolError> {
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| ToolError::Message(format!("failed to read docling response: {error}")))?;
+    let body =
+        read_docling_response_bounded(endpoint, response, MAX_DOCLING_RESPONSE_BYTES).await?;
     if !status.is_success() {
         return Err(ToolError::Message(format!(
             "docling request to `{endpoint}` failed with HTTP {}: {}",
@@ -334,6 +325,82 @@ async fn parse_convert_response(
     })
 }
 
+async fn read_docling_input_bounded(
+    file: std::fs::File,
+    path: &Utf8Path,
+    maximum: u64,
+) -> Result<Vec<u8>, ToolError> {
+    let file = tokio::fs::File::from_std(file);
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|error| ToolError::Message(format!("failed to stat opened `{path}`: {error}")))?;
+    if !metadata.is_file() {
+        return Err(ToolError::Message(format!(
+            "Docling input `{path}` is not a regular file"
+        )));
+    }
+    ensure_docling_limit(DoclingLimitSurface::InputBytes, metadata.len(), maximum)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or_default());
+    file.take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| ToolError::Message(format!("failed to read `{path}`: {error}")))?;
+    ensure_docling_limit(DoclingLimitSurface::InputBytes, bytes.len() as u64, maximum)?;
+    Ok(bytes)
+}
+
+async fn read_docling_response_bounded(
+    endpoint: &str,
+    response: reqwest::Response,
+    maximum: u64,
+) -> Result<String, ToolError> {
+    if let Some(length) = response.content_length() {
+        ensure_docling_limit(DoclingLimitSurface::ResponseBytes, length, maximum)?;
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            ToolError::Message(format!(
+                "failed to read docling response from `{endpoint}`: {error}"
+            ))
+        })?;
+        append_docling_response_chunk(&mut body, &chunk, maximum)?;
+    }
+    String::from_utf8(body).map_err(|_| {
+        ToolError::Message(format!(
+            "docling response from `{endpoint}` is not valid UTF-8"
+        ))
+    })
+}
+
+fn append_docling_response_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    maximum: u64,
+) -> Result<(), ToolError> {
+    let actual = (body.len() as u64).saturating_add(chunk.len() as u64);
+    ensure_docling_limit(DoclingLimitSurface::ResponseBytes, actual, maximum)?;
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn ensure_docling_limit(
+    surface: DoclingLimitSurface,
+    actual: u64,
+    maximum: u64,
+) -> Result<(), ToolError> {
+    if actual > maximum {
+        return Err(ToolError::DoclingLimitExceeded {
+            surface,
+            actual,
+            maximum,
+        });
+    }
+    Ok(())
+}
+
 fn endpoint(base_url: &str, suffix: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), suffix)
 }
@@ -382,5 +449,145 @@ fn compact_body(body: &str) -> String {
         compact
     } else {
         clip_text_with_ellipsis(&compact, 243)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::Router;
+    use axum::body::{Body, Bytes};
+    use axum::http::StatusCode;
+    use axum::routing::any;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn typed_effect_admission_is_checked_at_docling_send_boundary() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Docling fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let handler_count = Arc::clone(&request_count);
+        let app = Router::new().fallback(any(move || {
+            let handler_count = Arc::clone(&handler_count);
+            async move {
+                handler_count.fetch_add(1, Ordering::SeqCst);
+                StatusCode::OK
+            }
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Docling fixture");
+        });
+
+        let client = DoclingClient::new(DoclingConfig {
+            enabled: true,
+            base_url: format!("http://{address}"),
+            timeout_ms: 2_000,
+            api_key_env: None,
+            headers: BTreeMap::new(),
+        });
+        let error = client
+            .convert(
+                DoclingConvertRequest {
+                    local_input: None,
+                    source_url: Some("https://example.test/document.pdf".to_string()),
+                    from_formats: Vec::new(),
+                    to_formats: vec!["md".to_string()],
+                    do_ocr: None,
+                    include_images: Some(false),
+                    page_range: None,
+                },
+                || Err(ToolError::RunInterrupted),
+            )
+            .await
+            .expect_err("the typed terminal owner must reject the network send");
+
+        assert!(matches!(error, ToolError::RunInterrupted));
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn docling_input_metadata_limit_rejects_a_sparse_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("large.pdf")).expect("utf8");
+        let file = std::fs::File::create(&path).expect("fixture");
+        file.set_len(9).expect("sparse length");
+
+        let file = std::fs::File::open(&path).expect("open sparse fixture");
+        let error = read_docling_input_bounded(file, &path, 8)
+            .await
+            .expect_err("metadata over the input limit must fail");
+
+        assert!(matches!(
+            error,
+            ToolError::DoclingLimitExceeded {
+                surface: DoclingLimitSurface::InputBytes,
+                actual: 9,
+                maximum: 8,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn docling_input_reads_the_validated_handle_after_namespace_replacement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("document.pdf")).expect("utf8");
+        std::fs::write(&path, b"validated object").expect("seed validated object");
+        let file = std::fs::File::open(&path).expect("open validated handle");
+        std::fs::remove_file(&path).expect("remove namespace entry after validated open");
+        std::fs::write(&path, b"replacement object").expect("replace namespace entry");
+
+        let bytes = read_docling_input_bounded(file, &path, 1_024)
+            .await
+            .expect("read validated handle");
+
+        assert_eq!(bytes, b"validated object");
+        assert_eq!(
+            std::fs::read(&path).expect("read replacement"),
+            b"replacement object"
+        );
+    }
+
+    #[tokio::test]
+    async fn docling_chunked_response_limit_is_enforced_without_content_length() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Docling response fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let app = Router::new().fallback(any(|| async {
+            Body::from_stream(futures_util::stream::iter([
+                Ok::<_, Infallible>(Bytes::from_static(b"12345")),
+                Ok::<_, Infallible>(Bytes::from_static(b"6789")),
+            ]))
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve Docling response fixture");
+        });
+        let endpoint = format!("http://{address}/convert");
+        let response = reqwest::get(&endpoint).await.expect("fixture response");
+
+        let error = read_docling_response_bounded(&endpoint, response, 8)
+            .await
+            .expect_err("streamed response over the limit must fail");
+
+        assert!(matches!(
+            error,
+            ToolError::DoclingLimitExceeded {
+                surface: DoclingLimitSurface::ResponseBytes,
+                actual: 9,
+                maximum: 8,
+            }
+        ));
+        server.abort();
     }
 }

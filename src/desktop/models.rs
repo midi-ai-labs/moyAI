@@ -1,7 +1,7 @@
 use crate::protocol::TurnId;
 use crate::session::{
-    ChangeKind, LoadedSessionStatus, LoadedSessionSummary, ProjectId, SessionId, SessionMemoryMode,
-    SessionStatus, ToolCallId,
+    ChangeKind, LoadedSessionStatus, LoadedSessionSummary, ProjectId, SessionId, SessionStatus,
+    ToolCallId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -11,53 +11,18 @@ pub enum DesktopTranscriptRowKind {
     EmptyPlaceholder,
     User,
     Assistant,
-    Reasoning,
+    ReasoningSummary,
     Editing,
     Tool,
-    Summary,
     Diff,
     System,
     Error,
     WorkSummaryRunning,
+    WorkSummaryIncomplete,
     WorkSummaryCompleted,
     WorkSummaryFailed,
     WorkSummaryCancelled,
-    WorkSummaryAwaitingUser,
     FileChanges,
-}
-
-impl DesktopTranscriptRowKind {
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::EmptyPlaceholder => "empty_placeholder",
-            Self::User => "user",
-            Self::Assistant => "assistant",
-            Self::Reasoning => "reasoning",
-            Self::Editing => "editing",
-            Self::Tool => "tool",
-            Self::Summary => "summary",
-            Self::Diff => "diff",
-            Self::System => "system",
-            Self::Error => "error",
-            Self::WorkSummaryRunning => "work_summary_running",
-            Self::WorkSummaryCompleted => "work_summary_completed",
-            Self::WorkSummaryFailed => "work_summary_failed",
-            Self::WorkSummaryCancelled => "work_summary_cancelled",
-            Self::WorkSummaryAwaitingUser => "work_summary_awaiting_user",
-            Self::FileChanges => "file_changes",
-        }
-    }
-
-    pub fn is_work_summary(self) -> bool {
-        matches!(
-            self,
-            Self::WorkSummaryRunning
-                | Self::WorkSummaryCompleted
-                | Self::WorkSummaryFailed
-                | Self::WorkSummaryCancelled
-                | Self::WorkSummaryAwaitingUser
-        )
-    }
 }
 
 fn default_desktop_transcript_row_kind() -> DesktopTranscriptRowKind {
@@ -68,7 +33,6 @@ fn default_desktop_transcript_row_kind() -> DesktopTranscriptRowKind {
 pub struct DesktopTranscriptRow {
     #[serde(default = "default_desktop_transcript_row_kind")]
     pub row_kind: DesktopTranscriptRowKind,
-    pub kind: String,
     pub step: String,
     pub title: String,
     pub body: String,
@@ -113,13 +77,10 @@ pub struct DesktopProjectRow {
 pub struct DesktopSessionRow {
     pub session_id: SessionId,
     pub title: String,
-    pub status_kind: SessionStatus,
-    pub status: String,
+    pub status: SessionStatus,
     pub loaded_status: LoadedSessionStatus,
     #[serde(default)]
     pub archived: bool,
-    #[serde(default)]
-    pub memory_mode: SessionMemoryMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,19 +106,18 @@ impl DesktopSessionRow {
             summary.pending_user_input_requests,
         );
         row.archived = summary.archived;
-        row.memory_mode = summary.memory_mode;
         row
     }
 
     pub(crate) fn set_title_preserving_status(&mut self, title: &str) {
-        let status = self.status_kind;
+        let status = self.status;
         self.apply_parts(title, status);
     }
 
     pub(crate) fn set_status(&mut self, status: SessionStatus) {
         let title = self.title.clone();
         match status {
-            SessionStatus::Running | SessionStatus::AwaitingUser => {
+            SessionStatus::Running => {
                 self.loaded_status = LoadedSessionStatus::Active;
             }
             SessionStatus::Idle | SessionStatus::Completed | SessionStatus::Cancelled => {
@@ -206,11 +166,9 @@ impl DesktopSessionRow {
         let mut row = Self {
             session_id,
             title: String::new(),
-            status_kind: status,
-            status: String::new(),
+            status,
             loaded_status,
             archived: false,
-            memory_mode: SessionMemoryMode::default(),
             active_turn_id,
             active_turn_sequence_no,
             pending_permission_requests,
@@ -224,8 +182,7 @@ impl DesktopSessionRow {
 
     fn apply_parts(&mut self, title: &str, status: SessionStatus) {
         self.title = truncate_text(title.trim(), 24);
-        self.status_kind = status;
-        self.status = session_status_key(status).to_string();
+        self.status = status;
         self.short_id = short_session_id(self.session_id);
         self.label = format_session_row_parts(title, status, self.session_id);
     }
@@ -248,8 +205,6 @@ pub struct DesktopSessionDetail {
     pub tool_status_text: String,
     pub progress_text: String,
     pub run_status_text: String,
-    pub confirmation_text: String,
-    pub confirmation_visible: bool,
     pub artifacts: Vec<DesktopArtifactRow>,
     pub file_changes: Vec<DesktopFileChangeRow>,
     pub file_change_summary_text: String,
@@ -322,23 +277,11 @@ pub(crate) fn format_session_row_parts(
     )
 }
 
-fn session_status_key(status: SessionStatus) -> &'static str {
-    match status {
-        SessionStatus::Idle => "idle",
-        SessionStatus::Running => "running",
-        SessionStatus::Completed => "completed",
-        SessionStatus::AwaitingUser => "awaiting_user",
-        SessionStatus::Cancelled => "cancelled",
-        SessionStatus::Failed => "failed",
-    }
-}
-
 pub(crate) fn format_session_status(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Idle => "待機中",
         SessionStatus::Running => "実行中",
         SessionStatus::Completed => "完了",
-        SessionStatus::AwaitingUser => "確認待ち",
         SessionStatus::Cancelled => "停止済み",
         SessionStatus::Failed => "失敗",
     }
@@ -432,8 +375,7 @@ mod tests {
             2,
         );
 
-        assert_eq!(row.status_kind, SessionStatus::Running);
-        assert_eq!(row.status, "running");
+        assert_eq!(row.status, SessionStatus::Running);
         assert_eq!(row.loaded_status, LoadedSessionStatus::Active);
         assert_eq!(row.active_turn_id, Some(turn_id));
         assert_eq!(row.active_turn_sequence_no, Some(7));

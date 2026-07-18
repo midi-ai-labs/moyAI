@@ -2,23 +2,30 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { actionById, paletteActions, type ActionContext } from "../src/actions.ts";
-import { updateConfigDraftValue } from "../src/config_mutation.ts";
+import {
+  discardConfigDraft,
+  sameConfigMutationTarget,
+  updateConfigDraftValue,
+} from "../src/config_mutation.ts";
 import {
   InteractionLifecycle,
+  installInteractionEventGate,
   shouldBeginKeyboardInteraction,
   shouldBeginPointerInteraction,
 } from "../src/interaction_lifecycle.ts";
+import { wireEvents } from "../src/events.ts";
 import { globalShortcutAction } from "../src/keyboard_shortcut.ts";
 import { autoRefreshAllowed, runtimePollingRequired } from "../src/polling_state.ts";
 import {
   renderArtifactPane,
+  renderComposer,
   renderOverlay,
   renderSidebar,
   renderThreadContent,
   renderTopbar,
   setRenderContext,
 } from "../src/render.ts";
-import type { DesktopWebState } from "../src/types.ts";
+import type { DesktopViewState, DesktopWebState, RunMutationTarget } from "../src/types.ts";
 import { createUiLocalState } from "../src/ui_state.ts";
 import { validateConfigInput } from "../src/utils.ts";
 import {
@@ -33,7 +40,7 @@ import {
   sessionSearchMutationTarget,
 } from "../src/view_state.ts";
 
-function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
+function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState {
   return {
     projection_revision: "1",
     workspace_path: "C:/workspace",
@@ -41,20 +48,41 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
     current_session_label: "Session A",
     status_message: "Ready",
     status_detail: "",
+    status_code: "plain",
     access_label: "default",
     access_target: {
       workspacePath: "C:/workspace",
       sessionId: "session-a",
-      configGeneration: 1,
+      configGeneration: "1",
       accessMode: "default",
       runtimeOwnerToken: "idle:0",
-      configOwnerMutationOpen: true,
     },
-    access_mode_mutation_enabled: true,
-    config_owner_mutation_open: true,
-    config_draft_dirty: false,
-    config_draft_discard_enabled: false,
-    config_draft_commit_enabled: false,
+    config_draft_capabilities: {
+      clean: {
+        dirty: false,
+        edit_enabled: true,
+        discard_enabled: false,
+        commit_enabled: false,
+        external_owner_mutation_open: true,
+        access_mode_mutation_enabled: true,
+      },
+      dirty: {
+        dirty: true,
+        edit_enabled: true,
+        discard_enabled: true,
+        commit_enabled: true,
+        external_owner_mutation_open: false,
+        access_mode_mutation_enabled: false,
+      },
+    },
+    config_draft: {
+      dirty: false,
+      edit_enabled: true,
+      discard_enabled: false,
+      commit_enabled: false,
+      external_owner_mutation_open: true,
+      access_mode_mutation_enabled: true,
+    },
     model_label: "model-a",
     provider_label: "Local",
     selected_project_index: 0,
@@ -67,7 +95,6 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
       status: "idle",
       loaded_status: "idle",
       archived: false,
-      memory_mode: "enabled",
       pending_permission_requests: 0,
       pending_user_input_requests: 0,
       short_id: "session-a",
@@ -90,13 +117,20 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
       checks: [],
     },
     composer_commit_generation: "0",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "session-a" },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "session-a", ownerGeneration: 1 },
     busy: false,
     navigation_loading: false,
     navigation_admission_open: true,
     background_mutation_pending: false,
     agent_tree_active: false,
+    composer_submit_mode: "new_request",
     can_submit: true,
+    can_cancel_run: false,
+    run_target: {
+      workspacePath: "C:/workspace",
+      sessionId: "session-a",
+      runtimeOwnerToken: "idle:0",
+    } satisfies RunMutationTarget,
     enhance_enabled: true,
     image_input_enabled: true,
     send_enhanced_enabled: true,
@@ -114,7 +148,11 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
     provider_selected_model_summary: [],
     provider_loading: false,
     provider_apply_enabled: true,
-    config_target: { workspacePath: "C:/workspace", sessionId: "session-a", configGeneration: 1 },
+    config_target: {
+      workspacePath: "C:/workspace",
+      sessionId: "session-a",
+      configGeneration: "1",
+    },
     config_fields: [{
       key: "model.model",
       value: "model-a",
@@ -125,9 +163,6 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
       max_value: null,
       options: [],
     }],
-    selected_config_index: 0,
-    config_value_text: "model-a",
-    config_feedback_text: "",
     attached_images: [],
     transcript_rows: [],
     thread_empty: true,
@@ -139,10 +174,11 @@ function projection(overrides: Partial<DesktopWebState> = {}): DesktopWebState {
     agent_activity_rows: [],
     progress_text: "",
     tool_status_text: "",
+    plan: null,
     session_search_include_archived: false,
     history_export_enabled: true,
     ...overrides,
-  } as DesktopWebState;
+  } as DesktopViewState;
 }
 
 test("local drafts produce a view without mutating the Rust projection", () => {
@@ -186,6 +222,148 @@ test("all composer actions preserve the authoritative Rust admission gate", () =
   assert.equal(capabilities.canUseImageInput, true, "draft attachments remain available for the next prompt");
 });
 
+test("active root steering keeps an enabled send control labeled as additional instruction", () => {
+  for (const agentTreeActive of [false, true]) {
+    const rendered = renderComposer(projection({
+      busy: true,
+      agent_tree_active: agentTreeActive,
+      composer_submit_mode: "steer",
+      can_submit: true,
+      enhance_enabled: false,
+      draft_prompt: "追加指示",
+      token_meter_label: "",
+      token_meter_title: "",
+    }));
+
+    assert.match(
+      rendered,
+      /data-action="send" title="実行中のタスクへ追加指示を送信" aria-label="実行中のタスクへ追加指示を送信"/,
+      agentTreeActive ? "active child retention" : "active root",
+    );
+    assert.doesNotMatch(rendered, /実行中は送信できません|Sub Agentの完了または停止後に送信できます/);
+  }
+});
+
+test("active root steering with an empty draft asks for input instead of claiming steering is blocked", () => {
+  for (const agentTreeActive of [false, true]) {
+    const rendered = renderComposer(projection({
+      busy: true,
+      agent_tree_active: agentTreeActive,
+      composer_submit_mode: "steer",
+      can_submit: false,
+      enhance_enabled: false,
+      draft_prompt: "",
+      token_meter_label: "",
+      token_meter_title: "",
+    }));
+
+    assert.match(
+      rendered,
+      /data-action="send" title="依頼文を入力してください" aria-label="依頼文を入力してください"[^>]*disabled/,
+      agentTreeActive ? "active child retention" : "active root",
+    );
+    assert.doesNotMatch(rendered, /実行中は送信できません|Sub Agentの完了または停止後に送信できます/);
+  }
+});
+
+test("the installed prompt input handler refreshes the steer send title and aria label", () => {
+  class FakeHtmlElement {
+    hidden = false;
+  }
+  class FakePrompt extends FakeHtmlElement {
+    value = "";
+    scrollHeight = 24;
+    style = { height: "", overflowY: "" };
+    private readonly listeners = new Map<string, (event: { currentTarget: FakePrompt }) => void>();
+
+    addEventListener(name: string, listener: (event: { currentTarget: FakePrompt }) => void): void {
+      this.listeners.set(name, listener);
+    }
+
+    input(value: string): void {
+      this.value = value;
+      this.listeners.get("input")?.({ currentTarget: this });
+    }
+  }
+  class FakeButton extends FakeHtmlElement {
+    disabled = true;
+    title = "依頼文を入力してください";
+    readonly attributes = new Map<string, string>([["aria-label", this.title]]);
+
+    setAttribute(name: string, value: string): void {
+      this.attributes.set(name, value);
+    }
+
+    getAttribute(name: string): string | null {
+      return this.attributes.get(name) ?? null;
+    }
+  }
+
+  const prompt = new FakePrompt();
+  const send = new FakeButton();
+  const fakeDocument = {
+    activeElement: null,
+    addEventListener: () => undefined,
+    querySelector: (selector: string) => {
+      if (selector === "#prompt") return prompt;
+      if (selector === '[data-action="send"]') return send;
+      return null;
+    },
+    querySelectorAll: () => [],
+  };
+  const fakeWindow = {
+    getComputedStyle: () => ({ maxHeight: "200" }),
+    localStorage: { getItem: () => null, setItem: () => undefined },
+    addEventListener: () => undefined,
+  };
+  const previousGlobals = new Map(
+    ["document", "window", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "HTMLSelectElement", "HTMLButtonElement", "Element"]
+      .map((name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)] as const),
+  );
+  const defineGlobal = (name: string, value: unknown) => {
+    Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+  };
+
+  try {
+    defineGlobal("document", fakeDocument);
+    defineGlobal("window", fakeWindow);
+    defineGlobal("HTMLElement", FakeHtmlElement);
+    defineGlobal("HTMLInputElement", FakeHtmlElement);
+    defineGlobal("HTMLTextAreaElement", FakePrompt);
+    defineGlobal("HTMLSelectElement", FakeHtmlElement);
+    defineGlobal("HTMLButtonElement", FakeButton);
+    defineGlobal("Element", FakeHtmlElement);
+
+    const rustProjection = projection({
+      busy: true,
+      agent_tree_active: true,
+      composer_submit_mode: "steer",
+      can_submit: true,
+      enhance_enabled: false,
+      draft_prompt: "",
+    });
+    const ui = createUiLocalState();
+    reconcileUiDrafts(ui, null, rustProjection, null);
+    const view = projectViewState(rustProjection, ui);
+    const context = {
+      uiState: ui,
+      getProjection: () => rustProjection,
+    } as unknown as ActionContext;
+
+    wireEvents(view, context);
+    prompt.input("追加指示");
+
+    assert.equal(send.disabled, false);
+    assert.equal(send.title, "実行中のタスクへ追加指示を送信");
+    assert.equal(send.getAttribute("aria-label"), "実行中のタスクへ追加指示を送信");
+  } finally {
+    for (const [name, descriptor] of previousGlobals) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else delete (globalThis as Record<string, unknown>)[name];
+    }
+  }
+});
+
 test("local typing cannot reopen the hidden Rust finalizing gate", () => {
   const ui = createUiLocalState();
   const finalizing = projection({
@@ -219,8 +397,14 @@ test("a run-start command is single-flight in local capability projection", () =
   assert.equal(mutationAdmissionOpen(ui, "enhance_prompt"), false);
   const view = projectViewState(state, ui);
   assert.equal(view.background_mutation_pending, true);
-  assert.equal(view.busy, true, "Stop is available before the Rust command response arrives");
-  assert.equal(actionById("cancel-run")?.enabled?.(view, { index: -1, value: "" }), true);
+  assert.equal(view.busy, true, "the local request remains visibly pending");
+  assert.equal(
+    actionById("cancel-run")?.enabled?.(view, { index: -1, value: "" }),
+    false,
+    "only Rust may publish the cancel capability",
+  );
+  const admitted = projectViewState(projection({ can_cancel_run: true }), ui);
+  assert.equal(actionById("cancel-run")?.enabled?.(admitted, { index: -1, value: "" }), true);
 });
 
 test("an external config owner mutation immediately rejects submit and review dispatch", () => {
@@ -271,7 +455,7 @@ test("draft ownership resets only when its durable target changes", () => {
     projection_revision: "3",
     selected_session_title: "Session B",
     session_rows: [{ session_id: "session-b", label: "Session B" }],
-    draft_target: { workspacePath: "C:/workspace", sessionId: "session-b" },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "session-b", ownerGeneration: 2 },
     draft_prompt: "",
     config_target: { workspacePath: "C:/workspace", sessionId: "session-b", configGeneration: 1 },
   });
@@ -328,7 +512,7 @@ test("new-session binding preserves follow-up text typed after send", () => {
   const ui = createUiLocalState();
   const initial = projection({
     draft_prompt: "first request",
-    draft_target: { workspacePath: "C:/workspace", sessionId: null },
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 1 },
   });
   reconcileUiDrafts(ui, null, initial, null);
   const snapshot = captureDraftMutation(ui, "submit_prompt");
@@ -338,7 +522,7 @@ test("new-session binding preserves follow-up text typed after send", () => {
   const response = projection({
     projection_revision: "2",
     draft_prompt: "",
-    draft_target: { workspacePath: "C:/workspace", sessionId: null },
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 1 },
     busy: true,
   });
   acknowledgeDraftMutation(ui, response, "submit_prompt", snapshot);
@@ -347,13 +531,13 @@ test("new-session binding preserves follow-up text typed after send", () => {
     projection_revision: "3",
     composer_commit_generation: "1",
     draft_prompt: "",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "created-session" },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "created-session", ownerGeneration: 1 },
     busy: true,
   });
   reconcileUiDrafts(ui, response, bound, null);
 
   assert.equal(ui.drafts.prompt, "follow-up typed while running");
-  assert.equal(ui.drafts.composerOwner, "C:/workspace\u0000created-session");
+  assert.equal(ui.drafts.composerOwner, "C:/workspace\u00001\u0000created-session");
   assert.equal(ui.drafts.pendingRunSubmission, null);
 });
 
@@ -361,7 +545,7 @@ test("new-session binding is registered before a newer poll can beat the command
   const ui = createUiLocalState();
   const initial = projection({
     draft_prompt: "first request",
-    draft_target: { workspacePath: "C:/workspace", sessionId: null },
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 1 },
   });
   reconcileUiDrafts(ui, null, initial, null);
   const snapshot = captureDraftMutation(ui, "submit_prompt");
@@ -372,25 +556,47 @@ test("new-session binding is registered before a newer poll can beat the command
     projection_revision: "3",
     composer_commit_generation: "1",
     draft_prompt: "",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "created-before-response" },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "created-before-response", ownerGeneration: 1 },
     busy: true,
   });
   reconcileUiDrafts(ui, initial, boundPoll, null);
   const olderResponse = projection({
     projection_revision: "2",
     draft_prompt: "",
-    draft_target: { workspacePath: "C:/workspace", sessionId: null },
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 2 },
     busy: true,
   });
   acknowledgeDraftMutation(ui, olderResponse, "submit_prompt", snapshot);
 
   assert.equal(ui.drafts.prompt, "follow-up before command response");
-  assert.equal(ui.drafts.composerOwner, "C:/workspace\u0000created-before-response");
+  assert.equal(ui.drafts.composerOwner, "C:/workspace\u00001\u0000created-before-response");
+});
+
+test("same-owner generation reset discards stale local composer text", () => {
+  const ui = createUiLocalState();
+  const initial = projection({
+    draft_prompt: "server draft",
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 4 },
+  });
+  reconcileUiDrafts(ui, null, initial, null);
+  ui.drafts.prompt = "stale local draft";
+  ui.drafts.composerRevision += 1;
+
+  const reset = projection({
+    projection_revision: "2",
+    draft_prompt: "",
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 5 },
+  });
+  reconcileUiDrafts(ui, initial, reset, null);
+
+  assert.equal(ui.drafts.prompt, "");
 });
 
 test("failed run start releases an unconsumed pending submission", () => {
   const ui = createUiLocalState();
-  const initial = projection({ draft_target: { workspacePath: "C:/workspace", sessionId: null } });
+  const initial = projection({
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 1 },
+  });
   reconcileUiDrafts(ui, null, initial, null);
   const snapshot = captureDraftMutation(ui, "submit_prompt");
   assert.notEqual(ui.drafts.pendingRunSubmission, null);
@@ -486,6 +692,103 @@ test("review draft is retained until the reviewed run is durably admitted", () =
   assert.equal(ui.drafts.reviewDraft, "");
 });
 
+test("same-overlay prompt enhancement completion hydrates an untouched local review draft", () => {
+  const ui = createUiLocalState();
+  const enhancing = projection({
+    overlay: "prompt_review",
+    review_draft_text: "",
+    review_status_text: "Enhancing",
+  });
+  reconcileUiDrafts(ui, null, enhancing, null);
+
+  const reviewing = projection({
+    projection_revision: "2",
+    overlay: "prompt_review",
+    review_draft_text: "enhanced request",
+    review_status_text: "Reviewing",
+  });
+  reconcileUiDrafts(ui, enhancing, reviewing, null);
+
+  assert.equal(ui.drafts.reviewDraft, "enhanced request");
+  assert.equal(projectViewState(reviewing, ui).review_draft_text, "enhanced request");
+});
+
+test("late same-owner enhancement cannot overwrite a local review edit", () => {
+  const ui = createUiLocalState();
+  const enhancing = projection({
+    overlay: "prompt_review",
+    review_draft_text: "",
+    review_status_text: "Enhancing",
+  });
+  reconcileUiDrafts(ui, null, enhancing, null);
+  ui.drafts.reviewDraft = "user refinement";
+  ui.drafts.reviewRevision += 1;
+
+  const staleCompletion = projection({
+    projection_revision: "2",
+    overlay: "prompt_review",
+    review_draft_text: "late enhanced request",
+    review_status_text: "Reviewing",
+  });
+  reconcileUiDrafts(ui, enhancing, staleCompletion, null);
+
+  assert.equal(ui.drafts.reviewDraft, "user refinement");
+  assert.equal(projectViewState(staleCompletion, ui).review_draft_text, "user refinement");
+});
+
+test("prompt review owner change replaces an old owner's local edit", () => {
+  const ui = createUiLocalState();
+  const ownerA = projection({
+    overlay: "prompt_review",
+    review_draft_text: "owner A review",
+    draft_target: { workspacePath: "C:/workspace", sessionId: "session-a", ownerGeneration: 1 },
+  });
+  reconcileUiDrafts(ui, null, ownerA, null);
+  ui.drafts.reviewDraft = "owner A local edit";
+  ui.drafts.reviewRevision += 1;
+
+  const ownerB = projection({
+    projection_revision: "2",
+    overlay: "prompt_review",
+    review_draft_text: "owner B review",
+    draft_target: { workspacePath: "C:/workspace", sessionId: "session-b", ownerGeneration: 2 },
+  });
+  reconcileUiDrafts(ui, ownerA, ownerB, null);
+
+  assert.equal(ui.drafts.reviewDraft, "owner B review");
+  assert.equal(projectViewState(ownerB, ui).review_draft_text, "owner B review");
+});
+
+test("stale prompt review acknowledgement cannot cross an owner change", () => {
+  const ui = createUiLocalState();
+  const ownerA = projection({
+    overlay: "prompt_review",
+    review_draft_text: "owner A review",
+    draft_target: { workspacePath: "C:/workspace", sessionId: "session-a", ownerGeneration: 1 },
+  });
+  reconcileUiDrafts(ui, null, ownerA, null);
+  const staleSnapshot = captureDraftMutation(ui, "cancel_prompt_review");
+
+  const ownerB = projection({
+    projection_revision: "3",
+    overlay: "prompt_review",
+    review_draft_text: "owner B review",
+    draft_target: { workspacePath: "C:/workspace", sessionId: "session-b", ownerGeneration: 2 },
+  });
+  reconcileUiDrafts(ui, ownerA, ownerB, null);
+
+  const staleResponse = projection({
+    projection_revision: "2",
+    overlay: "none",
+    review_draft_text: "",
+    draft_target: { workspacePath: "C:/workspace", sessionId: "session-a", ownerGeneration: 1 },
+  });
+  acknowledgeDraftMutation(ui, staleResponse, "cancel_prompt_review", staleSnapshot);
+
+  assert.equal(ui.drafts.reviewDraft, "owner B review");
+  assert.equal(projectViewState(ownerB, ui).review_draft_text, "owner B review");
+});
+
 test("same-owner navigation acknowledgement cannot clear an unsaved composer draft", () => {
   const ui = createUiLocalState();
   const initial = projection({ draft_prompt: "server" });
@@ -502,27 +805,433 @@ test("same-owner navigation acknowledgement cannot clear an unsaved composer dra
   assert.equal(ui.drafts.prompt, "unsaved local");
 });
 
+class FakeInteractionEventTarget {
+  private readonly listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+
+  addEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    _options?: boolean | AddEventListenerOptions,
+  ): void {
+    if (!listener) return;
+    const listeners = this.listeners.get(type) ?? new Set<EventListenerOrEventListenerObject>();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(
+    type: string,
+    listener: EventListenerOrEventListenerObject | null,
+    _options?: boolean | EventListenerOptions,
+  ): void {
+    if (listener) this.listeners.get(type)?.delete(listener);
+  }
+
+  dispatch(type: string, values: Record<string, unknown> = {}): void {
+    const event = { type, ...values } as unknown as Event;
+    for (const listener of Array.from(this.listeners.get(type) ?? [])) {
+      if (typeof listener === "function") listener.call(this, event);
+      else listener.handleEvent(event);
+    }
+  }
+}
+
+class FakeInteractionWindow extends FakeInteractionEventTarget {
+  private now = 0;
+  private nextTimerId = 1;
+  private readonly timers = new Map<number, { at: number; handler: TimerHandler; args: unknown[] }>();
+
+  setTimeout(handler: TimerHandler, timeout = 0, ...args: unknown[]): number {
+    const id = this.nextTimerId++;
+    this.timers.set(id, { at: this.now + Math.max(0, timeout), handler, args });
+    return id;
+  }
+
+  clearTimeout(id: number | undefined): void {
+    if (id !== undefined) this.timers.delete(id);
+  }
+
+  advanceBy(milliseconds: number): void {
+    const target = this.now + milliseconds;
+    while (true) {
+      const next = Array.from(this.timers.entries())
+        .filter(([, timer]) => timer.at <= target)
+        .sort((left, right) => left[1].at - right[1].at || left[0] - right[0])[0];
+      if (!next) break;
+      const [id, timer] = next;
+      this.timers.delete(id);
+      this.now = timer.at;
+      if (typeof timer.handler !== "function") throw new Error("string timers are not supported by the fake clock");
+      timer.handler(...timer.args);
+    }
+    this.now = target;
+  }
+}
+
+class FakeInteractionDocument extends FakeInteractionEventTarget {
+  hidden = false;
+  body: FakeInteractionElement | null = null;
+  documentElement: FakeInteractionElement | null = null;
+}
+
+class FakeInteractionElement extends FakeInteractionEventTarget {
+  disabled = false;
+  projection = "revision-1";
+  replacements = 0;
+  readonly kind: "html" | "body" | "div" | "input";
+  readonly parentElement: FakeInteractionElement | null;
+
+  constructor(
+    kind: "html" | "body" | "div" | "input",
+    parentElement: FakeInteractionElement | null = null,
+  ) {
+    super();
+    this.kind = kind;
+    this.parentElement = parentElement;
+  }
+
+  contains(target: Node | null): boolean {
+    let current = target as unknown as FakeInteractionElement | null;
+    while (current) {
+      if (current === this) return true;
+      current = current.parentElement;
+    }
+    return false;
+  }
+
+  closest<E extends Element = Element>(selectors: string): E | null {
+    if (selectors === ":disabled") {
+      return (this.disabled ? this : null) as unknown as E | null;
+    }
+    if (selectors === "[data-action]") return null;
+    return (this.kind === "input" ? this : null) as unknown as E | null;
+  }
+
+  matches(selectors: string): boolean {
+    return selectors === ":disabled" && this.disabled;
+  }
+
+  setPointerCapture(_pointerId: number): void {}
+
+  applyProjection(revision: number): void {
+    this.projection = `revision-${revision}`;
+    this.replacements += 1;
+  }
+}
+
+interface InteractionGateHarness {
+  documentTarget: FakeInteractionDocument;
+  windowTarget: FakeInteractionWindow;
+  documentElement: FakeInteractionElement;
+  body: FakeInteractionElement;
+  appRoot: FakeInteractionElement;
+  input: FakeInteractionElement;
+  unrelated: FakeInteractionElement;
+  disabledInput: FakeInteractionElement;
+  lifecycle: InteractionLifecycle<number>;
+  applied: number[];
+  queueProjection: (revision: number) => void;
+  dispose: () => void;
+}
+
+function withInteractionGate(run: (harness: InteractionGateHarness) => void): void {
+  const elementDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Element");
+  Object.defineProperty(globalThis, "Element", {
+    configurable: true,
+    writable: true,
+    value: FakeInteractionElement,
+  });
+  const documentTarget = new FakeInteractionDocument();
+  const windowTarget = new FakeInteractionWindow();
+  const documentElement = new FakeInteractionElement("html");
+  const body = new FakeInteractionElement("body", documentElement);
+  const appRoot = new FakeInteractionElement("div", body);
+  const input = new FakeInteractionElement("input", appRoot);
+  const unrelated = new FakeInteractionElement("div", body);
+  const disabledInput = new FakeInteractionElement("input", appRoot);
+  disabledInput.disabled = true;
+  documentTarget.documentElement = documentElement;
+  documentTarget.body = body;
+  const lifecycle = new InteractionLifecycle<number>((current, candidate) => candidate > current);
+  const applied: number[] = [];
+  const applyProjection = (revision: number): void => {
+    appRoot.applyProjection(revision);
+    applied.push(revision);
+  };
+  const dispose = installInteractionEventGate({
+    documentTarget: documentTarget as unknown as Document,
+    windowTarget: windowTarget as unknown as Window,
+    appRoot: appRoot as unknown as Element,
+    lifecycle,
+    finish: (release) => {
+      if (release?.deferred !== null && release?.deferred !== undefined) {
+        applyProjection(release.deferred);
+      }
+    },
+  });
+
+  try {
+    run({
+      documentTarget,
+      windowTarget,
+      documentElement,
+      body,
+      appRoot,
+      input,
+      unrelated,
+      disabledInput,
+      lifecycle,
+      applied,
+      queueProjection: (revision) => {
+        if (!lifecycle.defer(revision, false, true)) applyProjection(revision);
+      },
+      dispose,
+    });
+  } finally {
+    dispose();
+    if (elementDescriptor) Object.defineProperty(globalThis, "Element", elementDescriptor);
+    else delete (globalThis as Record<string, unknown>).Element;
+  }
+}
+
 test("interaction lifecycle holds one newest projection across pointer, keyboard, and IME", () => {
   const lifecycle = new InteractionLifecycle<number>((current, candidate) => candidate > current);
   lifecycle.beginPointer(7);
   lifecycle.beginKey("Enter");
   lifecycle.beginComposition();
+  const endPointer = lifecycle.capturePointerEnd(7);
+  const endKey = lifecycle.captureKeyEnd("Enter");
+  const endComposition = lifecycle.captureCompositionEnd();
 
   assert.equal(lifecycle.defer(2, false, true), true);
   assert.equal(lifecycle.defer(1, false, true), true);
-  assert.equal(lifecycle.endPointer(7), null);
-  assert.equal(lifecycle.endKey("Enter"), null);
-  assert.deepEqual(lifecycle.endComposition(), { deferred: 2, renderCurrent: false });
+  assert.equal(endPointer?.(), null);
+  assert.equal(endKey?.(), null);
+  assert.deepEqual(endComposition?.(), { deferred: 2, renderCurrent: false });
   assert.equal(lifecycle.active, false);
 });
 
-test("interaction lifecycle cancellation recovers a missing compositionend", () => {
-  const lifecycle = new InteractionLifecycle<number>((_current, _candidate) => true);
-  lifecycle.beginComposition();
-  lifecycle.defer(4, false, true);
+test("a paused IME keeps the DOM stable until compositionend releases only the newest projection", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("compositionstart");
+    queueProjection(2);
+    queueProjection(3);
 
-  assert.deepEqual(lifecycle.cancel(), { deferred: 4, renderCurrent: false });
-  assert.equal(lifecycle.active, false);
+    windowTarget.advanceBy(60_000);
+    assert.equal(lifecycle.active, true);
+    assert.equal(appRoot.projection, "revision-1");
+    assert.equal(appRoot.replacements, 0);
+
+    documentTarget.dispatch("compositionend");
+    assert.equal(appRoot.projection, "revision-1", "the compositionend event settles after its input event turn");
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-3");
+    assert.deepEqual(applied, [3]);
+    windowTarget.advanceBy(60_000);
+    assert.deepEqual(applied, [3]);
+  });
+});
+
+test("a stationary pointer keeps the DOM stable until lost capture releases only the newest projection", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, input, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 7 });
+    queueProjection(2);
+    queueProjection(4);
+
+    windowTarget.advanceBy(60_000);
+    assert.equal(lifecycle.active, true);
+    assert.equal(appRoot.projection, "revision-1");
+    assert.equal(appRoot.replacements, 0);
+
+    documentTarget.dispatch("lostpointercapture", { target: input, pointerId: 7 });
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-4");
+    assert.deepEqual(applied, [4]);
+    windowTarget.advanceBy(60_000);
+    assert.deepEqual(applied, [4]);
+  });
+});
+
+test("a held key keeps the DOM stable until window blur explicitly recovers the lifecycle", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, input, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("keydown", {
+      target: input,
+      code: "ArrowDown",
+      isComposing: false,
+    });
+    queueProjection(5);
+
+    windowTarget.advanceBy(60_000);
+    assert.equal(lifecycle.active, true);
+    assert.equal(appRoot.projection, "revision-1");
+
+    windowTarget.dispatch("blur");
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-5");
+    assert.deepEqual(applied, [5]);
+  });
+});
+
+test("document visibility loss explicitly recovers a missing compositionend", () => {
+  withInteractionGate(({ documentTarget, appRoot, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("compositionstart");
+    queueProjection(6);
+    documentTarget.hidden = true;
+
+    documentTarget.dispatch("visibilitychange");
+
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-6");
+    assert.deepEqual(applied, [6]);
+  });
+});
+
+test("installed keyboard events admit BODY and HTML reading operations but reject unrelated and disabled targets", () => {
+  withInteractionGate(({
+    documentTarget,
+    windowTarget,
+    documentElement,
+    body,
+    unrelated,
+    disabledInput,
+    lifecycle,
+  }) => {
+    documentTarget.dispatch("keydown", { target: body, code: "PageDown", isComposing: false });
+    assert.equal(lifecycle.active, true, "BODY owns document-level reading keys");
+    documentTarget.dispatch("keyup", { target: body, code: "PageDown" });
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+
+    documentTarget.dispatch("keydown", { target: documentElement, code: "ArrowDown", isComposing: false });
+    assert.equal(lifecycle.active, true, "HTML owns document-level reading keys");
+    windowTarget.dispatch("blur");
+    assert.equal(lifecycle.active, false);
+
+    documentTarget.dispatch("keydown", { target: unrelated, code: "ArrowDown", isComposing: false });
+    assert.equal(lifecycle.active, false, "an unrelated element outside #app is not a document owner");
+    documentTarget.dispatch("keydown", { target: disabledInput, code: "Enter", isComposing: false });
+    assert.equal(lifecycle.active, false, "disabled controls remain outside keyboard admission");
+  });
+});
+
+test("delayed pointer termination cannot end a newer generation with the same pointer id", () => {
+  for (const termination of ["pointerup", "lostpointercapture"] as const) {
+    withInteractionGate(({ documentTarget, windowTarget, appRoot, input, lifecycle, applied, queueProjection }) => {
+      documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 9 });
+      queueProjection(2);
+      documentTarget.dispatch(termination, { target: input, pointerId: 9 });
+      documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 9 });
+      queueProjection(3);
+
+      windowTarget.advanceBy(0);
+      assert.equal(lifecycle.active, true, termination);
+      assert.equal(appRoot.projection, "revision-1", termination);
+      assert.deepEqual(applied, [], termination);
+
+      documentTarget.dispatch("pointerup", { target: input, pointerId: 9 });
+      windowTarget.advanceBy(0);
+      assert.equal(lifecycle.active, false, termination);
+      assert.equal(appRoot.projection, "revision-3", termination);
+      assert.deepEqual(applied, [3], termination);
+    });
+  }
+});
+
+test("delayed keyup cannot end a newer generation with the same key code", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, input, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("keydown", { target: input, code: "ArrowDown", isComposing: false });
+    queueProjection(2);
+    documentTarget.dispatch("keyup", { target: input, code: "ArrowDown" });
+    documentTarget.dispatch("keydown", { target: input, code: "ArrowDown", isComposing: false });
+    queueProjection(4);
+
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, true);
+    assert.equal(appRoot.projection, "revision-1");
+    assert.deepEqual(applied, []);
+
+    documentTarget.dispatch("keyup", { target: input, code: "ArrowDown" });
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-4");
+    assert.deepEqual(applied, [4]);
+  });
+});
+
+test("duplicate delayed compositionend callbacks cannot end a newer composition", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("compositionstart");
+    queueProjection(2);
+    documentTarget.dispatch("compositionend");
+    documentTarget.dispatch("compositionend");
+    documentTarget.dispatch("compositionstart");
+    queueProjection(5);
+
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, true);
+    assert.equal(appRoot.projection, "revision-1");
+    assert.deepEqual(applied, []);
+
+    documentTarget.dispatch("compositionend");
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-5");
+    assert.deepEqual(applied, [5]);
+  });
+});
+
+test("double termination releases a deferred projection exactly once", () => {
+  withInteractionGate(({ documentTarget, windowTarget, input, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 11 });
+    queueProjection(6);
+    documentTarget.dispatch("pointerup", { target: input, pointerId: 11 });
+    documentTarget.dispatch("lostpointercapture", { target: input, pointerId: 11 });
+
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    assert.deepEqual(applied, [6]);
+    windowTarget.dispatch("blur");
+    assert.deepEqual(applied, [6]);
+  });
+});
+
+test("blur invalidates a queued end before the same owner begins again", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, input, lifecycle, applied, queueProjection }) => {
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 13 });
+    queueProjection(2);
+    documentTarget.dispatch("pointerup", { target: input, pointerId: 13 });
+    windowTarget.dispatch("blur");
+    assert.deepEqual(applied, [2]);
+
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 13 });
+    queueProjection(7);
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, true);
+    assert.equal(appRoot.projection, "revision-2");
+    assert.deepEqual(applied, [2]);
+
+    documentTarget.dispatch("pointercancel", { target: input, pointerId: 13 });
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-7");
+    assert.deepEqual(applied, [2, 7]);
+  });
+});
+
+test("disposing the installed gate drops deferred state and cancels queued end callbacks", () => {
+  withInteractionGate(({ documentTarget, windowTarget, appRoot, input, lifecycle, applied, queueProjection, dispose }) => {
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 15 });
+    queueProjection(8);
+    documentTarget.dispatch("pointerup", { target: input, pointerId: 15 });
+
+    dispose();
+    windowTarget.advanceBy(0);
+
+    assert.equal(lifecycle.active, false);
+    assert.equal(appRoot.projection, "revision-1");
+    assert.deepEqual(applied, []);
+  });
 });
 
 test("non-control text selection, scrolling, and document keyboard reading start the lifecycle", () => {
@@ -588,7 +1297,11 @@ test("workspace browser submits its local draft with the authoritative draft own
     name: "browse_workspace",
     args: {
       text: "D:/next-workspace",
-      expectedTarget: { workspacePath: "C:/workspace", sessionId: "session-a" },
+      expectedTarget: {
+        workspacePath: "C:/workspace",
+        sessionId: "session-a",
+        ownerGeneration: 1,
+      },
     },
   });
 });
@@ -600,6 +1313,10 @@ test("search and attachment actions carry their authoritative owners", async () 
     mutate: async (name: string, args?: Record<string, unknown>) => {
       invocations.push({ name, args });
     },
+    prepareConfigSnapshot: () => state.config_fields.map((field) => ({
+      key: field.key,
+      text: field.value,
+    })),
   } as unknown as ActionContext;
 
   await actionById("toggle-session-archived-search")?.run(state, context, { index: -1, value: "" });
@@ -620,7 +1337,13 @@ test("search and attachment actions carry their authoritative owners", async () 
     },
     {
       name: "clear_images",
-      args: { expectedTarget: { workspacePath: "C:/workspace", sessionId: "session-a" } },
+      args: {
+        expectedTarget: {
+          workspacePath: "C:/workspace",
+          sessionId: "session-a",
+          ownerGeneration: 1,
+        },
+      },
     },
     {
       name: "toggle_access_mode",
@@ -628,17 +1351,22 @@ test("search and attachment actions carry their authoritative owners", async () 
         expectedTarget: {
           workspacePath: "C:/workspace",
           sessionId: "session-a",
-          configGeneration: 1,
+          configGeneration: "1",
           accessMode: "default",
           runtimeOwnerToken: "idle:0",
-          configOwnerMutationOpen: true,
         },
+        draftValues: [{ key: "model.model", text: "model-a" }],
       },
     },
   ]);
   assert.equal(
     actionById("toggle-access")?.enabled?.(
-      projection({ access_mode_mutation_enabled: false }),
+      projection({
+        config_draft: {
+          ...projection().config_draft,
+          access_mode_mutation_enabled: false,
+        },
+      }),
       { index: -1, value: "" },
     ),
     false,
@@ -666,18 +1394,25 @@ test("stable row identity and selected-state semantics survive list reordering",
 });
 
 test("access-mode control consumes the Rust mutation capability", () => {
+  const enabled = projection();
+  const disabled = projection({
+    config_draft: {
+      ...projection().config_draft,
+      access_mode_mutation_enabled: false,
+    },
+  });
   assert.match(
-    renderTopbar(projection({ access_mode_mutation_enabled: true })),
+    renderTopbar(enabled),
     /data-action="toggle-access"[^>]*aria-disabled="false"(?![^>]*\sdisabled(?:\s|>|=))[^>]*>/,
   );
   assert.match(
-    renderTopbar(projection({ access_mode_mutation_enabled: false })),
+    renderTopbar(disabled),
     /data-action="toggle-access"[^>]*aria-disabled="true"[^>]*\sdisabled>/,
   );
 });
 
 test("config commit capability never gates unrelated workspace or window actions", () => {
-  const clean = projection({ config_draft_commit_enabled: false });
+  const clean = projection();
   for (const id of ["browse-workspace", "toggle-maximize-window"]) {
     assert.equal(actionById(id)?.enabled?.(clean, { index: -1, value: "" }), true, id);
   }
@@ -712,7 +1447,7 @@ test("a closed dirty settings draft blocks every external config owner mutation"
       required: false,
       min_value: null,
       max_value: null,
-      options: ["default", "auto_review", "full_access"],
+      options: ["default", "full_access"],
     },
   ];
   const before = projection({ config_fields: fields });
@@ -729,9 +1464,8 @@ test("a closed dirty settings draft blocks every external config owner mutation"
 
   assert.equal(dirtyView.config_target.configGeneration, before.config_target.configGeneration);
   assert.equal(ui.configDirty, true);
-  assert.equal(dirtyView.config_owner_mutation_open, false);
-  assert.equal(dirtyView.access_target.configOwnerMutationOpen, false);
-  assert.equal(dirtyView.access_mode_mutation_enabled, false);
+  assert.equal(dirtyView.config_draft.external_owner_mutation_open, false);
+  assert.equal(dirtyView.config_draft.access_mode_mutation_enabled, false);
   assert.equal(dirtyView.provider_apply_enabled, false);
   assert.equal(
     dirtyView.config_fields.find((field) => field.key === "model.model")?.value,
@@ -787,11 +1521,11 @@ test("a closed dirty settings draft blocks every external config owner mutation"
   });
 
   const after = projection({
-    access_label: "auto_review",
-    access_target: { ...before.access_target, accessMode: "auto_review" },
+    access_label: "full_access",
+    access_target: { ...before.access_target, accessMode: "full_access" },
     config_target: { ...before.config_target },
     config_fields: fields.map((field) => field.key === "permissions.access_mode"
-      ? { ...field, value: "auto_review" }
+      ? { ...field, value: "full_access" }
       : field),
   });
 
@@ -800,13 +1534,13 @@ test("a closed dirty settings draft blocks every external config owner mutation"
   assert.equal(
     projectViewState(after, cleanUi).config_fields
       .find((field) => field.key === "permissions.access_mode")?.value,
-    "auto_review",
+    "full_access",
     "a clean settings view consumes the new Rust baseline",
   );
 });
 
 test("local config and run-start mutations close external config owner admission", async () => {
-  const state = projection({ access_mode_mutation_enabled: true });
+  const state = projection();
   const configPending = createUiLocalState();
   reconcileUiDrafts(configPending, null, state, null);
   updateConfigDraftValue(
@@ -816,13 +1550,13 @@ test("local config and run-start mutations close external config owner admission
     "model.model",
     "pending-model",
   );
-  configPending.activeConfigMutationGeneration = 1;
+  configPending.activeConfigMutationGeneration = 1n;
   const configPendingView = projectViewState(state, configPending);
-  assert.equal(configPendingView.access_mode_mutation_enabled, false);
+  assert.equal(configPendingView.config_draft.access_mode_mutation_enabled, false);
   assert.equal(configPendingView.provider_apply_enabled, false);
-  assert.equal(configPendingView.config_owner_mutation_open, false);
-  assert.equal(configPendingView.config_draft_discard_enabled, false);
-  assert.equal(configPendingView.config_draft_commit_enabled, false);
+  assert.equal(configPendingView.config_draft.external_owner_mutation_open, false);
+  assert.equal(configPendingView.config_draft.discard_enabled, false);
+  assert.equal(configPendingView.config_draft.commit_enabled, false);
   assert.equal(configDraftEditOpen(configPending), false);
   for (const id of ["discard-config-draft", "apply-session-config", "save-global-config"]) {
     assert.equal(actionById(id)?.enabled?.(
@@ -877,18 +1611,27 @@ test("local config and run-start mutations close external config owner admission
   });
 
   configPending.activeConfigMutationGeneration = null;
-  const resumed = projectViewState(state, configPending);
+  const rustOwnedDirty = projection();
+  const resumed = projectViewState(rustOwnedDirty, configPending);
   assert.equal(configDraftEditOpen(configPending), true);
-  assert.equal(resumed.config_draft_discard_enabled, true);
-  assert.equal(resumed.config_draft_commit_enabled, true);
+  assert.equal(resumed.config_draft.discard_enabled, true);
+  assert.equal(resumed.config_draft.commit_enabled, true);
 
   const runPending = createUiLocalState();
-  reconcileUiDrafts(runPending, null, state, null);
+  reconcileUiDrafts(runPending, null, rustOwnedDirty, null);
+  updateConfigDraftValue(
+    runPending,
+    rustOwnedDirty.config_target,
+    rustOwnedDirty.config_fields.map((field) => ({ key: field.key, text: field.value })),
+    "model.model",
+    "run-pending-model",
+  );
   runPending.runStartMutationPending = true;
-  const runPendingView = projectViewState(state, runPending);
-  assert.equal(runPendingView.access_mode_mutation_enabled, false);
+  const runPendingView = projectViewState(rustOwnedDirty, runPending);
+  assert.equal(runPendingView.config_draft.access_mode_mutation_enabled, false);
   assert.equal(runPendingView.provider_apply_enabled, false);
-  assert.equal(runPendingView.config_owner_mutation_open, false);
+  assert.equal(runPendingView.config_draft.external_owner_mutation_open, false);
+  assert.equal(runPendingView.config_draft.commit_enabled, false);
 });
 
 test("hidden settings draft can be reopened, discarded, and release external mutations", async () => {
@@ -902,29 +1645,29 @@ test("hidden settings draft can be reopened, discarded, and release external mut
     "model.model",
     "invalid-hidden-draft",
   );
-  assert.equal(projectViewState(raw, ui).config_owner_mutation_open, false);
+  assert.equal(projectViewState(raw, ui).config_draft.external_owner_mutation_open, false);
 
-  const reopened = { ...raw, overlay: "config" };
+  const reopened = {
+    ...raw,
+    overlay: "config",
+  };
   reconcileUiDrafts(ui, raw, reopened, null);
   const reopenedView = projectViewState(reopened, ui);
-  assert.equal(reopenedView.config_draft_dirty, true);
+  assert.equal(reopenedView.config_draft.dirty, true);
   assert.equal(actionById("discard-config-draft")?.enabled?.(
     reopenedView,
     { index: -1, value: "" },
   ), true);
-  let rerenders = 0;
-  await actionById("discard-config-draft")?.run(
-    reopenedView,
-    { uiState: ui, rerender: () => { rerenders += 1; } } as unknown as ActionContext,
-    { index: -1, value: "" },
-  );
+  discardConfigDraft(ui);
 
-  const cleanView = projectViewState(reopened, ui);
+  const rustOwnedClean = {
+    ...reopened,
+  };
+  const cleanView = projectViewState(rustOwnedClean, ui);
   assert.equal(ui.configDirty, false);
-  assert.equal(cleanView.config_owner_mutation_open, true);
-  assert.equal(cleanView.access_mode_mutation_enabled, true);
+  assert.equal(cleanView.config_draft.external_owner_mutation_open, true);
+  assert.equal(cleanView.config_draft.access_mode_mutation_enabled, true);
   assert.equal(cleanView.provider_apply_enabled, true);
-  assert.equal(rerenders, 1);
 });
 
 test("external config mutation roundtrip prevents a settings draft from starting", async () => {
@@ -936,10 +1679,10 @@ test("external config mutation roundtrip prevents a settings draft from starting
 
   const pending = projectViewState(state, ui);
   assert.equal(configDraftEditOpen(ui), false);
-  assert.equal(pending.config_owner_mutation_open, false);
-  assert.equal(pending.access_mode_mutation_enabled, false);
+  assert.equal(pending.config_draft.external_owner_mutation_open, false);
+  assert.equal(pending.config_draft.access_mode_mutation_enabled, false);
   assert.equal(pending.provider_apply_enabled, false);
-  assert.equal(pending.config_draft_commit_enabled, false);
+  assert.equal(pending.config_draft.commit_enabled, false);
   assert.equal(ui.configDirty, false);
   let configCommands = 0;
   await actionById("apply-session-config")?.run(
@@ -1058,12 +1801,11 @@ test("settings enum controls render only Rust-projected option values", () => {
   assert.doesNotMatch(html, /<option value="proactive"/);
 });
 
-test("canonical row_kind selects specialized transcript rendering over legacy kind", () => {
+test("canonical row_kind selects specialized transcript rendering", () => {
   const html = renderThreadContent(projection({
     thread_empty: false,
     transcript_rows: [{
       row_kind: "work_summary_running",
-      kind: "assistant",
       step: "1",
       title: "Work",
       body: "running",
@@ -1071,5 +1813,45 @@ test("canonical row_kind selects specialized transcript rendering over legacy ki
     }],
   }));
   assert.match(html, /message work-summary work_summary_running/);
+  assert.match(html, /<details[^>]+open>/);
+});
+
+test("config owner generation remains exact beyond JavaScript's safe integer range", () => {
+  const current = {
+    ...projection().config_target,
+    configGeneration: "9007199254740993",
+  };
+  const newerFence = {
+    ...current,
+    configGeneration: "9007199254740994",
+  };
+
+  assert.equal(sameConfigMutationTarget(current, { ...current }), true);
+  assert.equal(sameConfigMutationTarget(current, newerFence), false);
+});
+
+test("run target mirrors the exact Rust Stop owner projection", () => {
+  const target = projection().run_target;
+
+  assert.deepEqual(
+    Object.keys(target).sort(),
+    ["runtimeOwnerToken", "sessionId", "workspacePath"],
+  );
+  assert.equal("ownerGeneration" in target, false);
+});
+
+test("incomplete canonical turn is rendered as nonterminal evidence", () => {
+  const html = renderThreadContent(projection({
+    thread_empty: false,
+    transcript_rows: [{
+      row_kind: "work_summary_incomplete",
+      step: "1",
+      title: "状態未確定の作業履歴",
+      body: "### 作業サマリ\n- 結果: この turn の完了状態は未確定です。",
+      file_changes: [],
+    }],
+  }));
+  assert.match(html, /message work-summary work_summary_incomplete/);
+  assert.match(html, /状態未確定/);
   assert.match(html, /<details[^>]+open>/);
 });

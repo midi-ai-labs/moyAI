@@ -1,14 +1,10 @@
 use serde_json::Value;
-use sha2::{Digest, Sha256};
-use std::str::FromStr;
 
 use crate::protocol::{
-    CandidateRepairId, CandidateRepairValidity, ContentPart, FileChangeEvidence, HistoryItem,
-    HistoryItemId, HistoryItemPayload, InterAgentCommunication, PermissionDecision, ProjectionId,
-    RuntimeEvent, RuntimeEventId, RuntimeEventMsg, SandboxDecision, SandboxProfile,
-    SubAgentActivityKind, ToolLifecycleEnvelope, ToolLifecycleStatus, ToolProgressEffect,
-    ToolProposalId, TurnId, TurnItem, TurnItemId, TurnItemPayload, TurnTerminalStatus,
-    VerificationRunResult,
+    ContentPart, FileChangeEvidence, HistoryItem, HistoryItemId, HistoryItemPayload, HistoryScope,
+    InterAgentCommunication, PermissionDecision, PlanStep, PlanStepStatus, RuntimeEvent,
+    RuntimeEventId, RuntimeEventMsg, SubAgentActivityKind, ToolLifecycleEnvelope,
+    ToolLifecycleStatus, TurnId, TurnItem, TurnItemId, TurnItemPayload,
 };
 use crate::runtime::SystemClock;
 use crate::session::{RunEvent, SessionId};
@@ -27,15 +23,23 @@ pub fn project_protocol_run_event(
     turn_id: TurnId,
     sequence_no: i64,
 ) -> Option<ProtocolRunEventProjection> {
-    let session_id = session_id_for_run_event(event).or(fallback_session_id)?;
-    let history_item = project_history_item_for_run_event(event, session_id, turn_id, sequence_no);
+    if matches!(
+        event,
+        RunEvent::ProviderPhase { .. }
+            | RunEvent::TextDelta { .. }
+            | RunEvent::ReasoningSummaryDelta { .. }
+    ) {
+        return None;
+    }
+    let session_id = event.session_id().or(fallback_session_id)?;
+    let history_item = project_history_item(event, session_id, turn_id, sequence_no);
     let runtime_event = RuntimeEvent {
         id: RuntimeEventId::new(),
         session_id,
         turn_id,
         sequence_no,
         created_at_ms: SystemClock::now_ms(),
-        msg: runtime_msg_for_run_event(event, history_item.as_ref()),
+        msg: project_runtime_message(event, history_item.as_ref()),
     };
     let mut turn_item = project_turn_item_for_run_event(event, session_id, turn_id, sequence_no);
     if let (Some(turn_item), Some(history_item)) = (&mut turn_item, &history_item) {
@@ -58,7 +62,7 @@ pub fn project_inter_agent_communication(
     let history_item = HistoryItem {
         id: HistoryItemId::new(),
         session_id,
-        turn_id,
+        scope: HistoryScope::Turn { turn_id },
         sequence_no,
         created_at_ms,
         payload: HistoryItemPayload::InterAgentCommunication {
@@ -102,7 +106,7 @@ pub fn project_sub_agent_activity(
     let history_item = HistoryItem {
         id: HistoryItemId::new(),
         session_id,
-        turn_id,
+        scope: HistoryScope::Turn { turn_id },
         sequence_no,
         created_at_ms,
         payload: HistoryItemPayload::SubAgentActivity {
@@ -144,166 +148,26 @@ pub fn project_sub_agent_activity(
     }
 }
 
-pub fn filechange_item_projection_preserves_call_id_fixture_passes() -> bool {
-    let session_id = crate::session::SessionId::new();
-    let turn_id = TurnId::new();
-    let tool_call_id = crate::session::ToolCallId::new();
-    let change_id = crate::session::ChangeId::new();
-    let event = RunEvent::FileChangesRecorded {
-        tool_call_id,
-        changes: vec![crate::edit::ChangeSummary {
-            change_id,
-            kind: crate::session::ChangeKind::Update,
-            path_before: Some(camino::Utf8PathBuf::from("src/lib.rs")),
-            path_after: Some(camino::Utf8PathBuf::from("src/lib.rs")),
-        }],
-    };
-    let Some(projection) = project_protocol_run_event(&event, Some(session_id), turn_id, 7) else {
-        return false;
-    };
-    let runtime_has_owner = matches!(
-        projection.runtime_event.msg,
-        RuntimeEventMsg::FileChangesRecorded {
-            call_id,
-            ref change_ids,
-            ..
-        } if call_id == tool_call_id && change_ids.as_slice() == [change_id]
-    );
-    let history_has_owner = matches!(
-        projection.history_item.as_ref().map(|item| &item.payload),
-        Some(HistoryItemPayload::FileChange {
-            call_id,
-            change_ids,
-            ..
-        }) if *call_id == tool_call_id && change_ids.as_slice() == [change_id]
-    );
-    let turn_item_has_owner = matches!(
-        projection.turn_item.as_ref().map(|item| &item.payload),
-        Some(TurnItemPayload::FileChange {
-            call_id,
-            change_ids,
-            ..
-        }) if *call_id == tool_call_id && change_ids.as_slice() == [change_id]
-    );
-    runtime_has_owner && history_has_owner && turn_item_has_owner
-}
-
-pub fn tool_output_projection_preserves_blocked_action_fixture_passes() -> bool {
-    let session_id = crate::session::SessionId::new();
-    let turn_id = TurnId::new();
-    let tool_call_id = crate::session::ToolCallId::new();
-    let metadata = serde_json::json!({
-        "success": false,
-        "progress_effect": "no_progress",
-        "tool_feedback_envelope": {
-            "blocked_action": "apply_patch:src/workflow.rs",
-            "required_next_action": "apply_patch:src/workflow.rs",
-            "result_hash": "blocked-action-hash",
-            "operation_progress_class": "wrong_target_authoring_edit"
-        }
-    });
-    let event = RunEvent::ToolCallCompleted {
-        tool_call_id,
-        tool: ToolName::ApplyPatch,
-        title: "Wrong target rejected".to_string(),
-        summary: "The submitted edit targeted an inactive artifact.".to_string(),
-        metadata,
-    };
-    let Some(projection) = project_protocol_run_event(&event, Some(session_id), turn_id, 8) else {
-        return false;
-    };
-    let history_preserves_blocked_action = matches!(
-        projection.history_item.as_ref().map(|item| &item.payload),
-        Some(HistoryItemPayload::ToolOutput {
-            blocked_action,
-            result_hash,
-            ..
-        }) if blocked_action.as_deref() == Some("apply_patch:src/workflow.rs")
-            && result_hash.as_deref() == Some("blocked-action-hash")
-    );
-    let runtime_preserves_blocked_action = matches!(
-        projection.runtime_event.msg,
-        RuntimeEventMsg::ToolLifecycle { ref envelope }
-            if envelope.blocked_action.as_deref() == Some("apply_patch:src/workflow.rs")
-                && envelope.result_hash.as_deref() == Some("blocked-action-hash")
-                && envelope.semantic_class.as_deref() == Some("wrong_target_authoring_edit")
-    );
-    history_preserves_blocked_action && runtime_preserves_blocked_action
-}
-
-pub fn pending_tool_lifecycle_does_not_fabricate_blocked_action_fixture_passes() -> bool {
-    let session_id = crate::session::SessionId::new();
-    let turn_id = TurnId::new();
-    let tool_call_id = crate::session::ToolCallId::new();
-    let event = RunEvent::ToolCallPending {
-        tool_call_id,
-        tool: ToolName::ApplyPatch,
-        title: "apply patch src/workflow.rs".to_string(),
-        metadata: serde_json::json!({
-            "tool_route": {
-                "original_arguments": {"path": "src/workflow.rs"},
-                "effective_arguments": {"path": "src/workflow.rs"},
-                "allowed_tools": ["apply_patch"]
-            }
-        }),
-    };
-    let Some(projection) = project_protocol_run_event(&event, Some(session_id), turn_id, 6) else {
-        return false;
-    };
-    let runtime_pending_has_no_blocked_action = matches!(
-        projection.runtime_event.msg,
-        RuntimeEventMsg::ToolLifecycle { ref envelope }
-            if envelope.status == ToolLifecycleStatus::Pending
-                && envelope.blocked_action.is_none()
-                && envelope.result_hash.is_none()
-                && envelope.allowed_surface == vec![ToolName::ApplyPatch]
-    );
-    let history_pending_is_tool_call_not_output = matches!(
-        projection.history_item.as_ref().map(|item| &item.payload),
-        Some(HistoryItemPayload::ToolCall {
-            call_id,
-            tool,
-            effective_arguments,
-            ..
-        }) if *call_id == tool_call_id
-            && *tool == ToolName::ApplyPatch
-            && effective_arguments
-                .get("path")
-                .and_then(Value::as_str)
-                == Some("src/workflow.rs")
-    );
-    runtime_pending_has_no_blocked_action && history_pending_is_tool_call_not_output
-}
-
-pub fn project_history_item_for_run_event(
+fn project_history_item(
     event: &RunEvent,
     session_id: SessionId,
     turn_id: TurnId,
     sequence_no: i64,
 ) -> Option<HistoryItem> {
-    let id = HistoryItemId::new();
     let payload = match event {
-        RunEvent::TextDelta { message_id, delta } => HistoryItemPayload::Message {
-            message_id: Some(*message_id),
-            role: crate::session::MessageRole::Assistant,
-            content: vec![ContentPart::Text {
-                text: delta.clone(),
-            }],
-        },
-        RunEvent::SessionFailed { message, .. } => HistoryItemPayload::Error {
-            message_id: None,
-            message: message.clone(),
-        },
-        RunEvent::SessionInterrupted { reason, .. } => HistoryItemPayload::Error {
-            message_id: None,
-            message: reason.clone(),
-        },
-        RunEvent::ReasoningDelta { delta, .. } => HistoryItemPayload::Reasoning {
-            text: delta.clone(),
-        },
-        RunEvent::ControlEnvelopePrepared { envelope, .. } => HistoryItemPayload::ControlEnvelope {
-            envelope: envelope.clone(),
-        },
+        RunEvent::TextDelta { .. }
+        | RunEvent::ProviderPhase { .. }
+        | RunEvent::ReasoningSummaryDelta { .. }
+        | RunEvent::SessionStarted { .. }
+        | RunEvent::SessionTitleUpdated { .. }
+        | RunEvent::PermissionRequested { .. }
+        | RunEvent::TurnTerminal { .. } => return None,
+        RunEvent::AssistantMessageCommitted { response_id, text } => {
+            HistoryItemPayload::AssistantMessage {
+                response_id: *response_id,
+                content: vec![ContentPart::Text { text: text.clone() }],
+            }
+        }
         RunEvent::ModelRequestPrepared { diagnostics, .. } => {
             HistoryItemPayload::RequestDiagnostics {
                 diagnostics: diagnostics.clone(),
@@ -317,24 +181,16 @@ pub fn project_history_item_for_run_event(
         },
         RunEvent::ToolCallPending {
             tool_call_id,
-            tool,
-            metadata,
-            ..
+            response_id,
+            model_call_id,
+            tool_name,
+            arguments_json,
         } => HistoryItemPayload::ToolCall {
             call_id: *tool_call_id,
-            tool: tool.clone(),
-            arguments: tool_effective_arguments_from_metadata(metadata),
-            model_arguments: tool_model_arguments_from_metadata(metadata),
-            effective_arguments: tool_effective_arguments_from_metadata(metadata),
-            adjusted_arguments: tool_adjusted_arguments_from_metadata(metadata),
-            permission_decision: permission_decision_from_metadata(metadata),
-            sandbox_decision: sandbox_decision_from_metadata(metadata),
-            allowed_surface: allowed_surface_from_metadata(metadata),
-            retry_policy: tool_route_policy_from_metadata(metadata, "retry_policy"),
-            terminal_guard_policy: tool_route_policy_from_metadata(
-                metadata,
-                "terminal_guard_policy",
-            ),
+            response_id: *response_id,
+            model_call_id: model_call_id.clone(),
+            tool_name: tool_name.clone(),
+            arguments_json: arguments_json.clone(),
         },
         RunEvent::ToolCallCompleted {
             tool_call_id,
@@ -342,51 +198,53 @@ pub fn project_history_item_for_run_event(
             summary,
             metadata,
             ..
-        } => HistoryItemPayload::ToolOutput {
-            call_id: *tool_call_id,
-            status: ToolLifecycleStatus::Completed,
-            title: title.clone(),
-            output_text: summary.clone(),
-            metadata: metadata.clone(),
-            success: tool_success_from_metadata(metadata, ToolLifecycleStatus::Completed),
-            progress_effect: tool_progress_effect_from_metadata(
-                metadata,
-                ToolLifecycleStatus::Completed,
-            ),
-            blocked_action: blocked_action_from_metadata(metadata),
-            result_hash: result_hash_from_metadata(metadata),
-            verification_run: verification_run_result_from_metadata(metadata),
-        },
+        } => tool_output(
+            *tool_call_id,
+            ToolLifecycleStatus::Completed,
+            title.clone(),
+            summary.clone(),
+            metadata.clone(),
+            Some(metadata_success(metadata).unwrap_or(true)),
+        ),
+        RunEvent::ToolCallDeclined {
+            tool_call_id,
+            reason,
+            metadata,
+            ..
+        } => tool_output(
+            *tool_call_id,
+            ToolLifecycleStatus::Declined,
+            "Tool declined".to_string(),
+            reason.clone(),
+            metadata.clone(),
+            Some(false),
+        ),
+        RunEvent::ToolCallCancelled {
+            tool_call_id,
+            reason,
+            metadata,
+            ..
+        } => tool_output(
+            *tool_call_id,
+            ToolLifecycleStatus::Cancelled,
+            "Tool cancelled".to_string(),
+            reason.clone(),
+            metadata.clone(),
+            Some(false),
+        ),
         RunEvent::ToolCallFailed {
             tool_call_id,
             error,
             metadata,
             ..
-        } => HistoryItemPayload::ToolOutput {
-            call_id: *tool_call_id,
-            status: ToolLifecycleStatus::Failed,
-            title: "tool failed".to_string(),
-            output_text: error.clone(),
-            metadata: metadata.clone(),
-            success: tool_success_from_metadata(metadata, ToolLifecycleStatus::Failed),
-            progress_effect: tool_progress_effect_from_metadata(
-                metadata,
-                ToolLifecycleStatus::Failed,
-            ),
-            blocked_action: blocked_action_from_metadata(metadata),
-            result_hash: result_hash_from_metadata(metadata),
-            verification_run: verification_run_result_from_metadata(metadata),
-        },
-        RunEvent::ToolProposalRejected { proposal, .. } => {
-            HistoryItemPayload::RejectedToolProposal {
-                proposal: proposal.clone(),
-            }
-        }
-        RunEvent::CandidateRepairEditRecorded { candidate, .. } => {
-            HistoryItemPayload::CandidateRepairEdit {
-                candidate: candidate.clone(),
-            }
-        }
+        } => tool_output(
+            *tool_call_id,
+            ToolLifecycleStatus::Failed,
+            "Tool failed".to_string(),
+            error.clone(),
+            metadata.clone(),
+            Some(false),
+        ),
         RunEvent::FileChangesRecorded {
             tool_call_id,
             changes,
@@ -394,92 +252,65 @@ pub fn project_history_item_for_run_event(
             call_id: *tool_call_id,
             change_ids: changes.iter().map(|change| change.change_id).collect(),
             changes: changes.iter().map(file_change_evidence).collect(),
-            summary: changes
-                .iter()
-                .map(|change| change.summary_line(None))
-                .collect::<Vec<_>>()
-                .join("; "),
+            summary: file_changes_summary(changes),
         },
         RunEvent::CompactionCompleted {
             summarized_messages,
             summary,
             replacement_item_ids,
-            continuation,
             ..
         } => HistoryItemPayload::Compaction {
-            mode: crate::protocol::CompactionMode::MidTurn,
+            mode: crate::protocol::CompactionMode::Automatic,
             summary: if summary.trim().is_empty() {
                 format!("summarized {summarized_messages} messages")
             } else {
                 summary.clone()
             },
             replacement_item_ids: replacement_item_ids.clone(),
-            continuation: continuation.clone(),
-        },
-        RunEvent::StateUpdated { state, .. } => HistoryItemPayload::SessionState {
-            state: state.clone(),
-        },
-        RunEvent::LifecycleGuardUpdated { snapshot, .. } => HistoryItemPayload::LifecycleGuard {
-            snapshot: snapshot.clone(),
         },
         RunEvent::PermissionResolved {
             tool_call_id,
-            tool: _,
             approved,
+            ..
         } => HistoryItemPayload::ApprovalDecision {
             call_id: *tool_call_id,
-            decision: if *approved {
-                PermissionDecision::Approved
-            } else {
-                PermissionDecision::Denied {
-                    reason: "permission denied by user".to_string(),
-                }
-            },
+            decision: permission_decision(*approved),
         },
-        RunEvent::RetryScheduled {
-            attempt,
-            message,
-            next_retry_at_ms,
-            ..
-        } => HistoryItemPayload::RetryDecision {
-            attempt: *attempt,
-            message: message.clone(),
-            next_retry_at_ms: *next_retry_at_ms,
-        },
-        RunEvent::RecoverableRuntimeFeedback {
-            message_id,
-            message,
-            ..
-        } => HistoryItemPayload::Error {
-            message_id: Some(*message_id),
+        RunEvent::RecoverableRuntimeFeedback { message, .. } => HistoryItemPayload::Error {
             message: message.clone(),
         },
-        RunEvent::UserTurnStored {
-            message_id, turn, ..
-        } => HistoryItemPayload::UserTurn {
-            message_id: Some(*message_id),
+        RunEvent::UserTurnStored { turn, .. } => HistoryItemPayload::UserTurn {
             content: turn.content_parts(),
             prompt_dispatch: turn.prompt_dispatch.clone(),
             editor_context: turn.editor_context.clone(),
-            turn_context: Some(Box::new(turn.context.clone())),
         },
-        RunEvent::SessionStarted { .. }
-        | RunEvent::SessionTitleUpdated { .. }
-        | RunEvent::UserMessageStored { .. }
-        | RunEvent::AssistantStarted { .. }
-        | RunEvent::PermissionRequested { .. }
-        | RunEvent::SessionCompleted { .. }
-        | RunEvent::SessionAwaitingUser { .. } => return None,
     };
-
     Some(HistoryItem {
-        id,
+        id: HistoryItemId::new(),
         session_id,
-        turn_id,
+        scope: HistoryScope::Turn { turn_id },
         sequence_no,
         created_at_ms: SystemClock::now_ms(),
         payload,
     })
+}
+
+fn tool_output(
+    call_id: crate::session::ToolCallId,
+    status: ToolLifecycleStatus,
+    title: String,
+    output_text: String,
+    metadata: Value,
+    success: Option<bool>,
+) -> HistoryItemPayload {
+    HistoryItemPayload::ToolOutput {
+        call_id,
+        status,
+        title,
+        output_text,
+        metadata,
+        success,
+    }
 }
 
 pub fn project_turn_item_for_run_event(
@@ -489,52 +320,83 @@ pub fn project_turn_item_for_run_event(
     sequence_no: i64,
 ) -> Option<TurnItem> {
     let payload = match event {
-        RunEvent::TextDelta { delta, .. } => TurnItemPayload::AgentMessage {
-            text: delta.clone(),
-        },
-        RunEvent::ReasoningDelta { delta, .. } => TurnItemPayload::Reasoning {
-            text: delta.clone(),
-        },
+        RunEvent::TextDelta { .. }
+        | RunEvent::ProviderPhase { .. }
+        | RunEvent::ReasoningSummaryDelta { .. }
+        | RunEvent::SessionStarted { .. }
+        | RunEvent::SessionTitleUpdated { .. }
+        | RunEvent::ModelRequestPrepared { .. } => return None,
+        RunEvent::AssistantMessageCommitted { text, .. } => {
+            TurnItemPayload::AgentMessage { text: text.clone() }
+        }
         RunEvent::ToolCallPending {
             tool_call_id,
-            tool,
-            title,
+            tool_name,
             ..
-        } => TurnItemPayload::ToolStatus {
-            call_id: *tool_call_id,
-            tool: tool.clone(),
-            status: ToolLifecycleStatus::Pending,
-            title: title.clone(),
-            summary: String::new(),
-        },
+        } => tool_status(
+            *tool_call_id,
+            ToolName::parse(tool_name),
+            ToolLifecycleStatus::Pending,
+            tool_name.clone(),
+            String::new(),
+        ),
         RunEvent::ToolCallCompleted {
             tool_call_id,
             tool,
             title,
             summary,
+            metadata,
+        } => {
+            if *tool == ToolName::UpdatePlan
+                && let Some((explanation, plan)) = plan_from_metadata(metadata)
+            {
+                TurnItemPayload::Plan { explanation, plan }
+            } else {
+                tool_status(
+                    *tool_call_id,
+                    *tool,
+                    ToolLifecycleStatus::Completed,
+                    title.clone(),
+                    summary.clone(),
+                )
+            }
+        }
+        RunEvent::ToolCallDeclined {
+            tool_call_id,
+            tool,
+            reason,
             ..
-        } => TurnItemPayload::ToolStatus {
-            call_id: *tool_call_id,
-            tool: tool.clone(),
-            status: ToolLifecycleStatus::Completed,
-            title: title.clone(),
-            summary: summary.clone(),
-        },
+        } => tool_status(
+            *tool_call_id,
+            *tool,
+            ToolLifecycleStatus::Declined,
+            "Tool declined".to_string(),
+            reason.clone(),
+        ),
+        RunEvent::ToolCallCancelled {
+            tool_call_id,
+            tool,
+            reason,
+            ..
+        } => tool_status(
+            *tool_call_id,
+            *tool,
+            ToolLifecycleStatus::Cancelled,
+            "Tool cancelled".to_string(),
+            reason.clone(),
+        ),
         RunEvent::ToolCallFailed {
             tool_call_id,
             tool,
             error,
             ..
-        } => TurnItemPayload::ToolStatus {
-            call_id: *tool_call_id,
-            tool: tool.clone(),
-            status: ToolLifecycleStatus::Failed,
-            title: error.clone(),
-            summary: error.clone(),
-        },
-        RunEvent::ToolProposalRejected { .. } | RunEvent::CandidateRepairEditRecorded { .. } => {
-            return None;
-        }
+        } => tool_status(
+            *tool_call_id,
+            *tool,
+            ToolLifecycleStatus::Failed,
+            "Tool failed".to_string(),
+            error.clone(),
+        ),
         RunEvent::FileChangesRecorded {
             tool_call_id,
             changes,
@@ -542,104 +404,29 @@ pub fn project_turn_item_for_run_event(
             call_id: *tool_call_id,
             change_ids: changes.iter().map(|change| change.change_id).collect(),
             changes: changes.iter().map(file_change_evidence).collect(),
-            summary: changes
-                .iter()
-                .map(|change| change.summary_line(None))
-                .collect::<Vec<_>>()
-                .join("; "),
+            summary: file_changes_summary(changes),
         },
-        RunEvent::CompactionCompleted {
-            summarized_messages,
-            summary,
-            ..
-        } => TurnItemPayload::ContextCompaction {
-            summary: if summary.trim().is_empty() {
-                format!("summarized {summarized_messages} messages")
-            } else {
-                summary.clone()
-            },
+        RunEvent::CompactionCompleted { summary, .. } => TurnItemPayload::ContextCompaction {
+            summary: summary.clone(),
         },
         RunEvent::PermissionRequested {
             tool_call_id,
-            tool: _,
             summary,
+            ..
         } => TurnItemPayload::ApprovalRequest {
             call_id: *tool_call_id,
             summary: summary.clone(),
         },
-        RunEvent::PermissionResolved {
-            tool_call_id,
-            tool,
-            approved,
-        } => TurnItemPayload::ToolStatus {
-            call_id: *tool_call_id,
-            tool: *tool,
-            status: if *approved {
-                ToolLifecycleStatus::Deferred
-            } else {
-                ToolLifecycleStatus::Rejected
-            },
-            title: if *approved {
-                "Permission approved".to_string()
-            } else {
-                "Permission denied".to_string()
-            },
-            summary: String::new(),
-        },
-        RunEvent::SessionCompleted { .. } => TurnItemPayload::Terminal {
-            status: TurnTerminalStatus::Completed,
-            summary: "session completed".to_string(),
-        },
-        RunEvent::SessionAwaitingUser { .. } => TurnItemPayload::Terminal {
-            status: TurnTerminalStatus::AwaitingUser,
-            summary: "session awaiting user".to_string(),
-        },
-        RunEvent::SessionFailed { message, .. } => TurnItemPayload::Terminal {
-            status: TurnTerminalStatus::Failed,
-            summary: message.clone(),
-        },
-        RunEvent::SessionInterrupted { reason, .. } => TurnItemPayload::Terminal {
-            status: TurnTerminalStatus::Interrupted,
-            summary: reason.clone(),
-        },
-        RunEvent::RetryScheduled { message, .. } => TurnItemPayload::Warning {
-            message: message.clone(),
-        },
+        RunEvent::PermissionResolved { .. } => return None,
         RunEvent::RecoverableRuntimeFeedback { message, .. } => TurnItemPayload::Error {
             message: message.clone(),
         },
-        RunEvent::StateUpdated { state, .. } => TurnItemPayload::State {
-            summary: format!(
-                "state projected: route={:?}, phase={:?}, active_targets={}",
-                state.route,
-                state.process_phase,
-                state.active_targets.len()
-            ),
-        },
-        RunEvent::LifecycleGuardUpdated { snapshot, .. } => TurnItemPayload::LifecycleGuard {
-            summary: lifecycle_guard_summary(snapshot),
+        RunEvent::TurnTerminal { terminal, .. } => TurnItemPayload::Terminal {
+            outcome: terminal.outcome.clone(),
         },
         RunEvent::UserTurnStored { turn, .. } => TurnItemPayload::UserMessage {
-            text: turn
-                .content_parts()
-                .iter()
-                .map(|part| match part {
-                    ContentPart::Text { text } => text.clone(),
-                    ContentPart::Image { image } => image
-                        .source_path
-                        .as_ref()
-                        .map(|path| format!("{path} ({} bytes)", image.byte_len))
-                        .unwrap_or_else(|| format!("image attachment ({} bytes)", image.byte_len)),
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
+            text: user_turn_text(turn),
         },
-        RunEvent::UserMessageStored { .. }
-        | RunEvent::SessionStarted { .. }
-        | RunEvent::SessionTitleUpdated { .. }
-        | RunEvent::AssistantStarted { .. }
-        | RunEvent::ControlEnvelopePrepared { .. }
-        | RunEvent::ModelRequestPrepared { .. } => return None,
         RunEvent::WorldStateUpdated { snapshot, .. } => TurnItemPayload::WorldState {
             summary: format!("world state updated: {} sections", snapshot.section_count()),
         },
@@ -654,30 +441,27 @@ pub fn project_turn_item_for_run_event(
     })
 }
 
-fn runtime_msg_for_run_event(
+fn project_runtime_message(
     event: &RunEvent,
     history_item: Option<&HistoryItem>,
 ) -> RuntimeEventMsg {
     match event {
+        RunEvent::ProviderPhase { .. }
+        | RunEvent::TextDelta { .. }
+        | RunEvent::ReasoningSummaryDelta { .. } => {
+            unreachable!(
+                "streamed provider events are runtime-only and have no protocol projection"
+            )
+        }
         RunEvent::SessionStarted { title, .. } => RuntimeEventMsg::Warning {
             message: format!("thread started: {title}"),
         },
         RunEvent::SessionTitleUpdated { title, .. } => RuntimeEventMsg::Warning {
             message: format!("thread title updated: {title}"),
         },
-        RunEvent::UserMessageStored { .. } => RuntimeEventMsg::UserInputAccepted { item_count: 1 },
-        RunEvent::UserTurnStored { turn, .. } => RuntimeEventMsg::TurnStarted {
-            context: turn.context.clone(),
+        RunEvent::UserTurnStored { turn, .. } => RuntimeEventMsg::UserInputAccepted {
+            item_count: turn.items.len(),
         },
-        RunEvent::AssistantStarted { message_id, model } => RuntimeEventMsg::AssistantStarted {
-            message_id: *message_id,
-            model: model.clone(),
-        },
-        RunEvent::ControlEnvelopePrepared { envelope, .. } => {
-            RuntimeEventMsg::ControlEnvelopePrepared {
-                envelope: envelope.clone(),
-            }
-        }
         RunEvent::ModelRequestPrepared { diagnostics, .. } => {
             RuntimeEventMsg::ModelRequestPrepared {
                 diagnostics: diagnostics.clone(),
@@ -686,87 +470,100 @@ fn runtime_msg_for_run_event(
         RunEvent::WorldStateUpdated { snapshot, .. } => RuntimeEventMsg::WorldStateUpdated {
             snapshot: snapshot.clone(),
         },
-        RunEvent::TextDelta { message_id, delta } => RuntimeEventMsg::AssistantTextDelta {
-            message_id: *message_id,
-            delta: delta.clone(),
-        },
-        RunEvent::ReasoningDelta { message_id, delta } => RuntimeEventMsg::ReasoningDelta {
-            message_id: *message_id,
-            delta: delta.clone(),
+        RunEvent::AssistantMessageCommitted {
+            response_id, text, ..
+        } => RuntimeEventMsg::AssistantMessageCommitted {
+            response_id: *response_id,
+            text: text.clone(),
         },
         RunEvent::ToolCallPending {
             tool_call_id,
-            tool,
-            title: _,
-            metadata,
-        } => {
-            let mut envelope = tool_envelope(
+            tool_name,
+            ..
+        } => RuntimeEventMsg::ToolLifecycle {
+            envelope: lifecycle(
                 *tool_call_id,
-                tool.clone(),
+                ToolName::parse(tool_name),
                 ToolLifecycleStatus::Pending,
+                tool_name.clone(),
+                String::new(),
                 None,
-                None,
-            );
-            apply_tool_route_metadata(&mut envelope, metadata);
-            RuntimeEventMsg::ToolLifecycle { envelope }
-        }
+            ),
+        },
         RunEvent::ToolCallCompleted {
             tool_call_id,
             tool,
             title,
             summary,
             metadata,
+        } => RuntimeEventMsg::ToolLifecycle {
+            envelope: lifecycle(
+                *tool_call_id,
+                *tool,
+                ToolLifecycleStatus::Completed,
+                title.clone(),
+                summary.clone(),
+                Some(metadata_success(metadata).unwrap_or(true)),
+            ),
+        },
+        RunEvent::ToolCallDeclined {
+            tool_call_id,
+            tool,
+            reason,
             ..
         } => RuntimeEventMsg::ToolLifecycle {
-            envelope: completed_tool_envelope(
+            envelope: lifecycle(
                 *tool_call_id,
-                tool.clone(),
-                title,
-                summary,
-                metadata,
+                *tool,
+                ToolLifecycleStatus::Declined,
+                "Tool declined".to_string(),
+                reason.clone(),
+                Some(false),
+            ),
+        },
+        RunEvent::ToolCallCancelled {
+            tool_call_id,
+            tool,
+            reason,
+            ..
+        } => RuntimeEventMsg::ToolLifecycle {
+            envelope: lifecycle(
+                *tool_call_id,
+                *tool,
+                ToolLifecycleStatus::Cancelled,
+                "Tool cancelled".to_string(),
+                reason.clone(),
+                Some(false),
             ),
         },
         RunEvent::ToolCallFailed {
             tool_call_id,
             tool,
             error,
-            metadata,
-        } => {
-            let mut envelope = tool_envelope(
+            ..
+        } => RuntimeEventMsg::ToolLifecycle {
+            envelope: lifecycle(
                 *tool_call_id,
-                tool.clone(),
+                *tool,
                 ToolLifecycleStatus::Failed,
-                Some(error),
-                Some(error.clone()),
-            );
-            apply_completed_tool_metadata(&mut envelope, metadata);
-            RuntimeEventMsg::ToolLifecycle { envelope }
-        }
-        RunEvent::ToolProposalRejected { proposal, .. } => RuntimeEventMsg::ToolProposalRejected {
-            proposal: proposal.clone(),
+                "Tool failed".to_string(),
+                error.clone(),
+                Some(false),
+            ),
         },
-        RunEvent::CandidateRepairEditRecorded { candidate, .. } => {
-            RuntimeEventMsg::CandidateRepairEditRecorded {
-                candidate: candidate.clone(),
-            }
-        }
         RunEvent::FileChangesRecorded {
             tool_call_id,
             changes,
         } => RuntimeEventMsg::FileChangesRecorded {
             call_id: *tool_call_id,
             change_ids: changes.iter().map(|change| change.change_id).collect(),
-            summary: changes
-                .iter()
-                .map(|change| change.summary_line(None))
-                .collect::<Vec<_>>()
-                .join("; "),
+            summary: file_changes_summary(changes),
         },
         RunEvent::CompactionCompleted { .. } => RuntimeEventMsg::ContextCompacted {
             item_id: history_item
                 .map(|item| item.id)
-                .unwrap_or_else(crate::protocol::HistoryItemId::new),
-            mode: crate::protocol::CompactionMode::MidTurn,
+                .unwrap_or_else(HistoryItemId::new),
+            mode: crate::protocol::CompactionMode::Automatic,
         },
         RunEvent::PermissionRequested {
             tool_call_id,
@@ -784,298 +581,84 @@ fn runtime_msg_for_run_event(
         } => RuntimeEventMsg::ApprovalResolved {
             call_id: *tool_call_id,
             tool: *tool,
-            decision: if *approved {
-                PermissionDecision::Approved
-            } else {
-                PermissionDecision::Denied {
-                    reason: "permission denied by user".to_string(),
-                }
-            },
-        },
-        RunEvent::RetryScheduled {
-            attempt,
-            message,
-            next_retry_at_ms,
-            ..
-        } => RuntimeEventMsg::RetryScheduled {
-            attempt: *attempt,
-            message: message.clone(),
-            next_retry_at_ms: *next_retry_at_ms,
+            decision: permission_decision(*approved),
         },
         RunEvent::RecoverableRuntimeFeedback { message, .. } => RuntimeEventMsg::Warning {
             message: message.clone(),
         },
-        RunEvent::StateUpdated { state, .. } => RuntimeEventMsg::Warning {
-            message: format!(
-                "state projected: route={:?} phase={:?}",
-                state.route, state.process_phase
-            ),
-        },
-        RunEvent::LifecycleGuardUpdated { snapshot, .. } => {
-            RuntimeEventMsg::LifecycleGuardUpdated {
-                snapshot: snapshot.clone(),
-            }
-        }
-        RunEvent::SessionCompleted { finish_reason, .. } => RuntimeEventMsg::TurnCompleted {
-            finish_reason: *finish_reason,
-        },
-        RunEvent::SessionAwaitingUser { finish_reason, .. } => RuntimeEventMsg::TurnAwaitingUser {
-            reason: finish_reason
-                .map(|reason| format!("{reason:?}"))
-                .unwrap_or_else(|| "awaiting user".to_string()),
-        },
-        RunEvent::SessionFailed { message, .. } => RuntimeEventMsg::TurnFailed {
-            message: message.clone(),
-        },
-        RunEvent::SessionInterrupted { reason, .. } => RuntimeEventMsg::TurnInterrupted {
-            reason: reason.clone(),
+        RunEvent::TurnTerminal { terminal, .. } => RuntimeEventMsg::TurnTerminal {
+            terminal: terminal.clone(),
         },
     }
 }
 
-fn lifecycle_guard_summary(snapshot: &crate::protocol::LifecycleGuardSnapshot) -> String {
-    let counter_count = snapshot.counters.len();
-    let flag_count = snapshot.active_flags.len();
-    let target_count = snapshot.scoped_targets.len();
-    format!(
-        "lifecycle guard projected: counters={counter_count}, active_flags={flag_count}, scoped_targets={target_count}"
-    )
-}
-
-fn session_id_for_run_event(event: &RunEvent) -> Option<SessionId> {
-    match event {
-        RunEvent::SessionStarted { session_id, .. }
-        | RunEvent::SessionTitleUpdated { session_id, .. }
-        | RunEvent::UserTurnStored { session_id, .. }
-        | RunEvent::ControlEnvelopePrepared { session_id, .. }
-        | RunEvent::ModelRequestPrepared { session_id, .. }
-        | RunEvent::WorldStateUpdated { session_id, .. }
-        | RunEvent::RetryScheduled { session_id, .. }
-        | RunEvent::RecoverableRuntimeFeedback { session_id, .. }
-        | RunEvent::StateUpdated { session_id, .. }
-        | RunEvent::LifecycleGuardUpdated { session_id, .. }
-        | RunEvent::SessionCompleted { session_id, .. }
-        | RunEvent::SessionAwaitingUser { session_id, .. }
-        | RunEvent::SessionInterrupted { session_id, .. }
-        | RunEvent::SessionFailed { session_id, .. } => Some(*session_id),
-        RunEvent::UserMessageStored { .. }
-        | RunEvent::AssistantStarted { .. }
-        | RunEvent::TextDelta { .. }
-        | RunEvent::ReasoningDelta { .. }
-        | RunEvent::ToolCallPending { .. }
-        | RunEvent::ToolCallCompleted { .. }
-        | RunEvent::ToolCallFailed { .. }
-        | RunEvent::ToolProposalRejected { .. }
-        | RunEvent::CandidateRepairEditRecorded { .. }
-        | RunEvent::FileChangesRecorded { .. }
-        | RunEvent::CompactionCompleted { .. }
-        | RunEvent::PermissionRequested { .. }
-        | RunEvent::PermissionResolved { .. } => None,
-    }
-}
-
-fn tool_envelope(
+fn lifecycle(
     call_id: crate::session::ToolCallId,
-    tool: crate::tool::ToolName,
+    tool: ToolName,
     status: ToolLifecycleStatus,
-    hash_source: Option<&str>,
-    blocked_action: Option<String>,
+    title: String,
+    summary: String,
+    success: Option<bool>,
 ) -> ToolLifecycleEnvelope {
     ToolLifecycleEnvelope {
         call_id,
-        tool: tool.clone(),
-        proposal_id: None,
-        candidate_repair_id: None,
-        original_arguments: serde_json::Value::Null,
-        adjusted_arguments: None,
-        allowed_surface: vec![tool],
-        permission_decision: PermissionDecision::NotRequired,
-        sandbox_decision: SandboxDecision {
-            profile: SandboxProfile::WorkspaceWrite,
-            network_allowed: false,
-            escalated: false,
-        },
+        tool,
         status,
-        rejection_reason: None,
-        semantic_class: None,
-        candidate_validity: None,
-        result_hash: hash_source.map(|value| hash_text(value)),
-        blocked_action,
-        projection_id: ProjectionId::new(),
-        contract_refs: vec!["thread_turn_item_protocol".to_string()],
-        artifact_refs: Vec::new(),
+        title,
+        summary,
+        success,
     }
 }
 
-fn completed_tool_envelope(
+fn tool_status(
     call_id: crate::session::ToolCallId,
-    tool: crate::tool::ToolName,
-    _title: &str,
-    summary: &str,
-    metadata: &Value,
-) -> ToolLifecycleEnvelope {
-    let mut envelope = tool_envelope(
-        call_id,
-        tool.clone(),
-        ToolLifecycleStatus::Completed,
-        Some(summary),
-        None,
-    );
-    apply_completed_tool_metadata(&mut envelope, metadata);
-    envelope
-}
-
-fn tool_model_arguments_from_metadata(metadata: &Value) -> Value {
-    metadata
-        .get("tool_route")
-        .and_then(|route| route.get("original_arguments"))
-        .or_else(|| metadata.get("original_arguments"))
-        .cloned()
-        .unwrap_or(Value::Null)
-}
-
-fn tool_effective_arguments_from_metadata(metadata: &Value) -> Value {
-    metadata
-        .get("tool_route")
-        .and_then(|route| route.get("effective_arguments"))
-        .or_else(|| {
-            metadata
-                .get("tool_route")
-                .and_then(|route| route.get("adjusted_arguments"))
-        })
-        .or_else(|| metadata.get("effective_arguments"))
-        .or_else(|| metadata.get("adjusted_arguments"))
-        .or_else(|| {
-            metadata
-                .get("tool_route")
-                .and_then(|route| route.get("original_arguments"))
-        })
-        .or_else(|| metadata.get("original_arguments"))
-        .cloned()
-        .unwrap_or(Value::Null)
-}
-
-fn tool_adjusted_arguments_from_metadata(metadata: &Value) -> Option<Value> {
-    metadata
-        .get("tool_route")
-        .and_then(|route| route.get("adjusted_arguments"))
-        .or_else(|| metadata.get("adjusted_arguments"))
-        .filter(|value| !value.is_null())
-        .cloned()
-}
-
-fn tool_route_policy_from_metadata(metadata: &Value, key: &str) -> Option<Value> {
-    metadata
-        .get("tool_route")
-        .and_then(|route| route.get(key))
-        .or_else(|| metadata.get(key))
-        .cloned()
-}
-
-fn permission_decision_from_metadata(metadata: &Value) -> Option<PermissionDecision> {
-    metadata
-        .get("tool_route")
-        .and_then(|route| route.get("permission_decision"))
-        .or_else(|| metadata.get("permission_decision"))
-        .and_then(permission_decision_from_value)
-}
-
-fn sandbox_decision_from_metadata(metadata: &Value) -> Option<SandboxDecision> {
-    metadata
-        .get("tool_route")
-        .and_then(|route| route.get("sandbox_decision"))
-        .or_else(|| metadata.get("sandbox_decision"))
-        .and_then(sandbox_decision_from_value)
-}
-
-fn allowed_surface_from_metadata(metadata: &Value) -> Vec<ToolName> {
-    metadata
-        .get("tool_route")
-        .and_then(|route| route.get("allowed_tools"))
-        .or_else(|| metadata.get("allowed_tools"))
-        .and_then(tool_surface_from_value)
-        .unwrap_or_default()
-}
-
-fn verification_run_result_from_metadata(metadata: &Value) -> Option<VerificationRunResult> {
-    metadata
-        .get("verification_run_result")
-        .and_then(|value| serde_json::from_value::<VerificationRunResult>(value.clone()).ok())
-}
-
-fn tool_success_from_metadata(metadata: &Value, status: ToolLifecycleStatus) -> Option<bool> {
-    metadata
-        .get("success")
-        .or_else(|| {
-            metadata
-                .get("tool_feedback_envelope")
-                .and_then(|feedback| feedback.get("success"))
-        })
-        .and_then(Value::as_bool)
-        .or_else(|| match status {
-            ToolLifecycleStatus::Completed => Some(true),
-            ToolLifecycleStatus::Failed
-            | ToolLifecycleStatus::Blocked
-            | ToolLifecycleStatus::Rejected => Some(false),
-            _ => None,
-        })
-}
-
-fn tool_progress_effect_from_metadata(
-    metadata: &Value,
+    tool: ToolName,
     status: ToolLifecycleStatus,
-) -> ToolProgressEffect {
-    if let Some(run) = verification_run_result_from_metadata(metadata) {
-        return match run.status {
-            crate::protocol::VerificationRunStatus::Passed => {
-                ToolProgressEffect::VerificationPassed
-            }
-            crate::protocol::VerificationRunStatus::Failed
-            | crate::protocol::VerificationRunStatus::TimedOut => {
-                ToolProgressEffect::VerificationFailed
-            }
-            crate::protocol::VerificationRunStatus::NotVerification => ToolProgressEffect::Unknown,
-        };
+    title: String,
+    summary: String,
+) -> TurnItemPayload {
+    TurnItemPayload::ToolStatus {
+        call_id,
+        tool,
+        status,
+        title,
+        summary,
     }
-    metadata
-        .get("tool_feedback_envelope")
-        .and_then(|feedback| feedback.get("progress_effect"))
-        .or_else(|| metadata.get("progress_effect"))
-        .and_then(Value::as_str)
-        .map(|value| match value {
-            "made_progress" | "progress" => ToolProgressEffect::MadeProgress,
-            "no_progress" => ToolProgressEffect::NoProgress,
-            "blocked" => ToolProgressEffect::Blocked,
-            "verification_passed" => ToolProgressEffect::VerificationPassed,
-            "verification_failed" => ToolProgressEffect::VerificationFailed,
-            _ => ToolProgressEffect::Unknown,
-        })
-        .unwrap_or_else(|| match status {
-            ToolLifecycleStatus::Completed => ToolProgressEffect::MadeProgress,
-            ToolLifecycleStatus::Failed
-            | ToolLifecycleStatus::Blocked
-            | ToolLifecycleStatus::Rejected => ToolProgressEffect::Blocked,
-            _ => ToolProgressEffect::Unknown,
-        })
 }
 
-fn blocked_action_from_metadata(metadata: &Value) -> Option<String> {
-    let feedback = metadata.get("tool_feedback_envelope");
-    feedback
-        .and_then(|value| value.get("blocked_action"))
-        .or_else(|| feedback.and_then(|value| value.get("required_next_action")))
-        .or_else(|| metadata.get("blocked_action"))
-        .or_else(|| metadata.get("required_next_action"))
-        .and_then(string_from_value)
+fn plan_from_metadata(metadata: &Value) -> Option<(Option<String>, Vec<PlanStep>)> {
+    let value = metadata.get("tool_metadata").unwrap_or(metadata);
+    let explanation = value
+        .get("explanation")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let plan = serde_json::from_value::<Vec<PlanStep>>(value.get("plan")?.clone()).ok()?;
+    if plan.iter().any(|item| item.step.trim().is_empty())
+        || plan
+            .iter()
+            .filter(|item| item.status == PlanStepStatus::InProgress)
+            .count()
+            > 1
+    {
+        return None;
+    }
+    Some((explanation, plan))
 }
 
-fn result_hash_from_metadata(metadata: &Value) -> Option<String> {
-    metadata
-        .get("tool_feedback_envelope")
-        .and_then(|feedback| feedback.get("result_hash"))
-        .or_else(|| metadata.get("result_hash"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
+fn metadata_success(metadata: &Value) -> Option<bool> {
+    metadata.get("success").and_then(Value::as_bool)
+}
+
+fn permission_decision(approved: bool) -> PermissionDecision {
+    if approved {
+        PermissionDecision::Approved
+    } else {
+        PermissionDecision::Denied {
+            reason: "permission denied by user".to_string(),
+        }
+    }
 }
 
 fn file_change_evidence(change: &crate::edit::ChangeSummary) -> FileChangeEvidence {
@@ -1088,444 +671,136 @@ fn file_change_evidence(change: &crate::edit::ChangeSummary) -> FileChangeEviden
     }
 }
 
-fn apply_completed_tool_metadata(envelope: &mut ToolLifecycleEnvelope, metadata: &Value) {
-    apply_tool_route_metadata(envelope, metadata);
-    let control_projection = metadata.get("control_projection");
-    let feedback_envelope = metadata.get("tool_feedback_envelope");
-
-    if let Some(projection_id) = control_projection
-        .and_then(|projection| projection.get("projection_id"))
-        .and_then(projection_id_from_value)
-    {
-        envelope.projection_id = projection_id;
-    }
-
-    if let Some(allowed_surface) = control_projection
-        .and_then(|projection| projection.get("allowed_tools"))
-        .and_then(tool_surface_from_value)
-        .filter(|tools| !tools.is_empty())
-        .or_else(|| {
-            feedback_envelope
-                .and_then(|feedback| feedback.get("allowed_surface_snapshot"))
-                .and_then(tool_surface_from_value)
-                .filter(|tools| !tools.is_empty())
-        })
-    {
-        envelope.allowed_surface = allowed_surface;
-    }
-
-    if let Some(result_hash) = feedback_envelope
-        .and_then(|feedback| feedback.get("result_hash"))
-        .and_then(string_from_value)
-    {
-        envelope.result_hash = Some(result_hash);
-    }
-
-    if let Some(blocked_action) = blocked_action_from_metadata(metadata) {
-        envelope.blocked_action = Some(blocked_action);
-    }
-
-    if let Some(progress_class) = feedback_envelope
-        .and_then(|feedback| feedback.get("operation_progress_class"))
-        .or_else(|| metadata.get("operation_progress_class"))
-        .and_then(string_from_value)
-    {
-        envelope.semantic_class = Some(progress_class);
-    }
-
-    apply_candidate_repair_metadata(envelope, metadata);
-    add_metadata_contract_refs(envelope, metadata);
-}
-
-fn apply_tool_route_metadata(envelope: &mut ToolLifecycleEnvelope, metadata: &Value) {
-    let route = metadata.get("tool_route").unwrap_or(metadata);
-
-    if let Some(original_arguments) = route
-        .get("original_arguments")
-        .or_else(|| metadata.get("original_arguments"))
-        .cloned()
-    {
-        envelope.original_arguments = original_arguments;
-    }
-
-    if let Some(adjusted_arguments) = route
-        .get("adjusted_arguments")
-        .or_else(|| metadata.get("adjusted_arguments"))
-        .filter(|value| !value.is_null())
-        .cloned()
-    {
-        envelope.adjusted_arguments = Some(adjusted_arguments);
-    }
-
-    if let Some(allowed_surface) = route
-        .get("allowed_tools")
-        .or_else(|| metadata.get("allowed_tools"))
-        .and_then(tool_surface_from_value)
-        .filter(|tools| !tools.is_empty())
-    {
-        envelope.allowed_surface = allowed_surface;
-    }
-
-    if let Some(permission) = route
-        .get("permission_decision")
-        .or_else(|| metadata.get("permission_decision"))
-        .and_then(permission_decision_from_value)
-    {
-        envelope.permission_decision = permission;
-    }
-
-    if let Some(sandbox) = route
-        .get("sandbox_decision")
-        .or_else(|| metadata.get("sandbox_decision"))
-        .and_then(sandbox_decision_from_value)
-    {
-        envelope.sandbox_decision = sandbox;
-    }
-
-    if metadata.get("tool_route").is_some() {
-        envelope
-            .contract_refs
-            .push("tool_route_decision".to_string());
-        if route.get("retry_policy").is_some() {
-            envelope
-                .contract_refs
-                .push("tool_orchestrator_retry_policy".to_string());
-        }
-        if route.get("terminal_guard_policy").is_some() {
-            envelope
-                .contract_refs
-                .push("tool_orchestrator_terminal_guard_policy".to_string());
-        }
-        envelope.contract_refs.sort();
-        envelope.contract_refs.dedup();
-    }
-}
-
-fn permission_decision_from_value(value: &Value) -> Option<PermissionDecision> {
-    match value.as_str()? {
-        "not_required" => Some(PermissionDecision::NotRequired),
-        "pending" => Some(PermissionDecision::Pending),
-        "approved" => Some(PermissionDecision::Approved),
-        "denied" => Some(PermissionDecision::Denied {
-            reason: "tool route denied".to_string(),
-        }),
-        _ => None,
-    }
-}
-
-fn sandbox_decision_from_value(value: &Value) -> Option<SandboxDecision> {
-    let profile = match value.get("profile").and_then(Value::as_str)? {
-        "read_only" => SandboxProfile::ReadOnly,
-        "workspace_write" => SandboxProfile::WorkspaceWrite,
-        "full_access" => SandboxProfile::FullAccess,
-        _ => return None,
-    };
-    Some(SandboxDecision {
-        profile,
-        network_allowed: value
-            .get("network_allowed")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        escalated: value
-            .get("escalated")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    })
-}
-
-fn apply_candidate_repair_metadata(envelope: &mut ToolLifecycleEnvelope, metadata: &Value) {
-    let proposal = metadata.get("rejected_tool_proposal");
-    let candidate = metadata.get("candidate_repair_edit");
-
-    if let Some(proposal_id) = proposal
-        .and_then(|value| value.get("proposal_id"))
-        .and_then(tool_proposal_id_from_value)
-    {
-        envelope.proposal_id = Some(proposal_id);
-        envelope.status = ToolLifecycleStatus::Rejected;
-    }
-
-    if let Some(candidate_id) = candidate
-        .and_then(|value| value.get("candidate_id"))
-        .and_then(candidate_repair_id_from_value)
-        .or_else(|| {
-            proposal
-                .and_then(|value| value.get("candidate_repair_id"))
-                .and_then(candidate_repair_id_from_value)
-        })
-    {
-        envelope.candidate_repair_id = Some(candidate_id);
-    }
-
-    if let Some(reason) = proposal
-        .and_then(|value| value.get("blocked_reason"))
-        .and_then(string_from_value)
-    {
-        envelope.rejection_reason = Some(reason);
-    }
-
-    if let Some(semantic_class) = candidate
-        .and_then(|value| value.get("semantic_class"))
-        .or_else(|| proposal.and_then(|value| value.get("semantic_class")))
-        .and_then(string_from_value)
-    {
-        envelope.semantic_class = Some(semantic_class);
-    }
-
-    if let Some(validity) = candidate
-        .and_then(|value| value.get("validity"))
-        .and_then(candidate_validity_from_value)
-    {
-        envelope.candidate_validity = Some(validity);
-    }
-}
-
-fn projection_id_from_value(value: &Value) -> Option<ProjectionId> {
-    value
-        .as_str()
-        .and_then(|value| ProjectionId::from_str(value).ok())
-}
-
-fn tool_proposal_id_from_value(value: &Value) -> Option<ToolProposalId> {
-    value
-        .as_str()
-        .and_then(|value| ToolProposalId::from_str(value).ok())
-}
-
-fn candidate_repair_id_from_value(value: &Value) -> Option<CandidateRepairId> {
-    value
-        .as_str()
-        .and_then(|value| CandidateRepairId::from_str(value).ok())
-}
-
-fn candidate_validity_from_value(value: &Value) -> Option<CandidateRepairValidity> {
-    match value.as_str()? {
-        "unverified" => Some(CandidateRepairValidity::Unverified),
-        "tentative" => Some(CandidateRepairValidity::Tentative),
-        "contract_delta_verified" => Some(CandidateRepairValidity::ContractDeltaVerified),
-        "admitted" => Some(CandidateRepairValidity::Admitted),
-        "contradicted" => Some(CandidateRepairValidity::Contradicted),
-        "rejected" => Some(CandidateRepairValidity::Rejected),
-        "superseded" => Some(CandidateRepairValidity::Superseded),
-        "expired" => Some(CandidateRepairValidity::Expired),
-        "unsafe" => Some(CandidateRepairValidity::Unsafe),
-        _ => None,
-    }
-}
-
-fn string_from_value(value: &Value) -> Option<String> {
-    value
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && *value != "none")
-        .map(str::to_string)
-}
-
-fn tool_surface_from_value(value: &Value) -> Option<Vec<crate::tool::ToolName>> {
-    let array = value.as_array()?;
-    let mut tools = array
+fn file_changes_summary(changes: &[crate::edit::ChangeSummary]) -> String {
+    changes
         .iter()
-        .filter_map(Value::as_str)
-        .filter_map(tool_name_from_token)
-        .collect::<Vec<_>>();
-    tools.sort_by_key(|tool| tool.to_string());
-    tools.dedup();
-    Some(tools)
+        .map(|change| change.summary_line(None))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
-fn tool_name_from_token(token: &str) -> Option<crate::tool::ToolName> {
-    match token {
-        "list" => Some(crate::tool::ToolName::List),
-        "glob" => Some(crate::tool::ToolName::Glob),
-        "grep" => Some(crate::tool::ToolName::Grep),
-        "read" => Some(crate::tool::ToolName::Read),
-        "inspect_directory" => Some(crate::tool::ToolName::InspectDirectory),
-        "apply_patch" => Some(crate::tool::ToolName::ApplyPatch),
-        "write" => Some(crate::tool::ToolName::Write),
-        "shell" => Some(crate::tool::ToolName::Shell),
-        "current_time" => Some(crate::tool::ToolName::CurrentTime),
-        "skill" => Some(crate::tool::ToolName::Skill),
-        "docling_convert" => Some(crate::tool::ToolName::DoclingConvert),
-        "mcp_call" => Some(crate::tool::ToolName::McpCall),
-        "todowrite" => Some(crate::tool::ToolName::TodoWrite),
-        "get_goal" => Some(crate::tool::ToolName::GetGoal),
-        "create_goal" => Some(crate::tool::ToolName::CreateGoal),
-        "update_goal" => Some(crate::tool::ToolName::UpdateGoal),
-        "spawn_agent" => Some(crate::tool::ToolName::SpawnAgent),
-        "send_message" => Some(crate::tool::ToolName::SendMessage),
-        "followup_task" => Some(crate::tool::ToolName::FollowupTask),
-        "wait_agent" => Some(crate::tool::ToolName::WaitAgent),
-        "interrupt_agent" => Some(crate::tool::ToolName::InterruptAgent),
-        "list_agents" => Some(crate::tool::ToolName::ListAgents),
-        _ => None,
-    }
-}
-
-fn add_metadata_contract_refs(envelope: &mut ToolLifecycleEnvelope, metadata: &Value) {
-    let mut refs = envelope.contract_refs.clone();
-    if metadata.get("control_projection").is_some() {
-        refs.push("turn_control_envelope".to_string());
-        refs.push("projection_bundle".to_string());
-    }
-    if let Some(feedback) = metadata.get("tool_feedback_envelope") {
-        refs.push("tool_feedback_envelope".to_string());
-        if feedback.get("repair_operation_template").is_some() {
-            refs.push("repair_operation_template".to_string());
-        }
-        if feedback.get("verification_cluster").is_some() {
-            refs.push("verification_failure_cluster".to_string());
-        }
-        if feedback.get("repair_control_snapshot").is_some() {
-            refs.push("repair_control_snapshot".to_string());
-        }
-        if feedback.get("contract_reconciliation").is_some() {
-            refs.push("contract_reconciliation".to_string());
-        }
-    }
-    if metadata.get("rejected_tool_proposal").is_some() {
-        refs.push("rejected_tool_proposal".to_string());
-    }
-    if metadata.get("candidate_repair_edit").is_some() {
-        refs.push("candidate_repair_edit".to_string());
-    }
-    refs.sort();
-    refs.dedup();
-    envelope.contract_refs = refs;
-}
-
-fn hash_text(value: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
-    format!("{:x}", hasher.finalize())
+fn user_turn_text(turn: &crate::protocol::UserTurn) -> String {
+    turn.content_parts()
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text { text } => text.clone(),
+            ContentPart::Image { image } => image
+                .source_path
+                .as_ref()
+                .map(|path| format!("{path} ({} bytes)", image.byte_len))
+                .unwrap_or_else(|| format!("image attachment ({} bytes)", image.byte_len)),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{
-        HistoryItemAuthorityRole, HistoryItemPayload, RuntimeEventMsg, TurnItemProjectionRole,
-        TurnTerminalStatus,
-    };
-    use crate::session::{RunEvent, SessionId};
+    use crate::protocol::{PlanStepStatus, UserInputItem, UserTurn};
+    use crate::session::ToolCallId;
 
     #[test]
-    fn session_interrupted_projects_to_interrupted_terminal_items() {
+    fn pending_tool_call_preserves_raw_provider_name_and_arguments() {
         let session_id = SessionId::new();
+        let call_id = ToolCallId::new();
         let projection = project_protocol_run_event(
-            &RunEvent::SessionInterrupted {
-                session_id,
-                reason: "run cancelled by user".to_string(),
+            &RunEvent::ToolCallPending {
+                tool_call_id: call_id,
+                response_id: crate::protocol::ModelResponseId::new(),
+                model_call_id: "call_provider".to_string(),
+                tool_name: "unknown_provider_tool".to_string(),
+                arguments_json: "{not-json}".to_string(),
+            },
+            Some(session_id),
+            TurnId::new(),
+            1,
+        )
+        .expect("projection");
+        assert!(matches!(
+            projection.history_item.map(|item| item.payload),
+            Some(HistoryItemPayload::ToolCall {
+                call_id: projected,
+                model_call_id,
+                tool_name,
+                arguments_json,
+                ..
+            }) if projected == call_id
+                && model_call_id == "call_provider"
+                && tool_name == "unknown_provider_tool"
+                && arguments_json == "{not-json}"
+        ));
+    }
+
+    #[test]
+    fn update_plan_is_a_typed_turn_projection() {
+        let projection = project_protocol_run_event(
+            &RunEvent::ToolCallCompleted {
+                tool_call_id: ToolCallId::new(),
+                tool: ToolName::UpdatePlan,
+                title: "Plan updated".to_string(),
+                summary: "Plan updated".to_string(),
+                metadata: serde_json::json!({
+                    "tool_metadata": {
+                        "explanation": "reordered",
+                        "plan": [{"step":"Implement", "status":"in_progress"}]
+                    },
+                    "success": true
+                }),
+            },
+            Some(SessionId::new()),
+            TurnId::new(),
+            2,
+        )
+        .expect("projection");
+        assert!(matches!(
+            projection.turn_item.map(|item| item.payload),
+            Some(TurnItemPayload::Plan { plan, .. })
+                if plan.len() == 1 && plan[0].status == PlanStepStatus::InProgress
+        ));
+    }
+
+    #[test]
+    fn stream_deltas_are_runtime_only() {
+        let projection = project_protocol_run_event(
+            &RunEvent::TextDelta {
+                response_id: crate::protocol::ModelResponseId::new(),
+                delta: "partial".to_string(),
+            },
+            Some(SessionId::new()),
+            TurnId::new(),
+            3,
+        );
+        assert!(projection.is_none());
+    }
+
+    #[test]
+    fn user_turn_is_recorded_once() {
+        let turn = UserTurn {
+            turn_id: TurnId::new(),
+            items: vec![UserInputItem::Text {
+                text: "inspect".to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+        };
+        let projection = project_protocol_run_event(
+            &RunEvent::UserTurnStored {
+                session_id: SessionId::new(),
+                turn: Box::new(turn),
             },
             None,
             TurnId::new(),
-            42,
+            4,
         )
-        .expect("interrupted event should project");
-
-        match projection.runtime_event.msg {
-            RuntimeEventMsg::TurnInterrupted { reason } => {
-                assert_eq!(reason, "run cancelled by user");
-            }
-            other => panic!("unexpected runtime event: {other:?}"),
-        }
-        match projection.turn_item.expect("terminal turn item").payload {
-            TurnItemPayload::Terminal { status, summary } => {
-                assert_eq!(status, TurnTerminalStatus::Interrupted);
-                assert_eq!(summary, "run cancelled by user");
-            }
-            other => panic!("unexpected turn item: {other:?}"),
-        }
-        match projection.history_item.expect("history item").payload {
-            HistoryItemPayload::Error { message, .. } => {
-                assert_eq!(message, "run cancelled by user");
-            }
-            other => panic!("unexpected history item: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn inter_agent_communication_projects_as_visible_assistant_output() {
-        let session_id = SessionId::new();
-        let turn_id = TurnId::new();
-        let communication = InterAgentCommunication {
-            author: "/root/reviewer".to_string(),
-            recipient: "/root".to_string(),
-            content: "review complete".to_string(),
-            trigger_turn: false,
-        };
-
-        let projection =
-            project_inter_agent_communication(session_id, turn_id, 7, communication.clone());
+        .expect("projection");
         assert!(matches!(
-            &projection.runtime_event.msg,
-            RuntimeEventMsg::InterAgentCommunicationReceived { communication: stored }
-                if stored == &communication
+            projection.history_item.map(|item| item.payload),
+            Some(HistoryItemPayload::UserTurn { .. })
         ));
-        let history = projection.history_item.expect("history item");
-        assert_eq!(
-            history.payload.authority_role(),
-            HistoryItemAuthorityRole::AssistantOutput
-        );
-        let turn = projection.turn_item.expect("turn item");
-        assert_eq!(turn.source_item_id, Some(history.id));
-        assert_eq!(
-            turn.payload.projection_role(),
-            TurnItemProjectionRole::AssistantVisibleMessage
-        );
-    }
-
-    #[test]
-    fn sub_agent_activity_projects_as_runtime_control() {
-        let session_id = SessionId::new();
-        let agent_session_id = SessionId::new();
-        let turn_id = TurnId::new();
-
-        let projection = project_sub_agent_activity(
-            session_id,
-            turn_id,
-            8,
-            "activity-1".to_string(),
-            agent_session_id,
-            "/root/reviewer".to_string(),
-            SubAgentActivityKind::Started,
-        );
         assert!(matches!(
-            &projection.runtime_event.msg,
-            RuntimeEventMsg::SubAgentActivity {
-                activity_id,
-                agent_session_id: stored_session_id,
-                agent_path,
-                activity_kind: SubAgentActivityKind::Started,
-            } if activity_id == "activity-1"
-                && stored_session_id == &agent_session_id
-                && agent_path == "/root/reviewer"
+            projection.turn_item.map(|item| item.payload),
+            Some(TurnItemPayload::UserMessage { text }) if text == "inspect"
         ));
-        let history = projection.history_item.expect("history item");
-        assert_eq!(
-            history.payload.authority_role(),
-            HistoryItemAuthorityRole::RuntimeControl
-        );
-        let turn = projection.turn_item.expect("turn item");
-        assert_eq!(turn.source_item_id, Some(history.id));
-        assert_eq!(
-            turn.payload.projection_role(),
-            TurnItemProjectionRole::RuntimeControl
-        );
-        assert!(turn.payload.is_internal_projection_only());
-    }
-
-    #[test]
-    fn filechange_item_projection_preserves_call_id() {
-        assert!(filechange_item_projection_preserves_call_id_fixture_passes());
-    }
-
-    #[test]
-    fn tool_output_projection_preserves_blocked_action_fixture() {
-        assert!(tool_output_projection_preserves_blocked_action_fixture_passes());
-    }
-
-    #[test]
-    fn pending_tool_lifecycle_does_not_fabricate_blocked_action_fixture() {
-        assert!(pending_tool_lifecycle_does_not_fabricate_blocked_action_fixture_passes());
     }
 }

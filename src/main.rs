@@ -3,13 +3,12 @@ use std::process::ExitCode;
 
 use camino::Utf8PathBuf;
 use moyai::app::{
-    AppBootstrap, AppCommand, ReviewRequest, RunRequest, SessionArchiveRequest,
-    SessionCompactRequest, SessionEventsRequest, SessionForkRequest, SessionGoalClearRequest,
+    AppBootstrap, AppCommand, AppCommandOutcome, ReviewRequest, RunConfigInput, RunRequest,
+    SessionArchiveRequest, SessionEventsRequest, SessionForkRequest, SessionGoalClearRequest,
     SessionGoalGetRequest, SessionGoalSetRequest, SessionHistoryRequest, SessionInterruptRequest,
-    SessionListRequest, SessionLoadedRequest, SessionMemoryRequest, SessionReadRequest,
-    SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
-    SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest,
-    SessionTitleUpdateRequest, SessionTurnsRequest,
+    SessionListRequest, SessionLoadedRequest, SessionReadRequest, SessionRejoinRequest,
+    SessionRollbackRequest, SessionSearchRequest, SessionSettingsUpdateRequest, SessionShowRequest,
+    SessionSteerRequest, SessionTitleUpdateRequest, SessionTurnsRequest,
 };
 use moyai::cli::parse::parse as parse_cli;
 use moyai::cli::{
@@ -25,7 +24,8 @@ use moyai::harness::{
     HarnessEventStore, HarnessRunId, HarnessRunRecord, HarnessRunStatus, HarnessRunStore,
     ReplayExecution, ReplayMode, ReplayProfile, ReplayReportStore, ReplayStatus,
 };
-use moyai::runtime::{SystemClock, build_cancel_token};
+use moyai::protocol::TurnInterruptionCause;
+use moyai::runtime::SystemClock;
 use moyai::session::EditorContext;
 use moyai::session::SessionStatus;
 use moyai::storage::{SqliteStore, StoragePaths};
@@ -56,8 +56,6 @@ fn run() -> Result<(), (u8, String)> {
         | CliCommand::SessionSettings(_)
         | CliCommand::SessionTitle(_)
         | CliCommand::SessionInterrupt(_)
-        | CliCommand::SessionCompact(_)
-        | CliCommand::SessionMemory(_)
         | CliCommand::SessionGoalGet(_)
         | CliCommand::SessionGoalSet(_)
         | CliCommand::SessionGoalClear(_)
@@ -178,38 +176,80 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
     }
     let wait_for_agent_tree = matches!(&command, CliCommand::Run(_));
     let mut app_command = to_app_command(&command, &app);
-    let mut prompt = SharedConfirmationPrompt::new(StdConfirmationPrompt);
+    let root_run_control = match &app_command {
+        AppCommand::Run(request) => Some(request.run_control.clone()),
+        _ => None,
+    };
+    let mut prompt = match root_run_control {
+        Some(root_run_control) => {
+            SharedConfirmationPrompt::new_with_root_control(StdConfirmationPrompt, root_run_control)
+        }
+        None => SharedConfirmationPrompt::new(StdConfirmationPrompt),
+    };
     if let AppCommand::Run(request) = &mut app_command {
         request.agent_confirmation = Some(prompt.clone());
     }
     install_cli_interrupt_handler(&app_command);
     let output_mode = command_output_mode(&command);
     let mut renderer = build_renderer(output_mode);
-    let summary = app
+    let outcome = app
         .run_service
         .execute(app_command, renderer.as_mut(), &mut prompt)
         .await
         .map_err(|error| (4, error.to_string()))?;
-    if wait_for_agent_tree {
-        app.run_service
-            .wait_for_agent_tree_quiescence(summary.session_id)
-            .await
-            .map_err(|error| (4, error.to_string()))?;
+    match outcome {
+        AppCommandOutcome::ControlCompleted => Ok(()),
+        AppCommandOutcome::Turn(summary) if wait_for_agent_tree => {
+            app.run_service
+                .wait_for_agent_tree_quiescence(summary.session_id())
+                .await
+                .map_err(|error| (4, error.to_string()))?;
+            if let Some(exit) = terminal_run_exit(summary.status(), summary.interruption_cause()) {
+                return Err(exit);
+            }
+            Ok(())
+        }
+        AppCommandOutcome::Turn(_) => Err((
+            4,
+            "a control command unexpectedly returned an admitted turn".to_string(),
+        )),
     }
-    if summary.status == SessionStatus::Cancelled {
-        return Err((130, "run cancelled by user".to_string()));
+}
+
+fn terminal_run_exit(
+    status: SessionStatus,
+    interruption_cause: Option<TurnInterruptionCause>,
+) -> Option<(u8, String)> {
+    match status {
+        SessionStatus::Completed => None,
+        SessionStatus::Cancelled => Some(cancelled_run_exit(interruption_cause)),
+        SessionStatus::Failed => Some((4, "run failed".to_string())),
+        SessionStatus::Idle | SessionStatus::Running => Some((
+            4,
+            format!("run returned non-terminal status {}", status.key()),
+        )),
     }
-    Ok(())
+}
+
+fn cancelled_run_exit(cause: Option<TurnInterruptionCause>) -> (u8, String) {
+    let message = match cause {
+        Some(TurnInterruptionCause::UserStop) => "run cancelled by user",
+        Some(TurnInterruptionCause::ApprovalAborted) => "run aborted at the permission request",
+        Some(TurnInterruptionCause::TreeStopped) => "run stopped with its agent tree",
+        Some(TurnInterruptionCause::AgentInterrupted) => "agent run interrupted",
+        None => "run interrupted",
+    };
+    (130, message.to_string())
 }
 
 fn install_cli_interrupt_handler(command: &AppCommand) {
     let AppCommand::Run(request) = command else {
         return;
     };
-    let cancel = request.cancel.clone();
+    let run_control = request.run_control.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            cancel.cancel();
+            run_control.interrupt(moyai::protocol::TurnInterruptionCause::UserStop);
             eprintln!("interrupt requested; cancelling active run...");
         }
     });
@@ -264,11 +304,13 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
             continue_last: args.continue_last,
             title: args.title.clone(),
             cwd: app.workspace.cwd.clone(),
-            model: args.model_override.clone().unwrap_or_default(),
-            base_url: args.base_url_override.clone().unwrap_or_default(),
-            config_override: None,
+            config: RunConfigInput::Layered {
+                model: args.model_override.clone().unwrap_or_default(),
+                base_url: args.base_url_override.clone().unwrap_or_default(),
+                config_override: None,
+            },
             output_mode: args.output_mode,
-            show_reasoning: args.show_reasoning,
+            show_reasoning_summary: args.show_reasoning_summary,
             prompt_dispatch: None,
             editor_context: Some(EditorContext {
                 active_file: args.active_file.clone(),
@@ -291,8 +333,7 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
                     })
             },
             image_paths: args.image_paths.clone(),
-            cancel: build_cancel_token(),
-            live_config: None,
+            run_control: moyai::runtime::RunControl::new(),
             agent_confirmation: None,
             agent_context: None,
         }),
@@ -338,17 +379,8 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
         CliCommand::SessionInterrupt(args) => {
             AppCommand::SessionInterrupt(SessionInterruptRequest {
                 session_id: args.session_id,
-                reason: args.reason.clone(),
             })
         }
-        CliCommand::SessionCompact(args) => AppCommand::SessionCompact(SessionCompactRequest {
-            session_id: args.session_id,
-            keep_recent: args.keep_recent,
-        }),
-        CliCommand::SessionMemory(args) => AppCommand::SessionMemory(SessionMemoryRequest {
-            session_id: args.session_id,
-            mode: args.mode,
-        }),
         CliCommand::SessionGoalGet(args) => AppCommand::SessionGoalGet(SessionGoalGetRequest {
             session_id: args.session_id,
         }),
@@ -365,7 +397,6 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
         }
         CliCommand::SessionShow(args) => AppCommand::SessionShow(SessionShowRequest {
             session_id: args.session_id,
-            show_reasoning: args.show_reasoning,
         }),
         CliCommand::SessionHistory(args) => AppCommand::SessionHistory(SessionHistoryRequest {
             session_id: args.session_id,
@@ -445,8 +476,6 @@ fn command_output_mode(command: &CliCommand) -> OutputMode {
         CliCommand::SessionSettings(args) => args.output_mode,
         CliCommand::SessionTitle(args) => args.output_mode,
         CliCommand::SessionInterrupt(args) => args.output_mode,
-        CliCommand::SessionCompact(args) => args.output_mode,
-        CliCommand::SessionMemory(args) => args.output_mode,
         CliCommand::SessionGoalGet(args) => args.output_mode,
         CliCommand::SessionGoalSet(args) => args.output_mode,
         CliCommand::SessionGoalClear(args) => args.output_mode,
@@ -489,7 +518,7 @@ async fn run_model_availability_command(args: ModelAvailabilityArgs) -> Result<(
         model_override: args.model_override.clone(),
         base_url_override: args.base_url_override.clone(),
         output_mode: OutputMode::Json,
-        show_reasoning: false,
+        show_reasoning_summary: false,
         review_uncommitted: false,
         review_branch: None,
         active_file: None,
@@ -715,4 +744,58 @@ fn write_cli_artifact_atomic(path: &Utf8PathBuf, text: &str) -> Result<(), Strin
     temp.persist(path.as_std_path())
         .map(|_| ())
         .map_err(|error| error.error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_cli_exit_uses_only_the_typed_interruption_cause() {
+        for (cause, expected) in [
+            (
+                Some(TurnInterruptionCause::UserStop),
+                "run cancelled by user",
+            ),
+            (
+                Some(TurnInterruptionCause::ApprovalAborted),
+                "run aborted at the permission request",
+            ),
+            (
+                Some(TurnInterruptionCause::TreeStopped),
+                "run stopped with its agent tree",
+            ),
+            (
+                Some(TurnInterruptionCause::AgentInterrupted),
+                "agent run interrupted",
+            ),
+            (None, "run interrupted"),
+        ] {
+            assert_eq!(cancelled_run_exit(cause), (130, expected.to_string()));
+        }
+    }
+
+    #[test]
+    fn terminal_cli_exit_never_reports_failed_or_non_terminal_runs_as_success() {
+        assert_eq!(terminal_run_exit(SessionStatus::Completed, None), None);
+        assert_eq!(
+            terminal_run_exit(SessionStatus::Failed, None),
+            Some((4, "run failed".to_string()))
+        );
+        assert_eq!(
+            terminal_run_exit(SessionStatus::Idle, None),
+            Some((4, "run returned non-terminal status idle".to_string()))
+        );
+        assert_eq!(
+            terminal_run_exit(SessionStatus::Running, None),
+            Some((4, "run returned non-terminal status running".to_string()))
+        );
+        assert_eq!(
+            terminal_run_exit(
+                SessionStatus::Cancelled,
+                Some(TurnInterruptionCause::UserStop)
+            ),
+            Some((130, "run cancelled by user".to_string()))
+        );
+    }
 }

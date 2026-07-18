@@ -3,14 +3,12 @@
 [model]
 base_url = "http://127.0.0.1:1234"
 model = "qwen/qwen3.6-35b-a3b"
-prompt_profile = "auto"
 provider_metadata_mode = "lm_studio_native_required"
 api_key_env = "OPENAI_API_KEY"
-request_timeout_ms = 600000
+request_timeout_ms = 300000
 stream_idle_timeout_ms = 300000
 connect_timeout_ms = 10000
 max_retries = 2
-stream_max_retries = 2
 context_window = 131072
 max_output_tokens = 8192
 stop_sequences = []
@@ -26,10 +24,6 @@ max_parallel_predictions = 1
 num_ctx = 131072
 
 [session]
-default_title_max_len = 80
-transcript_limit_messages = 200
-auto_resume_last = false
-max_steps_per_turn = 128
 overflow_margin_tokens = 1024
 
 [permissions]
@@ -120,12 +114,19 @@ enabled = false
 transport = "http"
 base_url = "http://127.0.0.1:8123/mcp"
 timeout_ms = 120000
-route_allowlist = [
-    "ask",
-    "docs",
-    "review",
-]
-tool_allowlist = []
+
+# Every callable MCP tool needs one explicit effect route; unlisted routes fail closed.
+[[mcp.servers.tool_routes]]
+name = "ask"
+effect = "read"
+
+[[mcp.servers.tool_routes]]
+name = "docs"
+effect = "read"
+
+[[mcp.servers.tool_routes]]
+name = "review"
+effect = "read"
 
 [mcp.servers.headers]
 

@@ -29,6 +29,7 @@ required-features = ["tauri-desktop"]
 [dependencies]
 async-trait = "0.1.89"
 base64 = "0.22.1"
+bytes = "1.10.1"
 camino = { version = "1.2.1", features = ["serde1"] }
 chrono = "0.4.44"
 clap = { version = "4.5.39", features = ["derive", "env"] }
@@ -61,6 +62,24 @@ toml = "0.8.23"
 tui-textarea = "0.7.0"
 ulid = { version = "1.2.1", features = ["serde"] }
 unicode-width = "0.2.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemServices",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.184"
 
 [dev-dependencies]
 assert_cmd = "2.1.1"

@@ -61,40 +61,21 @@ pub fn builtin_permission_profiles() -> Vec<PermissionProfileEntry> {
             available: true,
         },
         PermissionProfileEntry {
-            mode: AccessMode::AutoReview,
-            id: "auto_review".to_string(),
-            label: "Auto Review".to_string(),
-            summary: "Automatically allows workspace read/search/list and non-risky edits."
-                .to_string(),
-            auto_allowed: strings(&["workspace list/search/read", "non-risky workspace edits"]),
-            requires_review: vec![
-                "shell",
-                "destructive edits",
-                "workspace authority files",
-                "detected outside configured boundary",
-                "network or external connections",
-            ]
-            .into_iter()
-            .map(ToString::to_string)
-            .collect(),
-            selected: false,
-            available: true,
-        },
-        PermissionProfileEntry {
             mode: AccessMode::FullAccess,
             id: "full_access".to_string(),
             label: "Full Access".to_string(),
-            summary: "Automatically allows ordinary configured-boundary operations. Shell review uses detected targets and risks; it is not an OS sandbox."
+            summary: "Automatically allows stable-handle-verified non-authority file operations inside the configured boundary. Workspace authority files, shell, and external operations require explicit human confirmation because this is not an OS sandbox."
                 .to_string(),
-            auto_allowed: strings(&["workspace list/search/read", "workspace edits", "shell"]),
-            requires_review: vec![
+            auto_allowed: strings(&[
+                "stable-handle-verified file list/search/read inside the configured boundary",
+                "stable-handle-verified file edits inside the configured boundary",
+            ]),
+            requires_review: strings(&[
                 "workspace authority files",
+                "shell",
                 "detected outside configured boundary",
-                "network or external connections",
-            ]
-            .into_iter()
-            .map(ToString::to_string)
-            .collect(),
+                "network, configured services, or other external operations",
+            ]),
             selected: false,
             available: true,
         },
@@ -111,14 +92,14 @@ mod tests {
 
     #[test]
     fn permission_profile_catalog_selects_current_mode() {
-        let catalog = super::PermissionProfileCatalog::for_current(AccessMode::AutoReview);
+        let catalog = super::PermissionProfileCatalog::for_current(AccessMode::FullAccess);
 
-        assert_eq!(catalog.profiles.len(), 3);
+        assert_eq!(catalog.profiles.len(), 2);
         assert_eq!(
             catalog
                 .selected_profile()
                 .map(|profile| profile.id.as_str()),
-            Some("auto_review")
+            Some("full_access")
         );
     }
 
@@ -129,27 +110,37 @@ mod tests {
         assert_eq!(profiles[0].auto_allowed, vec!["workspace list/search/read"]);
         assert_eq!(
             profiles[1].auto_allowed,
-            vec!["workspace list/search/read", "non-risky workspace edits"]
-        );
-        assert_eq!(
-            profiles[2].auto_allowed,
-            vec!["workspace list/search/read", "workspace edits", "shell"]
+            vec![
+                "stable-handle-verified file list/search/read inside the configured boundary",
+                "stable-handle-verified file edits inside the configured boundary"
+            ]
         );
         assert_eq!(profiles[0].requires_review[0], "workspace edits");
         assert_eq!(profiles[0].requires_review[1], "shell");
-        assert_eq!(profiles[1].requires_review[0], "shell");
+        assert!(profiles[1].summary.contains("not an OS sandbox"));
         assert!(
-            profiles[2]
+            profiles[1]
                 .requires_review
                 .iter()
-                .any(|value| value == "network or external connections")
+                .any(|value| value == "workspace authority files")
         );
-        assert!(profiles[2].summary.contains("not an OS sandbox"));
         assert!(
-            profiles[2]
+            profiles[1]
+                .requires_review
+                .iter()
+                .any(|value| value == "shell")
+        );
+        assert!(
+            profiles[1]
                 .requires_review
                 .iter()
                 .any(|value| value == "detected outside configured boundary")
+        );
+        assert!(
+            profiles[1]
+                .requires_review
+                .iter()
+                .any(|value| value == "network, configured services, or other external operations")
         );
     }
 }
