@@ -27,7 +27,7 @@ import {
 } from "../src/render.ts";
 import type { DesktopViewState, DesktopWebState, RunMutationTarget } from "../src/types.ts";
 import { createUiLocalState } from "../src/ui_state.ts";
-import { validateConfigInput } from "../src/utils.ts";
+import { displayAccessLabel, validateConfigInput } from "../src/utils.ts";
 import {
   acknowledgeDraftMutation,
   captureDraftMutation,
@@ -1270,6 +1270,13 @@ test("global action shortcuts ignore key-repeat activation", () => {
   assert.equal(globalShortcutAction({ key: "Enter", ctrlKey: true, metaKey: false, repeat: true }), null);
 });
 
+test("access modes use the Codex-aligned Japanese labels", () => {
+  assert.deepEqual(
+    ["default", "auto_review", "full_access"].map(displayAccessLabel),
+    ["承認を求める", "代理で承認", "フルアクセス"],
+  );
+});
+
 test("permission visibility does not stop runtime polling", () => {
   assert.equal(autoRefreshAllowed({ navigation_loading: false, confirmation_visible: true }, false), true);
   assert.equal(autoRefreshAllowed({ navigation_loading: false, confirmation_visible: true }, true), false);
@@ -1447,7 +1454,7 @@ test("a closed dirty settings draft blocks every external config owner mutation"
       required: false,
       min_value: null,
       max_value: null,
-      options: ["default", "full_access"],
+      options: ["default", "auto_review", "full_access"],
     },
   ];
   const before = projection({ config_fields: fields });

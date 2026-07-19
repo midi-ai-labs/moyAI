@@ -11,9 +11,12 @@ use crate::edit::{
 use crate::error::ToolError;
 use crate::protocol::{ToolApprovalDecision, TurnId};
 use crate::runtime::{RunCancelOutcome, RunCancellationCause, RunControl};
-use crate::session::{AdmissionId, SessionContext, SessionId, ToolCallId};
+use crate::session::{AdmissionId, SessionContext, SessionId, SessionRepository, ToolCallId};
 use crate::storage::{SqliteSessionRepository, session_repo::RunAdmissionLeaseRenewalOutcome};
 use crate::storage::{StoragePaths, StoreBundle};
+use crate::tool::permission_guardian::{
+    PermissionGuardian, PermissionGuardianDecision, PermissionGuardianEvidenceState,
+};
 use crate::tool::truncate::ToolTruncator;
 use crate::workspace::{AccessKind, GuardedPath, PathGuard, Workspace};
 
@@ -40,6 +43,7 @@ pub struct ToolContext<'a> {
     pub prompt: &'a mut dyn ConfirmationPrompt,
     pub services: &'a ToolServices,
     pub agent: Option<&'a crate::app::AgentRunContext>,
+    pub permission_guardian: Option<&'a mut dyn PermissionGuardian>,
 }
 
 #[derive(Debug, Clone)]
@@ -230,6 +234,28 @@ impl<'a> ToolContext<'a> {
         outside_workspace: bool,
         risks: Vec<crate::tool::PermissionRisk>,
     ) -> Result<ToolEffectAdmission, ToolError> {
+        self.confirm_if_needed_with_details_and_guardian_evidence(
+            access,
+            summary,
+            details,
+            targets,
+            outside_workspace,
+            risks,
+            PermissionGuardianEvidenceState::permission_request(),
+        )
+        .await
+    }
+
+    pub async fn confirm_if_needed_with_details_and_guardian_evidence(
+        &mut self,
+        access: AccessKind,
+        summary: String,
+        details: Vec<String>,
+        targets: Vec<Utf8PathBuf>,
+        outside_workspace: bool,
+        risks: Vec<crate::tool::PermissionRisk>,
+        guardian_evidence: PermissionGuardianEvidenceState,
+    ) -> Result<ToolEffectAdmission, ToolError> {
         let request = crate::tool::PermissionRequest {
             access,
             summary,
@@ -247,9 +273,43 @@ impl<'a> ToolContext<'a> {
                 .map(|agent| agent.task_name().to_string()),
         };
 
-        let access_mode = self.config.permissions.access_mode;
+        let access_mode = self.current_permission_access_mode().await?;
         if access_mode_allows_permission(access_mode, &request) {
             return self.accept_tool_effect();
+        }
+
+        if access_mode == AccessMode::AutoReview {
+            let evidence = match &guardian_evidence {
+                PermissionGuardianEvidenceState::Complete(evidence) => evidence,
+                PermissionGuardianEvidenceState::Incomplete { reason } => {
+                    return self.decline_permission(format!(
+                        "automatic permission guardian was not given complete action evidence, so the action was blocked: {reason}. Do not retry it or an equivalent workaround without new user authorization"
+                    ));
+                }
+            };
+            let decision = match self.permission_guardian.as_deref_mut() {
+                Some(guardian) => guardian.review(&request, evidence).await,
+                None => {
+                    return self.decline_permission(
+                        "automatic permission guardian is unavailable; the action was blocked"
+                            .to_string(),
+                    );
+                }
+            };
+            if self.run_control.is_cancelled() {
+                return Err(ToolError::RunInterrupted);
+            }
+            return match decision {
+                Ok(PermissionGuardianDecision::Allow { .. }) => self.accept_tool_effect(),
+                Ok(PermissionGuardianDecision::Deny { rationale }) => self.decline_permission(
+                    format!(
+                        "automatic permission guardian denied the action: {rationale}. The action was not executed; do not retry it or an equivalent workaround without new user authorization"
+                    ),
+                ),
+                Err(error) => self.decline_permission(format!(
+                    "automatic permission guardian could not authorize the action, so it was blocked: {error}. Do not retry it or an equivalent workaround without new user authorization"
+                )),
+            };
         }
 
         let outcome = self
@@ -264,14 +324,8 @@ impl<'a> ToolContext<'a> {
             ConfirmationOutcome::Resolved(ToolApprovalDecision::Approved) => {
                 self.accept_tool_effect()
             }
-            ConfirmationOutcome::Resolved(ToolApprovalDecision::Denied { .. }) => {
-                let settlement = self
-                    .run_control
-                    .begin_tool_settlement()
-                    .ok_or(ToolError::RunInterrupted)?;
-                Err(ToolError::PermissionDenied {
-                    settlement: Some(settlement),
-                })
+            ConfirmationOutcome::Resolved(ToolApprovalDecision::Denied { reason }) => {
+                self.decline_permission(reason)
             }
             ConfirmationOutcome::AbortRequested => {
                 let approval_abort = RunCancellationCause::Interruption(
@@ -295,6 +349,31 @@ impl<'a> ToolContext<'a> {
     fn accept_tool_effect(&self) -> Result<ToolEffectAdmission, ToolError> {
         Ok(ToolEffectAdmission::new(self.run_control.clone()))
     }
+
+    fn decline_permission(&self, reason: String) -> Result<ToolEffectAdmission, ToolError> {
+        let settlement = self
+            .run_control
+            .begin_tool_settlement()
+            .ok_or(ToolError::RunInterrupted)?;
+        Err(ToolError::PermissionDenied {
+            reason,
+            settlement: Some(settlement),
+        })
+    }
+
+    async fn current_permission_access_mode(&self) -> Result<AccessMode, ToolError> {
+        let owner_session_id = self
+            .agent
+            .map(crate::app::AgentRunContext::root_session_id)
+            .unwrap_or(self.session.session.id);
+        Ok(self
+            .services
+            .store
+            .session_repo()
+            .get_session(owner_session_id)
+            .await?
+            .access_mode)
+    }
 }
 
 pub fn access_mode_allows_permission(
@@ -302,35 +381,18 @@ pub fn access_mode_allows_permission(
     request: &crate::tool::PermissionRequest,
 ) -> bool {
     match access_mode {
-        AccessMode::FullAccess => full_access_allows(request),
-        AccessMode::Default => default_allows(request),
+        AccessMode::FullAccess => true,
+        AccessMode::Default | AccessMode::AutoReview => workspace_boundary_allows(request),
     }
 }
 
-fn full_access_allows(request: &crate::tool::PermissionRequest) -> bool {
-    if request.outside_workspace || request.access == AccessKind::Shell {
-        return false;
-    }
-    !request.risks.iter().any(|risk| {
-        matches!(
-            risk,
-            crate::tool::PermissionRisk::Network
-                | crate::tool::PermissionRisk::ExternalConnection
-                | crate::tool::PermissionRisk::ConfiguredLocalService
-                | crate::tool::PermissionRisk::ProtectedWorkspaceAuthority
-                | crate::tool::PermissionRisk::ExternalMutation
-                | crate::tool::PermissionRisk::ExternalDestructiveOperation
-        )
-    })
-}
-
-fn default_allows(request: &crate::tool::PermissionRequest) -> bool {
+fn workspace_boundary_allows(request: &crate::tool::PermissionRequest) -> bool {
     if request.outside_workspace || !request.risks.is_empty() {
         return false;
     }
     matches!(
         request.access,
-        AccessKind::List | AccessKind::Search | AccessKind::Read
+        AccessKind::List | AccessKind::Search | AccessKind::Read | AccessKind::Edit
     )
 }
 
@@ -339,9 +401,60 @@ mod tests {
     use camino::Utf8PathBuf;
 
     use super::*;
+    use crate::protocol::ReviewDecision;
     use crate::session::{NewSession, ProjectId, ProjectRepository, SessionRepository};
     use crate::storage::{SqliteStore, StoragePaths};
+    use crate::tool::permission_guardian::{PermissionGuardianDecision, PermissionGuardianError};
     use crate::workspace::AccessKind;
+
+    #[derive(Default)]
+    struct CountingPrompt {
+        requests: usize,
+    }
+
+    impl ConfirmationPrompt for CountingPrompt {
+        fn confirm(
+            &mut self,
+            _request: &crate::tool::PermissionRequest,
+        ) -> Result<ReviewDecision, crate::error::CliPromptError> {
+            self.requests += 1;
+            Ok(ReviewDecision::Denied)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FixedGuardianOutcome {
+        Allow,
+        Deny,
+        Fail,
+    }
+
+    struct FixedGuardian {
+        outcome: FixedGuardianOutcome,
+        requests: usize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PermissionGuardian for FixedGuardian {
+        async fn review(
+            &mut self,
+            _request: &crate::tool::PermissionRequest,
+            _evidence: &crate::tool::permission_guardian::PermissionGuardianEvidence,
+        ) -> Result<PermissionGuardianDecision, PermissionGuardianError> {
+            self.requests += 1;
+            match self.outcome {
+                FixedGuardianOutcome::Allow => Ok(PermissionGuardianDecision::Allow {
+                    rationale: "scoped action".to_string(),
+                }),
+                FixedGuardianOutcome::Deny => Ok(PermissionGuardianDecision::Deny {
+                    rationale: "not authorized".to_string(),
+                }),
+                FixedGuardianOutcome::Fail => Err(PermissionGuardianError::Request(
+                    "fixture transport failure".to_string(),
+                )),
+            }
+        }
+    }
 
     async fn fence_test_session() -> (StoreBundle, SessionId) {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -375,6 +488,50 @@ mod tests {
         (store, session.id)
     }
 
+    async fn permission_fixture(
+        access_mode: AccessMode,
+    ) -> (ResolvedConfig, SessionContext, ToolServices) {
+        let (store, session_id) = fence_test_session().await;
+        if access_mode != AccessMode::Default {
+            store
+                .session_repo()
+                .compare_and_set_root_session_access_mode(
+                    session_id,
+                    AccessMode::Default,
+                    access_mode,
+                )
+                .await
+                .expect("access mode update")
+                .expect("root access owner");
+        }
+        let session = store
+            .session_repo()
+            .get_session(session_id)
+            .await
+            .expect("session");
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::Default;
+        let workspace =
+            crate::workspace::WorkspaceDiscovery::discover_fixed_root(&session.cwd, &config)
+                .expect("workspace");
+        let data_dir = session.cwd.clone();
+        let services = ToolServices {
+            edit_safety: EditSafety::default(),
+            formatter: Formatter::new(config.format.clone()),
+            change_tracker: ChangeTracker,
+            store,
+            storage_paths: StoragePaths {
+                database_path: data_dir.join("moyai.sqlite3"),
+                truncation_dir: data_dir.join("truncation"),
+                data_dir,
+            },
+            truncator: ToolTruncator,
+            mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
+            skills: crate::skill::SkillsService::new(),
+        };
+        (config, SessionContext { session, workspace }, services)
+    }
+
     fn permission(
         access: AccessKind,
         risks: Vec<crate::tool::PermissionRisk>,
@@ -392,27 +549,26 @@ mod tests {
     }
 
     #[test]
-    fn shell_always_requires_an_explicit_decision_without_an_os_sandbox() {
+    fn workspace_modes_review_shell_while_full_access_does_not() {
         let request = permission(AccessKind::Shell, Vec::new());
 
-        assert!(!access_mode_allows_permission(
+        let decisions = [
             AccessMode::Default,
-            &request
-        ));
-        assert!(!access_mode_allows_permission(
+            AccessMode::AutoReview,
             AccessMode::FullAccess,
-            &request
-        ));
+        ]
+        .map(|mode| access_mode_allows_permission(mode, &request));
+        assert_eq!(decisions, [false, false, true]);
     }
 
     #[test]
-    fn full_access_still_requires_shell_confirmation_with_detected_risks() {
+    fn full_access_never_creates_a_permission_prompt() {
         let request = permission(
             AccessKind::Shell,
             vec![crate::tool::PermissionRisk::ExternalConnection],
         );
 
-        assert!(!access_mode_allows_permission(
+        assert!(access_mode_allows_permission(
             AccessMode::FullAccess,
             &request
         ));
@@ -421,13 +577,17 @@ mod tests {
     #[test]
     fn access_mode_policy_is_deterministic_for_risk_free_workspace_operations() {
         let cases = [
-            (AccessKind::List, [true, true]),
-            (AccessKind::Search, [true, true]),
-            (AccessKind::Read, [true, true]),
-            (AccessKind::Edit, [false, true]),
-            (AccessKind::Shell, [false, false]),
+            (AccessKind::List, [true, true, true]),
+            (AccessKind::Search, [true, true, true]),
+            (AccessKind::Read, [true, true, true]),
+            (AccessKind::Edit, [true, true, true]),
+            (AccessKind::Shell, [false, false, true]),
         ];
-        let modes = [AccessMode::Default, AccessMode::FullAccess];
+        let modes = [
+            AccessMode::Default,
+            AccessMode::AutoReview,
+            AccessMode::FullAccess,
+        ];
 
         for (access, expected) in cases {
             let request = permission(access, Vec::new());
@@ -442,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn default_keeps_hard_risk_requests_for_review() {
+    fn workspace_modes_keep_boundary_crossing_requests_for_review() {
         let hard_risks = [
             crate::tool::PermissionRisk::Network,
             crate::tool::PermissionRisk::ExternalConnection,
@@ -455,35 +615,56 @@ mod tests {
                 AccessMode::Default,
                 &request
             ));
+            assert!(!access_mode_allows_permission(
+                AccessMode::AutoReview,
+                &request
+            ));
         }
         let mut outside = permission(AccessKind::Read, Vec::new());
         outside.outside_workspace = true;
-        for mode in [AccessMode::Default, AccessMode::FullAccess] {
-            assert!(!access_mode_allows_permission(mode, &outside));
-        }
+        assert!(!access_mode_allows_permission(
+            AccessMode::Default,
+            &outside
+        ));
+        assert!(!access_mode_allows_permission(
+            AccessMode::AutoReview,
+            &outside
+        ));
+        assert!(access_mode_allows_permission(
+            AccessMode::FullAccess,
+            &outside
+        ));
     }
 
     #[test]
-    fn configured_local_service_requires_confirmation_in_both_modes() {
+    fn configured_local_service_crosses_only_the_workspace_modes_boundary() {
         let request = permission(
             AccessKind::Read,
             vec![crate::tool::PermissionRisk::ConfiguredLocalService],
         );
-        let decisions = [AccessMode::Default, AccessMode::FullAccess]
-            .map(|mode| access_mode_allows_permission(mode, &request));
-        assert_eq!(decisions, [false, false]);
+        let decisions = [
+            AccessMode::Default,
+            AccessMode::AutoReview,
+            AccessMode::FullAccess,
+        ]
+        .map(|mode| access_mode_allows_permission(mode, &request));
+        assert_eq!(decisions, [false, false, true]);
     }
 
     #[test]
-    fn workspace_authority_requires_confirmation_in_both_modes() {
+    fn workspace_authority_crosses_only_the_workspace_modes_boundary() {
         let request = permission(
             AccessKind::Edit,
             vec![crate::tool::PermissionRisk::ProtectedWorkspaceAuthority],
         );
-        let decisions = [AccessMode::Default, AccessMode::FullAccess]
-            .map(|mode| access_mode_allows_permission(mode, &request));
+        let decisions = [
+            AccessMode::Default,
+            AccessMode::AutoReview,
+            AccessMode::FullAccess,
+        ]
+        .map(|mode| access_mode_allows_permission(mode, &request));
 
-        assert_eq!(decisions, [false, false]);
+        assert_eq!(decisions, [false, false, true]);
         assert!(access_mode_allows_permission(
             AccessMode::FullAccess,
             &permission(AccessKind::Edit, Vec::new())
@@ -491,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn full_access_keeps_external_effects_for_explicit_confirmation() {
+    fn full_access_allows_external_effects_without_permission_confirmation() {
         for (access, risk) in [
             (AccessKind::Read, crate::tool::PermissionRisk::Network),
             (
@@ -512,7 +693,7 @@ mod tests {
             ),
         ] {
             let request = permission(access, vec![risk]);
-            assert!(!access_mode_allows_permission(
+            assert!(access_mode_allows_permission(
                 AccessMode::FullAccess,
                 &request
             ));
@@ -521,15 +702,219 @@ mod tests {
 
     #[test]
     fn destructive_and_move_risks_expand_only_at_full_access() {
-        let modes = [AccessMode::Default, AccessMode::FullAccess];
+        let modes = [
+            AccessMode::Default,
+            AccessMode::AutoReview,
+            AccessMode::FullAccess,
+        ];
         for risk in [
             crate::tool::PermissionRisk::DestructiveDelete,
             crate::tool::PermissionRisk::MoveOrRename,
         ] {
             let request = permission(AccessKind::Edit, vec![risk]);
             let decisions = modes.map(|mode| access_mode_allows_permission(mode, &request));
-            assert_eq!(decisions, [false, true]);
+            assert_eq!(decisions, [false, false, true]);
         }
+    }
+
+    #[tokio::test]
+    async fn permission_decision_reads_the_durable_root_mode_after_turn_admission() {
+        let (config, session, services) = permission_fixture(AccessMode::Default).await;
+        services
+            .store
+            .session_repo()
+            .compare_and_set_root_session_access_mode(
+                session.session.id,
+                AccessMode::Default,
+                AccessMode::FullAccess,
+            )
+            .await
+            .expect("live access update")
+            .expect("matching access owner");
+        assert_eq!(config.permissions.access_mode, AccessMode::Default);
+        assert_eq!(session.session.access_mode, AccessMode::Default);
+
+        let control = RunControl::new();
+        let mut prompt = CountingPrompt::default();
+        let mut context = ToolContext {
+            session: &session,
+            workspace: &session.workspace,
+            config: &config,
+            tool_call_id: ToolCallId::new(),
+            cancel: control.token(),
+            run_control: control.clone(),
+            run_mutation_fence: RunMutationFence::new(
+                services.store.session_repo(),
+                session.session.id,
+                AdmissionId::new(),
+                TurnId::new(),
+                control,
+            ),
+            prompt: &mut prompt,
+            services: &services,
+            agent: None,
+            permission_guardian: None,
+        };
+        let _ = context
+            .confirm_if_needed(
+                AccessKind::Shell,
+                "run a command".to_string(),
+                Vec::new(),
+                false,
+                Vec::new(),
+            )
+            .await
+            .expect("full access from durable root owner");
+        drop(context);
+        assert_eq!(prompt.requests, 0);
+
+        services
+            .store
+            .session_repo()
+            .compare_and_set_root_session_access_mode(
+                session.session.id,
+                AccessMode::FullAccess,
+                AccessMode::Default,
+            )
+            .await
+            .expect("live access downgrade")
+            .expect("matching access owner");
+        let control = RunControl::new();
+        let mut context = ToolContext {
+            session: &session,
+            workspace: &session.workspace,
+            config: &config,
+            tool_call_id: ToolCallId::new(),
+            cancel: control.token(),
+            run_control: control.clone(),
+            run_mutation_fence: RunMutationFence::new(
+                services.store.session_repo(),
+                session.session.id,
+                AdmissionId::new(),
+                TurnId::new(),
+                control,
+            ),
+            prompt: &mut prompt,
+            services: &services,
+            agent: None,
+            permission_guardian: None,
+        };
+        assert!(matches!(
+            context
+                .confirm_if_needed(
+                    AccessKind::Shell,
+                    "run a second command".to_string(),
+                    Vec::new(),
+                    false,
+                    Vec::new(),
+                )
+                .await,
+            Err(ToolError::PermissionDenied { .. })
+        ));
+        drop(context);
+        assert_eq!(prompt.requests, 1);
+    }
+
+    #[tokio::test]
+    async fn auto_review_uses_guardian_as_final_decision_without_human_fallback() {
+        for outcome in [
+            FixedGuardianOutcome::Allow,
+            FixedGuardianOutcome::Deny,
+            FixedGuardianOutcome::Fail,
+        ] {
+            let (config, session, services) = permission_fixture(AccessMode::AutoReview).await;
+            let control = RunControl::new();
+            let mut prompt = CountingPrompt::default();
+            let mut guardian = FixedGuardian {
+                outcome,
+                requests: 0,
+            };
+            let mut context = ToolContext {
+                session: &session,
+                workspace: &session.workspace,
+                config: &config,
+                tool_call_id: ToolCallId::new(),
+                cancel: control.token(),
+                run_control: control.clone(),
+                run_mutation_fence: RunMutationFence::new(
+                    services.store.session_repo(),
+                    session.session.id,
+                    AdmissionId::new(),
+                    TurnId::new(),
+                    control,
+                ),
+                prompt: &mut prompt,
+                services: &services,
+                agent: None,
+                permission_guardian: Some(&mut guardian),
+            };
+            let result = context
+                .confirm_if_needed(
+                    AccessKind::Shell,
+                    "run a command".to_string(),
+                    Vec::new(),
+                    false,
+                    Vec::new(),
+                )
+                .await;
+            drop(context);
+            match guardian.outcome {
+                FixedGuardianOutcome::Allow => assert!(result.is_ok()),
+                FixedGuardianOutcome::Deny | FixedGuardianOutcome::Fail => {
+                    assert!(matches!(result, Err(ToolError::PermissionDenied { .. })))
+                }
+            }
+            assert_eq!(guardian.requests, 1);
+            assert_eq!(prompt.requests, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_review_fails_closed_before_guardian_when_action_evidence_is_incomplete() {
+        let (config, session, services) = permission_fixture(AccessMode::AutoReview).await;
+        let control = RunControl::new();
+        let mut prompt = CountingPrompt::default();
+        let mut guardian = FixedGuardian {
+            outcome: FixedGuardianOutcome::Allow,
+            requests: 0,
+        };
+        let mut context = ToolContext {
+            session: &session,
+            workspace: &session.workspace,
+            config: &config,
+            tool_call_id: ToolCallId::new(),
+            cancel: control.token(),
+            run_control: control.clone(),
+            run_mutation_fence: RunMutationFence::new(
+                services.store.session_repo(),
+                session.session.id,
+                AdmissionId::new(),
+                TurnId::new(),
+                control,
+            ),
+            prompt: &mut prompt,
+            services: &services,
+            agent: None,
+            permission_guardian: Some(&mut guardian),
+        };
+        let result = context
+            .confirm_if_needed_with_details_and_guardian_evidence(
+                AccessKind::Shell,
+                "run an incompletely represented action".to_string(),
+                vec!["bounded human detail".to_string()],
+                Vec::new(),
+                false,
+                Vec::new(),
+                PermissionGuardianEvidenceState::incomplete(
+                    "a sensitive executable field was redacted",
+                ),
+            )
+            .await;
+        drop(context);
+
+        assert!(matches!(result, Err(ToolError::PermissionDenied { .. })));
+        assert_eq!(guardian.requests, 0);
+        assert_eq!(prompt.requests, 0);
     }
 
     #[tokio::test]

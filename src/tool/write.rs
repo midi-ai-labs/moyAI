@@ -544,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_formatter_promotes_write_to_shell_permission_in_every_access_mode() {
+    fn configured_formatter_crosses_the_workspace_boundary_except_in_full_access() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
         let target = root.join("output.txt");
@@ -566,6 +566,10 @@ mod tests {
             &request
         ));
         assert!(!access_mode_allows_permission(
+            AccessMode::AutoReview,
+            &request
+        ));
+        assert!(access_mode_allows_permission(
             AccessMode::FullAccess,
             &request
         ));
@@ -574,7 +578,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn denied_full_access_formatter_spawns_no_process_and_mutates_no_file() {
+    async fn denied_ask_mode_formatter_spawns_no_process_and_mutates_no_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
         let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
@@ -601,12 +605,12 @@ mod tests {
                 cwd: root.clone(),
                 model: "model".to_string(),
                 base_url: "http://localhost:1234".to_string(),
-                access_mode: AccessMode::FullAccess,
+                access_mode: AccessMode::Default,
             })
             .await
             .expect("session");
         let mut config = crate::config::ResolvedConfig::default();
-        config.permissions.access_mode = AccessMode::FullAccess;
+        config.permissions.access_mode = AccessMode::Default;
         config.format = marker_format_config();
         let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
         let session_context = SessionContext { session, workspace };
@@ -645,6 +649,7 @@ mod tests {
                     prompt: &mut prompt,
                     services: &services,
                     agent: None,
+                    permission_guardian: None,
                 },
             )
             .await

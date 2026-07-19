@@ -46,6 +46,15 @@ impl App {
     }
 }
 
+#[async_trait::async_trait(?Send)]
+pub trait RunSessionAccessModeAdoption: Send + Sync {
+    async fn adopt(
+        &self,
+        session_id: SessionId,
+        admitted_access_mode: AccessMode,
+    ) -> Result<(), String>;
+}
+
 #[derive(Clone)]
 pub enum RunConfigInput {
     Layered {
@@ -93,6 +102,9 @@ pub struct RunRequest {
     pub review_request: Option<ReviewRequest>,
     pub image_paths: Vec<Utf8PathBuf>,
     pub run_control: crate::runtime::RunControl,
+    /// Optional surface-owned handoff that commits a permission-mode change made while a new
+    /// root session is still being admitted. The durable session remains the decision owner.
+    pub session_access_mode_adoption: Option<std::sync::Arc<dyn RunSessionAccessModeAdoption>>,
     /// Cloneable permission channel inherited by child agent sessions.
     pub agent_confirmation: Option<crate::cli::SharedConfirmationPrompt>,
     /// Internal identity for a child turn. User-owned surface requests always leave this unset.
@@ -216,6 +228,10 @@ impl std::fmt::Debug for RunRequest {
             .field("review_request", &self.review_request)
             .field("image_count", &self.image_paths.len())
             .field("run_control", &self.run_control)
+            .field(
+                "session_access_mode_adoption_present",
+                &self.session_access_mode_adoption.is_some(),
+            )
             .field(
                 "agent_confirmation_present",
                 &self.agent_confirmation.is_some(),

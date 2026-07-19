@@ -138,13 +138,6 @@ pub(crate) fn access_runtime_owner_token(
     }
 }
 
-pub(crate) fn access_runtime_allows_mutation(
-    root_run_generation: Option<u64>,
-    agent_tree_active: bool,
-) -> bool {
-    root_run_generation.is_some() || !agent_tree_active
-}
-
 pub(crate) fn navigation_admission_blocker(
     busy: bool,
     background_mutation_pending: bool,
@@ -458,9 +451,8 @@ pub(crate) fn desktop_web_state_with_permission(
         && !state.navigation_loading()
         && !state.background_mutation_pending();
     let external_config_owner_mutation_open = !state.background_mutation_pending();
-    let access_mode_mutation_open = !state.navigation_loading()
-        && !state.background_mutation_pending()
-        && access_runtime_allows_mutation(runtime.root_run_generation, runtime.agent_tree_active);
+    let access_mode_mutation_open =
+        !state.navigation_loading() && !state.background_mutation_pending();
     let config_draft_capabilities = DesktopConfigDraftCapabilitiesProjection {
         clean: config_draft_capability_projection(
             false,
@@ -731,7 +723,7 @@ struct ConfigFieldMetadata {
 fn config_field_metadata(field: ConfigField) -> ConfigFieldMetadata {
     const NONE: &[&str] = &[];
     const PROVIDER_MODES: &[&str] = &["lm_studio_native_required", "openai_compatible_only"];
-    const ACCESS_MODES: &[&str] = &["default", "full_access"];
+    const ACCESS_MODES: &[&str] = &["default", "auto_review", "full_access"];
     const MULTI_AGENT_MODES: &[&str] = &["explicit_request_only", "proactive"];
 
     let (value_type, min_value, max_value, options) = match field {
@@ -887,6 +879,7 @@ fn run_status_key(status: RunStatus) -> &'static str {
 fn access_mode_key(access: AccessMode) -> &'static str {
     match access {
         AccessMode::Default => "default",
+        AccessMode::AutoReview => "auto_review",
         AccessMode::FullAccess => "full_access",
     }
 }
@@ -1320,6 +1313,11 @@ mod tests {
         let mode = config_field_metadata(ConfigField::MultiAgentMode);
         assert_eq!(mode.value_type, "enum");
         assert_eq!(mode.options, &["explicit_request_only", "proactive"]);
+
+        let access = config_field_metadata(ConfigField::AccessMode);
+        assert_eq!(access.value_type, "enum");
+        assert_eq!(access.options, &["default", "auto_review", "full_access"]);
+        assert_eq!(access_mode_key(AccessMode::AutoReview), "auto_review");
     }
 
     #[test]
@@ -1381,16 +1379,15 @@ mod tests {
     #[test]
     fn access_runtime_owner_distinguishes_queued_commands_across_the_tree_lifecycle() {
         let lifecycle = [
-            (None, false, 7, "idle:7", true),
-            (Some(8), false, 8, "root:8", true),
-            (None, true, 8, "tree:8", false),
-            (None, false, 8, "idle:8", true),
+            (None, false, 7, "idle:7"),
+            (Some(8), false, 8, "root:8"),
+            (None, true, 8, "tree:8"),
+            (None, false, 8, "idle:8"),
         ];
         let mut tokens = std::collections::BTreeSet::new();
-        for (root, tree, epoch, expected_token, expected_enabled) in lifecycle {
+        for (root, tree, epoch, expected_token) in lifecycle {
             let token = access_runtime_owner_token(root, tree, epoch);
             assert_eq!(token, expected_token);
-            assert_eq!(access_runtime_allows_mutation(root, tree), expected_enabled);
             assert!(
                 tokens.insert(token),
                 "each lifecycle boundary is a CAS barrier"
@@ -1471,7 +1468,7 @@ mod tests {
             },
         );
         assert!(
-            !child_only
+            child_only
                 .config_draft_capabilities
                 .clean
                 .access_mode_mutation_enabled

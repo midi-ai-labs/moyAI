@@ -70,7 +70,7 @@ moyAI is designed around those constraints:
 - Bounded workspace traversal/search/directory inspection with continuation cursors, guarded file reads, diff-based edits, and shell execution.
 - File writes and patches use one stable-handle, no-clobber conditional commit for create, update, delete, and rollback. A concurrent external replacement wins without being overwritten; if restoration cannot reclaim the target name, moyAI reports the preserved backup path. Parent directories are not created implicitly, so create the parent first.
 - On Unix, moyAI cannot prove that a writable descriptor opened before an update or delete no longer references the detached inode. Creation remains unchanged, but an existing-file update installs the new target and a delete detaches the target while retaining the old inode at a private backup path; both report a typed partial-commit error instead of claiming safe cleanup. Inspect and reconcile the reported backup because a pre-opened writer can still modify it.
-- Permission presets: `default` and `full_access`. `default` automatically allows configured-boundary reads and sends all other actions to explicit human confirmation. `full_access` automatically allows ordinary file operations verified against the configured boundary through stable filesystem handles, but workspace authority files, shell commands, network/service calls, and other external operations always require human confirmation. Detected outside-boundary file operations also require confirmation. There is no second AI reviewer/model loop. Desktop and TUI remember the selected root-session owner. Choosing **do not run; change instructions**, an external Stop, and an operational failure remain separate typed outcomes. Commands run with the current user account.
+- Permission modes: **Ask for approval** (`default` / 承認を求める), **Approve for me** (`auto_review` / 代理で承認), and **Full access** (`full_access` / フルアクセス). Ask and Auto share one deterministic workspace boundary that automatically admits risk-free List/Search/Read/Edit operations, including stable file edits. No-OS-sandbox shell commands, external/network effects, outside-boundary operations, and classified risks go to a human confirmation in Ask mode or to a separate tool-less AI Guardian in Auto mode. The Guardian judges complete typed action evidence separately from the bounded human preview: MCP preserves normalized full arguments, the configured target, and credential presence; Docling preserves the exact endpoint, source, effective options, and credential presence, without disclosing secret values. Incomplete evidence, denial, invalid output, unavailability, the 90-second total deadline, and request/storage failures all fail closed without a human fallback. Its tool-less request uses the current WorldState, exact committed call, and bounded prior results from the same response while remaining isolated from task-generation sampling. Full Access shows no permission prompt, but stable-handle, path-integrity, workspace-authority, no-clobber, and other product guards remain enforced. Desktop and TUI remember the selected root-session owner. Choosing **do not run; change instructions**, a Guardian denial, an external Stop, and an operational failure remain separate typed outcomes. Commands run with the current user account.
 - Vision-capable model support for image attachments.
 - Optional Docling Serve and HTTP MCP integration for document-heavy workflows.
 - Local instructions from `AGENTS.md`, `CLAUDE.md`, `.moyai/rules*`, `.moyai/commands/*.md`, and local `SKILL.md` files.
@@ -321,22 +321,39 @@ contract. Chat Completions varies by provider, so reasoning parameters remain fa
 
 ## Runtime and History Continuity
 
-Each turn captures one complete immutable `ResolvedTurnConfig` for model, provider target, operation
-deadlines, permissions, and remaining effective settings, then gives its single `TurnContext` owner
-the turn/admission identity, selected policy, and durable
-collaboration-mode instruction. Partial configuration is resolved only before admission and is not
-merged again by later runtime stages.
+Each turn captures one complete `ResolvedTurnConfig` for model, provider target, operation deadlines,
+the admitted permission preset, and remaining effective settings, then gives its single `TurnContext`
+owner the turn/admission identity, selected policy, and durable collaboration-mode instruction. Partial
+configuration is resolved only before admission and is not merged again by later runtime stages.
 It also captures one turn-start wall-clock snapshot. Step/world-state refreshes reuse that snapshot so
 a clock tick alone does not invalidate Responses continuity; an explicit `current_time` tool call still
 performs a fresh read.
 Session/workspace state remains in `SessionContext`, while the root-scoped agent context owns the
-agent-tree role. Access and multi-agent modes are derived from the `ResolvedTurnConfig` captured at
-admission. A settings change cannot rewrite the current turn or an in-flight permission request; it
-applies to turns admitted later. Each model request captures a `StepContext`
+agent-tree role. Model, provider, deadline, multi-agent, and `RunConfigSnapshot` state remain immutable
+through the turn. Permission decisions are the narrow exception: immediately before each decision,
+moyAI reads the durable root-session access mode, including for child-agent requests. A committed
+root-only mode switch therefore applies to the next permission request even in the active turn. It does
+not rewrite an already displayed pending request or an already admitted effect. Each model request captures a `StepContext`
 for the current world state, skills, and optional external-tool availability. The same step produces
 the advertised tool schema, execution router, and effect classification, so visibility and safety are
 not separate execution contracts. MCP effects come only from explicit per-server tool routes; an
 unlisted route is rejected.
+
+The AutoReview Guardian receives a complete typed action-evidence object separately from the bounded
+human-facing permission preview. MCP calls retain their normalized full arguments, configured target,
+exact tool name, and credential-presence flag; Docling retains its exact endpoint, local path or source
+URL, effective format/OCR/image/page options, and credential-presence flag. Secret values are not sent.
+If redaction or invalid configuration makes the executable effect incomplete, AutoReview denies before
+calling either the Guardian or a human. The Guardian request includes the current `WorldState`, bounded
+active canonical task context, the current exact committed response/call, and bounded results of prior
+tools in that same response. It has no tools, reasoning, or continuation, does not inherit task-generation
+sampling/stop/arbitrary-extra-body controls, and has a 90-second total deadline.
+
+Desktop binds a mode update made while only child agents remain active to the current root session and
+the exact `tree:N` owner; only the matching completion from `tree:N` to `idle:N` is accepted. For a new
+TUI root session, `RunSessionAccessModeAdoption` commits the latest pre-admission F8 selection to the
+durable session before `SessionStarted` or the agent loop. Switching with a human prompt already pending
+does not alter or settle that prompt; it affects only the next permission decision.
 
 Canonical protocol history is the conversation source of truth. User and steer turns enter it directly;
 assistant messages, raw tool calls/outputs, collaboration-mode instructions, and compaction lineage are
@@ -364,6 +381,9 @@ TUI does not insert a submitted user/steer row or clear the composer optimistica
 and steer submission identities, projects the row after durable `UserTurnStored` / successful
 `SteerStored` acceptance, and clears only a draft whose revision and text are still unchanged. A
 pre-admission/storage failure or a post-submit edit keeps the draft and creates no phantom user row.
+For a new root session, a pre-admission F8 access-mode change is adopted into that durable session before
+`SessionStarted` and before the agent loop; F8 during an existing human permission prompt leaves the
+prompt unchanged and applies the committed mode only to the next permission decision.
 Prompt Enhance is single-flight under a request ID and cancellation token. During the request, `Esc`
 cancels the provider while keeping the raw composer and the TUI running; `Ctrl+Q` cancels the provider
 and pending review before quitting. A late completion after cancellation cannot reopen the review.
@@ -405,8 +425,9 @@ protocol items before dropping the legacy tables. V37 converts a raw tool call o
 provider-response identity can be recovered uniquely from canonical evidence in the same turn. With
 zero or multiple candidates, the entire upgrade transaction rolls back and leaves the database
 unchanged; it neither deletes the ambiguous turn nor introduces an unresolved current payload variant.
-Back up the moyAI data directory before upgrading existing data. V38 then maps any retired `auto_review` session value
-one way to `default` and rebuilds the current storage domain with only `default` and `full_access`.
+Back up the moyAI data directory before upgrading existing data. V38 historically mapped the then-retired
+`auto_review` session value one way to `default` and rebuilt that schema's storage domain with only
+`default` and `full_access`.
 V39 rewrites legacy terminal JSON into the discriminated outcome contract, removes retired durable
 retry/delta rows, and fails closed rather than inventing an interruption cause. V40 keeps only valid
 flat root-to-direct-child spawn edges; nested edges are discarded without reparenting, while their
@@ -432,6 +453,9 @@ V44 adds a partial unique index that permits exactly one terminal runtime event 
 Migration rolls back without recording its marker when duplicate terminals already exist, and current
 opens validate the index table, key order, and predicate. Terminal readers also detect a second row and
 fail closed rather than relying on the index alone.
+V45 restores the current three-value session access domain: `default`, `auto_review`, and `full_access`.
+Values already collapsed to `default` by V38 cannot be distinguished from genuine Default choices and
+are therefore not reconstructed; users can explicitly select Auto Review again after the upgrade.
 
 The default tool surface exposes `update_plan` for non-trivial work. Its structured result is only a
 client-visible plan projection: it does not decide the next tool, end the turn, or trigger

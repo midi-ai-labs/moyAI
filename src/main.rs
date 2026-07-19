@@ -334,6 +334,7 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
             },
             image_paths: args.image_paths.clone(),
             run_control: moyai::runtime::RunControl::new(),
+            session_access_mode_adoption: None,
             agent_confirmation: None,
             agent_context: None,
         }),

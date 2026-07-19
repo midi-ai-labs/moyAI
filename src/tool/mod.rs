@@ -8,6 +8,7 @@ pub mod inspect_directory;
 pub(crate) mod internal_output;
 pub mod mcp_call;
 pub mod multi_agent;
+pub(crate) mod permission_guardian;
 pub(crate) mod process;
 pub mod read;
 pub mod registry;

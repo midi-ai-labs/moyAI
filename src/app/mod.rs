@@ -9,11 +9,11 @@ pub use agent_runtime::{
 };
 pub use bootstrap::AppBootstrap;
 pub use command::{
-    App, AppCommand, ReviewRequest, RunConfigInput, RunRequest, SessionArchiveRequest,
-    SessionEventsRequest, SessionForkRequest, SessionGoalClearRequest, SessionGoalGetRequest,
-    SessionGoalSetRequest, SessionHistoryRequest, SessionIdleAdmissionRequest,
-    SessionInterruptRequest, SessionListRequest, SessionLoadedRequest, SessionReadRequest,
-    SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
+    App, AppCommand, ReviewRequest, RunConfigInput, RunRequest, RunSessionAccessModeAdoption,
+    SessionArchiveRequest, SessionEventsRequest, SessionForkRequest, SessionGoalClearRequest,
+    SessionGoalGetRequest, SessionGoalSetRequest, SessionHistoryRequest,
+    SessionIdleAdmissionRequest, SessionInterruptRequest, SessionListRequest, SessionLoadedRequest,
+    SessionReadRequest, SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
     SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest,
     SessionTitleUpdateRequest, SessionTurnsRequest,
 };

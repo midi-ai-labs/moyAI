@@ -91,6 +91,8 @@ const V43_INDEXED_INTERNAL_FILE_OWNERSHIP: &str =
     include_str!("../../migrations/V43__indexed_internal_file_ownership.sql");
 const V44_UNIQUE_TURN_TERMINAL: &str =
     include_str!("../../migrations/V44__unique_turn_terminal.sql");
+const V45_RESTORE_AUTO_REVIEW_ACCESS_MODE: &str =
+    include_str!("../../migrations/V45__restore_auto_review_access_mode.sql");
 const LEGACY_PLANNER_CUTOVER_VERSION: i64 = 32;
 const CANONICAL_PROTOCOL_STORAGE_VERSION: i64 = 33;
 const DROP_SESSIONS_MEMORY_MODE_VERSION: i64 = 34;
@@ -104,8 +106,9 @@ const INDEXED_COLLABORATION_MODE_LOOKUP_VERSION: i64 = 41;
 const TYPED_HISTORY_SCOPE_VERSION: i64 = 42;
 const INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION: i64 = 43;
 const UNIQUE_TURN_TERMINAL_VERSION: i64 = 44;
+const RESTORE_AUTO_REVIEW_ACCESS_MODE_VERSION: i64 = 45;
 const SESSION_STATUS_DOMAIN: &[&str] = &["idle", "running", "completed", "cancelled", "failed"];
-const SESSION_ACCESS_MODE_DOMAIN: &[&str] = &["default", "full_access"];
+const SESSION_ACCESS_MODE_DOMAIN: &[&str] = &["default", "auto_review", "full_access"];
 const RELEASED_V18_SESSION_STATUS_DOMAIN: &[&str] = &[
     "idle",
     "running",
@@ -124,18 +127,25 @@ const TOOL_CALL_STATUS_DOMAIN: &[&str] = &[
 ];
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
+    if schema_migration_applied(connection, RESTORE_AUTO_REVIEW_ACCESS_MODE_VERSION)? {
+        validate_canonical_protocol_schema(connection)?;
+        return Ok(());
+    }
     if schema_migration_applied(connection, UNIQUE_TURN_TERMINAL_VERSION)? {
+        run_restore_auto_review_access_mode(connection)?;
         validate_canonical_protocol_schema(connection)?;
         return Ok(());
     }
     if schema_migration_applied(connection, INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION)? {
         run_unique_turn_terminal(connection)?;
+        run_restore_auto_review_access_mode(connection)?;
         validate_canonical_protocol_schema(connection)?;
         return Ok(());
     }
     if schema_migration_applied(connection, TYPED_HISTORY_SCOPE_VERSION)? {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
+        run_restore_auto_review_access_mode(connection)?;
         validate_canonical_protocol_schema(connection)?;
         return Ok(());
     }
@@ -143,6 +153,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_typed_history_scope(connection)?;
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
+        run_restore_auto_review_access_mode(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -151,6 +162,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_typed_history_scope(connection)?;
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
+        run_restore_auto_review_access_mode(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -160,6 +172,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_typed_history_scope(connection)?;
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
+        run_restore_auto_review_access_mode(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -170,6 +183,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_typed_history_scope(connection)?;
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
+        run_restore_auto_review_access_mode(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -181,6 +195,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_typed_history_scope(connection)?;
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
+        run_restore_auto_review_access_mode(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -193,6 +208,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_typed_history_scope(connection)?;
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
+        run_restore_auto_review_access_mode(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -206,6 +222,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_typed_history_scope(connection)?;
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
+        run_restore_auto_review_access_mode(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -220,6 +237,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_typed_history_scope(connection)?;
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
+        run_restore_auto_review_access_mode(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -235,6 +253,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_typed_history_scope(connection)?;
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
+        run_restore_auto_review_access_mode(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -257,6 +276,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
     run_typed_history_scope(connection)?;
     run_indexed_internal_file_ownership(connection)?;
     run_unique_turn_terminal(connection)?;
+    run_restore_auto_review_access_mode(connection)?;
     validate_canonical_protocol_storage(connection)?;
     Ok(())
 }
@@ -884,6 +904,14 @@ fn run_remove_auto_review_access_mode(connection: &Connection) -> Result<(), Sto
         connection,
         V38_REMOVE_AUTO_REVIEW_ACCESS_MODE,
         "V38 auto-review access mode removal migration",
+    )
+}
+
+fn run_restore_auto_review_access_mode(connection: &Connection) -> Result<(), StorageError> {
+    run_foreign_keys_disabled_migration(
+        connection,
+        V45_RESTORE_AUTO_REVIEW_ACCESS_MODE,
+        "V45 auto-review access mode restoration migration",
     )
 }
 
@@ -1766,6 +1794,12 @@ fn run_through_v36(connection: &Connection) -> Result<(), StorageError> {
 }
 
 fn validate_canonical_protocol_schema(connection: &Connection) -> Result<(), StorageError> {
+    if !schema_migration_applied(connection, RESTORE_AUTO_REVIEW_ACCESS_MODE_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V45 auto-review access mode restoration marker"
+                .to_string(),
+        ));
+    }
     if !schema_migration_applied(connection, UNIQUE_TURN_TERMINAL_VERSION)? {
         return Err(StorageError::Message(
             "current storage is missing the V44 unique turn-terminal marker".to_string(),
@@ -1838,7 +1872,7 @@ fn validate_canonical_protocol_schema(connection: &Connection) -> Result<(), Sto
     }
     if !table_has_exact_access_mode_domain(connection, "sessions", SESSION_ACCESS_MODE_DOMAIN)? {
         return Err(StorageError::Message(
-            "V38 access mode marker exists but sessions still accepts auto_review or has another non-current access mode domain"
+            "V45 access mode marker exists but sessions does not have the exact default/auto_review/full_access domain"
                 .to_string(),
         ));
     }
@@ -3983,6 +4017,12 @@ mod tests {
         run_typed_history_scope(connection).expect("V42 schema");
     }
 
+    fn run_through_v44(connection: &Connection) {
+        run_through_v42(connection);
+        run_indexed_internal_file_ownership(connection).expect("V43 schema");
+        run_unique_turn_terminal(connection).expect("V44 schema");
+    }
+
     fn insert_tool_call_parent_rows(connection: &Connection) {
         connection
             .execute_batch(
@@ -5900,7 +5940,7 @@ mod tests {
             )
             .expect("v33 session fixture");
 
-        run(&connection).expect("v34 through v38 upgrade");
+        run(&connection).expect("v34 through v45 upgrade");
         run(&connection).expect("idempotent current upgrade");
 
         assert!(!sessions_has_memory_mode(&connection).expect("current session columns"));
@@ -5958,7 +5998,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_v38_schema_accepts_only_current_access_modes() {
+    fn fresh_v45_schema_accepts_exactly_the_three_current_access_modes() {
         let connection = Connection::open_in_memory().expect("database");
         connection
             .pragma_update(None, "foreign_keys", "ON")
@@ -5969,6 +6009,10 @@ mod tests {
         assert!(
             schema_migration_applied(&connection, REMOVE_AUTO_REVIEW_ACCESS_MODE_VERSION)
                 .expect("v38 marker")
+        );
+        assert!(
+            schema_migration_applied(&connection, RESTORE_AUTO_REVIEW_ACCESS_MODE_VERSION)
+                .expect("v45 marker")
         );
         assert!(
             table_has_exact_access_mode_domain(
@@ -5988,6 +6032,7 @@ mod tests {
             .expect("project");
         for (id, access_mode) in [
             ("default-session", "default"),
+            ("auto-review-session", "auto_review"),
             ("full-session", "full_access"),
         ] {
             connection
@@ -6007,8 +6052,8 @@ mod tests {
                     "INSERT INTO sessions
                      (id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
                       model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms)
-                     VALUES ('retired-session', 'project-v38', 'retired', 'idle', 'C:/workspace',
-                             'model', 'http://localhost', 'auto_review', '{}', 1, 1, NULL)",
+                     VALUES ('unknown-session', 'project-v38', 'unknown', 'idle', 'C:/workspace',
+                             'model', 'http://localhost', 'unknown', '{}', 1, 1, NULL)",
                     [],
                 )
                 .is_err()
@@ -6037,8 +6082,8 @@ mod tests {
             )
             .expect("v37 auto-review fixture");
 
-        run(&connection).expect("v38 upgrade");
-        run(&connection).expect("idempotent v38 upgrade");
+        run(&connection).expect("v38 through v45 upgrade");
+        run(&connection).expect("idempotent v45 upgrade");
 
         assert_eq!(
             connection
@@ -6054,7 +6099,107 @@ mod tests {
             schema_migration_applied(&connection, REMOVE_AUTO_REVIEW_ACCESS_MODE_VERSION)
                 .expect("v38 marker")
         );
+        assert!(
+            schema_migration_applied(&connection, RESTORE_AUTO_REVIEW_ACCESS_MODE_VERSION)
+                .expect("v45 marker")
+        );
         assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v44_database_reaches_v45_without_changing_existing_access_modes() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_v44(&connection);
+        connection
+            .execute_batch(
+                r#"INSERT INTO projects
+                   (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                   VALUES ('project-v44', 'C:/workspace', 'workspace', 'none', 1, 1);
+                   INSERT INTO sessions
+                   (id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
+                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms)
+                   VALUES
+                   ('default-v44', 'project-v44', 'default', 'idle', 'C:/workspace', 'model',
+                    'http://localhost', 'default', '{}', 2, 3, NULL),
+                   ('full-v44', 'project-v44', 'full', 'idle', 'C:/workspace', 'model',
+                    'http://localhost', 'full_access', '{}', 4, 5, NULL);"#,
+            )
+            .expect("v44 access fixtures");
+
+        run(&connection).expect("V45 upgrade");
+        run(&connection).expect("idempotent V45 upgrade");
+
+        assert!(
+            schema_migration_applied(&connection, RESTORE_AUTO_REVIEW_ACCESS_MODE_VERSION)
+                .expect("V45 marker")
+        );
+        assert!(
+            table_has_exact_access_mode_domain(
+                &connection,
+                "sessions",
+                SESSION_ACCESS_MODE_DOMAIN,
+            )
+            .expect("V45 access mode domain")
+        );
+        let mut statement = connection
+            .prepare(
+                "SELECT access_mode FROM sessions
+                 WHERE id IN ('default-v44', 'full-v44') ORDER BY id",
+            )
+            .expect("access query");
+        let modes = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("access rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("access values");
+        assert_eq!(modes, vec!["default", "full_access"]);
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v45_missing_marker_reapplies_without_collapsing_auto_review() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh current schema");
+        connection
+            .execute_batch(
+                r#"INSERT INTO projects
+                   (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                   VALUES ('project-v45-retry', 'C:/workspace', 'workspace', 'none', 1, 1);
+                   INSERT INTO sessions
+                   (id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
+                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms)
+                   VALUES ('auto-v45-retry', 'project-v45-retry', 'auto', 'idle', 'C:/workspace',
+                           'model', 'http://localhost', 'auto_review', '{}', 2, 3, NULL);
+                   DELETE FROM moyai_schema_migrations WHERE version = 45;"#,
+            )
+            .expect("missing-marker fixture");
+
+        run(&connection).expect("reapply V45");
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT access_mode FROM sessions WHERE id = 'auto-v45-retry'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("preserved auto-review mode"),
+            "auto_review"
+        );
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v45_marker_requires_the_exact_three_mode_domain() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh current schema");
+        run_remove_auto_review_access_mode(&connection).expect("replace with stale V38 domain");
+
+        let error = run(&connection).expect_err("V45 marker must validate the access mode domain");
+        assert!(error.to_string().contains("V45 access mode marker"));
     }
 
     #[test]
@@ -6610,7 +6755,7 @@ mod tests {
         connection
             .execute_batch(
                 "DROP INDEX idx_protocol_runtime_events_unique_turn_terminal;
-                 DELETE FROM moyai_schema_migrations WHERE version = 44;",
+                 DELETE FROM moyai_schema_migrations WHERE version IN (44, 45);",
             )
             .expect("restore V43 fixture");
         let terminal = crate::session::DurableTurnTerminal {

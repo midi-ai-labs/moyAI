@@ -7,6 +7,9 @@ use serde_json::json;
 use crate::docling::{DoclingConvertRequest, DoclingConvertResult, DoclingLocalInput};
 use crate::error::ToolError;
 use crate::tool::context::ToolContext;
+use crate::tool::permission_guardian::{
+    DoclingSourceEvidence, PermissionGuardianEvidence, PermissionGuardianEvidenceState,
+};
 use crate::tool::registry::Tool;
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
 use crate::workspace::{AccessKind, PathGuard};
@@ -107,24 +110,39 @@ impl Tool for DoclingConvertTool {
             }
         };
         let page_range = parse_page_range(input.page_range)?;
+        let do_ocr = input.do_ocr;
+        let include_images = input.include_images.unwrap_or(false);
+        let source_url = input
+            .source_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
 
-        let (local_input, effect_admission) = match (
-            input.path,
-            input
-                .source_url
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty()),
-        ) {
+        let (local_input, effect_admission) = match (input.path, source_url.as_deref()) {
             (Some(path), None) => {
                 let guarded = PathGuard::require_path(ctx.workspace, &path, AccessKind::Read)?;
+                let guardian_evidence = docling_permission_evidence(
+                    &ctx.config.docling,
+                    DoclingSourceEvidence::LocalFile {
+                        path: guarded.absolute.clone(),
+                    },
+                    "/v1/convert/file",
+                    &from_formats,
+                    &to_formats,
+                    do_ocr,
+                    include_images,
+                    page_range,
+                );
                 let effect_admission = ctx
-                    .confirm_if_needed(
+                    .confirm_if_needed_with_details_and_guardian_evidence(
                         AccessKind::Read,
                         format!("Upload {} to Docling Serve", guarded.absolute),
+                        Vec::new(),
                         vec![guarded.absolute.clone()],
                         !guarded.inside_workspace && !guarded.trusted_external,
                         vec![PermissionRisk::ConfiguredLocalService],
+                        guardian_evidence,
                     )
                     .await?;
                 let file = PathGuard::open_validated_read_file(&guarded)?;
@@ -137,13 +155,27 @@ impl Tool for DoclingConvertTool {
                 )
             }
             (None, Some(source_url)) => {
+                let guardian_evidence = docling_permission_evidence(
+                    &ctx.config.docling,
+                    DoclingSourceEvidence::SourceUrl {
+                        url: source_url.to_string(),
+                    },
+                    "/v1/convert/source",
+                    &from_formats,
+                    &to_formats,
+                    do_ocr,
+                    include_images,
+                    page_range,
+                );
                 let effect_admission = ctx
-                    .confirm_if_needed(
+                    .confirm_if_needed_with_details_and_guardian_evidence(
                         AccessKind::Read,
                         format!("Fetch {} through Docling Serve", source_url),
                         Vec::new(),
+                        Vec::new(),
                         false,
                         vec![PermissionRisk::Network],
+                        guardian_evidence,
                     )
                     .await?;
                 (None, effect_admission)
@@ -164,11 +196,11 @@ impl Tool for DoclingConvertTool {
             .convert(
                 DoclingConvertRequest {
                     local_input,
-                    source_url: input.source_url,
+                    source_url,
                     from_formats,
                     to_formats,
-                    do_ocr: input.do_ocr,
-                    include_images: input.include_images.or(Some(false)),
+                    do_ocr,
+                    include_images: Some(include_images),
                     page_range,
                 },
                 || effect_admission.admit(),
@@ -209,6 +241,39 @@ impl Tool for DoclingConvertTool {
             _internal_file_lease: preview.internal_file_lease,
         })
     }
+}
+
+fn docling_permission_evidence(
+    config: &crate::config::DoclingConfig,
+    source: DoclingSourceEvidence,
+    endpoint_suffix: &str,
+    from_formats: &[String],
+    to_formats: &[String],
+    do_ocr: Option<bool>,
+    include_images: bool,
+    page_range: Option<(u32, u32)>,
+) -> PermissionGuardianEvidenceState {
+    if !config.enabled {
+        return PermissionGuardianEvidenceState::incomplete(
+            "Docling is disabled by the current configuration",
+        );
+    }
+    let endpoint = crate::docling::endpoint(&config.base_url, endpoint_suffix);
+    if endpoint.trim().is_empty() {
+        return PermissionGuardianEvidenceState::incomplete(
+            "the configured Docling endpoint is empty",
+        );
+    }
+    PermissionGuardianEvidenceState::Complete(PermissionGuardianEvidence::DoclingConvert {
+        endpoint,
+        source,
+        from_formats: from_formats.to_vec(),
+        to_formats: to_formats.to_vec(),
+        do_ocr,
+        include_images,
+        page_range: page_range.map(|(start, end)| [start, end]),
+        credential_present: config.api_key_env.is_some() || !config.headers.is_empty(),
+    })
 }
 
 fn normalize_formats(
@@ -303,4 +368,98 @@ fn sanitize_docling_output_content(content: &str) -> String {
     markdown_image_regex
         .replace_all(&sanitized, "[inline image omitted]")
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn config() -> crate::config::DoclingConfig {
+        crate::config::DoclingConfig {
+            enabled: true,
+            base_url: "https://docling.example.test/root".to_string(),
+            timeout_ms: 1_000,
+            api_key_env: None,
+            headers: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn source_conversion_evidence_contains_exact_request_without_header_secret_values() {
+        let mut config = config();
+        config.api_key_env = Some("DOCLING_API_KEY".to_string());
+        config.headers.insert(
+            "Authorization".to_string(),
+            "Bearer header-secret".to_string(),
+        );
+
+        let evidence = docling_permission_evidence(
+            &config,
+            DoclingSourceEvidence::SourceUrl {
+                url: "https://source.example.test/document.pdf?revision=42".to_string(),
+            },
+            "/v1/convert/source",
+            &["pdf".to_string()],
+            &["md".to_string(), "json".to_string()],
+            Some(true),
+            true,
+            Some((4, 9)),
+        );
+        let PermissionGuardianEvidenceState::Complete(evidence) = evidence else {
+            panic!("expected complete Docling evidence");
+        };
+        let payload = serde_json::to_value(evidence).expect("serialize evidence");
+
+        assert_eq!(
+            payload["endpoint"],
+            "https://docling.example.test/root/v1/convert/source"
+        );
+        assert_eq!(
+            payload["source"]["url"],
+            "https://source.example.test/document.pdf?revision=42"
+        );
+        assert_eq!(payload["from_formats"], json!(["pdf"]));
+        assert_eq!(payload["to_formats"], json!(["md", "json"]));
+        assert_eq!(payload["do_ocr"], true);
+        assert_eq!(payload["include_images"], true);
+        assert_eq!(payload["page_range"], json!([4, 9]));
+        assert_eq!(payload["credential_present"], true);
+        let serialized = payload.to_string();
+        assert!(!serialized.contains("header-secret"));
+        assert!(!serialized.contains("Authorization"));
+    }
+
+    #[test]
+    fn local_conversion_evidence_identifies_uploaded_path_and_effective_defaults() {
+        let evidence = docling_permission_evidence(
+            &config(),
+            DoclingSourceEvidence::LocalFile {
+                path: Utf8PathBuf::from("C:/workspace/report.pdf"),
+            },
+            "/v1/convert/file",
+            &[],
+            &["md".to_string()],
+            None,
+            false,
+            None,
+        );
+
+        assert_eq!(
+            evidence,
+            PermissionGuardianEvidenceState::Complete(PermissionGuardianEvidence::DoclingConvert {
+                endpoint: "https://docling.example.test/root/v1/convert/file".to_string(),
+                source: DoclingSourceEvidence::LocalFile {
+                    path: Utf8PathBuf::from("C:/workspace/report.pdf"),
+                },
+                from_formats: Vec::new(),
+                to_formats: vec!["md".to_string()],
+                do_ocr: None,
+                include_images: false,
+                page_range: None,
+                credential_present: false,
+            })
+        );
+    }
 }

@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_capture_freezes_access_and_multi_agent_settings() {
+    fn turn_capture_freezes_the_admission_access_snapshot_and_multi_agent_settings() {
         let mut effective = ResolvedConfig::default();
         effective.permissions.access_mode = crate::config::AccessMode::Default;
         effective.multi_agent.enabled = false;

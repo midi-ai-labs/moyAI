@@ -51,6 +51,7 @@ use crate::tool::registry::ToolRegistry;
 
 const TOOL_CANCELLATION_CLEANUP_TIMEOUT: Duration =
     crate::tool::process::MANAGED_PROCESS_CLEANUP_GRACE;
+const PERMISSION_GUARDIAN_TOTAL_DEADLINE: Duration = Duration::from_secs(90);
 
 async fn await_tool_cancellation_cleanup<T>(
     cleanup: impl Future<Output = T>,
@@ -755,6 +756,7 @@ impl AgentLoop {
                     return Ok(run_summary_from_terminal(&request, terminal));
                 }
 
+                let mut prior_guardian_tool_results = Vec::new();
                 for call in prepared_tool_calls {
                     if request.run_control.is_cancelled() {
                         return self
@@ -787,6 +789,11 @@ impl AgentLoop {
                             tool_plan.router(),
                             &request,
                             call.clone(),
+                            &prepared_request.world_state,
+                            model_response_id,
+                            &collector.text,
+                            &prior_guardian_tool_results,
+                            &mut model_request_count,
                             prompt,
                             sink,
                         )
@@ -796,6 +803,11 @@ impl AgentLoop {
                         &call.call.tool_name,
                         &mut failed_tool_count,
                         &mut failed_tool_calls_by_name,
+                    );
+                    push_permission_guardian_tool_result(
+                        &mut prior_guardian_tool_results,
+                        &call.call,
+                        &tool_output,
                     );
                     let (_result_text, tool_change_count) = match tool_output {
                         ToolDispatchOutcome::Completed {
@@ -1315,6 +1327,11 @@ impl AgentLoop {
         registry: &ToolRegistry,
         request: &AgentRunRequest,
         call: PreparedModelToolCall,
+        trusted_world_state: &WorldState,
+        committed_response_id: ModelResponseId,
+        committed_assistant_text: &str,
+        prior_committed_tool_results: &[PermissionGuardianPriorToolResult],
+        model_request_count: &mut usize,
         prompt: &mut dyn ConfirmationPrompt,
         sink: &mut dyn RunEventSink,
     ) -> Result<ToolDispatchOutcome, AgentError> {
@@ -1363,6 +1380,18 @@ impl AgentLoop {
         }
 
         renew_admission_lease(&self.store, request).await?;
+        let mut permission_guardian = AgentPermissionGuardian {
+            agent_loop: self,
+            request,
+            task_context: permission_guardian_context(request),
+            trusted_world_state,
+            committed_response_id,
+            committed_assistant_text,
+            committed_tool_request: &call,
+            prior_committed_tool_results,
+            model_request_count,
+            sink,
+        };
         let ctx = crate::tool::context::ToolContext {
             session: &request.session,
             workspace: &request.session.workspace,
@@ -1380,6 +1409,7 @@ impl AgentLoop {
             prompt,
             services: &self.tool_services,
             agent: request.agent_context.as_ref(),
+            permission_guardian: Some(&mut permission_guardian),
         };
         let mut cancellation_cleanup_diagnostic = None;
         let execution_result = {
@@ -1422,6 +1452,7 @@ impl AgentLoop {
                 }
             }
         };
+        drop(permission_guardian);
         let metadata = cancellation_cleanup_diagnostic
             .as_deref()
             .map(|diagnostic| tool_cleanup_diagnostic_metadata(metadata.clone(), diagnostic))
@@ -1512,7 +1543,9 @@ impl AgentLoop {
             Err(mut error) => {
                 let result_text = error.to_string();
                 let permission_denial_settlement = match &mut error {
-                    crate::error::ToolError::PermissionDenied { settlement } => settlement.take(),
+                    crate::error::ToolError::PermissionDenied { settlement, .. } => {
+                        settlement.take()
+                    }
                     _ => None,
                 };
                 if matches!(
@@ -2280,6 +2313,63 @@ enum ToolDispatchOutcome {
     },
 }
 
+const PERMISSION_GUARDIAN_MAX_PRIOR_TOOL_RESULTS: usize = 16;
+const PERMISSION_GUARDIAN_MAX_PRIOR_ARGUMENT_CHARS: usize = 1_000;
+const PERMISSION_GUARDIAN_MAX_PRIOR_RESULT_CHARS: usize = 2_000;
+
+#[derive(Debug, serde::Serialize)]
+struct PermissionGuardianPriorToolResult {
+    call_id: String,
+    tool_name: String,
+    arguments_preview: String,
+    arguments_truncated: bool,
+    outcome: &'static str,
+    result_preview: String,
+    result_truncated: bool,
+    change_count: usize,
+}
+
+fn push_permission_guardian_tool_result(
+    prior: &mut Vec<PermissionGuardianPriorToolResult>,
+    call: &ModelToolCall,
+    outcome: &ToolDispatchOutcome,
+) {
+    let (outcome_name, result, change_count) = match outcome {
+        ToolDispatchOutcome::Completed {
+            result_text,
+            change_count,
+        } => ("completed", result_text.as_str(), *change_count),
+        ToolDispatchOutcome::Declined { result_text } => ("declined", result_text.as_str(), 0),
+        ToolDispatchOutcome::Failed { result_text } => ("failed", result_text.as_str(), 0),
+        ToolDispatchOutcome::Interrupted { change_count } => ("interrupted", "", *change_count),
+    };
+    let (arguments_preview, arguments_truncated) = permission_guardian_bounded_text(
+        &call.arguments_json,
+        PERMISSION_GUARDIAN_MAX_PRIOR_ARGUMENT_CHARS,
+    );
+    let (result_preview, result_truncated) =
+        permission_guardian_bounded_text(result, PERMISSION_GUARDIAN_MAX_PRIOR_RESULT_CHARS);
+    if prior.len() == PERMISSION_GUARDIAN_MAX_PRIOR_TOOL_RESULTS {
+        prior.remove(0);
+    }
+    prior.push(PermissionGuardianPriorToolResult {
+        call_id: call.call_id.clone(),
+        tool_name: call.tool_name.clone(),
+        arguments_preview,
+        arguments_truncated,
+        outcome: outcome_name,
+        result_preview,
+        result_truncated,
+        change_count,
+    });
+}
+
+fn permission_guardian_bounded_text(value: &str, max_chars: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let preview = chars.by_ref().take(max_chars).collect::<String>();
+    (preview, chars.next().is_some())
+}
+
 fn record_tool_dispatch_failure(
     outcome: &ToolDispatchOutcome,
     tool_name: &str,
@@ -2293,6 +2383,283 @@ fn record_tool_dispatch_failure(
     *failed_tool_calls_by_name
         .entry(tool_name.to_string())
         .or_default() += 1;
+}
+
+struct AgentPermissionGuardian<'a> {
+    agent_loop: &'a AgentLoop,
+    request: &'a AgentRunRequest,
+    task_context: String,
+    trusted_world_state: &'a WorldState,
+    committed_response_id: ModelResponseId,
+    committed_assistant_text: &'a str,
+    committed_tool_request: &'a ModelToolCall,
+    prior_committed_tool_results: &'a [PermissionGuardianPriorToolResult],
+    model_request_count: &'a mut usize,
+    sink: &'a mut dyn RunEventSink,
+}
+
+impl AgentPermissionGuardian<'_> {
+    async fn review_inner(
+        &mut self,
+        permission_request: &crate::tool::PermissionRequest,
+        action_evidence: &crate::tool::permission_guardian::PermissionGuardianEvidence,
+    ) -> Result<
+        crate::tool::permission_guardian::PermissionGuardianDecision,
+        crate::tool::permission_guardian::PermissionGuardianError,
+    > {
+        use crate::tool::permission_guardian::PermissionGuardianError;
+
+        let input = serde_json::to_string_pretty(&serde_json::json!({
+            "trusted_world_state": &self.trusted_world_state.snapshot,
+            "task_context": &self.task_context,
+            "recent_committed_response": {
+                "response_id": self.committed_response_id,
+                "assistant_text": self.committed_assistant_text,
+                "tool_request": {
+                    "call_id": &self.committed_tool_request.call_id,
+                    "tool_name": &self.committed_tool_request.tool_name,
+                    "arguments_json": &self.committed_tool_request.arguments_json,
+                },
+                "prior_committed_tool_results": self.prior_committed_tool_results,
+            },
+            "permission_request": permission_request,
+            "action_evidence": action_evidence,
+        }))
+        .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+        let mut model = self.request.model_profile();
+        model.max_output_tokens = model.max_output_tokens.clamp(1, 512);
+        let resolved_model = &self.request.turn.resolved_config().runtime_config().model;
+        let mut guardian_request = ChatRequest::new(
+            self.request.turn.provider_target().clone(),
+            model,
+            include_str!("../../assets/prompts/permission_guardian.md")
+                .trim()
+                .to_string(),
+            vec![ModelMessage::User { content: input }],
+            Vec::new(),
+            None,
+            crate::config::ProviderReasoningCapability::Unsupported,
+            resolved_model.extra_headers.clone(),
+        );
+        guardian_request.extra_body =
+            permission_guardian_context_extra_body(resolved_model.extra_body_json.as_ref());
+        guardian_request
+            .validate_provider_lifecycle()
+            .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+
+        self.sink
+            .emit(RunEvent::ModelRequestPrepared {
+                session_id: self.request.session.session.id,
+                diagnostics: request_diagnostics(
+                    &guardian_request,
+                    self.request
+                        .turn
+                        .resolved_config()
+                        .runtime_config()
+                        .session
+                        .overflow_margin_tokens,
+                ),
+            })
+            .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+        renew_admission_lease(&self.agent_loop.store, self.request)
+            .await
+            .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+        *self.model_request_count += 1;
+
+        let request_gate = self
+            .request
+            .agent_context
+            .as_ref()
+            .map(crate::app::AgentRunContext::model_request_gate)
+            .or_else(|| self.agent_loop.model_request_gate.clone());
+        let _permit = match request_gate {
+            Some(gate) => {
+                let acquire = gate.acquire_owned();
+                let cancel = self.request.cancel_token();
+                tokio::pin!(acquire);
+                loop {
+                    tokio::select! {
+                        permit = &mut acquire => {
+                            break Some(permit.map_err(|_| PermissionGuardianError::Request(
+                                "model request concurrency gate closed".to_string()
+                            ))?);
+                        }
+                        _ = cancel.cancelled() => {
+                            return Err(PermissionGuardianError::Request(
+                                "permission review was cancelled".to_string()
+                            ));
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                            ensure_admission_active(&self.agent_loop.store, self.request)
+                                .await
+                                .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+                        }
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let response_id = ModelResponseId::new();
+        let guardian_store = self.agent_loop.store.clone();
+        let guardian_session_id = self.request.session.session.id;
+        let guardian_goal_id = self
+            .request
+            .turn
+            .goal()
+            .map(|goal| goal.goal_id().to_string());
+        let cancel = self.request.cancel_token();
+        let mut collector = CompactionResponseCollector::new(response_id, self.sink);
+        let response_result = {
+            let generation =
+                self.agent_loop
+                    .llm
+                    .stream_chat(guardian_request, cancel.clone(), &mut collector);
+            tokio::pin!(generation);
+            loop {
+                tokio::select! {
+                    response = &mut generation => break response,
+                    _ = cancel.cancelled() => {
+                        return Err(PermissionGuardianError::Request(
+                            "permission review was cancelled".to_string()
+                        ));
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        ensure_admission_active(&self.agent_loop.store, self.request)
+                            .await
+                            .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+                    }
+                }
+            }
+        };
+        let response = match response_result {
+            Ok(response) => {
+                account_permission_guardian_goal_usage(
+                    &guardian_store,
+                    guardian_session_id,
+                    guardian_goal_id.as_deref(),
+                    response.usage.as_ref(),
+                )
+                .await?;
+                response
+            }
+            Err(error) => {
+                account_permission_guardian_goal_usage(
+                    &guardian_store,
+                    guardian_session_id,
+                    guardian_goal_id.as_deref(),
+                    error.token_usage(),
+                )
+                .await?;
+                return Err(PermissionGuardianError::Request(error.to_string()));
+            }
+        };
+        let collector = collector.into_inner();
+        crate::llm::validate_toolless_text_response(
+            "automatic permission review",
+            &response,
+            !collector.tool_calls.is_empty(),
+        )
+        .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+        ensure_admission_active(&self.agent_loop.store, self.request)
+            .await
+            .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+        crate::tool::permission_guardian::parse_guardian_decision(&collector.text)
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::tool::permission_guardian::PermissionGuardian for AgentPermissionGuardian<'_> {
+    async fn review(
+        &mut self,
+        permission_request: &crate::tool::PermissionRequest,
+        action_evidence: &crate::tool::permission_guardian::PermissionGuardianEvidence,
+    ) -> Result<
+        crate::tool::permission_guardian::PermissionGuardianDecision,
+        crate::tool::permission_guardian::PermissionGuardianError,
+    > {
+        use crate::tool::permission_guardian::PermissionGuardianError;
+        let cancel = self.request.cancel_token();
+        tokio::select! {
+            _ = cancel.cancelled() => Err(PermissionGuardianError::Request(
+                "permission review was cancelled".to_string()
+            )),
+            result = tokio::time::timeout(
+                PERMISSION_GUARDIAN_TOTAL_DEADLINE,
+                self.review_inner(permission_request, action_evidence),
+            ) => match result {
+                Ok(result) => result,
+                Err(_) => Err(PermissionGuardianError::Request(format!(
+                    "permission review exceeded its total deadline of {} seconds",
+                    PERMISSION_GUARDIAN_TOTAL_DEADLINE.as_secs()
+                ))),
+            },
+        }
+    }
+}
+
+fn permission_guardian_context_extra_body(configured: Option<&Value>) -> Option<Value> {
+    let configured = configured?.as_object()?;
+    let (key, value) = ["num_ctx", "numCtx"]
+        .into_iter()
+        .find_map(|key| configured.get(key).map(|value| (key, value)))?;
+    value.as_u64()?;
+    let mut isolated = serde_json::Map::new();
+    isolated.insert(key.to_string(), value.clone());
+    Some(Value::Object(isolated))
+}
+
+async fn account_permission_guardian_goal_usage(
+    store: &StoreBundle,
+    session_id: crate::session::SessionId,
+    goal_id: Option<&str>,
+    usage: Option<&TokenUsage>,
+) -> Result<(), crate::tool::permission_guardian::PermissionGuardianError> {
+    let Some(goal_id) = goal_id else {
+        return Ok(());
+    };
+    store
+        .session_repo()
+        .account_thread_goal_usage_for_goal(session_id, goal_token_delta(usage), Some(goal_id))
+        .await
+        .map_err(|error| {
+            crate::tool::permission_guardian::PermissionGuardianError::Request(error.to_string())
+        })?;
+    Ok(())
+}
+
+fn permission_guardian_context(request: &AgentRunRequest) -> String {
+    const MAX_ITEMS: usize = 20;
+    const MAX_ITEM_CHARS: usize = 4_000;
+    const MAX_TOTAL_CHARS: usize = 16_000;
+
+    let active_ids = request
+        .context
+        .active_item_ids()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut remaining = MAX_TOTAL_CHARS;
+    let mut items = Vec::new();
+    for item in request
+        .context
+        .history_items()
+        .iter()
+        .rev()
+        .filter(|item| active_ids.contains(&item.id))
+        .take(MAX_ITEMS)
+    {
+        if remaining == 0 {
+            break;
+        }
+        let serialized = serde_json::to_string(&item.payload)
+            .unwrap_or_else(|_| "{\"kind\":\"unavailable\"}".to_string());
+        let limit = remaining.min(MAX_ITEM_CHARS);
+        let clipped = serialized.chars().take(limit).collect::<String>();
+        remaining = remaining.saturating_sub(clipped.chars().count());
+        items.push(clipped);
+    }
+    items.reverse();
+    items.join("\n")
 }
 
 #[derive(Default)]
@@ -2886,6 +3253,23 @@ mod tests {
         ) -> Result<LlmResponseSummary, LlmError> {
             self.requests.lock().expect("requests mutex").push(request);
             let response = self.responses.lock().expect("responses mutex").remove(0);
+            let transport_error_usage = if response.finish_reason == FinishReason::Error {
+                response.events.iter().find_map(|event| match event {
+                    LlmEvent::Finished {
+                        finish_reason: FinishReason::Error,
+                        usage,
+                    } => Some(usage.clone()),
+                    _ => None,
+                })
+            } else {
+                None
+            };
+            if let Some(usage) = transport_error_usage {
+                return Err(LlmError::IncompleteResponse {
+                    reason: "scripted provider failure".to_string(),
+                    usage,
+                });
+            }
             for event in response.events {
                 sink.push(event)?;
             }
@@ -3447,6 +3831,7 @@ mod tests {
                 }
             };
             Err(crate::error::ToolError::PermissionDenied {
+                reason: "permission denied by test".to_string(),
                 settlement: Some(settlement),
             })
         }
@@ -3615,6 +4000,48 @@ mod tests {
         }
     }
 
+    fn scripted_shell_call(call_id: &str, command: &str) -> ScriptedResponse {
+        ScriptedResponse {
+            events: vec![
+                LlmEvent::ToolCallStart {
+                    call_id: call_id.to_string(),
+                    tool_name: "shell".to_string(),
+                },
+                LlmEvent::ToolCallArgsDelta {
+                    call_id: call_id.to_string(),
+                    delta: serde_json::json!({"command": command}).to_string(),
+                },
+            ],
+            finish_reason: FinishReason::ToolCall,
+        }
+    }
+
+    fn scripted_mcp_call(
+        call_id: &str,
+        server_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> ScriptedResponse {
+        ScriptedResponse {
+            events: vec![
+                LlmEvent::ToolCallStart {
+                    call_id: call_id.to_string(),
+                    tool_name: "mcp_call".to_string(),
+                },
+                LlmEvent::ToolCallArgsDelta {
+                    call_id: call_id.to_string(),
+                    delta: serde_json::json!({
+                        "server_id": server_id,
+                        "tool_name": tool_name,
+                        "arguments": arguments,
+                    })
+                    .to_string(),
+                },
+            ],
+            finish_reason: FinishReason::ToolCall,
+        }
+    }
+
     #[tokio::test]
     async fn thin_loop_runs_scripted_provider_tool_turn() {
         let mut config = ResolvedConfig::default();
@@ -3718,6 +4145,466 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_review_uses_an_isolated_toolless_guardian_without_human_confirmation() {
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::AutoReview;
+        config.model.temperature = Some(0.8);
+        config.model.top_p = Some(0.7);
+        config.model.top_k = Some(40);
+        config.model.presence_penalty = Some(0.5);
+        config.model.frequency_penalty = Some(0.4);
+        config.model.seed = Some(42);
+        config.model.stop_sequences = vec!["}".to_string()];
+        config.model.extra_body_json = Some(serde_json::json!({
+            "num_ctx": 8_192,
+            "response_format": {"type": "text"},
+            "task_generation_override": true,
+        }));
+        config.model.extra_headers.insert(
+            "x-required-provider-header".to_string(),
+            "present".to_string(),
+        );
+        let run = run_scripted(
+            config,
+            vec![
+                scripted_shell_call("guardian_shell", "echo guardian-approved"),
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        r#"{"decision":"allow","rationale":"scoped command"}"#.to_string(),
+                    )],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("run");
+        let summary = run.summary.expect("summary");
+
+        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_eq!(summary.metrics().model_request_count, 3);
+        assert_eq!(run.confirmations.len(), 0);
+        assert_canonical_tool_statuses(
+            &run.store,
+            run.session_id,
+            &[ToolLifecycleStatus::Completed],
+        );
+        assert_eq!(run.requests.len(), 3);
+        let guardian_request = &run.requests[1];
+        assert!(guardian_request.tools.is_empty());
+        assert!(!guardian_request.parallel_tool_calls);
+        assert!(guardian_request.reasoning.is_none());
+        assert!(guardian_request.responses_continuation.is_none());
+        assert!(guardian_request.temperature.is_none());
+        assert!(guardian_request.top_p.is_none());
+        assert!(guardian_request.top_k.is_none());
+        assert!(guardian_request.presence_penalty.is_none());
+        assert!(guardian_request.frequency_penalty.is_none());
+        assert!(guardian_request.seed.is_none());
+        assert!(guardian_request.stop_sequences.is_empty());
+        assert_eq!(
+            guardian_request.extra_body,
+            Some(serde_json::json!({"num_ctx": 8_192}))
+        );
+        assert_eq!(guardian_request.model.max_output_tokens, 512);
+        assert_eq!(
+            guardian_request
+                .extra_headers()
+                .get("x-required-provider-header")
+                .map(String::as_str),
+            Some("present")
+        );
+        assert!(
+            guardian_request
+                .system_prompt
+                .contains("independent permission guardian")
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_review_first_step_includes_trusted_world_state_and_exact_committed_tool_request()
+    {
+        let instruction_dir = tempfile::tempdir().expect("instruction tempdir");
+        let instruction_path = Utf8PathBuf::from_path_buf(instruction_dir.path().join("AGENTS.md"))
+            .expect("utf8 instruction path");
+        std::fs::write(
+            &instruction_path,
+            "GUARDIAN_TRUSTED_AGENT_RULE: allow only task-scoped commands.",
+        )
+        .expect("write AGENTS fixture");
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::AutoReview;
+        config.instructions.additional_files.push(instruction_path);
+        let exact_command = "echo first-step-evidence";
+        let run = run_scripted(
+            config,
+            vec![
+                scripted_shell_call("guardian_first_step", exact_command),
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        r#"{"decision":"allow","rationale":"scoped command"}"#.to_string(),
+                    )],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("run");
+
+        let [ModelMessage::User { content }] = run.requests[1].messages.as_slice() else {
+            panic!("guardian should receive one user evidence message");
+        };
+        let payload: Value = serde_json::from_str(content).expect("guardian payload");
+        let instruction_sources =
+            payload["trusted_world_state"]["sections"]["instructions"]["sources"]
+                .as_array()
+                .expect("trusted instruction sources");
+        assert!(instruction_sources.iter().any(|source| {
+            source["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("GUARDIAN_TRUSTED_AGENT_RULE"))
+        }));
+        assert!(
+            payload["task_context"]
+                .as_str()
+                .is_some_and(|context| context.contains("write hello.txt"))
+        );
+        assert_eq!(
+            payload["recent_committed_response"]["tool_request"]["tool_name"],
+            "shell"
+        );
+        let raw_arguments = payload["recent_committed_response"]["tool_request"]["arguments_json"]
+            .as_str()
+            .expect("raw tool arguments");
+        assert_eq!(
+            serde_json::from_str::<Value>(raw_arguments).expect("tool arguments")["command"],
+            exact_command
+        );
+        assert!(payload["recent_committed_response"]["response_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn auto_review_second_tool_sees_bounded_result_of_first_committed_tool() {
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::AutoReview;
+        let first_arguments = r#"{"command":"echo first-committed-state"}"#;
+        let second_arguments = r#"{"command":"echo second-action"}"#;
+        let run = run_scripted(
+            config,
+            vec![
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "guardian_multi_first".to_string(),
+                            tool_name: "shell".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "guardian_multi_first".to_string(),
+                            delta: first_arguments.to_string(),
+                        },
+                        LlmEvent::ToolCallStart {
+                            call_id: "guardian_multi_second".to_string(),
+                            tool_name: "shell".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "guardian_multi_second".to_string(),
+                            delta: second_arguments.to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        r#"{"decision":"allow","rationale":"first scoped command"}"#.to_string(),
+                    )],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        r#"{"decision":"deny","rationale":"second action not needed"}"#.to_string(),
+                    )],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("run");
+
+        assert_canonical_tool_statuses(
+            &run.store,
+            run.session_id,
+            &[
+                ToolLifecycleStatus::Completed,
+                ToolLifecycleStatus::Declined,
+            ],
+        );
+        let [ModelMessage::User { content }] = run.requests[2].messages.as_slice() else {
+            panic!("second guardian should receive one user evidence message");
+        };
+        let payload: Value = serde_json::from_str(content).expect("guardian payload");
+        let prior = payload["recent_committed_response"]["prior_committed_tool_results"]
+            .as_array()
+            .expect("prior committed tool results");
+        assert_eq!(prior.len(), 1);
+        assert_eq!(prior[0]["tool_name"], "shell");
+        assert_eq!(prior[0]["arguments_preview"], first_arguments);
+        assert_eq!(prior[0]["arguments_truncated"], false);
+        assert_eq!(prior[0]["outcome"], "completed");
+        assert!(
+            prior[0]["result_preview"]
+                .as_str()
+                .is_some_and(|result| result.contains("first-committed-state"))
+        );
+    }
+
+    #[test]
+    fn auto_review_prior_tool_result_projection_stays_bounded() {
+        let mut prior = Vec::new();
+        for index in 0..=PERMISSION_GUARDIAN_MAX_PRIOR_TOOL_RESULTS {
+            let call = ModelToolCall {
+                call_id: format!("call_{index}"),
+                tool_name: "shell".to_string(),
+                arguments_json: "a".repeat(PERMISSION_GUARDIAN_MAX_PRIOR_ARGUMENT_CHARS + 1),
+            };
+            let outcome = ToolDispatchOutcome::Completed {
+                result_text: "r".repeat(PERMISSION_GUARDIAN_MAX_PRIOR_RESULT_CHARS + 1),
+                change_count: index,
+            };
+            push_permission_guardian_tool_result(&mut prior, &call, &outcome);
+        }
+
+        assert_eq!(prior.len(), PERMISSION_GUARDIAN_MAX_PRIOR_TOOL_RESULTS);
+        assert_eq!(prior[0].call_id, "call_1");
+        assert_eq!(
+            prior[0].arguments_preview.chars().count(),
+            PERMISSION_GUARDIAN_MAX_PRIOR_ARGUMENT_CHARS
+        );
+        assert!(prior[0].arguments_truncated);
+        assert_eq!(
+            prior[0].result_preview.chars().count(),
+            PERMISSION_GUARDIAN_MAX_PRIOR_RESULT_CHARS
+        );
+        assert!(prior[0].result_truncated);
+    }
+
+    #[test]
+    fn auto_review_total_deadline_is_ninety_seconds() {
+        assert_eq!(PERMISSION_GUARDIAN_TOTAL_DEADLINE, Duration::from_secs(90));
+    }
+
+    #[tokio::test]
+    async fn auto_review_mcp_guardian_receives_full_arguments_beyond_human_preview() {
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::AutoReview;
+        config.mcp.enabled = true;
+        let server = config.mcp.servers.first_mut().expect("default MCP server");
+        server.enabled = true;
+        server.tool_routes = vec![crate::config::McpToolRouteConfig {
+            name: "documents.update".to_string(),
+            effect: crate::tool::ToolEffectClass::Mutation,
+        }];
+        let arguments = serde_json::json!({
+            "a_padding": "x".repeat(2_500),
+            "z_operation": "delete_everything",
+        });
+        let run = run_scripted(
+            config,
+            vec![
+                scripted_mcp_call("guardian_mcp", "docling", "documents.update", arguments),
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        r#"{"decision":"deny","rationale":"destructive scope"}"#.to_string(),
+                    )],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("used a safer route".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("run");
+
+        assert_eq!(run.confirmations.len(), 0);
+        assert_canonical_tool_statuses(
+            &run.store,
+            run.session_id,
+            &[ToolLifecycleStatus::Declined],
+        );
+        let guardian_request = &run.requests[1];
+        let [ModelMessage::User { content }] = guardian_request.messages.as_slice() else {
+            panic!("guardian should receive one user evidence message");
+        };
+        let payload: serde_json::Value = serde_json::from_str(content).expect("guardian payload");
+        let visible_details = payload["permission_request"]["details"]
+            .as_array()
+            .expect("human details");
+        assert!(visible_details.iter().all(|detail| {
+            !detail
+                .as_str()
+                .unwrap_or_default()
+                .contains("delete_everything")
+        }));
+        assert_eq!(
+            payload["action_evidence"]["arguments"]["z_operation"],
+            "delete_everything"
+        );
+        assert_eq!(
+            payload["action_evidence"]["arguments"]["a_padding"]
+                .as_str()
+                .map(str::len),
+            Some(2_500)
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_review_denial_and_invalid_output_fail_closed_without_human_fallback() {
+        for (label, guardian_output, api_mode) in [
+            (
+                "deny",
+                r#"{"decision":"deny","rationale":"not authorized"}"#,
+                crate::config::model::ProviderApiMode::ChatCompletions,
+            ),
+            (
+                "invalid",
+                "approval looks fine",
+                crate::config::model::ProviderApiMode::Responses,
+            ),
+        ] {
+            let mut config = ResolvedConfig::default();
+            config.permissions.access_mode = AccessMode::AutoReview;
+            config.model.provider_api_mode = api_mode;
+            let run = run_scripted(
+                config,
+                vec![
+                    scripted_shell_call(&format!("guardian_{label}"), "echo must-not-run"),
+                    ScriptedResponse {
+                        events: vec![LlmEvent::TextDelta(guardian_output.to_string())],
+                        finish_reason: FinishReason::Stop,
+                    },
+                    ScriptedResponse {
+                        events: vec![LlmEvent::TextDelta("used a safer route".to_string())],
+                        finish_reason: FinishReason::Stop,
+                    },
+                ],
+            )
+            .await
+            .expect(label);
+            let summary = run.summary.expect(label);
+
+            assert_eq!(summary.status(), SessionStatus::Completed, "{label}");
+            assert_eq!(summary.metrics().model_request_count, 3, "{label}");
+            assert_eq!(run.confirmations.len(), 0, "{label}");
+            assert_eq!(run.requests[1].provider_target().api_mode(), api_mode);
+            assert_canonical_tool_statuses(
+                &run.store,
+                run.session_id,
+                &[ToolLifecycleStatus::Declined],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_review_accounts_usage_before_rejecting_tool_call_response_shape() {
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::AutoReview;
+        let run = run_scripted_with_goal(
+            config,
+            vec![
+                scripted_shell_call("guardian_invalid_shape", "echo must-not-run"),
+                ScriptedResponse {
+                    events: vec![LlmEvent::ToolCallStart {
+                        call_id: "guardian_must_be_toolless".to_string(),
+                        tool_name: "read".to_string(),
+                    }],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("used a safer route".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            Some(("finish safely", ThreadGoalStatus::Active, None)),
+        )
+        .await
+        .expect("run");
+        run.summary.expect("summary");
+
+        assert_canonical_tool_statuses(
+            &run.store,
+            run.session_id,
+            &[ToolLifecycleStatus::Declined],
+        );
+        let goal = run
+            .store
+            .session_repo()
+            .get_thread_goal(run.session_id)
+            .await
+            .expect("goal")
+            .expect("stored goal");
+        assert_eq!(goal.tokens_used, 45);
+    }
+
+    #[tokio::test]
+    async fn auto_review_accounts_provider_error_usage_before_failing_closed() {
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::AutoReview;
+        let guardian_error_usage = TokenUsage {
+            prompt_tokens: 20,
+            completion_tokens: 17,
+            total_tokens: 37,
+            reasoning_tokens: None,
+        };
+        let run = run_scripted_with_goal(
+            config,
+            vec![
+                scripted_shell_call("guardian_provider_error", "echo must-not-run"),
+                ScriptedResponse {
+                    events: vec![LlmEvent::Finished {
+                        finish_reason: FinishReason::Error,
+                        usage: Some(guardian_error_usage),
+                    }],
+                    finish_reason: FinishReason::Error,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("used a safer route".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            Some(("finish safely", ThreadGoalStatus::Active, None)),
+        )
+        .await
+        .expect("run");
+        run.summary.expect("summary");
+
+        assert_canonical_tool_statuses(
+            &run.store,
+            run.session_id,
+            &[ToolLifecycleStatus::Declined],
+        );
+        let goal = run
+            .store
+            .session_repo()
+            .get_thread_goal(run.session_id)
+            .await
+            .expect("goal")
+            .expect("stored goal");
+        assert_eq!(goal.tokens_used, 67);
+    }
+
+    #[tokio::test]
     async fn raw_tool_calls_commit_before_invalid_json_unknown_tool_and_schema_failures_settle() {
         let cases = [
             ("invalid_json", "read", "{not-json}"),
@@ -3810,21 +4697,19 @@ mod tests {
                 events: vec![
                     LlmEvent::ToolCallStart {
                         call_id: "call_1".to_string(),
-                        tool_name: "write".to_string(),
+                        tool_name: "shell".to_string(),
                     },
                     LlmEvent::ToolCallArgsDelta {
                         call_id: "call_1".to_string(),
-                        delta: r#"{"path":"first.txt","content":"must not be written\n"}"#
-                            .to_string(),
+                        delta: r#"{"command":"echo must-not-run > first.txt"}"#.to_string(),
                     },
                     LlmEvent::ToolCallStart {
                         call_id: "call_2".to_string(),
-                        tool_name: "write".to_string(),
+                        tool_name: "shell".to_string(),
                     },
                     LlmEvent::ToolCallArgsDelta {
                         call_id: "call_2".to_string(),
-                        delta: r#"{"path":"second.txt","content":"must not be written\n"}"#
-                            .to_string(),
+                        delta: r#"{"command":"echo must-not-run > second.txt"}"#.to_string(),
                     },
                 ],
                 finish_reason: FinishReason::ToolCall,
@@ -3885,12 +4770,11 @@ mod tests {
                     events: vec![
                         LlmEvent::ToolCallStart {
                             call_id: "call_denied".to_string(),
-                            tool_name: "write".to_string(),
+                            tool_name: "shell".to_string(),
                         },
                         LlmEvent::ToolCallArgsDelta {
                             call_id: "call_denied".to_string(),
-                            delta: r#"{"path":"denied.txt","content":"must not be written\n"}"#
-                                .to_string(),
+                            delta: r#"{"command":"echo must-not-run > denied.txt"}"#.to_string(),
                         },
                     ],
                     finish_reason: FinishReason::ToolCall,
@@ -4645,7 +5529,7 @@ mod tests {
                     cwd: root,
                     model: "scripted".to_string(),
                     base_url: "http://local".to_string(),
-                    access_mode: AccessMode::FullAccess,
+                    access_mode: config.permissions.access_mode,
                 },
                 workspace,
             )
@@ -5657,7 +6541,7 @@ mod tests {
                     cwd: root.clone(),
                     model: "scripted".to_string(),
                     base_url: "http://local".to_string(),
-                    access_mode: AccessMode::FullAccess,
+                    access_mode: config.permissions.access_mode,
                 },
                 workspace,
             )

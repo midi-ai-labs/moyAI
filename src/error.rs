@@ -404,8 +404,9 @@ pub enum ToolError {
         actual: u64,
         maximum: u64,
     },
-    #[error("permission denied by user")]
+    #[error("{reason}")]
     PermissionDenied {
+        reason: String,
         settlement: Option<crate::runtime::ToolSettlementReservation>,
     },
     #[error("permission request aborted by user")]

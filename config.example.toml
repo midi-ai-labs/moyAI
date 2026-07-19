@@ -17,6 +17,8 @@ supports_images = true
 num_ctx = 131072
 
 [permissions]
+# default = ask for approval, auto_review = let the AI guardian decide,
+# full_access = do not create permission prompts.
 access_mode = "default"
 # additional_read_roots and additional_write_roots, when set, must contain absolute paths.
 

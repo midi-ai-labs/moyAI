@@ -13,17 +13,20 @@ pub const DEFAULT_MODEL_MAX_OUTPUT_TOKENS: u32 = 8_192;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessMode {
-    #[serde(alias = "auto_review", alias = "auto-review")]
+    #[serde(alias = "normal")]
     Default,
+    #[serde(alias = "auto-review", alias = "autoreview", alias = "auto")]
+    AutoReview,
+    #[serde(alias = "full-access", alias = "full")]
     FullAccess,
 }
 
 impl AccessMode {
     pub fn parse(value: &str) -> Option<Self> {
-        match value.trim() {
-            "default" => Some(Self::Default),
-            "auto_review" | "auto-review" => Some(Self::Default),
-            "full_access" => Some(Self::FullAccess),
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" | "normal" => Some(Self::Default),
+            "auto_review" | "auto-review" | "autoreview" | "auto" => Some(Self::AutoReview),
+            "full_access" | "full-access" | "full" => Some(Self::FullAccess),
             _ => None,
         }
     }
@@ -31,20 +34,23 @@ impl AccessMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
+            Self::AutoReview => "auto_review",
             Self::FullAccess => "full_access",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Default => "Default",
-            Self::FullAccess => "Full Access",
+            Self::Default => "Ask for approval",
+            Self::AutoReview => "Approve for me",
+            Self::FullAccess => "Full access",
         }
     }
 
     pub fn next(self) -> Self {
         match self {
-            Self::Default => Self::FullAccess,
+            Self::Default => Self::AutoReview,
+            Self::AutoReview => Self::FullAccess,
             Self::FullAccess => Self::Default,
         }
     }
@@ -899,8 +905,76 @@ pub struct PartialLoggingConfig {
 
 #[cfg(test)]
 mod config_contract_tests {
-    use super::{McpServerConfig, PartialModelConfig, PartialResolvedConfig, ResolvedConfig};
+    use super::{
+        AccessMode, McpServerConfig, PartialModelConfig, PartialResolvedConfig, ResolvedConfig,
+    };
     use crate::tool::ToolEffectClass;
+
+    #[test]
+    fn access_modes_keep_canonical_keys_labels_and_three_state_order() {
+        let modes = [
+            AccessMode::Default,
+            AccessMode::AutoReview,
+            AccessMode::FullAccess,
+        ];
+        assert_eq!(
+            modes.map(AccessMode::as_str),
+            ["default", "auto_review", "full_access"]
+        );
+        assert_eq!(
+            modes.map(AccessMode::label),
+            ["Ask for approval", "Approve for me", "Full access"]
+        );
+        assert_eq!(
+            modes.map(AccessMode::next),
+            [
+                AccessMode::AutoReview,
+                AccessMode::FullAccess,
+                AccessMode::Default,
+            ]
+        );
+        assert_eq!(
+            modes.map(|mode| serde_json::to_string(&mode).expect("access mode wire key")),
+            ["\"default\"", "\"auto_review\"", "\"full_access\""]
+        );
+        for mode in modes {
+            let config = toml::from_str::<PartialResolvedConfig>(&format!(
+                "[permissions]\naccess_mode = \"{}\"\n",
+                mode.as_str()
+            ))
+            .expect("canonical config access mode");
+            assert_eq!(
+                config
+                    .permissions
+                    .and_then(|permissions| permissions.access_mode),
+                Some(mode)
+            );
+        }
+    }
+
+    #[test]
+    fn access_mode_legacy_aliases_resolve_to_their_current_variants() {
+        for (value, expected) in [
+            ("normal", AccessMode::Default),
+            ("auto-review", AccessMode::AutoReview),
+            ("autoreview", AccessMode::AutoReview),
+            ("auto", AccessMode::AutoReview),
+            ("full-access", AccessMode::FullAccess),
+            ("full", AccessMode::FullAccess),
+        ] {
+            assert_eq!(AccessMode::parse(value), Some(expected));
+            let config = toml::from_str::<PartialResolvedConfig>(&format!(
+                "[permissions]\naccess_mode = \"{value}\"\n"
+            ))
+            .expect("legacy config alias");
+            assert_eq!(
+                config
+                    .permissions
+                    .and_then(|permissions| permissions.access_mode),
+                Some(expected)
+            );
+        }
+    }
 
     #[test]
     fn provider_config_debug_omits_endpoint_and_header_secrets() {
