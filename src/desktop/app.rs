@@ -62,9 +62,8 @@ use super::state::DesktopState;
 #[cfg(test)]
 use super::web_model::desktop_web_state;
 use super::web_model::{
-    DesktopRuntimeProjection, DesktopWebState, access_runtime_allows_mutation,
-    access_runtime_owner_token, agent_activity_projection, desktop_web_state_with_permission,
-    navigation_admission_blocker,
+    DesktopRuntimeProjection, DesktopWebState, access_runtime_owner_token,
+    agent_activity_projection, desktop_web_state_with_permission, navigation_admission_blocker,
 };
 
 const DESKTOP_RUNTIME_DRAIN_BUDGET: usize = 256;
@@ -587,6 +586,14 @@ where
         };
     }
     Ok(remembered_path)
+}
+
+fn access_mode_display_label(access_mode: crate::config::AccessMode) -> &'static str {
+    match access_mode {
+        crate::config::AccessMode::Default => "承認を求める",
+        crate::config::AccessMode::AutoReview => "代理で承認",
+        crate::config::AccessMode::FullAccess => "フルアクセス",
+    }
 }
 
 fn session_search_result_can_apply(
@@ -1525,6 +1532,78 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
+    async fn desktop_child_only_tree_can_change_root_access_and_settle_after_tree_finishes() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let root_session_id = SessionId::new();
+        let child_session_id = SessionId::new();
+        controller.state.app_state.current_session_id = Some(root_session_id);
+        controller.loaded_agent_activity_records = Some((
+            root_session_id,
+            vec![agent_record(
+                child_session_id,
+                "/root/active_child",
+                AgentStatus::Running,
+                "",
+            )],
+        ));
+        assert!(controller.current_agent_tree_active());
+        assert!(!controller.run_lifecycle.root_is_active());
+        assert!(controller.access_mode_mutation_admission_open());
+        assert_eq!(
+            controller.access_mode_mutation_runtime_contract().0,
+            "tree:0"
+        );
+
+        let mut persisted = None;
+        assert!(controller.toggle_access_mode_with_persistence(
+            |expected, access_mode| {
+                assert_eq!(expected, crate::config::AccessMode::Default);
+                assert_eq!(access_mode, crate::config::AccessMode::AutoReview);
+                Ok(Some(Utf8PathBuf::from("C:/config.toml")))
+            },
+            |session_id, access_mode| {
+                persisted = Some((session_id, access_mode));
+                Ok(())
+            },
+        ));
+        assert_eq!(
+            persisted,
+            Some((root_session_id, crate::config::AccessMode::AutoReview))
+        );
+
+        let target = AccessModePersistenceTarget {
+            operation_id: controller.state.begin_access_mode_persistence(),
+            workspace_root: controller.app.workspace.root.clone(),
+            session_id: Some(root_session_id),
+            config_generation: controller.state.provider_config.config_generation,
+            root_run_generation: None,
+            runtime_owner_token: "tree:0".to_string(),
+            old_global_access_mode: crate::config::AccessMode::Default,
+            old_effective_access_mode: crate::config::AccessMode::Default,
+            access_mode: crate::config::AccessMode::AutoReview,
+        };
+        controller.loaded_agent_activity_records = Some((root_session_id, Vec::new()));
+        assert!(!controller.current_agent_tree_active());
+        assert_eq!(
+            controller.access_mode_mutation_runtime_contract().0,
+            "idle:0"
+        );
+        assert_eq!(
+            controller.access_mode_persistence_target_relation(&target),
+            AccessModePersistenceTargetRelation::Exact,
+            "tree:N to idle:N keeps the same root-session access owner"
+        );
+
+        controller.run_lifecycle.begin(1, RunControl::new());
+        controller.next_root_run_generation = 2;
+        assert_eq!(
+            controller.access_mode_persistence_target_relation(&target),
+            AccessModePersistenceTargetRelation::Stale,
+            "a new root generation revokes the finished tree completion grace"
+        );
+    }
+
+    #[tokio::test]
     async fn pre_admission_access_change_persists_the_same_root_session_adopted_before_completion()
     {
         use crate::session::{NewSession, SessionRepository as _};
@@ -2332,7 +2411,7 @@ mod command_projection_owner_tests {
         assert!(controller.toggle_access_mode_with_persistence(
             |expected, access_mode| {
                 assert_eq!(expected, initial_access_mode);
-                assert_eq!(access_mode, crate::config::AccessMode::FullAccess);
+                assert_eq!(access_mode, crate::config::AccessMode::AutoReview);
                 Ok(Some(Utf8PathBuf::from("C:/config.toml")))
             },
             |_, _| Ok(()),
@@ -2346,7 +2425,8 @@ mod command_projection_owner_tests {
             .status_message
             .as_deref()
             .expect("failure status");
-        assert!(status.contains("later admitted turns"));
+        assert!(status.contains("next permission decision"));
+        assert!(status.contains("already displayed confirmation is unchanged"));
     }
 
     #[tokio::test]
@@ -2372,7 +2452,7 @@ mod command_projection_owner_tests {
         assert!(controller.start_access_mode_persistence(
             move |expected, access_mode| {
                 assert_eq!(expected, initial_access_mode);
-                assert_eq!(access_mode, crate::config::AccessMode::FullAccess);
+                assert_eq!(access_mode, crate::config::AccessMode::AutoReview);
                 Ok(Some(Utf8PathBuf::from("C:/config.toml")))
             },
             |_, _| Ok(()),
@@ -2394,7 +2474,8 @@ mod command_projection_owner_tests {
             .status_message
             .as_deref()
             .expect("failure status");
-        assert!(status.contains("later admitted turns"));
+        assert!(status.contains("next permission decision"));
+        assert!(status.contains("already displayed confirmation is unchanged"));
     }
 
     #[tokio::test]
@@ -3892,6 +3973,7 @@ mod command_projection_owner_tests {
         )
         .await
         .expect("controller");
+        assert!(controller.reload_config());
         let initial_access_mode = controller.app.config.permissions.access_mode;
         controller.run_lifecycle.begin(1, RunControl::new());
         let request = test_permission("pending permission");
@@ -6261,9 +6343,7 @@ impl DesktopController {
                 agent_tree_active,
                 self.last_root_run_epoch(),
             ),
-            !self.state.navigation_loading()
-                && !self.state.background_mutation_pending()
-                && access_runtime_allows_mutation(root_run_generation, agent_tree_active),
+            !self.state.navigation_loading() && !self.state.background_mutation_pending(),
         )
     }
 
@@ -6286,7 +6366,11 @@ impl DesktopController {
         if relation != AccessModePersistenceTargetRelation::Stale {
             return relation;
         }
-        self.access_mode_persistence_relation_after_root_finish(target)
+        let after_root = self.access_mode_persistence_relation_after_root_finish(target);
+        if after_root != AccessModePersistenceTargetRelation::Stale {
+            return after_root;
+        }
+        self.access_mode_persistence_relation_after_tree_finish(target)
     }
 
     fn access_mode_persistence_relation_after_root_finish(
@@ -6310,6 +6394,27 @@ impl DesktopController {
             }
             (None, Some(session_id)) => {
                 AccessModePersistenceTargetRelation::AdoptedSession(session_id)
+            }
+            _ => AccessModePersistenceTargetRelation::Stale,
+        }
+    }
+
+    fn access_mode_persistence_relation_after_tree_finish(
+        &self,
+        target: &AccessModePersistenceTarget,
+    ) -> AccessModePersistenceTargetRelation {
+        if target.root_run_generation.is_some()
+            || target.workspace_root != self.app.workspace.root
+            || target.config_generation != self.state.provider_config.config_generation
+            || self.root_run_generation().is_some()
+            || self.current_agent_tree_active()
+            || target.runtime_owner_token != format!("tree:{}", self.last_root_run_epoch())
+        {
+            return AccessModePersistenceTargetRelation::Stale;
+        }
+        match (target.session_id, self.state.app_state.current_session_id) {
+            (target_session_id, current_session_id) if target_session_id == current_session_id => {
+                AccessModePersistenceTargetRelation::Exact
             }
             _ => AccessModePersistenceTargetRelation::Stale,
         }
@@ -6509,8 +6614,8 @@ impl DesktopController {
             .provider_config
             .update_access_mode(pending.target.access_mode);
         self.state.set_status_message(format!(
-            "global config access mode set to {} and remembered in {}; the change applies to later admitted turns",
-            pending.target.access_mode.label(),
+            "global config access mode set to {} and remembered in {}; it applies to the next permission decision; an already displayed confirmation is unchanged",
+            access_mode_display_label(pending.target.access_mode),
             pending.remembered_path
         ));
     }
@@ -6585,8 +6690,8 @@ impl DesktopController {
             "global config"
         };
         let config_message = format!(
-            "{scope} access mode set to {} and remembered in {}; the change applies to later admitted turns",
-            access_mode.label(),
+            "{scope} access mode set to {} and remembered in {}; it applies to the next permission decision; an already displayed confirmation is unchanged",
+            access_mode_display_label(access_mode),
             remembered_path
         );
         self.state.set_status_message(config_message);
@@ -7324,6 +7429,7 @@ impl DesktopController {
             review_request,
             image_paths,
             run_control: run_control.clone(),
+            session_access_mode_adoption: None,
             agent_confirmation: None,
             agent_context: None,
         };
@@ -8458,8 +8564,11 @@ impl DesktopController {
                         ) if session_id == current_session_id => (true, Some(session_id)),
                         _ => (false, None),
                     };
+                    if !target_is_current {
+                        continue;
+                    }
                     match result {
-                        Ok(path) if target_is_current => {
+                        Ok(path) => {
                             self.app.config.permissions.access_mode = target.access_mode;
                             self.state
                                 .provider_config
@@ -8482,23 +8591,15 @@ impl DesktopController {
                                 "global config"
                             };
                             let config_message = format!(
-                                "{scope} access mode set to {} and remembered in {}; the change applies to later admitted turns",
-                                target.access_mode.label(),
+                                "{scope} access mode set to {} and remembered in {}; it applies to the next permission decision; an already displayed confirmation is unchanged",
+                                access_mode_display_label(target.access_mode),
                                 path
                             );
                             self.state.set_status_message(config_message);
                         }
-                        Ok(_) => {
-                            let _ = self.reload_config();
-                            self.state.set_status_message(
-                                "access mode was persisted for its original owner; current configuration was reloaded",
-                            );
-                        }
                         Err(error) => {
                             let _ = self.reload_config();
-                            if target_is_current
-                                && self.state.app_state.current_session_id.is_some()
-                            {
+                            if self.state.app_state.current_session_id.is_some() {
                                 self.state
                                     .provider_config
                                     .update_access_mode(target.old_effective_access_mode);

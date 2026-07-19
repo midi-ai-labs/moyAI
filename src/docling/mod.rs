@@ -401,7 +401,7 @@ fn ensure_docling_limit(
     Ok(())
 }
 
-fn endpoint(base_url: &str, suffix: &str) -> String {
+pub(crate) fn endpoint(base_url: &str, suffix: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), suffix)
 }
 

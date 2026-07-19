@@ -376,7 +376,7 @@ export function renderTopbar(state: DesktopViewState): string {
           <button data-action="show-provider" title="${escapeHtml(state.provider_label)}">
             <span>${escapeHtml(state.model_label)}</span><small>${escapeHtml(state.provider_label)}</small>
           </button>
-           <button data-action="toggle-access" title="アクセス権限" aria-disabled="${state.config_draft.access_mode_mutation_enabled ? "false" : "true"}" ${state.config_draft.access_mode_mutation_enabled ? "" : "disabled"}>${escapeHtml(displayAccessLabel(state.access_label))}</button>
+           <button data-action="toggle-access" title="権限モードを切り替え（承認を求める → 代理で承認 → フルアクセス）" aria-disabled="${state.config_draft.access_mode_mutation_enabled ? "false" : "true"}" ${state.config_draft.access_mode_mutation_enabled ? "" : "disabled"}>${escapeHtml(displayAccessLabel(state.access_label))}</button>
           ${
             turnPageVisible
               ? `<span class="turn-page-chip">${turnPageStart}-${turnPageEnd}/${state.turn_page_total}</span>
@@ -975,7 +975,8 @@ function renderConfigOverlay(state: DesktopWebState): string {
             <section id="settings-permissions" class="settings-section">
               <h3>Permissions</h3>
               ${renderConfigEnumField(state, "permissions.access_mode", "Access mode", {
-                default: "標準",
+                default: "承認を求める",
+                auto_review: "代理で承認",
                 full_access: "フルアクセス",
               })}
             </section>

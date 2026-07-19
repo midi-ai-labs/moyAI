@@ -337,6 +337,7 @@ impl RunService {
                 review_request: None,
                 image_paths: Vec::new(),
                 run_control: request.run_control.clone(),
+                session_access_mode_adoption: None,
                 agent_confirmation: request.agent_confirmation.clone(),
                 agent_context: request.agent_context.clone(),
             };
@@ -748,6 +749,12 @@ impl RunService {
             current_time: crate::context::current_time::CurrentTimeSnapshot::now(),
         });
         let admitted_result: Result<RunSummary, AppRunError> = async {
+            if let Some(adoption) = request.session_access_mode_adoption.as_ref() {
+                adoption
+                    .adopt(session_id, session_context.session.access_mode)
+                    .await
+                    .map_err(AppRunError::Message)?;
+            }
             if let Some(context) = agent_context
                 .as_ref()
                 .filter(|context| !context.is_sub_agent())
@@ -1132,23 +1139,33 @@ impl RunService {
         request: SessionSettingsUpdateRequest,
         renderer: &mut dyn EventRenderer,
     ) -> Result<(), AppRunError> {
-        let update = self
-            .session_service
-            .update_session_settings(
-                request.session_id,
-                SessionSettingsPatch {
-                    cwd: request.cwd,
-                    model: request.model,
-                    base_url: request.base_url,
-                    access_mode: request.access_mode,
-                    reset_model_parameters: request.reset_model_parameters,
-                    temperature: request.temperature,
-                    top_p: request.top_p,
-                    top_k: request.top_k,
-                    max_output_tokens: request.max_output_tokens,
-                },
-            )
-            .await?;
+        let update = if session_settings_request_is_access_only(&request) {
+            self.session_service
+                .update_root_session_access_mode(
+                    request.session_id,
+                    request
+                        .access_mode
+                        .expect("access-only request must contain an access mode"),
+                )
+                .await?
+        } else {
+            self.session_service
+                .update_session_settings(
+                    request.session_id,
+                    SessionSettingsPatch {
+                        cwd: request.cwd,
+                        model: request.model,
+                        base_url: request.base_url,
+                        access_mode: request.access_mode,
+                        reset_model_parameters: request.reset_model_parameters,
+                        temperature: request.temperature,
+                        top_p: request.top_p,
+                        top_k: request.top_k,
+                        max_output_tokens: request.max_output_tokens,
+                    },
+                )
+                .await?
+        };
         renderer.render_session_list(std::slice::from_ref(&update.session))?;
         Ok(())
     }
@@ -1378,6 +1395,18 @@ impl RunService {
             .await?;
         Ok(())
     }
+}
+
+fn session_settings_request_is_access_only(request: &SessionSettingsUpdateRequest) -> bool {
+    request.access_mode.is_some()
+        && request.cwd.is_none()
+        && request.model.is_none()
+        && request.base_url.is_none()
+        && !request.reset_model_parameters
+        && request.temperature.is_none()
+        && request.top_p.is_none()
+        && request.top_k.is_none()
+        && request.max_output_tokens.is_none()
 }
 
 async fn renew_admitted_run_lease_with_terminal_cancel(
@@ -2398,6 +2427,36 @@ mod tests {
     }
 
     #[test]
+    fn only_access_mode_updates_use_the_live_root_session_path() {
+        let access_only = super::SessionSettingsUpdateRequest {
+            session_id: crate::session::SessionId::new(),
+            cwd: None,
+            model: None,
+            base_url: None,
+            access_mode: Some(crate::config::AccessMode::AutoReview),
+            reset_model_parameters: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_output_tokens: None,
+        };
+        assert!(super::session_settings_request_is_access_only(&access_only));
+
+        let combined = super::SessionSettingsUpdateRequest {
+            model: Some("replacement-model".to_string()),
+            ..access_only.clone()
+        };
+        assert!(!super::session_settings_request_is_access_only(&combined));
+
+        let no_access = super::SessionSettingsUpdateRequest {
+            access_mode: None,
+            model: Some("replacement-model".to_string()),
+            ..access_only
+        };
+        assert!(!super::session_settings_request_is_access_only(&no_access));
+    }
+
+    #[test]
     fn image_attachment_records_bytes_read_from_the_open_handle() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8");
@@ -2950,6 +3009,7 @@ mod tests {
                     review_request: None,
                     image_paths: Vec::new(),
                     run_control: run_control.clone(),
+                    session_access_mode_adoption: None,
                     agent_confirmation: None,
                     agent_context: None,
                 }),
@@ -3083,6 +3143,7 @@ mod tests {
                     review_request: None,
                     image_paths: Vec::new(),
                     run_control: root_scope.clone(),
+                    session_access_mode_adoption: None,
                     agent_confirmation: Some(confirmation),
                     agent_context: None,
                 },

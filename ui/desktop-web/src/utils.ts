@@ -77,7 +77,8 @@ export function shortenPath(path: string): string {
 }
 
 export function displayAccessLabel(label: string): string {
-  if (label === "default") return "標準";
+  if (label === "default") return "承認を求める";
+  if (label === "auto_review") return "代理で承認";
   if (label === "full_access") return "フルアクセス";
   return label;
 }

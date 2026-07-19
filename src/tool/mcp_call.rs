@@ -4,6 +4,9 @@ use serde_json::{Value, json};
 
 use crate::error::ToolError;
 use crate::tool::context::ToolContext;
+use crate::tool::permission_guardian::{
+    PermissionGuardianEvidence, PermissionGuardianEvidenceState,
+};
 use crate::tool::registry::Tool;
 use crate::tool::truncate::clip_text_with_ellipsis;
 use crate::tool::{ToolName, ToolResult, ToolSpec};
@@ -54,15 +57,17 @@ impl Tool for McpCallTool {
             Some(tool_name) => format!("Call MCP tool {}:{}", input.server_id, tool_name),
             None => format!("List MCP tools from {}", input.server_id),
         };
-        let details = mcp_permission_details(ctx.services.mcp.config(), &input);
+        let (details, guardian_evidence) =
+            mcp_permission_material(ctx.services.mcp.config(), &input);
         let effect_admission = ctx
-            .confirm_if_needed_with_details(
+            .confirm_if_needed_with_details_and_guardian_evidence(
                 effect.access_kind(),
                 summary,
                 details,
                 Vec::new(),
                 false,
                 effect.permission_risks(),
+                guardian_evidence,
             )
             .await?;
         let operation = match input
@@ -177,53 +182,114 @@ impl Tool for McpCallTool {
     }
 }
 
-fn mcp_permission_details(config: &crate::config::McpConfig, input: &McpCallInput) -> Vec<String> {
-    let target = config
+fn mcp_permission_material(
+    config: &crate::config::McpConfig,
+    input: &McpCallInput,
+) -> (Vec<String>, PermissionGuardianEvidenceState) {
+    let configured_server = config
         .servers
         .iter()
-        .find(|server| server.id == input.server_id)
-        .map(|server| redact_mcp_target(&server.base_url))
-        .unwrap_or_else(|| "[unconfigured server]".to_string());
+        .find(|server| server.id == input.server_id);
+    let server = configured_server.filter(|server| config.enabled && server.enabled);
+    let (target, target_was_redacted) = configured_server
+        .map(|server| redact_mcp_target_with_status(&server.base_url))
+        .unwrap_or_else(|| ("[unconfigured server]".to_string(), true));
     let mut details = vec![format!("Configured target: {target}")];
-    if input
+    let tool_name = input
         .tool_name
         .as_deref()
-        .is_some_and(|name| !name.trim().is_empty())
-    {
-        let arguments = input
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    let (arguments, arguments_were_redacted) = if tool_name.is_some() {
+        let raw_arguments = input
             .arguments
             .as_ref()
-            .map(redact_mcp_value)
+            .cloned()
             .unwrap_or_else(|| Value::Object(Default::default()));
-        let rendered = serde_json::to_string_pretty(&arguments)
+        let (visible_arguments, arguments_were_redacted) =
+            redact_mcp_value_with_status(&raw_arguments);
+        let rendered = serde_json::to_string_pretty(&visible_arguments)
             .unwrap_or_else(|_| "[arguments could not be rendered]".to_string());
         details.push(format!(
             "Arguments:\n{}",
             clip_text_with_ellipsis(&rendered, 2_000)
         ));
-    }
-    details
+        (raw_arguments, arguments_were_redacted)
+    } else {
+        (Value::Object(Default::default()), false)
+    };
+
+    let guardian_evidence = match (server, target_was_redacted, arguments_were_redacted) {
+        (None, _, _) => PermissionGuardianEvidenceState::incomplete(
+            "the requested MCP server is not configured and enabled",
+        ),
+        (Some(_), true, _) => PermissionGuardianEvidenceState::incomplete(
+            "the configured MCP target contains redacted or invalid URL components",
+        ),
+        (Some(_), _, true) => PermissionGuardianEvidenceState::incomplete(
+            "the MCP arguments contain sensitive values that cannot be disclosed to the guardian",
+        ),
+        (Some(_), false, false) => {
+            let credential_present = server.is_some_and(|server| !server.headers.is_empty());
+            let evidence = match tool_name {
+                Some(tool_name) => PermissionGuardianEvidence::McpCall {
+                    server_id: input.server_id.clone(),
+                    configured_target: target,
+                    credential_present,
+                    tool_name: tool_name.to_string(),
+                    arguments,
+                },
+                None => PermissionGuardianEvidence::McpListTools {
+                    server_id: input.server_id.clone(),
+                    configured_target: target,
+                    credential_present,
+                },
+            };
+            PermissionGuardianEvidenceState::Complete(evidence)
+        }
+    };
+    (details, guardian_evidence)
 }
 
+#[cfg(test)]
 fn redact_mcp_target(value: &str) -> String {
+    redact_mcp_target_with_status(value).0
+}
+
+fn redact_mcp_target_with_status(value: &str) -> (String, bool) {
     let Ok(mut url) = reqwest::Url::parse(value) else {
-        return "[configured target is not a valid URL]".to_string();
+        return ("[configured target is not a valid URL]".to_string(), true);
     };
+    let mut redacted = false;
     if !url.username().is_empty() {
         let _ = url.set_username("[redacted]");
+        redacted = true;
     }
     if url.password().is_some() {
         let _ = url.set_password(Some("[redacted]"));
+        redacted = true;
+    }
+    if url.query().is_some() {
+        redacted = true;
+    }
+    if url.fragment().is_some() {
+        redacted = true;
     }
     url.set_query(None);
     url.set_fragment(None);
-    url.to_string()
+    (url.to_string(), redacted)
 }
 
+#[cfg(test)]
 fn redact_mcp_value(value: &Value) -> Value {
+    redact_mcp_value_with_status(value).0
+}
+
+fn redact_mcp_value_with_status(value: &Value) -> (Value, bool) {
     match value {
-        Value::Object(object) => Value::Object(
-            object
+        Value::Object(object) => {
+            let mut redacted = false;
+            let visible = object
                 .iter()
                 .map(|(key, value)| {
                     let normalized = key.to_ascii_lowercase();
@@ -238,19 +304,32 @@ fn redact_mcp_value(value: &Value) -> Value {
                     ]
                     .iter()
                     .any(|marker| normalized.contains(marker));
-                    (
-                        key.clone(),
-                        if sensitive {
-                            Value::String("[redacted]".to_string())
-                        } else {
-                            redact_mcp_value(value)
-                        },
-                    )
+                    let visible_value = if sensitive {
+                        redacted = true;
+                        Value::String("[redacted]".to_string())
+                    } else {
+                        let (visible, nested_redaction) = redact_mcp_value_with_status(value);
+                        redacted |= nested_redaction;
+                        visible
+                    };
+                    (key.clone(), visible_value)
                 })
-                .collect(),
-        ),
-        Value::Array(values) => Value::Array(values.iter().map(redact_mcp_value).collect()),
-        _ => value.clone(),
+                .collect();
+            (Value::Object(visible), redacted)
+        }
+        Value::Array(values) => {
+            let mut redacted = false;
+            let visible = values
+                .iter()
+                .map(|value| {
+                    let (visible, nested_redaction) = redact_mcp_value_with_status(value);
+                    redacted |= nested_redaction;
+                    visible
+                })
+                .collect();
+            (Value::Array(visible), redacted)
+        }
+        _ => (value.clone(), false),
     }
 }
 
@@ -258,7 +337,60 @@ fn redact_mcp_value(value: &Value) -> Value {
 mod tests {
     use serde_json::json;
 
-    use super::{redact_mcp_target, redact_mcp_value};
+    use super::{mcp_permission_material, redact_mcp_target, redact_mcp_value};
+    use crate::config::{McpConfig, McpServerConfig, McpTransportKind};
+    use crate::tool::permission_guardian::{
+        PermissionGuardianEvidence, PermissionGuardianEvidenceState,
+    };
+
+    fn config() -> McpConfig {
+        McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                id: "fixture".to_string(),
+                enabled: true,
+                transport: McpTransportKind::Http,
+                base_url: "https://mcp.example.test/rpc".to_string(),
+                timeout_ms: 1_000,
+                tool_routes: Vec::new(),
+                headers: Default::default(),
+            }],
+        }
+    }
+
+    fn assert_tail_evidence(operation: &str) {
+        let input = super::McpCallInput {
+            server_id: "fixture".to_string(),
+            tool_name: Some("documents.update".to_string()),
+            arguments: Some(json!({
+                "a_padding": "x".repeat(2_500),
+                "z_operation": operation,
+            })),
+        };
+        let (details, evidence) = mcp_permission_material(&config(), &input);
+
+        assert!(details[1].len() < 2_100);
+        assert!(!details[1].contains(operation));
+        let PermissionGuardianEvidenceState::Complete(PermissionGuardianEvidence::McpCall {
+            arguments,
+            ..
+        }) = evidence
+        else {
+            panic!("expected complete MCP call evidence");
+        };
+        assert_eq!(arguments["z_operation"], operation);
+        assert_eq!(arguments["a_padding"].as_str().map(str::len), Some(2_500));
+    }
+
+    #[test]
+    fn guardian_evidence_preserves_positive_decisive_field_beyond_human_preview() {
+        assert_tail_evidence("read_only");
+    }
+
+    #[test]
+    fn guardian_evidence_preserves_negative_decisive_field_beyond_human_preview() {
+        assert_tail_evidence("delete_everything");
+    }
 
     #[test]
     fn permission_arguments_preserve_targets_and_redact_secrets() {
@@ -284,5 +416,46 @@ mod tests {
         assert!(!target.contains("password"));
         assert!(!target.contains("secret"));
         assert!(!target.contains("fragment"));
+    }
+
+    #[test]
+    fn sensitive_arguments_are_human_redacted_and_not_auto_reviewable() {
+        let input = super::McpCallInput {
+            server_id: "fixture".to_string(),
+            tool_name: Some("documents.update".to_string()),
+            arguments: Some(json!({"document_id": "doc-42", "api_token": "secret-value"})),
+        };
+        let (details, evidence) = mcp_permission_material(&config(), &input);
+
+        assert!(details[1].contains("[redacted]"));
+        assert!(!details[1].contains("secret-value"));
+        assert!(matches!(
+            evidence,
+            PermissionGuardianEvidenceState::Incomplete { .. }
+        ));
+    }
+
+    #[test]
+    fn mcp_evidence_reports_credentials_without_disclosing_header_values() {
+        let mut config = config();
+        config.servers[0].headers.insert(
+            "Authorization".to_string(),
+            "Bearer header-secret".to_string(),
+        );
+        let input = super::McpCallInput {
+            server_id: "fixture".to_string(),
+            tool_name: Some("documents.read".to_string()),
+            arguments: Some(json!({"document_id": "doc-42"})),
+        };
+        let (_, evidence) = mcp_permission_material(&config, &input);
+        let PermissionGuardianEvidenceState::Complete(evidence) = evidence else {
+            panic!("expected complete MCP evidence");
+        };
+        let payload = serde_json::to_value(evidence).expect("serialize evidence");
+
+        assert_eq!(payload["credential_present"], true);
+        let serialized = payload.to_string();
+        assert!(!serialized.contains("header-secret"));
+        assert!(!serialized.contains("Authorization"));
     }
 }

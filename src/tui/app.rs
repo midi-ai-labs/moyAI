@@ -21,13 +21,13 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::app::{
     App, AppBootstrap, AppCommand, AppCommandOutcome, ReviewRequest, RunConfigInput, RunRequest,
-    SessionSteerRequest,
+    RunSessionAccessModeAdoption, SessionSteerRequest,
 };
 use crate::cli::{
     ConfirmationOutcome, ConfirmationPrompt, EventRenderer, OutputMode, ReviewDecision,
     SharedConfirmationPrompt, TuiArgs,
 };
-use crate::config::{ConfigLoader, ResolvedConfig, ShellFamily};
+use crate::config::{AccessMode, ConfigLoader, ResolvedConfig, ShellFamily};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
 use crate::protocol::{PlanStepStatus, ToolApprovalDecision, TurnInterruptionCause};
 use crate::runtime::{RunCancelOutcome, RunCancellationCause, RunControl, SystemClock};
@@ -54,6 +54,14 @@ use super::state::{
 type TerminalHandle = Terminal<CrosstermBackend<Stdout>>;
 const TUI_RUNTIME_DRAIN_BUDGET: usize = 128;
 const TUI_RUNTIME_MAILBOX_CAPACITY: usize = 256;
+
+fn access_mode_display_label(access_mode: AccessMode) -> &'static str {
+    match access_mode {
+        AccessMode::Default => "承認を求める",
+        AccessMode::AutoReview => "代理で承認",
+        AccessMode::FullAccess => "フルアクセス",
+    }
+}
 
 struct TuiRootRun {
     generation: u64,
@@ -175,6 +183,92 @@ fn has_pending_steer_submission(submissions: &[PendingComposerSubmission]) -> bo
         .any(|pending| matches!(pending.id, PendingComposerSubmissionId::Steer(_)))
 }
 
+struct PreAdmissionAccessModeState {
+    access_mode: AccessMode,
+    session_id: Option<SessionId>,
+}
+
+struct PreAdmissionAccessModeAdoption {
+    session_service: crate::session::SessionService,
+    state: tokio::sync::Mutex<PreAdmissionAccessModeState>,
+}
+
+impl PreAdmissionAccessModeAdoption {
+    fn new(session_service: crate::session::SessionService, access_mode: AccessMode) -> Self {
+        Self {
+            session_service,
+            state: tokio::sync::Mutex::new(PreAdmissionAccessModeState {
+                access_mode,
+                session_id: None,
+            }),
+        }
+    }
+
+    async fn update(&self, access_mode: AccessMode) -> Result<bool, String> {
+        let mut state = self.state.lock().await;
+        let Some(session_id) = state.session_id else {
+            state.access_mode = access_mode;
+            return Ok(false);
+        };
+        if state.access_mode != access_mode {
+            let updated = self
+                .session_service
+                .compare_and_set_root_session_access_mode(
+                    session_id,
+                    state.access_mode,
+                    access_mode,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if updated.is_none() {
+                return Err(format!(
+                    "session {session_id} access mode changed before the pre-admission update"
+                ));
+            }
+            state.access_mode = access_mode;
+        }
+        Ok(true)
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl RunSessionAccessModeAdoption for PreAdmissionAccessModeAdoption {
+    async fn adopt(
+        &self,
+        session_id: SessionId,
+        admitted_access_mode: AccessMode,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().await;
+        if let Some(bound_session_id) = state.session_id {
+            return if bound_session_id == session_id {
+                Ok(())
+            } else {
+                Err(format!(
+                    "pre-admission access owner changed from session {bound_session_id} to {session_id}"
+                ))
+            };
+        }
+        if state.access_mode != admitted_access_mode {
+            let updated = self
+                .session_service
+                .compare_and_set_root_session_access_mode(
+                    session_id,
+                    admitted_access_mode,
+                    state.access_mode,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if updated.is_none() {
+                return Err(format!(
+                    "session {session_id} access mode changed before pre-admission adoption"
+                ));
+            }
+        }
+        state.session_id = Some(session_id);
+        Ok(())
+    }
+}
+
 struct TuiController {
     app: App,
     state: AppState,
@@ -189,6 +283,7 @@ struct TuiController {
     next_steer_submission_id: u64,
     composer_draft_revision: u64,
     pending_composer_submissions: Vec<PendingComposerSubmission>,
+    pending_access_mode_adoption: Option<(u64, Arc<PreAdmissionAccessModeAdoption>)>,
     runtime_tx: mpsc::SyncSender<RuntimeMessage>,
     runtime_rx: mpsc::Receiver<RuntimeMessage>,
     pending_permission: Option<PendingPermission>,
@@ -225,6 +320,7 @@ impl TuiController {
             next_steer_submission_id: 1,
             composer_draft_revision: 0,
             pending_composer_submissions: Vec::new(),
+            pending_access_mode_adoption: None,
             runtime_tx,
             runtime_rx,
             pending_permission: None,
@@ -272,6 +368,10 @@ impl TuiController {
             && (matches!(self.state.run_status, RunStatus::Running) || self.agent_tree_active())
         {
             return self.stop_current_run().await;
+        }
+        if self.pending_permission.is_some() && key.code == KeyCode::F(8) {
+            self.toggle_access_mode().await?;
+            return Ok(());
         }
         if self.pending_permission.is_some() {
             return self.handle_permission_key(key);
@@ -322,7 +422,7 @@ impl TuiController {
             {
                 self.start_uncommitted_review().await?;
             }
-            KeyCode::F(8) if self.state.run_status != RunStatus::Running => {
+            KeyCode::F(8) => {
                 self.toggle_access_mode().await?;
             }
             KeyCode::F(9) if self.state.run_status != RunStatus::Running => {
@@ -682,31 +782,75 @@ impl TuiController {
     }
 
     async fn toggle_access_mode(&mut self) -> Result<(), AppRunError> {
+        self.toggle_access_mode_with_global_remember(ConfigEditorState::remember_global_access_mode)
+            .await
+    }
+
+    async fn toggle_access_mode_with_global_remember<RememberGlobal>(
+        &mut self,
+        mut remember_global: RememberGlobal,
+    ) -> Result<(), AppRunError>
+    where
+        RememberGlobal: FnMut(AccessMode) -> Result<camino::Utf8PathBuf, String>,
+    {
         let access_mode = self.effective_config.permissions.access_mode.next();
-        let session_access_owner = self.state.current_session_id.is_some();
+        let old_access_mode = self.effective_config.permissions.access_mode;
+        let mut session_access_owner = self.state.current_session_id.is_some();
         if session_access_owner {
             if !self.persist_current_session_access_mode(access_mode).await {
                 return Ok(());
             }
-        } else if let Err(error) = ConfigEditorState::remember_global_access_mode(access_mode) {
-            self.state.status_message = Some(format!(
-                "access mode was not changed because it could not be remembered: {error}"
-            ));
-            return Ok(());
         } else {
-            self.app.config.permissions.access_mode = access_mode;
-            self.base_config.permissions.access_mode = access_mode;
+            let pending_adoption = self
+                .pending_access_mode_adoption
+                .as_ref()
+                .map(|(_, adoption)| Arc::clone(adoption));
+            if let Some(adoption) = pending_adoption {
+                session_access_owner = match adoption.update(access_mode).await {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                        self.state.status_message = Some(format!(
+                            "access mode was not changed because the admitting root session rejected it: {error}"
+                        ));
+                        return Ok(());
+                    }
+                };
+                if !session_access_owner {
+                    if let Err(error) = remember_global(access_mode) {
+                        let rollback_error = adoption.update(old_access_mode).await.err();
+                        self.state.status_message = Some(match rollback_error {
+                            Some(rollback_error) => format!(
+                                "access mode could not be remembered and the pending session rollback failed: {error}; {rollback_error}"
+                            ),
+                            None => format!(
+                                "access mode was not changed because it could not be remembered: {error}"
+                            ),
+                        });
+                        return Ok(());
+                    }
+                    self.app.config.permissions.access_mode = access_mode;
+                    self.base_config.permissions.access_mode = access_mode;
+                }
+            } else if let Err(error) = remember_global(access_mode) {
+                self.state.status_message = Some(format!(
+                    "access mode was not changed because it could not be remembered: {error}"
+                ));
+                return Ok(());
+            } else {
+                self.app.config.permissions.access_mode = access_mode;
+                self.base_config.permissions.access_mode = access_mode;
+            }
         }
         self.apply_access_mode_owner(access_mode);
         self.state.status_message = Some(if session_access_owner {
             format!(
-                "session access mode set to {} and remembered for this session; it applies to turns admitted later",
-                access_mode.label()
+                "session access mode set to {} and remembered for this session; it applies to the next permission decision; an already displayed confirmation is unchanged",
+                access_mode_display_label(access_mode)
             )
         } else {
             format!(
-                "default access mode set to {} and remembered globally; it applies to turns admitted later",
-                access_mode.label()
+                "default access mode set to {} and remembered globally; it applies to the next permission decision; an already displayed confirmation is unchanged",
+                access_mode_display_label(access_mode)
             )
         });
         Ok(())
@@ -794,6 +938,7 @@ impl TuiController {
         self.composer = build_composer();
         self.composer_draft_revision = 0;
         self.pending_composer_submissions.clear();
+        self.pending_access_mode_adoption = None;
         self.review_editor = build_composer();
         self.workspace_picker = build_composer();
         self.pending_permission = None;
@@ -949,6 +1094,17 @@ impl TuiController {
             return Ok(());
         }
         self.next_root_run_generation = next_generation;
+        let session_access_mode_adoption = if self.state.current_session_id.is_none() {
+            let adoption = Arc::new(PreAdmissionAccessModeAdoption::new(
+                self.app.session_service.clone(),
+                self.effective_config.permissions.access_mode,
+            ));
+            self.pending_access_mode_adoption = Some((run_generation, Arc::clone(&adoption)));
+            Some(adoption as Arc<dyn RunSessionAccessModeAdoption>)
+        } else {
+            self.pending_access_mode_adoption = None;
+            None
+        };
         let request = RunRequest {
             prompt: prompt.clone(),
             session_id: self.state.current_session_id,
@@ -963,6 +1119,7 @@ impl TuiController {
             review_request,
             image_paths: Vec::new(),
             run_control,
+            session_access_mode_adoption,
             agent_confirmation: None,
             agent_context: None,
         };
@@ -1209,6 +1366,13 @@ impl TuiController {
                             PendingComposerSubmissionId::RootRun(run_generation),
                             *session_id,
                         );
+                        if self
+                            .pending_access_mode_adoption
+                            .as_ref()
+                            .is_some_and(|(generation, _)| *generation == run_generation)
+                        {
+                            self.pending_access_mode_adoption = None;
+                        }
                     }
                     let live_refresh_session_id =
                         event.session_id().or(self.state.current_session_id);
@@ -1256,6 +1420,13 @@ impl TuiController {
                     run_generation,
                     result,
                 } => {
+                    if self
+                        .pending_access_mode_adoption
+                        .as_ref()
+                        .is_some_and(|(generation, _)| *generation == run_generation)
+                    {
+                        self.pending_access_mode_adoption = None;
+                    }
                     let Some(cancellation_cause) = self.root_run_lifecycle.finish(run_generation)
                     else {
                         continue;
@@ -1734,7 +1905,7 @@ impl TuiController {
                 )),
                 Span::raw(format!(
                     "access_mode={}  ",
-                    self.effective_config.permissions.access_mode.as_str()
+                    access_mode_display_label(self.effective_config.permissions.access_mode)
                 )),
                 Span::raw(format!(
                     "workspace={}",
@@ -2283,7 +2454,7 @@ impl TuiController {
                 )),
                 Line::from(format!(
                     "Access mode: {}",
-                    self.effective_config.permissions.access_mode.as_str()
+                    access_mode_display_label(self.effective_config.permissions.access_mode)
                 )),
                 Line::from(""),
                 Line::from("a = approve and run once"),
@@ -4102,6 +4273,162 @@ mod key_tests {
             Some(RunCancellationCause::Failure(
                 "provider failed first".to_string()
             ))
+        );
+    }
+
+    #[tokio::test]
+    async fn f8_cycles_all_access_modes_for_an_active_root_without_resolving_pending_permission() {
+        use crate::session::SessionRepository as _;
+
+        let (_temp, mut controller, session_id) =
+            tui_controller_with_session("f8-active-root-access-cycle").await;
+        assert!(controller.root_run_lifecycle.begin(7, RunControl::new()));
+        let request = test_tui_permission("unchanged-by-access-cycle");
+        let (responder, _receiver) = mpsc::channel();
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request: request.clone(),
+            responder,
+            run_control: RunControl::new(),
+        });
+
+        for (expected, label) in [
+            (AccessMode::AutoReview, "代理で承認"),
+            (AccessMode::FullAccess, "フルアクセス"),
+            (AccessMode::Default, "承認を求める"),
+        ] {
+            controller
+                .handle_key(KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE))
+                .await
+                .expect("F8 key toggle with pending permission");
+
+            assert_eq!(
+                controller.effective_config.permissions.access_mode,
+                expected
+            );
+            assert_eq!(
+                controller
+                    .app
+                    .store
+                    .session_repo()
+                    .get_session(session_id)
+                    .await
+                    .expect("durable root session")
+                    .access_mode,
+                expected
+            );
+            let pending = controller
+                .pending_permission
+                .as_ref()
+                .expect("displayed permission remains pending");
+            assert_eq!(pending.confirmation_id, 42);
+            assert_eq!(pending.request.summary, request.summary);
+            assert!(
+                controller
+                    .state
+                    .status_message
+                    .as_deref()
+                    .is_some_and(|status| status.contains(label)
+                        && status.contains("next permission decision")
+                        && status.contains("already displayed confirmation is unchanged"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn f8_key_reaches_live_access_mode_toggle_while_root_is_running() {
+        use crate::session::SessionRepository as _;
+
+        let (_temp, mut controller, session_id) =
+            tui_controller_with_session("f8-running-root-key-route").await;
+        assert!(controller.root_run_lifecycle.begin(8, RunControl::new()));
+        controller.state.run_status = RunStatus::Running;
+
+        controller
+            .handle_key(KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE))
+            .await
+            .expect("running F8 key toggle");
+
+        assert_eq!(
+            controller.effective_config.permissions.access_mode,
+            AccessMode::AutoReview
+        );
+        assert_eq!(
+            controller
+                .app
+                .store
+                .session_repo()
+                .get_session(session_id)
+                .await
+                .expect("durable running root session")
+                .access_mode,
+            AccessMode::AutoReview
+        );
+    }
+
+    #[tokio::test]
+    async fn f8_before_new_session_admission_is_adopted_before_permission_decisions() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (_temp, mut controller, _existing_session_id) =
+            tui_controller_with_session("f8-pre-admission-access-adoption").await;
+        controller.state.current_session_id = None;
+        let repository = controller.app.store.session_repo();
+        let admitted_session = repository
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "admitting root".to_string(),
+                cwd: controller.app.workspace.cwd.clone(),
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: AccessMode::Default,
+            })
+            .await
+            .expect("new root session");
+        let adoption = Arc::new(PreAdmissionAccessModeAdoption::new(
+            controller.app.session_service.clone(),
+            AccessMode::Default,
+        ));
+        controller.pending_access_mode_adoption = Some((9, Arc::clone(&adoption)));
+        assert!(controller.root_run_lifecycle.begin(9, RunControl::new()));
+        controller.state.run_status = RunStatus::Running;
+
+        let mut remembered_modes = Vec::new();
+        controller
+            .toggle_access_mode_with_global_remember(|access_mode| {
+                remembered_modes.push(access_mode);
+                Ok(Utf8PathBuf::from("C:/isolated-test-config.toml"))
+            })
+            .await
+            .expect("pre-admission F8 toggle");
+        assert_eq!(remembered_modes, vec![AccessMode::AutoReview]);
+
+        adoption
+            .adopt(admitted_session.id, AccessMode::Default)
+            .await
+            .expect("adopt pending access mode before agent loop");
+        assert_eq!(
+            repository
+                .get_session(admitted_session.id)
+                .await
+                .expect("adopted root session")
+                .access_mode,
+            AccessMode::AutoReview
+        );
+
+        controller
+            .toggle_access_mode_with_global_remember(|_| {
+                panic!("a bound admitting session must not rewrite the global owner")
+            })
+            .await
+            .expect("bound pre-admission F8 toggle");
+        assert_eq!(
+            repository
+                .get_session(admitted_session.id)
+                .await
+                .expect("live admitting root session")
+                .access_mode,
+            AccessMode::FullAccess
         );
     }
 

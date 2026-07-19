@@ -443,8 +443,7 @@ fn access_mode_from_document(document: &toml::Value) -> Result<AccessMode, Strin
         .ok_or_else(|| "permissions.access_mode must be a string".to_string())?;
     match value {
         "default" | "standard" => Ok(AccessMode::Default),
-        // One-way normalization for user config written by the retired AI-review mode.
-        "auto_review" | "auto-review" => Ok(AccessMode::Default),
+        "auto_review" | "auto-review" => Ok(AccessMode::AutoReview),
         "full_access" | "full-access" => Ok(AccessMode::FullAccess),
         _ => Err(format!("unknown permissions.access_mode `{value}`")),
     }
@@ -764,7 +763,7 @@ fn parse_provider_metadata_mode(value: &str) -> Result<ProviderMetadataMode, Str
 fn parse_access_mode(value: &str) -> Result<AccessMode, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "default" | "normal" => Ok(AccessMode::Default),
-        "auto_review" | "auto-review" | "autoreview" | "auto" => Ok(AccessMode::Default),
+        "auto_review" | "auto-review" | "autoreview" | "auto" => Ok(AccessMode::AutoReview),
         "full_access" | "full-access" | "full" => Ok(AccessMode::FullAccess),
         other => Err(format!("unsupported access_mode `{other}`")),
     }
@@ -829,6 +828,7 @@ fn field_value(key: ConfigField, config: &ResolvedConfig) -> String {
         },
         ConfigField::AccessMode => match config.permissions.access_mode {
             AccessMode::Default => "default".to_string(),
+            AccessMode::AutoReview => "auto_review".to_string(),
             AccessMode::FullAccess => "full_access".to_string(),
         },
         ConfigField::MultiAgentEnabled => config.multi_agent.enabled.to_string(),
@@ -1256,6 +1256,7 @@ mod tests {
         .expect("seed config");
 
         for (mode, expected) in [
+            (AccessMode::AutoReview, "auto_review"),
             (AccessMode::FullAccess, "full_access"),
             (AccessMode::Default, "default"),
         ] {

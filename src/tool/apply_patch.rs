@@ -1554,14 +1554,13 @@ mod tests {
         .expect_err("operation and formatter plan targets must remain aligned");
         validate_patch_formatter_plan_target(Some(formatter_plan), None, "delete")
             .expect_err("delete operations cannot retain formatter plans");
-        assert!(!access_mode_allows_permission(
+        let decisions = [
             AccessMode::Default,
-            &request
-        ));
-        assert!(!access_mode_allows_permission(
+            AccessMode::AutoReview,
             AccessMode::FullAccess,
-            &request
-        ));
+        ]
+        .map(|mode| access_mode_allows_permission(mode, &request));
+        assert_eq!(decisions, [false, false, true]);
         assert!(
             request
                 .details

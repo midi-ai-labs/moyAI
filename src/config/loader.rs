@@ -1182,13 +1182,7 @@ fn parse_reasoning_summary(value: &str) -> Option<ReasoningSummary> {
 }
 
 fn parse_access_mode(value: &str) -> Option<AccessMode> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "default" | "normal" => Some(AccessMode::Default),
-        // Retired values normalize at the config boundary and are never represented in runtime.
-        "auto_review" | "auto-review" | "autoreview" | "auto" => Some(AccessMode::Default),
-        "full_access" | "full-access" | "full" => Some(AccessMode::FullAccess),
-        _ => None,
-    }
+    AccessMode::parse(value)
 }
 
 fn parse_string_map_json(value: &str) -> Option<std::collections::BTreeMap<String, String>> {

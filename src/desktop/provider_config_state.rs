@@ -182,7 +182,7 @@ mod tests {
             .iter()
             .map(|model| model.id.clone())
             .collect::<Vec<_>>();
-        state.update_access_mode(AccessMode::FullAccess);
+        state.update_access_mode(AccessMode::AutoReview);
 
         assert_eq!(state.config_generation, generation);
         assert_eq!(state.provider_loaded_base_url, loaded_base_url);
@@ -197,7 +197,7 @@ mod tests {
         );
         assert_eq!(
             state.effective_config.permissions.access_mode,
-            AccessMode::FullAccess
+            AccessMode::AutoReview
         );
     }
 }

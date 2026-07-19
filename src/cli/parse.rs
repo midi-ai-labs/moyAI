@@ -700,7 +700,7 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
 fn parse_cli_access_mode(value: &str) -> Result<AccessMode, CliUsageError> {
     AccessMode::parse(value).ok_or_else(|| {
         CliUsageError::Message(format!(
-            "invalid access mode `{value}`; expected default or full_access"
+            "invalid access mode `{value}`; expected default, auto_review, or full_access"
         ))
     })
 }
@@ -941,10 +941,7 @@ struct SessionSettingsCommand {
     model: Option<String>,
     #[arg(long = "base-url")]
     base_url: Option<String>,
-    #[arg(
-        long = "access-mode",
-        value_parser = ["default", "full_access"]
-    )]
+    #[arg(long = "access-mode")]
     access_mode: Option<String>,
     #[arg(long = "reset-model-parameters")]
     reset_model_parameters: bool,
@@ -1174,7 +1171,28 @@ impl clap::ValueEnum for OutputMode {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_bounded_session_page_limit;
+    use super::{parse_bounded_session_page_limit, parse_cli_access_mode};
+    use crate::config::AccessMode;
+
+    #[test]
+    fn cli_access_mode_parser_accepts_canonical_keys_and_legacy_aliases() {
+        for (value, expected) in [
+            ("default", AccessMode::Default),
+            ("normal", AccessMode::Default),
+            ("auto_review", AccessMode::AutoReview),
+            ("auto-review", AccessMode::AutoReview),
+            ("auto", AccessMode::AutoReview),
+            ("full_access", AccessMode::FullAccess),
+            ("full-access", AccessMode::FullAccess),
+            ("full", AccessMode::FullAccess),
+        ] {
+            assert_eq!(
+                parse_cli_access_mode(value).expect("accepted access mode"),
+                expected
+            );
+        }
+        assert!(parse_cli_access_mode("unknown").is_err());
+    }
 
     #[test]
     fn session_page_limits_are_rejected_before_repository_dispatch() {

@@ -3970,6 +3970,7 @@ fn parse_access_mode_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::
     let value = row.get::<_, String>(index)?;
     match value.as_str() {
         "default" => Ok(AccessMode::Default),
+        "auto_review" => Ok(AccessMode::AutoReview),
         "full_access" => Ok(AccessMode::FullAccess),
         _ => Err(rusqlite::Error::FromSqlConversionFailure(
             index,
@@ -5217,6 +5218,32 @@ mod tests {
             .await
             .expect_err("unknown persisted access mode must fail closed");
         assert!(error.to_string().contains("unknown persisted access mode"));
+    }
+
+    #[tokio::test]
+    async fn persisted_auto_review_access_mode_round_trips_through_the_typed_repository() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let update = repository
+            .compare_and_set_root_session_access_mode(
+                session_id,
+                AccessMode::Default,
+                AccessMode::AutoReview,
+            )
+            .await
+            .expect("auto-review access update")
+            .expect("matching access owner");
+
+        assert!(update.changed);
+        assert_eq!(update.session.access_mode, AccessMode::AutoReview);
+        assert_eq!(
+            repository
+                .get_session(session_id)
+                .await
+                .expect("persisted session")
+                .access_mode,
+            AccessMode::AutoReview
+        );
     }
 
     async fn active_turn(store: &StoreBundle, session_id: SessionId) -> (AdmissionId, TurnId) {

@@ -1311,6 +1311,7 @@ impl AgentRuntime {
                                 review_request: None,
                                 image_paths: Vec::new(),
                                 run_control: request_run_control,
+                                session_access_mode_adoption: None,
                                 agent_confirmation: Some(run_context.confirmation_prompt()),
                                 agent_context: Some(run_context),
                             };

@@ -124,7 +124,7 @@ export interface ConfigMutationTarget {
 }
 
 export interface AccessModeMutationTarget extends ConfigMutationTarget {
-  accessMode: "default" | "full_access";
+  accessMode: "default" | "auto_review" | "full_access";
   runtimeOwnerToken: string;
 }
 

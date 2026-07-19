@@ -42,12 +42,11 @@ pub fn builtin_permission_profiles() -> Vec<PermissionProfileEntry> {
         PermissionProfileEntry {
             mode: AccessMode::Default,
             id: "default".to_string(),
-            label: "Default".to_string(),
-            summary: "Automatically allows in-workspace list, search, and read operations only."
+            label: AccessMode::Default.label().to_string(),
+            summary: "Automatically allows ordinary in-workspace file operations and asks the user when an operation crosses that boundary."
                 .to_string(),
-            auto_allowed: strings(&["workspace list/search/read"]),
+            auto_allowed: strings(&["ordinary workspace file operations"]),
             requires_review: vec![
-                "workspace edits",
                 "shell",
                 "destructive edits",
                 "workspace authority files",
@@ -61,21 +60,30 @@ pub fn builtin_permission_profiles() -> Vec<PermissionProfileEntry> {
             available: true,
         },
         PermissionProfileEntry {
-            mode: AccessMode::FullAccess,
-            id: "full_access".to_string(),
-            label: "Full Access".to_string(),
-            summary: "Automatically allows stable-handle-verified non-authority file operations inside the configured boundary. Workspace authority files, shell, and external operations require explicit human confirmation because this is not an OS sandbox."
+            mode: AccessMode::AutoReview,
+            id: "auto_review".to_string(),
+            label: AccessMode::AutoReview.label().to_string(),
+            summary: "Uses the same workspace boundary as Ask for approval, then sends boundary-crossing requests to an independent AI guardian."
                 .to_string(),
             auto_allowed: strings(&[
-                "stable-handle-verified file list/search/read inside the configured boundary",
-                "stable-handle-verified file edits inside the configured boundary",
+                "ordinary workspace file operations",
+                "operations approved by the AI reviewer",
             ]),
             requires_review: strings(&[
-                "workspace authority files",
-                "shell",
-                "detected outside configured boundary",
-                "network, configured services, or other external operations",
+                "operations not approved by the AI reviewer",
+                "reviewer unavailable or invalid reviewer responses",
             ]),
+            selected: false,
+            available: true,
+        },
+        PermissionProfileEntry {
+            mode: AccessMode::FullAccess,
+            id: "full_access".to_string(),
+            label: AccessMode::FullAccess.label().to_string(),
+            summary: "Does not ask for permission approval. Independent filesystem, ownership, and runtime integrity checks still fail closed."
+                .to_string(),
+            auto_allowed: strings(&["all permission requests"]),
+            requires_review: Vec::new(),
             selected: false,
             available: true,
         },
@@ -94,7 +102,7 @@ mod tests {
     fn permission_profile_catalog_selects_current_mode() {
         let catalog = super::PermissionProfileCatalog::for_current(AccessMode::FullAccess);
 
-        assert_eq!(catalog.profiles.len(), 2);
+        assert_eq!(catalog.profiles.len(), 3);
         assert_eq!(
             catalog
                 .selected_profile()
@@ -107,40 +115,18 @@ mod tests {
     fn permission_profile_catalog_describes_monotonic_authority() {
         let profiles = super::builtin_permission_profiles();
 
-        assert_eq!(profiles[0].auto_allowed, vec!["workspace list/search/read"]);
         assert_eq!(
-            profiles[1].auto_allowed,
-            vec![
-                "stable-handle-verified file list/search/read inside the configured boundary",
-                "stable-handle-verified file edits inside the configured boundary"
-            ]
+            profiles[0].auto_allowed,
+            vec!["ordinary workspace file operations"]
         );
-        assert_eq!(profiles[0].requires_review[0], "workspace edits");
-        assert_eq!(profiles[0].requires_review[1], "shell");
-        assert!(profiles[1].summary.contains("not an OS sandbox"));
+        assert_eq!(profiles[1].mode, AccessMode::AutoReview);
+        assert_eq!(profiles[2].auto_allowed, vec!["all permission requests"]);
+        assert_eq!(profiles[0].requires_review[0], "shell");
         assert!(
-            profiles[1]
-                .requires_review
-                .iter()
-                .any(|value| value == "workspace authority files")
+            profiles[2]
+                .summary
+                .contains("integrity checks still fail closed")
         );
-        assert!(
-            profiles[1]
-                .requires_review
-                .iter()
-                .any(|value| value == "shell")
-        );
-        assert!(
-            profiles[1]
-                .requires_review
-                .iter()
-                .any(|value| value == "detected outside configured boundary")
-        );
-        assert!(
-            profiles[1]
-                .requires_review
-                .iter()
-                .any(|value| value == "network, configured services, or other external operations")
-        );
+        assert!(profiles[2].requires_review.is_empty());
     }
 }
