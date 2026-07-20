@@ -308,6 +308,8 @@ mod llm_error_tests {
 pub enum EditError {
     #[error("edit io error: {0}")]
     Io(#[from] io::Error),
+    #[error("{0}")]
+    Sandbox(#[from] crate::tool::sandbox_process::SandboxExecutionError),
     #[error(
         "parent directory `{parent}` for `{path}` does not exist; the file mutation was not applied and no directory was created"
     )]
@@ -398,6 +400,10 @@ pub enum ToolError {
     Edit(#[from] EditError),
     #[error("tool patch error: {0}")]
     Patch(#[from] PatchError),
+    #[error("OS sandbox profile could not be resolved: {0}")]
+    SandboxProfile(#[from] crate::tool::os_sandbox::SandboxProfileError),
+    #[error("{0}")]
+    SandboxExecution(#[from] crate::tool::sandbox_process::SandboxExecutionError),
     #[error("docling {surface} {actual} exceeds the limit {maximum}")]
     DoclingLimitExceeded {
         surface: DoclingLimitSurface,

@@ -47,6 +47,18 @@ enum ExistingObjectIdentityKind {
 pub struct PathGuard;
 
 impl PathGuard {
+    #[cfg(windows)]
+    pub(crate) fn directory_is_case_sensitive(path: &Utf8Path) -> Result<bool, WorkspaceError> {
+        WindowsSecurityAnchor::open(path)
+            .map_err(WorkspaceError::Io)?
+            .case_sensitive_directory()
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn directory_is_case_sensitive(_path: &Utf8Path) -> Result<bool, WorkspaceError> {
+        Ok(true)
+    }
+
     pub fn require_path(
         workspace: &Workspace,
         requested: &Utf8Path,

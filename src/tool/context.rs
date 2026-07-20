@@ -14,6 +14,7 @@ use crate::runtime::{RunCancelOutcome, RunCancellationCause, RunControl};
 use crate::session::{AdmissionId, SessionContext, SessionId, SessionRepository, ToolCallId};
 use crate::storage::{SqliteSessionRepository, session_repo::RunAdmissionLeaseRenewalOutcome};
 use crate::storage::{StoragePaths, StoreBundle};
+use crate::tool::os_sandbox::ProcessSandboxPlan;
 use crate::tool::permission_guardian::{
     PermissionGuardian, PermissionGuardianDecision, PermissionGuardianEvidenceState,
 };
@@ -51,6 +52,9 @@ pub struct ToolFormatterPlan {
     invocation: ResolvedFormatterInvocation,
     target_guard: GuardedPath,
     working_directory_guard: GuardedPath,
+    shell: crate::config::ShellConfig,
+    outside_workspace: bool,
+    permission_risks: Vec<crate::tool::PermissionRisk>,
 }
 
 impl ToolFormatterPlan {
@@ -66,10 +70,24 @@ impl ToolFormatterPlan {
         };
         let working_directory_guard =
             PathGuard::require_path(workspace, invocation.working_directory(), AccessKind::Shell)?;
+        let permission_risks = crate::tool::shell::process_argv_permission_risks(
+            workspace,
+            &working_directory_guard,
+            invocation.command(),
+            &config.instructions.additional_files,
+        );
+        let outside_workspace = crate::tool::shell::process_argv_references_outside_workspace(
+            workspace,
+            &working_directory_guard,
+            invocation.command(),
+        );
         Ok(Some(Self {
             invocation,
             target_guard: target_guard.clone(),
             working_directory_guard,
+            shell: config.shell.clone(),
+            outside_workspace,
+            permission_risks,
         }))
     }
 
@@ -84,17 +102,57 @@ impl ToolFormatterPlan {
     pub fn command(&self) -> &[String] {
         self.invocation.command()
     }
+
+    pub fn permission_risks(&self) -> &[crate::tool::PermissionRisk] {
+        &self.permission_risks
+    }
+
+    pub fn outside_workspace(&self) -> bool {
+        self.outside_workspace
+    }
+}
+
+pub(crate) fn targets_configured_instruction_authority(
+    config: &ResolvedConfig,
+    workspace: &Workspace,
+    target: &Utf8Path,
+) -> bool {
+    config
+        .instructions
+        .additional_files
+        .iter()
+        .any(|configured| {
+            let candidate = if configured.is_absolute() {
+                configured.clone()
+            } else {
+                workspace.root.join(configured)
+            };
+            crate::workspace::project::normalize_path(&workspace.root, &candidate).is_ok_and(
+                |candidate| {
+                    PathGuard::stable_identity_key(&candidate)
+                        == PathGuard::stable_identity_key(target)
+                },
+            )
+        })
 }
 
 #[must_use = "call admit immediately before every independently startable observable effect"]
 #[derive(Clone)]
 pub struct ToolEffectAdmission {
     control: RunControl,
+    sandbox_plan: ProcessSandboxPlan,
 }
 
 impl ToolEffectAdmission {
-    pub(crate) fn new(control: RunControl) -> Self {
-        Self { control }
+    pub(crate) fn new(control: RunControl, sandbox_plan: ProcessSandboxPlan) -> Self {
+        Self {
+            control,
+            sandbox_plan,
+        }
+    }
+
+    pub(crate) fn sandbox_plan(&self) -> &ProcessSandboxPlan {
+        &self.sandbox_plan
     }
 
     /// Linearizes one observable tool effect against Stop, Abort, failure, and supersession.
@@ -123,7 +181,13 @@ impl ToolEffectAdmission {
         PathGuard::revalidate(&plan.working_directory_guard)?;
         self.admit()?;
         formatter
-            .format_resolved(&plan.invocation, normalized, options)
+            .format_resolved_with_sandbox(
+                &plan.invocation,
+                normalized,
+                options,
+                &plan.shell,
+                &self.sandbox_plan,
+            )
             .await
             .map_err(ToolError::from)
     }
@@ -256,7 +320,7 @@ impl<'a> ToolContext<'a> {
         risks: Vec<crate::tool::PermissionRisk>,
         guardian_evidence: PermissionGuardianEvidenceState,
     ) -> Result<ToolEffectAdmission, ToolError> {
-        let request = crate::tool::PermissionRequest {
+        let mut request = crate::tool::PermissionRequest {
             access,
             summary,
             details,
@@ -275,7 +339,20 @@ impl<'a> ToolContext<'a> {
 
         let access_mode = self.current_permission_access_mode().await?;
         if access_mode_allows_permission(access_mode, &request) {
-            return self.accept_tool_effect();
+            let sandbox_plan = process_sandbox_plan_for_admission(
+                request.access,
+                access_mode,
+                self.workspace,
+                self.config,
+            )?;
+            return self.accept_tool_effect(sandbox_plan);
+        }
+
+        if request.access == AccessKind::Shell {
+            request.details.push(
+                "execution boundary: approval grants this process effect elevation outside the workspace-write OS sandbox"
+                    .to_string(),
+            );
         }
 
         if access_mode == AccessMode::AutoReview {
@@ -300,7 +377,9 @@ impl<'a> ToolContext<'a> {
                 return Err(ToolError::RunInterrupted);
             }
             return match decision {
-                Ok(PermissionGuardianDecision::Allow { .. }) => self.accept_tool_effect(),
+                Ok(PermissionGuardianDecision::Allow { .. }) => {
+                    self.accept_tool_effect(approved_process_sandbox_plan(request.access))
+                }
                 Ok(PermissionGuardianDecision::Deny { rationale }) => self.decline_permission(
                     format!(
                         "automatic permission guardian denied the action: {rationale}. The action was not executed; do not retry it or an equivalent workaround without new user authorization"
@@ -322,7 +401,7 @@ impl<'a> ToolContext<'a> {
             })?;
         match outcome {
             ConfirmationOutcome::Resolved(ToolApprovalDecision::Approved) => {
-                self.accept_tool_effect()
+                self.accept_tool_effect(approved_process_sandbox_plan(request.access))
             }
             ConfirmationOutcome::Resolved(ToolApprovalDecision::Denied { reason }) => {
                 self.decline_permission(reason)
@@ -346,8 +425,14 @@ impl<'a> ToolContext<'a> {
         }
     }
 
-    fn accept_tool_effect(&self) -> Result<ToolEffectAdmission, ToolError> {
-        Ok(ToolEffectAdmission::new(self.run_control.clone()))
+    fn accept_tool_effect(
+        &self,
+        sandbox_plan: ProcessSandboxPlan,
+    ) -> Result<ToolEffectAdmission, ToolError> {
+        Ok(ToolEffectAdmission::new(
+            self.run_control.clone(),
+            sandbox_plan,
+        ))
     }
 
     fn decline_permission(&self, reason: String) -> Result<ToolEffectAdmission, ToolError> {
@@ -376,6 +461,27 @@ impl<'a> ToolContext<'a> {
     }
 }
 
+fn process_sandbox_plan_for_admission(
+    access: AccessKind,
+    access_mode: AccessMode,
+    workspace: &crate::workspace::Workspace,
+    config: &ResolvedConfig,
+) -> Result<ProcessSandboxPlan, crate::tool::os_sandbox::SandboxProfileError> {
+    if access == AccessKind::Shell {
+        ProcessSandboxPlan::for_access_mode_with_config(access_mode, workspace, config)
+    } else {
+        Ok(ProcessSandboxPlan::NoProcess)
+    }
+}
+
+fn approved_process_sandbox_plan(access: AccessKind) -> ProcessSandboxPlan {
+    if access == AccessKind::Shell {
+        ProcessSandboxPlan::Unrestricted
+    } else {
+        ProcessSandboxPlan::NoProcess
+    }
+}
+
 pub fn access_mode_allows_permission(
     access_mode: AccessMode,
     request: &crate::tool::PermissionRequest,
@@ -392,7 +498,11 @@ fn workspace_boundary_allows(request: &crate::tool::PermissionRequest) -> bool {
     }
     matches!(
         request.access,
-        AccessKind::List | AccessKind::Search | AccessKind::Read | AccessKind::Edit
+        AccessKind::List
+            | AccessKind::Search
+            | AccessKind::Read
+            | AccessKind::Edit
+            | AccessKind::Shell
     )
 }
 
@@ -405,7 +515,7 @@ mod tests {
     use crate::session::{NewSession, ProjectId, ProjectRepository, SessionRepository};
     use crate::storage::{SqliteStore, StoragePaths};
     use crate::tool::permission_guardian::{PermissionGuardianDecision, PermissionGuardianError};
-    use crate::workspace::AccessKind;
+    use crate::workspace::{AccessKind, WorkspaceDiscovery};
 
     #[derive(Default)]
     struct CountingPrompt {
@@ -434,6 +544,11 @@ mod tests {
         requests: usize,
     }
 
+    #[derive(Default)]
+    struct CapturingAllowGuardian {
+        requests: Vec<crate::tool::PermissionRequest>,
+    }
+
     #[async_trait::async_trait(?Send)]
     impl PermissionGuardian for FixedGuardian {
         async fn review(
@@ -453,6 +568,20 @@ mod tests {
                     "fixture transport failure".to_string(),
                 )),
             }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PermissionGuardian for CapturingAllowGuardian {
+        async fn review(
+            &mut self,
+            request: &crate::tool::PermissionRequest,
+            _evidence: &crate::tool::permission_guardian::PermissionGuardianEvidence,
+        ) -> Result<PermissionGuardianDecision, PermissionGuardianError> {
+            self.requests.push(request.clone());
+            Ok(PermissionGuardianDecision::Allow {
+                rationale: "scoped elevation".to_string(),
+            })
         }
     }
 
@@ -549,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_modes_review_shell_while_full_access_does_not() {
+    fn risk_free_shell_uses_workspace_sandbox_without_review_in_workspace_modes() {
         let request = permission(AccessKind::Shell, Vec::new());
 
         let decisions = [
@@ -558,7 +687,7 @@ mod tests {
             AccessMode::FullAccess,
         ]
         .map(|mode| access_mode_allows_permission(mode, &request));
-        assert_eq!(decisions, [false, false, true]);
+        assert_eq!(decisions, [true, true, true]);
     }
 
     #[test]
@@ -581,7 +710,7 @@ mod tests {
             (AccessKind::Search, [true, true, true]),
             (AccessKind::Read, [true, true, true]),
             (AccessKind::Edit, [true, true, true]),
-            (AccessKind::Shell, [false, false, true]),
+            (AccessKind::Shell, [true, true, true]),
         ];
         let modes = [
             AccessMode::Default,
@@ -761,7 +890,7 @@ mod tests {
                 "run a command".to_string(),
                 Vec::new(),
                 false,
-                Vec::new(),
+                vec![crate::tool::PermissionRisk::ExternalConnection],
             )
             .await
             .expect("full access from durable root owner");
@@ -806,13 +935,139 @@ mod tests {
                     "run a second command".to_string(),
                     Vec::new(),
                     false,
-                    Vec::new(),
+                    vec![crate::tool::PermissionRisk::ExternalConnection],
                 )
                 .await,
             Err(ToolError::PermissionDenied { .. })
         ));
         drop(context);
         assert_eq!(prompt.requests, 1);
+    }
+
+    #[tokio::test]
+    async fn live_mode_switch_changes_the_next_plan_but_not_an_admitted_effect() {
+        let (config, session, services) = permission_fixture(AccessMode::Default).await;
+        let control = RunControl::new();
+        let mut prompt = CountingPrompt::default();
+        let mut context = ToolContext {
+            session: &session,
+            workspace: &session.workspace,
+            config: &config,
+            tool_call_id: ToolCallId::new(),
+            cancel: control.token(),
+            run_control: control.clone(),
+            run_mutation_fence: RunMutationFence::new(
+                services.store.session_repo(),
+                session.session.id,
+                AdmissionId::new(),
+                TurnId::new(),
+                control,
+            ),
+            prompt: &mut prompt,
+            services: &services,
+            agent: None,
+            permission_guardian: None,
+        };
+
+        let admitted = context
+            .confirm_if_needed(
+                AccessKind::Shell,
+                "run inside sandbox".to_string(),
+                Vec::new(),
+                false,
+                Vec::new(),
+            )
+            .await
+            .expect("default safe shell admission");
+        assert!(matches!(
+            admitted.sandbox_plan(),
+            ProcessSandboxPlan::WorkspaceWrite(_)
+        ));
+
+        services
+            .store
+            .session_repo()
+            .compare_and_set_root_session_access_mode(
+                session.session.id,
+                AccessMode::Default,
+                AccessMode::FullAccess,
+            )
+            .await
+            .expect("live mode switch")
+            .expect("root session owner");
+
+        let next = context
+            .confirm_if_needed(
+                AccessKind::Shell,
+                "run after switch".to_string(),
+                Vec::new(),
+                false,
+                Vec::new(),
+            )
+            .await
+            .expect("next full-access admission");
+        assert!(matches!(
+            next.sandbox_plan(),
+            ProcessSandboxPlan::Unrestricted
+        ));
+        assert!(matches!(
+            admitted.sandbox_plan(),
+            ProcessSandboxPlan::WorkspaceWrite(_)
+        ));
+        drop(context);
+        assert_eq!(prompt.requests, 0);
+    }
+
+    #[test]
+    fn non_process_admission_does_not_compile_an_unused_process_profile() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir(&root).expect("workspace root");
+        let mut config = crate::config::ResolvedConfig::default();
+        config.permissions.additional_write_roots = vec![root.join("missing-write-root")];
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+
+        assert_eq!(
+            process_sandbox_plan_for_admission(
+                AccessKind::Read,
+                AccessMode::Default,
+                &workspace,
+                &config,
+            )
+            .expect("read does not need a process profile"),
+            ProcessSandboxPlan::NoProcess
+        );
+        assert!(
+            process_sandbox_plan_for_admission(
+                AccessKind::Shell,
+                AccessMode::Default,
+                &workspace,
+                &config,
+            )
+            .is_err(),
+            "a shell admission must still fail closed when a writable root is invalid"
+        );
+    }
+
+    #[test]
+    fn configured_instruction_target_is_shared_permission_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir(&root).expect("workspace root");
+        let mut config = crate::config::ResolvedConfig::default();
+        config.instructions.additional_files = vec![Utf8PathBuf::from("policy.md")];
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+
+        assert!(targets_configured_instruction_authority(
+            &config,
+            &workspace,
+            &root.join("policy.md")
+        ));
+        assert!(!targets_configured_instruction_authority(
+            &config,
+            &workspace,
+            &root.join("other.md")
+        ));
     }
 
     #[tokio::test]
@@ -854,7 +1109,7 @@ mod tests {
                     "run a command".to_string(),
                     Vec::new(),
                     false,
-                    Vec::new(),
+                    vec![crate::tool::PermissionRisk::ExternalConnection],
                 )
                 .await;
             drop(context);
@@ -867,6 +1122,110 @@ mod tests {
             assert_eq!(guardian.requests, 1);
             assert_eq!(prompt.requests, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn guardian_evidence_discloses_the_requested_sandbox_elevation() {
+        let (config, session, services) = permission_fixture(AccessMode::AutoReview).await;
+        let control = RunControl::new();
+        let mut prompt = CountingPrompt::default();
+        let mut guardian = CapturingAllowGuardian::default();
+        let mut context = ToolContext {
+            session: &session,
+            workspace: &session.workspace,
+            config: &config,
+            tool_call_id: ToolCallId::new(),
+            cancel: control.token(),
+            run_control: control.clone(),
+            run_mutation_fence: RunMutationFence::new(
+                services.store.session_repo(),
+                session.session.id,
+                AdmissionId::new(),
+                TurnId::new(),
+                control,
+            ),
+            prompt: &mut prompt,
+            services: &services,
+            agent: None,
+            permission_guardian: Some(&mut guardian),
+        };
+
+        let admission = context
+            .confirm_if_needed_with_details(
+                AccessKind::Shell,
+                "run with explicitly requested elevation".to_string(),
+                vec!["Requested sandbox elevation: needs an exact external effect".to_string()],
+                Vec::new(),
+                true,
+                Vec::new(),
+            )
+            .await
+            .expect("guardian-approved elevation");
+        assert!(matches!(
+            admission.sandbox_plan(),
+            ProcessSandboxPlan::Unrestricted
+        ));
+        drop(context);
+        assert_eq!(prompt.requests, 0);
+        assert_eq!(guardian.requests.len(), 1);
+        assert!(guardian.requests[0].outside_workspace);
+        assert!(guardian.requests[0].risks.is_empty());
+        assert!(guardian.requests[0].details.iter().any(|detail| {
+            detail == "Requested sandbox elevation: needs an exact external effect"
+        }));
+        assert!(
+            guardian.requests[0].details.iter().any(|detail| {
+                detail.contains("elevation outside the workspace-write OS sandbox")
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn non_process_guardian_request_does_not_claim_process_elevation() {
+        let (config, session, services) = permission_fixture(AccessMode::AutoReview).await;
+        let control = RunControl::new();
+        let mut prompt = CountingPrompt::default();
+        let mut guardian = CapturingAllowGuardian::default();
+        let mut context = ToolContext {
+            session: &session,
+            workspace: &session.workspace,
+            config: &config,
+            tool_call_id: ToolCallId::new(),
+            cancel: control.token(),
+            run_control: control.clone(),
+            run_mutation_fence: RunMutationFence::new(
+                services.store.session_repo(),
+                session.session.id,
+                AdmissionId::new(),
+                TurnId::new(),
+                control,
+            ),
+            prompt: &mut prompt,
+            services: &services,
+            agent: None,
+            permission_guardian: Some(&mut guardian),
+        };
+
+        let admission = context
+            .confirm_if_needed(
+                AccessKind::Read,
+                "send a file to a configured service".to_string(),
+                Vec::new(),
+                false,
+                vec![crate::tool::PermissionRisk::ConfiguredLocalService],
+            )
+            .await
+            .expect("guardian-approved non-process effect");
+        assert_eq!(admission.sandbox_plan(), &ProcessSandboxPlan::NoProcess);
+        drop(context);
+        assert_eq!(prompt.requests, 0);
+        assert_eq!(guardian.requests.len(), 1);
+        assert!(
+            guardian.requests[0]
+                .details
+                .iter()
+                .all(|detail| !detail.contains("workspace-write OS sandbox"))
+        );
     }
 
     #[tokio::test]
@@ -904,7 +1263,7 @@ mod tests {
                 vec!["bounded human detail".to_string()],
                 Vec::new(),
                 false,
-                Vec::new(),
+                vec![crate::tool::PermissionRisk::ExternalConnection],
                 PermissionGuardianEvidenceState::incomplete(
                     "a sensitive executable field was redacted",
                 ),

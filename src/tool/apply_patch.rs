@@ -1100,7 +1100,8 @@ fn build_patch_permission_admission(
                 let guarded = PathGuard::require_path(workspace, path, AccessKind::Edit)?;
                 extend_patch_permission_admission(
                     &mut admission,
-                    workspace.root.as_path(),
+                    config,
+                    workspace,
                     &guarded,
                     None,
                     false,
@@ -1121,7 +1122,8 @@ fn build_patch_permission_admission(
                     .is_some_and(|target| target.absolute != guarded.absolute);
                 extend_patch_permission_admission(
                     &mut admission,
-                    workspace.root.as_path(),
+                    config,
+                    workspace,
                     &guarded,
                     move_guard.as_ref(),
                     false,
@@ -1141,7 +1143,8 @@ fn build_patch_permission_admission(
                 let guarded = PathGuard::require_path(workspace, path, AccessKind::Edit)?;
                 extend_patch_permission_admission(
                     &mut admission,
-                    workspace.root.as_path(),
+                    config,
+                    workspace,
                     &guarded,
                     None,
                     true,
@@ -1167,6 +1170,10 @@ fn push_patch_formatter_plan(
     if let Some(plan) = formatter_plan.as_ref() {
         admission.access = AccessKind::Shell;
         admission.details.push(plan.permission_detail());
+        admission.outside_workspace |= plan.outside_workspace();
+        for risk in plan.permission_risks() {
+            push_unique_risk(&mut admission.risks, *risk);
+        }
     }
     admission.formatter_plans.push(formatter_plan);
 }
@@ -1205,7 +1212,8 @@ fn normalize_apply_patch_tool_invocation_lock_paths(
 
 fn extend_patch_permission_admission(
     admission: &mut PatchPermissionAdmission,
-    workspace_root: &Utf8Path,
+    config: &ResolvedConfig,
+    workspace: &Workspace,
     guarded: &GuardedPath,
     move_guard: Option<&GuardedPath>,
     destructive_delete: bool,
@@ -1218,7 +1226,8 @@ fn extend_patch_permission_admission(
     }
     admission.outside_workspace |= edit_request_is_outside_workspace(guarded, move_guard);
     for risk in edit_request_risks(
-        workspace_root,
+        config,
+        workspace,
         guarded,
         move_guard,
         destructive_delete,
@@ -1420,7 +1429,8 @@ fn edit_request_is_outside_workspace(
 }
 
 fn edit_request_risks(
-    workspace_root: &Utf8Path,
+    config: &ResolvedConfig,
+    workspace: &Workspace,
     guarded: &GuardedPath,
     move_guard: Option<&GuardedPath>,
     destructive_delete: bool,
@@ -1433,9 +1443,19 @@ fn edit_request_risks(
     if move_or_rename {
         risks.push(PermissionRisk::MoveOrRename);
     }
-    if PathGuard::targets_protected_workspace_authority(workspace_root, guarded)
+    if PathGuard::targets_protected_workspace_authority(&workspace.root, guarded)
+        || crate::tool::context::targets_configured_instruction_authority(
+            config,
+            workspace,
+            &guarded.absolute,
+        )
         || move_guard.as_ref().is_some_and(|target| {
-            PathGuard::targets_protected_workspace_authority(workspace_root, target)
+            PathGuard::targets_protected_workspace_authority(&workspace.root, target)
+                || crate::tool::context::targets_configured_instruction_authority(
+                    config,
+                    workspace,
+                    &target.absolute,
+                )
         })
     {
         risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
@@ -1560,13 +1580,82 @@ mod tests {
             AccessMode::FullAccess,
         ]
         .map(|mode| access_mode_allows_permission(mode, &request));
-        assert_eq!(decisions, [false, false, true]);
+        assert_eq!(decisions, [true, true, true]);
         assert!(
             request
                 .details
                 .iter()
                 .any(|detail| detail.contains("argv="))
         );
+
+        config.format.commands[0].command = vec![
+            "npx".to_string(),
+            "prettier".to_string(),
+            "--stdin-filepath".to_string(),
+            "{file}".to_string(),
+        ];
+        let risky_formatter = build_patch_permission_admission(&config, &workspace, &operations)
+            .expect("build risky formatter admission");
+        assert!(
+            risky_formatter
+                .risks
+                .contains(&crate::tool::PermissionRisk::ExternalConnection)
+        );
+        let risky_request = crate::tool::PermissionRequest {
+            access: risky_formatter.access,
+            summary: "patch with network-capable formatter".to_string(),
+            details: risky_formatter.details,
+            targets: risky_formatter.targets,
+            outside_workspace: risky_formatter.outside_workspace,
+            risks: risky_formatter.risks,
+            agent_path: None,
+            agent_task_name: None,
+        };
+        let decisions = [
+            AccessMode::Default,
+            AccessMode::AutoReview,
+            AccessMode::FullAccess,
+        ]
+        .map(|mode| access_mode_allows_permission(mode, &risky_request));
+        assert_eq!(decisions, [false, false, true]);
+
+        #[cfg(windows)]
+        {
+            let outside_temp = tempfile::tempdir().expect("outside tempdir");
+            let outside_formatter =
+                Utf8PathBuf::from_path_buf(outside_temp.path().join("outside.ps1"))
+                    .expect("utf8 outside formatter");
+            std::fs::write(&outside_formatter, "[Console]::In.ReadToEnd()\n")
+                .expect("outside formatter fixture");
+            config.format.commands[0].command = vec![
+                "powershell.exe".to_string(),
+                "-File".to_string(),
+                outside_formatter.to_string(),
+            ];
+            let outside_formatter_admission =
+                build_patch_permission_admission(&config, &workspace, &operations)
+                    .expect("build outside formatter admission");
+            assert!(outside_formatter_admission.outside_workspace);
+            let outside_request = crate::tool::PermissionRequest {
+                access: outside_formatter_admission.access,
+                summary: "patch with outside formatter argv".to_string(),
+                details: outside_formatter_admission.details,
+                targets: outside_formatter_admission.targets,
+                outside_workspace: outside_formatter_admission.outside_workspace,
+                risks: outside_formatter_admission.risks,
+                agent_path: None,
+                agent_task_name: None,
+            };
+            assert_eq!(
+                [
+                    AccessMode::Default,
+                    AccessMode::AutoReview,
+                    AccessMode::FullAccess,
+                ]
+                .map(|mode| access_mode_allows_permission(mode, &outside_request)),
+                [false, false, true]
+            );
+        }
 
         config.format.commands[0].glob = "**/*.rs".to_string();
         let no_match = build_patch_permission_admission(&config, &workspace, &operations)
@@ -1600,7 +1689,10 @@ mod tests {
             let first_path = first_dir.join("first.txt");
             let second_path = second_dir.join("second.txt");
             let control = RunControl::new();
-            let admission = ToolEffectAdmission::new(control.clone());
+            let admission = ToolEffectAdmission::new(
+                control.clone(),
+                crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted,
+            );
             let format = marker_format_config();
             let mut config = crate::config::ResolvedConfig::default();
             config.format = format.clone();
@@ -1644,7 +1736,10 @@ mod tests {
             Utf8PathBuf::from_path_buf(temp.path().join("must-not-exist.txt")).expect("utf8 path");
         let workspace = test_workspace(path.parent().expect("parent"));
         let control = RunControl::new();
-        let effect_admission = ToolEffectAdmission::new(control.clone());
+        let effect_admission = ToolEffectAdmission::new(
+            control.clone(),
+            crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted,
+        );
         let ready = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
         let worker_ready = Arc::clone(&ready);

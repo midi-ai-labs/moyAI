@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use encoding_rs::SHIFT_JIS;
@@ -13,10 +11,14 @@ use tokio_util::sync::CancellationToken;
 use crate::config::ShellFamily;
 use crate::error::ToolError;
 use crate::tool::context::ToolContext;
+use crate::tool::os_sandbox::ProcessSandboxPlan;
 use crate::tool::process::ManagedProcess;
 #[cfg(test)]
 use crate::tool::process::{ProcessTerminationStep, process_tree_termination_plan};
 use crate::tool::registry::Tool;
+use crate::tool::sandbox_process::{
+    SandboxedProcessRequest, captured_process_environment, execute_workspace_write,
+};
 use crate::tool::truncate::clip_text_with_ellipsis;
 use crate::tool::{PermissionRisk, ToolName, ToolResult, ToolSpec};
 use crate::workspace::{AccessKind, GuardedPath, PathGuard};
@@ -28,6 +30,18 @@ pub struct ShellInput {
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub sandbox_permissions: ShellSandboxPermissions,
+    #[serde(default)]
+    pub justification: String,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellSandboxPermissions {
+    #[default]
+    UseDefault,
+    RequireEscalated,
 }
 
 #[derive(Debug, Default)]
@@ -37,9 +51,9 @@ pub struct ShellTool;
 impl Tool for ShellTool {
     fn spec(&self) -> ToolSpec {
         let description = if cfg!(windows) {
-            "Run a PowerShell command with the current user account. Shell side effects have no typed file-change owner, so every edit baseline for the current session is invalidated before execution."
+            "Run a PowerShell command. Workspace modes use the native workspace-write OS sandbox; set sandbox_permissions=require_escalated with a concise justification only when this exact command must run outside it. Approved elevation and Full Access run without the sandbox. Shell side effects have no typed file-change owner, so every edit baseline for the current session is invalidated before execution."
         } else {
-            "Run a bash command with the current user account. Shell side effects have no typed file-change owner, so every edit baseline for the current session is invalidated before execution."
+            "Run a bash command. Workspace modes require a supported native workspace-write OS sandbox; set sandbox_permissions=require_escalated with a concise justification only when this exact command must run outside it. Approved elevation and Full Access run without the sandbox. Shell side effects have no typed file-change owner, so every edit baseline for the current session is invalidated before execution."
         };
         ToolSpec {
             name: ToolName::Shell,
@@ -52,7 +66,12 @@ impl Tool for ShellTool {
                     "command": { "type": "string" },
                     "workdir": { "type": "string" },
                     "timeout_ms": { "type": "integer" },
-                    "description": { "type": "string" }
+                    "description": { "type": "string" },
+                    "sandbox_permissions": {
+                        "type": "string",
+                        "enum": ["use_default", "require_escalated"]
+                    },
+                    "justification": { "type": "string" }
                 }
             }),
         }
@@ -64,31 +83,17 @@ impl Tool for ShellTool {
         mut ctx: ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<ShellInput>(raw_arguments)?;
-        let requested_workdir = input.workdir.unwrap_or_else(|| Utf8PathBuf::from("."));
-        let guarded =
-            PathGuard::require_path(ctx.workspace, &requested_workdir, AccessKind::Shell)?;
-        if !guarded.absolute.is_dir() {
-            return Err(ToolError::Message(format!(
-                "shell workdir `{}` is not a directory",
-                guarded.absolute
-            )));
-        }
-        let outside_workspace = (!guarded.inside_workspace && !guarded.trusted_external)
-            || references_outside_workspace_from(ctx.workspace, &guarded.absolute, &input.command);
-        let description = if input.description.trim().is_empty() {
-            default_description(&input.command)
-        } else {
-            input.description.clone()
-        };
-        let risks = shell_permission_risks_from(ctx.workspace, &guarded, &input.command);
+        let permission = shell_permission_intent(ctx.workspace, ctx.config, &input)?;
+        let guarded = permission.guarded;
+        let description = permission.description;
         let effect_admission = ctx
             .confirm_if_needed_with_details(
                 AccessKind::Shell,
                 description.clone(),
-                shell_permission_details(&input.command, &guarded.absolute),
+                permission.details,
                 vec![guarded.absolute.clone()],
-                outside_workspace,
-                risks,
+                permission.outside_workspace,
+                permission.risks,
             )
             .await?;
         let timeout_ms = input
@@ -111,6 +116,7 @@ impl Tool for ShellTool {
             timeout_ms,
             ctx.config.tool_output.max_bytes.max(1),
             ctx.cancel.clone(),
+            effect_admission.sandbox_plan(),
         )
         .await?;
         let merged_output = format_shell_output_for_display(
@@ -143,12 +149,14 @@ impl Tool for ShellTool {
                 "stdout_capture_truncated": output.stdout_truncated,
                 "stderr_capture_truncated": output.stderr_truncated,
                 "truncated": preview.truncated,
-                "success": output.exit_code == Some(0) && !output.timed_out && !output.cancelled,
+                "success": output.exit_code == Some(0) && !output.timed_out && !output.cancelled && !output.cleanup_failed,
+                "cleanup_failed": output.cleanup_failed,
                 "change_evidence": {
                     "status": change_evidence_status,
                     "effects_unknown": output.effect_started,
                     "session_edit_baselines_invalidated": effect_may_start,
-                }
+                },
+                "sandbox": effect_admission.sandbox_plan().audit_description(),
             }),
             truncated_output_path: preview.truncated_output_path,
             recorded_changes: Vec::new(),
@@ -156,6 +164,76 @@ impl Tool for ShellTool {
             _internal_file_lease: preview.internal_file_lease,
         })
     }
+}
+
+struct ShellPermissionIntent {
+    guarded: GuardedPath,
+    description: String,
+    details: Vec<String>,
+    outside_workspace: bool,
+    risks: Vec<PermissionRisk>,
+}
+
+fn shell_permission_intent(
+    workspace: &crate::workspace::Workspace,
+    config: &crate::config::ResolvedConfig,
+    input: &ShellInput,
+) -> Result<ShellPermissionIntent, ToolError> {
+    let requested_elevation = shell_requested_elevation(input)?;
+    let requested_workdir = input
+        .workdir
+        .clone()
+        .unwrap_or_else(|| Utf8PathBuf::from("."));
+    let guarded = PathGuard::require_path(workspace, &requested_workdir, AccessKind::Shell)?;
+    if !guarded.absolute.is_dir() {
+        return Err(ToolError::Message(format!(
+            "shell workdir `{}` is not a directory",
+            guarded.absolute
+        )));
+    }
+    let outside_workspace = requested_elevation
+        || (!guarded.inside_workspace && !guarded.trusted_external)
+        || references_outside_workspace_from(workspace, &guarded.absolute, &input.command);
+    let description = if input.description.trim().is_empty() {
+        default_description(&input.command)
+    } else {
+        input.description.clone()
+    };
+    let mut risks = shell_permission_risks_from(workspace, &guarded, &input.command);
+    if command_mentions_configured_instruction_target(
+        workspace,
+        &config.instructions.additional_files,
+        &guarded,
+        &input.command,
+    ) && !risks.contains(&PermissionRisk::ProtectedWorkspaceAuthority)
+    {
+        risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
+    }
+    let mut details = shell_permission_details(&input.command, &guarded.absolute);
+    if requested_elevation {
+        details.push(format!(
+            "Requested sandbox elevation: {}",
+            input.justification.trim()
+        ));
+    }
+    Ok(ShellPermissionIntent {
+        guarded,
+        description,
+        details,
+        outside_workspace,
+        risks,
+    })
+}
+
+fn shell_requested_elevation(input: &ShellInput) -> Result<bool, ToolError> {
+    let requested = input.sandbox_permissions == ShellSandboxPermissions::RequireEscalated;
+    if requested && input.justification.trim().is_empty() {
+        return Err(ToolError::Message(
+            "shell sandbox_permissions=require_escalated requires a concise justification"
+                .to_string(),
+        ));
+    }
+    Ok(requested)
 }
 
 fn format_shell_output_for_display(
@@ -208,6 +286,7 @@ struct CommandOutput {
     timed_out: bool,
     cancelled: bool,
     effect_started: bool,
+    cleanup_failed: bool,
     stdout_truncated: bool,
     stderr_truncated: bool,
 }
@@ -225,6 +304,7 @@ async fn execute_shell_command(
     timeout_ms: u64,
     max_output_bytes: usize,
     cancel: CancellationToken,
+    sandbox_plan: &ProcessSandboxPlan,
 ) -> Result<CommandOutput, ToolError> {
     if cancel.is_cancelled() {
         return Ok(CommandOutput {
@@ -234,6 +314,7 @@ async fn execute_shell_command(
             timed_out: false,
             cancelled: true,
             effect_started: false,
+            cleanup_failed: false,
             stdout_truncated: false,
             stderr_truncated: false,
         });
@@ -243,21 +324,76 @@ async fn execute_shell_command(
     } else {
         ShellFamily::Bash
     });
-    let mut command = if let Some(program) = &shell.program {
-        Command::new(program)
-    } else if matches!(family, ShellFamily::PowerShell) {
-        Command::new("powershell")
-    } else {
-        Command::new("bash")
+    let program = shell
+        .program
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            if matches!(family, ShellFamily::PowerShell) {
+                "powershell".to_string()
+            } else {
+                "bash".to_string()
+            }
+        });
+    let arguments = match family {
+        ShellFamily::PowerShell => vec![
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            command_text.to_string(),
+        ],
+        ShellFamily::Bash => vec!["-lc".to_string(), command_text.to_string()],
     };
-    match family {
-        ShellFamily::PowerShell => {
-            command.args(["-NoProfile", "-Command", command_text]);
-        }
-        ShellFamily::Bash => {
-            command.args(["-lc", command_text]);
-        }
+    let environment = captured_process_environment(shell);
+
+    if let ProcessSandboxPlan::NoProcess = sandbox_plan {
+        return Err(ToolError::SandboxExecution(
+            crate::tool::sandbox_process::SandboxExecutionError::InvalidProfile(
+                "shell process was not authorized by this tool admission".to_string(),
+            ),
+        ));
     }
+    if let ProcessSandboxPlan::WorkspaceWrite(profile) = sandbox_plan {
+        let mut argv = Vec::with_capacity(arguments.len() + 1);
+        argv.push(program);
+        argv.extend(arguments);
+        let completed = execute_workspace_write(
+            profile.clone(),
+            SandboxedProcessRequest {
+                argv,
+                cwd: workdir.to_path_buf(),
+                environment,
+                stdin: Vec::new(),
+                timeout_ms,
+                max_output_bytes,
+                hide_window: shell.hide_windows,
+                cancel,
+            },
+        )
+        .await?;
+        let stdout = captured_shell_text(&completed.stdout.bytes, completed.stdout.truncated);
+        let mut stderr = captured_shell_text(&completed.stderr.bytes, completed.stderr.truncated);
+        let cleanup_error = completed.cleanup_error();
+        if let Some(cleanup_error) = &cleanup_error {
+            if !stderr.is_empty() {
+                stderr.push('\n');
+            }
+            stderr.push_str(&cleanup_error);
+        }
+        return Ok(CommandOutput {
+            stdout,
+            stderr,
+            exit_code: completed.exit_code,
+            timed_out: completed.timed_out,
+            cancelled: completed.cancelled,
+            effect_started: completed.effect_started,
+            cleanup_failed: cleanup_error.is_some(),
+            stdout_truncated: completed.stdout.truncated,
+            stderr_truncated: completed.stderr.truncated,
+        });
+    }
+
+    let mut command = Command::new(program);
+    command.args(arguments);
     command.current_dir(workdir.as_std_path());
     apply_shell_environment(&mut command, shell);
     let mut process = ManagedProcess::spawn(command, shell.hide_windows, max_output_bytes).await?;
@@ -308,9 +444,15 @@ async fn execute_shell_command(
         timed_out,
         cancelled,
         effect_started: true,
+        cleanup_failed: execution_error.is_some() || cleanup_error.is_some(),
         stdout_truncated: stdout_capture.truncated,
         stderr_truncated: stderr_capture.truncated,
     })
+}
+
+fn apply_shell_environment(command: &mut Command, shell: &crate::config::ShellConfig) {
+    command.env_clear();
+    command.envs(captured_process_environment(shell));
 }
 
 fn captured_shell_text(bytes: &[u8], truncated: bool) -> String {
@@ -338,21 +480,6 @@ fn decode_shell_bytes_for_display(bytes: &[u8]) -> String {
     }
 }
 
-fn apply_shell_environment(command: &mut Command, shell: &crate::config::ShellConfig) {
-    let mut captured = HashMap::new();
-    for key in &shell.env_allowlist {
-        if let Some(value) = std::env::var_os(key) {
-            captured.insert(key.clone(), value);
-        }
-    }
-    command.env_clear();
-    for key in &shell.env_allowlist {
-        if let Some(value) = captured.get(key) {
-            command.env(key, value);
-        }
-    }
-}
-
 #[cfg(test)]
 fn shell_timeout_termination_plan() -> Vec<ShellTerminationStep> {
     process_tree_termination_plan()
@@ -376,14 +503,20 @@ fn references_outside_workspace_from(
     }
     extract_absolute_paths(workdir, command)
         .into_iter()
-        .any(|path| {
-            !path.starts_with(&workspace.root)
-                && !workspace
-                    .path_policy
-                    .additional_write_roots
-                    .iter()
-                    .any(|root| path.starts_with(root))
-        })
+        .any(|path| path_is_outside_writable_boundary(workspace, &path))
+}
+
+fn path_is_outside_writable_boundary(
+    workspace: &crate::workspace::Workspace,
+    path: &Utf8Path,
+) -> bool {
+    let inside = |root: &Utf8Path| PathGuard::security_path_is_within(path, root).unwrap_or(false);
+    !inside(&workspace.root)
+        && !workspace
+            .path_policy
+            .additional_write_roots
+            .iter()
+            .any(|root| inside(root))
 }
 
 fn extract_absolute_paths(workdir: &Utf8Path, command: &str) -> Vec<Utf8PathBuf> {
@@ -564,7 +697,7 @@ fn shell_permission_details(command: &str, workdir: &Utf8Path) -> Vec<String> {
     vec![
         format!("Command: {}", command.trim()),
         format!("Workdir: {workdir}"),
-        "Shell runs with the current user account; permission review is risk classification, not an OS filesystem sandbox."
+        "Workspace modes run this process in the native workspace-write OS sandbox; an approved elevation or Full Access runs it unrestricted under the current user account. The unelevated Windows backend uses advisory network controls rather than firewall enforcement."
             .to_string(),
     ]
 }
@@ -604,6 +737,87 @@ fn shell_permission_risks_from(
     risks
 }
 
+pub(crate) fn process_argv_permission_risks(
+    workspace: &crate::workspace::Workspace,
+    guarded_workdir: &GuardedPath,
+    argv: &[String],
+    configured_instruction_files: &[Utf8PathBuf],
+) -> Vec<PermissionRisk> {
+    let command = argv.join(" ");
+    let mut risks = shell_permission_risks_from(workspace, guarded_workdir, &command);
+    let structured_paths = process_argv_path_candidates(&guarded_workdir.absolute, argv);
+    if structured_paths.iter().any(|path| {
+        PathGuard::require_path(workspace, path, AccessKind::Shell).is_ok_and(|guarded| {
+            PathGuard::targets_protected_workspace_authority(&workspace.root, &guarded)
+        })
+    }) && !risks.contains(&PermissionRisk::ProtectedWorkspaceAuthority)
+    {
+        risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
+    }
+    if command_mentions_configured_instruction_target(
+        workspace,
+        configured_instruction_files,
+        guarded_workdir,
+        &command,
+    ) && !risks.contains(&PermissionRisk::ProtectedWorkspaceAuthority)
+    {
+        risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
+    }
+    if configured_instruction_files.iter().any(|configured| {
+        let candidate = if configured.is_absolute() {
+            configured.clone()
+        } else {
+            workspace.root.join(configured)
+        };
+        crate::workspace::project::normalize_path(&workspace.root, &candidate).is_ok_and(
+            |candidate| {
+                structured_paths.iter().any(|path| {
+                    PathGuard::stable_identity_key(path)
+                        == PathGuard::stable_identity_key(&candidate)
+                })
+            },
+        )
+    }) && !risks.contains(&PermissionRisk::ProtectedWorkspaceAuthority)
+    {
+        risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
+    }
+    risks
+}
+
+pub(crate) fn process_argv_references_outside_workspace(
+    workspace: &crate::workspace::Workspace,
+    guarded_workdir: &GuardedPath,
+    argv: &[String],
+) -> bool {
+    references_outside_workspace_from(workspace, &guarded_workdir.absolute, &argv.join(" "))
+        || process_argv_path_candidates(&guarded_workdir.absolute, argv)
+            .iter()
+            .any(|path| path_is_outside_writable_boundary(workspace, path))
+}
+
+fn process_argv_path_candidates(workdir: &Utf8Path, argv: &[String]) -> Vec<Utf8PathBuf> {
+    let mut paths = extract_absolute_paths(workdir, &argv.join(" "));
+    for argument in argv {
+        for candidate in std::iter::once(argument.as_str())
+            .chain(argument.split_once('=').map(|(_, value)| value))
+        {
+            let candidate = candidate.trim_matches(['"', '\'']);
+            let resolved = if cfg!(windows) {
+                resolve_quoted_windows_path(workdir, candidate)
+            } else {
+                let path = Utf8PathBuf::from(candidate);
+                path.is_absolute().then_some(path)
+            };
+            if let Some(path) = resolved {
+                paths.push(path);
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 fn shell_references_network_path(workdir: &Utf8Path, command: &str) -> bool {
     cfg!(windows)
         && (is_windows_unc_path(workdir)
@@ -617,44 +831,41 @@ fn is_windows_unc_path(path: &Utf8Path) -> bool {
 }
 
 fn shell_has_delete_risk(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    ["remove-item", "rm ", "del ", "erase ", "rmdir ", "rd "]
-        .into_iter()
-        .any(|needle| lower.contains(needle))
+    command_tokens(command).iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "remove-item" | "rm" | "del" | "erase" | "rmdir" | "rd"
+        )
+    })
 }
 
 fn shell_has_move_risk(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    [
-        "move-item",
-        "rename-item",
-        " mv ",
-        "move ",
-        " ren ",
-        "rename ",
-    ]
-    .into_iter()
-    .any(|needle| lower.contains(needle))
+    command_tokens(command).iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "mv" | "move" | "ren" | "rename" | "move-item" | "rename-item"
+        )
+    })
 }
 
 fn shell_has_network_risk(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
-    [
-        "http://",
-        "https://",
-        "curl ",
-        "wget ",
-        "invoke-webrequest",
-        "invoke-restmethod",
-        "iwr ",
-        "irm ",
-        "git fetch",
-        "git pull",
-        "git push",
-        "git clone",
-    ]
-    .into_iter()
-    .any(|needle| lower.contains(needle))
+    if lower.contains("http://") || lower.contains("https://") {
+        return true;
+    }
+    let tokens = command_tokens(command);
+    if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "curl" | "wget" | "invoke-webrequest" | "invoke-restmethod" | "iwr" | "irm"
+        )
+    }) {
+        return true;
+    }
+    tokens.iter().any(|token| token == "git")
+        && tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "fetch" | "pull" | "push" | "clone"))
 }
 
 fn shell_requires_external_connection_review(command: &str) -> bool {
@@ -752,6 +963,33 @@ fn command_mentions_protected_target(
         })
 }
 
+fn command_mentions_configured_instruction_target(
+    workspace: &crate::workspace::Workspace,
+    configured_files: &[Utf8PathBuf],
+    guarded_workdir: &GuardedPath,
+    command: &str,
+) -> bool {
+    let lower = command.replace('/', "\\").to_ascii_lowercase();
+    let absolute_paths = extract_absolute_paths(&guarded_workdir.absolute, command);
+    configured_files.iter().any(|configured| {
+        let candidate = if configured.is_absolute() {
+            configured.clone()
+        } else {
+            workspace.root.join(configured)
+        };
+        let Ok(candidate) = crate::workspace::project::normalize_path(&workspace.root, &candidate)
+        else {
+            return false;
+        };
+        absolute_paths.iter().any(|path| {
+            PathGuard::stable_identity_key(path) == PathGuard::stable_identity_key(&candidate)
+        }) || lower.contains(&candidate.as_str().replace('/', "\\").to_ascii_lowercase())
+            || candidate
+                .file_name()
+                .is_some_and(|name| lower.contains(&name.to_ascii_lowercase()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use camino::Utf8PathBuf;
@@ -780,8 +1018,8 @@ mod tests {
     fn network_urls_are_not_classified_as_outside_workspace_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
-        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &ResolvedConfig::default())
-            .expect("workspace");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
         for command in [
             "curl.exe http://127.0.0.1:18945/health",
             "Invoke-WebRequest https://example.com/C:/artifact.json",
@@ -800,7 +1038,148 @@ mod tests {
         assert_eq!(details[0], "Command: Get-Date");
         assert_eq!(details[1], "Workdir: C:/workspace");
         assert!(details[2].contains("current user account"));
-        assert!(details[2].contains("not an OS filesystem sandbox"));
+        assert!(details[2].contains("workspace-write OS sandbox"));
+        assert!(details[2].contains("advisory network controls"));
+    }
+
+    #[test]
+    fn explicit_sandbox_elevation_requires_justification() {
+        let spec = crate::tool::registry::Tool::spec(&super::ShellTool);
+        assert_eq!(
+            spec.input_schema["properties"]["sandbox_permissions"]["enum"],
+            serde_json::json!(["use_default", "require_escalated"])
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["justification"]["type"],
+            "string"
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let default_input: super::ShellInput = serde_json::from_value(serde_json::json!({
+            "command": "Get-Date"
+        }))
+        .expect("default shell input");
+        assert!(!super::shell_requested_elevation(&default_input).expect("default plan"));
+
+        let missing: super::ShellInput = serde_json::from_value(serde_json::json!({
+            "command": "Get-Date",
+            "sandbox_permissions": "require_escalated"
+        }))
+        .expect("escalated shell input");
+        assert!(super::shell_requested_elevation(&missing).is_err());
+
+        let justified: super::ShellInput = serde_json::from_value(serde_json::json!({
+            "command": "Get-Date",
+            "workdir": root,
+            "sandbox_permissions": "require_escalated",
+            "justification": "needs an exact external effect"
+        }))
+        .expect("justified shell input");
+        assert!(super::shell_requested_elevation(&justified).expect("elevated plan"));
+        let intent = super::shell_permission_intent(&workspace, &config, &justified)
+            .expect("explicit elevation intent");
+        assert!(intent.outside_workspace);
+        assert!(intent.risks.is_empty());
+        assert!(intent.details.iter().any(|detail| {
+            detail == "Requested sandbox elevation: needs an exact external effect"
+        }));
+    }
+
+    #[test]
+    fn configured_instruction_command_is_routed_to_authority_review() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let mut config = ResolvedConfig::default();
+        config.instructions.additional_files = vec![Utf8PathBuf::from("policy.md")];
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+            "command": "Set-Content -LiteralPath policy.md -Value changed"
+        }))
+        .expect("shell input");
+
+        let intent = super::shell_permission_intent(&workspace, &config, &input)
+            .expect("configured instruction intent");
+        assert!(
+            intent
+                .risks
+                .contains(&crate::tool::PermissionRisk::ProtectedWorkspaceAuthority)
+        );
+    }
+
+    #[test]
+    fn move_aliases_at_command_boundaries_are_routed_to_review() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+
+        for command in [
+            "mv -Force source.txt target.txt",
+            "\tmv source.txt target.txt",
+            "Write-Output ready;ren old.txt new.txt",
+            "Write-Output ready\nRename-Item old.txt new.txt",
+        ] {
+            assert!(
+                super::shell_permission_risks(&workspace, command)
+                    .contains(&crate::tool::PermissionRisk::MoveOrRename),
+                "command was not classified: {command}"
+            );
+        }
+        assert!(!super::shell_has_move_risk("Write-Output movement"));
+    }
+
+    #[test]
+    fn delete_and_network_aliases_with_non_space_boundaries_are_routed_to_review() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+
+        let delete_risks = super::shell_permission_risks(&workspace, "rm\told.txt");
+        assert!(delete_risks.contains(&crate::tool::PermissionRisk::DestructiveDelete));
+        for command in [
+            "curl\texample.com",
+            "wget\texample.com",
+            "git\tpush origin main",
+        ] {
+            let risks = super::shell_permission_risks(&workspace, command);
+            assert!(
+                risks.contains(&crate::tool::PermissionRisk::Network)
+                    && risks.contains(&crate::tool::PermissionRisk::ExternalConnection),
+                "command was not classified: {command}"
+            );
+        }
+        assert!(!super::shell_has_delete_risk("Write-Output rmdirname"));
+        assert!(!super::shell_has_network_risk("Write-Output curling"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn structured_formatter_argv_preserves_spaces_when_classifying_outside_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 fixture");
+        let root = fixture.join("repo");
+        let outside = fixture.join("repo escaped");
+        std::fs::create_dir_all(&root).expect("workspace root");
+        std::fs::create_dir_all(&outside).expect("outside root");
+        let executable = outside.join("formatter.exe");
+        std::fs::write(&executable, b"fixture").expect("outside formatter fixture");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let guarded = crate::workspace::PathGuard::require_path(
+            &workspace,
+            &root,
+            crate::workspace::AccessKind::Shell,
+        )
+        .expect("guarded workdir");
+
+        assert!(super::process_argv_references_outside_workspace(
+            &workspace,
+            &guarded,
+            &[executable.to_string()]
+        ));
     }
 
     #[test]
@@ -829,6 +1208,7 @@ mod tests {
             5_000,
             1_024,
             cancel,
+            &crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted,
         )
         .await
         .expect("pre-cancel output");
@@ -850,6 +1230,7 @@ mod tests {
             5_000,
             32,
             CancellationToken::new(),
+            &crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted,
         )
         .await
         .expect("bounded shell output");
@@ -857,6 +1238,157 @@ mod tests {
         assert!(output.effect_started);
         assert!(output.stdout_truncated);
         assert!(output.stdout.ends_with("[shell stream capture truncated]"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn workspace_write_shell_dispatch_allows_workspace_and_denies_dynamic_outside_write() {
+        std::fs::create_dir_all("target").expect("target directory");
+        let temp = tempfile::Builder::new()
+            .prefix("moyai-shell-sandbox-")
+            .tempdir_in("target")
+            .expect("tempdir");
+        let fixture = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let workspace_root = fixture.join("workspace");
+        let outside_root = fixture.join("outside");
+        std::fs::create_dir_all(&workspace_root).expect("workspace");
+        std::fs::create_dir_all(&outside_root).expect("outside");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&workspace_root, &config)
+            .expect("workspace discovery");
+        let plan = crate::tool::os_sandbox::ProcessSandboxPlan::for_access_mode(
+            crate::config::AccessMode::Default,
+            &workspace,
+        )
+        .expect("workspace plan");
+        let inside = workspace_root.join("inside.txt");
+        let outside = outside_root.join("outside.txt");
+        let command = format!(
+            "Set-Content -LiteralPath '{}' -Value inside; try {{ Set-Content -LiteralPath '{}' -Value outside -ErrorAction Stop; Write-Output outside-allowed }} catch {{ Write-Output outside-denied }}",
+            inside.as_str().replace('\'', "''"),
+            outside.as_str().replace('\'', "''")
+        );
+
+        let output = super::execute_shell_command(
+            &config.shell,
+            &workspace_root,
+            &command,
+            30_000,
+            8_192,
+            CancellationToken::new(),
+            &plan,
+        )
+        .await
+        .expect("workspace-write shell");
+
+        assert_eq!(output.exit_code, Some(0));
+        assert!(inside.exists());
+        assert!(!outside.exists());
+        assert!(output.stdout.contains("outside-denied"));
+        assert!(!output.cleanup_failed);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unrestricted_shell_dispatch_can_write_outside_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let workspace_root = fixture.join("workspace");
+        let outside_root = fixture.join("outside");
+        std::fs::create_dir_all(&workspace_root).expect("workspace");
+        std::fs::create_dir_all(&outside_root).expect("outside");
+        let config = ResolvedConfig::default();
+        let outside = outside_root.join("outside.txt");
+        let command = format!(
+            "Set-Content -LiteralPath '{}' -Value outside",
+            outside.as_str().replace('\'', "''")
+        );
+        let output = super::execute_shell_command(
+            &config.shell,
+            &workspace_root,
+            &command,
+            30_000,
+            8_192,
+            CancellationToken::new(),
+            &crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted,
+        )
+        .await
+        .expect("unrestricted shell");
+
+        assert_eq!(output.exit_code, Some(0));
+        assert!(outside.exists());
+        assert!(!output.cleanup_failed);
+    }
+
+    #[tokio::test]
+    async fn no_process_admission_never_spawns_a_shell() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let marker = root.join("must-not-start.txt");
+        let config = ResolvedConfig::default();
+        let command = if cfg!(windows) {
+            format!("Set-Content -LiteralPath '{}' -Value started", marker)
+        } else {
+            format!("printf started > '{}'", marker)
+        };
+        let result = super::execute_shell_command(
+            &config.shell,
+            &root,
+            &command,
+            5_000,
+            1_024,
+            CancellationToken::new(),
+            &crate::tool::os_sandbox::ProcessSandboxPlan::NoProcess,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("no-process admission must reject shell dispatch");
+        };
+
+        assert!(matches!(
+            error,
+            crate::error::ToolError::SandboxExecution(
+                crate::tool::sandbox_process::SandboxExecutionError::InvalidProfile(_)
+            )
+        ));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn workspace_shell_fails_closed_without_a_native_backend() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir(&root).expect("workspace root");
+        let marker = root.join("must-not-start.txt");
+        let config = ResolvedConfig::default();
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace discovery");
+        let plan = crate::tool::os_sandbox::ProcessSandboxPlan::for_access_mode(
+            crate::config::AccessMode::Default,
+            &workspace,
+        )
+        .expect("workspace sandbox plan");
+        let error = super::execute_shell_command(
+            &config.shell,
+            &root,
+            &format!("printf started > '{}'", marker),
+            5_000,
+            1_024,
+            CancellationToken::new(),
+            &plan,
+        )
+        .await
+        .err()
+        .expect("unsupported workspace sandbox must fail closed");
+
+        assert!(matches!(
+            error,
+            crate::error::ToolError::SandboxExecution(
+                crate::tool::sandbox_process::SandboxExecutionError::UnsupportedPlatform
+            )
+        ));
+        assert!(!marker.exists());
     }
 
     #[cfg(windows)]

@@ -4000,7 +4000,7 @@ mod tests {
         }
     }
 
-    fn scripted_shell_call(call_id: &str, command: &str) -> ScriptedResponse {
+    fn scripted_escalated_shell_call(call_id: &str, command: &str) -> ScriptedResponse {
         ScriptedResponse {
             events: vec![
                 LlmEvent::ToolCallStart {
@@ -4009,7 +4009,12 @@ mod tests {
                 },
                 LlmEvent::ToolCallArgsDelta {
                     call_id: call_id.to_string(),
-                    delta: serde_json::json!({"command": command}).to_string(),
+                    delta: serde_json::json!({
+                        "command": command,
+                        "sandbox_permissions": "require_escalated",
+                        "justification": "exercise the permission review path",
+                    })
+                    .to_string(),
                 },
             ],
             finish_reason: FinishReason::ToolCall,
@@ -4167,7 +4172,7 @@ mod tests {
         let run = run_scripted(
             config,
             vec![
-                scripted_shell_call("guardian_shell", "echo guardian-approved"),
+                scripted_escalated_shell_call("guardian_shell", "echo guardian-approved"),
                 ScriptedResponse {
                     events: vec![LlmEvent::TextDelta(
                         r#"{"decision":"allow","rationale":"scoped command"}"#.to_string(),
@@ -4242,7 +4247,7 @@ mod tests {
         let run = run_scripted(
             config,
             vec![
-                scripted_shell_call("guardian_first_step", exact_command),
+                scripted_escalated_shell_call("guardian_first_step", exact_command),
                 ScriptedResponse {
                     events: vec![LlmEvent::TextDelta(
                         r#"{"decision":"allow","rationale":"scoped command"}"#.to_string(),
@@ -4294,8 +4299,8 @@ mod tests {
     async fn auto_review_second_tool_sees_bounded_result_of_first_committed_tool() {
         let mut config = ResolvedConfig::default();
         config.permissions.access_mode = AccessMode::AutoReview;
-        let first_arguments = r#"{"command":"echo first-committed-state"}"#;
-        let second_arguments = r#"{"command":"echo second-action"}"#;
+        let first_arguments = r#"{"command":"echo first-committed-state","sandbox_permissions":"require_escalated","justification":"exercise the first permission review"}"#;
+        let second_arguments = r#"{"command":"echo second-action","sandbox_permissions":"require_escalated","justification":"exercise the second permission review"}"#;
         let run = run_scripted(
             config,
             vec![
@@ -4489,7 +4494,10 @@ mod tests {
             let run = run_scripted(
                 config,
                 vec![
-                    scripted_shell_call(&format!("guardian_{label}"), "echo must-not-run"),
+                    scripted_escalated_shell_call(
+                        &format!("guardian_{label}"),
+                        "echo must-not-run",
+                    ),
                     ScriptedResponse {
                         events: vec![LlmEvent::TextDelta(guardian_output.to_string())],
                         finish_reason: FinishReason::Stop,
@@ -4523,7 +4531,7 @@ mod tests {
         let run = run_scripted_with_goal(
             config,
             vec![
-                scripted_shell_call("guardian_invalid_shape", "echo must-not-run"),
+                scripted_escalated_shell_call("guardian_invalid_shape", "echo must-not-run"),
                 ScriptedResponse {
                     events: vec![LlmEvent::ToolCallStart {
                         call_id: "guardian_must_be_toolless".to_string(),
@@ -4570,7 +4578,7 @@ mod tests {
         let run = run_scripted_with_goal(
             config,
             vec![
-                scripted_shell_call("guardian_provider_error", "echo must-not-run"),
+                scripted_escalated_shell_call("guardian_provider_error", "echo must-not-run"),
                 ScriptedResponse {
                     events: vec![LlmEvent::Finished {
                         finish_reason: FinishReason::Error,
@@ -4701,7 +4709,7 @@ mod tests {
                     },
                     LlmEvent::ToolCallArgsDelta {
                         call_id: "call_1".to_string(),
-                        delta: r#"{"command":"echo must-not-run > first.txt"}"#.to_string(),
+                        delta: r#"{"command":"echo must-not-run > first.txt","sandbox_permissions":"require_escalated","justification":"exercise aborting an explicit escalation"}"#.to_string(),
                     },
                     LlmEvent::ToolCallStart {
                         call_id: "call_2".to_string(),
@@ -4709,7 +4717,7 @@ mod tests {
                     },
                     LlmEvent::ToolCallArgsDelta {
                         call_id: "call_2".to_string(),
-                        delta: r#"{"command":"echo must-not-run > second.txt"}"#.to_string(),
+                        delta: r#"{"command":"echo must-not-run > second.txt","sandbox_permissions":"require_escalated","justification":"exercise sibling cancellation after abort"}"#.to_string(),
                     },
                 ],
                 finish_reason: FinishReason::ToolCall,
@@ -4774,7 +4782,7 @@ mod tests {
                         },
                         LlmEvent::ToolCallArgsDelta {
                             call_id: "call_denied".to_string(),
-                            delta: r#"{"command":"echo must-not-run > denied.txt"}"#.to_string(),
+                            delta: r#"{"command":"echo must-not-run > denied.txt","sandbox_permissions":"require_escalated","justification":"exercise a user-denied explicit escalation"}"#.to_string(),
                         },
                     ],
                     finish_reason: FinishReason::ToolCall,

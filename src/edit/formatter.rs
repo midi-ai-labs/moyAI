@@ -7,7 +7,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{FormatConfig, FormatterRule, NewlineStyle};
 use crate::error::EditError;
+use crate::tool::os_sandbox::ProcessSandboxPlan;
 use crate::tool::process::{ManagedProcess, ManagedProcessOutput};
+use crate::tool::sandbox_process::{
+    SandboxedProcessRequest, captured_process_environment, execute_workspace_write,
+};
 
 #[derive(Debug, Clone)]
 pub struct Formatter;
@@ -110,6 +114,24 @@ impl Formatter {
         text: String,
         options: FormatterExecutionOptions,
     ) -> Result<String, EditError> {
+        self.format_resolved_with_sandbox(
+            invocation,
+            text,
+            options,
+            &crate::config::ResolvedConfig::default().shell,
+            &ProcessSandboxPlan::Unrestricted,
+        )
+        .await
+    }
+
+    pub(crate) async fn format_resolved_with_sandbox(
+        &self,
+        invocation: &ResolvedFormatterInvocation,
+        text: String,
+        options: FormatterExecutionOptions,
+        shell: &crate::config::ShellConfig,
+        sandbox_plan: &ProcessSandboxPlan,
+    ) -> Result<String, EditError> {
         if options.cancel.is_cancelled() {
             return Err(EditError::Message(format!(
                 "formatter `{}` cancelled by user",
@@ -117,10 +139,82 @@ impl Formatter {
             )));
         }
 
+        let environment = captured_process_environment(shell);
+        if let ProcessSandboxPlan::NoProcess = sandbox_plan {
+            return Err(EditError::Sandbox(
+                crate::tool::sandbox_process::SandboxExecutionError::InvalidProfile(
+                    "formatter process was not authorized by this tool admission".to_string(),
+                ),
+            ));
+        }
+        if let ProcessSandboxPlan::WorkspaceWrite(profile) = sandbox_plan {
+            let completed = execute_workspace_write(
+                profile.clone(),
+                SandboxedProcessRequest {
+                    argv: invocation.command.clone(),
+                    cwd: invocation.working_directory.clone(),
+                    environment,
+                    stdin: text.into_bytes(),
+                    timeout_ms: options.timeout_ms.max(1),
+                    max_output_bytes: options.max_output_bytes.max(1),
+                    hide_window: shell.hide_windows,
+                    cancel: options.cancel,
+                },
+            )
+            .await?;
+            let cleanup_error = completed.cleanup_error();
+            let cleanup_suffix = cleanup_error
+                .as_deref()
+                .map(|error| format!("; cleanup failed: {error}"))
+                .unwrap_or_default();
+            if completed.cancelled {
+                return Err(EditError::Message(format!(
+                    "formatter `{}` cancelled by user{cleanup_suffix}",
+                    invocation.command.join(" "),
+                )));
+            }
+            if completed.timed_out {
+                return Err(EditError::Message(format!(
+                    "formatter `{}` timed out after {} ms{cleanup_suffix}",
+                    invocation.command.join(" "),
+                    options.timeout_ms
+                )));
+            }
+            if let Some(error) = cleanup_error {
+                return Err(EditError::Message(format!(
+                    "formatter `{}` cleanup failed: {error}",
+                    invocation.command.join(" ")
+                )));
+            }
+            if completed.stdout.truncated || completed.stderr.truncated {
+                return Err(EditError::Message(format!(
+                    "formatter `{}` output exceeded the {} byte capture limit",
+                    invocation.command.join(" "),
+                    options.max_output_bytes.max(1)
+                )));
+            }
+            if completed.exit_code != Some(0) {
+                return Err(EditError::Message(format!(
+                    "formatter `{}` failed with exit code {}: {}",
+                    invocation.command.join(" "),
+                    completed
+                        .exit_code
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    String::from_utf8_lossy(&completed.stderr.bytes)
+                )));
+            }
+            return String::from_utf8(completed.stdout.bytes).map_err(|error| {
+                EditError::Message(format!("formatter output is not UTF-8: {error}"))
+            });
+        }
+
         let mut command = Command::new(&invocation.command[0]);
         command.args(&invocation.command[1..]);
         command.stdin(std::process::Stdio::piped());
         command.current_dir(&invocation.working_directory);
+        command.env_clear();
+        command.envs(environment);
         let output_limit = options.max_output_bytes.max(1);
         let mut process = ManagedProcess::spawn(command, false, output_limit).await?;
         let deadline = Instant::now() + Duration::from_millis(options.timeout_ms.max(1));

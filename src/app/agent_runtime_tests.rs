@@ -31,11 +31,11 @@ use crate::runtime::{
     SessionRuntimeEventHub, SystemClock,
 };
 use crate::session::{
-    DurableTurnTerminal, FinishReason, ProjectRepository, RunEvent, SessionSelector,
-    SessionStartRequest, SessionStatus, ThreadGoalStatus, TokenUsage,
+    AdmissionId, DurableTurnTerminal, FinishReason, ProjectRepository, RunEvent, SessionSelector,
+    SessionStartRequest, SessionStatus, ThreadGoalStatus, TokenUsage, ToolCallId,
 };
 use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
-use crate::tool::context::ToolServices;
+use crate::tool::context::{RunMutationFence, ToolContext, ToolServices};
 use crate::tool::registry::ToolRegistry;
 use crate::tool::truncate::ToolTruncator;
 use crate::workspace::WorkspaceDiscovery;
@@ -556,6 +556,104 @@ async fn child_finish_fixture(
         workspace: child.workspace.clone(),
     };
     (runtime, root_execution, child_context, child_lease, child)
+}
+
+#[tokio::test]
+async fn child_permission_uses_live_root_mode_and_keeps_the_admitted_process_plan() {
+    let (runtime, _root_execution, child_context, _child_lease, child) =
+        child_finish_fixture("child-live-root-permission").await;
+    let root_session_id = child_context.root_session_id();
+    runtime
+        .store
+        .session_repo()
+        .compare_and_set_root_session_access_mode(
+            root_session_id,
+            AccessMode::Default,
+            AccessMode::FullAccess,
+        )
+        .await
+        .expect("root mode update")
+        .expect("root access owner");
+    assert_eq!(child.session.access_mode, AccessMode::Default);
+
+    let config = child_context.effective_config();
+    let services = ToolServices {
+        edit_safety: crate::edit::EditSafety::default(),
+        formatter: crate::edit::Formatter::new(config.format.clone()),
+        change_tracker: crate::edit::ChangeTracker::default(),
+        store: runtime.store.clone(),
+        storage_paths: runtime.store.paths().clone(),
+        truncator: ToolTruncator,
+        mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
+        skills: crate::skill::SkillsService::new(),
+    };
+    let control = RunControl::new();
+    let mut prompt = AllowPrompt;
+    let mut context = ToolContext {
+        session: &child,
+        workspace: &child.workspace,
+        config: &config,
+        tool_call_id: ToolCallId::new(),
+        cancel: control.token(),
+        run_control: control.clone(),
+        run_mutation_fence: RunMutationFence::new(
+            runtime.store.session_repo(),
+            child.session.id,
+            AdmissionId::new(),
+            TurnId::new(),
+            control,
+        ),
+        prompt: &mut prompt,
+        services: &services,
+        agent: Some(&child_context),
+        permission_guardian: None,
+    };
+
+    let admitted_before_switch = context
+        .confirm_if_needed(
+            crate::workspace::AccessKind::Shell,
+            "child shell before root downgrade".to_string(),
+            Vec::new(),
+            false,
+            Vec::new(),
+        )
+        .await
+        .expect("child full-access admission");
+    assert!(matches!(
+        admitted_before_switch.sandbox_plan(),
+        crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted
+    ));
+
+    runtime
+        .store
+        .session_repo()
+        .compare_and_set_root_session_access_mode(
+            root_session_id,
+            AccessMode::FullAccess,
+            AccessMode::Default,
+        )
+        .await
+        .expect("root mode downgrade")
+        .expect("root access owner");
+
+    let admitted_after_switch = context
+        .confirm_if_needed(
+            crate::workspace::AccessKind::Shell,
+            "child shell after root downgrade".to_string(),
+            Vec::new(),
+            false,
+            Vec::new(),
+        )
+        .await
+        .expect("child workspace-write admission");
+    assert!(matches!(
+        admitted_after_switch.sandbox_plan(),
+        crate::tool::os_sandbox::ProcessSandboxPlan::WorkspaceWrite(_)
+    ));
+    assert!(matches!(
+        admitted_before_switch.sandbox_plan(),
+        crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted
+    ));
 }
 
 fn terminal_summary(session_id: SessionId, outcome: TurnTerminalOutcome) -> RunSummary {

@@ -9,7 +9,9 @@ use crate::edit::{
 };
 use crate::error::ToolError;
 use crate::session::{ChangeId, ChangeRepository};
-use crate::tool::context::{ToolContext, ToolFormatterPlan};
+use crate::tool::context::{
+    ToolContext, ToolFormatterPlan, targets_configured_instruction_authority,
+};
 use crate::tool::registry::Tool;
 use crate::tool::write_support::{
     delete_file_conditionally, read_text_file_with_identity, to_summary,
@@ -60,8 +62,21 @@ impl Tool for WriteTool {
         let guarded = PathGuard::require_path(ctx.workspace, &input.path, AccessKind::Edit)?;
         let formatter_plan = ToolFormatterPlan::resolve(ctx.config, ctx.workspace, &guarded)?;
         let mut risks = Vec::new();
-        if PathGuard::targets_protected_workspace_authority(&ctx.workspace.root, &guarded) {
+        if PathGuard::targets_protected_workspace_authority(&ctx.workspace.root, &guarded)
+            || targets_configured_instruction_authority(
+                ctx.config,
+                ctx.workspace,
+                &guarded.absolute,
+            )
+        {
             risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
+        }
+        if let Some(plan) = formatter_plan.as_ref() {
+            for risk in plan.permission_risks() {
+                if !risks.contains(risk) {
+                    risks.push(*risk);
+                }
+            }
         }
         let permission_access = write_permission_access(formatter_plan.as_ref());
         let permission_details = formatter_plan
@@ -75,7 +90,10 @@ impl Tool for WriteTool {
                 format!("Write full contents to {}", guarded.absolute),
                 permission_details,
                 vec![guarded.absolute.clone()],
-                !guarded.inside_workspace && !guarded.trusted_external,
+                (!guarded.inside_workspace && !guarded.trusted_external)
+                    || formatter_plan
+                        .as_ref()
+                        .is_some_and(ToolFormatterPlan::outside_workspace),
                 risks,
             )
             .await?;
@@ -457,44 +475,19 @@ mod tests {
     use camino::Utf8PathBuf;
     use std::time::Duration;
 
-    use crate::cli::{ConfirmationPrompt, ReviewDecision};
     use crate::config::{AccessMode, FormatConfig, FormatterRule, NewlineStyle};
-    use crate::edit::{
-        ChangeTracker, EditSafety, Formatter, FormatterExecutionOptions, read_file_with_identity,
-    };
+    use crate::edit::{EditSafety, Formatter, FormatterExecutionOptions, read_file_with_identity};
     use crate::protocol::TurnInterruptionCause;
     use crate::runtime::RunControl;
-    use crate::session::{
-        AdmissionId, NewSession, ProjectId, ProjectRepository, SessionContext, SessionRepository,
-        ToolCallId,
-    };
     use crate::tool::context::{
-        RunMutationFence, ToolContext, ToolEffectAdmission, ToolFormatterPlan, ToolServices,
-        access_mode_allows_permission,
+        ToolEffectAdmission, ToolFormatterPlan, access_mode_allows_permission,
     };
-    use crate::tool::registry::Tool;
-    use crate::tool::truncate::ToolTruncator;
     use crate::workspace::{AccessKind, PathGuard, WorkspaceDiscovery};
 
     use super::{
-        WriteRollbackState, WriteTool, restore_write_file_state, validate_final_write_content,
+        WriteRollbackState, restore_write_file_state, validate_final_write_content,
         validate_write_commit_precondition, write_permission_access,
     };
-
-    #[derive(Default)]
-    struct DenyPrompt {
-        requests: Vec<crate::tool::PermissionRequest>,
-    }
-
-    impl ConfirmationPrompt for DenyPrompt {
-        fn confirm(
-            &mut self,
-            request: &crate::tool::PermissionRequest,
-        ) -> Result<ReviewDecision, crate::error::CliPromptError> {
-            self.requests.push(request.clone());
-            Ok(ReviewDecision::Denied)
-        }
-    }
 
     fn marker_format_config() -> FormatConfig {
         FormatConfig {
@@ -503,6 +496,17 @@ mod tests {
             commands: vec![FormatterRule {
                 glob: "**/*.txt".to_string(),
                 command: marker_wait_command(),
+            }],
+        }
+    }
+
+    fn passthrough_marker_format_config() -> FormatConfig {
+        FormatConfig {
+            default_newline: NewlineStyle::Lf,
+            ensure_trailing_newline: true,
+            commands: vec![FormatterRule {
+                glob: "**/*.txt".to_string(),
+                command: passthrough_marker_command(),
             }],
         }
     }
@@ -543,8 +547,20 @@ mod tests {
         ]
     }
 
+    #[cfg(windows)]
+    fn passthrough_marker_command() -> Vec<String> {
+        vec![
+            "powershell.exe".to_string(),
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            "Set-Content -LiteralPath 'formatter-started.marker' -Value 'started'; [Console]::Out.Write([Console]::In.ReadToEnd())"
+                .to_string(),
+        ]
+    }
+
     #[test]
-    fn configured_formatter_crosses_the_workspace_boundary_except_in_full_access() {
+    fn configured_formatter_stays_inside_workspace_sandbox_when_risk_free() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
         let target = root.join("output.txt");
@@ -561,11 +577,8 @@ mod tests {
         };
 
         assert_eq!(request.access, AccessKind::Shell);
-        assert!(!access_mode_allows_permission(
-            AccessMode::Default,
-            &request
-        ));
-        assert!(!access_mode_allows_permission(
+        assert!(access_mode_allows_permission(AccessMode::Default, &request));
+        assert!(access_mode_allows_permission(
             AccessMode::AutoReview,
             &request
         ));
@@ -577,91 +590,169 @@ mod tests {
         assert_eq!(write_permission_access(None), AccessKind::Edit);
     }
 
-    #[tokio::test]
-    async fn denied_ask_mode_formatter_spawns_no_process_and_mutates_no_file() {
+    #[test]
+    fn network_capable_formatter_requires_elevation_review_in_workspace_modes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let target = root.join("output.txt");
+        let mut config = crate::config::ResolvedConfig::default();
+        config.format.commands = vec![FormatterRule {
+            glob: "**/*.txt".to_string(),
+            command: vec![
+                "npx".to_string(),
+                "prettier".to_string(),
+                "--stdin-filepath".to_string(),
+                "{file}".to_string(),
+            ],
+        }];
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let guarded = PathGuard::require_path(&workspace, &target, AccessKind::Edit)
+            .expect("formatter target guard");
+        let plan = ToolFormatterPlan::resolve(&config, &workspace, &guarded)
+            .expect("formatter plan")
+            .expect("matching formatter");
+        assert!(
+            plan.permission_risks()
+                .contains(&crate::tool::PermissionRisk::ExternalConnection)
+        );
+        let request = crate::tool::PermissionRequest {
+            access: write_permission_access(Some(&plan)),
+            summary: "write with network-capable formatter".to_string(),
+            details: vec![plan.permission_detail()],
+            targets: vec![target],
+            outside_workspace: false,
+            risks: plan.permission_risks().to_vec(),
+            agent_path: None,
+            agent_task_name: None,
+        };
+        let decisions = [
+            AccessMode::Default,
+            AccessMode::AutoReview,
+            AccessMode::FullAccess,
+        ]
+        .map(|mode| access_mode_allows_permission(mode, &request));
+        assert_eq!(decisions, [false, false, true]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn formatter_argv_outside_workspace_requires_elevation_review() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
-        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let outside =
+            Utf8PathBuf::from_path_buf(temp.path().join("outside.ps1")).expect("utf8 outside path");
         std::fs::create_dir(&root).expect("workspace root");
-        let storage_paths = crate::storage::StoragePaths {
-            database_path: data_dir.join("moyai.sqlite3"),
-            truncation_dir: data_dir.join("truncation"),
-            data_dir: data_dir.clone(),
-        };
-        let sqlite = crate::storage::SqliteStore::open(&storage_paths).expect("store");
-        sqlite.migrate().expect("migrate");
-        let store = crate::storage::StoreBundle::new(sqlite);
-        let project_id = ProjectId::new();
-        store
-            .project_repo()
-            .upsert_project(project_id, &root, "formatter denial", "none")
-            .await
-            .expect("project");
-        let session = store
-            .session_repo()
-            .create_session(NewSession {
-                project_id,
-                title: "formatter denial".to_string(),
-                cwd: root.clone(),
-                model: "model".to_string(),
-                base_url: "http://localhost:1234".to_string(),
-                access_mode: AccessMode::Default,
-            })
-            .await
-            .expect("session");
+        std::fs::write(&outside, "[Console]::In.ReadToEnd()\n").expect("outside formatter");
+        let target = root.join("output.txt");
         let mut config = crate::config::ResolvedConfig::default();
-        config.permissions.access_mode = AccessMode::Default;
-        config.format = marker_format_config();
+        config.format.commands = vec![FormatterRule {
+            glob: "**/*.txt".to_string(),
+            command: vec![
+                "powershell.exe".to_string(),
+                "-File".to_string(),
+                outside.to_string(),
+            ],
+        }];
         let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
-        let session_context = SessionContext { session, workspace };
-        let services = ToolServices {
-            edit_safety: EditSafety::default(),
-            formatter: Formatter::new(config.format.clone()),
-            change_tracker: ChangeTracker,
-            store: store.clone(),
-            storage_paths,
-            truncator: ToolTruncator,
-            mcp: std::sync::Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
-            skills: crate::skill::SkillsService::new(),
+        let guarded = PathGuard::require_path(&workspace, &target, AccessKind::Edit)
+            .expect("formatter target guard");
+        let plan = ToolFormatterPlan::resolve(&config, &workspace, &guarded)
+            .expect("formatter plan")
+            .expect("matching formatter");
+        assert!(plan.outside_workspace());
+
+        let request = crate::tool::PermissionRequest {
+            access: write_permission_access(Some(&plan)),
+            summary: "write with outside formatter argv".to_string(),
+            details: vec![plan.permission_detail()],
+            targets: vec![target],
+            outside_workspace: plan.outside_workspace(),
+            risks: plan.permission_risks().to_vec(),
+            agent_path: None,
+            agent_task_name: None,
         };
-        let control = RunControl::new();
-        let mut prompt = DenyPrompt::default();
+        assert_eq!(
+            [
+                AccessMode::Default,
+                AccessMode::AutoReview,
+                AccessMode::FullAccess,
+            ]
+            .map(|mode| access_mode_allows_permission(mode, &request)),
+            [false, false, true]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_process_admission_never_spawns_a_formatter() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
         let target = root.join("output.txt");
         let marker = root.join("formatter-started.marker");
+        let control = RunControl::new();
+        let (formatter, plan) = marker_formatter_and_plan(&root, &target);
+        let admission = ToolEffectAdmission::new(
+            control.clone(),
+            crate::tool::os_sandbox::ProcessSandboxPlan::NoProcess,
+        );
 
-        let error = WriteTool
-            .execute(
-                serde_json::json!({"path": "output.txt", "content": "content"}),
-                ToolContext {
-                    session: &session_context,
-                    workspace: &session_context.workspace,
-                    config: &config,
-                    tool_call_id: ToolCallId::new(),
-                    cancel: control.token(),
-                    run_control: control.clone(),
-                    run_mutation_fence: RunMutationFence::new(
-                        store.session_repo(),
-                        session_context.session.id,
-                        AdmissionId::new(),
-                        crate::protocol::TurnId::new(),
-                        control,
-                    ),
-                    prompt: &mut prompt,
-                    services: &services,
-                    agent: None,
-                    permission_guardian: None,
-                },
+        let error = admission
+            .format_if_planned(
+                &formatter,
+                Some(&plan),
+                "content".to_string(),
+                formatter_options(&control),
             )
             .await
-            .expect_err("denied formatter permission must stop write");
+            .expect_err("no-process admission must reject formatter dispatch");
 
         assert!(matches!(
             error,
-            crate::error::ToolError::PermissionDenied { .. }
+            crate::error::ToolError::Edit(crate::error::EditError::Sandbox(
+                crate::tool::sandbox_process::SandboxExecutionError::InvalidProfile(_)
+            ))
         ));
-        assert_eq!(prompt.requests.len(), 1);
-        assert_eq!(prompt.requests[0].access, AccessKind::Shell);
         assert!(!marker.exists());
+        assert!(!target.exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn risk_free_formatter_runs_inside_workspace_sandbox() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir(&root).expect("workspace root");
+        let mut config = crate::config::ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::Default;
+        config.format = passthrough_marker_format_config();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let control = RunControl::new();
+        let target = root.join("output.txt");
+        let marker = root.join("formatter-started.marker");
+        let guarded = PathGuard::require_path(&workspace, &target, AccessKind::Edit)
+            .expect("formatter target guard");
+        let plan = ToolFormatterPlan::resolve(&config, &workspace, &guarded)
+            .expect("formatter plan")
+            .expect("matching formatter");
+        let sandbox_plan = crate::tool::os_sandbox::ProcessSandboxPlan::for_access_mode(
+            AccessMode::Default,
+            &workspace,
+        )
+        .expect("workspace sandbox profile");
+        let admission = ToolEffectAdmission::new(control.clone(), sandbox_plan);
+        let formatter = Formatter::new(config.format.clone());
+
+        let formatted = admission
+            .format_if_planned(
+                &formatter,
+                Some(&plan),
+                "content".to_string(),
+                formatter_options(&control),
+            )
+            .await
+            .expect("risk-free formatter should run in the workspace sandbox");
+
+        assert_eq!(formatted, "content");
+        assert!(marker.exists());
         assert!(!target.exists());
     }
 
@@ -674,6 +765,61 @@ mod tests {
         ]
     }
 
+    #[cfg(not(windows))]
+    fn passthrough_marker_command() -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf started > formatter-started.marker; cat".to_string(),
+        ]
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn workspace_formatter_fails_closed_without_a_native_backend() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir(&root).expect("workspace root");
+        let mut config = crate::config::ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::Default;
+        config.format = passthrough_marker_format_config();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let control = RunControl::new();
+        let target = root.join("output.txt");
+        let marker = root.join("formatter-started.marker");
+        let guarded = PathGuard::require_path(&workspace, &target, AccessKind::Edit)
+            .expect("formatter target guard");
+        let plan = ToolFormatterPlan::resolve(&config, &workspace, &guarded)
+            .expect("formatter plan")
+            .expect("matching formatter");
+        let sandbox_plan = crate::tool::os_sandbox::ProcessSandboxPlan::for_access_mode(
+            AccessMode::Default,
+            &workspace,
+        )
+        .expect("workspace sandbox profile");
+        let admission = ToolEffectAdmission::new(control.clone(), sandbox_plan);
+        let formatter = Formatter::new(config.format.clone());
+
+        let error = admission
+            .format_if_planned(
+                &formatter,
+                Some(&plan),
+                "content".to_string(),
+                formatter_options(&control),
+            )
+            .await
+            .expect_err("unsupported native sandbox must fail closed");
+
+        assert!(matches!(
+            error,
+            crate::error::ToolError::Edit(crate::error::EditError::Sandbox(
+                crate::tool::sandbox_process::SandboxExecutionError::UnsupportedPlatform
+            ))
+        ));
+        assert!(!marker.exists());
+        assert!(!target.exists());
+    }
+
     #[tokio::test]
     async fn terminal_before_write_effect_admission_spawns_no_formatter_and_mutates_no_file() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -684,15 +830,18 @@ mod tests {
         assert!(control.interrupt(TurnInterruptionCause::UserStop));
         let (formatter, plan) = marker_formatter_and_plan(&root, &target);
 
-        let error = ToolEffectAdmission::new(control.clone())
-            .format_if_planned(
-                &formatter,
-                Some(&plan),
-                "content".to_string(),
-                formatter_options(&control),
-            )
-            .await
-            .expect_err("terminal producer must win before the formatter effect");
+        let error = ToolEffectAdmission::new(
+            control.clone(),
+            crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted,
+        )
+        .format_if_planned(
+            &formatter,
+            Some(&plan),
+            "content".to_string(),
+            formatter_options(&control),
+        )
+        .await
+        .expect_err("terminal producer must win before the formatter effect");
 
         assert!(matches!(error, crate::error::ToolError::RunInterrupted));
         assert!(!marker.exists());
@@ -711,14 +860,17 @@ mod tests {
         let worker_target = target.clone();
         let worker = tokio::spawn(async move {
             let (formatter, plan) = marker_formatter_and_plan(&worker_root, &worker_target);
-            ToolEffectAdmission::new(worker_control.clone())
-                .format_if_planned(
-                    &formatter,
-                    Some(&plan),
-                    "content".to_string(),
-                    formatter_options(&worker_control),
-                )
-                .await
+            ToolEffectAdmission::new(
+                worker_control.clone(),
+                crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted,
+            )
+            .format_if_planned(
+                &formatter,
+                Some(&plan),
+                "content".to_string(),
+                formatter_options(&worker_control),
+            )
+            .await
         });
 
         tokio::time::timeout(Duration::from_secs(5), async {

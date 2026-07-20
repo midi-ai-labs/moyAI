@@ -43,15 +43,17 @@ pub fn builtin_permission_profiles() -> Vec<PermissionProfileEntry> {
             mode: AccessMode::Default,
             id: "default".to_string(),
             label: AccessMode::Default.label().to_string(),
-            summary: "Automatically allows ordinary in-workspace file operations and asks the user when an operation crosses that boundary."
+            summary: "Runs ordinary typed in-workspace file operations directly and local shell/formatter processes in the native workspace-write OS sandbox profile when available (currently Windows), then asks the user before explicit or detected elevation. The Windows profile pins a finite set of existing objects; namespace, network, outside-path, and same-user host-process isolation are not exhaustive."
                 .to_string(),
-            auto_allowed: strings(&["ordinary workspace file operations"]),
+            auto_allowed: strings(&[
+                "ordinary workspace file operations",
+                "shell and formatter processes classified as local inside the workspace-write sandbox",
+            ]),
             requires_review: vec![
-                "shell",
                 "destructive edits",
                 "workspace authority files",
                 "detected outside configured boundary",
-                "network or external connections",
+                "explicitly requested or heuristically detected network/external elevation",
             ]
             .into_iter()
             .map(ToString::to_string)
@@ -63,10 +65,11 @@ pub fn builtin_permission_profiles() -> Vec<PermissionProfileEntry> {
             mode: AccessMode::AutoReview,
             id: "auto_review".to_string(),
             label: AccessMode::AutoReview.label().to_string(),
-            summary: "Uses the same workspace boundary as Ask for approval, then sends boundary-crossing requests to an independent AI guardian."
+            summary: "Uses the same finite native workspace-write OS sandbox profile as Ask for approval when available (currently Windows), then sends explicit or detected elevation requests to an independent AI guardian. Namespace, network, outside-path, and same-user host-process isolation are not exhaustive."
                 .to_string(),
             auto_allowed: strings(&[
                 "ordinary workspace file operations",
+                "shell and formatter processes classified as local inside the workspace-write sandbox",
                 "operations approved by the AI reviewer",
             ]),
             requires_review: strings(&[
@@ -80,7 +83,7 @@ pub fn builtin_permission_profiles() -> Vec<PermissionProfileEntry> {
             mode: AccessMode::FullAccess,
             id: "full_access".to_string(),
             label: AccessMode::FullAccess.label().to_string(),
-            summary: "Does not ask for permission approval. Independent filesystem, ownership, and runtime integrity checks still fail closed."
+            summary: "Runs process effects without the workspace OS sandbox and does not ask for permission approval. Typed file/in-process guards and process lifecycle checks still apply, but unrestricted child filesystem mutations do not pass through typed file guards."
                 .to_string(),
             auto_allowed: strings(&["all permission requests"]),
             requires_review: Vec::new(),
@@ -117,15 +120,23 @@ mod tests {
 
         assert_eq!(
             profiles[0].auto_allowed,
-            vec!["ordinary workspace file operations"]
+            vec![
+                "ordinary workspace file operations",
+                "shell and formatter processes classified as local inside the workspace-write sandbox",
+            ]
         );
         assert_eq!(profiles[1].mode, AccessMode::AutoReview);
         assert_eq!(profiles[2].auto_allowed, vec!["all permission requests"]);
-        assert_eq!(profiles[0].requires_review[0], "shell");
+        assert_eq!(profiles[0].requires_review[0], "destructive edits");
+        assert!(
+            profiles[0]
+                .summary
+                .contains("native workspace-write OS sandbox")
+        );
         assert!(
             profiles[2]
                 .summary
-                .contains("integrity checks still fail closed")
+                .contains("unrestricted child filesystem mutations")
         );
         assert!(profiles[2].requires_review.is_empty());
     }
