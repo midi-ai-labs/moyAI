@@ -461,11 +461,21 @@ pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed(
                 }
             }
             crate::protocol::TurnItemPayload::ToolStatus {
+                tool,
                 title,
                 status,
                 summary,
                 ..
             } => {
+                if *status == crate::protocol::ToolLifecycleStatus::Failed {
+                    current.system_rows.push(desktop_transcript_row(
+                        DesktopTranscriptRowKind::Error,
+                        String::new(),
+                        format!("エラー - Tool {tool}"),
+                        summary.clone(),
+                        Vec::new(),
+                    ));
+                }
                 current.tool_rows.push(format_tool_history_row(
                     *status,
                     title.trim(),
