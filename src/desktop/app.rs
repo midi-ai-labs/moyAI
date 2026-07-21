@@ -1999,6 +1999,7 @@ mod command_projection_owner_tests {
                     has_more: false,
                     items: turn_items,
                 },
+                turn_elapsed_ms: Default::default(),
                 latest_turn_id,
                 active_turn_id: None,
                 active_turn_sequence_no: None,
@@ -9838,6 +9839,7 @@ mod tests {
         let rows = vec![
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::User,
+                stable_history_identity: None,
                 step: "01".to_string(),
                 title: "Prompt".to_string(),
                 body: "Older request.".to_string(),
@@ -9845,6 +9847,7 @@ mod tests {
             },
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::Assistant,
+                stable_history_identity: None,
                 step: "02".to_string(),
                 title: "Previous response".to_string(),
                 body: "Earlier answer.".to_string(),
@@ -9852,6 +9855,7 @@ mod tests {
             },
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::User,
+                stable_history_identity: None,
                 step: "03".to_string(),
                 title: "Prompt".to_string(),
                 body: "Create a report.".to_string(),
@@ -9859,6 +9863,7 @@ mod tests {
             },
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::Assistant,
+                stable_history_identity: None,
                 step: "04".to_string(),
                 title: "Response".to_string(),
                 body: "Done.\nSaved files.".to_string(),
@@ -9903,6 +9908,7 @@ mod tests {
         let rows = vec![
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::User,
+                stable_history_identity: None,
                 step: "01".to_string(),
                 title: "Prompt".to_string(),
                 body: "Create files.".to_string(),
@@ -9910,6 +9916,7 @@ mod tests {
             },
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::Assistant,
+                stable_history_identity: None,
                 step: "02".to_string(),
                 title: "Response".to_string(),
                 body: "Now run this:\n<tool_call>\n<function=shell>\n</tool_call>".to_string(),
@@ -9917,6 +9924,7 @@ mod tests {
             },
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::Diff,
+                stable_history_identity: None,
                 step: "03".to_string(),
                 title: "File changes".to_string(),
                 body: "Added README.md\nAdded __pycache__\\workflow.cpython-313.pyc".to_string(),
@@ -9960,6 +9968,7 @@ mod tests {
         let rows = vec![
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::User,
+                stable_history_identity: None,
                 step: "01".to_string(),
                 title: "Prompt".to_string(),
                 body: "Update the implementation.".to_string(),
@@ -9967,6 +9976,7 @@ mod tests {
             },
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::Assistant,
+                stable_history_identity: None,
                 step: "02".to_string(),
                 title: "Response".to_string(),
                 body: "テストの期待値を修正します。".to_string(),
@@ -9974,6 +9984,7 @@ mod tests {
             },
             DesktopTranscriptRow {
                 row_kind: DesktopTranscriptRowKind::WorkSummaryCancelled,
+                stable_history_identity: None,
                 step: "03".to_string(),
                 title: "作業履歴 / 作業サマリ".to_string(),
                 body: "### 作業サマリ\n- 結果: run cancelled by user".to_string(),
@@ -10572,6 +10583,7 @@ pub fn desktop_open_transcript_markdown_preserves_visible_evidence_fixture_passe
     let rows = vec![
         DesktopTranscriptRow {
             row_kind: super::models::DesktopTranscriptRowKind::User,
+            stable_history_identity: None,
             step: "01".to_string(),
             title: "Prompt".to_string(),
             body: "Create files.".to_string(),
@@ -10579,6 +10591,7 @@ pub fn desktop_open_transcript_markdown_preserves_visible_evidence_fixture_passe
         },
         DesktopTranscriptRow {
             row_kind: super::models::DesktopTranscriptRowKind::Assistant,
+            stable_history_identity: None,
             step: "02".to_string(),
             title: "Response".to_string(),
             body: "Now run this:\n<tool_call>\n<function=shell>\n</tool_call>".to_string(),
@@ -10586,6 +10599,7 @@ pub fn desktop_open_transcript_markdown_preserves_visible_evidence_fixture_passe
         },
         DesktopTranscriptRow {
             row_kind: super::models::DesktopTranscriptRowKind::Diff,
+            stable_history_identity: None,
             step: "03".to_string(),
             title: "File changes".to_string(),
             body: "Added README.md\nAdded __pycache__\\workflow.cpython-313.pyc".to_string(),

@@ -20,6 +20,7 @@ export interface TranscriptRow {
     | "work_summary_failed"
     | "work_summary_cancelled"
     | "file_changes";
+  stable_history_identity?: string | null;
   step: string;
   title: string;
   body: string;

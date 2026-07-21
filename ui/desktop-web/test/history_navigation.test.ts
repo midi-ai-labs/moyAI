@@ -6,16 +6,19 @@ import {
   captureViewportAnchor,
   createPendingHistoryPrepend,
   pinThreadToEnd,
+  pinResolvedThreadToEnd,
   rejectPendingHistoryPrepend,
   restoreViewportAnchor,
   shouldRevealThreadEnd,
+  syncResolvedInactiveThreadViewport,
+  ThreadTailFollowAffinity,
   transcriptAnchors,
   turnPageLoadPending,
   type HistoryPrependProjection,
 } from "../src/history_navigation.ts";
 import type { TranscriptRow } from "../src/types.ts";
 
-test("an explicit run start reveals the new turn even when history was scrolled away from the end", () => {
+test("an active run-tail owner reveals through a transient raw geometry gap", () => {
   assert.equal(shouldRevealThreadEnd({
     sessionChanged: false,
     runStartRequested: true,
@@ -44,6 +47,135 @@ test("an explicit run start reveals the new turn even when history was scrolled 
   const thread = { scrollTop: 0, scrollHeight: 2_400 };
   pinThreadToEnd(thread);
   assert.equal(thread.scrollTop, 2_400, "the run-start render pins synchronously before a poll can replace it");
+});
+
+test("run-scoped tail affinity survives long composer layout, replacement, streaming, and terminal render", () => {
+  const affinity = new ThreadTailFollowAffinity();
+  const owner = tailOwner("idle:30");
+  affinity.noteUserViewport(true);
+  assert.equal(affinity.armRun(owner), true);
+
+  let currentThread = clampedThread({ scrollTop: 46, scrollHeight: 869, clientHeight: 823 });
+  let decision = affinity.reconcile(tailProjection("idle:30", false, true));
+  assert.equal(decision.follow, true, "the pre-admission rerender follows without treating the prior terminal state as this run");
+  assert.equal(decision.clearAfterPin, false);
+  assert.equal(pinResolvedThreadToEnd(() => currentThread), true);
+
+  currentThread.scrollHeight = 1_180;
+  currentThread.clientHeight = 780;
+  assert.ok(threadGap(currentThread) > 96, "long composer reserve can move raw geometry beyond the passive threshold");
+  assert.equal(pinResolvedThreadToEnd(() => currentThread), true, "the post-layout callback resolves and pins the current thread");
+  assert.equal(threadGap(currentThread), 0);
+  affinity.completeRender(decision, true);
+
+  currentThread = clampedThread({ scrollTop: currentThread.scrollTop, scrollHeight: 1_407, clientHeight: 780 });
+  decision = affinity.reconcile(tailProjection("root:31", true, false));
+  assert.equal(decision.follow, true, "the accepted long User row binds the root generation");
+  pinResolvedThreadToEnd(() => currentThread);
+  affinity.completeRender(decision, true);
+  assert.equal(threadGap(currentThread), 0);
+
+  for (const scrollHeight of [2_019, 2_183, 2_416, 2_724]) {
+    currentThread = clampedThread({ scrollTop: currentThread.scrollTop, scrollHeight, clientHeight: 780 });
+    decision = affinity.reconcile(tailProjection("root:31", true, false));
+    assert.equal(decision.follow, true);
+    pinResolvedThreadToEnd(() => currentThread);
+    affinity.completeRender(decision, true);
+    assert.equal(threadGap(currentThread), 0, `incoming output at height ${scrollHeight} remains at the tail`);
+  }
+
+  currentThread = clampedThread({ scrollTop: currentThread.scrollTop, scrollHeight: 2_120, clientHeight: 823 });
+  decision = affinity.reconcile(tailProjection("idle:31", false, true));
+  assert.deepEqual(decision, { follow: true, clearAfterPin: true });
+  pinResolvedThreadToEnd(() => currentThread);
+  affinity.completeRender(decision, true);
+  assert.equal(threadGap(currentThread), 0, "the final assistant/summary render is pinned before affinity clears");
+  assert.equal(affinity.followingRun, false);
+});
+
+test("explicit user scroll-away cancels run following while layout and DOM replacement do not", () => {
+  const affinity = new ThreadTailFollowAffinity();
+  affinity.noteUserViewport(true);
+  assert.equal(affinity.armRun(tailOwner("idle:7")), true);
+  assert.equal(affinity.reconcile(tailProjection("root:8", true, false)).follow, true);
+
+  affinity.noteUserScrollAway();
+  assert.equal(affinity.followingRun, false);
+  assert.equal(affinity.reconcile(tailProjection("root:8", true, false)).follow, false);
+  assert.equal(affinity.armRun(tailOwner("root:8")), false, "a viewport deliberately left behind cannot arm another follow");
+
+  const prior = clampedThread({ scrollTop: 300, scrollHeight: 1_200, clientHeight: 600 });
+  const replacement = clampedThread({ scrollTop: prior.scrollTop, scrollHeight: 1_800, clientHeight: 600 });
+  assert.equal(threadGap(replacement), 900, "incoming growth preserves the explicit older-history position");
+
+  assert.equal(affinity.syncInactiveViewport(true), true, "interaction completion re-observes a return to the tail");
+  assert.equal(affinity.armRun(tailOwner("idle:8")), true, "returning to the tail permits a later run to follow");
+});
+
+test("inactive session geometry resets stale viewport affinity without clearing an active run on layout", () => {
+  const affinity = new ThreadTailFollowAffinity();
+  affinity.noteUserScrollAway();
+  assert.equal(affinity.viewportIsNearEnd, false);
+  assert.equal(affinity.syncInactiveViewport(true), true, "a newly selected session adopts its current tail geometry");
+  assert.equal(affinity.viewportIsNearEnd, true);
+
+  assert.equal(affinity.armRun(tailOwner("idle:12")), true);
+  assert.equal(affinity.reconcile(tailProjection("root:13", true, false)).follow, true);
+  const layoutShiftedThread = clampedThread({ scrollTop: 200, scrollHeight: 1_500, clientHeight: 600 });
+  assert.equal(
+    syncResolvedInactiveThreadViewport(
+      affinity,
+      () => layoutShiftedThread,
+      (thread) => threadGap(thread) <= 96,
+    ),
+    false,
+    "composer or transcript layout cannot overwrite semantic affinity while the run owner is active",
+  );
+  assert.equal(affinity.viewportIsNearEnd, true);
+  assert.equal(affinity.followingRun, true);
+});
+
+test("rail smooth-scroll completion at the latest tail rearms the next run", () => {
+  const affinity = new ThreadTailFollowAffinity();
+  let currentThread = clampedThread({ scrollTop: 100, scrollHeight: 1_500, clientHeight: 600 });
+  const resolveThread = () => currentThread;
+  const isNearEnd = (thread: ClampedThread) => threadGap(thread) <= 96;
+
+  affinity.noteUserScrollAway();
+  assert.equal(affinity.armRun(tailOwner("idle:20")), false);
+  assert.equal(syncResolvedInactiveThreadViewport(affinity, resolveThread, isNearEnd), true);
+  assert.equal(affinity.viewportIsNearEnd, false, "an intermediate smooth-scroll frame remains away");
+
+  currentThread = clampedThread({ scrollTop: 900, scrollHeight: 1_500, clientHeight: 600 });
+  assert.equal(syncResolvedInactiveThreadViewport(affinity, resolveThread, isNearEnd), true);
+  assert.equal(affinity.armRun(tailOwner("idle:20")), true, "the final native scroll frame restores tail affinity");
+});
+
+test("failed or fit-content history prepend resyncs current geometry for the next run", () => {
+  for (const currentThread of [
+    clampedThread({ scrollTop: 600, scrollHeight: 1_200, clientHeight: 600 }),
+    clampedThread({ scrollTop: 0, scrollHeight: 480, clientHeight: 600 }),
+  ]) {
+    const affinity = new ThreadTailFollowAffinity();
+    affinity.noteUserScrollAway();
+    assert.equal(
+      syncResolvedInactiveThreadViewport(affinity, () => currentThread, (thread) => threadGap(thread) <= 96),
+      true,
+    );
+    assert.equal(affinity.armRun(tailOwner("idle:40")), true);
+  }
+});
+
+test("resolved tail pin targets the current DOM replacement instead of a detached thread", () => {
+  const detached = clampedThread({ scrollTop: 0, scrollHeight: 1_000, clientHeight: 500 });
+  const replacement = clampedThread({ scrollTop: 120, scrollHeight: 1_600, clientHeight: 600 });
+  let current: ClampedThread = detached;
+  const resolve = () => current;
+  current = replacement;
+
+  assert.equal(pinResolvedThreadToEnd(resolve), true);
+  assert.equal(detached.scrollTop, 0);
+  assert.equal(threadGap(replacement), 0);
 });
 
 test("viewport anchor capture restores the first surviving visible candidate", () => {
@@ -171,6 +303,33 @@ test("work-summary disclosure identities survive only the phase-appropriate upda
   );
 });
 
+test("durable work-summary identity survives mutable presentation and separates turns", () => {
+  const stableIdentity = "turn:01STABLE:work-summary";
+  const running = {
+    ...transcriptRow("work_summary_running", "12s 作業中", "以前の進捗"),
+    stable_history_identity: stableIdentity,
+    file_changes: [{ label: "old", path: "old.txt", action: "更新", summary: "before" }],
+  };
+  const completed = {
+    ...transcriptRow("work_summary_completed", "18s作業しました", "最終結果"),
+    stable_history_identity: stableIdentity,
+    file_changes: [{ label: "new", path: "new.txt", action: "追加", summary: "after" }],
+  };
+  const otherTurn = {
+    ...completed,
+    stable_history_identity: "turn:01OTHER:work-summary",
+  };
+
+  const runningAnchor = transcriptAnchors([running])[0]!;
+  const completedAnchor = transcriptAnchors([completed])[0]!;
+  const otherTurnAnchor = transcriptAnchors([otherTurn])[0]!;
+
+  assert.equal(completedAnchor.id, runningAnchor.id);
+  assert.equal(completedAnchor.detailsId, runningAnchor.detailsId);
+  assert.notEqual(otherTurnAnchor.id, completedAnchor.id);
+  assert.notEqual(otherTurnAnchor.detailsId, completedAnchor.detailsId);
+});
+
 test("the latest streaming assistant keeps its rail identity while text grows", () => {
   const user = transcriptRow("user", "ユーザー依頼", "確認してください");
   const before = transcriptRow("assistant", "Assistant", "確認しています");
@@ -212,6 +371,46 @@ function transcriptRow(
   body: string,
 ): TranscriptRow {
   return { row_kind: rowKind, step: "1", title, body, file_changes: [] };
+}
+
+function tailOwner(runtimeOwnerToken: string) {
+  return {
+    workspacePath: "C:/workspace",
+    sessionId: "root-session",
+    runtimeOwnerToken,
+  };
+}
+
+function tailProjection(runtimeOwnerToken: string, runActive: boolean, terminal: boolean) {
+  return {
+    ...tailOwner(runtimeOwnerToken),
+    runActive,
+    terminal,
+  };
+}
+
+interface ClampedThread {
+  scrollTop: number;
+  scrollHeight: number;
+  clientHeight: number;
+}
+
+function clampedThread(initial: ClampedThread): ClampedThread {
+  let scrollTop = initial.scrollTop;
+  const thread = {
+    scrollHeight: initial.scrollHeight,
+    clientHeight: initial.clientHeight,
+    get scrollTop() { return scrollTop; },
+    set scrollTop(value: number) {
+      scrollTop = Math.max(0, Math.min(value, thread.scrollHeight - thread.clientHeight));
+    },
+  };
+  thread.scrollTop = initial.scrollTop;
+  return thread;
+}
+
+function threadGap(thread: ClampedThread): number {
+  return thread.scrollHeight - thread.scrollTop - thread.clientHeight;
 }
 
 interface MockAnchorGeometry {

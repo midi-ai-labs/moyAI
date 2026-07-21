@@ -1019,6 +1019,7 @@ fn canonical_session_snapshot_from_storage(
         fence,
         history,
         turns,
+        turn_elapsed_ms,
         latest_turn_position,
     } = protocol;
     let history_has_more = history.has_more();
@@ -1042,6 +1043,7 @@ fn canonical_session_snapshot_from_storage(
                 has_more: turn_has_more,
                 items: turns.items,
             },
+            turn_elapsed_ms,
             latest_turn_id: latest_turn_position.map(|(turn_id, _)| turn_id),
             active_turn_id: active_turn_position.map(|(turn_id, _)| turn_id),
             active_turn_sequence_no: active_turn_position.map(|(_, sequence_no)| sequence_no),

@@ -2,7 +2,10 @@ use crate::session::{CanonicalSessionRead, CanonicalTurnPage, SessionRecord};
 use crate::tui::state::{AppState, RunStatus};
 
 use super::models::DesktopSessionDetail;
-use super::query::{build_session_detail, build_session_detail_from_app_state_with_session};
+use super::query::{
+    build_session_detail, build_session_detail_from_app_state_with_session,
+    turn_work_summary_stable_identity,
+};
 
 #[derive(Debug, Clone)]
 pub struct OpenSessionView {
@@ -56,8 +59,16 @@ impl OpenSessionView {
         } else {
             self.read.clone()
         };
+        let mut turn_elapsed_ms = self.read.turn_elapsed_ms.clone();
+        turn_elapsed_ms.extend(
+            incoming
+                .turn_elapsed_ms
+                .iter()
+                .map(|(turn_id, elapsed_ms)| (*turn_id, *elapsed_ms)),
+        );
         read.turns = turns;
         read.turns.session = read.session.clone();
+        read.turn_elapsed_ms = turn_elapsed_ms;
         self.stored_detail = build_session_detail(&read, None);
         self.read = read;
         true
@@ -77,6 +88,12 @@ impl OpenSessionView {
         self.read.latest_turn_id = incoming.latest_turn_id;
         self.read.active_turn_id = incoming.active_turn_id;
         self.read.active_turn_sequence_no = incoming.active_turn_sequence_no;
+        self.read.turn_elapsed_ms.extend(
+            incoming
+                .turn_elapsed_ms
+                .iter()
+                .map(|(turn_id, elapsed_ms)| (*turn_id, *elapsed_ms)),
+        );
         self.read.turns.session = incoming.turns.session.clone();
         self.read.turns.limit = self.read.turns.limit.max(incoming.turns.limit);
         self.read.turns.total = self.read.turns.total.max(incoming.turns.total);
@@ -92,6 +109,26 @@ impl OpenSessionView {
     ) -> DesktopSessionDetail {
         let mut detail =
             build_session_detail_from_app_state_with_session(app_state, Some(&self.read.session));
+        let live_work_summary_turn_id = if app_state.current_session_id != Some(self.session_id()) {
+            None
+        } else if matches!(app_state.run_status, RunStatus::Running) {
+            self.read.active_turn_id
+        } else {
+            app_state
+                .last_summary
+                .as_ref()
+                .filter(|summary| summary.session_id() == self.session_id())
+                .map(crate::session::RunSummary::turn_id)
+        };
+        if let Some(turn_id) = live_work_summary_turn_id
+            && let Some(row) = detail
+                .transcript_rows
+                .iter_mut()
+                .rev()
+                .find(|row| is_work_summary_kind(row.row_kind))
+        {
+            row.stable_history_identity = Some(turn_work_summary_stable_identity(turn_id));
+        }
         if matches!(app_state.run_status, RunStatus::Running) {
             detail.transcript_rows = merge_canonical_prefix_with_live_suffix(
                 self.canonical_prefix_rows(),
@@ -134,14 +171,16 @@ impl OpenSessionView {
             .iter()
             .cloned()
             .partition(|item| item.turn_id != active_turn_id);
-        let mut rows = super::query::transcript_rows_from_turn_items_with_context(
+        let mut rows = super::query::transcript_rows_from_turn_items_with_context_and_elapsed(
             &self.read.session,
             &prior_items,
+            &self.read.turn_elapsed_ms,
         );
         rows.extend(
-            super::query::transcript_rows_from_turn_items_with_context(
+            super::query::transcript_rows_from_turn_items_with_context_and_elapsed(
                 &self.read.session,
                 &active_items,
+                &self.read.turn_elapsed_ms,
             )
             .into_iter()
             .filter(|row| {
@@ -490,6 +529,7 @@ mod tests {
                 has_more: offset.saturating_add(items.len()) < total,
                 items,
             },
+            turn_elapsed_ms: Default::default(),
             latest_turn_id: None,
             active_turn_id: None,
             active_turn_sequence_no: None,
@@ -519,6 +559,7 @@ mod tests {
     ) -> DesktopTranscriptRow {
         DesktopTranscriptRow {
             row_kind,
+            stable_history_identity: None,
             step: String::new(),
             title: title.to_string(),
             body: body.to_string(),
@@ -534,6 +575,7 @@ mod tests {
         stored_detail.transcript_text = "stale transcript".to_string();
         stored_detail.transcript_rows = vec![DesktopTranscriptRow {
             row_kind: DesktopTranscriptRowKind::FileChanges,
+            stable_history_identity: None,
             step: "1".to_string(),
             title: "old changes".to_string(),
             body: "stale transcript".to_string(),
@@ -665,6 +707,95 @@ mod tests {
             .position(|row| row.body == "second request")
             .expect("live user");
         assert!(first_final < second_user);
+    }
+
+    #[test]
+    fn live_work_summary_identity_matches_terminal_canonical_owner() {
+        let mut running_session = session();
+        running_session.status = SessionStatus::Running;
+        running_session.completed_at_ms = None;
+        let turn_id = TurnId::new();
+        let mut items = vec![
+            turn_item(
+                running_session.id,
+                turn_id,
+                1,
+                TurnItemPayload::UserMessage {
+                    text: "inspect".to_string(),
+                },
+            ),
+            turn_item(
+                running_session.id,
+                turn_id,
+                2,
+                TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Shell,
+                    status: crate::protocol::ToolLifecycleStatus::Completed,
+                    title: "inspect".to_string(),
+                    summary: "done".to_string(),
+                },
+            ),
+        ];
+        let mut running_read =
+            canonical_read(&running_session, 0, items.len(), items.len(), items.clone());
+        running_read.active_turn_id = Some(turn_id);
+        let mut view = OpenSessionView::from_loaded(&running_read);
+        let mut live = AppState::default();
+        live.load_turn_items_with_active_turn(&running_session, &items, Some(turn_id));
+
+        let running_identity = view
+            .live_detail(&live, None)
+            .transcript_rows
+            .into_iter()
+            .find(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryRunning)
+            .and_then(|row| row.stable_history_identity)
+            .expect("live running work summary identity");
+        assert_eq!(running_identity, turn_work_summary_stable_identity(turn_id));
+
+        let terminal = crate::session::DurableTurnTerminal {
+            outcome: TurnTerminalOutcome::Completed,
+            final_response_id: None,
+            tool_call_count: 1,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        };
+        items.push(turn_item(
+            running_session.id,
+            turn_id,
+            3,
+            TurnItemPayload::Terminal {
+                outcome: terminal.outcome.clone(),
+            },
+        ));
+        let mut completed_session = running_session.clone();
+        completed_session.status = SessionStatus::Completed;
+        completed_session.updated_at_ms = completed_session.updated_at_ms.saturating_add(1);
+        completed_session.completed_at_ms = Some(completed_session.updated_at_ms);
+        let completed_read = canonical_read(
+            &completed_session,
+            0,
+            items.len(),
+            items.len(),
+            items.clone(),
+        );
+        assert!(view.merge_contiguous(&completed_read));
+        live.load_turn_items_with_active_turn(&completed_session, &items, None);
+        live.set_summary(crate::session::RunSummary::from_terminal(
+            completed_session.id,
+            turn_id,
+            terminal,
+        ));
+
+        let completed_identity = view
+            .live_detail(&live, None)
+            .transcript_rows
+            .into_iter()
+            .find(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+            .and_then(|row| row.stable_history_identity)
+            .expect("terminal canonical work summary identity");
+        assert_eq!(completed_identity, running_identity);
     }
 
     #[test]
@@ -1356,6 +1487,18 @@ mod tests {
                 session.id,
                 turn_id,
                 2,
+                TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Shell,
+                    status: crate::protocol::ToolLifecycleStatus::Completed,
+                    title: "inspect".to_string(),
+                    summary: "earlier tool evidence".to_string(),
+                },
+            ),
+            turn_item(
+                session.id,
+                turn_id,
+                3,
                 TurnItemPayload::AgentMessage {
                     text: "final answer".to_string(),
                 },
@@ -1363,20 +1506,32 @@ mod tests {
             turn_item(
                 session.id,
                 turn_id,
-                3,
+                4,
                 TurnItemPayload::Terminal {
                     outcome: TurnTerminalOutcome::Completed,
                 },
             ),
         ];
-        let suffix = canonical_read(&session, 1, 2, 3, items[1..].to_vec());
-        let earlier = canonical_read(&session, 0, 2, 3, items[..2].to_vec());
+        let suffix = canonical_read(&session, 2, 2, 4, items[2..].to_vec());
+        let earlier = canonical_read(&session, 0, 3, 4, items[..3].to_vec());
         let mut view = OpenSessionView::from_loaded(&suffix);
+        let partial_summary = view
+            .stored_detail()
+            .transcript_rows
+            .iter()
+            .find(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+            .expect("partial turn work summary");
+        let partial_identity = partial_summary
+            .stable_history_identity
+            .clone()
+            .expect("partial summary stable identity");
+        let partial_body = partial_summary.body.clone();
+        assert_eq!(partial_identity, format!("turn:{turn_id}:work-summary"));
 
         assert!(view.merge_contiguous(&earlier));
 
         assert_eq!(view.read.turns.offset, 0);
-        assert_eq!(view.read.turns.items.len(), 3);
+        assert_eq!(view.read.turns.items.len(), 4);
         assert!(!view.read.turns.has_more);
         let rows = &view.stored_detail().transcript_rows;
         assert_eq!(
@@ -1399,6 +1554,135 @@ mod tests {
         );
         assert!(rows.iter().any(|row| row.body.contains("old request")));
         assert!(rows.iter().any(|row| row.body.contains("final answer")));
+        let full_summary = rows
+            .iter()
+            .find(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+            .expect("completed split turn work summary");
+        assert_ne!(full_summary.body, partial_body);
+        assert_eq!(
+            full_summary.stable_history_identity.as_deref(),
+            Some(partial_identity.as_str()),
+        );
+    }
+
+    #[test]
+    fn same_turn_steer_segment_identities_survive_prepend_reprojection() {
+        let session = session();
+        let turn_id = TurnId::new();
+        let first_steer_id = TurnItemId::new();
+        let second_steer_id = TurnItemId::new();
+        let items = vec![
+            turn_item(
+                session.id,
+                turn_id,
+                1,
+                TurnItemPayload::UserMessage {
+                    text: "initial request".to_string(),
+                },
+            ),
+            turn_item(
+                session.id,
+                turn_id,
+                2,
+                TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Shell,
+                    status: crate::protocol::ToolLifecycleStatus::Completed,
+                    title: "first".to_string(),
+                    summary: "first evidence".to_string(),
+                },
+            ),
+            TurnItem {
+                id: first_steer_id,
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 3,
+                payload: TurnItemPayload::SteerMessage {
+                    text: "first steer".to_string(),
+                },
+            },
+            turn_item(
+                session.id,
+                turn_id,
+                4,
+                TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Shell,
+                    status: crate::protocol::ToolLifecycleStatus::Completed,
+                    title: "second".to_string(),
+                    summary: "second evidence".to_string(),
+                },
+            ),
+            TurnItem {
+                id: second_steer_id,
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 5,
+                payload: TurnItemPayload::SteerMessage {
+                    text: "second steer".to_string(),
+                },
+            },
+            turn_item(
+                session.id,
+                turn_id,
+                6,
+                TurnItemPayload::AgentMessage {
+                    text: "final answer".to_string(),
+                },
+            ),
+            turn_item(
+                session.id,
+                turn_id,
+                7,
+                TurnItemPayload::Terminal {
+                    outcome: TurnTerminalOutcome::Completed,
+                },
+            ),
+        ];
+        let suffix = canonical_read(&session, 3, 4, 7, items[3..].to_vec());
+        let earlier = canonical_read(&session, 0, 4, 7, items[..4].to_vec());
+        let mut view = OpenSessionView::from_loaded(&suffix);
+        let partial_identities = view
+            .stored_detail()
+            .transcript_rows
+            .iter()
+            .filter_map(|row| {
+                is_work_summary_kind(row.row_kind)
+                    .then(|| row.stable_history_identity.clone())
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            partial_identities,
+            vec![
+                format!("turn:{turn_id}:before:{second_steer_id}:work-summary"),
+                turn_work_summary_stable_identity(turn_id),
+            ]
+        );
+
+        assert!(view.merge_contiguous(&earlier));
+
+        let full_identities = view
+            .stored_detail()
+            .transcript_rows
+            .iter()
+            .filter_map(|row| {
+                is_work_summary_kind(row.row_kind)
+                    .then(|| row.stable_history_identity.clone())
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            full_identities,
+            vec![
+                format!("turn:{turn_id}:before:{first_steer_id}:work-summary"),
+                format!("turn:{turn_id}:before:{second_steer_id}:work-summary"),
+                turn_work_summary_stable_identity(turn_id),
+            ]
+        );
+        assert_eq!(&full_identities[1..], partial_identities.as_slice());
     }
 
     #[test]

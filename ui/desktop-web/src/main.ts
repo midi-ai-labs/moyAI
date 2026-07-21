@@ -6,10 +6,12 @@ import {
   advancePendingHistoryPrepend,
   captureViewportAnchor,
   createPendingHistoryPrepend,
+  pinResolvedThreadToEnd,
   rejectPendingHistoryPrepend,
   restoreViewportAnchor,
-  pinThreadToEnd,
   shouldRevealThreadEnd,
+  syncResolvedInactiveThreadViewport,
+  ThreadTailFollowAffinity,
   type PendingHistoryPrepend,
 } from "./history_navigation";
 import { commandConflictState, commandInternalState } from "./command_error";
@@ -106,7 +108,8 @@ const uiState = createUiLocalState();
 let pendingHistoryPrepend: PendingHistoryPrepend | null = null;
 let nextHistoryPrependGeneration = 1;
 let lastRenderedAgentExecutionOwner: string | null = null;
-let runStartThreadEndRevealPending = false;
+const threadTailFollow = new ThreadTailFollowAffinity();
+let threadEndRevealGeneration = 0;
 
 interface StateUpdate {
   state: DesktopWebState;
@@ -202,7 +205,13 @@ async function mutate(name: string, args?: Record<string, unknown>): Promise<voi
     if (!historyPrependRequest) return;
   }
   if (startsRun) {
-    runStartThreadEndRevealPending = true;
+    if (currentState) {
+      threadTailFollow.armRun({
+        workspacePath: currentState.run_target.workspacePath,
+        sessionId: currentState.run_target.sessionId,
+        runtimeOwnerToken: currentState.run_target.runtimeOwnerToken,
+      });
+    }
     uiState.runStartMutationPending = true;
     if (currentState) acceptState(currentState, true);
     window.setTimeout(() => void refresh(), 0);
@@ -229,8 +238,10 @@ async function mutate(name: string, args?: Record<string, unknown>): Promise<voi
         pendingHistoryPrepend,
         historyPrependRequest.generation,
       );
+      scheduleInactiveThreadViewportSync();
     }
     rejectDraftMutation(uiState, name, draftSnapshot);
+    if (startsRun) threadTailFollow.cancelRun();
     if (!recoverCommandConflict(error)) reportError(error);
   } finally {
     if (startsRun) {
@@ -318,6 +329,7 @@ function beginHistoryPrepend(): PendingHistoryPrepend | null {
   if (!request) return null;
   nextHistoryPrependGeneration += 1;
   pendingHistoryPrepend = request;
+  noteUserThreadScrollAway();
   return request;
 }
 
@@ -328,11 +340,18 @@ function jumpToHistoryAnchor(anchorId: string): void {
     `[data-history-anchor="${CSS.escape(anchorId)}"]`,
   );
   if (!thread || !target) return;
+  noteUserThreadScrollAway();
   const top = thread.scrollTop
     + target.getBoundingClientRect().top
     - thread.getBoundingClientRect().top
     - 18;
-  thread.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
+  const targetTop = Math.min(
+    Math.max(0, top),
+    Math.max(0, thread.scrollHeight - thread.clientHeight),
+  );
+  const alreadyAtTarget = Math.abs(thread.scrollTop - targetTop) <= 1;
+  thread.scrollTo({ top: targetTop, behavior: "smooth" });
+  if (alreadyAtTarget) scheduleInactiveThreadViewportSync();
 }
 
 function recoverCommandConflict(error: unknown): boolean {
@@ -493,6 +512,7 @@ function applyStateUpdate(update: StateUpdate): void {
 }
 
 function renderCommitted(state: DesktopViewState, mutationName: string | null): void {
+  const revealGeneration = ++threadEndRevealGeneration;
   const elapsedSplashMs = performance.now() - splashStartedAt;
   if (!splashDismissed && shouldShowSplash(elapsedSplashMs)) {
     appRoot.innerHTML = renderStartupSplash(state, elapsedSplashMs, SPLASH_MIN_VISIBLE_MS);
@@ -556,9 +576,16 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
     && uiState.artifactPaneMode === "agents"
     && selectedAgentActivityChanged(previousAgentRows, agentRows, uiState.selectedAgentPath);
   const runCompleted = Boolean(previous?.busy && !state.busy) || isTerminalRunStatus(state.run_status_key);
+  const tailFollowDecision = threadTailFollow.reconcile({
+    workspacePath: state.run_target.workspacePath,
+    sessionId: state.run_target.sessionId,
+    runtimeOwnerToken: state.run_target.runtimeOwnerToken,
+    runActive: state.busy || state.agent_tree_active || state.post_run_refresh_pending,
+    terminal: isTerminalRunStatus(state.run_status_key),
+  });
   const shouldRevealEnd = shouldRevealThreadEnd({
     sessionChanged,
-    runStartRequested: runStartThreadEndRevealPending,
+    runStartRequested: tailFollowDecision.follow,
     previouslyNearEnd: previousThreadWasNearEnd,
     updateWantsEnd: state.busy
       || state.agent_tree_active
@@ -629,14 +656,15 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
   }
   if (prependViewportAnchor) restoreDetailSnapshots(detailSnapshots, nextAgentExecutionOwner);
   const thread = document.querySelector<HTMLElement>("#thread");
+  let pinnedToEnd = false;
   if (thread && prependViewportAnchor && restoreViewportAnchor(thread, prependViewportAnchor)) {
     // Preserve the visible message while an older bounded history chunk is prepended.
   } else if (thread && shouldRevealEnd) {
-    revealThreadEnd(thread);
+    revealThreadEnd(revealGeneration);
+    pinnedToEnd = true;
   } else if (thread && previousThread) {
     restoreThreadPosition(thread, previousThreadScrollTop);
   }
-  if (thread && runStartThreadEndRevealPending) runStartThreadEndRevealPending = false;
   previousSessionKey = nextSessionKey;
   lastRenderedLocalConfirmationPending = localConfirmationPending;
   lastRenderedState = state;
@@ -645,6 +673,17 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
   if (!prependViewportAnchor) restoreDetailSnapshots(detailSnapshots, nextAgentExecutionOwner);
   restoreFocusSnapshot(focusSnapshot);
   wireEvents(state, eventContext);
+  if (thread) wireThreadTailFollowEvents(thread);
+  if (pinnedToEnd) {
+    pinResolvedThreadToEnd(resolveCurrentThread);
+    threadTailFollow.completeRender(tailFollowDecision, true);
+  } else if (previous === null || sessionChanged) {
+    syncInactiveThreadViewport();
+  }
+  if (historyPrependTransition.disposition === "consume"
+    || historyPrependTransition.disposition === "discard") {
+    scheduleInactiveThreadViewportSync();
+  }
   focusAgentPaneAfterRender();
   if (
     modalClosing &&
@@ -1078,13 +1117,86 @@ function isThreadNearEnd(thread: HTMLElement): boolean {
   return thread.scrollHeight - thread.scrollTop - thread.clientHeight <= THREAD_END_THRESHOLD_PX;
 }
 
-function revealThreadEnd(thread: HTMLElement): void {
+function resolveCurrentThread(): HTMLElement | null {
+  return document.querySelector<HTMLElement>("#thread");
+}
+
+function syncInactiveThreadViewport(): boolean {
+  return syncResolvedInactiveThreadViewport(
+    threadTailFollow,
+    resolveCurrentThread,
+    isThreadNearEnd,
+  );
+}
+
+function scheduleInactiveThreadViewportSync(): void {
+  window.requestAnimationFrame(() => {
+    syncInactiveThreadViewport();
+  });
+}
+
+function revealThreadEnd(generation: number): void {
   const scroll = () => {
-    pinThreadToEnd(thread);
+    if (generation !== threadEndRevealGeneration) return;
+    pinResolvedThreadToEnd(resolveCurrentThread);
   };
   scroll();
   requestAnimationFrame(scroll);
   window.setTimeout(scroll, 50);
+}
+
+function noteUserThreadScrollAway(): void {
+  threadEndRevealGeneration += 1;
+  threadTailFollow.noteUserScrollAway();
+}
+
+function wireThreadTailFollowEvents(thread: HTMLElement): void {
+  let observationFrame: number | null = null;
+  const observeUserViewport = () => {
+    if (observationFrame !== null) window.cancelAnimationFrame(observationFrame);
+    observationFrame = window.requestAnimationFrame(() => {
+      observationFrame = null;
+      const currentThread = resolveCurrentThread();
+      if (!currentThread) return;
+      threadTailFollow.noteUserViewport(isThreadNearEnd(currentThread));
+    });
+  };
+  const moveAway = () => {
+    noteUserThreadScrollAway();
+    observeUserViewport();
+  };
+  thread.addEventListener("scroll", syncInactiveThreadViewport, { passive: true });
+  thread.addEventListener("wheel", (event) => {
+    if (event.deltaY < 0) {
+      moveAway();
+    } else {
+      observeUserViewport();
+    }
+  }, { passive: true });
+  thread.addEventListener("touchmove", moveAway, { passive: true });
+  thread.addEventListener("touchend", observeUserViewport, { passive: true });
+  thread.addEventListener("touchcancel", observeUserViewport, { passive: true });
+  thread.addEventListener("pointerdown", (event) => {
+    const bounds = thread.getBoundingClientRect();
+    if (event.clientX < bounds.right - 20) return;
+    moveAway();
+    const pointerId = event.pointerId;
+    const finishPointerScroll = (finishedEvent: PointerEvent) => {
+      if (finishedEvent.pointerId !== pointerId) return;
+      document.removeEventListener("pointerup", finishPointerScroll, true);
+      document.removeEventListener("pointercancel", finishPointerScroll, true);
+      observeUserViewport();
+    };
+    document.addEventListener("pointerup", finishPointerScroll, true);
+    document.addEventListener("pointercancel", finishPointerScroll, true);
+  });
+  thread.addEventListener("keydown", (event) => {
+    if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+      moveAway();
+    } else if (["ArrowDown", "PageDown", "End"].includes(event.key)) {
+      observeUserViewport();
+    }
+  });
 }
 
 function restoreThreadPosition(thread: HTMLElement, scrollTop: number): void {

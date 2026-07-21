@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use camino::Utf8PathBuf;
@@ -630,6 +630,8 @@ pub struct CanonicalSessionRead {
     pub session: SessionRecord,
     pub history: CanonicalHistoryPage,
     pub turns: CanonicalTurnPage,
+    #[serde(skip)]
+    pub turn_elapsed_ms: HashMap<TurnId, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
