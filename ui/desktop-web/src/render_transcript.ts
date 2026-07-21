@@ -227,7 +227,7 @@ function renderWorkSummary(
     <article class="message work-summary ${escapeHtml(row.row_kind)}" data-history-anchor="${escapeHtml(anchorId)}">
       <div class="message-body">
         <details data-details-key="work-summary:${escapeHtml(detailsId)}" ${open}>
-          <summary><span>${escapeHtml(row.title)}</span>${statusText ? `<small>${escapeHtml(statusText)}</small>` : ""}</summary>
+          <summary data-focus-key="work-summary:${escapeHtml(anchorId)}"><span>${escapeHtml(row.title)}</span>${statusText ? `<small>${escapeHtml(statusText)}</small>` : ""}</summary>
           <div class="work-summary-body">${body}</div>
         </details>
       </div>
