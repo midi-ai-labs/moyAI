@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.8.0"><img alt="Release" src="https://img.shields.io/badge/release-v0.8.0-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.0.0"><img alt="Release" src="https://img.shields.io/badge/release-v1.0.0-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.ja.md">日本語 README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v0.8.0">Download release</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.0.0">Download release</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -80,12 +80,13 @@ moyAI is designed around those constraints:
 
 ## Current Release
 
-The current beta release is available here:
+The current release is available here:
 
-[**moyAI v0.8.0 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v0.8.0)
+[**moyAI v1.0.0 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v1.0.0)
 
-v0.8.0 includes the canonical runtime/storage cutover, Codex-style planning, Responses transport,
-semantic compaction, and the Desktop interaction hardening described in this source tree.
+v1.0.0 adds a Codex-inspired continuous Desktop conversation and Sub Agent history, three explicit
+permission modes with the Windows workspace sandbox, and hardened LM Studio/Qwen tool-call and
+post-compaction compatibility on top of the canonical runtime introduced in v0.8.0.
 
 The Windows release zip includes:
 
@@ -133,7 +134,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 0.8.0 -ManualGuiStResultsPath path\to\RESULTS.md
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 1.0.0 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
 
 Run packaging from the clean source commit for that release. If `v<version>` already exists, the
@@ -194,6 +195,12 @@ enabled = false
 retry delays, request-body upload, and waiting for response headers. `stream_idle_timeout_ms` limits a period with no SSE
 event after streaming starts. Both default to 300,000 ms. They are no-progress deadlines, not a cap on
 total generation time; explicit config or environment overrides remain supported.
+`max_output_tokens` bounds the complete model output, including reasoning and serialized tool-call
+arguments. Tool-heavy runs that write a whole document need the provider's verified profile budget;
+the bundled LM Studio/Qwen profile and product default use `8192`. A provider-side
+`response.failed` such as `Failed to parse tool call: Unexpected end of content` is reported as a
+generation failure with the configured budget and is not treated as a locally parsed or executed
+tool call.
 `max_retries` applies only to retryable connection/transport failures before any HTTP response, with
 every retry delay capped at 30,000 ms. A response-start timeout, any HTTP error response (including
 429/5xx), or a failure after an SSE response starts is terminal and is not replayed automatically.

@@ -276,8 +276,8 @@ fn reasoning_summary_name(summary: ReasoningSummary) -> &'static str {
 
 fn instructions(request: &ChatRequest) -> String {
     // Responses does not carry prior `instructions` forward with
-    // `previous_response_id`, so current system/compaction guidance is projected
-    // on every request instead of becoming another incremental input item.
+    // `previous_response_id`, so current system guidance is projected on every
+    // request instead of becoming another incremental input item.
     std::iter::once(request.system_prompt.clone())
         .chain(request.messages.iter().filter_map(|message| match message {
             ModelMessage::System { content } => Some(content.clone()),
@@ -2067,6 +2067,64 @@ mod tests {
         assert_eq!(input[1]["call_id"], json!("call_1"));
         assert_eq!(input[2]["type"], json!("function_call_output"));
         assert_eq!(input[2]["output"], json!("contents"));
+    }
+
+    #[test]
+    fn compacted_full_history_keeps_its_user_query_before_tool_led_suffix() {
+        let compacted_context =
+            "Earlier conversation context was compacted.\nContinue the calculator task.";
+        let request = request(vec![
+            ModelMessage::User {
+                content: compacted_context.to_string(),
+            },
+            ModelMessage::AssistantToolCalls {
+                content: Some("I will inspect the tests.".to_string()),
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call_1".to_string(),
+                    tool_name: "read_file".to_string(),
+                    arguments_json: r#"{"path":"test_calculator.py"}"#.to_string(),
+                }],
+            },
+            ModelMessage::Tool {
+                call_id: "call_1".to_string(),
+                tool_name: "read_file".to_string(),
+                result: "test contents".to_string(),
+                metadata: Value::Null,
+            },
+        ]);
+
+        let wire = to_responses_request(
+            &request,
+            ResponsesRequestOptions {
+                reasoning_capability: responses_capability(),
+                ..ResponsesRequestOptions::default()
+            },
+        )
+        .expect("cursor-less compacted Responses request");
+
+        assert_eq!(wire["instructions"], json!("Base instructions"));
+        assert!(wire.get("previous_response_id").is_none());
+        assert_eq!(
+            wire["input"],
+            json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": compacted_context }]
+            }, {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "I will inspect the tests." }]
+            }, {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read_file",
+                "arguments": r#"{"path":"test_calculator.py"}"#
+            }, {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "test contents"
+            }])
+        );
     }
 
     #[test]

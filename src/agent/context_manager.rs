@@ -603,16 +603,7 @@ fn project_model_messages(
                     .filter_map(|id| index_by_id.get(id).copied())
                     .min()
                     .unwrap_or(index);
-                projected.push((
-                    insertion_index,
-                    0,
-                    ModelMessage::System {
-                        content: format!(
-                            "Earlier conversation context was compacted.\n{}",
-                            summary.trim()
-                        ),
-                    },
-                ));
+                projected.push((insertion_index, 0, semantic_compaction_message(summary)));
             }
             HistoryItemPayload::Error { message, .. } => projected.push((
                 index,
@@ -629,6 +620,15 @@ fn project_model_messages(
         .into_iter()
         .map(|(_, _, message)| message)
         .collect()
+}
+
+pub(super) fn semantic_compaction_message(summary: &str) -> ModelMessage {
+    ModelMessage::User {
+        content: format!(
+            "Earlier conversation context was compacted.\n{}",
+            summary.trim()
+        ),
+    }
 }
 
 fn user_message_from_content(content: &[ContentPart], supports_images: bool) -> ModelMessage {
@@ -820,8 +820,90 @@ mod tests {
         );
         assert!(matches!(
             context.model_messages(false).as_slice(),
-            [ModelMessage::System { content }, ModelMessage::User { content: tail_text }]
+            [ModelMessage::User { content }, ModelMessage::User { content: tail_text }]
                 if content.contains("first and second summarized") && tail_text == "tail"
+        ));
+    }
+
+    #[test]
+    fn partial_compaction_anchors_a_retained_tool_suffix_with_user_context() {
+        let old = user_item("old request detail");
+        let response_id = ModelResponseId::new();
+        let call_id = ToolCallId::new();
+        let retained = [
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id: old.session_id,
+                scope: old.scope,
+                sequence_no: 2,
+                created_at_ms: 2,
+                payload: HistoryItemPayload::AssistantMessage {
+                    response_id,
+                    content: vec![ContentPart::Text {
+                        text: "I will inspect the retained file.".to_string(),
+                    }],
+                },
+            },
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id: old.session_id,
+                scope: old.scope,
+                sequence_no: 3,
+                created_at_ms: 3,
+                payload: HistoryItemPayload::ToolCall {
+                    call_id,
+                    response_id,
+                    model_call_id: "call-retained".to_string(),
+                    tool_name: "read".to_string(),
+                    arguments_json: serde_json::json!({"path": "retained.txt"}).to_string(),
+                },
+            },
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id: old.session_id,
+                scope: old.scope,
+                sequence_no: 4,
+                created_at_ms: 4,
+                payload: HistoryItemPayload::ToolOutput {
+                    call_id,
+                    status: ToolLifecycleStatus::Completed,
+                    title: "read".to_string(),
+                    output_text: "retained contents".to_string(),
+                    metadata: serde_json::Value::Null,
+                    success: Some(true),
+                },
+            },
+        ];
+        let mut active = vec![old.clone()];
+        active.extend(retained.clone());
+        let mut context = ContextManager::from_active_history(active, Some(4), 4, 0, 0);
+        let compaction = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: old.session_id,
+            scope: old.scope,
+            sequence_no: 5,
+            created_at_ms: 5,
+            payload: HistoryItemPayload::Compaction {
+                mode: crate::protocol::CompactionMode::Automatic,
+                summary: "Continue the retained inspection.".to_string(),
+                replacement_item_ids: vec![old.id],
+            },
+        };
+
+        let delta = context.ingest_committed_delta(vec![compaction], Some(5));
+        let projected = context.model_messages(false);
+
+        assert_eq!(delta.change, HistoryChange::Compacted);
+        assert!(matches!(
+            projected.as_slice(),
+            [
+                ModelMessage::User { content },
+                ModelMessage::AssistantToolCalls { tool_calls, .. },
+                ModelMessage::Tool { call_id, result, .. }
+            ] if content.contains("Continue the retained inspection.")
+                && matches!(tool_calls.as_slice(), [ModelToolCall { call_id, .. }] if call_id == "call-retained")
+                && call_id == "call-retained"
+                && result == "retained contents"
         ));
     }
 

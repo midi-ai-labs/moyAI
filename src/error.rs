@@ -201,6 +201,17 @@ pub enum LlmError {
         message: String,
     },
     #[error(
+        "provider generation failed{response_text}{code_text} with configured max_output_tokens={max_output_tokens}: {message}",
+        response_text = response_id.as_ref().map(|value| format!(" for response {value}")).unwrap_or_default(),
+        code_text = code.as_ref().map(|value| format!(" ({value})")).unwrap_or_default()
+    )]
+    ProviderGenerationFailed {
+        response_id: Option<String>,
+        code: Option<String>,
+        message: String,
+        max_output_tokens: u32,
+    },
+    #[error(
         "{operation} expected a complete tool-less text response, but provider finish reason was {finish_reason:?}"
     )]
     ToollessTextFinish {
@@ -247,6 +258,12 @@ impl LlmError {
     pub fn rejects_previous_response_id(&self) -> bool {
         if let Self::ProviderFailure { source, .. } = self {
             return source.rejects_previous_response_id();
+        }
+        if let Self::ProviderGenerationFailed { code, .. } = self {
+            return code.as_deref().is_some_and(|value| {
+                let value = value.to_ascii_lowercase();
+                value.contains("previous_response") || value.contains("response_not_found")
+            });
         }
         let Self::ProviderRejected {
             status,
@@ -301,6 +318,14 @@ mod llm_error_tests {
             message: "previous_response_id was not found".to_string(),
         };
         assert!(!message_only.rejects_previous_response_id());
+
+        let streamed_rejection = LlmError::ProviderGenerationFailed {
+            response_id: Some("resp_failed".to_string()),
+            code: Some("invalid_previous_response_id".to_string()),
+            message: "previous response was not found".to_string(),
+            max_output_tokens: 8_192,
+        };
+        assert!(streamed_rejection.rejects_previous_response_id());
     }
 }
 

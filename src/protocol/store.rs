@@ -4523,7 +4523,7 @@ mod tests {
         assert!(matches!(
             messages.as_slice(),
             [
-                crate::llm::ModelMessage::System { content: summary },
+                crate::llm::ModelMessage::User { content: summary },
                 crate::llm::ModelMessage::User { content: current }
             ] if summary.contains("compacted contract")
                 && current == "continue from the compacted contract"

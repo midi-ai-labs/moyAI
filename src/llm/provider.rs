@@ -108,6 +108,7 @@ pub enum ProviderFailureKind {
     ResponseStartTimeout,
     StreamIdleTimeout,
     HttpStatus,
+    Generation,
     Protocol,
     Decode,
     Cancelled,
@@ -147,7 +148,7 @@ impl fmt::Display for ProviderFailure {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderPhase, resolve_api_key_from_env};
+    use super::{ProviderFailureKind, ProviderPhase, resolve_api_key_from_env};
 
     #[test]
     fn configured_api_key_environment_fails_closed() {
@@ -187,6 +188,18 @@ mod tests {
                 "retired provider phase `{retired}` must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn provider_generation_failure_kind_has_a_stable_wire_name() {
+        let encoded = serde_json::to_string(&ProviderFailureKind::Generation)
+            .expect("serialize generation failure kind");
+        assert_eq!(encoded, "\"generation\"");
+        assert_eq!(
+            serde_json::from_str::<ProviderFailureKind>(&encoded)
+                .expect("deserialize generation failure kind"),
+            ProviderFailureKind::Generation
+        );
     }
 }
 

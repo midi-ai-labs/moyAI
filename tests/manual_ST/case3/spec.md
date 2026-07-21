@@ -9,6 +9,7 @@
 - `project_sandbox/<task>/case3/workspace/` に fresh workspace を作る。
 - case1 相当の `calculator.py` と `test_calculator.py` を配置し、開始前の `python -m unittest` が成功することを確認する。
 - config/data directory を fresh にする。
+- tool-call出力上限はcurrent verified provider profileを使う。同梱のLM Studio/Qwen profileでは`max_output_tokens = 8192`であり、これを縮小したrunはrelease smokeの代替にしない。
 - stage1 から stage3 は同一 Project Chat session で実行する。
 
 ## Stage 1 request
@@ -72,6 +73,7 @@ Python API は既存の `calculate(left, operator, right)` の引数意味を壊
 - `pow` is a binary operator; unary functions use a consistent API without dummy operands or duplicated function tokens.
 - all external command contracts pass with exact exit-code and stdout/stderr behavior.
 - transcript shows the requested turn boundaries, file changes, verification, and normal completion.
+- automatic compactionが発生した場合、最初のcursor-less full-history requestはcompaction summaryのuser-context anchorから始まり、保持されたassistant/tool suffixを続けても`No user query found in messages`等のprompt-template errorにならずterminal completedへ到達する。
 - workspace outside the scenario remains unchanged.
 
 内部recovery fieldを合格条件にしない。runがloopまたはdriftした場合は、current provider request、tool output、transcript、workspace evidenceから診断する。

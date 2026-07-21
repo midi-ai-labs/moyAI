@@ -32,7 +32,7 @@ core / agent-loop / release の広い regression では、必要に応じて `ca
 ## Common execution
 
 1. `project_sandbox/<task>/<case>/` に fresh workspace、fresh config/data、artifact directory を作る。
-2. 対象 build と provider/model/config を `RESULTS.md` に記録する。
+2. 対象 build と provider/model/configを`RESULTS.md`に記録する。provider/modelはcurrent verified profileを起点とし、別用途fixtureの縮小したcontext/output budgetを流用しない。意図的なoverrideは既定/profileとの差分と理由を明記する。
 3. visible Tauri Desktop を起動し、scenario の canonical user request を GUI から送る。
 4. pointer、keyboard、attachment、confirmation など scenario に必要な操作を実際に行う。
 5. scenario 内の required verification を moyAI の tool evidence と外部 command の両方で確認する。
@@ -50,7 +50,7 @@ CLI から Desktop を起動する場合の current option は `moyai desktop --
 - transcript Markdown export または同等の canonical session evidence
 - required verification の stdout / stderr / exit code
 - workspace output と diff summary
-- provider/image変更時の model capability と request diagnostics
+- provider/image変更時の model capability と request diagnostics（configured/effective `max_output_tokens`を含む）
 
 release package の gate artifact は `Manual ST Gate: PASS` を含め、`scripts/package-release.ps1` の入力条件を満たす。
 
