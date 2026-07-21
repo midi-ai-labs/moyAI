@@ -1,25 +1,24 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { actionById, menuActions, paletteActions, shortcutActions, type ActionDefinition, type ActionMenu } from "./actions.ts";
 import { icon } from "./icons.ts";
-import { renderMarkdown } from "./markdown.ts";
+import { turnPageLoadPending } from "./history_navigation.ts";
+import { renderEarlierHistoryTrigger, renderTranscriptRows } from "./render_transcript.ts";
 import { navigationIsIdle, quickChatDeleteAction, sessionRowCapabilities } from "./navigation_state.ts";
 import {
   renderAgentInspector,
   renderInlineAgentActivity,
   renderSubAgentSummaryTrigger,
 } from "./render_agent_activity.ts";
-import { agentActivitySummary } from "./agent_activity.ts";
+import { agentActivitySummary, agentDisplayName, stableAgentVisual } from "./agent_activity.ts";
 import { runCanBeCancelled, runSurfaceActive } from "./run_control.ts";
 import type {
   ConfigFieldProjection,
   DesktopViewState,
   DesktopWebState,
-  FileChangeRow,
   ProjectRow,
   SessionRow,
-  TranscriptRow,
 } from "./types.ts";
-import type { ArtifactPaneMode } from "./ui_state.ts";
+import type { AgentExecutionCacheEntry, ArtifactPaneMode } from "./ui_state.ts";
 import { displayAccessLabel, escapeHtml, fileName, goalSlashCommandHint, shortenPath } from "./utils.ts";
 import { providerCapabilities } from "./view_state.ts";
 
@@ -32,6 +31,7 @@ interface RenderContext {
   artifactPaneCollapsed: boolean;
   artifactPaneMode?: ArtifactPaneMode;
   selectedAgentPath?: string | null;
+  selectedAgentExecution?: AgentExecutionCacheEntry | null;
   attachmentTrayOpen: boolean;
   configDirty: boolean;
   configMutationPending: boolean;
@@ -44,6 +44,7 @@ interface RenderContext {
 let artifactPaneCollapsed = false;
 let artifactPaneMode: ArtifactPaneMode = "output";
 let selectedAgentPath: string | null = null;
+let selectedAgentExecution: AgentExecutionCacheEntry | null = null;
 let attachmentTrayOpen = false;
 let configDirty = false;
 let configMutationInFlight = false;
@@ -91,6 +92,7 @@ export function setRenderContext(context: RenderContext): void {
   artifactPaneCollapsed = context.artifactPaneCollapsed;
   artifactPaneMode = context.artifactPaneMode ?? "output";
   selectedAgentPath = context.selectedAgentPath ?? null;
+  selectedAgentExecution = context.selectedAgentExecution ?? null;
   attachmentTrayOpen = context.attachmentTrayOpen;
   configDirty = context.configDirty;
   configMutationInFlight = context.configMutationPending;
@@ -348,12 +350,6 @@ export function renderTopbar(state: DesktopViewState): string {
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
   const exportDisabled = !state.history_export_enabled || !navigationIsIdle(state);
   const exportTitle = exportDisabled ? "保存できる表示中の履歴がありません" : "表示中の履歴をMarkdown保存";
-  const turnPageVisible = state.turn_page_total > state.turn_page_limit && state.turn_page_limit > 0;
-  const turnPageStart = state.turn_page_total === 0 ? 0 : state.turn_page_offset + 1;
-  const turnPageEnd = Math.min(state.turn_page_total, state.turn_page_offset + state.turn_page_limit);
-  const navigationBlocked = !navigationIsIdle(state);
-  const previousDisabled = state.turn_page_offset === 0 || navigationBlocked;
-  const nextDisabled = !state.turn_page_has_more || navigationBlocked;
   return `
     <header class="topbar">
       <div class="title-row">
@@ -377,13 +373,6 @@ export function renderTopbar(state: DesktopViewState): string {
             <span>${escapeHtml(state.model_label)}</span><small>${escapeHtml(state.provider_label)}</small>
           </button>
            <button data-action="toggle-access" title="権限モードを切り替え（承認を求める → 代理で承認 → フルアクセス）" aria-disabled="${state.config_draft.access_mode_mutation_enabled ? "false" : "true"}" ${state.config_draft.access_mode_mutation_enabled ? "" : "disabled"}>${escapeHtml(displayAccessLabel(state.access_label))}</button>
-          ${
-            turnPageVisible
-              ? `<span class="turn-page-chip">${turnPageStart}-${turnPageEnd}/${state.turn_page_total}</span>
-                 <button class="icon-button" data-action="load-previous-turn-page" title="前の履歴ページ" aria-label="前の履歴ページ" ${previousDisabled ? "disabled" : ""}>${icon("chevron-left")}</button>
-                 <button class="icon-button" data-action="load-next-turn-page" title="次の履歴ページ" aria-label="次の履歴ページ" ${nextDisabled ? "disabled" : ""}>${icon("chevron-right")}</button>`
-              : ""
-          }
           <button class="icon-button" data-action="export-transcript" title="${exportTitle}" aria-label="${exportTitle}" ${exportDisabled ? "disabled" : ""}>${icon("download")}</button>
         </div>
       </div>
@@ -415,11 +404,49 @@ export function renderRunStatusStrip(state: DesktopWebState): string {
 }
 
 export function renderThreadContent(state: DesktopWebState): string {
-  const agentActivity = renderInlineAgentActivity(state, artifactPaneMode === "agents");
+  const selectedTranscriptAgentPath = artifactPaneMode === "agents" ? selectedAgentPath : null;
+  const representedAgentPaths = new Set(
+    state.transcript_rows
+      .filter((row) => row.row_kind.startsWith("sub_agent_"))
+      .map((row) => row.title.trim()),
+  );
+  if (state.transcript_rows.some((row) => row.row_kind.startsWith("work_summary"))) {
+    state.current_turn_agent_activity_rows.forEach((row) => representedAgentPaths.add(row.agent_path));
+  }
+  const unmatchedAgentRows = state.agent_activity_rows.filter(
+    (row) => !representedAgentPaths.has(row.agent_path),
+  );
+  const currentAgentPaths = new Set(
+    state.current_turn_agent_activity_rows.map((row) => row.agent_path),
+  );
+  const agentActivity = unmatchedAgentRows.length > 0
+    ? renderInlineAgentActivity(
+      {
+        ...state,
+        agent_activity_rows: unmatchedAgentRows,
+        agent_tree_active: state.agent_tree_active
+          && unmatchedAgentRows.some((row) => currentAgentPaths.has(row.agent_path)),
+      },
+      selectedTranscriptAgentPath,
+    )
+    : "";
   if ((state.thread_empty || state.selected_session_index < 0) && state.file_change_rows.length === 0) {
     return `${renderEmptyThread(state)}${agentActivity}`;
   }
-  return `${state.transcript_rows.map(renderTranscriptCard).join("")}${agentActivity}`;
+  const earlier = renderEarlierHistoryTrigger(
+    state.turn_page_offset,
+    !state.turn_page_admission_open || turnPageLoadPending(state),
+  );
+  return `${earlier}${agentActivity}${renderTranscriptRows(state.transcript_rows, {
+    includeRail: true,
+    agentActivityRows: state.agent_activity_rows,
+    currentTurnAgentActivityRows: state.current_turn_agent_activity_rows,
+    includeLiveAgentFallback: state.current_turn_agent_activity_rows.length > 0,
+    selectedAgentPath: selectedTranscriptAgentPath,
+    // Keep the newest response marker stable across streaming and the terminal
+    // projection that seals the same response.
+    stableLatestAssistant: true,
+  })}`;
 }
 
 function renderEmptyThread(state: DesktopWebState): string {
@@ -439,124 +466,6 @@ function renderEmptyThread(state: DesktopWebState): string {
       </div>
     </div>
   `;
-}
-
-function renderTranscriptCard(row: TranscriptRow): string {
-  const rowKind = row.row_kind;
-  if (rowKind.startsWith("work_summary")) {
-    return renderWorkSummaryCard(row);
-  }
-  if (rowKind === "file_changes") {
-    return renderFileChangesTranscriptCard(row);
-  }
-  return `
-    <article class="message ${escapeHtml(rowKind)}">
-      <div class="message-step">${escapeHtml(row.step)}</div>
-      <div class="message-body">
-        <h2>${escapeHtml(row.title)}</h2>
-        <div class="markdown-body">${renderMarkdown(row.body)}</div>
-      </div>
-    </article>
-  `;
-}
-
-function renderFileChangesTranscriptCard(row: TranscriptRow): string {
-  const changes = row.file_changes;
-  const body = changes.length === 0 ? `<div class="markdown-body">${renderMarkdown(row.body)}</div>` : renderTranscriptFileChangeTable(changes);
-  return `
-    <article class="message file_changes">
-      <div class="message-step">${escapeHtml(row.step)}</div>
-      <div class="message-body">
-        <h2>${escapeHtml(row.title)}</h2>
-        ${body}
-      </div>
-    </article>
-  `;
-}
-
-function renderTranscriptFileChangeTable(changes: FileChangeRow[]): string {
-  const rows = changes
-    .map(
-      (change) => `
-        <div class="transcript-change-row">
-          <span class="transcript-change-action">${escapeHtml(change.action)}</span>
-          <strong title="${escapeHtml(change.path)}">${escapeHtml(change.path)}</strong>
-          <small>${escapeHtml(change.summary || change.label || change.path)}</small>
-        </div>
-      `,
-    )
-    .join("");
-  return `
-    <div class="transcript-change-table" role="table" aria-label="ファイル変更結果">
-      <div class="transcript-change-row transcript-change-head" role="row">
-        <span>操作</span>
-        <span>ファイル</span>
-        <span>内容</span>
-      </div>
-      ${rows}
-    </div>
-  `;
-}
-
-function renderWorkSummaryCard(row: TranscriptRow): string {
-  const rowKind = row.row_kind;
-  const running = rowKind === "work_summary_running";
-  const incomplete = rowKind === "work_summary_incomplete";
-  const open = running || incomplete ? "open" : "";
-  const statusText = running ? "実行中" : incomplete ? "状態未確定" : "作業サマリ";
-  const summary = extractMarkdownSections(row.body, ["作業サマリ", "完了"]);
-  const history = removeMarkdownSections(row.body, ["作業サマリ", "完了"]);
-  const visibleSummary = !running && summary.trim().length > 0 ? summary : "";
-  const detailBody = visibleSummary.length > 0 && history.trim().length > 0 ? history : row.body;
-  return `
-    <article class="message work-summary ${escapeHtml(rowKind)}">
-      <div class="message-step">${escapeHtml(row.step)}</div>
-      <div class="message-body">
-        ${
-          visibleSummary.length > 0
-            ? `<h2>${escapeHtml(row.title)}</h2><div class="markdown-body work-summary-visible">${renderMarkdown(visibleSummary)}</div>`
-            : ""
-        }
-        <details data-details-key="work-summary:${escapeHtml(`${row.step}:${rowKind}:${row.title}`)}" ${open}>
-          <summary>
-            <span>${escapeHtml(visibleSummary.length > 0 ? "作業履歴" : row.title)}</span>
-            <small>${escapeHtml(statusText)}</small>
-          </summary>
-          <div class="markdown-body">${renderMarkdown(detailBody)}</div>
-        </details>
-      </div>
-    </article>
-  `;
-}
-
-function extractMarkdownSections(body: string, headings: string[]): string {
-  const wanted = new Set(headings);
-  const lines = body.replace(/\r\n/g, "\n").split("\n");
-  const result: string[] = [];
-  let taking = false;
-  for (const line of lines) {
-    const heading = line.match(/^###\s+(.+)$/);
-    if (heading) {
-      taking = wanted.has(heading[1].trim());
-    }
-    if (taking) result.push(line);
-  }
-  return result.join("\n").trim();
-}
-
-function removeMarkdownSections(body: string, headings: string[]): string {
-  const unwanted = new Set(headings);
-  const lines = body.replace(/\r\n/g, "\n").split("\n");
-  const result: string[] = [];
-  let dropping = false;
-  for (const line of lines) {
-    const heading = line.match(/^###\s+(.+)$/);
-    if (heading) {
-      dropping = unwanted.has(heading[1].trim());
-    }
-    if (!dropping) result.push(line);
-  }
-  return result.join("\n").trim();
 }
 
 export function composerSendTitle(
@@ -715,14 +624,19 @@ export function renderArtifactPane(state: DesktopWebState): string {
     `;
   }
   if (artifactPaneMode === "agents") {
+    const selectedAgent = state.agent_activity_rows.find((row) => row.agent_path === selectedAgentPath);
+    const visual = selectedAgent ? stableAgentVisual(selectedAgent.agent_path) : null;
     return `
       <aside id="sub-agent-inspector" class="artifact-pane agent-inspector-pane" data-pane-mode="sub-agents" aria-label="Sub Agent履歴">
         <div class="pane-title agent-pane-title">
-          <button class="agent-pane-back" data-action="show-output-pane" aria-label="出力ペインに戻る">‹ <span>出力</span></button>
-          <strong>サブエージェント</strong>
+          <button class="agent-pane-back" data-action="${selectedAgent ? "show-agent-list" : "show-output-pane"}"
+            data-focus-key="agent-pane-back" aria-label="${selectedAgent ? "Sub Agent一覧に戻る" : "出力ペインに戻る"}">‹ <span>${selectedAgent ? "一覧" : "出力"}</span></button>
+          ${selectedAgent && visual
+            ? `<span class="agent-pane-identity agent-tone-${visual.tone}"><span class="agent-symbol" aria-hidden="true">${visual.glyph}</span><strong>${escapeHtml(agentDisplayName(selectedAgent))}</strong></span>`
+            : "<strong>サブエージェント</strong>"}
           <button class="pin" data-action="toggle-artifact-pane" title="Sub Agentペインを閉じる" aria-label="Sub Agentペインを閉じる">${icon("x")}</button>
         </div>
-        ${renderAgentInspector(state, selectedAgentPath)}
+        ${renderAgentInspector(state, selectedAgentPath, selectedAgentExecution)}
       </aside>
     `;
   }

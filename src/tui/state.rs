@@ -1,7 +1,7 @@
 use crate::context::ContextWindowTokenStatus;
 use crate::edit::ChangeSummary;
 use crate::protocol::{
-    ModelResponseId, PlanStep, ToolLifecycleStatus, TurnInterruptionCause, TurnItem,
+    ModelResponseId, PlanStep, ToolLifecycleStatus, TurnId, TurnInterruptionCause, TurnItem,
     TurnItemPayload, TurnTerminalOutcome, turn_items_in_projection_order,
 };
 use crate::runtime::RunCancellationCause;
@@ -240,13 +240,35 @@ impl Default for AppState {
 
 impl AppState {
     pub fn load_turn_items(&mut self, session: &SessionRecord, turn_items: &[TurnItem]) {
+        let active_turn_id = (session.status == SessionStatus::Running)
+            .then(|| {
+                turn_items_in_projection_order(turn_items)
+                    .last()
+                    .map(|item| item.turn_id)
+            })
+            .flatten();
+        self.load_turn_items_with_active_turn(session, turn_items, active_turn_id);
+    }
+
+    pub fn load_turn_items_with_active_turn(
+        &mut self,
+        session: &SessionRecord,
+        turn_items: &[TurnItem],
+        active_turn_id: Option<TurnId>,
+    ) {
         let previous_session_id = self.current_session_id;
         let previous_context_window = self.latest_context_window.clone();
         self.route = Route::Session;
         self.current_session_id = Some(session.id);
         self.current_session_title = session.title.clone();
         self.transcript_entries = transcript_entries_from_turn_items(turn_items);
-        self.tool_statuses = tool_statuses_from_turn_items(turn_items);
+        self.tool_statuses = if session.status == SessionStatus::Running {
+            active_turn_id
+                .map(|turn_id| tool_statuses_from_turn_items_for_turn(turn_items, Some(turn_id)))
+                .unwrap_or_default()
+        } else {
+            tool_statuses_from_turn_items_for_turn(turn_items, None)
+        };
         self.run_status = match session.status {
             SessionStatus::Idle => RunStatus::Idle,
             SessionStatus::Running => RunStatus::Running,
@@ -255,6 +277,9 @@ impl AppState {
             SessionStatus::Failed => RunStatus::Failed,
         };
         self.progress = progress_from_loaded_state(self.run_status, &self.tool_statuses);
+        if previous_session_id != Some(session.id) || session.status == SessionStatus::Running {
+            self.last_summary = None;
+        }
         self.latest_context_window = if previous_session_id == Some(session.id) {
             previous_context_window
         } else {
@@ -347,6 +372,8 @@ impl AppState {
                 self.current_session_id = Some(*session_id);
                 self.current_session_title = title.clone();
                 self.current_plan = None;
+                self.tool_statuses.clear();
+                self.last_summary = None;
                 self.run_status = RunStatus::Running;
                 self.status_message = Some(format!("session {} started", session_id));
                 self.progress = RunProgressView {
@@ -1119,8 +1146,18 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
 }
 
 pub fn tool_statuses_from_turn_items(turn_items: &[TurnItem]) -> Vec<ToolStatusView> {
+    tool_statuses_from_turn_items_for_turn(turn_items, None)
+}
+
+fn tool_statuses_from_turn_items_for_turn(
+    turn_items: &[TurnItem],
+    selected_turn_id: Option<TurnId>,
+) -> Vec<ToolStatusView> {
     let mut statuses = Vec::new();
     for item in turn_items_in_projection_order(turn_items) {
+        if selected_turn_id.is_some_and(|turn_id| turn_id != item.turn_id) {
+            continue;
+        }
         if let TurnItemPayload::ToolStatus {
             call_id,
             tool,
@@ -1391,6 +1428,90 @@ mod tests {
             }]
         );
         assert_eq!(state.progress.current_phase, RunProgressPhase::Loaded);
+    }
+
+    #[test]
+    fn running_canonical_load_scopes_tools_and_summary_to_the_active_turn() {
+        let session_id = SessionId::new();
+        let old_turn = TurnId::new();
+        let active_turn = TurnId::new();
+        let tool_item = |turn_id, sequence_no, title: &str| TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no,
+            payload: TurnItemPayload::ToolStatus {
+                call_id: ToolCallId::new(),
+                tool: ToolName::Shell,
+                status: ToolLifecycleStatus::Completed,
+                title: title.to_string(),
+                summary: format!("{title} done"),
+            },
+        };
+        let items = vec![
+            tool_item(old_turn, 1, "old turn tool"),
+            tool_item(active_turn, 2, "active turn tool"),
+        ];
+        let mut session = test_session(session_id);
+        session.status = SessionStatus::Running;
+        session.completed_at_ms = None;
+        let mut state = AppState {
+            current_session_id: Some(session_id),
+            last_summary: Some(RunSummary::from_terminal(
+                session_id,
+                old_turn,
+                crate::session::DurableTurnTerminal {
+                    outcome: TurnTerminalOutcome::Completed,
+                    final_response_id: None,
+                    tool_call_count: 1,
+                    failed_tool_count: 0,
+                    change_count: 0,
+                    metrics: Default::default(),
+                },
+            )),
+            ..AppState::default()
+        };
+
+        state.load_turn_items_with_active_turn(&session, &items, Some(active_turn));
+
+        assert_eq!(state.tool_statuses.len(), 1);
+        assert_eq!(state.tool_statuses[0].title, "active turn tool");
+        assert!(state.last_summary.is_none());
+    }
+
+    #[test]
+    fn session_started_clears_previous_turn_tools_and_summary() {
+        let session_id = SessionId::new();
+        let old_turn = TurnId::new();
+        let mut state = AppState::default();
+        state.apply_run_event(&RunEvent::ToolCallPending {
+            tool_call_id: ToolCallId::new(),
+            response_id: ModelResponseId::new(),
+            model_call_id: "old-call".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_json: "{}".to_string(),
+        });
+        state.last_summary = Some(RunSummary::from_terminal(
+            session_id,
+            old_turn,
+            crate::session::DurableTurnTerminal {
+                outcome: TurnTerminalOutcome::Completed,
+                final_response_id: None,
+                tool_call_count: 1,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            },
+        ));
+
+        state.apply_run_event(&RunEvent::SessionStarted {
+            session_id,
+            title: "follow-up".to_string(),
+        });
+
+        assert!(state.tool_statuses.is_empty());
+        assert!(state.last_summary.is_none());
     }
 
     #[test]

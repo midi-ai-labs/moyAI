@@ -10,10 +10,15 @@ use tokio::sync::Mutex;
 use crate::app::App;
 use crate::cli::ReviewDecision;
 use crate::error::AppRunError;
+use crate::session::{SessionId, SessionSpawnEdge};
 
 use super::app::{DesktopController, PendingPermissionResolution};
 use super::args::DesktopArgs;
-use super::web_model::DesktopWebState;
+use super::query::{
+    DESKTOP_HISTORY_PROJECTION_LIMIT, DESKTOP_TURN_PAGE_LIMIT, build_session_detail,
+    load_latest_session_detail,
+};
+use super::web_model::{DesktopAgentExecutionProjection, DesktopWebState};
 
 type SharedController = Arc<Mutex<DesktopController>>;
 
@@ -92,6 +97,16 @@ impl DesktopCommandError {
             state: Some(state),
         }
     }
+
+    fn storage(message: impl Into<String>) -> Self {
+        Self {
+            kind: "internal",
+            category: DesktopCommandErrorCategory::Storage,
+            code: DesktopCommandErrorCode::StorageFailure,
+            message: message.into(),
+            state: None,
+        }
+    }
 }
 
 fn command_conflict_error(
@@ -110,6 +125,16 @@ fn command_conflict_error(
             state: Some(state),
         },
         Err(error) => DesktopCommandError::internal(error),
+    }
+}
+
+fn read_only_command_conflict_error(conflict: DesktopCommandConflict) -> DesktopCommandError {
+    DesktopCommandError {
+        kind: "conflict",
+        category: DesktopCommandErrorCategory::Unknown,
+        code: DesktopCommandErrorCode::Unknown,
+        message: conflict.message,
+        state: None,
     }
 }
 
@@ -170,6 +195,8 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             select_project,
             select_session,
             rejoin_session,
+            load_agent_execution,
+            load_previous_agent_execution_page,
             load_previous_turn_page,
             load_next_turn_page,
             select_chat_session,
@@ -397,6 +424,124 @@ struct DesktopRunMutationTarget {
 struct DesktopSessionSearchTarget {
     workspace_path: String,
     project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DesktopAgentExecutionTarget {
+    workspace_path: String,
+    root_session_id: String,
+    agent_path: String,
+    child_session_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentExecutionReadRequest {
+    Latest,
+    Previous { expected_end: usize, offset: usize },
+}
+
+#[derive(Debug)]
+enum AgentExecutionReadFailure {
+    Storage(String),
+    Conflict(String),
+}
+
+fn previous_agent_execution_page_request(
+    expected_offset: usize,
+    expected_end: usize,
+) -> Result<AgentExecutionReadRequest, DesktopCommandConflict> {
+    if expected_offset == 0 || expected_end <= expected_offset {
+        return Err(DesktopCommandConflict::new(
+            "the complete Sub Agent execution history is already loaded",
+        ));
+    }
+    let limit = expected_offset.min(DESKTOP_TURN_PAGE_LIMIT);
+    let offset = expected_offset - limit;
+    Ok(AgentExecutionReadRequest::Previous {
+        expected_end,
+        offset,
+    })
+}
+
+fn validate_previous_agent_execution_page(
+    requested_offset: usize,
+    expected_end: usize,
+    actual_offset: usize,
+    item_count: usize,
+    total: usize,
+) -> Result<(), DesktopCommandConflict> {
+    let actual_end = actual_offset.checked_add(item_count);
+    if actual_offset != requested_offset || actual_end != Some(expected_end) || total < expected_end
+    {
+        return Err(DesktopCommandConflict::new(
+            "the Sub Agent execution history changed before the previous page was loaded; retry from the current history",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_agent_execution_snapshot_end(
+    requested_offset: usize,
+    expected_end: usize,
+    snapshot_end: usize,
+) -> Result<(), DesktopCommandConflict> {
+    if snapshot_end != expected_end || snapshot_end <= requested_offset {
+        return Err(DesktopCommandConflict::new(
+            "the Sub Agent execution history changed before the previous page was loaded; retry from the current history",
+        ));
+    }
+    Ok(())
+}
+
+fn agent_execution_has_previous(offset: usize, end: usize) -> bool {
+    offset > 0 && end > offset
+}
+
+fn validate_agent_execution_owner(
+    expected: &DesktopAgentExecutionTarget,
+    workspace_path: &str,
+    current_root_session_id: Option<SessionId>,
+) -> Result<(SessionId, SessionId), DesktopCommandConflict> {
+    let root_session_id = expected.root_session_id.parse::<SessionId>().map_err(|_| {
+        DesktopCommandConflict::new(
+            "the requested Sub Agent root is invalid; review the current task and try again",
+        )
+    })?;
+    let child_session_id = expected
+        .child_session_id
+        .parse::<SessionId>()
+        .map_err(|_| {
+            DesktopCommandConflict::new(
+                "the requested Sub Agent session is invalid; review the current task and try again",
+            )
+        })?;
+    if expected.workspace_path != workspace_path || current_root_session_id != Some(root_session_id)
+    {
+        return Err(DesktopCommandConflict::new(
+            "the Sub Agent owner changed before its execution history was loaded; review the current task and try again",
+        ));
+    }
+    Ok((root_session_id, child_session_id))
+}
+
+fn validate_agent_execution_edge(
+    expected: &DesktopAgentExecutionTarget,
+    root_session_id: SessionId,
+    child_session_id: SessionId,
+    edge: Option<&SessionSpawnEdge>,
+) -> Result<(), DesktopCommandConflict> {
+    let matches_target = edge.is_some_and(|edge| {
+        edge.root_session_id == root_session_id
+            && edge.child_session_id == child_session_id
+            && edge.agent_path == expected.agent_path
+    });
+    if !matches_target {
+        return Err(DesktopCommandConflict::new(
+            "the requested Sub Agent no longer belongs to the current task; refresh the activity list and try again",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_session_search_target(
@@ -913,6 +1058,277 @@ async fn rejoin_session(
 }
 
 #[tauri::command]
+async fn load_agent_execution(
+    controller: State<'_, SharedController>,
+    expected_target: DesktopAgentExecutionTarget,
+) -> Result<DesktopAgentExecutionProjection, DesktopCommandError> {
+    load_agent_execution_projection(
+        controller.inner(),
+        expected_target,
+        AgentExecutionReadRequest::Latest,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn load_previous_agent_execution_page(
+    controller: State<'_, SharedController>,
+    expected_target: DesktopAgentExecutionTarget,
+    expected_offset: usize,
+    expected_end: usize,
+) -> Result<DesktopAgentExecutionProjection, DesktopCommandError> {
+    let read_request = previous_agent_execution_page_request(expected_offset, expected_end)
+        .map_err(read_only_command_conflict_error)?;
+    load_agent_execution_projection(controller.inner(), expected_target, read_request).await
+}
+
+async fn load_agent_execution_projection(
+    controller: &SharedController,
+    expected_target: DesktopAgentExecutionTarget,
+    read_request: AgentExecutionReadRequest,
+) -> Result<DesktopAgentExecutionProjection, DesktopCommandError> {
+    let (app, root_session_id, child_session_id) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        let (root_session_id, child_session_id) = validate_agent_execution_owner(
+            &expected_target,
+            controller.app.workspace.root.as_str(),
+            controller.state.app_state.current_session_id,
+        )
+        .map_err(read_only_command_conflict_error)?;
+        (controller.app.clone(), root_session_id, child_session_id)
+    };
+
+    let edge = load_agent_execution_edge(app.clone(), child_session_id).await?;
+    if let Err(edge_conflict) = validate_agent_execution_edge(
+        &expected_target,
+        root_session_id,
+        child_session_id,
+        edge.as_ref(),
+    ) {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        if let Err(owner_conflict) = validate_agent_execution_owner(
+            &expected_target,
+            controller.app.workspace.root.as_str(),
+            controller.state.app_state.current_session_id,
+        ) {
+            return Err(read_only_command_conflict_error(owner_conflict));
+        }
+        return Err(read_only_command_conflict_error(edge_conflict));
+    }
+
+    let detail_app = app.clone();
+    let read = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                AgentExecutionReadFailure::Storage(format!(
+                    "failed to start the Sub Agent read worker: {error}"
+                ))
+            })?;
+        runtime.block_on(async move {
+            match read_request {
+                AgentExecutionReadRequest::Latest => {
+                    load_latest_session_detail(&detail_app, child_session_id)
+                        .await
+                        .map(|loaded| loaded.read)
+                        .map_err(|error| AgentExecutionReadFailure::Storage(error.to_string()))
+                }
+                AgentExecutionReadRequest::Previous {
+                    expected_end,
+                    offset,
+                    ..
+                } => {
+                    let mut snapshot = detail_app
+                        .session_service
+                        .canonical_session_snapshot(
+                            child_session_id,
+                            0,
+                            DESKTOP_HISTORY_PROJECTION_LIMIT,
+                            offset,
+                            DESKTOP_TURN_PAGE_LIMIT,
+                        )
+                        .await
+                        .map_err(|error| AgentExecutionReadFailure::Storage(error.to_string()))?;
+                    let fence = snapshot.fence;
+                    let target_end = fence.turn_count;
+                    validate_agent_execution_snapshot_end(offset, expected_end, target_end)
+                        .map_err(|conflict| {
+                            AgentExecutionReadFailure::Conflict(conflict.message)
+                        })?;
+                    let mut next_offset = offset;
+                    let mut combined = snapshot.read;
+                    let first_page_len = combined.turns.items.len();
+                    if combined.turns.offset != next_offset || first_page_len == 0 {
+                        return Err(AgentExecutionReadFailure::Conflict(
+                            "the Sub Agent execution history page is no longer contiguous".to_string(),
+                        ));
+                    }
+                    next_offset = next_offset.saturating_add(first_page_len);
+                    while next_offset < target_end {
+                        let page_limit = (target_end - next_offset).min(DESKTOP_TURN_PAGE_LIMIT);
+                        snapshot = detail_app
+                            .session_service
+                            .canonical_session_snapshot(
+                                child_session_id,
+                                0,
+                                DESKTOP_HISTORY_PROJECTION_LIMIT,
+                                next_offset,
+                                page_limit,
+                            )
+                            .await
+                            .map_err(|error| {
+                                AgentExecutionReadFailure::Storage(error.to_string())
+                            })?;
+                        if snapshot.fence != fence || snapshot.read.turns.offset != next_offset {
+                            return Err(AgentExecutionReadFailure::Conflict(
+                                "the Sub Agent execution history changed while its previous page was loading; retry from the current history".to_string(),
+                            ));
+                        }
+                        let mut page = snapshot.read;
+                        let page_len = page.turns.items.len();
+                        if page_len == 0 {
+                            return Err(AgentExecutionReadFailure::Conflict(
+                                "the Sub Agent execution history page is no longer contiguous".to_string(),
+                            ));
+                        }
+                        combined.session = page.session;
+                        combined.latest_turn_id = page.latest_turn_id;
+                        combined.active_turn_id = page.active_turn_id;
+                        combined.active_turn_sequence_no = page.active_turn_sequence_no;
+                        combined.turns.items.append(&mut page.turns.items);
+                        next_offset = next_offset.saturating_add(page_len);
+                    }
+
+                    let final_snapshot = detail_app
+                        .session_service
+                        .canonical_latest_session_snapshot(
+                            child_session_id,
+                            DESKTOP_HISTORY_PROJECTION_LIMIT,
+                            1,
+                        )
+                        .await
+                        .map_err(|error| AgentExecutionReadFailure::Storage(error.to_string()))?;
+                    if final_snapshot.fence != fence || next_offset != target_end {
+                        return Err(AgentExecutionReadFailure::Conflict(
+                            "the Sub Agent execution history changed while its previous page was loading; retry from the current history".to_string(),
+                        ));
+                    }
+                    combined.session = final_snapshot.read.session;
+                    combined.latest_turn_id = final_snapshot.read.latest_turn_id;
+                    combined.active_turn_id = final_snapshot.read.active_turn_id;
+                    combined.active_turn_sequence_no = final_snapshot.read.active_turn_sequence_no;
+                    combined.turns.offset = offset;
+                    combined.turns.limit = target_end - offset;
+                    combined.turns.total = target_end;
+                    combined.turns.has_more = false;
+                    Ok(combined)
+                }
+            }
+        })
+    })
+    .await
+    .map_err(|error| {
+        DesktopCommandError::storage(format!(
+            "failed to join the Sub Agent execution reader: {error}"
+        ))
+    })?
+    .map_err(|error| match error {
+        AgentExecutionReadFailure::Storage(error) => DesktopCommandError::storage(format!(
+            "failed to load the Sub Agent execution history: {error}"
+        )),
+        AgentExecutionReadFailure::Conflict(message) => {
+            read_only_command_conflict_error(DesktopCommandConflict::new(message))
+        }
+    })?;
+
+    if let AgentExecutionReadRequest::Previous { offset, .. } = read_request {
+        let target_end = read.turns.total;
+        validate_previous_agent_execution_page(
+            offset,
+            target_end,
+            read.turns.offset,
+            read.turns.items.len(),
+            read.turns.total,
+        )
+        .map_err(read_only_command_conflict_error)?;
+    }
+    let detail = build_session_detail(&read, None);
+    let turn_page_end = read.turns.offset.saturating_add(read.turns.items.len());
+
+    // The detail read runs outside the controller lock. Re-read the durable edge
+    // afterward so a concurrent root/child deletion cannot return an orphaned
+    // child transcript under an otherwise unchanged visible owner.
+    let edge = load_agent_execution_edge(app.clone(), child_session_id).await?;
+    {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        validate_agent_execution_owner(
+            &expected_target,
+            controller.app.workspace.root.as_str(),
+            controller.state.app_state.current_session_id,
+        )
+        .map_err(read_only_command_conflict_error)?;
+    }
+    validate_agent_execution_edge(
+        &expected_target,
+        root_session_id,
+        child_session_id,
+        edge.as_ref(),
+    )
+    .map_err(read_only_command_conflict_error)?;
+    let edge = edge.expect("validated Sub Agent edge must be present");
+
+    Ok(DesktopAgentExecutionProjection {
+        workspace_path: app.workspace.root.to_string(),
+        root_session_id: root_session_id.to_string(),
+        agent_path: edge.agent_path,
+        session_id: child_session_id.to_string(),
+        task_name: edge.task_name,
+        transcript_rows: detail.transcript_rows,
+        turn_page_offset: detail.turn_page_offset,
+        turn_page_end,
+        turn_page_total: detail.turn_page_total,
+        turn_page_has_previous: agent_execution_has_previous(
+            detail.turn_page_offset,
+            turn_page_end,
+        ),
+    })
+}
+
+async fn load_agent_execution_edge(
+    app: App,
+    child_session_id: SessionId,
+) -> Result<Option<SessionSpawnEdge>, DesktopCommandError> {
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("failed to start the Sub Agent read worker: {error}"))?;
+        runtime.block_on(async move {
+            app.store
+                .session_repo()
+                .session_spawn_edge_for_child(child_session_id)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    })
+    .await
+    .map_err(|error| {
+        DesktopCommandError::storage(format!(
+            "failed to join the Sub Agent ownership reader: {error}"
+        ))
+    })?
+    .map_err(|error| {
+        DesktopCommandError::storage(format!(
+            "failed to load the Sub Agent ownership record: {error}"
+        ))
+    })
+}
+
+#[tauri::command]
 async fn load_previous_turn_page(
     controller: State<'_, SharedController>,
     index: usize,
@@ -958,10 +1374,20 @@ fn ensure_turn_page_offset(
     controller: &DesktopController,
     expected_offset: usize,
 ) -> Result<(), DesktopCommandConflict> {
+    validate_turn_page_load_admission(controller.state.turn_page_load_pending())?;
     validate_turn_page_offset(
         expected_offset,
         controller.state.selected_detail().turn_page_offset,
     )
+}
+
+fn validate_turn_page_load_admission(pending: bool) -> Result<(), DesktopCommandConflict> {
+    if pending {
+        return Err(DesktopCommandConflict::new(
+            "a turn page load is already active; wait for the current history request to finish",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_turn_page_offset(
@@ -2283,6 +2709,148 @@ mod tests {
     }
 
     #[test]
+    fn agent_execution_target_uses_camel_case_input_and_snake_case_output() {
+        let root_session_id = SessionId::new();
+        let child_session_id = SessionId::new();
+        let target: DesktopAgentExecutionTarget = serde_json::from_value(serde_json::json!({
+            "workspacePath": "C:/workspace",
+            "rootSessionId": root_session_id.to_string(),
+            "agentPath": "review/security",
+            "childSessionId": child_session_id.to_string(),
+        }))
+        .expect("deserialize agent execution target");
+        assert_eq!(target.agent_path, "review/security");
+
+        let projection = DesktopAgentExecutionProjection {
+            workspace_path: "C:/workspace".to_string(),
+            root_session_id: root_session_id.to_string(),
+            agent_path: target.agent_path,
+            session_id: child_session_id.to_string(),
+            task_name: "security_review".to_string(),
+            transcript_rows: Vec::new(),
+            turn_page_offset: 0,
+            turn_page_end: 0,
+            turn_page_total: 0,
+            turn_page_has_previous: false,
+        };
+        let value = serde_json::to_value(projection).expect("serialize agent execution projection");
+        let object = value.as_object().expect("projection object");
+        assert!(object.contains_key("workspace_path"));
+        assert!(object.contains_key("root_session_id"));
+        assert!(object.contains_key("transcript_rows"));
+        assert!(object.contains_key("turn_page_offset"));
+        assert!(object.contains_key("turn_page_end"));
+        assert!(object.contains_key("turn_page_total"));
+        assert!(object.contains_key("turn_page_has_previous"));
+        assert!(!object.contains_key("workspacePath"));
+    }
+
+    #[test]
+    fn agent_execution_target_rejects_stale_workspace_or_root_owner() {
+        let root_session_id = SessionId::new();
+        let child_session_id = SessionId::new();
+        let target = DesktopAgentExecutionTarget {
+            workspace_path: "C:/workspace".to_string(),
+            root_session_id: root_session_id.to_string(),
+            agent_path: "review/security".to_string(),
+            child_session_id: child_session_id.to_string(),
+        };
+        assert!(
+            validate_agent_execution_owner(&target, "C:/workspace", Some(root_session_id),).is_ok()
+        );
+        assert!(
+            validate_agent_execution_owner(&target, "C:/other", Some(root_session_id)).is_err()
+        );
+        assert!(
+            validate_agent_execution_owner(&target, "C:/workspace", Some(SessionId::new()),)
+                .is_err()
+        );
+        assert!(validate_agent_execution_owner(&target, "C:/workspace", None).is_err());
+    }
+
+    #[test]
+    fn agent_execution_edge_rejects_forged_root_child_and_path() {
+        let root_session_id = SessionId::new();
+        let child_session_id = SessionId::new();
+        let target = DesktopAgentExecutionTarget {
+            workspace_path: "C:/workspace".to_string(),
+            root_session_id: root_session_id.to_string(),
+            agent_path: "review/security".to_string(),
+            child_session_id: child_session_id.to_string(),
+        };
+        let edge = SessionSpawnEdge {
+            root_session_id,
+            parent_session_id: SessionId::new(),
+            child_session_id,
+            agent_path: target.agent_path.clone(),
+            task_name: "security_review".to_string(),
+            created_at_ms: 1,
+        };
+        assert!(
+            validate_agent_execution_edge(&target, root_session_id, child_session_id, Some(&edge),)
+                .is_ok()
+        );
+        assert!(
+            validate_agent_execution_edge(
+                &target,
+                SessionId::new(),
+                child_session_id,
+                Some(&edge),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_agent_execution_edge(&target, root_session_id, SessionId::new(), Some(&edge),)
+                .is_err()
+        );
+        let mut forged_path = target.clone();
+        forged_path.agent_path = "review/other".to_string();
+        assert!(
+            validate_agent_execution_edge(
+                &forged_path,
+                root_session_id,
+                child_session_id,
+                Some(&edge),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_agent_execution_edge(&target, root_session_id, child_session_id, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn previous_agent_execution_page_is_bounded_and_requires_exact_adjacency() {
+        assert_eq!(
+            previous_agent_execution_page_request(160, 240),
+            Ok(AgentExecutionReadRequest::Previous {
+                expected_end: 240,
+                offset: 80,
+            })
+        );
+        assert_eq!(
+            previous_agent_execution_page_request(37, 117),
+            Ok(AgentExecutionReadRequest::Previous {
+                expected_end: 117,
+                offset: 0,
+            })
+        );
+        assert!(previous_agent_execution_page_request(0, 80).is_err());
+        assert!(previous_agent_execution_page_request(80, 80).is_err());
+        assert!(validate_previous_agent_execution_page(0, 160, 0, 160, 200).is_ok());
+        assert!(validate_previous_agent_execution_page(0, 160, 0, 159, 200).is_err());
+        assert!(validate_previous_agent_execution_page(0, 160, 1, 159, 200).is_err());
+        assert!(validate_previous_agent_execution_page(0, 160, 0, 160, 159).is_err());
+        assert!(validate_agent_execution_snapshot_end(0, 160, 160).is_ok());
+        assert!(validate_agent_execution_snapshot_end(0, 160, 161).is_err());
+        assert!(validate_agent_execution_snapshot_end(160, 160, 160).is_err());
+        assert!(agent_execution_has_previous(80, 160));
+        assert!(!agent_execution_has_previous(0, 160));
+        assert!(agent_execution_has_previous(80, 720));
+    }
+
+    #[test]
     fn config_mutation_target_rejects_workspace_session_and_generation_changes() {
         let expected = DesktopConfigMutationTarget {
             workspace_path: "C:/workspace".to_string(),
@@ -2536,6 +3104,8 @@ mod tests {
 
     #[test]
     fn turn_page_target_rejects_a_reordered_page_command() {
+        assert!(validate_turn_page_load_admission(false).is_ok());
+        assert!(validate_turn_page_load_admission(true).is_err());
         assert!(validate_turn_page_offset(40, 40).is_ok());
         assert!(validate_turn_page_offset(40, 60).is_err());
     }

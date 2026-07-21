@@ -52,6 +52,7 @@ use super::async_ops::{
 };
 use super::models::{DesktopSnapshot, DesktopTranscriptRow, DesktopTranscriptRowKind};
 use super::navigation::NavigationRequestId;
+use super::open_session::OpenSessionView;
 use super::preferences::DesktopPreferences;
 use super::query::{
     DESKTOP_HISTORY_PROJECTION_LIMIT, DESKTOP_TURN_PAGE_LIMIT, LoadedSessionDetail,
@@ -2018,7 +2019,7 @@ mod command_projection_owner_tests {
             session_id,
         };
         let request_id = controller
-            .current_session_refresh_requests
+            .session_projection_refresh_requests
             .begin(target.clone());
         let root_admission_fence = controller.next_root_run_generation;
 
@@ -2041,7 +2042,7 @@ mod command_projection_owner_tests {
             .expect("current Stop settlement");
         controller.drain_runtime_messages();
 
-        assert!(!controller.current_session_refresh_requests.is_pending());
+        assert!(!controller.session_projection_refresh_requests.is_pending());
         assert_eq!(
             controller.state.app_state.run_status,
             crate::tui::state::RunStatus::Completed
@@ -2063,7 +2064,7 @@ mod command_projection_owner_tests {
         controller.drain_runtime_messages();
 
         assert_eq!(controller.state.app_state.status_message, settled_status);
-        assert!(!controller.current_session_refresh_requests.is_pending());
+        assert!(!controller.session_projection_refresh_requests.is_pending());
     }
 
     #[tokio::test]
@@ -2076,7 +2077,7 @@ mod command_projection_owner_tests {
             session_id,
         };
         let request_id = controller
-            .current_session_refresh_requests
+            .session_projection_refresh_requests
             .begin(target.clone());
         let old_root_admission_fence = controller.next_root_run_generation;
 
@@ -2121,7 +2122,7 @@ mod command_projection_owner_tests {
             .expect("stale Stop settlement");
         controller.drain_runtime_messages();
 
-        assert!(!controller.current_session_refresh_requests.is_pending());
+        assert!(!controller.session_projection_refresh_requests.is_pending());
         assert_eq!(
             controller.run_lifecycle.root_generation(),
             Some(old_root_admission_fence)
@@ -2622,13 +2623,13 @@ mod command_projection_owner_tests {
         controller.cancel_active_run();
         for _ in 0..200 {
             controller.drain_runtime_messages();
-            if !controller.current_session_refresh_requests.is_pending() {
+            if !controller.session_projection_refresh_requests.is_pending() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
-        assert!(!controller.current_session_refresh_requests.is_pending());
+        assert!(!controller.session_projection_refresh_requests.is_pending());
         assert_eq!(
             repository
                 .get_session(root.id)
@@ -2662,7 +2663,7 @@ mod command_projection_owner_tests {
         controller.cancel_active_run();
         for _ in 0..200 {
             controller.drain_runtime_messages();
-            if !controller.current_session_refresh_requests.is_pending() {
+            if !controller.session_projection_refresh_requests.is_pending() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3296,6 +3297,7 @@ mod command_projection_owner_tests {
             result_preview: result_preview.to_string(),
             started_order: 1,
             updated: false,
+            is_current_turn: false,
         }
     }
 
@@ -3834,7 +3836,7 @@ mod command_projection_owner_tests {
             session_id: session_a.id,
         };
         let delayed_refresh_request = controller
-            .current_session_refresh_requests
+            .session_projection_refresh_requests
             .begin(delayed_refresh_target.clone());
         let delayed_refresh = loaded_session_from_detail(
             load_latest_session_detail(&controller.app, session_a.id)
@@ -4493,8 +4495,7 @@ pub(crate) struct DesktopController {
     session_search_requests: SessionSearchRequestTracker<SessionSearchRequestTarget>,
     snapshot_requests: LatestRequestTracker<SnapshotRequestTarget>,
     turn_page_requests: LatestRequestTracker<SessionPageRequestTarget>,
-    live_session_refresh_requests: LatestRequestTracker<SessionRefreshRequestTarget>,
-    current_session_refresh_requests: LatestRequestTracker<SessionRefreshRequestTarget>,
+    session_projection_refresh_requests: LatestRequestTracker<SessionRefreshRequestTarget>,
     durable_agent_activity_refresh_requests: LatestRequestTracker<SessionRefreshRequestTarget>,
     history_export_requests: LatestRequestTracker<HistoryExportRequestTarget>,
     provider_catalog_requests: LatestRequestTracker<ProviderCatalogRequestTarget>,
@@ -4632,8 +4633,7 @@ impl DesktopController {
             session_search_requests: SessionSearchRequestTracker::default(),
             snapshot_requests: LatestRequestTracker::default(),
             turn_page_requests: LatestRequestTracker::default(),
-            live_session_refresh_requests: LatestRequestTracker::default(),
-            current_session_refresh_requests: LatestRequestTracker::default(),
+            session_projection_refresh_requests: LatestRequestTracker::default(),
             durable_agent_activity_refresh_requests: LatestRequestTracker::default(),
             history_export_requests: LatestRequestTracker::default(),
             provider_catalog_requests: LatestRequestTracker::default(),
@@ -4675,8 +4675,15 @@ impl DesktopController {
             ) && durable_agent_activity_retry_allowed(
                 self.durable_agent_activity_refresh_failures,
             );
+            let current_turn_records = records
+                .iter()
+                .filter(|record| record.is_current_turn)
+                .cloned()
+                .collect();
             let (rows, tree_active) = agent_activity_projection(records);
+            let (current_turn_rows, _) = agent_activity_projection(current_turn_records);
             runtime_projection.agent_activity_rows = rows;
+            runtime_projection.current_turn_agent_activity_rows = current_turn_rows;
             runtime_projection.agent_tree_active = tree_active;
             if tree_active {
                 self.invalidate_session_search_requests();
@@ -4924,8 +4931,7 @@ impl DesktopController {
         self.invalidate_session_search_requests();
         self.snapshot_requests.clear();
         self.turn_page_requests.clear();
-        self.live_session_refresh_requests.clear();
-        self.current_session_refresh_requests.clear();
+        self.session_projection_refresh_requests.clear();
         self.durable_agent_activity_refresh_requests.clear();
         self.history_export_requests.clear();
         self.state.finish_snapshot_refresh();
@@ -5301,23 +5307,23 @@ impl DesktopController {
     }
 
     pub(crate) fn load_next_turn_page(&mut self) {
-        let detail = self.state.selected_detail();
-        if !detail.turn_page_has_more || detail.turn_page_limit == 0 {
+        let Some(next_offset) = self.state.next_turn_page_offset() else {
             self.state
                 .set_status_message("later turn page is not available");
             return;
-        }
-        self.load_selected_turn_page(
-            detail
-                .turn_page_offset
-                .saturating_add(detail.turn_page_limit),
-        );
+        };
+        self.load_selected_turn_page(next_offset);
     }
 
     fn load_selected_turn_page(&mut self, offset: usize) {
-        if !self.state.can_begin_navigation() {
+        if self.state.turn_page_load_pending() {
             self.state
-                .set_status_message("turn page cannot change while another operation is active");
+                .set_status_message("turn page load is already active");
+            return;
+        }
+        if !self.state.can_begin_turn_page_load() {
+            self.state
+                .set_status_message("turn page cannot load while the current session is changing");
             return;
         }
         let Some(session_id) = self.state.selected_session_id() else {
@@ -5398,12 +5404,27 @@ impl DesktopController {
     }
 
     fn spawn_current_session_refresh(&mut self, session_id: SessionId) {
+        self.spawn_current_session_refresh_page(
+            session_id,
+            CurrentSessionRefreshPurpose::Refresh,
+            None,
+        );
+    }
+
+    fn spawn_current_session_refresh_page(
+        &mut self,
+        session_id: SessionId,
+        purpose: CurrentSessionRefreshPurpose,
+        offset: Option<usize>,
+    ) {
         let app = self.app.clone();
         let target = SessionRefreshRequestTarget {
             workspace_root: self.app.workspace.root.clone(),
             session_id,
         };
-        let request_id = self.current_session_refresh_requests.begin(target.clone());
+        let request_id = self
+            .session_projection_refresh_requests
+            .begin(target.clone());
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -5411,15 +5432,30 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop current-session-refresh runtime");
             let result = runtime.block_on(async move {
-                let detail = load_latest_session_detail(&app, session_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                let detail = if let Some(offset) = offset {
+                    let read = app
+                        .session_service
+                        .canonical_session_read(
+                            session_id,
+                            0,
+                            DESKTOP_HISTORY_PROJECTION_LIMIT,
+                            offset,
+                            DESKTOP_TURN_PAGE_LIMIT,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    LoadedSessionDetail { read }
+                } else {
+                    load_latest_session_detail(&app, session_id)
+                        .await
+                        .map_err(|error| error.to_string())?
+                };
                 loaded_session_from_detail_with_activity(&app, detail).await
             });
             let _ = runtime_tx.send(RuntimeMessage::CurrentSessionRefreshed {
                 request_id,
                 target,
-                purpose: CurrentSessionRefreshPurpose::Refresh,
+                purpose,
                 result,
             });
         });
@@ -5466,51 +5502,21 @@ impl DesktopController {
         });
     }
 
-    fn spawn_live_session_refresh(&mut self, session_id: SessionId, offset: usize, limit: usize) {
-        let app = self.app.clone();
-        let target = SessionRefreshRequestTarget {
-            workspace_root: self.app.workspace.root.clone(),
-            session_id,
-        };
-        let request_id = self.live_session_refresh_requests.begin(target.clone());
-        let runtime_tx = self.runtime_tx.clone();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build desktop live-session-refresh runtime");
-            let result = runtime.block_on(async move {
-                let read = app
-                    .session_service
-                    .canonical_session_read(
-                        session_id,
-                        0,
-                        DESKTOP_HISTORY_PROJECTION_LIMIT,
-                        offset,
-                        limit,
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                Ok(LoadedSession {
-                    read,
-                    agent_activity_records: None,
-                })
-            });
-            let _ = runtime_tx.send(RuntimeMessage::LiveSessionRefreshed {
-                request_id,
-                target,
-                result,
-            });
-        });
-    }
-
     fn spawn_latest_live_session_refresh(&mut self, session_id: SessionId) {
         let app = self.app.clone();
+        let contiguous_offset = self
+            .state
+            .open_session
+            .as_ref()
+            .filter(|open_session| open_session.session_id() == session_id)
+            .map(OpenSessionView::loaded_turn_end);
         let target = SessionRefreshRequestTarget {
             workspace_root: self.app.workspace.root.clone(),
             session_id,
         };
-        let request_id = self.live_session_refresh_requests.begin(target.clone());
+        let request_id = self
+            .session_projection_refresh_requests
+            .begin(target.clone());
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -5518,9 +5524,24 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop latest-session-refresh runtime");
             let result = runtime.block_on(async move {
-                let detail = load_latest_session_detail(&app, session_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                let detail = if let Some(offset) = contiguous_offset {
+                    let read = app
+                        .session_service
+                        .canonical_session_read(
+                            session_id,
+                            0,
+                            DESKTOP_HISTORY_PROJECTION_LIMIT,
+                            offset,
+                            DESKTOP_TURN_PAGE_LIMIT,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    LoadedSessionDetail { read }
+                } else {
+                    load_latest_session_detail(&app, session_id)
+                        .await
+                        .map_err(|error| error.to_string())?
+                };
                 Ok(loaded_session_from_detail(detail, None))
             });
             let _ = runtime_tx.send(RuntimeMessage::LiveSessionRefreshed {
@@ -5613,7 +5634,9 @@ impl DesktopController {
             workspace_root: self.app.workspace.root.clone(),
             session_id,
         };
-        let request_id = self.current_session_refresh_requests.begin(target.clone());
+        let request_id = self
+            .session_projection_refresh_requests
+            .begin(target.clone());
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -7668,10 +7691,29 @@ impl DesktopController {
         match result {
             Ok(loaded) => {
                 let loaded_status = loaded.read.session.status;
-                self.state.load_open_session(&loaded.read);
+                let page_has_more = loaded.read.turns.has_more;
+                let history_is_contiguous = self
+                    .state
+                    .load_open_session_preserving_history(&loaded.read);
                 if let Some(records) = loaded.agent_activity_records {
                     self.loaded_agent_activity_records = Some((loaded.read.session.id, records));
                     self.durable_agent_activity_refresh_failures = 0;
+                }
+                if !history_is_contiguous || page_has_more {
+                    let next_offset = self
+                        .state
+                        .open_session
+                        .as_ref()
+                        .filter(|open_session| open_session.session_id() == session_id)
+                        .map(OpenSessionView::loaded_turn_end);
+                    if let Some(next_offset) = next_offset {
+                        self.spawn_current_session_refresh_page(
+                            session_id,
+                            purpose,
+                            Some(next_offset),
+                        );
+                        return;
+                    }
                 }
                 self.state.clear_post_run_refresh_pending();
                 if matches!(purpose, CurrentSessionRefreshPurpose::StopSettlement { .. }) {
@@ -7863,21 +7905,10 @@ impl DesktopController {
                         && live_refresh_session_id == self.state.app_state.current_session_id
                     {
                         if let Some(session_id) = live_refresh_session_id {
-                            if run_event_is_terminal(&event) {
-                                self.spawn_latest_live_session_refresh(session_id);
-                            } else {
-                                let detail = self.state.selected_detail();
-                                let limit = if detail.turn_page_limit == 0 {
-                                    DESKTOP_TURN_PAGE_LIMIT
-                                } else {
-                                    detail.turn_page_limit
-                                };
-                                self.spawn_live_session_refresh(
-                                    session_id,
-                                    detail.turn_page_offset,
-                                    limit,
-                                );
-                            }
+                            // The main transcript is a continuously merged suffix. Always refresh
+                            // its latest bounded chunk so expanding older history never leaves live
+                            // output pinned to an obsolete earlier offset.
+                            self.spawn_latest_live_session_refresh(session_id);
                         }
                     }
                     if run_event_is_terminal(&event) {
@@ -8042,7 +8073,7 @@ impl DesktopController {
                     result,
                 } => {
                     if !self
-                        .current_session_refresh_requests
+                        .session_projection_refresh_requests
                         .finish_if_current(request_id, &target)
                         || !self.live_session_target_is_current(&target)
                     {
@@ -8272,32 +8303,36 @@ impl DesktopController {
                         continue;
                     }
                     self.state.finish_turn_page_load();
-                    if !self.session_page_target_is_current(&target)
-                        || self.session_load_is_blocked_by_active_run()
-                    {
+                    if !self.session_page_target_is_current(&target) {
                         continue;
                     }
                     match result {
                         Ok(loaded) => {
-                            self.state.load_open_session(&loaded.read);
-                            if let Some(records) = loaded.agent_activity_records {
-                                self.loaded_agent_activity_records =
-                                    Some((loaded.read.session.id, records));
+                            let start = loaded.read.turns.offset.saturating_add(1);
+                            let end = loaded
+                                .read
+                                .turns
+                                .offset
+                                .saturating_add(loaded.read.turns.items.len());
+                            let total = loaded.read.turns.total;
+                            if self.state.merge_open_session_history(&loaded.read) {
+                                if let Some(records) = loaded.agent_activity_records {
+                                    self.loaded_agent_activity_records =
+                                        Some((loaded.read.session.id, records));
+                                }
+                                self.state.set_status_message(format!(
+                                    "loaded earlier history {start}-{end} of {total}"
+                                ));
+                            } else {
+                                self.state.set_status_message(
+                                    "earlier history no longer overlaps the open session"
+                                        .to_string(),
+                                );
                             }
-                            self.state.set_status_message(format!(
-                                "loaded turn page {}-{} of {}",
-                                loaded.read.turns.offset.saturating_add(1),
-                                loaded
-                                    .read
-                                    .turns
-                                    .offset
-                                    .saturating_add(loaded.read.turns.items.len()),
-                                loaded.read.turns.total
-                            ));
                         }
                         Err(error) => self
                             .state
-                            .set_status_message(format!("turn page load failed: {error}")),
+                            .set_status_message(format!("earlier history load failed: {error}")),
                     }
                 }
                 RuntimeMessage::LiveSessionRefreshed {
@@ -8306,7 +8341,7 @@ impl DesktopController {
                     result,
                 } => {
                     if !self
-                        .live_session_refresh_requests
+                        .session_projection_refresh_requests
                         .finish_if_current(request_id, &target)
                         || !self.live_session_target_is_current(&target)
                     {
@@ -8314,16 +8349,25 @@ impl DesktopController {
                     }
                     match result {
                         Ok(loaded) => {
-                            if !self.session_load_is_blocked_by_active_run()
-                                && loaded.read.turns.has_more
-                            {
-                                self.spawn_latest_live_session_refresh(target.session_id);
-                                continue;
-                            }
+                            let has_more = loaded.read.turns.has_more;
                             self.state.refresh_open_session_projection(&loaded.read);
                             if let Some(records) = loaded.agent_activity_records {
                                 self.loaded_agent_activity_records =
                                     Some((loaded.read.session.id, records));
+                            }
+                            let catchup_needed = self
+                                .state
+                                .open_session
+                                .as_ref()
+                                .filter(|open_session| {
+                                    open_session.session_id() == target.session_id
+                                })
+                                .is_some_and(|open_session| {
+                                    open_session.loaded_turn_end()
+                                        < open_session.stored_detail().turn_page_total
+                                });
+                            if has_more || catchup_needed {
+                                self.spawn_latest_live_session_refresh(target.session_id);
                             }
                         }
                         Err(error) => self
@@ -8394,8 +8438,7 @@ impl DesktopController {
                                 self.session_search_requests.clear();
                                 self.snapshot_requests.clear();
                                 self.turn_page_requests.clear();
-                                self.live_session_refresh_requests.clear();
-                                self.current_session_refresh_requests.clear();
+                                self.session_projection_refresh_requests.clear();
                                 self.durable_agent_activity_refresh_requests.clear();
                                 self.history_export_requests.clear();
                                 self.provider_catalog_requests.clear();
@@ -9441,6 +9484,20 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
         }
+    }
+
+    #[test]
+    fn shared_session_projection_tracker_rejects_a_live_result_after_current_dispatch() {
+        let target = SessionRefreshRequestTarget {
+            workspace_root: "C:/workspace".into(),
+            session_id: SessionId::new(),
+        };
+        let mut tracker = LatestRequestTracker::default();
+        let stale_live_request = tracker.begin(target.clone());
+        let current_request = tracker.begin(target.clone());
+
+        assert!(tracker.finish_if_current(current_request, &target));
+        assert!(!tracker.finish_if_current(stale_live_request, &target));
     }
 
     #[test]

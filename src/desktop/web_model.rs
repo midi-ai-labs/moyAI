@@ -86,6 +86,20 @@ pub struct DesktopAgentActivityRow {
     pub updated: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopAgentExecutionProjection {
+    pub workspace_path: String,
+    pub root_session_id: String,
+    pub agent_path: String,
+    pub session_id: String,
+    pub task_name: String,
+    pub transcript_rows: Vec<DesktopTranscriptRow>,
+    pub turn_page_offset: usize,
+    pub turn_page_end: usize,
+    pub turn_page_total: usize,
+    pub turn_page_has_previous: bool,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DesktopComposerSubmitMode {
@@ -103,6 +117,7 @@ impl DesktopComposerSubmitMode {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DesktopRuntimeProjection {
     pub agent_activity_rows: Vec<DesktopAgentActivityRow>,
+    pub current_turn_agent_activity_rows: Vec<DesktopAgentActivityRow>,
     pub agent_tree_active: bool,
     pub root_run_finalizing: bool,
     pub root_run_generation: Option<u64>,
@@ -293,6 +308,7 @@ pub struct DesktopWebState {
     pub pending_async_operations: Vec<String>,
     pub navigation_loading: bool,
     pub navigation_admission_open: bool,
+    pub turn_page_admission_open: bool,
     pub post_run_refresh_pending: bool,
     pub background_mutation_pending: bool,
     pub overlay: String,
@@ -316,6 +332,7 @@ pub struct DesktopWebState {
     pub file_change_rows: Vec<DesktopFileChangeRow>,
     pub file_change_summary_text: String,
     pub agent_activity_rows: Vec<DesktopAgentActivityRow>,
+    pub current_turn_agent_activity_rows: Vec<DesktopAgentActivityRow>,
     pub agent_tree_active: bool,
     pub local_search_text: String,
     pub local_search_results_text: String,
@@ -613,6 +630,7 @@ pub(crate) fn desktop_web_state_with_permission(
         pending_async_operations: state.pending_async_operation_keys(),
         navigation_loading: state.navigation_loading(),
         navigation_admission_open,
+        turn_page_admission_open: state.can_begin_turn_page_load(),
         post_run_refresh_pending: state.post_run_refresh_pending(),
         background_mutation_pending: state.background_mutation_pending(),
         overlay: overlay_key(state.view.overlay).to_string(),
@@ -636,6 +654,7 @@ pub(crate) fn desktop_web_state_with_permission(
         file_change_rows: detail.file_changes,
         file_change_summary_text: detail.file_change_summary_text,
         agent_activity_rows: runtime.agent_activity_rows.clone(),
+        current_turn_agent_activity_rows: runtime.current_turn_agent_activity_rows.clone(),
         agent_tree_active: runtime.agent_tree_active,
         local_search_text: state.view.local_search_text.clone(),
         local_search_results_text: state.local_search_results_text(),
@@ -1773,6 +1792,7 @@ mod tests {
                 result_preview: "reviewed".to_string(),
                 started_order: 2,
                 updated: true,
+                is_current_turn: false,
             },
             AgentActivityRecord {
                 agent_path: "/root/runtime".to_string(),
@@ -1784,6 +1804,7 @@ mod tests {
                 result_preview: String::new(),
                 started_order: 1,
                 updated: false,
+                is_current_turn: true,
             },
         ]);
 
@@ -1826,6 +1847,7 @@ mod tests {
             result_preview: String::new(),
             started_order: 1,
             updated: false,
+            is_current_turn: false,
         }]);
 
         assert_eq!(rows[0].status, "interrupted");

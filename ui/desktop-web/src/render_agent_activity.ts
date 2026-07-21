@@ -5,40 +5,34 @@ import {
   agentIsActive,
   agentStatusLabel,
   orderedAgentActivityRows,
+  plainAgentPreview,
   stableAgentVisual,
 } from "./agent_activity.ts";
 import type { AgentActivityRow, DesktopWebState } from "./types.ts";
+import type { AgentExecutionCacheEntry } from "./ui_state.ts";
+import { renderTranscriptRows } from "./render_transcript.ts";
 import { escapeHtml } from "./utils.ts";
 
-export function renderInlineAgentActivity(state: DesktopWebState, inspectorOpen = false): string {
+export function renderInlineAgentActivity(
+  state: DesktopWebState,
+  selectedAgentPath: string | null = null,
+): string {
   const rows = orderedAgentActivityRows(state.agent_activity_rows ?? []);
   if (!state.agent_tree_active && rows.length === 0) return "";
-  if (!state.agent_tree_active) {
-    return `
-      <section class="agent-inline-activity agent-inline-history" aria-label="Sub Agentの履歴">
-        <button type="button" class="agent-history-trigger" data-action="show-agent-pane" data-focus-key="agent-history-trigger"
-          aria-controls="sub-agent-inspector" aria-expanded="${inspectorOpen ? "true" : "false"}">
-          <span><strong>${rows.length}件のSub Agentが作業しました</strong><small>${escapeHtml(agentActivitySummary(rows, false))}</small></span>
-          <span aria-hidden="true">›</span>
-        </button>
-      </section>
-    `;
-  }
   const counts = agentActivityCounts(rows);
   const updateText = counts.updated > 0 ? `${counts.updated}件のSub Agentが更新しました` : "";
-  const currentRows = rows.filter((row) => activityPreview(row).length > 0);
+  const groupPhase = state.agent_tree_active ? "active" : "terminal";
   return `
     <section class="agent-inline-activity" aria-label="Sub Agentの活動">
-      <div class="agent-inline-heading">
-        <strong>${escapeHtml(agentActivitySummary(rows, state.agent_tree_active))}</strong>
-        ${updateText ? `<span class="agent-update-summary" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(updateText)}</span>` : ""}
-      </div>
-      ${rows.length > 0 ? `<div class="agent-chip-list">${rows.map((row) => renderAgentChip(row, inspectorOpen)).join("")}</div>` : renderAgentTreePending()}
-      ${
-        currentRows.length > 0
-          ? `<div class="agent-current-list">${currentRows.map((row) => renderInlineCurrentActivity(row, inspectorOpen)).join("")}</div>`
-          : ""
-      }
+      <details class="agent-job-group" data-details-key="sub-agent-inline-group:${groupPhase}" ${state.agent_tree_active ? "open" : ""}>
+        <summary>
+          <span class="agent-inline-heading"><strong>Sub Agent</strong><small>${escapeHtml(agentActivitySummary(rows, state.agent_tree_active))}</small></span>
+          ${updateText ? `<span class="agent-update-summary" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(updateText)}</span>` : ""}
+        </summary>
+        ${rows.length > 0
+          ? `<div class="agent-job-list">${rows.map((row) => renderAgentJobCard(row, selectedAgentPath)).join("")}</div>`
+          : renderAgentTreePending()}
+      </details>
     </section>
   `;
 }
@@ -60,9 +54,15 @@ export function renderSubAgentSummaryTrigger(state: DesktopWebState): string {
   `;
 }
 
-export function renderAgentInspector(state: DesktopWebState, selectedAgentPath: string | null): string {
+export function renderAgentInspector(
+  state: DesktopWebState,
+  selectedAgentPath: string | null,
+  execution: AgentExecutionCacheEntry | null = null,
+): string {
   const rows = orderedAgentActivityRows(state.agent_activity_rows ?? []);
   if (rows.length === 0) return renderAgentTreePending();
+  const selected = rows.find((row) => row.agent_path === selectedAgentPath);
+  if (selected) return renderAgentExecution(selected, execution);
   const groups = [
     { key: "active", label: "作業中", rows: rows.filter((row) => agentIsActive(row.status)) },
     { key: "attention", label: "要確認", rows: rows.filter((row) => ["interrupted", "errored"].includes(row.status)) },
@@ -75,7 +75,7 @@ export function renderAgentInspector(state: DesktopWebState, selectedAgentPath: 
       ${groups.map((group) => `
         <section class="sub-agent-group" aria-labelledby="sub-agent-group-${group.key}">
           <h3 id="sub-agent-group-${group.key}">${group.label}<small>${group.rows.length}</small></h3>
-          ${group.rows.map((row) => renderAgentDetail(row, row.agent_path === selectedAgentPath)).join("")}
+          ${group.rows.map((row) => renderInspectorListCard(row)).join("")}
         </section>
       `).join("")}
     </div>
@@ -93,71 +93,81 @@ export function renderPermissionAgentIdentity(agentPath: string, taskName: strin
   `;
 }
 
-function renderAgentChip(row: AgentActivityRow, inspectorOpen: boolean): string {
+function renderAgentJobCard(row: AgentActivityRow, selectedAgentPath: string | null): string {
   const visual = stableAgentVisual(row.agent_path);
   const label = agentDisplayName(row);
   const status = agentStatusLabel(row.status);
+  const preview = plainAgentPreview(activityPreview(row) || row.task_preview.trim());
+  const selected = selectedAgentPath === row.agent_path;
   return `
-    <button type="button" class="agent-chip agent-tone-${visual.tone} agent-status-${row.status} ${row.updated ? "updated" : ""}"
+    <button type="button" class="agent-job-card agent-tone-${visual.tone} agent-status-${row.status} ${row.updated ? "updated" : ""}"
       data-action="show-agent-pane" data-agent-path="${escapeHtml(row.agent_path)}"
-      data-focus-key="agent-chip:${escapeHtml(row.agent_path)}" title="${escapeHtml(`${row.agent_path} · ${status}`)}"
+      data-focus-key="agent-job:${escapeHtml(row.agent_path)}" title="${escapeHtml(`${row.agent_path} · ${status}`)}"
       aria-label="${escapeHtml(`${label}のSub Agent履歴を表示 · ${status}`)}"
-      aria-controls="sub-agent-inspector" aria-expanded="${inspectorOpen ? "true" : "false"}">
+      aria-controls="sub-agent-inspector" aria-expanded="${selected ? "true" : "false"}">
       <span class="agent-symbol" aria-hidden="true">${visual.glyph}</span>
-      <span class="agent-chip-label">${escapeHtml(label)}</span>
-      <small>${escapeHtml(status)}</small>
+      <span class="agent-job-copy"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(preview)}</small></span>
+      <span class="agent-status-label">${escapeHtml(status)}</span>
+      <span class="agent-job-chevron" aria-hidden="true">›</span>
     </button>
   `;
 }
 
-function renderInlineCurrentActivity(row: AgentActivityRow, inspectorOpen: boolean): string {
+function renderInspectorListCard(row: AgentActivityRow): string {
   const visual = stableAgentVisual(row.agent_path);
+  const preview = plainAgentPreview(activityPreview(row) || row.task_preview.trim());
   return `
-    <button type="button" class="agent-inline-current agent-tone-${visual.tone}"
+    <button type="button" class="sub-agent-list-card agent-tone-${visual.tone} agent-status-${row.status} ${row.updated ? "updated" : ""}"
       data-action="show-agent-pane" data-agent-path="${escapeHtml(row.agent_path)}"
-      data-focus-key="agent-current:${escapeHtml(row.agent_path)}"
+      data-focus-key="sub-agent-card:${escapeHtml(row.agent_path)}"
       aria-label="${escapeHtml(`${agentDisplayName(row)}のSub Agent履歴を表示`)}"
-      aria-controls="sub-agent-inspector" aria-expanded="${inspectorOpen ? "true" : "false"}">
+      aria-controls="sub-agent-inspector">
       <span class="agent-symbol" aria-hidden="true">${visual.glyph}</span>
-      <span><strong>${escapeHtml(agentDisplayName(row))}</strong><small>${escapeHtml(activityPreview(row))}</small></span>
+      <span class="agent-job-copy"><strong>${escapeHtml(agentDisplayName(row))}</strong><small>${escapeHtml(preview)}</small></span>
+      <span class="agent-status-label">${escapeHtml(agentStatusLabel(row.status))}</span>
+      <span class="agent-job-chevron" aria-hidden="true">›</span>
     </button>
   `;
 }
 
-function renderAgentDetail(row: AgentActivityRow, selected = false): string {
-  const visual = stableAgentVisual(row.agent_path);
-  const open = selected || agentIsActive(row.status) || row.updated ? "open" : "";
-  const activity = row.current_activity.trim();
-  const task = row.task_preview.trim();
-  const result = row.result_preview.trim();
+function renderAgentExecution(row: AgentActivityRow, execution: AgentExecutionCacheEntry | null): string {
+  const projection = execution?.projection;
+  const transcript = projection
+    ? renderTranscriptRows(projection.transcript_rows, { anchorPrefix: "agent-execution" })
+    : "";
+  const count = projection
+    ? projection.turn_page_offset > 0
+      ? `${projection.transcript_rows.length}件を表示 · 以前の実行履歴あり`
+      : `${projection.transcript_rows.length}件の履歴`
+    : "";
+  const previousHistoryAction = projection?.turn_page_has_previous
+    ? `<button type="button" class="agent-execution-previous" data-action="load-previous-agent-execution-page"
+         data-agent-path="${escapeHtml(row.agent_path)}" ${execution?.status === "loading" ? "disabled" : ""}>
+         ${execution?.status === "loading" ? '<span class="busy-spinner small"></span><span>読み込み中</span>' : "以前の実行履歴"}
+       </button>`
+    : "";
   return `
-    <details class="sub-agent-detail agent-tone-${visual.tone} agent-status-${row.status} ${row.updated ? "updated" : ""} ${selected ? "selected" : ""}"
-      data-details-key="sub-agent:${escapeHtml(row.agent_path)}" data-agent-path="${escapeHtml(row.agent_path)}" ${open}>
-      <summary data-focus-key="sub-agent-summary:${escapeHtml(row.agent_path)}"${selected ? ' aria-current="true"' : ""}>
-        <span class="agent-symbol" aria-hidden="true">${visual.glyph}</span>
-        <span class="sub-agent-title">
-          <strong>${escapeHtml(agentDisplayName(row))}</strong>
-          <small>${escapeHtml(row.agent_path)}</small>
-        </span>
-        <span class="agent-status-label">${escapeHtml(agentStatusLabel(row.status))}</span>
-      </summary>
-      <div class="sub-agent-detail-body">
-        ${task ? renderDetailLine("依頼", task) : ""}
-        ${activity ? renderDetailLine("現在", activity) : ""}
-        ${result ? renderDetailLine("結果", result) : ""}
-        <small class="sub-agent-session">Session ${escapeHtml(row.session_id)}</small>
+    <section class="agent-execution" data-agent-path="${escapeHtml(row.agent_path)}"
+      data-focus-key="agent-execution:${escapeHtml(row.agent_path)}" tabindex="-1">
+      <div class="agent-execution-meta">
+        <span>${escapeHtml(agentStatusLabel(row.status))}</span>
+        <small>${escapeHtml(count || `Session ${row.session_id}`)}</small>
       </div>
-    </details>
+      ${execution?.status === "loading" && !projection ? '<div class="agent-execution-state"><span class="busy-spinner small"></span><span>実行履歴を読み込んでいます</span></div>' : ""}
+      ${execution?.status === "error" ? `<div class="agent-execution-error" role="status"><span>${escapeHtml(execution.error)}</span><button type="button" data-action="show-agent-pane" data-agent-path="${escapeHtml(row.agent_path)}">再試行</button></div>` : ""}
+      ${previousHistoryAction ? `<div class="agent-execution-history-controls">${previousHistoryAction}</div>` : ""}
+      ${transcript
+        ? `<div class="agent-execution-scroll">${transcript}</div>`
+        : execution?.status === "loading"
+          ? ""
+          : '<div class="empty agent-execution-empty">表示できる実行履歴はありません</div>'}
+    </section>
   `;
 }
 
 function renderSummarySymbol(row: AgentActivityRow): string {
   const visual = stableAgentVisual(row.agent_path);
   return `<span class="agent-symbol agent-tone-${visual.tone}">${visual.glyph}</span>`;
-}
-
-function renderDetailLine(label: string, value: string): string {
-  return `<div class="sub-agent-detail-line"><span>${escapeHtml(label)}</span><p>${escapeHtml(value)}</p></div>`;
 }
 
 function renderAgentTreePending(): string {

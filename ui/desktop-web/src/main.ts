@@ -1,6 +1,17 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { command } from "./api";
-import { agentActivityRowsChanged } from "./agent_activity";
+import { agentActivityRowsChanged, selectedAgentActivityChanged } from "./agent_activity";
+import {
+  acknowledgePendingHistoryPrepend,
+  advancePendingHistoryPrepend,
+  captureViewportAnchor,
+  createPendingHistoryPrepend,
+  rejectPendingHistoryPrepend,
+  restoreViewportAnchor,
+  pinThreadToEnd,
+  shouldRevealThreadEnd,
+  type PendingHistoryPrepend,
+} from "./history_navigation";
 import { commandConflictState, commandInternalState } from "./command_error";
 import type { ActionContext } from "./actions";
 import {
@@ -23,8 +34,19 @@ import {
   renderTopbar,
   setRenderContext,
 } from "./render";
-import type { DesktopViewState, DesktopWebState } from "./types";
-import { createUiLocalState, reconcileAgentPaneState } from "./ui_state";
+import type { AgentExecutionProjection, DesktopViewState, DesktopWebState } from "./types";
+import {
+  beginAgentExecutionLoad,
+  beginPreviousAgentExecutionPageLoad,
+  createUiLocalState,
+  agentExecutionRequestNeedsRefresh,
+  agentExecutionSnapshotOwnerIdentity,
+  failAgentExecutionLoad,
+  finishAgentExecutionLoad,
+  reconcileAgentPaneState,
+  selectedAgentExecution,
+  shouldPreserveAgentExecutionSnapshots,
+} from "./ui_state";
 import {
   InteractionLifecycle,
   type InteractionRelease,
@@ -81,6 +103,10 @@ const splashStartedAt = performance.now();
 const SPLASH_MIN_VISIBLE_MS = 5000;
 const THREAD_END_THRESHOLD_PX = 96;
 const uiState = createUiLocalState();
+let pendingHistoryPrepend: PendingHistoryPrepend | null = null;
+let nextHistoryPrependGeneration = 1;
+let lastRenderedAgentExecutionOwner: string | null = null;
+let runStartThreadEndRevealPending = false;
 
 interface StateUpdate {
   state: DesktopWebState;
@@ -126,6 +152,9 @@ const eventContext: ActionContext = {
   prepareConfigSnapshot: (target) => prepareConfigSnapshot(eventContext, target),
   submitPermissionDecision,
   setWindowMaximized,
+  loadAgentExecution,
+  loadPreviousAgentExecutionPage,
+  jumpToHistoryAnchor,
 };
 
 installInteractionEventGate({
@@ -167,7 +196,13 @@ async function mutate(name: string, args?: Record<string, unknown>): Promise<voi
   const startsRun = mutationStartsRun(name);
   const changesConfigOwner = mutationChangesConfigOwner(name);
   if (!mutationAdmissionOpen(uiState, name)) return;
+  let historyPrependRequest: PendingHistoryPrepend | null = null;
+  if (name === "load_previous_turn_page") {
+    historyPrependRequest = beginHistoryPrepend();
+    if (!historyPrependRequest) return;
+  }
   if (startsRun) {
+    runStartThreadEndRevealPending = true;
     uiState.runStartMutationPending = true;
     if (currentState) acceptState(currentState, true);
     window.setTimeout(() => void refresh(), 0);
@@ -179,10 +214,22 @@ async function mutate(name: string, args?: Record<string, unknown>): Promise<voi
   const draftSnapshot = captureDraftMutation(uiState, name);
   try {
     const state = await command<DesktopWebState>(name, args);
+    if (
+      historyPrependRequest
+      && pendingHistoryPrepend?.generation === historyPrependRequest.generation
+    ) {
+      pendingHistoryPrepend = acknowledgePendingHistoryPrepend(pendingHistoryPrepend);
+    }
     acknowledgeDraftMutation(uiState, state, name, draftSnapshot);
     acceptState(state, true, name, true, draftSnapshot);
     if (currentState && currentState !== state) acceptState(currentState, true);
   } catch (error) {
+    if (historyPrependRequest) {
+      pendingHistoryPrepend = rejectPendingHistoryPrepend(
+        pendingHistoryPrepend,
+        historyPrependRequest.generation,
+      );
+    }
     rejectDraftMutation(uiState, name, draftSnapshot);
     if (!recoverCommandConflict(error)) reportError(error);
   } finally {
@@ -195,6 +242,97 @@ async function mutate(name: string, args?: Record<string, unknown>): Promise<voi
       if (currentState) acceptState(currentState, true);
     }
   }
+}
+
+async function loadAgentExecution(state: DesktopWebState, agentPath: string): Promise<void> {
+  const row = state.agent_activity_rows.find((candidate) => candidate.agent_path === agentPath);
+  if (!row || state.draft_target.sessionId === null) return;
+  const request = beginAgentExecutionLoad(uiState, state, row);
+  if (currentState) acceptState(currentState, true);
+  try {
+    const projection = await command<AgentExecutionProjection>("load_agent_execution", {
+      expectedTarget: request.expectedTarget,
+    });
+    if (finishAgentExecutionLoad(uiState, request, projection)) {
+      renderAgentExecutionSettlement(request);
+    }
+  } catch (error) {
+    recoverCommandConflict(error);
+    const message = humanizeError(error);
+    if (failAgentExecutionLoad(uiState, request, `${message.title}: ${message.hint}`)) {
+      renderAgentExecutionSettlement(request);
+    }
+  }
+}
+
+async function loadPreviousAgentExecutionPage(
+  state: DesktopWebState,
+  agentPath: string,
+): Promise<void> {
+  const row = state.agent_activity_rows.find((candidate) => candidate.agent_path === agentPath);
+  if (!row || state.draft_target.sessionId === null) return;
+  const request = beginPreviousAgentExecutionPageLoad(uiState, state, row);
+  if (!request || request.expectedOffset === null || request.expectedEnd === null) return;
+  if (currentState) acceptState(currentState, true);
+  try {
+    const projection = await command<AgentExecutionProjection>(
+      "load_previous_agent_execution_page",
+      {
+        expectedTarget: request.expectedTarget,
+        expectedOffset: request.expectedOffset,
+        expectedEnd: request.expectedEnd,
+      },
+    );
+    if (finishAgentExecutionLoad(uiState, request, projection)) {
+      renderAgentExecutionSettlement(request);
+    }
+  } catch (error) {
+    recoverCommandConflict(error);
+    const message = humanizeError(error);
+    if (failAgentExecutionLoad(uiState, request, `${message.title}: ${message.hint}`)) {
+      renderAgentExecutionSettlement(request);
+    }
+  }
+}
+
+function renderAgentExecutionSettlement(request: ReturnType<typeof beginAgentExecutionLoad>): void {
+  if (!currentState) return;
+  const settledState = currentState;
+  const refreshAfterSettlement = agentExecutionRequestNeedsRefresh(request, settledState);
+  acceptState(settledState, true);
+  if (
+    refreshAfterSettlement
+    && uiState.selectedAgentPath === request.expectedTarget.agentPath
+    && uiState.activeAgentExecutionRequest === null
+  ) {
+    void loadAgentExecution(settledState, request.expectedTarget.agentPath);
+  }
+}
+
+function beginHistoryPrepend(): PendingHistoryPrepend | null {
+  if (!currentState || pendingHistoryPrepend) return null;
+  const request = createPendingHistoryPrepend(
+    currentState,
+    nextHistoryPrependGeneration,
+  );
+  if (!request) return null;
+  nextHistoryPrependGeneration += 1;
+  pendingHistoryPrepend = request;
+  return request;
+}
+
+function jumpToHistoryAnchor(anchorId: string): void {
+  if (!anchorId) return;
+  const thread = document.querySelector<HTMLElement>("#thread");
+  const target = thread?.querySelector<HTMLElement>(
+    `[data-history-anchor="${CSS.escape(anchorId)}"]`,
+  );
+  if (!thread || !target) return;
+  const top = thread.scrollTop
+    + target.getBoundingClientRect().top
+    - thread.getBoundingClientRect().top
+    - 18;
+  thread.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
 }
 
 function recoverCommandConflict(error: unknown): boolean {
@@ -360,6 +498,7 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
     appRoot.innerHTML = renderStartupSplash(state, elapsedSplashMs, SPLASH_MIN_VISIBLE_MS);
     scheduleSplashReveal(elapsedSplashMs);
     lastRenderedState = state;
+    lastRenderedAgentExecutionOwner = null;
     return;
   }
   if (!splashDismissed) {
@@ -371,6 +510,10 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
   }
   const previous = lastRenderedState;
   reconcileUiLocalState(previous, state, mutationName);
+  const nextAgentExecutionOwner = agentExecutionSnapshotOwnerIdentity(
+    state,
+    uiState.selectedAgentPath,
+  );
   const localConfirmationPending = uiState.pendingLocalConfirmation !== null;
   const backgroundInert = modalIsOpen(state, localConfirmationPending);
   const localConfirmationOpening = !lastRenderedLocalConfirmationPending && localConfirmationPending;
@@ -379,7 +522,7 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
   const modalClosing = (previous !== null && isModalClosing(previous, state)) || localConfirmationClosing;
   if (modalOpening) {
     modalScrollReturnStack.push(captureSelectorScrollSnapshots(MODAL_SCROLL_SELECTORS));
-    modalDetailsReturnStack.push(captureCurrentDetailSnapshots());
+    modalDetailsReturnStack.push(captureCurrentDetailSnapshots(lastRenderedAgentExecutionOwner));
     modalFocusReturnStack.push(captureCurrentFocusSnapshot());
   }
   const focusSnapshot = modalClosing
@@ -387,9 +530,9 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
     : modalOpening
       ? null
       : captureFocusSnapshot(previous, state);
-  const scrollSnapshots = captureScrollSnapshots(previous, state);
+  const scrollSnapshots = captureScrollSnapshots(previous, state, lastRenderedAgentExecutionOwner);
   if (modalClosing) scrollSnapshots.push(...(modalScrollReturnStack.pop() ?? []));
-  const detailSnapshots = captureDetailSnapshots(previous, state);
+  const detailSnapshots = captureDetailSnapshots(previous, state, lastRenderedAgentExecutionOwner);
   if (modalClosing) detailSnapshots.push(...(modalDetailsReturnStack.pop() ?? []));
   const previousThread = document.querySelector<HTMLElement>("#thread");
   const previousThreadScrollTop = previousThread?.scrollTop ?? 0;
@@ -400,13 +543,29 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
   const previousAgentRows = previous?.agent_activity_rows ?? [];
   const agentRows = state.agent_activity_rows ?? [];
   const sessionChanged = nextSessionKey !== previousSessionKey;
+  const historyPrependTransition = advancePendingHistoryPrepend(pendingHistoryPrepend, state);
+  pendingHistoryPrepend = historyPrependTransition.pending;
+  const prependViewportAnchor = historyPrependTransition.disposition === "consume" && previousThread
+    ? captureViewportAnchor(previousThread)
+    : null;
   const contentAdvanced = state.transcript_rows.length > previousTranscriptCount || state.file_change_rows.length > previousChangeCount;
   const agentActivityAdvanced = previous
     ? agentActivityRowsChanged(previousAgentRows, agentRows) || (!previous.agent_tree_active && state.agent_tree_active)
     : agentRows.length > 0;
+  const selectedAgentNeedsRefresh = previous !== null
+    && uiState.artifactPaneMode === "agents"
+    && selectedAgentActivityChanged(previousAgentRows, agentRows, uiState.selectedAgentPath);
   const runCompleted = Boolean(previous?.busy && !state.busy) || isTerminalRunStatus(state.run_status_key);
-  const shouldRevealEnd = sessionChanged
-    || (previousThreadWasNearEnd && (state.busy || state.agent_tree_active || contentAdvanced || agentActivityAdvanced || runCompleted));
+  const shouldRevealEnd = shouldRevealThreadEnd({
+    sessionChanged,
+    runStartRequested: runStartThreadEndRevealPending,
+    previouslyNearEnd: previousThreadWasNearEnd,
+    updateWantsEnd: state.busy
+      || state.agent_tree_active
+      || contentAdvanced
+      || agentActivityAdvanced
+      || runCompleted,
+  });
   const previousOutputCount = (previous?.artifact_rows.length ?? 0) + (previous?.file_change_rows.length ?? 0) + previousAgentRows.length;
   const outputCount = state.artifact_rows.length + state.file_change_rows.length + agentRows.length;
   if (previous && outputCount > 0 && previousOutputCount === 0 && uiState.artifactPaneCollapsed) {
@@ -417,6 +576,7 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
     artifactPaneCollapsed: uiState.artifactPaneCollapsed,
     artifactPaneMode: uiState.artifactPaneMode,
     selectedAgentPath: uiState.selectedAgentPath,
+    selectedAgentExecution: selectedAgentExecution(uiState, state),
     attachmentTrayOpen: uiState.attachmentTrayOpen,
     configDirty: configDraftAppliesTo(uiState, state.config_target),
     configMutationPending: configMutationPending(uiState),
@@ -467,20 +627,25 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
       applicationCommands?.removeAttribute("aria-hidden");
     }
   }
+  if (prependViewportAnchor) restoreDetailSnapshots(detailSnapshots, nextAgentExecutionOwner);
   const thread = document.querySelector<HTMLElement>("#thread");
-  if (thread && shouldRevealEnd) {
+  if (thread && prependViewportAnchor && restoreViewportAnchor(thread, prependViewportAnchor)) {
+    // Preserve the visible message while an older bounded history chunk is prepended.
+  } else if (thread && shouldRevealEnd) {
     revealThreadEnd(thread);
   } else if (thread && previousThread) {
     restoreThreadPosition(thread, previousThreadScrollTop);
   }
+  if (thread && runStartThreadEndRevealPending) runStartThreadEndRevealPending = false;
   previousSessionKey = nextSessionKey;
   lastRenderedLocalConfirmationPending = localConfirmationPending;
   lastRenderedState = state;
-  restoreScrollSnapshots(scrollSnapshots);
-  restoreDetailSnapshots(detailSnapshots);
+  lastRenderedAgentExecutionOwner = nextAgentExecutionOwner;
+  restoreScrollSnapshots(scrollSnapshots, nextAgentExecutionOwner);
+  if (!prependViewportAnchor) restoreDetailSnapshots(detailSnapshots, nextAgentExecutionOwner);
   restoreFocusSnapshot(focusSnapshot);
   wireEvents(state, eventContext);
-  focusSelectedAgentAfterRender();
+  focusAgentPaneAfterRender();
   if (
     modalClosing &&
     !focusSnapshot &&
@@ -491,20 +656,35 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
     requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>("#prompt")?.focus());
   }
   focusPromptIfRequested(state);
+  if (
+    selectedAgentNeedsRefresh
+    && uiState.selectedAgentPath
+    && uiState.activeAgentExecutionRequest === null
+  ) {
+    void loadAgentExecution(state, uiState.selectedAgentPath);
+  }
 }
 
-function focusSelectedAgentAfterRender(): void {
-  if (!uiState.focusSelectedAgentAfterRender || !uiState.selectedAgentPath) return;
-  const agentPath = uiState.selectedAgentPath;
-  uiState.focusSelectedAgentAfterRender = false;
+function focusAgentPaneAfterRender(): void {
+  if (uiState.focusSelectedAgentAfterRender && uiState.selectedAgentPath) {
+    const agentPath = uiState.selectedAgentPath;
+    uiState.focusSelectedAgentAfterRender = false;
+    requestAnimationFrame(() => {
+      const detail = document.querySelector<HTMLElement>(
+        `[data-focus-key="agent-execution:${CSS.escape(agentPath)}"]`,
+      );
+      detail?.focus({ preventScroll: true });
+      detail?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
+    return;
+  }
+  const focusTarget = uiState.agentPaneFocusAfterRender;
+  if (!focusTarget) return;
+  uiState.agentPaneFocusAfterRender = null;
   requestAnimationFrame(() => {
-    const summary = document.querySelector<HTMLElement>(
-      `[data-focus-key="sub-agent-summary:${CSS.escape(agentPath)}"]`,
-    );
-    const detail = summary?.closest<HTMLDetailsElement>("details[data-details-key]");
-    if (detail) detail.open = true;
-    summary?.focus({ preventScroll: true });
-    summary?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    document.querySelector<HTMLElement>(
+      `[data-focus-key="${CSS.escape(focusTarget)}"]`,
+    )?.focus({ preventScroll: true });
   });
 }
 
@@ -584,14 +764,23 @@ interface ScrollSnapshot {
   occurrence: number;
   scrollLeft: number;
   scrollTop: number;
+  agentExecutionOwner: string | null;
 }
 
 interface DetailSnapshot {
   key: string;
   open: boolean;
+  scope: "global" | "agent-execution";
+  agentExecutionOwner: string | null;
 }
 
-const STABLE_LIST_SCROLL_SELECTORS = [".project-list", ".chat-list", ".artifact-list", ".sub-agent-list"];
+const STABLE_LIST_SCROLL_SELECTORS = [
+  ".project-list",
+  ".chat-list",
+  ".artifact-list",
+  ".sub-agent-list",
+  ".agent-execution-scroll",
+];
 const MODAL_SCROLL_SELECTORS = [".modal", ".settings-content", ".settings-nav", ".select-list"];
 
 function captureFocusSnapshot(previous: DesktopWebState | null, state: DesktopWebState): FocusSnapshot | null {
@@ -650,28 +839,50 @@ function restoreFocusSnapshot(snapshot: FocusSnapshot | null): void {
   }
 }
 
-function captureScrollSnapshots(previous: DesktopWebState | null, state: DesktopWebState): ScrollSnapshot[] {
+function captureScrollSnapshots(
+  previous: DesktopWebState | null,
+  state: DesktopWebState,
+  agentExecutionOwner: string | null,
+): ScrollSnapshot[] {
   const selectors = [...STABLE_LIST_SCROLL_SELECTORS];
   if (previous && selectedSessionIdentity(previous) === selectedSessionIdentity(state)) selectors.push(".activity");
   if (previous && selectedArtifactIdentity(previous) === selectedArtifactIdentity(state)) selectors.push(".preview");
   if (previous && modalIdentity(previous) === modalIdentity(state) && modalIdentity(state) !== "none") {
     selectors.push(...MODAL_SCROLL_SELECTORS);
   }
-  return captureSelectorScrollSnapshots(selectors);
+  return captureSelectorScrollSnapshots(selectors, agentExecutionOwner);
 }
 
-function captureSelectorScrollSnapshots(selectors: string[]): ScrollSnapshot[] {
+function captureSelectorScrollSnapshots(
+  selectors: string[],
+  agentExecutionOwner: string | null = null,
+): ScrollSnapshot[] {
   const snapshots: ScrollSnapshot[] = [];
   for (const selector of selectors) {
     document.querySelectorAll<HTMLElement>(selector).forEach((node, occurrence) => {
-      snapshots.push({ selector, occurrence, scrollLeft: node.scrollLeft, scrollTop: node.scrollTop });
+      snapshots.push({
+        selector,
+        occurrence,
+        scrollLeft: node.scrollLeft,
+        scrollTop: node.scrollTop,
+        agentExecutionOwner: selector === ".agent-execution-scroll" ? agentExecutionOwner : null,
+      });
     });
   }
   return snapshots;
 }
 
-function restoreScrollSnapshots(snapshots: ScrollSnapshot[]): void {
+function restoreScrollSnapshots(
+  snapshots: ScrollSnapshot[],
+  agentExecutionOwner: string | null,
+): void {
   for (const snapshot of snapshots) {
+    if (
+      snapshot.selector === ".agent-execution-scroll"
+      && !shouldPreserveAgentExecutionSnapshots(snapshot.agentExecutionOwner, agentExecutionOwner)
+    ) {
+      continue;
+    }
     const target = document.querySelectorAll<HTMLElement>(snapshot.selector)[snapshot.occurrence];
     if (!target) continue;
     target.scrollLeft = snapshot.scrollLeft;
@@ -679,7 +890,11 @@ function restoreScrollSnapshots(snapshots: ScrollSnapshot[]): void {
   }
 }
 
-function captureDetailSnapshots(previous: DesktopWebState | null, state: DesktopWebState): DetailSnapshot[] {
+function captureDetailSnapshots(
+  previous: DesktopWebState | null,
+  state: DesktopWebState,
+  agentExecutionOwner: string | null,
+): DetailSnapshot[] {
   if (
     !previous ||
     selectedSessionIdentity(previous) !== selectedSessionIdentity(state) ||
@@ -687,19 +902,33 @@ function captureDetailSnapshots(previous: DesktopWebState | null, state: Desktop
   ) {
     return [];
   }
-  return captureCurrentDetailSnapshots();
+  return captureCurrentDetailSnapshots(agentExecutionOwner);
 }
 
-function captureCurrentDetailSnapshots(): DetailSnapshot[] {
-  return Array.from(document.querySelectorAll<HTMLDetailsElement>("details[data-details-key]"), (detail) => ({
-    key: detail.dataset.detailsKey ?? "",
-    open: detail.open,
-  })).filter((snapshot) => snapshot.key.length > 0);
+function captureCurrentDetailSnapshots(agentExecutionOwner: string | null): DetailSnapshot[] {
+  return Array.from(document.querySelectorAll<HTMLDetailsElement>("details[data-details-key]"), (detail) => {
+    const inAgentExecution = detail.closest(".agent-execution") !== null;
+    return {
+      key: detail.dataset.detailsKey ?? "",
+      open: detail.open,
+      scope: inAgentExecution ? "agent-execution" as const : "global" as const,
+      agentExecutionOwner: inAgentExecution ? agentExecutionOwner : null,
+    };
+  }).filter((snapshot) => snapshot.key.length > 0);
 }
 
-function restoreDetailSnapshots(snapshots: DetailSnapshot[]): void {
+function restoreDetailSnapshots(
+  snapshots: DetailSnapshot[],
+  agentExecutionOwner: string | null,
+): void {
   const details = Array.from(document.querySelectorAll<HTMLDetailsElement>("details[data-details-key]"));
   for (const snapshot of snapshots) {
+    if (
+      snapshot.scope === "agent-execution"
+      && !shouldPreserveAgentExecutionSnapshots(snapshot.agentExecutionOwner, agentExecutionOwner)
+    ) {
+      continue;
+    }
     const detail = details.find((candidate) => candidate.dataset.detailsKey === snapshot.key);
     if (detail) detail.open = snapshot.open;
   }
@@ -851,8 +1080,9 @@ function isThreadNearEnd(thread: HTMLElement): boolean {
 
 function revealThreadEnd(thread: HTMLElement): void {
   const scroll = () => {
-    thread.scrollTop = thread.scrollHeight;
+    pinThreadToEnd(thread);
   };
+  scroll();
   requestAnimationFrame(scroll);
   window.setTimeout(scroll, 50);
 }

@@ -1,4 +1,6 @@
-use crate::protocol::{HistoryItem, HistoryItemPayload, TurnInterruptionCause};
+use crate::protocol::{
+    HistoryItem, HistoryItemPayload, TurnInterruptionCause, TurnItemPayload, TurnTerminalOutcome,
+};
 use crate::session::{
     CanonicalSessionRead, ProjectId, PromptDispatchPart, SessionId, SessionStatus,
 };
@@ -353,6 +355,16 @@ impl DesktopState {
 
     pub fn can_begin_navigation(&self) -> bool {
         !self.is_busy() && !self.background_mutation_pending() && !self.navigation_loading()
+    }
+
+    pub fn can_begin_turn_page_load(&self) -> bool {
+        !self.background_mutation_pending()
+            && !self.navigation_loading()
+            && !self.turn_page_load_pending()
+            && self.selected_session_id().is_some()
+            && self.open_session.as_ref().is_some_and(|open_session| {
+                Some(open_session.session_id()) == self.selected_session_id()
+            })
     }
 
     pub fn begin_snapshot_refresh(&mut self) {
@@ -812,7 +824,8 @@ impl DesktopState {
         self.provider_config.update_access_mode(session.access_mode);
         self.bind_composer_to_loaded_session(session.id);
         let open_session = OpenSessionView::from_loaded(read);
-        self.app_state.load_turn_items(session, turn_items);
+        self.app_state
+            .load_turn_items_with_active_turn(session, turn_items, read.active_turn_id);
         self.status_code = self
             .app_state
             .interruption_cause
@@ -835,10 +848,174 @@ impl DesktopState {
         self.view.artifact_selected_index = 0;
     }
 
+    pub fn turn_page_load_pending(&self) -> bool {
+        self.view
+            .async_operations
+            .is_pending(DesktopAsyncOperationKind::TurnPageLoad)
+    }
+
+    pub fn merge_open_session_history(&mut self, read: &CanonicalSessionRead) -> bool {
+        let Some(open_session) = self
+            .open_session
+            .as_mut()
+            .filter(|open_session| open_session.session_id() == read.session.id)
+        else {
+            return false;
+        };
+        if !open_session.merge_contiguous(read) {
+            return false;
+        }
+        let session = open_session.session().clone();
+        let turn_items = open_session.turn_items().to_vec();
+        let detail = open_session.stored_detail().clone();
+
+        self.provider_config.update_access_mode(session.access_mode);
+        let preserve_current_projection = self.app_state.current_session_id == Some(session.id);
+        if preserve_current_projection {
+            self.app_state.refresh_plan_from_turn_items(&turn_items);
+        } else {
+            self.app_state.load_turn_items_with_active_turn(
+                &session,
+                &turn_items,
+                open_session.active_turn_id(),
+            );
+        }
+        self.status_code = self
+            .app_state
+            .interruption_cause
+            .map(DesktopStatusCode::from_interruption)
+            .unwrap_or(DesktopStatusCode::Plain);
+        if let Some(context_window) = latest_context_window_from_history_items(&read.history.items)
+        {
+            self.app_state.latest_context_window = Some(context_window);
+        }
+        self.snapshot.replace_detail(detail);
+        self.update_session_row_title(session.id, &session.title);
+        let row_status = if preserve_current_projection {
+            session_status_from_run_status(self.app_state.run_status)
+        } else {
+            session.status
+        };
+        self.update_session_row_status(session.id, row_status);
+        true
+    }
+
+    pub fn load_open_session_preserving_history(&mut self, read: &CanonicalSessionRead) -> bool {
+        if self.merge_open_session_history(read) {
+            self.apply_canonical_terminal_to_running_session(read);
+            return true;
+        }
+        let preserved = self
+            .open_session
+            .as_mut()
+            .filter(|open_session| open_session.session_id() == read.session.id)
+            .is_some_and(|open_session| {
+                open_session.refresh_metadata_preserving_loaded_history(read)
+            });
+        if !preserved {
+            self.load_open_session(read);
+            return true;
+        }
+        let open_session = self
+            .open_session
+            .as_ref()
+            .expect("preserved open session remains available");
+        let session = open_session.session().clone();
+        let detail = open_session.stored_detail().clone();
+        self.provider_config.update_access_mode(session.access_mode);
+        if let Some(context_window) = latest_context_window_from_history_items(&read.history.items)
+        {
+            self.app_state.latest_context_window = Some(context_window);
+        }
+        self.snapshot.replace_detail(detail);
+        self.update_session_row_title(session.id, &session.title);
+        self.update_session_row_status(session.id, session.status);
+        self.apply_canonical_terminal_to_running_session(read);
+        false
+    }
+
+    fn apply_canonical_terminal_to_running_session(&mut self, read: &CanonicalSessionRead) -> bool {
+        if self.app_state.current_session_id != Some(read.session.id)
+            || !matches!(self.app_state.run_status, RunStatus::Running)
+        {
+            return false;
+        }
+        let Some(outcome) = read.turns.items.iter().rev().find_map(|item| {
+            if let TurnItemPayload::Terminal { outcome } = &item.payload {
+                Some(outcome.clone())
+            } else {
+                None
+            }
+        }) else {
+            return false;
+        };
+        if outcome.session_status() != read.session.status {
+            return false;
+        }
+
+        let (run_status, progress_status, status_message) = match &outcome {
+            TurnTerminalOutcome::Completed => (
+                RunStatus::Completed,
+                "Completed",
+                "run completed".to_string(),
+            ),
+            TurnTerminalOutcome::Interrupted { cause } => (
+                RunStatus::Cancelled,
+                "Cancelled",
+                crate::tui::state::interruption_status_message(*cause),
+            ),
+            TurnTerminalOutcome::Failed { error } => (RunStatus::Failed, "Failed", error.clone()),
+        };
+        self.app_state.run_status = run_status;
+        self.app_state.status_message = Some(status_message);
+        self.app_state.interruption_cause = outcome.interruption_cause();
+        self.app_state.permission = None;
+        self.app_state.progress.status = progress_status.to_string();
+        self.app_state.progress.current_phase = RunProgressPhase::Terminal;
+        self.app_state.progress.active_step = outcome.summary().to_string();
+        self.status_code = self
+            .app_state
+            .interruption_cause
+            .map(DesktopStatusCode::from_interruption)
+            .unwrap_or(DesktopStatusCode::Plain);
+        self.update_session_row_status(read.session.id, outcome.session_status());
+        true
+    }
+
+    pub fn next_turn_page_offset(&self) -> Option<usize> {
+        let detail = self.selected_detail();
+        if !detail.turn_page_has_more || detail.turn_page_limit == 0 {
+            return None;
+        }
+        let selected_session_id = self.selected_session_id();
+        let next_offset = self
+            .open_session
+            .as_ref()
+            .filter(|open_session| Some(open_session.session_id()) == selected_session_id)
+            .map(OpenSessionView::loaded_turn_end)
+            .unwrap_or_else(|| {
+                detail
+                    .turn_page_offset
+                    .saturating_add(detail.turn_page_limit)
+            });
+        (next_offset < detail.turn_page_total).then_some(next_offset)
+    }
+
     pub fn refresh_open_session_projection(&mut self, read: &CanonicalSessionRead) {
-        let session = &read.session;
-        let turn_items = &read.turns.items;
-        let open_session = OpenSessionView::from_loaded(read);
+        let mut open_session = self.open_session.take().filter(|open_session| {
+            open_session.session_id() == read.session.id
+                && open_session.session_id() == read.turns.session.id
+        });
+        let retained = open_session.as_mut().is_some_and(|open_session| {
+            open_session.merge_contiguous(read)
+                || open_session.refresh_metadata_preserving_loaded_history(read)
+        });
+        if !retained {
+            open_session = Some(OpenSessionView::from_loaded(read));
+        }
+        let open_session = open_session.expect("open session projection is always available");
+        let session = open_session.session().clone();
+        let turn_items = open_session.turn_items();
         let detail = open_session.stored_detail().clone();
         self.app_state.refresh_plan_from_turn_items(turn_items);
         if let Some(context_window) = latest_context_window_from_history_items(&read.history.items)
@@ -1444,6 +1621,16 @@ impl DesktopState {
     }
 }
 
+const fn session_status_from_run_status(status: RunStatus) -> SessionStatus {
+    match status {
+        RunStatus::Idle => SessionStatus::Idle,
+        RunStatus::Running => SessionStatus::Running,
+        RunStatus::Completed => SessionStatus::Completed,
+        RunStatus::Cancelled => SessionStatus::Cancelled,
+        RunStatus::Failed => SessionStatus::Failed,
+    }
+}
+
 fn latest_context_window_from_history_items(
     items: &[HistoryItem],
 ) -> Option<crate::context::ContextWindowTokenStatus> {
@@ -1642,6 +1829,22 @@ mod tests {
         }
     }
 
+    fn turn_item(
+        session_id: SessionId,
+        turn_id: crate::protocol::TurnId,
+        sequence_no: i64,
+        payload: crate::protocol::TurnItemPayload,
+    ) -> crate::protocol::TurnItem {
+        crate::protocol::TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no,
+            payload,
+        }
+    }
+
     fn terminal_event(
         session_id: SessionId,
         outcome: crate::protocol::TurnTerminalOutcome,
@@ -1698,6 +1901,454 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn current_and_live_refreshes_preserve_the_expanded_turn_suffix() {
+        let session_id = SessionId::new();
+        let session = session_record(session_id);
+        let first_turn = crate::protocol::TurnId::new();
+        let second_turn = crate::protocol::TurnId::new();
+        let third_turn = crate::protocol::TurnId::new();
+        let items = vec![
+            turn_item(
+                session_id,
+                first_turn,
+                1,
+                crate::protocol::TurnItemPayload::UserMessage {
+                    text: "retained old request".to_string(),
+                },
+            ),
+            turn_item(
+                session_id,
+                first_turn,
+                2,
+                crate::protocol::TurnItemPayload::AgentMessage {
+                    text: "retained old answer".to_string(),
+                },
+            ),
+            turn_item(
+                session_id,
+                second_turn,
+                3,
+                crate::protocol::TurnItemPayload::UserMessage {
+                    text: "current request".to_string(),
+                },
+            ),
+            turn_item(
+                session_id,
+                second_turn,
+                4,
+                crate::protocol::TurnItemPayload::AgentMessage {
+                    text: "current answer".to_string(),
+                },
+            ),
+            turn_item(
+                session_id,
+                third_turn,
+                5,
+                crate::protocol::TurnItemPayload::UserMessage {
+                    text: "latest request".to_string(),
+                },
+            ),
+            turn_item(
+                session_id,
+                third_turn,
+                6,
+                crate::protocol::TurnItemPayload::AgentMessage {
+                    text: "latest answer".to_string(),
+                },
+            ),
+        ];
+        let mut expanded = canonical_read(&session, Vec::new(), items[..4].to_vec());
+        expanded.turns.limit = 2;
+        expanded.turns.total = 4;
+        let mut current_refresh = canonical_read(&session, Vec::new(), items[3..5].to_vec());
+        current_refresh.turns.offset = 3;
+        current_refresh.turns.limit = 2;
+        current_refresh.turns.total = 5;
+        let mut live_refresh = canonical_read(&session, Vec::new(), items[4..].to_vec());
+        live_refresh.turns.offset = 4;
+        live_refresh.turns.limit = 2;
+        live_refresh.turns.total = 6;
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session_id,
+                    &session.title,
+                    SessionStatus::Completed,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+
+        state.load_open_session(&expanded);
+        state.load_open_session_preserving_history(&current_refresh);
+
+        let current_items = state
+            .open_session
+            .as_ref()
+            .expect("open session after current refresh")
+            .turn_items();
+        assert_eq!(current_items.len(), 5);
+        assert_eq!(current_items[0].id, items[0].id);
+        assert_eq!(current_items[4].id, items[4].id);
+        assert!(
+            state
+                .app_state
+                .transcript_entries
+                .iter()
+                .any(|entry| entry.body.contains("retained old request"))
+        );
+
+        state.refresh_open_session_projection(&live_refresh);
+
+        let live_view = state
+            .open_session
+            .as_ref()
+            .expect("open session after live refresh");
+        assert_eq!(live_view.turn_items().len(), 6);
+        assert_eq!(live_view.turn_items()[0].id, items[0].id);
+        assert_eq!(live_view.turn_items()[5].id, items[5].id);
+        assert!(
+            live_view
+                .stored_detail()
+                .transcript_rows
+                .iter()
+                .any(|row| row.body.contains("retained old request"))
+        );
+        assert!(
+            live_view
+                .stored_detail()
+                .transcript_rows
+                .iter()
+                .any(|row| row.body.contains("latest answer"))
+        );
+    }
+
+    #[test]
+    fn active_history_prepend_does_not_replace_the_live_runtime_suffix() {
+        let session_id = SessionId::new();
+        let mut session = session_record(session_id);
+        session.status = SessionStatus::Running;
+        session.completed_at_ms = None;
+        let turn_id = crate::protocol::TurnId::new();
+        let items = vec![
+            turn_item(
+                session_id,
+                turn_id,
+                1,
+                crate::protocol::TurnItemPayload::UserMessage {
+                    text: "older canonical request".to_string(),
+                },
+            ),
+            turn_item(
+                session_id,
+                turn_id,
+                2,
+                crate::protocol::TurnItemPayload::AgentMessage {
+                    text: "stored running answer".to_string(),
+                },
+            ),
+        ];
+        let mut suffix = canonical_read(&session, Vec::new(), items[1..].to_vec());
+        suffix.turns.offset = 1;
+        suffix.turns.total = 2;
+        suffix.active_turn_id = Some(turn_id);
+        let mut prepend = canonical_read(&session, Vec::new(), items);
+        prepend.active_turn_id = Some(turn_id);
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session_id,
+                    &session.title,
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&suffix);
+        state
+            .app_state
+            .transcript_entries
+            .push(crate::tui::state::TranscriptEntry {
+                kind: crate::tui::state::TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "not-yet-reloaded live suffix".to_string(),
+                response_id: None,
+                tool_call_id: None,
+            });
+
+        assert!(state.merge_open_session_history(&prepend));
+
+        assert!(
+            state
+                .app_state
+                .transcript_entries
+                .iter()
+                .any(|entry| entry.body == "not-yet-reloaded live suffix")
+        );
+        assert!(
+            state
+                .open_session
+                .as_ref()
+                .expect("merged open session")
+                .turn_items()
+                .iter()
+                .any(|item| item.id == prepend.turns.items[0].id)
+        );
+    }
+
+    #[test]
+    fn stale_running_prepend_cannot_reverse_an_observed_terminal_event() {
+        let session_id = SessionId::new();
+        let mut running_session = session_record(session_id);
+        running_session.status = SessionStatus::Running;
+        running_session.completed_at_ms = None;
+        let turn_id = crate::protocol::TurnId::new();
+        let items = vec![
+            turn_item(
+                session_id,
+                turn_id,
+                1,
+                crate::protocol::TurnItemPayload::UserMessage {
+                    text: "request".to_string(),
+                },
+            ),
+            turn_item(
+                session_id,
+                turn_id,
+                2,
+                crate::protocol::TurnItemPayload::AgentMessage {
+                    text: "answer".to_string(),
+                },
+            ),
+        ];
+        let mut suffix = canonical_read(&running_session, Vec::new(), items[1..].to_vec());
+        suffix.turns.offset = 1;
+        suffix.turns.total = 2;
+        suffix.active_turn_id = Some(turn_id);
+        let mut stale_prepend = canonical_read(&running_session, Vec::new(), items);
+        stale_prepend.active_turn_id = Some(turn_id);
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session_id,
+                    &running_session.title,
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&suffix);
+        state.apply_run_event(&terminal_event(
+            session_id,
+            crate::protocol::TurnTerminalOutcome::Completed,
+        ));
+
+        assert!(state.merge_open_session_history(&stale_prepend));
+
+        assert_eq!(state.app_state.run_status, RunStatus::Completed);
+        assert_eq!(
+            state.snapshot.session_rows[0].loaded_status,
+            crate::session::LoadedSessionStatus::Idle,
+        );
+        assert!(!state.snapshot.session_rows[0].label.contains("[実行中]"));
+    }
+
+    #[test]
+    fn canonical_terminal_refresh_settles_an_open_running_current_session() {
+        let session_id = SessionId::new();
+        let mut running_session = session_record(session_id);
+        running_session.status = SessionStatus::Running;
+        running_session.completed_at_ms = None;
+        let turn_id = crate::protocol::TurnId::new();
+        let user_item = turn_item(
+            session_id,
+            turn_id,
+            1,
+            crate::protocol::TurnItemPayload::UserMessage {
+                text: "stop the rejoined run".to_string(),
+            },
+        );
+        let mut running = canonical_read(&running_session, Vec::new(), vec![user_item.clone()]);
+        running.active_turn_id = Some(turn_id);
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session_id,
+                    &running_session.title,
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&running);
+        state
+            .app_state
+            .transcript_entries
+            .push(crate::tui::state::TranscriptEntry {
+                kind: crate::tui::state::TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "live projection remains intact".to_string(),
+                response_id: None,
+                tool_call_id: None,
+            });
+
+        let mut cancelled_session = running_session.clone();
+        cancelled_session.status = SessionStatus::Cancelled;
+        cancelled_session.updated_at_ms += 1;
+        cancelled_session.completed_at_ms = Some(cancelled_session.updated_at_ms);
+        let terminal_item = turn_item(
+            session_id,
+            turn_id,
+            2,
+            crate::protocol::TurnItemPayload::Terminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Interrupted {
+                    cause: crate::protocol::TurnInterruptionCause::UserStop,
+                },
+            },
+        );
+        let terminal = canonical_read(
+            &cancelled_session,
+            Vec::new(),
+            vec![user_item, terminal_item],
+        );
+
+        assert!(state.load_open_session_preserving_history(&terminal));
+
+        assert_eq!(state.app_state.run_status, RunStatus::Cancelled);
+        assert_eq!(
+            state.app_state.interruption_cause,
+            Some(crate::protocol::TurnInterruptionCause::UserStop)
+        );
+        assert_eq!(state.status_code, DesktopStatusCode::UserStopped);
+        assert_eq!(
+            state.app_state.progress.current_phase,
+            RunProgressPhase::Terminal
+        );
+        assert!(!state.is_busy());
+        assert!(
+            state
+                .app_state
+                .transcript_entries
+                .iter()
+                .any(|entry| entry.body == "live projection remains intact")
+        );
+        assert_eq!(
+            state
+                .open_session
+                .as_ref()
+                .expect("settled open session")
+                .session()
+                .status,
+            SessionStatus::Cancelled
+        );
+        assert!(!state.snapshot.session_rows[0].label.contains("[実行中]"));
+    }
+
+    #[test]
+    fn noncontiguous_terminal_refresh_keeps_the_expanded_prefix() {
+        let session_id = SessionId::new();
+        let session = session_record(session_id);
+        let old_turn = crate::protocol::TurnId::new();
+        let terminal_turn = crate::protocol::TurnId::new();
+        let prefix_item = turn_item(
+            session_id,
+            old_turn,
+            1,
+            crate::protocol::TurnItemPayload::UserMessage {
+                text: "expanded retained request".to_string(),
+            },
+        );
+        let terminal_item = turn_item(
+            session_id,
+            terminal_turn,
+            4,
+            crate::protocol::TurnItemPayload::Terminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
+            },
+        );
+        let mut expanded = canonical_read(&session, Vec::new(), vec![prefix_item.clone()]);
+        expanded.turns.total = 3;
+        expanded.turns.has_more = true;
+        let mut terminal = canonical_read(&session, Vec::new(), vec![terminal_item]);
+        terminal.turns.offset = 3;
+        terminal.turns.total = 4;
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session_id,
+                    &session.title,
+                    SessionStatus::Completed,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&expanded);
+
+        assert!(!state.load_open_session_preserving_history(&terminal));
+
+        let view = state.open_session.as_ref().expect("preserved open session");
+        assert_eq!(view.turn_items()[0].id, prefix_item.id);
+        assert_eq!(view.stored_detail().turn_page_total, 4);
+        assert!(
+            view.stored_detail()
+                .transcript_rows
+                .iter()
+                .any(|row| row.body.contains("expanded retained request"))
+        );
+    }
+
+    #[test]
+    fn next_turn_page_offset_advances_from_the_merged_loaded_end() {
+        let session_id = SessionId::new();
+        let session = session_record(session_id);
+        let turn_id = crate::protocol::TurnId::new();
+        let items = (1..=6)
+            .map(|sequence_no| {
+                turn_item(
+                    session_id,
+                    turn_id,
+                    sequence_no,
+                    crate::protocol::TurnItemPayload::AgentMessage {
+                        text: format!("message {sequence_no}"),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut first = canonical_read(&session, Vec::new(), items[..2].to_vec());
+        first.turns.limit = 2;
+        first.turns.total = 6;
+        first.turns.has_more = true;
+        let mut second = canonical_read(&session, Vec::new(), items[2..4].to_vec());
+        second.turns.offset = 2;
+        second.turns.limit = 2;
+        second.turns.total = 6;
+        second.turns.has_more = true;
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session_id,
+                    &session.title,
+                    SessionStatus::Completed,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+
+        state.load_open_session(&first);
+        assert_eq!(state.next_turn_page_offset(), Some(2));
+
+        assert!(state.merge_open_session_history(&second));
+
+        assert_eq!(state.next_turn_page_offset(), Some(4));
     }
 
     #[test]
@@ -2263,6 +2914,37 @@ mod tests {
     }
 
     #[test]
+    fn read_only_turn_page_admission_stays_open_during_the_owned_run() {
+        let session_id = SessionId::new();
+        let session = session_record(session_id);
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session_id,
+                    &session.title,
+                    SessionStatus::Completed,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&canonical_read(&session, Vec::new(), Vec::new()));
+        state.app_state.run_status = RunStatus::Running;
+
+        assert!(!state.can_begin_navigation());
+        assert!(state.can_begin_turn_page_load());
+
+        state.begin_turn_page_load();
+        assert!(!state.can_begin_turn_page_load());
+        state.finish_turn_page_load();
+        assert!(state.can_begin_turn_page_load());
+
+        let mutation_id = state.begin_session_delete_mutation();
+        assert!(!state.can_begin_turn_page_load());
+        assert!(state.finish_session_delete_mutation(mutation_id));
+    }
+
+    #[test]
     fn snapshot_and_turn_page_operations_keep_async_polling_alive() {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
 
@@ -2279,6 +2961,7 @@ mod tests {
         assert!(!state.snapshot_refresh_pending());
 
         state.begin_turn_page_load();
+        assert!(state.turn_page_load_pending());
         assert!(state.async_polling_required());
         assert!(
             state
@@ -2286,6 +2969,7 @@ mod tests {
                 .contains(&"turn_page_load".to_string())
         );
         state.finish_turn_page_load();
+        assert!(!state.turn_page_load_pending());
         assert!(!state.async_polling_required());
     }
 

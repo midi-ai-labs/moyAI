@@ -314,7 +314,7 @@ pub fn build_session_detail(
     let session = &read.session;
     let turn_items = &read.turns.items;
     let mut ui_state = AppState::default();
-    ui_state.load_turn_items(session, turn_items);
+    ui_state.load_turn_items_with_active_turn(session, turn_items, read.active_turn_id);
     let file_changes =
         file_change_rows_from_turn_items_with_root(turn_items, Some(session.cwd.as_path()));
     let mut detail = build_session_detail_from_app_state(&ui_state);
@@ -351,6 +351,7 @@ struct TurnTranscriptGroup {
     tool_rows: Vec<String>,
     file_change_items: Vec<crate::protocol::TurnItem>,
     system_rows: Vec<DesktopTranscriptRow>,
+    agent_rows: Vec<DesktopTranscriptRow>,
     terminal_outcome: Option<crate::protocol::TurnTerminalOutcome>,
 }
 
@@ -361,11 +362,12 @@ impl TurnTranscriptGroup {
             || !self.tool_rows.is_empty()
             || !self.file_change_items.is_empty()
             || !self.system_rows.is_empty()
+            || !self.agent_rows.is_empty()
             || self.terminal_outcome.is_some()
     }
 }
 
-fn transcript_rows_from_turn_items_with_context(
+pub(super) fn transcript_rows_from_turn_items_with_context(
     session: &SessionRecord,
     turn_items: &[crate::protocol::TurnItem],
 ) -> Vec<DesktopTranscriptRow> {
@@ -383,8 +385,10 @@ fn transcript_rows_from_turn_items_with_context(
         })
         .count()
         <= 1;
+    let mut immediately_preceding_agent_communication: Option<String> = None;
 
     for item in ordered {
+        let preceding_agent_communication = immediately_preceding_agent_communication.take();
         match &item.payload {
             crate::protocol::TurnItemPayload::UserMessage { text } => {
                 flush_turn_transcript_group(
@@ -410,13 +414,24 @@ fn transcript_rows_from_turn_items_with_context(
                 current.assistant_bodies.push(text.clone());
             }
             crate::protocol::TurnItemPayload::InterAgentCommunication { communication } => {
-                current.system_rows.push(desktop_transcript_row(
-                    DesktopTranscriptRowKind::System,
-                    String::new(),
-                    format!("Sub Agent · {}", communication.author),
-                    communication.content.clone(),
-                    Vec::new(),
-                ));
+                if communication.recipient == "/root" {
+                    current.agent_rows.push(desktop_transcript_row(
+                        DesktopTranscriptRowKind::SubAgentUpdated,
+                        String::new(),
+                        communication.author.clone(),
+                        String::new(),
+                        Vec::new(),
+                    ));
+                    immediately_preceding_agent_communication = Some(communication.author.clone());
+                } else {
+                    current.system_rows.push(desktop_transcript_row(
+                        DesktopTranscriptRowKind::System,
+                        String::new(),
+                        "Agent間の追加指示".to_string(),
+                        communication.content.clone(),
+                        Vec::new(),
+                    ));
+                }
             }
             crate::protocol::TurnItemPayload::ToolStatus {
                 title,
@@ -472,8 +487,43 @@ fn transcript_rows_from_turn_items_with_context(
             crate::protocol::TurnItemPayload::Terminal { outcome } => {
                 current.terminal_outcome = Some(outcome.clone());
             }
-            crate::protocol::TurnItemPayload::SubAgentActivity { .. }
-            | crate::protocol::TurnItemPayload::Plan { .. }
+            crate::protocol::TurnItemPayload::SubAgentActivity {
+                agent_path,
+                activity_kind,
+                ..
+            } => {
+                let row_kind = match activity_kind {
+                    crate::protocol::SubAgentActivityKind::Started => {
+                        DesktopTranscriptRowKind::SubAgentStarted
+                    }
+                    crate::protocol::SubAgentActivityKind::Interacted => {
+                        DesktopTranscriptRowKind::SubAgentUpdated
+                    }
+                    crate::protocol::SubAgentActivityKind::Interrupted => {
+                        DesktopTranscriptRowKind::SubAgentInterrupted
+                    }
+                };
+                if row_kind == DesktopTranscriptRowKind::SubAgentUpdated
+                    && preceding_agent_communication.as_deref() == Some(agent_path.as_str())
+                    && let Some(communication_row) = current.agent_rows.last_mut()
+                    && communication_row.row_kind == DesktopTranscriptRowKind::SubAgentUpdated
+                    && communication_row.title == agent_path.as_str()
+                {
+                    // send_message persists the durable communication first and
+                    // the lifecycle marker immediately afterwards. One compact
+                    // activity marker represents that single interaction.
+                    communication_row.body.clear();
+                    continue;
+                }
+                current.agent_rows.push(desktop_transcript_row(
+                    row_kind,
+                    String::new(),
+                    agent_path.clone(),
+                    String::new(),
+                    Vec::new(),
+                ));
+            }
+            crate::protocol::TurnItemPayload::Plan { .. }
             | crate::protocol::TurnItemPayload::WorldState { .. } => {}
         }
     }
@@ -540,6 +590,7 @@ fn flush_turn_transcript_group(
     }
     let has_work_summary = turn_group_has_work_summary(group);
     rows.extend(group.system_rows.drain(..));
+    rows.extend(group.agent_rows.drain(..));
 
     let file_changes = file_change_rows_from_turn_items_with_root(
         &group.file_change_items,
@@ -953,9 +1004,16 @@ fn transcript_rows_with_context(
         terminal,
     );
     if let Some(work_summary) = work_summary {
+        let latest_user_index = rows
+            .iter()
+            .rposition(|row| row.row_kind == DesktopTranscriptRowKind::User);
         let insert_index = rows
             .iter()
-            .position(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
+            .enumerate()
+            .skip(latest_user_index.map_or(0, |index| index.saturating_add(1)))
+            .find_map(|(index, row)| {
+                (row.row_kind == DesktopTranscriptRowKind::Assistant).then_some(index)
+            })
             .unwrap_or(rows.len());
         rows.insert(insert_index, work_summary);
     }
@@ -977,28 +1035,27 @@ fn fold_intermediate_assistant_rows(
     if !should_fold {
         return rows;
     }
-    let last_assistant_index = rows.iter().rposition(|row| {
-        row.row_kind == DesktopTranscriptRowKind::Assistant && !row.body.trim().is_empty()
-    });
-    let assistant_count = rows
-        .iter()
-        .filter(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
-        .count();
-    if assistant_count <= 1 {
-        return rows;
-    }
-    rows.into_iter()
-        .enumerate()
-        .filter_map(|(index, row)| {
-            if row.row_kind == DesktopTranscriptRowKind::Assistant
-                && Some(index) != last_assistant_index
-            {
-                None
-            } else {
-                Some(row)
+    let mut folded = Vec::with_capacity(rows.len());
+    let mut retained_assistant_for_turn = false;
+    for row in rows.into_iter().rev() {
+        if row.row_kind == DesktopTranscriptRowKind::User {
+            retained_assistant_for_turn = false;
+            folded.push(row);
+            continue;
+        }
+        if row.row_kind == DesktopTranscriptRowKind::Assistant {
+            if row.body.trim().is_empty() {
+                continue;
             }
-        })
-        .collect()
+            if retained_assistant_for_turn {
+                continue;
+            }
+            retained_assistant_for_turn = true;
+        }
+        folded.push(row);
+    }
+    folded.reverse();
+    folded
 }
 
 #[cfg(test)]
@@ -2587,6 +2644,149 @@ mod tests {
     }
 
     #[test]
+    fn multi_agent_turn_projects_typed_events_before_history_and_keeps_root_final_answer() {
+        let session = session_record(ProjectId::new(), "multi-agent workflow");
+        let turn_id = crate::protocol::TurnId::new();
+        let child_session_id = SessionId::new();
+        let turn_items = vec![
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 1,
+                payload: TurnItemPayload::UserMessage {
+                    text: "review with a Sub Agent".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 2,
+                payload: TurnItemPayload::SubAgentActivity {
+                    activity_id: "spawn-reviewer".to_string(),
+                    agent_session_id: child_session_id,
+                    agent_path: "/root/reviewer".to_string(),
+                    activity_kind: crate::protocol::SubAgentActivityKind::Started,
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 3,
+                payload: TurnItemPayload::InterAgentCommunication {
+                    communication: crate::protocol::InterAgentCommunication {
+                        author: "/root/reviewer".to_string(),
+                        recipient: "/root".to_string(),
+                        content: "**raw child report**".to_string(),
+                        trigger_turn: false,
+                    },
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 4,
+                payload: TurnItemPayload::SubAgentActivity {
+                    activity_id: "message-reviewer".to_string(),
+                    agent_session_id: child_session_id,
+                    agent_path: "/root/reviewer".to_string(),
+                    activity_kind: crate::protocol::SubAgentActivityKind::Interacted,
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 5,
+                payload: TurnItemPayload::AgentMessage {
+                    text: "Root final summary names reviewer.".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 6,
+                payload: TurnItemPayload::Terminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                },
+            },
+        ];
+
+        let rows = transcript_rows_from_turn_items_with_context(&session, &turn_items);
+        let row_index = |kind: DesktopTranscriptRowKind| {
+            rows.iter()
+                .position(|row| row.row_kind == kind)
+                .expect("expected typed transcript row")
+        };
+        let started = row_index(DesktopTranscriptRowKind::SubAgentStarted);
+        let updated = row_index(DesktopTranscriptRowKind::SubAgentUpdated);
+        let work_summary = row_index(DesktopTranscriptRowKind::WorkSummaryCompleted);
+        let final_answer = row_index(DesktopTranscriptRowKind::Assistant);
+
+        assert!(row_index(DesktopTranscriptRowKind::User) < started);
+        assert!(started < updated && updated < work_summary);
+        assert!(work_summary < final_answer);
+        assert_eq!(rows[started].title, "/root/reviewer");
+        assert_eq!(rows[updated].title, "/root/reviewer");
+        assert!(rows[updated].body.is_empty());
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.row_kind == DesktopTranscriptRowKind::SubAgentUpdated)
+                .count(),
+            1,
+            "one durable send_message interaction projects one Sub Agent update marker",
+        );
+        assert!(!rows.iter().any(|row| row.body.contains("raw child report")));
+        assert!(rows[final_answer].body.contains("Root final summary"));
+        assert!(!rows.iter().any(|row| {
+            row.row_kind == DesktopTranscriptRowKind::System && row.title.contains("Sub Agent")
+        }));
+    }
+
+    #[test]
+    fn child_execution_projects_parent_followup_as_readable_instruction_not_root_agent_marker() {
+        let session = session_record(ProjectId::new(), "child execution");
+        let turn_id = crate::protocol::TurnId::new();
+        let rows = transcript_rows_from_turn_items_with_context(
+            &session,
+            &[TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 1,
+                payload: TurnItemPayload::InterAgentCommunication {
+                    communication: crate::protocol::InterAgentCommunication {
+                        author: "/root".to_string(),
+                        recipient: "/root/reviewer".to_string(),
+                        content: "Please verify the final interaction.".to_string(),
+                        trigger_turn: true,
+                    },
+                },
+            }],
+        );
+
+        assert!(rows.iter().any(|row| {
+            row.row_kind == DesktopTranscriptRowKind::System
+                && row.title == "Agent間の追加指示"
+                && row.body == "Please verify the final interaction."
+        }));
+        assert!(!rows.iter().any(|row| {
+            row.row_kind == DesktopTranscriptRowKind::SubAgentUpdated && row.title == "/root"
+        }));
+    }
+
+    #[test]
     fn completed_work_transcript_keeps_final_answer_and_folds_intermediate_assistant_prose() {
         let mut state = AppState::default();
         state.run_status = RunStatus::Completed;
@@ -2751,6 +2951,87 @@ mod tests {
         assert!(
             rows.iter()
                 .any(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+        );
+    }
+
+    #[test]
+    fn completed_work_transcript_keeps_the_final_answer_for_each_user_turn() {
+        let mut state = AppState::default();
+        state.run_status = RunStatus::Completed;
+        state.last_summary = Some(completed_run_summary_fixture(SessionId::new(), 1, 0));
+        state.transcript_entries = vec![
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User".to_string(),
+                body: "first request".to_string(),
+                response_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "first intermediate update".to_string(),
+                response_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "first final answer".to_string(),
+                response_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User".to_string(),
+                body: "second request".to_string(),
+                response_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "second final answer".to_string(),
+                response_id: None,
+                tool_call_id: None,
+            },
+            crate::tui::state::TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: String::new(),
+                response_id: None,
+                tool_call_id: None,
+            },
+        ];
+
+        let rows = transcript_rows(&state);
+        let assistant_bodies = rows
+            .iter()
+            .filter(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
+            .map(|row| row.body.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            assistant_bodies,
+            ["first final answer", "second final answer"]
+        );
+        let row_index = |body: &str| {
+            rows.iter()
+                .position(|row| row.body == body)
+                .expect("expected transcript row")
+        };
+        let work_summary_index = rows
+            .iter()
+            .position(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+            .expect("expected work summary row");
+        assert!(row_index("first request") < row_index("first final answer"));
+        assert!(row_index("first final answer") < row_index("second request"));
+        assert!(row_index("second request") < work_summary_index);
+        assert!(work_summary_index < row_index("second final answer"));
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.body.contains("first intermediate update"))
         );
     }
 

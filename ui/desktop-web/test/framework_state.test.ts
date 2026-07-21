@@ -13,7 +13,8 @@ import {
   shouldBeginKeyboardInteraction,
   shouldBeginPointerInteraction,
 } from "../src/interaction_lifecycle.ts";
-import { wireEvents } from "../src/events.ts";
+import { shouldDispatchDelegatedKeyboardAction, wireEvents } from "../src/events.ts";
+import { transcriptAnchors } from "../src/history_navigation.ts";
 import { globalShortcutAction } from "../src/keyboard_shortcut.ts";
 import { autoRefreshAllowed, runtimePollingRequired } from "../src/polling_state.ts";
 import {
@@ -121,6 +122,7 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
     busy: false,
     navigation_loading: false,
     navigation_admission_open: true,
+    turn_page_admission_open: true,
     background_mutation_pending: false,
     agent_tree_active: false,
     composer_submit_mode: "new_request",
@@ -172,6 +174,7 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
     artifact_preview_text: "",
     file_change_rows: [],
     agent_activity_rows: [],
+    current_turn_agent_activity_rows: [],
     progress_text: "",
     tool_status_text: "",
     plan: null,
@@ -1418,6 +1421,18 @@ test("access-mode control consumes the Rust mutation capability", () => {
   );
 });
 
+test("topbar omits page replacement controls even when bounded history has more rows", () => {
+  const html = renderTopbar(projection({
+    turn_page_offset: 80,
+    turn_page_limit: 80,
+    turn_page_total: 240,
+    turn_page_has_more: true,
+  }));
+  assert.doesNotMatch(html, /turn-page-chip/);
+  assert.doesNotMatch(html, /data-action="load-previous-turn-page"/);
+  assert.doesNotMatch(html, /data-action="load-next-turn-page"/);
+});
+
 test("config commit capability never gates unrelated workspace or window actions", () => {
   const clean = projection();
   for (const id of ["browse-workspace", "toggle-maximize-window"]) {
@@ -1821,6 +1836,431 @@ test("canonical row_kind selects specialized transcript rendering", () => {
   }));
   assert.match(html, /message work-summary work_summary_running/);
   assert.match(html, /<details[^>]+open>/);
+});
+
+test("conversation rows render naturally with stable rail anchors and inline earlier history", () => {
+  const user = {
+    row_kind: "user" as const,
+    step: "01",
+    title: "ユーザー依頼",
+    body: "自然な依頼です",
+    file_changes: [],
+  };
+  const assistant = {
+    row_kind: "assistant" as const,
+    step: "02",
+    title: "Assistant",
+    body: "自然な応答です",
+    file_changes: [],
+  };
+  const completed = {
+    row_kind: "work_summary_completed" as const,
+    step: "03",
+    title: "1分作業しました",
+    body: "### 作業履歴\n- ファイルを確認しました",
+    file_changes: [],
+  };
+  const html = renderThreadContent(projection({
+    thread_empty: false,
+    turn_page_offset: 80,
+    navigation_loading: false,
+    transcript_rows: [user, assistant, completed],
+  }));
+
+  assert.match(html, /data-action="load-previous-turn-page"/);
+  assert.match(html, /<nav class="history-rail"/);
+  assert.equal(html.match(/data-action="jump-history-anchor"/g)?.length, 3);
+  assert.match(html, /class="message user"/);
+  assert.match(html, /class="message assistant"/);
+  assert.doesNotMatch(html, /message-step|<h2>ユーザー依頼<\/h2>|<h2>Assistant<\/h2>/);
+  assert.match(html, /work_summary_completed[^>]+data-history-anchor=[\s\S]*?<details[^>]+>/);
+  assert.doesNotMatch(html, /work_summary_completed[\s\S]*?<details[^>]+open>/);
+
+  const activeRun = projection({
+    thread_empty: false,
+    turn_page_offset: 80,
+    navigation_admission_open: false,
+    turn_page_admission_open: true,
+    transcript_rows: [user, assistant, completed],
+  });
+  assert.equal(
+    actionById("load-previous-turn-page")?.enabled?.(activeRun, { index: -1, value: "" }),
+    true,
+    "read-only history prepend remains available while the owned run is active",
+  );
+
+  const loading = projection({
+    thread_empty: false,
+    turn_page_offset: 80,
+    turn_page_has_more: true,
+    pending_async_operations: ["turn_page_load"],
+    transcript_rows: [user, assistant, completed],
+  });
+  const loadingHtml = renderThreadContent(loading);
+  assert.match(loadingHtml, /data-action="load-previous-turn-page"[^>]+disabled/);
+  assert.equal(actionById("load-previous-turn-page")?.enabled?.(loading, { index: -1, value: "" }), false);
+  assert.equal(actionById("load-next-turn-page")?.enabled?.(loading, { index: -1, value: "" }), false);
+
+  const renumbered = { ...user, step: "99" };
+  assert.equal(transcriptAnchors([user])[0]?.id, transcriptAnchors([renumbered])[0]?.id);
+  assert.deepEqual(
+    transcriptAnchors([user, user, user]).slice(1).map((anchor) => anchor.id),
+    transcriptAnchors([user, user]).map((anchor) => anchor.id),
+    "prepending an identical projected row preserves the visible suffix anchors",
+  );
+  const runningUpdated = {
+    row_kind: "work_summary_running" as const,
+    step: "04",
+    title: "作業中",
+    body: "新しい進捗",
+    file_changes: [],
+  };
+  assert.equal(
+    transcriptAnchors([{ ...runningUpdated, body: "以前の進捗" }])[0]?.detailsId,
+    transcriptAnchors([runningUpdated])[0]?.detailsId,
+    "running work disclosure identity survives visible progress updates",
+  );
+  assert.equal(
+    transcriptAnchors([{ ...runningUpdated, title: "12s 作業中" }])[0]?.detailsId,
+    transcriptAnchors([{ ...runningUpdated, title: "14s 作業中" }])[0]?.detailsId,
+    "running work disclosure identity survives elapsed-title updates",
+  );
+
+  const longRail = renderThreadContent(projection({
+    thread_empty: false,
+    transcript_rows: Array.from({ length: 60 }, (_, index) => ({
+      ...user,
+      body: `依頼 ${index}`,
+    })),
+  }));
+  assert.equal(
+    longRail.match(/data-action="jump-history-anchor"/g)?.length,
+    60,
+    "ordinary histories keep every conversational marker mounted",
+  );
+
+  const boundedRail = renderThreadContent(projection({
+    thread_empty: false,
+    transcript_rows: Array.from({ length: 240 }, (_, index) => ({
+      ...user,
+      body: `長い依頼 ${index}`,
+    })),
+  }));
+  assert.equal(
+    boundedRail.match(/data-action="jump-history-anchor"/g)?.length,
+    96,
+    "very long histories remain bounded to the viewport-scale rail capacity",
+  );
+  const boundedTargets = [...boundedRail.matchAll(/data-history-target="([^"]+)"/g)]
+    .map((match) => match[1]);
+  assert.equal(new Set(boundedTargets).size, 96, "sampled rail targets remain unique");
+  assert.match(boundedRail, /aria-label="依頼: 長い依頼 0"/);
+  assert.match(boundedRail, /aria-label="依頼: 長い依頼 239"/);
+});
+
+test("durable Sub Agent events stay inside their turn history and the root final summary stays visible", () => {
+  const rows = [
+    {
+      row_kind: "user" as const,
+      step: "01",
+      title: "ユーザー依頼",
+      body: "2つのSub Agentで確認してください",
+      file_changes: [],
+    },
+    {
+      row_kind: "sub_agent_started" as const,
+      step: "02",
+      title: "/root/navigation_review",
+      body: "",
+      file_changes: [],
+    },
+    {
+      row_kind: "sub_agent_updated" as const,
+      step: "03",
+      title: "/root/navigation_review",
+      body: "**RAW CHILD REPORT** https://example.invalid/private",
+      file_changes: [],
+    },
+    {
+      row_kind: "work_summary_completed" as const,
+      step: "04",
+      title: "12s作業しました",
+      body: "### 作業サマリ\n- 結果: セッションは完了しました。\n\n### 作業履歴\n- [完了] wait_agent\n  出力: 2件完了",
+      file_changes: [],
+    },
+    {
+      row_kind: "assistant" as const,
+      step: "05",
+      title: "応答",
+      body: "---\n\n**`navigation_review` の最終結果**\n\n- 問題ありません。",
+      file_changes: [],
+    },
+    {
+      row_kind: "user" as const,
+      step: "06",
+      title: "ユーザー依頼",
+      body: "次の依頼",
+      file_changes: [],
+    },
+    {
+      row_kind: "work_summary_completed" as const,
+      step: "07",
+      title: "2s作業しました",
+      body: "### 作業サマリ\n- 結果: セッションは完了しました。",
+      file_changes: [],
+    },
+    {
+      row_kind: "assistant" as const,
+      step: "08",
+      title: "応答",
+      body: "次の依頼も完了しました。",
+      file_changes: [],
+    },
+  ];
+  const html = renderThreadContent(projection({
+    thread_empty: false,
+    agent_tree_active: false,
+    transcript_rows: rows,
+    agent_activity_rows: [{
+      agent_path: "/root/navigation_review",
+      session_id: "child-navigation",
+      task_name: "Navigation review",
+      task_preview: "**履歴を確認** [内部リンク](https://secret.invalid/task) <script>alert('x')</script> `cargo test`",
+      status: "completed",
+      current_activity: "",
+      result_preview: "RAW CHILD REPORT",
+      started_order: 1,
+      updated: false,
+    }],
+  }));
+
+  const firstSummary = html.indexOf("12s作業しました");
+  const firstFinal = html.indexOf("navigation_review</code> の最終結果");
+  const secondUser = html.indexOf("次の依頼", firstFinal);
+  const secondFinal = html.indexOf("次の依頼も完了しました。", secondUser);
+  assert.ok(firstSummary >= 0 && firstSummary < firstFinal);
+  assert.ok(firstFinal < secondUser && secondUser < secondFinal);
+  const firstSummaryHtml = html.slice(firstSummary, firstFinal);
+  assert.match(
+    firstSummaryHtml,
+    /class="agent-job-card work-summary-agent-card[^\"]*"[\s\S]*data-agent-path="\/root\/navigation_review"[\s\S]*Navigation review[\s\S]*履歴を確認 内部リンク[\s\S]*cargo test[\s\S]*完了しました/,
+  );
+  assert.equal(firstSummaryHtml.match(/data-agent-path="\/root\/navigation_review"/g)?.length, 1);
+  assert.equal(firstSummaryHtml.match(/data-focus-key="agent-history:[^"]+:\/root\/navigation_review"/g)?.length, 1);
+  assert.match(firstSummaryHtml, /data-action="show-agent-pane"[\s\S]*aria-controls="sub-agent-inspector" aria-expanded="false"/);
+  assert.match(firstSummaryHtml, /&lt;script&gt;alert\(&#0?39;x&#0?39;\)&lt;\/script&gt;/);
+  assert.doesNotMatch(firstSummaryHtml, /https:\/\/secret\.invalid|<script>/);
+  assert.match(html, /<strong><code>navigation_review<\/code> の最終結果<\/strong>/);
+  assert.match(html, /class="work-history-event"[\s\S]*Sub Agentの完了を待ちました/);
+  assert.doesNotMatch(html, /出力: 2件完了/);
+  assert.doesNotMatch(html, /RAW CHILD REPORT|example\.invalid|message sub_agent_|agent-inline-activity/);
+  assert.equal(html.match(/data-action="jump-history-anchor"/g)?.length, 6);
+});
+
+test("Sub Agent lifecycle events coalesce to one described card per path in spawn order", () => {
+  const activity = (path: string, order: number, preview: string) => ({
+    agent_path: path,
+    session_id: `child-${order}`,
+    task_name: path.endsWith("alpha") ? "Alpha security review" : "Beta navigation review",
+    task_preview: preview,
+    status: "completed" as const,
+    current_activity: "",
+    result_preview: `RAW ${path} RESULT`,
+    started_order: order,
+    updated: true,
+  });
+  const html = renderThreadContent(projection({
+    thread_empty: false,
+    transcript_rows: [
+      { row_kind: "sub_agent_started", step: "1", title: "/root/alpha", body: "", file_changes: [] },
+      { row_kind: "sub_agent_started", step: "2", title: "/root/beta", body: "", file_changes: [] },
+      { row_kind: "sub_agent_updated", step: "3", title: "/root/beta", body: "RAW BETA REPORT", file_changes: [] },
+      { row_kind: "sub_agent_updated", step: "4", title: "/root/alpha", body: "RAW ALPHA REPORT", file_changes: [] },
+      { row_kind: "sub_agent_updated", step: "5", title: "/root/beta", body: "RAW BETA REPORT 2", file_changes: [] },
+      { row_kind: "work_summary_completed", step: "6", title: "history", body: "", file_changes: [] },
+    ],
+    agent_activity_rows: [
+      activity("/root/alpha", 1, "Sandbox boundaryを確認"),
+      activity("/root/beta", 2, "履歴navigationを確認"),
+    ],
+    current_turn_agent_activity_rows: [],
+  }));
+
+  assert.equal(html.match(/class="agent-job-card work-summary-agent-card/g)?.length, 2);
+  assert.equal(html.match(/data-agent-path="\/root\/alpha"/g)?.length, 1);
+  assert.equal(html.match(/data-agent-path="\/root\/beta"/g)?.length, 1);
+  assert.equal(html.match(/class="agent-status-label">完了しました/g)?.length, 2);
+  assert.match(html, /Alpha security review[\s\S]*Sandbox boundaryを確認/);
+  assert.match(html, /Beta navigation review[\s\S]*履歴navigationを確認/);
+  assert.ok(html.indexOf("/root/alpha") < html.indexOf("/root/beta"));
+  assert.doesNotMatch(html, /RAW (?:ALPHA|BETA|\/root)/);
+});
+
+test("live Sub Agent fallback is owned by the current turn and survives child quiescence", () => {
+  const agent = (path: string, status: "running" | "completed", order: number) => ({
+    agent_path: path,
+    session_id: `child-${order}`,
+    task_name: path.split("/").at(-1) ?? "agent",
+    task_preview: "bounded review",
+    status,
+    current_activity: "",
+    result_preview: status === "completed" ? "done" : "",
+    started_order: order,
+    updated: false,
+  });
+  const oldAgent = agent("/root/old_agent", "completed", 1);
+  const currentAgent = agent("/root/current_agent", "completed", 2);
+  const html = renderThreadContent(projection({
+    thread_empty: false,
+    agent_tree_active: false,
+    transcript_rows: [
+      { row_kind: "user", step: "1", title: "ユーザー依頼", body: "first", file_changes: [] },
+      { row_kind: "sub_agent_started", step: "2", title: oldAgent.agent_path, body: "", file_changes: [] },
+      { row_kind: "sub_agent_updated", step: "3", title: oldAgent.agent_path, body: "done", file_changes: [] },
+      { row_kind: "work_summary_completed", step: "4", title: "first history", body: "", file_changes: [] },
+      { row_kind: "assistant", step: "5", title: "応答", body: "first final", file_changes: [] },
+      { row_kind: "user", step: "6", title: "ユーザー依頼", body: "second", file_changes: [] },
+      { row_kind: "work_summary_running", step: "7", title: "second history", body: "", file_changes: [] },
+    ],
+    agent_activity_rows: [oldAgent, currentAgent],
+    current_turn_agent_activity_rows: [currentAgent],
+  }));
+
+  const firstHistory = html.lastIndexOf("first history");
+  const firstFinal = html.lastIndexOf("first final");
+  const secondHistory = html.lastIndexOf("second history");
+  assert.match(html.slice(firstHistory, firstFinal), /Old agent[\s\S]*完了しました/);
+  assert.doesNotMatch(html.slice(firstHistory, firstFinal), /Current agent/);
+  assert.match(html.slice(secondHistory), /Current agent[\s\S]*完了しました/);
+  assert.doesNotMatch(html.slice(secondHistory), /Old agent/);
+});
+
+test("a current Sub Agent remains visible before the live WorkSummary is projected", () => {
+  const currentAgent = {
+    agent_path: "/root/early_agent",
+    session_id: "child-early",
+    task_name: "Early review",
+    task_preview: "review while the turn starts",
+    status: "running" as const,
+    current_activity: "checking",
+    result_preview: "",
+    started_order: 1,
+    updated: false,
+  };
+  const html = renderThreadContent(projection({
+    thread_empty: false,
+    transcript_rows: [
+      { row_kind: "user", step: "1", title: "ユーザー依頼", body: "start", file_changes: [] },
+    ],
+    agent_tree_active: true,
+    agent_activity_rows: [currentAgent],
+    current_turn_agent_activity_rows: [currentAgent],
+  }));
+
+  assert.match(html, /class="agent-inline-activity"/);
+  assert.match(html, /Early review/);
+});
+
+test("interleaved legacy communication markers coalesce to one card per Sub Agent", () => {
+  const activity = (path: string, order: number) => ({
+    agent_path: path,
+    session_id: `child-${order}`,
+    task_name: path.endsWith("alpha") ? "Alpha review" : "Beta review",
+    task_preview: "review",
+    status: "completed" as const,
+    current_activity: "",
+    result_preview: "done",
+    started_order: order,
+    updated: true,
+  });
+  const html = renderThreadContent(projection({
+    thread_empty: false,
+    transcript_rows: [
+      { row_kind: "sub_agent_updated", step: "1", title: "/root/alpha", body: "", file_changes: [] },
+      { row_kind: "sub_agent_updated", step: "2", title: "/root/beta", body: "", file_changes: [] },
+      { row_kind: "sub_agent_updated", step: "3", title: "/root/alpha", body: "", file_changes: [] },
+      { row_kind: "sub_agent_updated", step: "4", title: "/root/beta", body: "", file_changes: [] },
+      { row_kind: "work_summary_completed", step: "5", title: "history", body: "", file_changes: [] },
+    ],
+    agent_activity_rows: [activity("/root/alpha", 1), activity("/root/beta", 2)],
+    current_turn_agent_activity_rows: [],
+  }));
+
+  assert.equal(html.match(/data-agent-path="\/root\/alpha"/g)?.length, 1);
+  assert.equal(html.match(/data-agent-path="\/root\/beta"/g)?.length, 1);
+});
+
+test("a started-only detached Sub Agent uses terminal status only at its latest turn", () => {
+  const currentAgent = {
+    agent_path: "/root/reused_agent",
+    session_id: "child-reused",
+    task_name: "reused_agent",
+    task_preview: "follow-up",
+    status: "completed" as const,
+    current_activity: "",
+    result_preview: "done",
+    started_order: 1,
+    updated: true,
+  };
+  const html = renderThreadContent(projection({
+    thread_empty: false,
+    transcript_rows: [
+      { row_kind: "user", step: "1", title: "ユーザー依頼", body: "first", file_changes: [] },
+      { row_kind: "sub_agent_started", step: "2", title: currentAgent.agent_path, body: "", file_changes: [] },
+      { row_kind: "work_summary_completed", step: "3", title: "old history", body: "", file_changes: [] },
+      { row_kind: "assistant", step: "4", title: "応答", body: "old final", file_changes: [] },
+      { row_kind: "user", step: "5", title: "ユーザー依頼", body: "follow-up", file_changes: [] },
+      { row_kind: "sub_agent_updated", step: "6", title: currentAgent.agent_path, body: "done", file_changes: [] },
+      { row_kind: "work_summary_completed", step: "7", title: "new history", body: "", file_changes: [] },
+    ],
+    agent_activity_rows: [currentAgent],
+    current_turn_agent_activity_rows: [currentAgent],
+  }));
+
+  const oldHistory = html.lastIndexOf("old history");
+  const oldFinal = html.lastIndexOf("old final");
+  const newHistory = html.lastIndexOf("new history");
+  const oldHistoryHtml = html.slice(oldHistory, oldFinal);
+  const newHistoryHtml = html.slice(newHistory);
+  assert.equal(html.match(/data-agent-path="\/root\/reused_agent"/g)?.length, 2);
+  assert.match(oldHistoryHtml, /Reused agent[\s\S]*作業を開始しました/);
+  assert.doesNotMatch(oldHistoryHtml, /follow-up/);
+  assert.match(newHistoryHtml, /Reused agent[\s\S]*follow-up[\s\S]*完了しました/);
+});
+
+test("a bounded canonical suffix keeps unmatched durable Sub Agents visible as compact cards", () => {
+  const boundaryAgent = {
+    agent_path: "/root/boundary_agent",
+    session_id: "child-boundary",
+    task_name: "Boundary security review",
+    task_preview: "review the truncated turn boundary",
+    status: "completed" as const,
+    current_activity: "",
+    result_preview: "done",
+    started_order: 1,
+    updated: false,
+  };
+  const html = renderThreadContent(projection({
+    thread_empty: false,
+    transcript_rows: [
+      { row_kind: "work_summary_completed", step: "1", title: "bounded history", body: "", file_changes: [] },
+      { row_kind: "assistant", step: "2", title: "応答", body: "root final", file_changes: [] },
+    ],
+    agent_activity_rows: [boundaryAgent],
+    current_turn_agent_activity_rows: [],
+  }));
+
+  assert.match(html, /class="agent-inline-activity"/);
+  assert.match(html, /Boundary security review/);
+  assert.match(html, /data-action="show-agent-pane" data-agent-path="\/root\/boundary_agent"/);
+  assert.ok(html.indexOf("Boundary security review") < html.lastIndexOf("root final"));
+});
+
+test("delegated keyboard activation skips native controls to avoid a second native click", () => {
+  assert.equal(shouldDispatchDelegatedKeyboardAction("BUTTON"), false);
+  assert.equal(shouldDispatchDelegatedKeyboardAction("A", true), false);
+  assert.equal(shouldDispatchDelegatedKeyboardAction("SUMMARY"), false);
+  assert.equal(shouldDispatchDelegatedKeyboardAction("DIV"), true);
 });
 
 test("config owner generation remains exact beyond JavaScript's safe integer range", () => {

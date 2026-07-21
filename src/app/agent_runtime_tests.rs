@@ -1320,6 +1320,14 @@ async fn existing_child_followup_uses_the_newly_admitted_root_config() {
     let child_context = runtime
         .context_for_execution(&root.context.tree, &child_lease)
         .expect("rehydrated child context");
+    assert!(
+        runtime
+            .activity_records(root_session.session.id)
+            .iter()
+            .find(|record| record.agent_path == child_path.to_string())
+            .is_some_and(|record| record.is_current_turn),
+        "a follow-up execution moves the retained child into the newly admitted root turn"
+    );
 
     let materialized = runtime
         .materialize_context_config_and_sync_session(&child_context)
@@ -1728,6 +1736,7 @@ async fn durable_activity_projection_restores_three_completed_paths_tasks_and_re
         assert_eq!(record.task_name, task_name);
         assert_eq!(record.task_preview, task);
         assert!(matches!(record.status, AgentStatus::Completed(Some(_))));
+        assert!(!record.is_current_turn);
         assert_eq!(record.result_preview, result);
         assert!(record.current_activity.is_empty());
 

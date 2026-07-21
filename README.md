@@ -58,6 +58,7 @@ moyAI is designed around those constraints:
 ## Highlights
 
 - Tauri Desktop app with project chat, quick chat, transcript, artifacts, settings, and provider discovery.
+- Desktop renders canonical history as a continuous conversation: user bubbles and plain assistant responses have no display-only step numbers, completed work history is collapsible without swallowing the root Agent's final response, and older bounded chunks prepend in place with a left-side hover/jump rail instead of replacing the page.
 - One Desktop instance per user; launching it again restores the existing window.
 - Desktop Stop validates the projected workspace, root session, run generation, and Agent Tree epoch, so stale UI actions cannot cancel a later run. Settings values, baseline, dirty state, and monotonic revision exist only in one frontend-local draft owner. Rust projects typed clean/dirty capability variants and statelessly validates a complete draft plus a decimal-string config-generation target before Apply, Save, Reset, or another config-owner mutation. Commit builds one complete temporary `ResolvedConfig`, preserving cleared optional values instead of re-layering them. Active-turn steer clears input only after durable acceptance.
 - CLI and TUI for terminal-centered workflows.
@@ -413,8 +414,11 @@ creates no runtime event, turn item, or terminal, remains visible to the next tu
 and is not consumed by rollback of a real turn.
 
 Desktop and TUI use bounded latest/offset canonical snapshots with a fence instead of eagerly loading
-the whole history. Explicit Markdown export reads bounded pages and checks the append fence before it
-returns a complete export. Runtime delivery uses bounded mailboxes with explicit backpressure. Active
+the whole history. Desktop can prepend adjacent older turn chunks into one continuous in-memory range,
+reprojects turn boundaries after each merge, and keeps latest live/current refreshes under one
+latest-wins owner so delayed snapshots cannot roll the transcript or terminal status backward.
+Explicit Markdown export reads bounded pages and checks the append fence before it returns a complete
+export. Runtime delivery uses bounded mailboxes with explicit backpressure. Active
 steer content is read only from canonical history through append-position cursor pages of at most 200
 items; the process-local wake-up is a coalesced generation signal that carries neither content nor an
 item identity. Best-effort harness recording disables only itself when initialization or writing
@@ -505,10 +509,13 @@ the config file to expose these six tools to the model: `spawn_agent`, `send_mes
   root Agent Tree. A completed turn's terminal classification is not reopened for the next turn: a
   Stop that wins first blocks continuation, and a continuation that wins first is stopped as part of
   the same tree.
-- Desktop shows active work as clickable inline agent chips and collapses terminal activity into one
-  history summary. Activating that summary, or the compact summary in Output, opens a read-only
-  Sub Agent pane for the current root task with status groups, task, current work, result, and child
-  session ID. It does not navigate to the child session and becomes a right-side drawer in narrow
+- Desktop coalesces each turn's Sub Agent lifecycle events by `agent_path` into one compact, individually
+  clickable stable-icon job with its task preview and latest status inside that turn's collapsible activity group; the root Agent's final response
+  remains the next normal assistant message. Activating a job, or the compact summary in Output,
+  opens a read-only right pane: the list is grouped by status and each selected child shows its bounded
+  canonical execution transcript. Older child execution pages can be prepended in place from that pane;
+  each read stays bounded and reprojects the complete loaded range across turn boundaries. It does not navigate to or select the child session, rejects stale
+  workspace/root/agent/child responses, and becomes a right-side drawer in narrow
   windows. Permission prompts identify the requesting agent and are serialized. While any agent in
   the current tree is active, new-chat, session, project, and workspace navigation is blocked. This
   keeps the current root task selected and preserves permission and Stop routing; Stop cancels the

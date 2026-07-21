@@ -57,6 +57,7 @@ pub struct AgentActivityRecord {
     pub result_preview: String,
     pub started_order: u64,
     pub updated: bool,
+    pub is_current_turn: bool,
 }
 
 #[derive(Clone)]
@@ -398,6 +399,7 @@ struct AgentNodeMetadata {
     config: Arc<ResolvedTurnConfig>,
     workspace: Workspace,
     updated: bool,
+    activity_owner: Option<AgentDurableTurnOwner>,
 }
 
 struct DurableAgentChild {
@@ -631,6 +633,7 @@ impl AgentRuntime {
                 config: Arc::clone(&config),
                 workspace: session.workspace.clone(),
                 updated: false,
+                activity_owner: None,
             },
         );
         drop(metadata);
@@ -775,6 +778,7 @@ impl AgentRuntime {
                     config: Arc::clone(config),
                     workspace: workspace.clone(),
                     updated: false,
+                    activity_owner: None,
                 },
             ));
         }
@@ -814,6 +818,7 @@ impl AgentRuntime {
                         .map_err(|_| "durable agent spawn order exceeded u64".to_string())?
                         .saturating_add(1),
                     updated: false,
+                    is_current_turn: false,
                 })
             })
             .collect()
@@ -879,6 +884,11 @@ impl AgentRuntime {
         let Ok(snapshot) = tree.control.snapshot() else {
             return Vec::new();
         };
+        let active_owner = tree
+            .active_root_turn_owner
+            .lock()
+            .ok()
+            .and_then(|owner| *owner);
         let Ok(metadata) = tree.metadata.lock() else {
             return Vec::new();
         };
@@ -908,6 +918,9 @@ impl AgentRuntime {
                     result_preview: agent_status_result(&agent.status),
                     started_order: agent.spawn_order,
                     updated: node.is_some_and(|node| node.updated),
+                    is_current_turn: node
+                        .and_then(|node| node.activity_owner)
+                        .is_some_and(|owner| Some(owner) == active_owner),
                 }
             })
             .collect()
@@ -972,6 +985,7 @@ impl AgentRuntime {
         if message.trim().is_empty() {
             return Err("spawn_agent requires a non-empty message".to_string());
         }
+        let activity_owner = caller.durable_root_turn_owner()?;
         let child_path = caller.path.join(task_name)?;
         if caller
             .tree
@@ -1060,6 +1074,7 @@ impl AgentRuntime {
                     config: Arc::clone(&caller.config),
                     workspace: caller.workspace.clone(),
                     updated: false,
+                    activity_owner: Some(activity_owner),
                 },
             );
         if let Err(error) = self.append_activity(
@@ -1172,18 +1187,17 @@ impl AgentRuntime {
             })
             .map_err(agent_control_error)?;
         let scheduled = scheduled_mail_delivery(delivery)?;
-        let (activity_session_id, activity_path) = if recipient_path.is_root() {
-            (caller.session_id, &caller.path)
+        if recipient_path.is_root() {
+            let _ = self.mark_activity_owner(caller, &caller.path);
         } else {
-            (recipient.session_id, &recipient_path)
-        };
-        let _ = self.append_activity(
-            caller,
-            &activity_id,
-            activity_session_id,
-            activity_path,
-            SubAgentActivityKind::Interacted,
-        );
+            let _ = self.append_activity(
+                caller,
+                &activity_id,
+                recipient.session_id,
+                &recipient_path,
+                SubAgentActivityKind::Interacted,
+            );
+        }
         self.launch_scheduled_turns(&caller.tree, scheduled);
         Ok(())
     }
@@ -1538,6 +1552,18 @@ impl AgentRuntime {
             .find(|agent| agent.path == *path)
             .map(|agent| agent.session_id)
             .ok_or_else(|| format!("agent `{path}` was not found"))?;
+        let active_owner = if path.is_root() {
+            None
+        } else {
+            Some(
+                tree.active_root_turn_owner
+                    .lock()
+                    .map_err(|_| "active root turn owner lock was poisoned".to_string())?
+                    .ok_or_else(|| {
+                        format!("agent `{path}` has no active durable root turn owner")
+                    })?,
+            )
+        };
         let metadata = tree
             .metadata
             .lock()
@@ -1548,11 +1574,12 @@ impl AgentRuntime {
         let root_turn_owner = if path.is_root() {
             Arc::new(OnceLock::new())
         } else {
-            let owner = tree
-                .active_root_turn_owner
-                .lock()
-                .map_err(|_| "active root turn owner lock was poisoned".to_string())?
-                .ok_or_else(|| format!("agent `{path}` has no active durable root turn owner"))?;
+            let owner = active_owner.expect("a non-root execution has an active owner");
+            if let Ok(mut nodes) = tree.metadata.lock()
+                && let Some(node) = nodes.get_mut(path)
+            {
+                node.activity_owner = Some(owner);
+            }
             let cell = OnceLock::new();
             cell.set(owner)
                 .expect("a fresh child root-turn owner cell must be empty");
@@ -1666,7 +1693,27 @@ impl AgentRuntime {
                 agent_path.to_string(),
                 activity_kind,
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if let Ok(mut metadata) = caller.tree.metadata.lock()
+            && let Some(node) = metadata.get_mut(agent_path)
+        {
+            node.activity_owner = Some(owner);
+        }
+        Ok(())
+    }
+
+    fn mark_activity_owner(
+        &self,
+        caller: &AgentRunContext,
+        agent_path: &AgentPath,
+    ) -> Result<(), String> {
+        let owner = caller.durable_root_turn_owner()?;
+        if let Ok(mut metadata) = caller.tree.metadata.lock()
+            && let Some(node) = metadata.get_mut(agent_path)
+        {
+            node.activity_owner = Some(owner);
+        }
+        Ok(())
     }
 }
 

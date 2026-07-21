@@ -9,6 +9,9 @@ export interface TranscriptRow {
     | "editing"
     | "tool"
     | "diff"
+    | "sub_agent_started"
+    | "sub_agent_updated"
+    | "sub_agent_interrupted"
     | "system"
     | "error"
     | "work_summary_running"
@@ -75,6 +78,26 @@ export interface AgentActivityRow {
   result_preview: string;
   started_order: number;
   updated: boolean;
+}
+
+export interface AgentExecutionExpectedTarget {
+  workspacePath: string;
+  rootSessionId: RowId;
+  agentPath: string;
+  childSessionId: RowId;
+}
+
+export interface AgentExecutionProjection {
+  workspace_path: string;
+  root_session_id: RowId;
+  agent_path: string;
+  session_id: RowId;
+  task_name: string;
+  transcript_rows: TranscriptRow[];
+  turn_page_offset: number;
+  turn_page_end: number;
+  turn_page_total: number;
+  turn_page_has_previous: boolean;
 }
 
 export type RunStatusKey = "idle" | "running" | "completed" | "cancelled" | "failed";
@@ -241,6 +264,7 @@ export interface DesktopWebState {
   pending_async_operations: string[];
   navigation_loading: boolean;
   navigation_admission_open: boolean;
+  turn_page_admission_open: boolean;
   post_run_refresh_pending: boolean;
   background_mutation_pending: boolean;
   overlay: string;
@@ -264,6 +288,7 @@ export interface DesktopWebState {
   file_change_rows: FileChangeRow[];
   file_change_summary_text: string;
   agent_activity_rows: AgentActivityRow[];
+  current_turn_agent_activity_rows: AgentActivityRow[];
   agent_tree_active: boolean;
   local_search_text: string;
   local_search_results_text: string;

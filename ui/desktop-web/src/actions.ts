@@ -6,6 +6,7 @@ import {
   type ConfigValueInput,
 } from "./config_mutation.ts";
 import { finishLocalDecision, type PermissionReviewDecision } from "./decision_state.ts";
+import { turnPageLoadPending } from "./history_navigation.ts";
 import {
   navigationIsIdle,
   sessionActionIndex,
@@ -23,6 +24,7 @@ import type {
 import {
   openAgentPane,
   setArtifactPaneCollapsed,
+  showAgentList,
   showOutputPane,
   type UiLocalState,
 } from "./ui_state.ts";
@@ -59,6 +61,9 @@ export interface ActionContext {
   prepareConfigSnapshot: (target: ConfigMutationTarget) => ConfigValueInput[] | null;
   submitPermissionDecision: (decision: PermissionReviewDecision) => Promise<void>;
   setWindowMaximized: (maximized: boolean) => void;
+  loadAgentExecution: (state: DesktopWebState, agentPath: string) => Promise<void>;
+  loadPreviousAgentExecutionPage: (state: DesktopWebState, agentPath: string) => Promise<void>;
+  jumpToHistoryAnchor: (anchorId: string) => void;
 }
 
 export interface ActionDefinition {
@@ -463,16 +468,15 @@ export const ACTIONS: ActionDefinition[] = [
   },
   {
     id: "load-previous-turn-page",
-    label: "前の履歴ページ",
+    label: "以前の履歴を読み込む",
     palette: true,
-    enabled: (state) => navigationIsIdle(state) && state.turn_page_offset > 0,
+    enabled: (state) => state.turn_page_admission_open && !turnPageLoadPending(state) && state.turn_page_offset > 0,
     run: (state, context) => runTurnPageMutation("load_previous_turn_page", state, context),
   },
   {
     id: "load-next-turn-page",
-    label: "次の履歴ページ",
-    palette: true,
-    enabled: (state) => navigationIsIdle(state) && state.turn_page_has_more,
+    label: "新しい履歴へ移動",
+    enabled: (state) => state.turn_page_admission_open && !turnPageLoadPending(state) && state.turn_page_has_more,
     run: (state, context) => runTurnPageMutation("load_next_turn_page", state, context),
   },
   {
@@ -493,8 +497,20 @@ export const ACTIONS: ActionDefinition[] = [
     id: "show-agent-pane",
     label: "Sub Agent履歴を表示",
     enabled: (state) => state.agent_activity_rows.length > 0,
-    run: (state, context, payload) => {
-      if (openAgentPane(context.uiState, state, payload.value)) context.rerender();
+    run: async (state, context, payload) => {
+      if (!openAgentPane(context.uiState, state, payload.value)) return;
+      context.rerender();
+      const selectedAgentPath = context.uiState.selectedAgentPath;
+      if (selectedAgentPath) await context.loadAgentExecution(state, selectedAgentPath);
+    },
+  },
+  {
+    id: "show-agent-list",
+    label: "Sub Agent一覧に戻る",
+    enabled: always,
+    run: (_state, context) => {
+      showAgentList(context.uiState);
+      context.rerender();
     },
   },
   {
@@ -502,8 +518,22 @@ export const ACTIONS: ActionDefinition[] = [
     label: "出力ペインに戻る",
     enabled: always,
     run: (_state, context) => {
-      showOutputPane(context.uiState);
+      showOutputPane(context.uiState, true);
       context.rerender();
+    },
+  },
+  {
+    id: "jump-history-anchor",
+    label: "会話履歴へ移動",
+    enabled: always,
+    run: (_state, context, payload) => context.jumpToHistoryAnchor(payload.value),
+  },
+  {
+    id: "load-previous-agent-execution-page",
+    label: "以前の実行履歴",
+    enabled: always,
+    run: async (state, context, payload) => {
+      await context.loadPreviousAgentExecutionPage(state, payload.value);
     },
   },
   {

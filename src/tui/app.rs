@@ -1563,7 +1563,11 @@ impl TuiController {
         let read = session_view(&self.app.session_service, session_id).await?;
         self.cancel_pending_prompt_enhance();
         self.apply_access_mode_owner(read.session.access_mode);
-        self.state.load_turn_items(&read.session, &read.turns.items);
+        self.state.load_turn_items_with_active_turn(
+            &read.session,
+            &read.turns.items,
+            read.active_turn_id,
+        );
         self.state.modal = Modal::None;
         Ok(())
     }
@@ -1640,7 +1644,11 @@ impl TuiController {
         let read = session_view(&self.app.session_service, session_id).await?;
         self.cancel_pending_prompt_enhance();
         self.apply_access_mode_owner(read.session.access_mode);
-        self.state.load_turn_items(&read.session, &read.turns.items);
+        self.state.load_turn_items_with_active_turn(
+            &read.session,
+            &read.turns.items,
+            read.active_turn_id,
+        );
         self.state.status_message = Some(format!("rejoined running session {session_id}"));
         self.state.modal = Modal::None;
         Ok(())

@@ -262,7 +262,7 @@ function installDelegatedActionEvents(context: ActionContext): void {
     if (!currentState) return;
     const action = node.dataset.action ?? "";
     const index = Number(node.dataset.index ?? "-1");
-    const value = node.dataset.agentPath ?? node.dataset.mode ?? "";
+    const value = node.dataset.agentPath ?? node.dataset.historyTarget ?? node.dataset.mode ?? "";
     void dispatchAction(action, index, value, currentState, context).catch((error) => context.reportError(error));
   });
   document.addEventListener("keydown", (event) => {
@@ -270,16 +270,17 @@ function installDelegatedActionEvents(context: ActionContext): void {
     const target = event.target;
     if (!(target instanceof Element)) return;
     const node = target.closest<HTMLElement>(
-      '[data-action="show-agent-pane"], [data-action="show-output-pane"]',
+      '[data-action="show-agent-pane"], [data-action="show-agent-list"], [data-action="show-output-pane"], [data-action="jump-history-anchor"]',
     );
     if (!node || (node instanceof HTMLButtonElement && node.disabled)) return;
+    if (!shouldDispatchDelegatedKeyboardAction(node.tagName, node.hasAttribute("href"))) return;
     const currentState = context.getViewState();
     if (!currentState) return;
     event.preventDefault();
     event.stopPropagation();
     const action = node.dataset.action ?? "";
     const index = Number(node.dataset.index ?? "-1");
-    const value = node.dataset.agentPath ?? node.dataset.mode ?? "";
+    const value = node.dataset.agentPath ?? node.dataset.historyTarget ?? node.dataset.mode ?? "";
     void dispatchAction(action, index, value, currentState, context).catch((error) => context.reportError(error));
   });
   document.addEventListener("pointerdown", (event) => {
@@ -334,6 +335,12 @@ function installDelegatedActionEvents(context: ActionContext): void {
       );
     }
   });
+}
+
+export function shouldDispatchDelegatedKeyboardAction(tagName: string, hasHref = false): boolean {
+  const normalized = tagName.toUpperCase();
+  if (["BUTTON", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"].includes(normalized)) return false;
+  return normalized !== "A" || !hasHref;
 }
 
 function titlebarPointerSample(event: PointerEvent, target: Element) {

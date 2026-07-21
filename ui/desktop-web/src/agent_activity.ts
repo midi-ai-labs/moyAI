@@ -102,6 +102,21 @@ export function stableAgentVisual(agentPath: string): AgentVisual {
   return AGENT_VISUALS[hash % AGENT_VISUALS.length];
 }
 
+export function plainAgentPreview(value: string): string {
+  return value
+    .replace(/```[\s\S]*?```/g, " コード ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/~~([^~]+)~~/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^[-*+]\s+/gm, "")
+    .replace(/[*_~]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function agentActivityRowsChanged(
   previous: readonly AgentActivityRow[],
   current: readonly AgentActivityRow[],
@@ -109,10 +124,22 @@ export function agentActivityRowsChanged(
   const previousOrdered = orderedAgentActivityRows(previous);
   const currentOrdered = orderedAgentActivityRows(current);
   if (previousOrdered.length !== currentOrdered.length) return true;
-  return previousOrdered.some((row, index) => agentActivityRowKey(row) !== agentActivityRowKey(currentOrdered[index]));
+  return previousOrdered.some((row, index) => agentActivityRowIdentity(row) !== agentActivityRowIdentity(currentOrdered[index]));
 }
 
-function agentActivityRowKey(row: AgentActivityRow): string {
+export function selectedAgentActivityChanged(
+  previous: readonly AgentActivityRow[],
+  current: readonly AgentActivityRow[],
+  agentPath: string | null,
+): boolean {
+  if (!agentPath) return false;
+  const previousRow = previous.find((row) => row.agent_path === agentPath);
+  const currentRow = current.find((row) => row.agent_path === agentPath);
+  if (!previousRow || !currentRow) return previousRow !== currentRow;
+  return agentActivityRowIdentity(previousRow) !== agentActivityRowIdentity(currentRow);
+}
+
+export function agentActivityRowIdentity(row: AgentActivityRow): string {
   return [
     row.agent_path,
     row.session_id,

@@ -85,6 +85,11 @@ export function renderMarkdown(value: string): string {
       flushTextBlocks();
       continue;
     }
+    if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+      flushTextBlocks();
+      html += '<hr class="md-divider">';
+      continue;
+    }
     if (looksLikeTableLine(trimmed)) {
       flushParagraph();
       flushList();
@@ -149,15 +154,95 @@ function isAlignmentRow(row: string[]): boolean {
 }
 
 function renderInlineMarkdown(value: string): string {
-  return value
-    .split(/(`[^`]*`)/g)
-    .map((part) => {
-      if (part.startsWith("`") && part.endsWith("`")) {
-        return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
-      }
-      return escapeHtml(part)
-        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-        .replace(/__([^_]+)__/g, "<strong>$1</strong>");
-    })
-    .join("");
+  let cursor = 0;
+  let html = "";
+  while (cursor < value.length) {
+    const token = nextInlineToken(value, cursor);
+    if (!token) {
+      html += escapeHtml(value.slice(cursor));
+      break;
+    }
+    html += escapeHtml(value.slice(cursor, token.start));
+    if (token.kind === "code") {
+      html += `<code>${escapeHtml(token.content)}</code>`;
+    } else if (token.kind === "strong") {
+      html += `<strong>${renderInlineMarkdown(token.content)}</strong>`;
+    } else {
+      const href = safeMarkdownHref(token.href);
+      html += href
+        ? `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer">${renderInlineMarkdown(token.content)}</a>`
+        : renderInlineMarkdown(token.content);
+    }
+    cursor = token.end;
+  }
+  return html;
+}
+
+type InlineToken =
+  | { kind: "code"; start: number; end: number; content: string }
+  | { kind: "strong"; start: number; end: number; content: string }
+  | { kind: "link"; start: number; end: number; content: string; href: string };
+
+function nextInlineToken(value: string, cursor: number): InlineToken | null {
+  const candidates = [
+    delimitedInlineToken(value, cursor, "`", "code"),
+    delimitedInlineToken(value, cursor, "**", "strong"),
+    delimitedInlineToken(value, cursor, "__", "strong"),
+    markdownLinkToken(value, cursor),
+  ].filter((candidate): candidate is InlineToken => candidate !== null);
+  candidates.sort((left, right) => left.start - right.start || inlineTokenPriority(left) - inlineTokenPriority(right));
+  return candidates[0] ?? null;
+}
+
+function delimitedInlineToken(
+  value: string,
+  cursor: number,
+  delimiter: string,
+  kind: "code" | "strong",
+): InlineToken | null {
+  let start = value.indexOf(delimiter, cursor);
+  while (start >= 0) {
+    const end = value.indexOf(delimiter, start + delimiter.length);
+    if (end >= 0) {
+      return {
+        kind,
+        start,
+        end: end + delimiter.length,
+        content: value.slice(start + delimiter.length, end),
+      };
+    }
+    start = value.indexOf(delimiter, start + delimiter.length);
+  }
+  return null;
+}
+
+function markdownLinkToken(value: string, cursor: number): InlineToken | null {
+  const expression = /\[([^\]]+)\]\(([^)\s]+)\)/g;
+  expression.lastIndex = cursor;
+  const match = expression.exec(value);
+  if (!match || match.index > 0 && value[match.index - 1] === "!") return null;
+  return {
+    kind: "link",
+    start: match.index,
+    end: match.index + match[0].length,
+    content: match[1],
+    href: match[2],
+  };
+}
+
+function safeMarkdownHref(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("#")) return trimmed;
+  try {
+    const parsed = new URL(trimmed);
+    return ["http:", "https:", "mailto:"].includes(parsed.protocol) ? trimmed : null;
+  } catch {
+    return null;
+  }
+}
+
+function inlineTokenPriority(token: InlineToken): number {
+  if (token.kind === "strong") return 0;
+  if (token.kind === "code") return 1;
+  return 2;
 }

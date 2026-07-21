@@ -180,7 +180,7 @@ max_concurrent_model_requests = 1
 - agent上限は同時active数でrootを含む。既定値`4`はrootとchild最大3件の同時実行を許す。完了agentは一覧とfollow-up用に保持するがactive枠は消費しない。retained registryはroot込み256件（direct child最大255件）で、満杯時は履歴をevictせず新しいspawnを拒否する。
 - local LLM model request は tree 内で既定 1 本。inference server が並列処理できる場合だけ値を増やす。
 - child は通常session listには出ない独立session。context forkは現在activeなuser turn、表示対象assistant message、durableなcollaboration-mode instruction、active compaction summaryを引き継ぐ。summaryが置換したraw parent historyは復活させず、Sub Agent activityはfreshなactive turnにだけ記録する。
-- Desktopはactiveなactivityを本文内のクリック可能なAgentチップ、terminal後を1件の履歴集約として表示する。本文またはOutputの集約表示をクリックすると、current root taskに紐づくread-onlyのSub Agent専用paneが開き、状態別一覧、task、current work、result、child session IDを確認できる。child sessionへ画面遷移はせず、狭いwindowでは右側drawerになる。permission dialogには要求元agentが表示される。Agent Tree実行中は新規chat / session / project / workspace navigationを禁止する。Stopはtree全体を停止する。
+- Desktopは各turnのSub Agent lifecycle eventを`agent_path`ごとに1枚へ統合し、そのturnの折りたたみ可能な作業履歴内に、stable icon・task preview・最新状態を持つ短いクリック可能なAgentカードとして表示する。root Agentの最終応答は作業履歴へ取り込まず、直後の通常assistant messageとして残る。本文またはOutputの集約表示をクリックすると、current root taskに紐づくread-onlyのSub Agent専用paneが開き、状態別一覧、task、current work、result、child session IDを確認できる。長いchild履歴は同じpaneの「以前の実行履歴」から段階的に追加読込し、turn境界をまたぐ範囲も一つのcanonical transcriptとして再表示する。child sessionへ画面遷移はせず、狭いwindowでは右側drawerになる。permission dialogには要求元agentが表示される。Agent Tree実行中は新規chat / session / project / workspace navigationを禁止する。Stopはtree全体を停止する。
 - goal continuationを含む各turnは新しい実行controlを持つが、Stop targetは同じroot Agent Treeとして保持される。完了turnのterminal stateを次turnへ再利用せず、Stopが先ならcontinuationを開始せず、continuationが先なら新turnを含むtree全体を停止する。
 
 ## 履歴と保存場所
