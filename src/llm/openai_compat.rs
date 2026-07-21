@@ -335,12 +335,16 @@ impl OpenAiCompatClient {
                         response_id: Some(response_id),
                     });
                 }
-                Some(ResponsesTerminal::Failed { code, message, .. }) => {
-                    return Err(LlmError::ProviderRejected {
-                        status: None,
+                Some(ResponsesTerminal::Failed {
+                    response_id,
+                    code,
+                    message,
+                }) => {
+                    return Err(LlmError::ProviderGenerationFailed {
+                        response_id,
                         code,
-                        param: None,
                         message,
+                        max_output_tokens: request.effective_max_output_tokens(),
                     });
                 }
                 Some(ResponsesTerminal::Incomplete { reason, usage, .. }) => {
@@ -669,6 +673,12 @@ impl<'a> ProviderTraceSink<'a> {
                 }
                 LlmError::ProviderRejected { status, code, .. } => {
                     (ProviderFailureKind::HttpStatus, *status, code.clone())
+                }
+                LlmError::ProviderGenerationFailed { code, .. } => {
+                    (ProviderFailureKind::Generation, None, code.clone())
+                }
+                LlmError::IncompleteResponse { .. } => {
+                    (ProviderFailureKind::Generation, None, None)
                 }
                 LlmError::Json(_) => (ProviderFailureKind::Decode, None, None),
                 LlmError::Message(_) if self.current_phase == ProviderPhase::FirstProgress => {
@@ -3894,8 +3904,96 @@ mod tests {
         server.abort();
 
         assert!(error.to_string().contains("try again"));
+        let failure = error.provider_failure().expect("typed generation failure");
+        assert_eq!(failure.kind, ProviderFailureKind::Generation);
+        assert_eq!(failure.phase, ProviderPhase::FirstProgress);
+        assert_eq!(failure.status, None);
+        assert_eq!(failure.code.as_deref(), Some("server_error"));
         assert_eq!(requests.lock().expect("request capture").len(), 1);
         assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn responses_lm_studio_tool_parse_failure_is_generation_terminal() {
+        let failed = responses_sse([
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_truncated",
+                "delta": "{\"path\":\"docs/calculator-design.md\",\"content\":"
+            }),
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "id": "resp_tool_parse_failed",
+                    "error": {
+                        "code": "unknown",
+                        "message": "Failed to parse tool call: Unexpected end of content."
+                    }
+                }
+            }),
+        ]);
+        let (base_url, requests, server) = start_responses_fixture(vec![failed]).await;
+        let mut request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "Rewrite the design document".to_string(),
+            }],
+        );
+        request.model.max_output_tokens = 2_048;
+        let expected_max_output_tokens = 2_048;
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("LM Studio generation failure must remain terminal");
+        server.abort();
+
+        let failure = error.provider_failure().expect("typed generation failure");
+        assert_eq!(failure.kind, ProviderFailureKind::Generation);
+        assert_eq!(failure.phase, ProviderPhase::FirstProgress);
+        assert_eq!(failure.status, None);
+        assert_eq!(failure.code.as_deref(), Some("unknown"));
+        assert!(
+            error
+                .to_string()
+                .contains("configured max_output_tokens=2048")
+        );
+        assert!(matches!(
+            &error,
+            LlmError::ProviderFailure { source, .. }
+                if matches!(
+                    source.as_ref(),
+                    LlmError::ProviderGenerationFailed {
+                        response_id: Some(response_id),
+                        code: Some(code),
+                        message,
+                        max_output_tokens,
+                    } if response_id == "resp_tool_parse_failed"
+                        && code == "unknown"
+                        && message == "Failed to parse tool call: Unexpected end of content."
+                        && *max_output_tokens == expected_max_output_tokens
+                )
+        ));
+        let requests = requests.lock().expect("request capture");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["max_output_tokens"],
+            json!(expected_max_output_tokens)
+        );
+        assert!(sink.events.is_empty());
+        assert!(matches!(
+            sink.phases.last(),
+            Some(ProviderPhaseEvent {
+                phase: ProviderPhase::ProviderTerminal,
+                terminal_status: Some(ProviderTerminalStatus::Failed),
+                failure: Some(terminal_failure),
+                ..
+            }) if terminal_failure.kind == ProviderFailureKind::Generation
+                && terminal_failure.status.is_none()
+                && terminal_failure.code.as_deref() == Some("unknown")
+        ));
     }
 
     #[tokio::test]
@@ -4321,7 +4419,7 @@ mod tests {
         let client = OpenAiCompatClient::new(None);
 
         for (index, expected) in [
-            "provider rejected the request (server_error): unavailable",
+            "provider generation failed for response resp_failed (server_error)",
             "provider returned an incomplete response: max_output_tokens",
             "Responses stream closed before response.completed",
         ]
@@ -4338,6 +4436,10 @@ mod tests {
                 "unexpected Responses error: {error}"
             );
             if index == 1 {
+                let failure = error.provider_failure().expect("typed incomplete failure");
+                assert_eq!(failure.kind, ProviderFailureKind::Generation);
+                assert_eq!(failure.status, None);
+                assert_eq!(failure.code, None);
                 assert!(matches!(
                     error.token_usage(),
                     Some(TokenUsage {

@@ -1111,7 +1111,9 @@ impl AgentLoop {
                 .context
                 .model_messages_for_items(&retained_ids, supports_images);
             let mut projected = request_template.clone();
-            projected.messages = vec![semantic_compaction_message("[semantic summary]")];
+            projected.messages = vec![context_manager::semantic_compaction_message(
+                "[semantic summary]",
+            )];
             projected.messages.extend(retained_messages.clone());
             projected.messages.extend(transient_messages.clone());
             let projected_status = ContextWindowTokenStatus::for_request(
@@ -1148,7 +1150,7 @@ impl AgentLoop {
             )
             .await?;
         let mut post_compaction = request_template.clone();
-        post_compaction.messages = vec![semantic_compaction_message(&summary)];
+        post_compaction.messages = vec![context_manager::semantic_compaction_message(&summary)];
         post_compaction.messages.extend(retained_messages);
         post_compaction.messages.extend(transient_messages);
         let post_status = ContextWindowTokenStatus::for_request(
@@ -1965,15 +1967,6 @@ fn resolve_success_commit_from_durable_summary(
 struct PreparedChatRequest {
     chat_request: ChatRequest,
     world_state: WorldState,
-}
-
-fn semantic_compaction_message(summary: &str) -> ModelMessage {
-    ModelMessage::System {
-        content: format!(
-            "Earlier conversation context was compacted.\n{}",
-            summary.trim()
-        ),
-    }
 }
 
 fn compaction_request_with_content(template: &ChatRequest, content: String) -> ChatRequest {
@@ -6315,7 +6308,7 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert!(matches!(
             &messages[0],
-            ModelMessage::System { content }
+            ModelMessage::User { content }
                 if content.contains("old detail summary")
                     && !content.contains("recent detail")
         ));
