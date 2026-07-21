@@ -30,6 +30,35 @@ export interface ThreadEndRevealInput {
   updateWantsEnd: boolean;
 }
 
+export interface ThreadTailFollowOwner {
+  workspacePath: string;
+  sessionId: string | null;
+  runtimeOwnerToken: string;
+}
+
+export interface ThreadTailFollowProjection extends ThreadTailFollowOwner {
+  runActive: boolean;
+  terminal: boolean;
+}
+
+export interface ThreadTailFollowDecision {
+  follow: boolean;
+  clearAfterPin: boolean;
+}
+
+interface ActiveThreadTailFollow {
+  workspacePath: string;
+  sessionId: string | null;
+  initialRuntimeEpoch: string | null;
+  runEpoch: string | null;
+  observedRunOwner: boolean;
+}
+
+interface RuntimeOwnerIdentity {
+  kind: "idle" | "root" | "tree";
+  epoch: string;
+}
+
 export interface HistoryPrependProjection {
   workspace_path: string;
   selected_session_index: number;
@@ -68,6 +97,143 @@ export function pinThreadToEnd(
   thread: Pick<HTMLElement, "scrollTop" | "scrollHeight">,
 ): void {
   thread.scrollTop = thread.scrollHeight;
+}
+
+export function pinResolvedThreadToEnd(
+  resolveThread: () => Pick<HTMLElement, "scrollTop" | "scrollHeight"> | null,
+): boolean {
+  const thread = resolveThread();
+  if (!thread) return false;
+  pinThreadToEnd(thread);
+  return true;
+}
+
+export class ThreadTailFollowAffinity {
+  private viewportNearEnd = true;
+  private activeRun: ActiveThreadTailFollow | null = null;
+
+  get followingRun(): boolean {
+    return this.activeRun !== null;
+  }
+
+  get viewportIsNearEnd(): boolean {
+    return this.viewportNearEnd;
+  }
+
+  armRun(owner: ThreadTailFollowOwner): boolean {
+    if (!this.viewportNearEnd) return false;
+    const runtimeOwner = parseRuntimeOwner(owner.runtimeOwnerToken);
+    this.activeRun = {
+      workspacePath: owner.workspacePath,
+      sessionId: owner.sessionId,
+      initialRuntimeEpoch: runtimeOwner?.epoch ?? null,
+      runEpoch: runtimeOwner?.kind === "root" || runtimeOwner?.kind === "tree"
+        ? runtimeOwner.epoch
+        : null,
+      observedRunOwner: runtimeOwner?.kind === "root" || runtimeOwner?.kind === "tree",
+    };
+    return true;
+  }
+
+  reconcile(projection: ThreadTailFollowProjection): ThreadTailFollowDecision {
+    const activeRun = this.activeRun;
+    if (!activeRun) return noTailFollow();
+    if (activeRun.workspacePath !== projection.workspacePath) {
+      this.activeRun = null;
+      return noTailFollow();
+    }
+    if (activeRun.sessionId === null && projection.sessionId !== null) {
+      activeRun.sessionId = projection.sessionId;
+    } else if (
+      activeRun.sessionId !== null
+      && projection.sessionId !== activeRun.sessionId
+    ) {
+      this.activeRun = null;
+      return noTailFollow();
+    }
+
+    const runtimeOwner = parseRuntimeOwner(projection.runtimeOwnerToken);
+    if (!runtimeOwner) {
+      this.activeRun = null;
+      return noTailFollow();
+    }
+    if (runtimeOwner.kind === "root" || runtimeOwner.kind === "tree") {
+      if (activeRun.runEpoch !== null && activeRun.runEpoch !== runtimeOwner.epoch) {
+        this.activeRun = null;
+        return noTailFollow();
+      }
+      activeRun.runEpoch = runtimeOwner.epoch;
+      activeRun.observedRunOwner = true;
+    } else if (activeRun.runEpoch !== null) {
+      if (activeRun.runEpoch !== runtimeOwner.epoch) {
+        this.activeRun = null;
+        return noTailFollow();
+      }
+    } else if (
+      activeRun.initialRuntimeEpoch !== null
+      && activeRun.initialRuntimeEpoch !== runtimeOwner.epoch
+    ) {
+      // A very short run can settle before a root:<generation> projection is observed.
+      activeRun.runEpoch = runtimeOwner.epoch;
+      activeRun.observedRunOwner = true;
+    }
+
+    return {
+      follow: true,
+      clearAfterPin: activeRun.observedRunOwner
+        && !projection.runActive
+        && projection.terminal
+        && runtimeOwner.kind === "idle",
+    };
+  }
+
+  completeRender(decision: ThreadTailFollowDecision, pinnedToEnd: boolean): void {
+    if (!pinnedToEnd) return;
+    this.viewportNearEnd = true;
+    if (decision.clearAfterPin) this.activeRun = null;
+  }
+
+  noteUserViewport(nearEnd: boolean): void {
+    this.viewportNearEnd = nearEnd;
+    if (!nearEnd) this.activeRun = null;
+  }
+
+  noteUserScrollAway(): void {
+    this.noteUserViewport(false);
+  }
+
+  syncInactiveViewport(nearEnd: boolean): boolean {
+    if (this.activeRun) return false;
+    this.viewportNearEnd = nearEnd;
+    return true;
+  }
+
+  cancelRun(): void {
+    this.activeRun = null;
+  }
+}
+
+export function syncResolvedInactiveThreadViewport<T>(
+  affinity: ThreadTailFollowAffinity,
+  resolveThread: () => T | null,
+  isNearEnd: (thread: T) => boolean,
+): boolean {
+  const thread = resolveThread();
+  if (!thread) return false;
+  return affinity.syncInactiveViewport(isNearEnd(thread));
+}
+
+function noTailFollow(): ThreadTailFollowDecision {
+  return { follow: false, clearAfterPin: false };
+}
+
+function parseRuntimeOwner(token: string): RuntimeOwnerIdentity | null {
+  const match = /^(idle|root|tree):(.+)$/.exec(token);
+  if (!match) return null;
+  return {
+    kind: match[1] as RuntimeOwnerIdentity["kind"],
+    epoch: match[2]!,
+  };
 }
 
 export function transcriptAnchors(
@@ -216,6 +382,8 @@ export function historyPrependOwnerIdentity(state: HistoryPrependProjection): st
 }
 
 function transcriptIdentity(row: TranscriptRow): string {
+  const stableIdentity = row.stable_history_identity?.trim();
+  if (stableIdentity) return stableIdentity;
   // Polling changes both the elapsed label and the live work body. Keep the
   // rail/focus owner stable for the running phase just like its disclosure.
   if (row.row_kind === "work_summary_running" || row.row_kind === "work_summary_incomplete") {
@@ -228,6 +396,8 @@ function transcriptIdentity(row: TranscriptRow): string {
 }
 
 function transcriptDetailsIdentity(row: TranscriptRow): string {
+  const stableIdentity = row.stable_history_identity?.trim();
+  if (stableIdentity) return stableIdentity;
   // Work-summary titles can contain a live elapsed-time label. Keep the
   // disclosure owner stable while that visible label and body are refreshed;
   // the reverse occurrence still distinguishes multiple summaries.

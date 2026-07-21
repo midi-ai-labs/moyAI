@@ -331,7 +331,11 @@ pub fn build_session_detail(
     };
     detail.turn_page_has_more = read.turns.has_more;
     detail.session_id = session.id;
-    detail.transcript_rows = transcript_rows_from_turn_items_with_context(session, turn_items);
+    detail.transcript_rows = transcript_rows_from_turn_items_with_context_and_elapsed(
+        session,
+        turn_items,
+        &read.turn_elapsed_ms,
+    );
     detail.thread_empty = transcript_rows_are_empty_placeholder(&detail.transcript_rows);
     detail.artifacts = artifact_rows_from_file_changes(&file_changes);
     detail.file_change_summary_text = format_file_change_summary(&file_changes);
@@ -346,6 +350,7 @@ pub fn build_session_detail(
 
 #[derive(Default)]
 struct TurnTranscriptGroup {
+    turn_id: Option<crate::protocol::TurnId>,
     user_body: String,
     assistant_bodies: Vec<String>,
     tool_rows: Vec<String>,
@@ -367,47 +372,69 @@ impl TurnTranscriptGroup {
     }
 }
 
+#[cfg(test)]
 pub(super) fn transcript_rows_from_turn_items_with_context(
     session: &SessionRecord,
     turn_items: &[crate::protocol::TurnItem],
 ) -> Vec<DesktopTranscriptRow> {
+    transcript_rows_from_turn_items_with_context_and_elapsed(
+        session,
+        turn_items,
+        &std::collections::HashMap::new(),
+    )
+}
+
+pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed(
+    session: &SessionRecord,
+    turn_items: &[crate::protocol::TurnItem],
+    turn_elapsed_ms: &std::collections::HashMap<crate::protocol::TurnId, u64>,
+) -> Vec<DesktopTranscriptRow> {
     let mut rows = Vec::new();
     let mut current = TurnTranscriptGroup::default();
     let ordered = ordered_turn_items_for_projection(turn_items);
-    let show_session_elapsed_on_work_summary = ordered
-        .iter()
-        .filter(|item| {
-            matches!(
-                item.payload,
-                crate::protocol::TurnItemPayload::UserMessage { .. }
-                    | crate::protocol::TurnItemPayload::SteerMessage { .. }
-            )
-        })
-        .count()
-        <= 1;
     let mut immediately_preceding_agent_communication: Option<String> = None;
 
     for item in ordered {
+        if current
+            .turn_id
+            .is_some_and(|turn_id| turn_id != item.turn_id)
+        {
+            let elapsed_ms = current
+                .turn_id
+                .and_then(|turn_id| turn_elapsed_ms.get(&turn_id).copied());
+            flush_turn_transcript_group(&mut rows, session, &mut current, elapsed_ms, None, None);
+        }
+        current.turn_id.get_or_insert(item.turn_id);
         let preceding_agent_communication = immediately_preceding_agent_communication.take();
         match &item.payload {
             crate::protocol::TurnItemPayload::UserMessage { text } => {
+                let elapsed_ms = current
+                    .turn_id
+                    .and_then(|turn_id| turn_elapsed_ms.get(&turn_id).copied());
                 flush_turn_transcript_group(
                     &mut rows,
                     session,
                     &mut current,
-                    show_session_elapsed_on_work_summary,
+                    elapsed_ms,
                     None,
+                    Some(item.id),
                 );
+                current.turn_id = Some(item.turn_id);
                 current.user_body = text.clone();
             }
             crate::protocol::TurnItemPayload::SteerMessage { text } => {
+                let elapsed_ms = current
+                    .turn_id
+                    .and_then(|turn_id| turn_elapsed_ms.get(&turn_id).copied());
                 flush_turn_transcript_group(
                     &mut rows,
                     session,
                     &mut current,
-                    show_session_elapsed_on_work_summary,
+                    elapsed_ms,
                     None,
+                    Some(item.id),
                 );
+                current.turn_id = Some(item.turn_id);
                 current.user_body = text.clone();
             }
             crate::protocol::TurnItemPayload::AgentMessage { text } => {
@@ -527,12 +554,16 @@ pub(super) fn transcript_rows_from_turn_items_with_context(
             | crate::protocol::TurnItemPayload::WorldState { .. } => {}
         }
     }
+    let elapsed_ms = current
+        .turn_id
+        .and_then(|turn_id| turn_elapsed_ms.get(&turn_id).copied());
     flush_turn_transcript_group(
         &mut rows,
         session,
         &mut current,
-        show_session_elapsed_on_work_summary,
+        elapsed_ms,
         Some(session.status),
+        None,
     );
     if rows.is_empty() {
         rows.push(desktop_transcript_row(
@@ -556,6 +587,7 @@ fn desktop_transcript_row(
 ) -> DesktopTranscriptRow {
     DesktopTranscriptRow {
         row_kind,
+        stable_history_identity: None,
         step,
         title,
         body,
@@ -573,10 +605,12 @@ fn flush_turn_transcript_group(
     rows: &mut Vec<DesktopTranscriptRow>,
     session: &SessionRecord,
     group: &mut TurnTranscriptGroup,
-    show_session_elapsed_on_work_summary: bool,
+    elapsed_ms: Option<u64>,
     lifecycle_status: Option<SessionStatus>,
+    next_user_boundary_id: Option<crate::protocol::TurnItemId>,
 ) {
     if !group.has_content() {
+        group.turn_id = None;
         return;
     }
     if !group.user_body.trim().is_empty() {
@@ -598,13 +632,20 @@ fn flush_turn_transcript_group(
     );
     if has_work_summary {
         let row_kind = turn_work_summary_kind(group, lifecycle_status);
-        rows.push(desktop_transcript_row(
+        let mut row = desktop_transcript_row(
             row_kind,
             String::new(),
-            stored_turn_work_summary_title(session, row_kind, show_session_elapsed_on_work_summary),
+            stored_turn_work_summary_title(row_kind, elapsed_ms),
             turn_work_summary_body(group, &file_changes, lifecycle_status),
             Vec::new(),
-        ));
+        );
+        row.stable_history_identity = group.turn_id.map(|turn_id| {
+            next_user_boundary_id.map_or_else(
+                || turn_work_summary_stable_identity(turn_id),
+                |boundary_id| turn_work_summary_segment_stable_identity(turn_id, boundary_id),
+            )
+        });
+        rows.push(row);
     }
     for body in primary_assistant_bodies_for_turn_group(group) {
         if body.trim().is_empty() {
@@ -633,6 +674,18 @@ fn flush_turn_transcript_group(
     group.tool_rows.clear();
     group.file_change_items.clear();
     group.terminal_outcome = None;
+    group.turn_id = None;
+}
+
+pub(super) fn turn_work_summary_stable_identity(turn_id: crate::protocol::TurnId) -> String {
+    format!("turn:{turn_id}:work-summary")
+}
+
+fn turn_work_summary_segment_stable_identity(
+    turn_id: crate::protocol::TurnId,
+    next_user_boundary_id: crate::protocol::TurnItemId,
+) -> String {
+    format!("turn:{turn_id}:before:{next_user_boundary_id}:work-summary")
 }
 
 fn turn_work_summary_kind(
@@ -663,9 +716,8 @@ fn turn_work_summary_kind(
 }
 
 fn stored_turn_work_summary_title(
-    session: &SessionRecord,
     row_kind: DesktopTranscriptRowKind,
-    show_session_elapsed: bool,
+    elapsed_ms: Option<u64>,
 ) -> String {
     let base = match row_kind {
         DesktopTranscriptRowKind::WorkSummaryRunning => "作業中",
@@ -675,17 +727,11 @@ fn stored_turn_work_summary_title(
         DesktopTranscriptRowKind::WorkSummaryCompleted => "作業履歴 / 作業サマリ",
         _ => "作業履歴 / 作業サマリ",
     };
-    if !show_session_elapsed {
-        return base.to_string();
-    }
-    let Some(elapsed) = session_elapsed_label(session) else {
+    let Some(elapsed_ms) = elapsed_ms else {
         return base.to_string();
     };
+    let elapsed = format_duration(elapsed_ms);
     match row_kind {
-        DesktopTranscriptRowKind::WorkSummaryRunning => format!("{elapsed} 作業中"),
-        DesktopTranscriptRowKind::WorkSummaryIncomplete => {
-            format!("{elapsed} 状態未確定の作業履歴")
-        }
         DesktopTranscriptRowKind::WorkSummaryFailed => format!("{elapsed}で失敗しました"),
         DesktopTranscriptRowKind::WorkSummaryCancelled => format!("{elapsed}で停止しました"),
         DesktopTranscriptRowKind::WorkSummaryCompleted => format!("{elapsed}作業しました"),
@@ -995,7 +1041,7 @@ fn transcript_rows_with_context(
         || session
             .map(|session| session_status_is_terminal(session.status))
             .unwrap_or(false);
-    let work_summary = work_summary_row(state, session, file_changes);
+    let work_summary = work_summary_row(state, file_changes);
     let mut rows = fold_intermediate_assistant_rows(
         base_rows,
         state,
@@ -1099,7 +1145,6 @@ fn is_internal_transcript_projection(kind: DesktopTranscriptRowKind, title: &str
 
 fn work_summary_row(
     state: &AppState,
-    session: Option<&SessionRecord>,
     file_changes: &[DesktopFileChangeRow],
 ) -> Option<DesktopTranscriptRow> {
     let has_work = !state.tool_statuses.is_empty()
@@ -1120,18 +1165,20 @@ fn work_summary_row(
     Some(desktop_transcript_row(
         kind,
         String::new(),
-        work_summary_title(state, session),
+        work_summary_title(state),
         work_summary_body(state, file_changes),
         Vec::new(),
     ))
 }
 
-fn work_summary_title(state: &AppState, session: Option<&SessionRecord>) -> String {
-    let elapsed = session.and_then(session_elapsed_label);
+fn work_summary_title(state: &AppState) -> String {
+    let elapsed = state
+        .last_summary
+        .as_ref()
+        .and_then(|summary| summary.metrics().elapsed_ms)
+        .map(format_duration);
     match state.run_status {
-        RunStatus::Running => elapsed
-            .map(|value| format!("{value} 作業中"))
-            .unwrap_or_else(|| "作業中".to_string()),
+        RunStatus::Running => "作業中".to_string(),
         RunStatus::Failed => elapsed
             .map(|value| format!("{value}で失敗しました"))
             .unwrap_or_else(|| "失敗しました".to_string()),
@@ -1141,23 +1188,12 @@ fn work_summary_title(state: &AppState, session: Option<&SessionRecord>) -> Stri
         RunStatus::Completed => elapsed
             .map(|value| format!("{value}作業しました"))
             .unwrap_or_else(|| "作業しました".to_string()),
-        RunStatus::Idle => elapsed
-            .map(|value| format!("{value} 状態未確定の作業履歴"))
-            .unwrap_or_else(|| "状態未確定の作業履歴".to_string()),
+        RunStatus::Idle => "状態未確定の作業履歴".to_string(),
     }
 }
 
-fn session_elapsed_label(session: &SessionRecord) -> Option<String> {
-    let end = session
-        .completed_at_ms
-        .unwrap_or(session.updated_at_ms)
-        .max(session.created_at_ms);
-    let elapsed_ms = end.checked_sub(session.created_at_ms)?;
-    Some(format_duration(elapsed_ms))
-}
-
-fn format_duration(elapsed_ms: i64) -> String {
-    let total_seconds = (elapsed_ms / 1000).max(0);
+fn format_duration(elapsed_ms: u64) -> String {
+    let total_seconds = elapsed_ms / 1000;
     let minutes = total_seconds / 60;
     let seconds = total_seconds % 60;
     if minutes > 0 {
@@ -1554,6 +1590,37 @@ mod tests {
         session
     }
 
+    fn canonical_read_with_elapsed(
+        session: &SessionRecord,
+        turn_items: Vec<TurnItem>,
+        turn_elapsed_ms: std::collections::HashMap<crate::protocol::TurnId, u64>,
+    ) -> CanonicalSessionRead {
+        let latest_turn_id = turn_items.last().map(|item| item.turn_id);
+        CanonicalSessionRead {
+            session: session.clone(),
+            history: crate::session::CanonicalHistoryPage {
+                session: session.clone(),
+                offset: 0,
+                limit: usize::MAX,
+                total: 0,
+                has_more: false,
+                items: Vec::new(),
+            },
+            turns: crate::session::CanonicalTurnPage {
+                session: session.clone(),
+                offset: 0,
+                limit: DESKTOP_TURN_PAGE_LIMIT,
+                total: turn_items.len(),
+                has_more: false,
+                items: turn_items,
+            },
+            turn_elapsed_ms,
+            latest_turn_id,
+            active_turn_id: None,
+            active_turn_sequence_no: None,
+        }
+    }
+
     #[test]
     fn terminal_projection_uses_the_typed_outcome_as_its_only_owner() {
         let session = session_record(ProjectId::new(), "typed terminal");
@@ -1697,6 +1764,216 @@ mod tests {
         assert_eq!(
             turn_work_summary_kind(&group, None),
             DesktopTranscriptRowKind::WorkSummaryIncomplete
+        );
+    }
+
+    #[test]
+    fn work_summary_stable_identity_survives_running_to_completed_projection() {
+        let mut running_session = session_record(ProjectId::new(), "stable summary identity");
+        running_session.status = SessionStatus::Running;
+        running_session.completed_at_ms = None;
+        let turn_id = crate::protocol::TurnId::new();
+        let mut items = vec![
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: running_session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 1,
+                payload: TurnItemPayload::UserMessage {
+                    text: "inspect".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: running_session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 2,
+                payload: TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Shell,
+                    status: crate::protocol::ToolLifecycleStatus::Completed,
+                    title: "inspect".to_string(),
+                    summary: "done".to_string(),
+                },
+            },
+        ];
+        let running_rows = transcript_rows_from_turn_items_with_context(&running_session, &items);
+        let running_summary = running_rows
+            .iter()
+            .find(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryRunning)
+            .expect("running work summary");
+
+        let mut completed_session = running_session.clone();
+        completed_session.status = SessionStatus::Completed;
+        completed_session.completed_at_ms = Some(completed_session.updated_at_ms);
+        items.push(TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id: completed_session.id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 3,
+            payload: TurnItemPayload::Terminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
+            },
+        });
+        let completed_rows =
+            transcript_rows_from_turn_items_with_context(&completed_session, &items);
+        let completed_summary = completed_rows
+            .iter()
+            .find(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+            .expect("completed work summary");
+
+        assert_ne!(completed_summary.title, running_summary.title);
+        assert_ne!(completed_summary.body, running_summary.body);
+        assert_eq!(
+            completed_summary.stable_history_identity,
+            running_summary.stable_history_identity,
+        );
+        assert_eq!(
+            completed_summary.stable_history_identity.as_deref(),
+            Some(format!("turn:{turn_id}:work-summary").as_str()),
+        );
+    }
+
+    #[test]
+    fn same_turn_steer_segments_have_unique_durable_work_summary_identities() {
+        let session = session_record(ProjectId::new(), "stable steer segments");
+        let turn_id = crate::protocol::TurnId::new();
+        let steer_id = crate::protocol::TurnItemId::new();
+        let items = vec![
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 1,
+                payload: TurnItemPayload::UserMessage {
+                    text: "inspect".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 2,
+                payload: TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Shell,
+                    status: crate::protocol::ToolLifecycleStatus::Completed,
+                    title: "inspect".to_string(),
+                    summary: "first segment".to_string(),
+                },
+            },
+            TurnItem {
+                id: steer_id,
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 3,
+                payload: TurnItemPayload::SteerMessage {
+                    text: "also verify".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 4,
+                payload: TurnItemPayload::AgentMessage {
+                    text: "done".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 5,
+                payload: TurnItemPayload::Terminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                },
+            },
+        ];
+
+        let identities = transcript_rows_from_turn_items_with_context(&session, &items)
+            .into_iter()
+            .filter(|row| {
+                matches!(
+                    row.row_kind,
+                    DesktopTranscriptRowKind::WorkSummaryIncomplete
+                        | DesktopTranscriptRowKind::WorkSummaryCompleted
+                )
+            })
+            .map(|row| {
+                row.stable_history_identity
+                    .expect("stable work summary identity")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            identities,
+            vec![
+                format!("turn:{turn_id}:before:{steer_id}:work-summary"),
+                turn_work_summary_stable_identity(turn_id),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignored_only_turn_does_not_leak_elapsed_or_identity_across_partial_boundary() {
+        let session = session_record(ProjectId::new(), "partial ignored boundary");
+        let ignored_turn = crate::protocol::TurnId::new();
+        let visible_turn = crate::protocol::TurnId::new();
+        let items = vec![
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id: ignored_turn,
+                source_item_id: None,
+                sequence_no: 1,
+                payload: TurnItemPayload::Plan {
+                    explanation: None,
+                    plan: Vec::new(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id: visible_turn,
+                source_item_id: None,
+                sequence_no: 2,
+                payload: TurnItemPayload::AgentMessage {
+                    text: "visible partial answer".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id: visible_turn,
+                source_item_id: None,
+                sequence_no: 3,
+                payload: TurnItemPayload::Terminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                },
+            },
+        ];
+        let elapsed =
+            std::collections::HashMap::from([(ignored_turn, 1_000), (visible_turn, 91_889)]);
+
+        let summary =
+            transcript_rows_from_turn_items_with_context_and_elapsed(&session, &items, &elapsed)
+                .into_iter()
+                .find(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+                .expect("visible turn work summary");
+
+        assert_eq!(summary.title, "1m 31s作業しました");
+        assert_eq!(
+            summary.stable_history_identity.as_deref(),
+            Some(turn_work_summary_stable_identity(visible_turn).as_str()),
         );
     }
 
@@ -2367,7 +2644,7 @@ mod tests {
             error: None,
         }];
 
-        let row = work_summary_row(&state, None, &[]).expect("idle work summary");
+        let row = work_summary_row(&state, &[]).expect("idle work summary");
 
         assert_eq!(
             row.row_kind,
@@ -2415,7 +2692,7 @@ mod tests {
         ] {
             state.run_status = status;
             assert_eq!(
-                work_summary_row(&state, None, &[])
+                work_summary_row(&state, &[])
                     .expect("live work summary")
                     .row_kind,
                 expected
@@ -2424,12 +2701,44 @@ mod tests {
     }
 
     #[test]
-    fn stored_session_work_summary_uses_elapsed_time_and_hides_internal_rows() {
+    fn live_completed_work_summary_uses_terminal_elapsed_not_session_elapsed() {
+        let mut state = AppState::default();
+        state.run_status = RunStatus::Completed;
+        state.last_summary = Some(crate::session::RunSummary::from_terminal(
+            SessionId::new(),
+            crate::protocol::TurnId::new(),
+            crate::session::DurableTurnTerminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                final_response_id: None,
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: crate::session::RunMetrics {
+                    elapsed_ms: Some(50_970),
+                    ..Default::default()
+                },
+            },
+        ));
+        let mut session = session_record(ProjectId::new(), "live terminal elapsed");
+        session.created_at_ms = 1_000;
+        session.updated_at_ms = 908_000;
+        session.completed_at_ms = Some(908_000);
+
+        let row = transcript_rows_with_context(&state, Some(&session), &[])
+            .into_iter()
+            .find(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+            .expect("completed work summary");
+
+        assert_eq!(row.title, "50s作業しました");
+    }
+
+    #[test]
+    fn stored_turn_work_summary_uses_terminal_elapsed_time_and_hides_internal_rows() {
         let project_id = ProjectId::new();
         let mut session = session_record(project_id, "workflow");
         session.created_at_ms = 1_000;
-        session.updated_at_ms = 108_000;
-        session.completed_at_ms = Some(108_000);
+        session.updated_at_ms = 908_000;
+        session.completed_at_ms = Some(908_000);
         let turn_id = crate::protocol::TurnId::new();
         let turn_items = vec![
             TurnItem {
@@ -2492,31 +2801,12 @@ mod tests {
             },
         ];
 
-        let detail = build_session_detail(
-            &CanonicalSessionRead {
-                session: session.clone(),
-                history: crate::session::CanonicalHistoryPage {
-                    session: session.clone(),
-                    offset: 0,
-                    limit: usize::MAX,
-                    total: 0,
-                    has_more: false,
-                    items: Vec::new(),
-                },
-                turns: crate::session::CanonicalTurnPage {
-                    session,
-                    offset: 0,
-                    limit: DESKTOP_TURN_PAGE_LIMIT,
-                    total: turn_items.len(),
-                    has_more: false,
-                    items: turn_items,
-                },
-                latest_turn_id: Some(turn_id),
-                active_turn_id: None,
-                active_turn_sequence_no: None,
-            },
-            None,
+        let read = canonical_read_with_elapsed(
+            &session,
+            turn_items.clone(),
+            std::collections::HashMap::from([(turn_id, 107_000)]),
         );
+        let detail = build_session_detail(&read, None);
 
         assert!(detail.transcript_rows.iter().any(|row| {
             row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted
@@ -2532,6 +2822,138 @@ mod tests {
             row.row_kind == DesktopTranscriptRowKind::Assistant
                 && row.body.contains("src/workflow.rs")
         }));
+
+        let legacy = build_session_detail(
+            &canonical_read_with_elapsed(&session, turn_items, Default::default()),
+            None,
+        );
+        assert!(legacy.transcript_rows.iter().any(|row| {
+            row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted
+                && row.title == "作業履歴 / 作業サマリ"
+        }));
+    }
+
+    #[test]
+    fn completed_turn_durations_remain_stable_after_later_turn_and_compaction() {
+        let session = session_record(ProjectId::new(), "stable durations");
+        let turn_a = crate::protocol::TurnId::new();
+        let turn_b = crate::protocol::TurnId::new();
+        let turn_c = crate::protocol::TurnId::new();
+        let item = |turn_id, sequence_no, payload| TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id: session.id,
+            turn_id,
+            source_item_id: None,
+            sequence_no,
+            payload,
+        };
+        let initial_items = vec![
+            item(
+                turn_a,
+                1,
+                TurnItemPayload::UserMessage {
+                    text: "stage 1".to_string(),
+                },
+            ),
+            item(
+                turn_a,
+                2,
+                TurnItemPayload::AgentMessage {
+                    text: "stage 1 done".to_string(),
+                },
+            ),
+            item(
+                turn_a,
+                3,
+                TurnItemPayload::Terminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                },
+            ),
+            item(
+                turn_b,
+                1,
+                TurnItemPayload::UserMessage {
+                    text: "stage 2".to_string(),
+                },
+            ),
+            item(
+                turn_b,
+                2,
+                TurnItemPayload::AgentMessage {
+                    text: "stage 2 done".to_string(),
+                },
+            ),
+            item(
+                turn_b,
+                3,
+                TurnItemPayload::Terminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                },
+            ),
+        ];
+        let elapsed = std::collections::HashMap::from([(turn_a, 50_970), (turn_b, 91_889)]);
+        let initial = build_session_detail(
+            &canonical_read_with_elapsed(&session, initial_items.clone(), elapsed.clone()),
+            None,
+        );
+        let initial_titles = initial
+            .transcript_rows
+            .iter()
+            .filter(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+            .map(|row| row.title.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            initial_titles,
+            vec!["50s作業しました", "1m 31s作業しました"]
+        );
+
+        let mut later_items = initial_items;
+        later_items.extend([
+            item(
+                turn_c,
+                1,
+                TurnItemPayload::UserMessage {
+                    text: "stage 3".to_string(),
+                },
+            ),
+            item(
+                turn_c,
+                2,
+                TurnItemPayload::ContextCompaction {
+                    summary: "later-turn compaction".to_string(),
+                },
+            ),
+            item(
+                turn_c,
+                3,
+                TurnItemPayload::AgentMessage {
+                    text: "stage 3 done".to_string(),
+                },
+            ),
+            item(
+                turn_c,
+                4,
+                TurnItemPayload::Terminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                },
+            ),
+        ]);
+        let mut later_elapsed = elapsed;
+        later_elapsed.insert(turn_c, 125_000);
+        let later = build_session_detail(
+            &canonical_read_with_elapsed(&session, later_items, later_elapsed),
+            None,
+        );
+        let later_titles = later
+            .transcript_rows
+            .iter()
+            .filter(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+            .map(|row| row.title.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            later_titles,
+            vec!["50s作業しました", "1m 31s作業しました", "2m 5s作業しました",]
+        );
     }
 
     #[test]

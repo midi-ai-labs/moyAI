@@ -242,6 +242,7 @@ pub struct CanonicalProtocolSnapshot {
     pub fence: CanonicalProtocolFence,
     pub history: ProtocolPage<HistoryItem>,
     pub turns: ProtocolPage<TurnItem>,
+    pub turn_elapsed_ms: HashMap<TurnId, u64>,
     pub latest_turn_position: Option<(TurnId, i64)>,
 }
 
@@ -1940,13 +1941,59 @@ pub(crate) fn canonical_protocol_snapshot_from_connection(
     )?;
     let turns =
         turn_item_page_from_connection(connection, session_id, turn_request, fence.turn_count)?;
+    let turn_elapsed_ms = turn_elapsed_ms_from_connection(connection, session_id, &turns.items)?;
     let latest_turn_position = latest_turn_position_for_session(connection, session_id)?;
     Ok(CanonicalProtocolSnapshot {
         fence,
         history,
         turns,
+        turn_elapsed_ms,
         latest_turn_position,
     })
+}
+
+fn turn_elapsed_ms_from_connection(
+    connection: &Connection,
+    session_id: SessionId,
+    turn_items: &[TurnItem],
+) -> Result<HashMap<TurnId, u64>, StorageError> {
+    let mut seen = HashSet::new();
+    let turn_ids = turn_items
+        .iter()
+        .map(|item| item.turn_id)
+        .filter(|turn_id| seen.insert(*turn_id))
+        .collect::<Vec<_>>();
+    let mut elapsed_by_turn = HashMap::with_capacity(turn_ids.len());
+    let mut statement = connection.prepare(
+        "SELECT msg_json
+         FROM protocol_runtime_events
+         WHERE session_id = ?1 AND turn_id = ?2
+           AND json_extract(msg_json, '$.kind') = 'turn_terminal'
+         ORDER BY sequence_no DESC, rowid DESC
+         LIMIT 1",
+    )?;
+    for turn_id in turn_ids {
+        let terminal_json = statement
+            .query_row(
+                params![session_id.to_string(), turn_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(terminal_json) = terminal_json else {
+            continue;
+        };
+        let RuntimeEventMsg::TurnTerminal { terminal } =
+            serde_json::from_str::<RuntimeEventMsg>(&terminal_json)?
+        else {
+            return Err(StorageError::Message(
+                "terminal runtime-event discriminator did not decode as TurnTerminal".to_string(),
+            ));
+        };
+        if let Some(elapsed_ms) = terminal.metrics.elapsed_ms {
+            elapsed_by_turn.insert(turn_id, elapsed_ms);
+        }
+    }
+    Ok(elapsed_by_turn)
 }
 
 fn protocol_source_count(
@@ -3832,17 +3879,18 @@ mod tests {
                 text: "second".to_string(),
             },
         };
+        let mut second_terminal = completed_terminal_event(session_id, second_turn, 1);
+        let RuntimeEventMsg::TurnTerminal { terminal } = &mut second_terminal.msg else {
+            unreachable!("completed terminal fixture projects a terminal runtime event");
+        };
+        terminal.metrics.elapsed_ms = Some(91_889);
         for (history, turn_item, runtime) in [
             (
                 &first_history,
                 &first_turn_item,
                 warning_event(session_id, first_turn, 0, "first"),
             ),
-            (
-                &second_history,
-                &second_turn_item,
-                warning_event(session_id, second_turn, 0, "second"),
-            ),
+            (&second_history, &second_turn_item, second_terminal),
         ] {
             store
                 .seed_history_item_for_test(history)
@@ -3871,6 +3919,8 @@ mod tests {
         assert_eq!(snapshot.history.items[0].id, second_history.id);
         assert_eq!(snapshot.turns.offset, 1);
         assert_eq!(snapshot.turns.items[0].id, second_turn_item.id);
+        assert_eq!(snapshot.turn_elapsed_ms.get(&second_turn), Some(&91_889));
+        assert!(!snapshot.turn_elapsed_ms.contains_key(&first_turn));
         assert_eq!(snapshot.latest_turn_position, Some((second_turn, 3)));
 
         let runtime_page = store

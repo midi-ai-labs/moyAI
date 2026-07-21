@@ -658,6 +658,7 @@ impl DesktopState {
                 transcript_text: "チャットはまだありません。".to_string(),
                 transcript_rows: vec![crate::desktop::models::DesktopTranscriptRow {
                     row_kind: crate::desktop::models::DesktopTranscriptRowKind::EmptyPlaceholder,
+                    stable_history_identity: None,
                     step: "00".to_string(),
                     title: "チャットはありません".to_string(),
                     body: if self.selected_project_id().is_some() {
@@ -1823,6 +1824,7 @@ mod tests {
                 has_more: false,
                 items: turn_items,
             },
+            turn_elapsed_ms: Default::default(),
             latest_turn_id,
             active_turn_id: None,
             active_turn_sequence_no: None,
