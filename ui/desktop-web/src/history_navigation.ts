@@ -397,7 +397,17 @@ function transcriptIdentity(row: TranscriptRow): string {
 
 function transcriptDetailsIdentity(row: TranscriptRow): string {
   const stableIdentity = row.stable_history_identity?.trim();
-  if (stableIdentity) return stableIdentity;
+  if (stableIdentity) {
+    // The rail/focus owner stays bound to the durable turn while its running
+    // WorkSummary becomes terminal. The disclosure owner is phase-scoped so
+    // an automatically-open running card renders with the terminal default
+    // (collapsed), while a user-opened terminal card still survives later
+    // title/body refreshes and history prepends.
+    if (row.row_kind.startsWith("work_summary")) {
+      return `${stableIdentity}\u0000${row.row_kind}`;
+    }
+    return stableIdentity;
+  }
   // Work-summary titles can contain a live elapsed-time label. Keep the
   // disclosure owner stable while that visible label and body are refreshed;
   // the reverse occurrence still distinguishes multiple summaries.

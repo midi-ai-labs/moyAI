@@ -1824,7 +1824,8 @@ test("settings enum controls render only Rust-projected option values", () => {
 });
 
 test("canonical row_kind selects specialized transcript rendering", () => {
-  const html = renderThreadContent(projection({
+  const stableHistoryIdentity = "turn:01STABLE:work-summary";
+  const running = renderThreadContent(projection({
     thread_empty: false,
     transcript_rows: [{
       row_kind: "work_summary_running",
@@ -1832,10 +1833,32 @@ test("canonical row_kind selects specialized transcript rendering", () => {
       title: "Work",
       body: "running",
       file_changes: [],
+      stable_history_identity: stableHistoryIdentity,
     }],
   }));
-  assert.match(html, /message work-summary work_summary_running/);
-  assert.match(html, /<details[^>]+open>/);
+  const completed = renderThreadContent(projection({
+    thread_empty: false,
+    transcript_rows: [{
+      row_kind: "work_summary_completed",
+      step: "1",
+      title: "1分作業しました",
+      body: "completed",
+      file_changes: [],
+      stable_history_identity: stableHistoryIdentity,
+    }],
+  }));
+
+  assert.match(running, /message work-summary work_summary_running/);
+  assert.match(running, /<details[^>]+open>/);
+  assert.doesNotMatch(completed, /<details[^>]+open>/);
+  const runningFocusKey = running.match(/<summary data-focus-key="([^"]+)"/)?.[1];
+  const completedFocusKey = completed.match(/<summary data-focus-key="([^"]+)"/)?.[1];
+  const runningDetailsKey = running.match(/<details data-details-key="([^"]+)"/)?.[1];
+  const completedDetailsKey = completed.match(/<details data-details-key="([^"]+)"/)?.[1];
+  assert.ok(runningFocusKey);
+  assert.equal(completedFocusKey, runningFocusKey, "phase changes retain keyboard focus ownership");
+  assert.ok(runningDetailsKey);
+  assert.notEqual(completedDetailsKey, runningDetailsKey, "phase changes reset automatic disclosure state");
 });
 
 test("conversation rows render naturally with stable rail anchors and inline earlier history", () => {

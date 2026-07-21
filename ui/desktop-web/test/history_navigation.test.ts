@@ -303,7 +303,7 @@ test("work-summary disclosure identities survive only the phase-appropriate upda
   );
 });
 
-test("durable work-summary identity survives mutable presentation and separates turns", () => {
+test("durable work-summary anchor survives phase changes while disclosure state is phase-scoped", () => {
   const stableIdentity = "turn:01STABLE:work-summary";
   const running = {
     ...transcriptRow("work_summary_running", "12s 作業中", "以前の進捗"),
@@ -319,13 +319,29 @@ test("durable work-summary identity survives mutable presentation and separates 
     ...completed,
     stable_history_identity: "turn:01OTHER:work-summary",
   };
+  const completedUpdated = {
+    ...completed,
+    title: "19s作業しました",
+    body: "更新後の最終結果",
+    file_changes: [{ label: "latest", path: "latest.txt", action: "更新", summary: "latest" }],
+  };
 
   const runningAnchor = transcriptAnchors([running])[0]!;
   const completedAnchor = transcriptAnchors([completed])[0]!;
+  const completedUpdatedAnchor = transcriptAnchors([completedUpdated])[0]!;
   const otherTurnAnchor = transcriptAnchors([otherTurn])[0]!;
 
   assert.equal(completedAnchor.id, runningAnchor.id);
-  assert.equal(completedAnchor.detailsId, runningAnchor.detailsId);
+  assert.notEqual(
+    completedAnchor.detailsId,
+    runningAnchor.detailsId,
+    "the automatically-open running disclosure must not keep the terminal card open",
+  );
+  assert.equal(
+    completedUpdatedAnchor.detailsId,
+    completedAnchor.detailsId,
+    "an explicitly opened terminal disclosure survives mutable presentation refreshes",
+  );
   assert.notEqual(otherTurnAnchor.id, completedAnchor.id);
   assert.notEqual(otherTurnAnchor.detailsId, completedAnchor.detailsId);
 });
