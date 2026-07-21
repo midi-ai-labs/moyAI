@@ -1075,25 +1075,34 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
                 title,
                 status,
                 summary,
-            } => Some(TranscriptEntry {
-                kind: if *status == ToolLifecycleStatus::Failed {
-                    TranscriptKind::Error
-                } else if *status == ToolLifecycleStatus::Pending
-                    || *status == ToolLifecycleStatus::Running
-                {
-                    transcript_kind_for_tool_pending(*tool)
-                } else {
-                    TranscriptKind::Tool
-                },
-                title: tool_status_transcript_title(*tool, *status).to_string(),
-                body: if summary.trim().is_empty() {
-                    format!("{title} [{status:?}]")
-                } else {
-                    format!("{title} [{status:?}]\n{}", summary.trim())
-                },
-                response_id: None,
-                tool_call_id: Some(*call_id),
-            }),
+            } => {
+                let failed = *status == ToolLifecycleStatus::Failed;
+                Some(TranscriptEntry {
+                    kind: if failed {
+                        TranscriptKind::Error
+                    } else if *status == ToolLifecycleStatus::Pending
+                        || *status == ToolLifecycleStatus::Running
+                    {
+                        transcript_kind_for_tool_pending(*tool)
+                    } else {
+                        TranscriptKind::Tool
+                    },
+                    title: if failed {
+                        format!("Tool {tool}")
+                    } else {
+                        tool_status_transcript_title(*tool, *status).to_string()
+                    },
+                    body: if failed {
+                        summary.clone()
+                    } else if summary.trim().is_empty() {
+                        format!("{title} [{status:?}]")
+                    } else {
+                        format!("{title} [{status:?}]\n{}", summary.trim())
+                    },
+                    response_id: None,
+                    tool_call_id: Some(*call_id),
+                })
+            }
             TurnItemPayload::FileChange {
                 call_id,
                 changes,
@@ -1362,6 +1371,40 @@ mod tests {
             .expect("pending tool transcript entry");
         assert_eq!(transcript.body, "vendor.custom_tool");
         assert_eq!(transcript.tool_call_id, Some(tool_call_id));
+    }
+
+    #[test]
+    fn failed_tool_reload_projection_matches_the_runtime_error_entry() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let tool_call_id = ToolCallId::new();
+        let error = "tool edit error: no edit baseline exists".to_string();
+        let mut runtime = AppState::default();
+
+        runtime.apply_run_event(&RunEvent::ToolCallFailed {
+            tool_call_id,
+            tool: ToolName::Write,
+            error: error.clone(),
+            metadata: serde_json::Value::Null,
+        });
+        let loaded = transcript_entries_from_turn_items(&[TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 1,
+            payload: TurnItemPayload::ToolStatus {
+                call_id: tool_call_id,
+                tool: ToolName::Write,
+                status: ToolLifecycleStatus::Failed,
+                title: "Tool failed".to_string(),
+                summary: error,
+            },
+        }]);
+
+        assert_eq!(loaded, vec![runtime.transcript_entries[0].clone()]);
+        assert_eq!(loaded[0].kind, TranscriptKind::Error);
+        assert_eq!(loaded[0].title, "Tool write");
     }
 
     #[test]

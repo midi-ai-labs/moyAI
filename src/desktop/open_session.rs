@@ -1245,6 +1245,190 @@ mod tests {
     }
 
     #[test]
+    fn terminal_reconciliation_keeps_all_turn_summaries_after_compaction_and_tool_failure() {
+        let session = session();
+        let first_turn = TurnId::new();
+        let second_turn = TurnId::new();
+        let third_turn = TurnId::new();
+        let mut items = Vec::new();
+        let mut append_busy_completed_turn = |turn_id: TurnId, request: &str, answer: &str| {
+            items.push(turn_item(
+                session.id,
+                turn_id,
+                1,
+                TurnItemPayload::UserMessage {
+                    text: request.to_string(),
+                },
+            ));
+            for sequence_no in 2..=40 {
+                items.push(turn_item(
+                    session.id,
+                    turn_id,
+                    sequence_no,
+                    TurnItemPayload::ToolStatus {
+                        call_id: crate::session::ToolCallId::new(),
+                        tool: crate::tool::ToolName::Shell,
+                        status: crate::protocol::ToolLifecycleStatus::Completed,
+                        title: format!("step {sequence_no}"),
+                        summary: "completed".to_string(),
+                    },
+                ));
+            }
+            items.push(turn_item(
+                session.id,
+                turn_id,
+                41,
+                TurnItemPayload::AgentMessage {
+                    text: answer.to_string(),
+                },
+            ));
+            items.push(turn_item(
+                session.id,
+                turn_id,
+                42,
+                TurnItemPayload::Terminal {
+                    outcome: TurnTerminalOutcome::Completed,
+                },
+            ));
+        };
+        append_busy_completed_turn(first_turn, "first request", "first final answer");
+        append_busy_completed_turn(second_turn, "second request", "second final answer");
+        items.extend([
+            turn_item(
+                session.id,
+                third_turn,
+                1,
+                TurnItemPayload::UserMessage {
+                    text: "third request".to_string(),
+                },
+            ),
+            turn_item(
+                session.id,
+                third_turn,
+                2,
+                TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Write,
+                    status: crate::protocol::ToolLifecycleStatus::Failed,
+                    title: "Tool failed".to_string(),
+                    summary: "tool edit error: no edit baseline exists".to_string(),
+                },
+            ),
+            turn_item(
+                session.id,
+                third_turn,
+                3,
+                TurnItemPayload::ContextCompaction {
+                    summary: "retained compact context".to_string(),
+                },
+            ),
+            turn_item(
+                session.id,
+                third_turn,
+                4,
+                TurnItemPayload::Error {
+                    message: "first compaction feedback".to_string(),
+                },
+            ),
+            turn_item(
+                session.id,
+                third_turn,
+                5,
+                TurnItemPayload::ContextCompaction {
+                    summary: "retained compact context again".to_string(),
+                },
+            ),
+            turn_item(
+                session.id,
+                third_turn,
+                6,
+                TurnItemPayload::Error {
+                    message: "second compaction feedback".to_string(),
+                },
+            ),
+            turn_item(
+                session.id,
+                third_turn,
+                7,
+                TurnItemPayload::AgentMessage {
+                    text: "third final answer".to_string(),
+                },
+            ),
+            turn_item(
+                session.id,
+                third_turn,
+                8,
+                TurnItemPayload::Terminal {
+                    outcome: TurnTerminalOutcome::Completed,
+                },
+            ),
+        ]);
+        assert!(items.len() > 80);
+        let mut first_page = canonical_read(&session, 0, 80, items.len(), items[..80].to_vec());
+        first_page.latest_turn_id = Some(third_turn);
+        let mut latest_page = canonical_read(&session, 80, 80, items.len(), items[80..].to_vec());
+        latest_page.latest_turn_id = Some(third_turn);
+        let mut view = OpenSessionView::from_loaded(&first_page);
+        assert!(view.merge_contiguous(&latest_page));
+        assert_eq!(view.read.turns.offset, 0);
+        assert_eq!(view.loaded_turn_end(), items.len());
+        let mut live = AppState::default();
+        live.load_turn_items(&session, &items);
+
+        let detail = view.live_detail(&live, None);
+        let summary_rows = detail
+            .transcript_rows
+            .iter()
+            .filter(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+            .collect::<Vec<_>>();
+
+        assert_eq!(summary_rows.len(), 3);
+        assert_eq!(
+            summary_rows
+                .iter()
+                .map(|row| row.stable_history_identity.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(turn_work_summary_stable_identity(first_turn)),
+                Some(turn_work_summary_stable_identity(second_turn)),
+                Some(turn_work_summary_stable_identity(third_turn)),
+            ]
+        );
+        assert_eq!(
+            detail
+                .transcript_rows
+                .iter()
+                .filter(|row| row.row_kind == DesktopTranscriptRowKind::Error)
+                .count(),
+            3
+        );
+        let failed_tool_error = detail
+            .transcript_rows
+            .iter()
+            .find(|row| row.body == "tool edit error: no edit baseline exists")
+            .expect("failed tool error row");
+        assert_eq!(failed_tool_error.row_kind, DesktopTranscriptRowKind::Error);
+        assert_eq!(failed_tool_error.title, "エラー - Tool write");
+        for (summary, answer) in [
+            (summary_rows[0], "first final answer"),
+            (summary_rows[1], "second final answer"),
+            (summary_rows[2], "third final answer"),
+        ] {
+            let summary_index = detail
+                .transcript_rows
+                .iter()
+                .position(|row| std::ptr::eq(row, summary))
+                .expect("summary row position");
+            let answer_index = detail
+                .transcript_rows
+                .iter()
+                .position(|row| row.body == answer)
+                .expect("final assistant row");
+            assert!(summary_index < answer_index);
+        }
+    }
+
+    #[test]
     fn terminal_live_detail_folds_no_tool_intermediate_assistant_rows_after_reopen() {
         let session = session();
         let turn_id = TurnId::new();
