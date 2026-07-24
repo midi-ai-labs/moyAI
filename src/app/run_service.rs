@@ -749,6 +749,17 @@ impl RunService {
             current_time: crate::context::current_time::CurrentTimeSnapshot::now(),
         });
         let admitted_result: Result<RunSummary, AppRunError> = async {
+            if let Some(context) = agent_context
+                .as_ref()
+                .filter(|context| context.is_sub_agent())
+            {
+                // Publish Running only after the durable session admission
+                // exists. PendingInit mail can therefore be committed without
+                // racing a not-yet-created active turn.
+                context
+                    .mark_durable_turn_admitted()
+                    .map_err(AppRunError::Message)?;
+            }
             if let Some(adoption) = request.session_access_mode_adoption.as_ref() {
                 adoption
                     .adopt(session_id, session_context.session.access_mode)

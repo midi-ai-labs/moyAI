@@ -251,81 +251,76 @@ impl LlmError {
         }
     }
 
-    /// Returns true only when the provider explicitly identifies the Responses
-    /// continuation cursor as the rejected part of the request. This is kept
-    /// separate from transport retries: callers may retry once with full
-    /// canonical history, never by replaying a stale cursor.
-    pub fn rejects_previous_response_id(&self) -> bool {
-        if let Self::ProviderFailure { source, .. } = self {
-            return source.rejects_previous_response_id();
+    pub fn is_context_window_exceeded(&self) -> bool {
+        match self {
+            Self::ProviderFailure { source, .. } => source.is_context_window_exceeded(),
+            Self::ProviderRejected { code, .. } | Self::ProviderGenerationFailed { code, .. } => {
+                code.as_deref() == Some("context_length_exceeded")
+            }
+            _ => false,
         }
-        if let Self::ProviderGenerationFailed { code, .. } = self {
-            return code.as_deref().is_some_and(|value| {
-                let value = value.to_ascii_lowercase();
-                value.contains("previous_response") || value.contains("response_not_found")
-            });
-        }
-        let Self::ProviderRejected {
-            status,
-            code,
-            param,
-            message: _,
-        } = self
-        else {
-            return false;
-        };
-        if status.is_some_and(|status| !(400..500).contains(&status)) {
-            return false;
-        }
-        let param_is_cursor = param.as_deref().is_some_and(|value| {
-            value.eq_ignore_ascii_case("previous_response_id")
-                || value.eq_ignore_ascii_case("previous_response")
-        });
-        let code_is_cursor = code.as_deref().is_some_and(|value| {
-            let value = value.to_ascii_lowercase();
-            value.contains("previous_response") || value.contains("response_not_found")
-        });
-        param_is_cursor || code_is_cursor
     }
 }
 
 #[cfg(test)]
 mod llm_error_tests {
     use super::LlmError;
+    use crate::llm::{ProviderFailure, ProviderFailureKind, ProviderPhase, ProviderRequestId};
 
     #[test]
-    fn previous_response_rejection_is_typed_and_narrow() {
+    fn context_window_rejection_requires_the_provider_code() {
         let rejected = LlmError::ProviderRejected {
             status: Some(400),
-            code: Some("invalid_previous_response_id".to_string()),
-            param: Some("previous_response_id".to_string()),
-            message: "previous response was not found".to_string(),
+            code: Some("context_length_exceeded".to_string()),
+            param: None,
+            message: "maximum context length exceeded".to_string(),
         };
-        assert!(rejected.rejects_previous_response_id());
-
-        let ordinary = LlmError::ProviderRejected {
-            status: Some(400),
-            code: Some("invalid_request".to_string()),
-            param: Some("tools".to_string()),
-            message: "tool schema is invalid".to_string(),
-        };
-        assert!(!ordinary.rejects_previous_response_id());
+        assert!(rejected.is_context_window_exceeded());
 
         let message_only = LlmError::ProviderRejected {
             status: Some(400),
-            code: None,
+            code: Some("invalid_request".to_string()),
             param: None,
-            message: "previous_response_id was not found".to_string(),
+            message: "maximum context length exceeded".to_string(),
         };
-        assert!(!message_only.rejects_previous_response_id());
+        assert!(!message_only.is_context_window_exceeded());
 
-        let streamed_rejection = LlmError::ProviderGenerationFailed {
-            response_id: Some("resp_failed".to_string()),
-            code: Some("invalid_previous_response_id".to_string()),
-            message: "previous response was not found".to_string(),
+        let differently_cased = LlmError::ProviderRejected {
+            status: Some(400),
+            code: Some("CONTEXT_LENGTH_EXCEEDED".to_string()),
+            param: None,
+            message: "maximum context length exceeded".to_string(),
+        };
+        assert!(!differently_cased.is_context_window_exceeded());
+
+        let streamed = LlmError::ProviderGenerationFailed {
+            response_id: Some("resp-overflow".to_string()),
+            code: Some("context_length_exceeded".to_string()),
+            message: "maximum context length exceeded".to_string(),
             max_output_tokens: 8_192,
         };
-        assert!(streamed_rejection.rejects_previous_response_id());
+        assert!(streamed.is_context_window_exceeded());
+
+        let nested = LlmError::ProviderFailure {
+            failure: ProviderFailure {
+                request_id: ProviderRequestId::new(),
+                endpoint: "http://provider.invalid".to_string(),
+                phase: ProviderPhase::ProviderTerminal,
+                attempt: 1,
+                elapsed_ms: 10,
+                kind: ProviderFailureKind::Generation,
+                status: None,
+                code: Some("context_length_exceeded".to_string()),
+                message: "wrapped context overflow".to_string(),
+            },
+            source: Box::new(LlmError::ProviderGenerationFailed {
+                response_id: Some("resp-wrapped-overflow".to_string()),
+                code: Some("context_length_exceeded".to_string()),
+                message: "maximum context length exceeded".to_string(),
+                max_output_tokens: 8_192,
+            }),
+        };
+        assert!(nested.is_context_window_exceeded());
     }
 }
 

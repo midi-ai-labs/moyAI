@@ -63,10 +63,10 @@ moyAI is designed around those constraints:
 - Desktop Stop validates the projected workspace, root session, run generation, and Agent Tree epoch, so stale UI actions cannot cancel a later run. Settings values, baseline, dirty state, and monotonic revision exist only in one frontend-local draft owner. Rust projects typed clean/dirty capability variants and statelessly validates a complete draft plus a decimal-string config-generation target before Apply, Save, Reset, or another config-owner mutation. Commit builds one complete temporary `ResolvedConfig`, preserving cleared optional values instead of re-layering them. Active-turn steer clears input only after durable acceptance.
 - CLI and TUI for terminal-centered workflows.
 - OpenAI-compatible local LLM connection with explicit model availability diagnostics. moyAI connects to the configured external HTTP endpoint; it does not launch or supervise the provider process.
-- Evidence-first task planning with canonical `update_plan` as a client-visible progress projection, not an execution gate.
+- Evidence-first task planning with canonical `update_plan` as a client-visible progress projection, plus an admitted-turn-scoped root-ownership checkpoint for fresh proactive multi-agent work.
 - One immutable `ResolvedTurnConfig`/turn/step context captured at admission, canonical protocol history, and atomic response-scoped assistant/raw-tool-call commits keyed by `ModelResponseId`.
-- LM Studio Responses API support with turn-scoped `previous_response_id` continuity and typed reasoning summaries.
-- Automatic LLM semantic compaction near the context threshold, using response/call-output semantic units, a prepared-request token target, giant-item map/reduce, replacement lineage, and non-destructive no-progress handling.
+- LM Studio Responses API support with full canonical HTTP input replay and typed reasoning summaries.
+- Automatic LLM semantic compaction near the context threshold, using provider-reported total usage plus a Codex-style UTF-8-bytes/4 local suffix estimate, a full-request local fallback, full native summary requests with typed overflow reduction, and durable replacement lineage.
 - LM Studio metadata discovery through `/v1/models` and `/api/v1/models`.
 - Bounded workspace traversal/search/directory inspection with continuation cursors, guarded file reads, diff-based edits, and shell execution.
 - File writes and patches use one stable-handle, no-clobber conditional commit for create, update, delete, and rollback. A concurrent external replacement wins without being overwritten; if restoration cannot reclaim the target name, moyAI reports the preserved backup path. Parent directories are not created implicitly, so create the parent first.
@@ -76,7 +76,7 @@ moyAI is designed around those constraints:
 - Optional Docling Serve and HTTP MCP integration for document-heavy workflows.
 - Local instructions from `AGENTS.md`, `CLAUDE.md`, `.moyai/rules*`, `.moyai/commands/*.md`, and local `SKILL.md` files.
 - Canonical protocol session history, typed turn terminals, Markdown export, and lightweight live-smoke artifacts.
-- Optional root-scoped multi-agent collaboration with separate child sessions and visible Desktop activity.
+- Root-scoped multi-agent collaboration, available by default for explicit delegation requests, with separate child sessions and visible Desktop activity.
 
 ## Current Release
 
@@ -164,12 +164,12 @@ model = "qwen/qwen3.6-35b-a3b"
 provider_metadata_mode = "lm_studio_native_required"
 provider_api_mode = "responses"
 reasoning_summary = "none"
-request_timeout_ms = 300000
-stream_idle_timeout_ms = 300000
+request_timeout_ms = 600000
+stream_idle_timeout_ms = 600000
 context_window = 131072
 supports_tools = true
 supports_images = true
-max_output_tokens = 8192
+max_output_tokens = 16384
 
 [model.extra_body_json]
 num_ctx = 131072
@@ -178,7 +178,7 @@ num_ctx = 131072
 access_mode = "default"
 
 [multi_agent]
-enabled = false
+enabled = true
 mode = "explicit_request_only"
 max_concurrent_agents = 4
 max_concurrent_model_requests = 1
@@ -193,11 +193,11 @@ enabled = false
 
 `request_timeout_ms` is one response-start operation budget shared by connection attempts, connection
 retry delays, request-body upload, and waiting for response headers. `stream_idle_timeout_ms` limits a period with no SSE
-event after streaming starts. Both default to 300,000 ms. They are no-progress deadlines, not a cap on
+event after streaming starts. Both default to 600,000 ms. They are no-progress deadlines, not a cap on
 total generation time; explicit config or environment overrides remain supported.
 `max_output_tokens` bounds the complete model output, including reasoning and serialized tool-call
 arguments. Tool-heavy runs that write a whole document need the provider's verified profile budget;
-the bundled LM Studio/Qwen profile and product default use `8192`. A provider-side
+the product default uses `16384`. A provider-side
 `response.failed` such as `Failed to parse tool call: Unexpected end of content` is reported as a
 generation failure with the configured budget and is not treated as a locally parsed or executed
 tool call.
@@ -307,15 +307,18 @@ config unless a provider exposes those fields in `/v1/models`.
 Choose `provider_api_mode = "chat_completions"` explicitly for a provider that requires
 `/v1/chat/completions`. The retired string `auto` is accepted only at the config/serde input boundary
 and normalized one way to `responses`; it is not a runtime mode and metadata mode no longer changes
-the generation transport implicitly. The Responses transport keeps provider state within the active
-turn by reusing `previous_response_id` and sending only new tool outputs or steer input after a
-completed response. Raw reasoning text is neither replayed nor stored as assistant context. A
+the generation transport implicitly. The HTTP Responses transport sends the complete current
+canonical input on every request, including any compaction checkpoint, and does not send
+`previous_response_id`. Raw reasoning text is neither replayed nor stored as assistant context. A
 requested typed reasoning summary is a runtime-only client event, not a durable conversation or
 runtime row.
 
 Every generation request has a runtime-only provider request ID and reports the phases
 `attempt_started`, `request_in_flight`, `headers_received`, `first_progress`, `last_progress`, and
-`provider_terminal`, plus attempt/elapsed data and a sanitized endpoint. These are transport
+`provider_terminal`, plus attempt/elapsed data, a sanitized endpoint, and provider-reported token
+usage on a successful terminal when the provider supplies it. Prepared-request diagnostics keep the
+logical model-message count separate from the exact HTTP wire input-item count and serialized body
+size, without retaining the body. These are transport
 boundaries observed by moyAI; they do not infer provider-process startup, server-side acceptance, or
 model-instance loading. A long `request_in_flight` phase establishes only that the operation has not
 reached response headers. Before POST, moyAI bounds messages, tools, schemas, extra body, stop data,
@@ -334,7 +337,7 @@ the admitted permission preset, and remaining effective settings, then gives its
 owner the turn/admission identity, selected policy, and durable collaboration-mode instruction. Partial
 configuration is resolved only before admission and is not merged again by later runtime stages.
 It also captures one turn-start wall-clock snapshot. Step/world-state refreshes reuse that snapshot so
-a clock tick alone does not invalidate Responses continuity; an explicit `current_time` tool call still
+a clock tick alone does not change model-visible time; an explicit `current_time` tool call still
 performs a fresh read.
 Session/workspace state remains in `SessionContext`, while the root-scoped agent context owns the
 agent-tree role. Model, provider, deadline, multi-agent, and `RunConfigSnapshot` state remain immutable
@@ -467,34 +470,71 @@ fail closed rather than relying on the index alone.
 V45 restores the current three-value session access domain: `default`, `auto_review`, and `full_access`.
 Values already collapsed to `default` by V38 cannot be distinguished from genuine Default choices and
 are therefore not reconstructed; users can explicitly select Auto Review again after the upgrade.
+V46 upgrades recoverable stored v1 compaction rows to the `user_anchored_checkpoint` layout by
+reconstructing bounded real-user anchors from canonical append order. Rows whose real-user text cannot
+be recovered remain explicit `legacy_prefix` checkpoints without changing their effective ordering.
+The migration validates JSON, hashes, session-local replacement lineage, and anchor bounds, rewrites
+compaction rows in bounded pages, and rolls back without its marker when validation fails.
 
-The default tool surface exposes `update_plan` for non-trivial work. Its structured result is only a
-client-visible plan projection: it does not decide the next tool, end the turn, or trigger
-compaction. A durable Plan mode exists internally, keeps `update_plan`, and hides mutation tools, but no
-CLI, TUI, or Desktop mode selector is currently exposed.
+The default tool surface exposes `update_plan` for non-trivial work. Its structured result is a
+client-visible plan projection: moyAI does not interpret plan text to select the next tool, end the
+turn, or trigger compaction. On a fresh proactive root turn only, successful settlement of
+`update_plan` records that root owns the immediate blocker; this is an ownership decision, not a
+host-authored task plan. A durable Plan mode exists internally, keeps `update_plan`, and hides
+mutation tools, but no CLI, TUI, or Desktop mode selector is currently exposed.
 
-When a prepared request reaches the model policy's context threshold, moyAI selects model-visible
-semantic units rather than a fixed item count. One provider response's assistant text, calls, and
-settled outputs stay together, and compaction stops before an unsettled call. It selects units until
-the prepared request reaches the model token target; a single giant item is split to the model's input
-capacity and summarized through map/reduce. The exact replacement lineage is committed while original
-history remains stored. If character volume or the prepared-request token estimate does not shrink,
-or summarization otherwise fails, history remains unchanged; below the hard limit the original history
+At the model policy's 90% working target, moyAI selects model-visible semantic units rather than a
+fixed item count. When available, the latest provider-reported total is rehydrated from the durable
+turn terminal and combined with only the local items appended after that model response. Otherwise,
+the full prepared request uses the same coarse UTF-8-bytes/4 fallback as Codex. Request diagnostics
+identify which source was used. One provider response's assistant text,
+calls, and settled outputs stay together; no compaction is attempted while a tool response is
+unsettled. Summary generation keeps the base instructions and native User / Assistant / tool
+structure, appends the Codex checkpoint prompt as the final User input, and sends no tools or provider
+cursor. It first sends that full native request. Only a typed `context_length_exceeded` response removes
+the oldest provider-native item (and its exact call/output counterpart when required) before retrying;
+there is no semantic map/reduce path.
+
+The resulting checkpoint retains the newest real User and Steer text inputs in original order
+within a conservative 20,000-token budget. One boundary input is middle-truncated instead of being
+dropped whole, and the prefixed summary is the final User input; old summaries are never promoted to
+anchors. A delegated turn's canonical `NEW_TASK` remains an anchor, while ordinary agent messages and
+final handoffs belong in the summary. The exact
+replacement lineage is committed while original history remains stored.
+If cancellation occurs or summarization otherwise fails, history remains unchanged; below the hard limit the original history
 continues, and at the hard limit the run fails explicitly.
 
 An active session goal is not declared successful after an arbitrary number of idle continuations. It
 continues until the goal state, its token/elapsed budget, cancellation, or a typed terminal provides a
 semantic stopping condition.
 
-## Multi-Agent Collaboration (Opt-in)
+## Multi-Agent Collaboration
 
-Multi-agent collaboration is disabled by default. Set `[multi_agent].enabled = true` in Settings or
-the config file to expose these six tools to the model: `spawn_agent`, `send_message`,
-`followup_task`, `wait_agent`, `interrupt_agent`, and `list_agents`.
+Multi-agent collaboration is available by default and normally exposes these six tools to the model:
+`spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, and
+`list_agents`. Set `[multi_agent].enabled = false` in Settings or the config file to hide them.
 
 - `mode = "explicit_request_only"` delegates only when the user explicitly requests agents,
   sub-agents, delegation, or parallel agent work. `mode = "proactive"` also lets the model delegate
-  bounded independent work when doing so materially improves quality or latency.
+  bounded parallel work or context-isolated sequential handoffs when doing so materially improves
+  quality, latency, or context efficiency.
+- A fresh proactive root turn starts with only `spawn_agent` and `update_plan` visible. A completed
+  `spawn_agent` enters delegated ownership and keeps root on `spawn_agent`, `send_message`,
+  `followup_task`, `wait_agent`, `interrupt_agent`, `list_agents`, and `update_plan`; workspace
+  tools remain with the child. A completed `update_plan` chooses root-local ownership of a distinct,
+  non-overlapping immediate blocker and restores the normal root surface on the next model request.
+  Failed or declined calls do not change ownership. A response that contains `spawn_agent` cannot
+  execute a workspace-tool sibling even if that sibling was visible before delegation. Children,
+  explicit-request-only mode, Plan mode, tool-less models, and empty-prompt continuations do not use
+  this checkpoint. The choice is scoped to the admitted root turn, survives compaction, and does not
+  create a persisted planner, task DAG, or package-size classifier.
+- The root keeps the overall objective, constraints, compact progress, integration, and final answer,
+  while the model chooses concrete task boundaries from the current evidence. There is no fixed
+  scout/stage router. A child owns one verifiable outcome with a clear scope and, when it writes, one
+  mutation owner. Sequential dependency handoffs do not need to run simultaneously. In proactive
+  mode, set `fork_turns` explicitly: use `"none"` for a self-contained task packet and `"all"` only
+  when the child needs parent context. Parallel mutations must have disjoint targets, overlapping
+  targets have one writer, and material changes can receive a later independent read-only verification.
 - The first release uses one flat `/root/<task>` namespace: only the root may call `spawn_agent`, every
   child is linked directly to that root, and a child cannot spawn another Sub Agent.
 - `max_concurrent_agents` is the root-inclusive limit for simultaneously active agents. The default
@@ -507,11 +547,15 @@ the config file to expose these six tools to the model: `spawn_agent`, `send_mes
   only when the configured inference server can safely sustain parallel requests.
 - Each child is a separate durable session linked directly to its root. Normal project/session lists keep
   those implementation sessions hidden. `spawn_agent` accepts `fork_turns = "all"` (the default)
-  or `"none"`; `"all"` streams active history in bounded pages under a stable append fence and copies the currently active user turns, visible assistant messages, durable
+  or `"none"`; `"all"` streams active history in bounded pages under a stable append fence and copies the currently active user turns, plain final assistant messages owned by successfully completed terminals, durable
   collaboration-mode instruction, and active compaction summary. History replaced by that summary is
   not resurrected, and reasoning, tool traffic, retired control state, and permission evidence are not
   copied. Target-session existence is checked in the same transaction; a fence mismatch or mid-copy
   failure rolls back the entire fork. Sub Agent activity is recorded only while its owning root session has a fresh active turn.
+- Spawn, follow-up, ordinary message, and child completion are delivered as Codex-style
+  `NEW_TASK`, `MESSAGE`, and `FINAL_ANSWER` envelopes rather than a new user request. The parent
+  receives the child's concise final handoff, not its private investigation transcript, and integrates
+  that evidence without repeating the completed scope unless contrary evidence appears.
 - Every continuation turn receives a fresh run control, while the Stop target remains the retained
   root Agent Tree. A completed turn's terminal classification is not reopened for the next turn: a
   Stop that wins first blocks continuation, and a continuation that wins first is stopped as part of

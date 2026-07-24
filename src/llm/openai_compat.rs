@@ -511,6 +511,7 @@ impl<'a> ProviderTraceSink<'a> {
             attempt: self.attempt,
             elapsed_ms: self.elapsed_ms(),
             terminal_status: None,
+            usage: None,
             failure: None,
         })
     }
@@ -588,6 +589,7 @@ impl<'a> ProviderTraceSink<'a> {
                 attempt: self.attempt,
                 elapsed_ms,
                 terminal_status: None,
+                usage: None,
                 failure: None,
             }) {
                 return Err(self.normalize_projection_failure(source, result.err()));
@@ -609,6 +611,7 @@ impl<'a> ProviderTraceSink<'a> {
                     attempt: self.attempt,
                     elapsed_ms: self.elapsed_ms(),
                     terminal_status: Some(terminal_status),
+                    usage: summary.usage.clone(),
                     failure: None,
                 }) {
                     return Err(self.normalize_failure(source));
@@ -619,6 +622,7 @@ impl<'a> ProviderTraceSink<'a> {
                 let Some(failure) = provider_failure else {
                     return Err(source);
                 };
+                let usage = source.token_usage().cloned();
                 self.current_phase = ProviderPhase::ProviderTerminal;
                 if let Err(projection_source) = self.project_provider_phase(ProviderPhaseEvent {
                     request_id: self.request_id.clone(),
@@ -627,6 +631,7 @@ impl<'a> ProviderTraceSink<'a> {
                     attempt: self.attempt,
                     elapsed_ms: self.elapsed_ms(),
                     terminal_status: Some(ProviderTerminalStatus::Failed),
+                    usage,
                     failure: Some(failure),
                 }) {
                     return Err(self.normalize_projection_failure(projection_source, Some(source)));
@@ -1547,7 +1552,7 @@ pub(crate) fn to_openai_request_with_reasoning(
     let mut non_system_messages = Vec::with_capacity(request.messages.len());
     for message in &request.messages {
         match message {
-            ModelMessage::System { content } => {
+            ModelMessage::System { content } | ModelMessage::Developer { content } => {
                 let trimmed = content.trim();
                 if !trimmed.is_empty() {
                     system_segments.push(trimmed.to_string());
@@ -1564,6 +1569,12 @@ pub(crate) fn to_openai_request_with_reasoning(
     });
     messages.extend(non_system_messages.into_iter().map(|message| {
         match message {
+            ModelMessage::Agent { content } => OpenAiMessage {
+                role: "user".to_string(),
+                content: Some(OpenAiContent::Text(content.clone())),
+                tool_calls: None,
+                tool_call_id: None,
+            },
             ModelMessage::User { content } => OpenAiMessage {
                 role: "user".to_string(),
                 content: Some(OpenAiContent::Text(content.clone())),
@@ -1628,7 +1639,9 @@ pub(crate) fn to_openai_request_with_reasoning(
                 tool_calls: None,
                 tool_call_id: Some(call_id.clone()),
             },
-            ModelMessage::System { .. } => unreachable!("system messages are merged above"),
+            ModelMessage::System { .. } | ModelMessage::Developer { .. } => {
+                unreachable!("instruction messages are merged above")
+            }
         }
     }));
     let base = OpenAiChatRequest {
@@ -1947,7 +1960,7 @@ mod tests {
     use crate::llm::{
         ChatRequest, LlmClient, LlmEvent, LlmEventSink, ModelCapabilities, ModelMessage,
         ModelProfile, ModelToolCall, ProviderFailureKind, ProviderPhase, ProviderPhaseEvent,
-        ProviderTerminalStatus, ProviderToolChoice, ResponsesContinuation, ToolSchema,
+        ProviderTerminalStatus, ProviderToolChoice, ToolSchema,
     };
     use crate::session::{FinishReason, TokenUsage};
 
@@ -2030,6 +2043,93 @@ mod tests {
         let system_prompt = first_system_prompt(&body);
 
         assert_eq!(system_prompt, "Base coding prompt");
+    }
+
+    #[test]
+    fn chat_wire_keeps_the_real_user_anchor_before_the_latest_summary() {
+        let model = ModelProfile {
+            name: "openai-compatible-fixture-model".to_string(),
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            capabilities: ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: false,
+                supports_images: false,
+            },
+        };
+        let provider = provider_target(
+            "http://openai-compatible.fixture.invalid",
+            &model.name,
+            model.provider_metadata_mode,
+            ProviderApiMode::ChatCompletions,
+            ProviderDeadlines {
+                response_start_timeout_ms: 30_000,
+                stream_idle_timeout_ms: 300_000,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 0,
+            },
+        );
+        let summary = format!(
+            "{}\nThe tests were inspected and the implementation remains pending.",
+            include_str!("../../assets/prompts/compaction_summary_prefix.md").trim()
+        );
+        let request = ChatRequest::new(
+            provider,
+            model,
+            "Base coding prompt".to_string(),
+            vec![
+                ModelMessage::Developer {
+                    content: "<multi_agent_mode>proactive</multi_agent_mode>".to_string(),
+                },
+                ModelMessage::Developer {
+                    content: "<sub_agent>Return verified evidence.</sub_agent>".to_string(),
+                },
+                ModelMessage::Agent {
+                    content: "Message Type: NEW_TASK\nPayload:\nInspect the calculator."
+                        .to_string(),
+                },
+                ModelMessage::User {
+                    content: "Continue the calculator task.".to_string(),
+                },
+                ModelMessage::User {
+                    content: summary.clone(),
+                },
+            ],
+            Vec::new(),
+            None,
+            ProviderReasoningCapability::Unsupported,
+            BTreeMap::new(),
+        );
+
+        let body = to_openai_request(&request).expect("compacted Chat wire");
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], json!("system"));
+        assert_eq!(
+            messages[0]["content"],
+            json!(
+                "Base coding prompt\n\n<multi_agent_mode>proactive</multi_agent_mode>\n\n<sub_agent>Return verified evidence.</sub_agent>"
+            )
+        );
+        assert_eq!(messages[1]["role"], json!("user"));
+        assert_eq!(
+            messages[1]["content"],
+            json!("Message Type: NEW_TASK\nPayload:\nInspect the calculator.")
+        );
+        assert_eq!(messages[2]["role"], json!("user"));
+        assert_eq!(
+            messages[2]["content"],
+            json!("Continue the calculator task.")
+        );
+        assert_eq!(messages[3]["role"], json!("user"));
+        assert_eq!(messages[3]["content"], json!(summary));
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message["role"] == json!("developer"))
+        );
     }
 
     #[test]
@@ -2192,7 +2292,6 @@ mod tests {
                 Some(&reasoning),
                 ProviderReasoningCapability::Responses {
                     supports_summary: true,
-                    supports_previous_response_id: true,
                 },
             )
             .is_err()
@@ -3561,6 +3660,12 @@ mod tests {
                 ModelMessage::System {
                     content: "Repository policy".to_string(),
                 },
+                ModelMessage::Developer {
+                    content: "Root delegation plan".to_string(),
+                },
+                ModelMessage::Developer {
+                    content: "Proactive delegation mode".to_string(),
+                },
                 ModelMessage::User {
                     content: "Inspect the repository".to_string(),
                 },
@@ -3629,6 +3734,10 @@ mod tests {
             sink.phases.last().and_then(|event| event.terminal_status),
             Some(ProviderTerminalStatus::Completed)
         );
+        assert_eq!(
+            sink.phases.last().and_then(|event| event.usage.as_ref()),
+            summary.usage.as_ref()
+        );
 
         let captured = requests.lock().expect("Responses request capture");
         assert_eq!(captured.len(), 1);
@@ -3636,7 +3745,9 @@ mod tests {
         assert_eq!(wire["model"], json!("responses-fixture-model"));
         assert_eq!(
             wire["instructions"],
-            json!("Responses fixture instructions\n\nRepository policy")
+            json!(
+                "Responses fixture instructions\n\nRepository policy\n\nRoot delegation plan\n\nProactive delegation mode"
+            )
         );
         assert_eq!(
             wire["input"],
@@ -3654,14 +3765,14 @@ mod tests {
             json!({ "effort": "high", "summary": "detailed" })
         );
         assert_eq!(wire["max_output_tokens"], json!(4_096));
-        assert_eq!(wire["store"], json!(true));
+        assert_eq!(wire["store"], json!(false));
         assert_eq!(wire["stream"], json!(true));
         assert!(wire.get("messages").is_none());
         assert!(wire.get("previous_response_id").is_none());
     }
 
     #[tokio::test]
-    async fn responses_transport_reuses_response_id_and_sends_only_incremental_tool_output() {
+    async fn responses_http_transport_replays_complete_canonical_input_without_cursor() {
         let first_response = responses_sse([
             json!({
                 "type": "response.output_item.done",
@@ -3794,18 +3905,12 @@ mod tests {
                 metadata: Value::Null,
             },
         ];
-        second_request.responses_continuation = Some(ResponsesContinuation {
-            previous_response_id: first_summary
-                .response_id
-                .expect("first response id for continuation"),
-            input_start: 2,
-        });
         let mut second_sink = RecordingLlmEventSink::default();
 
         let second_summary = client
             .stream_chat(second_request, CancellationToken::new(), &mut second_sink)
             .await
-            .expect("continued Responses stream");
+            .expect("full-history Responses stream");
         server.abort();
 
         assert_eq!(second_summary.finish_reason, FinishReason::Stop);
@@ -3833,11 +3938,20 @@ mod tests {
                 "content": [{ "type": "input_text", "text": "Inspect README.md" }]
             }])
         );
-        assert_eq!(captured[1]["previous_response_id"], json!("resp_tool_1"));
+        assert!(captured[1].get("previous_response_id").is_none());
         assert_eq!(captured[1]["num_ctx"], json!(131_072));
         assert_eq!(
             captured[1]["input"],
             json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Inspect README.md" }]
+            }, {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            }, {
                 "type": "function_call_output",
                 "call_id": "call_1",
                 "output": "README contents"
@@ -4449,6 +4563,21 @@ mod tests {
                         reasoning_tokens: None,
                     })
                 ));
+                assert!(matches!(
+                    sink.phases.last(),
+                    Some(ProviderPhaseEvent {
+                        phase: ProviderPhase::ProviderTerminal,
+                        terminal_status: Some(ProviderTerminalStatus::Failed),
+                        usage: Some(TokenUsage {
+                            prompt_tokens: 10,
+                            completion_tokens: 20,
+                            total_tokens: 30,
+                            reasoning_tokens: None,
+                        }),
+                        failure: Some(terminal_failure),
+                        ..
+                    }) if terminal_failure.kind == ProviderFailureKind::Generation
+                ));
             } else {
                 assert!(error.token_usage().is_none());
             }
@@ -4711,7 +4840,6 @@ mod tests {
             None,
             ProviderReasoningCapability::Responses {
                 supports_summary: true,
-                supports_previous_response_id: true,
             },
             BTreeMap::new(),
         )

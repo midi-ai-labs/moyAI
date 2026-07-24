@@ -18,7 +18,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::ConfirmationPrompt;
 use crate::config::MultiAgentMode;
-use crate::context::context_window::ContextWindowTokenStatus;
+#[cfg(test)]
+use crate::context::context_window::{COMPACTION_USER_MESSAGE_MAX_TOKENS, estimate_text_tokens};
+use crate::context::context_window::{ContextWindowTokenStatus, bounded_compaction_user_messages};
 use crate::context::world_state::WorldState;
 use crate::error::AgentError;
 use crate::llm::{
@@ -52,6 +54,7 @@ use crate::tool::registry::ToolRegistry;
 const TOOL_CANCELLATION_CLEANUP_TIMEOUT: Duration =
     crate::tool::process::MANAGED_PROCESS_CLEANUP_GRACE;
 const PERMISSION_GUARDIAN_TOTAL_DEADLINE: Duration = Duration::from_secs(90);
+const COMPACTION_ACCURACY_WARNING: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
 
 async fn await_tool_cancellation_cleanup<T>(
     cleanup: impl Future<Output = T>,
@@ -69,7 +72,6 @@ impl PromptBuilder {
         world_state: &WorldState,
         skills_snapshot: &crate::skill::SkillsSnapshot,
         turn: &turn_context::TurnContext,
-        is_sub_agent: bool,
     ) -> String {
         let mut sections = vec![
             turn.policy.model.base_instructions.trim().to_string(),
@@ -79,28 +81,45 @@ impl PromptBuilder {
         if let Some(instructions) = turn.mode.developer_instructions {
             sections.insert(1, instructions.trim().to_string());
         }
-        if let Some(multi_agent_mode) = turn.multi_agent_mode() {
-            sections.push(
-                match multi_agent_mode {
-                    MultiAgentMode::ExplicitRequestOnly => {
-                        include_str!("../../assets/prompts/multi_agent_explicit.md")
-                    }
-                    MultiAgentMode::Proactive => {
-                        include_str!("../../assets/prompts/multi_agent_proactive.md")
-                    }
-                }
-                .trim()
-                .to_string(),
-            );
-            if is_sub_agent {
-                sections.push(
-                    include_str!("../../assets/prompts/sub_agent.md")
-                        .trim()
-                        .to_string(),
-                );
-            }
-        }
         sections.join("\n\n")
+    }
+
+    fn multi_agent_context_messages(
+        &self,
+        turn: &turn_context::TurnContext,
+        is_sub_agent: bool,
+    ) -> Vec<ModelMessage> {
+        let Some(multi_agent_mode) = turn.multi_agent_mode() else {
+            return Vec::new();
+        };
+        let max_concurrent_agents = turn
+            .resolved_config()
+            .runtime_config()
+            .multi_agent
+            .max_concurrent_agents
+            .to_string();
+        let usage_hint = if is_sub_agent {
+            include_str!("../../assets/prompts/sub_agent.md")
+        } else {
+            include_str!("../../assets/prompts/multi_agent_root.md")
+        }
+        .replace("{{max_concurrent_agents}}", &max_concurrent_agents);
+        let mode_instructions = match multi_agent_mode {
+            MultiAgentMode::ExplicitRequestOnly => {
+                include_str!("../../assets/prompts/multi_agent_explicit.md")
+            }
+            MultiAgentMode::Proactive => {
+                include_str!("../../assets/prompts/multi_agent_proactive.md")
+            }
+        };
+        vec![
+            ModelMessage::Developer {
+                content: usage_hint.trim().to_string(),
+            },
+            ModelMessage::Developer {
+                content: mode_instructions.trim().to_string(),
+            },
+        ]
     }
 }
 
@@ -135,6 +154,83 @@ impl AgentRunRequest {
     fn model_name(&self) -> &str {
         &self.turn.policy.model.id
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootOwnershipState {
+    NotRequired,
+    Awaiting,
+    RootLocal,
+    Delegated,
+}
+
+impl RootOwnershipState {
+    fn for_request(request: &AgentRunRequest) -> Self {
+        let is_sub_agent = request
+            .agent_context
+            .as_ref()
+            .is_some_and(crate::app::AgentRunContext::is_sub_agent);
+        let has_fresh_user_turn = has_canonical_user_turn(&request.context, request.turn_id());
+        Self::for_turn(
+            has_fresh_user_turn,
+            is_sub_agent,
+            request.turn.mode.kind,
+            request.turn.multi_agent_mode(),
+            request.turn.policy.model.supports_tools,
+        )
+    }
+
+    fn for_turn(
+        has_fresh_user_turn: bool,
+        is_sub_agent: bool,
+        mode_kind: mode::ModeKind,
+        multi_agent_mode: Option<MultiAgentMode>,
+        supports_tools: bool,
+    ) -> Self {
+        if has_fresh_user_turn
+            && !is_sub_agent
+            && mode_kind == mode::ModeKind::Default
+            && multi_agent_mode == Some(MultiAgentMode::Proactive)
+            && supports_tools
+        {
+            Self::Awaiting
+        } else {
+            Self::NotRequired
+        }
+    }
+
+    fn tool_surface(self) -> crate::tool::spec_plan::RootOwnershipToolSurface {
+        match self {
+            Self::NotRequired | Self::RootLocal => {
+                crate::tool::spec_plan::RootOwnershipToolSurface::Normal
+            }
+            Self::Awaiting => crate::tool::spec_plan::RootOwnershipToolSurface::AwaitingDecision,
+            Self::Delegated => {
+                crate::tool::spec_plan::RootOwnershipToolSurface::DelegatedCollaboration
+            }
+        }
+    }
+
+    fn apply_settled_response(&mut self, completed_spawn: bool, completed_plan: bool) {
+        if *self == Self::NotRequired {
+            return;
+        }
+        if completed_spawn {
+            *self = Self::Delegated;
+        } else if completed_plan && matches!(*self, Self::Awaiting | Self::Delegated) {
+            *self = Self::RootLocal;
+        }
+    }
+}
+
+fn has_canonical_user_turn(context: &context_manager::ContextManager, turn_id: TurnId) -> bool {
+    context.history_items().iter().any(|item| {
+        item.turn_id() == Some(turn_id)
+            && matches!(
+                &item.payload,
+                crate::protocol::HistoryItemPayload::UserTurn { .. }
+            )
+    })
 }
 
 #[derive(Clone)]
@@ -194,8 +290,16 @@ impl AgentLoop {
             .as_ref()
             .map(|goal| goal.goal_id().to_string());
         let mut last_model_response_id: Option<ModelResponseId> = None;
-        let mut llm_turn =
-            crate::llm::turn_session::LlmTurnSession::new(request.context.revision().as_str());
+        // One admitted-run owner. It is initialized once per root turn and
+        // deliberately survives every model round and semantic compaction.
+        let mut root_ownership = RootOwnershipState::for_request(&request);
+        let previous_terminal = repo
+            .latest_durable_terminal_before_turn(request.session.session.id, request.turn_id())
+            .await?;
+        let mut active_context_tokens = context_manager::ActiveContextTokenState::rehydrate(
+            &request.context,
+            previous_terminal.as_ref(),
+        );
 
         let outcome: Result<RunSummary, AgentError> = async {
             loop {
@@ -225,10 +329,9 @@ impl AgentLoop {
                     request.session.session.id,
                     &mut request.context,
                 )?;
-                llm_turn.update_history(
-                    history_update_kind(context_refresh.delta.change),
-                    request.context.revision().as_str(),
-                );
+                if context_refresh.delta.change == context_manager::HistoryChange::Compacted {
+                    active_context_tokens.reset_after_compaction();
+                }
                 if context_refresh.has_more {
                     continue;
                 }
@@ -253,11 +356,13 @@ impl AgentLoop {
                 } else {
                     crate::tool::spec_plan::AgentToolRole::Root
                 };
-                let tool_plan = crate::tool::spec_plan::ToolSpecPlan::build_for_agent(
-                    &step,
-                    &step_registry,
-                    agent_role,
-                );
+                let tool_plan =
+                    crate::tool::spec_plan::ToolSpecPlan::build_for_agent_with_root_ownership(
+                        &step,
+                        &step_registry,
+                        agent_role,
+                        root_ownership.tool_surface(),
+                    );
                 step.refresh_world_state(
                     &request.session.workspace,
                     &tool_plan.tool_names(),
@@ -277,14 +382,18 @@ impl AgentLoop {
                     agent.set_activity(format!("Preparing model request {}", model_request_count + 1));
                 }
 
-                let mut prepared_request =
+                let prepared_request =
                     self.chat_request(&request, &step, &messages, &tool_plan, goal_snapshot.as_ref())?;
-                llm_turn.prepare_request(
-                    &mut prepared_request.chat_request,
-                    request.context.revision().as_str(),
-                )?;
-                let context_status = ContextWindowTokenStatus::for_request(
+                let supports_images = request
+                    .turn
+                    .policy
+                    .model
+                    .input_modalities
+                    .contains(&crate::llm::model_policy::InputModality::Image);
+                let context_status = active_context_tokens.status_for_request(
+                    &request.context,
                     &prepared_request.chat_request,
+                    supports_images,
                     request
                         .turn
                         .resolved_config()
@@ -305,7 +414,7 @@ impl AgentLoop {
                         .await
                     {
                         Ok(true) => {
-                            llm_turn.invalidate_cursor();
+                            active_context_tokens.reset_after_compaction();
                             continue;
                         }
                         Ok(false) if context_status.token_limit_reached => {
@@ -340,13 +449,15 @@ impl AgentLoop {
                             .runtime_config()
                             .session
                             .overflow_margin_tokens,
+                        Some(context_status.clone()),
                     ),
                 })?;
                 renew_admission_lease(&self.store, &request).await?;
                 model_request_count += 1;
                 let model_response_id = ModelResponseId::new();
-                let mut sent_request = prepared_request.chat_request.clone();
-                let Some((mut response_result, mut collector)) = self
+                let sent_request = prepared_request.chat_request.clone();
+                let sent_context_item_ids = request.context.active_item_ids();
+                let Some((response_result, mut collector)) = self
                     .execute_model_request(
                         &request,
                         sent_request.clone(),
@@ -372,57 +483,6 @@ impl AgentLoop {
                         )
                         .await;
                 };
-                if collector.is_empty() {
-                    if let Err(error) = &response_result {
-                        if let Some(retry) =
-                            llm_turn.full_history_retry_after_rejection(&sent_request, error)
-                        {
-                            sent_request = retry;
-                            sink.emit(RunEvent::ModelRequestPrepared {
-                                session_id: request.session.session.id,
-                                diagnostics: request_diagnostics(
-                                    &sent_request,
-                                    request
-                                        .turn
-                                        .resolved_config()
-                                        .runtime_config()
-                                        .session
-                                        .overflow_margin_tokens,
-                                ),
-                            })?;
-                            renew_admission_lease(&self.store, &request).await?;
-                            model_request_count += 1;
-                            let Some((retry_result, retry_collector)) = self
-                                .execute_model_request(
-                                    &request,
-                                    sent_request.clone(),
-                                    model_response_id,
-                                    sink,
-                                )
-                                .await?
-                            else {
-                                return self
-                                    .finish_for_run_control_cause(
-                                        &request,
-                                        last_model_response_id,
-                                        latest_usage.clone(),
-                                        tool_call_count,
-                                        failed_tool_count,
-                                        change_count,
-                                        model_request_count,
-                                        tool_calls_by_name.clone(),
-                                        failed_tool_calls_by_name.clone(),
-                                        started_at,
-                                        active_goal_id_for_turn.as_deref(),
-                                        sink,
-                                    )
-                                    .await;
-                            };
-                            response_result = retry_result;
-                            collector = retry_collector;
-                        }
-                    }
-                }
                 ensure_admission_active(&self.store, &request).await?;
                 let response = match response_result {
                     Ok(response) => response,
@@ -443,11 +503,6 @@ impl AgentLoop {
                         return Err(error.into());
                     }
                 };
-                llm_turn.record_response(
-                    &sent_request,
-                    request.context.revision().as_str(),
-                    response.response_id.clone(),
-                )?;
                 latest_usage = response.usage.clone();
                 if let Some(goal) = &goal_snapshot {
                     self.store
@@ -549,16 +604,38 @@ impl AgentLoop {
                 // response lineage (for example, output-limit and invalid-shape responses fail
                 // before this transaction).
                 last_model_response_id = Some(model_response_id);
+                active_context_tokens.record_provider_response(
+                    model_response_id,
+                    response.usage.as_ref(),
+                    sent_context_item_ids,
+                );
 
                 // ToolName routing, JSON decoding, and schema validation are transient
                 // execution concerns. They intentionally happen only after the exact raw
                 // provider response bundle above has committed successfully.
-                let prepared_tool_calls = raw_tool_calls
+                let mut prepared_tool_calls = raw_tool_calls
                     .into_iter()
                     .map(|(id, call)| {
                         prepare_model_tool_call(id, call, tool_plan.model_visible_specs())
                     })
                     .collect::<Vec<_>>();
+                if root_ownership != RootOwnershipState::NotRequired
+                    && prepared_tool_calls
+                        .iter()
+                        .any(|call| call.call.tool_name == "spawn_agent")
+                {
+                    for call in &mut prepared_tool_calls {
+                        if call.validation_error.is_none()
+                            && !crate::tool::spec_plan::RootOwnershipToolSurface::DelegatedCollaboration
+                                .allows_tool(&call.call.tool_name)
+                        {
+                            call.validation_error = Some(format!(
+                                "tool `{}` is unavailable in a response that also delegates root ownership with `spawn_agent`",
+                                call.call.tool_name
+                            ));
+                        }
+                    }
+                }
 
                 if prepared_tool_calls.is_empty() {
                     drain_pending_agent_communications(&request)?;
@@ -567,10 +644,6 @@ impl AgentLoop {
                         request.session.session.id,
                         &mut request.context,
                     )?;
-                    llm_turn.update_history(
-                        history_update_kind(context_refresh.delta.change),
-                        request.context.revision().as_str(),
-                    );
                     if context_refresh.has_more
                         || !context_refresh.delta.steer_item_ids.is_empty()
                         || !context_refresh
@@ -677,10 +750,6 @@ impl AgentLoop {
                         if context_refresh.has_more
                             || !context_refresh.delta.steer_item_ids.is_empty()
                         {
-                            llm_turn.update_history(
-                                history_update_kind(context_refresh.delta.change),
-                                request.context.revision().as_str(),
-                            );
                             continue;
                         }
                         return Err(AgentError::Message(format!(
@@ -706,10 +775,6 @@ impl AgentLoop {
                                 .agent_communication_item_ids
                                 .is_empty()
                         {
-                            llm_turn.update_history(
-                                history_update_kind(context_refresh.delta.change),
-                                request.context.revision().as_str(),
-                            );
                             continue;
                         }
                         return Err(AgentError::Message(format!(
@@ -757,6 +822,8 @@ impl AgentLoop {
                 }
 
                 let mut prior_guardian_tool_results = Vec::new();
+                let mut completed_spawn = false;
+                let mut completed_plan = false;
                 for call in prepared_tool_calls {
                     if request.run_control.is_cancelled() {
                         return self
@@ -798,6 +865,10 @@ impl AgentLoop {
                             sink,
                         )
                         .await?;
+                    if matches!(&tool_output, ToolDispatchOutcome::Completed { .. }) {
+                        completed_spawn |= call.call.tool_name == "spawn_agent";
+                        completed_plan |= call.call.tool_name == "update_plan";
+                    }
                     record_tool_dispatch_failure(
                         &tool_output,
                         &call.call.tool_name,
@@ -848,6 +919,7 @@ impl AgentLoop {
                     ensure_admission_active(&self.store, &request).await?;
                     change_count += tool_change_count;
                 }
+                root_ownership.apply_settled_response(completed_spawn, completed_plan);
             }
         }
         .await;
@@ -920,7 +992,7 @@ impl AgentLoop {
                     outcome: crate::protocol::TurnTerminalOutcome::Failed {
                         error: failure_message,
                     },
-                    final_response_id: last_model_response_id,
+                    final_response_id: None,
                     tool_call_count,
                     failed_tool_count,
                     change_count,
@@ -1023,18 +1095,19 @@ impl AgentLoop {
         let model = request.model_profile();
         let resolved_model = &request.turn.resolved_config().runtime_config().model;
         let provider_target = request.turn.provider_target();
-        let system_prompt = self.prompt_builder.build(
-            &step.world_state,
-            &step.skills,
-            &request.turn,
-            request
-                .agent_context
-                .as_ref()
-                .is_some_and(crate::app::AgentRunContext::is_sub_agent),
-        );
-        let mut request_messages = messages.to_vec();
+        let is_sub_agent = request
+            .agent_context
+            .as_ref()
+            .is_some_and(crate::app::AgentRunContext::is_sub_agent);
+        let system_prompt =
+            self.prompt_builder
+                .build(&step.world_state, &step.skills, &request.turn);
+        let mut request_messages = self
+            .prompt_builder
+            .multi_agent_context_messages(&request.turn, is_sub_agent);
+        request_messages.extend_from_slice(messages);
         if let Some(goal_message) = goal.and_then(goal_steering::steering_message_for_goal) {
-            request_messages.push(goal_message);
+            insert_before_final_compaction_summary(&mut request_messages, goal_message);
         }
         let mut chat_request = ChatRequest::new(
             provider_target.clone(),
@@ -1069,109 +1142,33 @@ impl AgentLoop {
         model_request_count: &mut usize,
         sink: &mut dyn RunEventSink,
     ) -> Result<bool, AgentError> {
-        let supports_images = request
-            .turn
-            .policy
-            .model
-            .input_modalities
-            .contains(&crate::llm::model_policy::InputModality::Image);
         let units = request.context.semantic_compaction_units();
         if units.is_empty() {
             return Ok(false);
         }
-        let canonical_messages = request.context.model_messages(supports_images);
-        let transient_messages = request_template
-            .messages
-            .get(canonical_messages.len()..)
-            .unwrap_or_default()
-            .to_vec();
-        let active_ids = request.context.active_item_ids();
-        let current_status = ContextWindowTokenStatus::for_request(
-            request_template,
-            request
-                .turn
-                .resolved_config()
-                .runtime_config()
-                .session
-                .overflow_margin_tokens,
-        );
-        let mut selected_units = Vec::new();
-        let mut replacement_item_ids = Vec::new();
-        let mut retained_messages = canonical_messages;
-        for unit in units {
-            replacement_item_ids.extend(unit.iter().copied());
-            selected_units.push(unit);
-            let selected = replacement_item_ids.iter().copied().collect::<HashSet<_>>();
-            let retained_ids = active_ids
-                .iter()
-                .filter(|item_id| !selected.contains(item_id))
-                .copied()
-                .collect::<Vec<_>>();
-            retained_messages = request
+        let mut seen_item_ids = HashSet::new();
+        let selected_item_ids = units
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|item_id| seen_item_ids.insert(*item_id))
+            .collect::<Vec<_>>();
+        if selected_item_ids.is_empty() {
+            return Ok(false);
+        }
+        let preserved_user_messages = bounded_compaction_user_messages(
+            &request
                 .context
-                .model_messages_for_items(&retained_ids, supports_images);
-            let mut projected = request_template.clone();
-            projected.messages = vec![context_manager::semantic_compaction_message(
-                "[semantic summary]",
-            )];
-            projected.messages.extend(retained_messages.clone());
-            projected.messages.extend(transient_messages.clone());
-            let projected_status = ContextWindowTokenStatus::for_request(
-                &projected,
-                request
-                    .turn
-                    .resolved_config()
-                    .runtime_config()
-                    .session
-                    .overflow_margin_tokens,
-            );
-            if projected_status.active_context_tokens
-                < request.turn.policy.model.working_context_token_limit
-            {
-                break;
-            }
-        }
-        if replacement_item_ids.is_empty() {
-            return Ok(false);
-        }
-        let segments = request
-            .context
-            .compaction_segments_for_units(&selected_units, supports_images);
-        if segments.is_empty() {
-            return Ok(false);
-        }
-        let summary = self
-            .summarize_compaction_segments(
-                request,
-                request_template,
-                segments,
-                model_request_count,
-                sink,
-            )
-            .await?;
-        let mut post_compaction = request_template.clone();
-        post_compaction.messages = vec![context_manager::semantic_compaction_message(&summary)];
-        post_compaction.messages.extend(retained_messages);
-        post_compaction.messages.extend(transient_messages);
-        let post_status = ContextWindowTokenStatus::for_request(
-            &post_compaction,
-            request
-                .turn
-                .resolved_config()
-                .runtime_config()
-                .session
-                .overflow_margin_tokens,
+                .compaction_user_messages_for_items(&selected_item_ids),
         );
-        if post_status.active_context_tokens >= current_status.active_context_tokens {
-            return Err(AgentError::Message(format!(
-                "semantic compaction did not reduce the prepared request (before {} estimated tokens, after {}); canonical history was left unchanged",
-                current_status.active_context_tokens, post_status.active_context_tokens
-            )));
-        }
+        let summary = self
+            .summarize_compaction_history(request, request_template, model_request_count, sink)
+            .await?;
         let event = RunEvent::CompactionCompleted {
-            summarized_messages: replacement_item_ids.len(),
+            summarized_messages: selected_item_ids.len(),
+            preserved_user_messages,
             summary,
-            replacement_item_ids,
+            replacement_item_ids: selected_item_ids,
         };
         self.store
             .session_repo()
@@ -1187,72 +1184,50 @@ impl AgentLoop {
         // publisher/UI projection cannot revoke it; the next loop iteration reloads the durable
         // append through ContextManager.
         let _ = sink.emit_committed(event);
+        let _ = sink.emit_runtime_only(RunEvent::RecoverableRuntimeFeedback {
+            session_id: request.session.session.id,
+            message: COMPACTION_ACCURACY_WARNING.to_string(),
+        });
         Ok(true)
     }
 
-    async fn summarize_compaction_segments(
+    async fn summarize_compaction_history(
         &self,
         request: &AgentRunRequest,
         request_template: &ChatRequest,
-        mut segments: Vec<String>,
         model_request_count: &mut usize,
         sink: &mut dyn RunEventSink,
     ) -> Result<String, AgentError> {
+        let mut messages = request_template.messages.clone();
         loop {
-            let input_chars = segments.iter().map(|segment| segment.chars().count()).sum();
-            let batches = build_compaction_batches(
-                request_template,
-                &segments,
-                request
-                    .turn
-                    .resolved_config()
-                    .runtime_config()
-                    .session
-                    .overflow_margin_tokens,
-            )?;
-            let mut summaries = Vec::with_capacity(batches.len());
-            for batch in batches {
-                summaries.push(
-                    self.run_compaction_request(
-                        request,
-                        request_template,
-                        batch,
-                        model_request_count,
-                        sink,
-                    )
-                    .await?,
-                );
+            match self
+                .run_compaction_request(
+                    request,
+                    compaction_request_with_messages(request_template, messages.clone()),
+                    model_request_count,
+                    sink,
+                )
+                .await
+            {
+                Ok(summary) => return Ok(summary),
+                Err(AgentError::Llm(error))
+                    if error.is_context_window_exceeded()
+                        && has_removable_compaction_message(&messages) =>
+                {
+                    remove_oldest_compaction_message(&mut messages);
+                }
+                Err(error) => return Err(error),
             }
-            if summaries.len() == 1 {
-                return Ok(summaries.remove(0));
-            }
-            let output_chars = summaries
-                .iter()
-                .map(|summary| summary.chars().count())
-                .sum::<usize>();
-            if output_chars >= input_chars {
-                return Err(AgentError::Message(format!(
-                    "semantic compaction map/reduce made no progress ({} input characters, {} summary characters); canonical history was left unchanged",
-                    input_chars, output_chars
-                )));
-            }
-            segments = summaries
-                .into_iter()
-                .enumerate()
-                .map(|(index, summary)| format!("[partial summary {}]\n{}", index + 1, summary))
-                .collect();
         }
     }
 
     async fn run_compaction_request(
         &self,
         request: &AgentRunRequest,
-        request_template: &ChatRequest,
-        content: String,
+        compaction_request: ChatRequest,
         model_request_count: &mut usize,
         sink: &mut dyn RunEventSink,
     ) -> Result<String, AgentError> {
-        let compaction_request = compaction_request_with_content(request_template, content);
         sink.emit(RunEvent::ModelRequestPrepared {
             session_id: request.session.session.id,
             diagnostics: request_diagnostics(
@@ -1263,6 +1238,7 @@ impl AgentLoop {
                     .runtime_config()
                     .session
                     .overflow_margin_tokens,
+                None,
             ),
         })?;
         renew_admission_lease(&self.store, request).await?;
@@ -1296,6 +1272,12 @@ impl AgentLoop {
             .stream_chat(compaction_request, request.cancel_token(), &mut collector)
             .await?;
         let collector = collector.into_inner();
+        if response.finish_reason == FinishReason::Cancelled {
+            return Err(AgentError::Message(
+                "semantic compaction was cancelled; canonical history was left unchanged"
+                    .to_string(),
+            ));
+        }
         validate_provider_response_terminal(
             response.finish_reason,
             !collector.tool_calls.is_empty(),
@@ -1812,7 +1794,7 @@ impl AgentLoop {
     async fn finish_for_run_control_cause(
         &self,
         request: &AgentRunRequest,
-        final_response_id: Option<ModelResponseId>,
+        _final_response_id: Option<ModelResponseId>,
         usage: Option<TokenUsage>,
         tool_call_count: usize,
         failed_tool_count: usize,
@@ -1828,7 +1810,7 @@ impl AgentLoop {
             Some(RunCancellationCause::Interruption(cause)) => {
                 let terminal = DurableTurnTerminal {
                     outcome: crate::protocol::TurnTerminalOutcome::Interrupted { cause },
-                    final_response_id,
+                    final_response_id: None,
                     tool_call_count,
                     failed_tool_count,
                     change_count,
@@ -1861,7 +1843,7 @@ impl AgentLoop {
             Some(RunCancellationCause::Failure(message)) => {
                 let terminal = DurableTurnTerminal {
                     outcome: crate::protocol::TurnTerminalOutcome::Failed { error: message },
-                    final_response_id,
+                    final_response_id: None,
                     tool_call_count,
                     failed_tool_count,
                     change_count,
@@ -1969,127 +1951,147 @@ struct PreparedChatRequest {
     world_state: WorldState,
 }
 
-fn compaction_request_with_content(template: &ChatRequest, content: String) -> ChatRequest {
+fn insert_before_final_compaction_summary(
+    messages: &mut Vec<ModelMessage>,
+    transient: ModelMessage,
+) {
+    let insertion_index = messages
+        .last()
+        .is_some_and(context_manager::is_semantic_compaction_message)
+        .then_some(messages.len().saturating_sub(1))
+        .unwrap_or(messages.len());
+    messages.insert(insertion_index, transient);
+}
+
+fn remove_oldest_compaction_message(messages: &mut Vec<ModelMessage>) {
+    enum OldestNativeItem {
+        AssistantContent,
+        AssistantCall(String),
+        EmptyAssistant,
+        ToolOutput(String),
+        Other,
+    }
+
+    let Some(oldest_index) = messages
+        .iter()
+        .position(|message| !matches!(message, ModelMessage::System { .. }))
+    else {
+        return;
+    };
+    let oldest = &messages[oldest_index];
+    let oldest = match oldest {
+        ModelMessage::AssistantToolCalls {
+            content,
+            tool_calls,
+        } if content
+            .as_deref()
+            .is_some_and(|content| !content.is_empty()) =>
+        {
+            OldestNativeItem::AssistantContent
+        }
+        ModelMessage::AssistantToolCalls { tool_calls, .. } => tool_calls
+            .first()
+            .map(|call| OldestNativeItem::AssistantCall(call.call_id.clone()))
+            .unwrap_or(OldestNativeItem::EmptyAssistant),
+        ModelMessage::Tool { call_id, .. } => OldestNativeItem::ToolOutput(call_id.clone()),
+        _ => OldestNativeItem::Other,
+    };
+
+    match oldest {
+        OldestNativeItem::AssistantContent => {
+            let ModelMessage::AssistantToolCalls {
+                content,
+                tool_calls,
+            } = &mut messages[oldest_index]
+            else {
+                unreachable!("classified assistant content")
+            };
+            if tool_calls.is_empty() {
+                messages.remove(oldest_index);
+            } else {
+                *content = None;
+            }
+        }
+        OldestNativeItem::AssistantCall(call_id) => {
+            let ModelMessage::AssistantToolCalls { tool_calls, .. } = &mut messages[oldest_index]
+            else {
+                unreachable!("classified assistant tool call")
+            };
+            tool_calls.remove(0);
+            if let Some(output_index) = messages.iter().position(
+                |message| matches!(message, ModelMessage::Tool { call_id: candidate, .. } if candidate == &call_id),
+            ) {
+                messages.remove(output_index);
+            }
+            normalize_compaction_assistant_group(messages, oldest_index);
+        }
+        OldestNativeItem::EmptyAssistant | OldestNativeItem::Other => {
+            messages.remove(oldest_index);
+        }
+        OldestNativeItem::ToolOutput(call_id) => {
+            messages.remove(oldest_index);
+            let Some(assistant_index) = messages.iter().position(|message| {
+                matches!(
+                    message,
+                    ModelMessage::AssistantToolCalls { tool_calls, .. }
+                        if tool_calls.iter().any(|call| call.call_id == call_id)
+                )
+            }) else {
+                return;
+            };
+            let ModelMessage::AssistantToolCalls { tool_calls, .. } =
+                &mut messages[assistant_index]
+            else {
+                unreachable!("matched assistant tool-call message")
+            };
+            if let Some(call_index) = tool_calls.iter().position(|call| call.call_id == call_id) {
+                tool_calls.remove(call_index);
+            }
+            normalize_compaction_assistant_group(messages, assistant_index);
+        }
+    }
+}
+
+fn has_removable_compaction_message(messages: &[ModelMessage]) -> bool {
+    messages
+        .iter()
+        .any(|message| !matches!(message, ModelMessage::System { .. }))
+}
+
+fn normalize_compaction_assistant_group(messages: &mut Vec<ModelMessage>, index: usize) {
+    let Some(ModelMessage::AssistantToolCalls {
+        content,
+        tool_calls,
+    }) = messages.get_mut(index)
+    else {
+        return;
+    };
+    if !tool_calls.is_empty() {
+        return;
+    }
+    let content = content.take().filter(|content| !content.is_empty());
+    if let Some(content) = content {
+        messages[index] = ModelMessage::Assistant { content };
+    } else {
+        messages.remove(index);
+    }
+}
+
+fn compaction_request_with_messages(
+    template: &ChatRequest,
+    mut messages: Vec<ModelMessage>,
+) -> ChatRequest {
     let mut request = template.clone();
-    request.system_prompt = include_str!("../../assets/prompts/compaction.md")
-        .trim()
-        .to_string();
-    request.messages = vec![ModelMessage::User { content }];
+    messages.push(ModelMessage::User {
+        content: include_str!("../../assets/prompts/compaction.md")
+            .trim()
+            .to_string(),
+    });
+    request.messages = messages;
     request.tools.clear();
     request.tool_choice = None;
     request.parallel_tool_calls = false;
-    request.responses_continuation = None;
     request
-}
-
-fn compaction_content_fits(
-    template: &ChatRequest,
-    content: &str,
-    overflow_margin_tokens: usize,
-) -> bool {
-    !ContextWindowTokenStatus::for_request(
-        &compaction_request_with_content(template, content.to_string()),
-        overflow_margin_tokens,
-    )
-    .token_limit_reached
-}
-
-fn build_compaction_batches(
-    template: &ChatRequest,
-    segments: &[String],
-    overflow_margin_tokens: usize,
-) -> Result<Vec<String>, AgentError> {
-    if !compaction_content_fits(template, "", overflow_margin_tokens) {
-        return Err(AgentError::Message(
-            "semantic compaction has no model input capacity after output and safety reservation; canonical history was left unchanged"
-                .to_string(),
-        ));
-    }
-    let mut batches = Vec::new();
-    let mut current = String::new();
-    for segment in segments.iter().filter(|segment| !segment.trim().is_empty()) {
-        let candidate = if current.is_empty() {
-            segment.clone()
-        } else {
-            format!("{current}\n\n---\n\n{segment}")
-        };
-        if compaction_content_fits(template, &candidate, overflow_margin_tokens) {
-            current = candidate;
-            continue;
-        }
-        if !current.is_empty() {
-            batches.push(std::mem::take(&mut current));
-        }
-        if compaction_content_fits(template, segment, overflow_margin_tokens) {
-            current = segment.clone();
-            continue;
-        }
-        batches.extend(split_compaction_segment(
-            template,
-            segment,
-            overflow_margin_tokens,
-        )?);
-    }
-    if !current.is_empty() {
-        batches.push(current);
-    }
-    if batches.is_empty() {
-        return Err(AgentError::Message(
-            "semantic compaction had no model-visible source content".to_string(),
-        ));
-    }
-    Ok(batches)
-}
-
-fn split_compaction_segment(
-    template: &ChatRequest,
-    segment: &str,
-    overflow_margin_tokens: usize,
-) -> Result<Vec<String>, AgentError> {
-    let mut offset_bytes = 0;
-    let mut chunks = Vec::new();
-    while offset_bytes < segment.len() {
-        let remaining = &segment[offset_bytes..];
-        let mut low = 1;
-        let mut high = remaining.len();
-        let mut best = 0;
-        while low <= high {
-            let mid = low + (high - low) / 2;
-            let mut candidate_end = mid;
-            while candidate_end > 0 && !remaining.is_char_boundary(candidate_end) {
-                candidate_end -= 1;
-            }
-            if candidate_end < low {
-                candidate_end = mid;
-                while candidate_end < remaining.len() && !remaining.is_char_boundary(candidate_end)
-                {
-                    candidate_end += 1;
-                }
-                if candidate_end > high {
-                    break;
-                }
-            }
-            if compaction_content_fits(
-                template,
-                &remaining[..candidate_end],
-                overflow_margin_tokens,
-            ) {
-                best = candidate_end;
-                low = candidate_end + 1;
-            } else {
-                high = candidate_end.saturating_sub(1);
-            }
-        }
-        if best == 0 {
-            return Err(AgentError::Message(
-                "semantic compaction could not fit one source character in the configured context window"
-                    .to_string(),
-            ));
-        }
-        chunks.push(remaining[..best].to_string());
-        offset_bytes += best;
-    }
-    Ok(chunks)
 }
 
 fn context_limit_error(status: &ContextWindowTokenStatus) -> AgentError {
@@ -2223,22 +2225,6 @@ fn refresh_committed_context_page(
     }
     let delta = context.ingest_committed_delta(page.items, page.next_cursor);
     Ok(CommittedContextRefreshPage { delta, has_more })
-}
-
-fn history_update_kind(
-    change: context_manager::HistoryChange,
-) -> crate::llm::turn_session::HistoryUpdateKind {
-    match change {
-        context_manager::HistoryChange::Unchanged => {
-            crate::llm::turn_session::HistoryUpdateKind::Unchanged
-        }
-        context_manager::HistoryChange::Appended => {
-            crate::llm::turn_session::HistoryUpdateKind::AppendOnly
-        }
-        context_manager::HistoryChange::Compacted => {
-            crate::llm::turn_session::HistoryUpdateKind::Compacted
-        }
-    }
 }
 
 fn validate_provider_response_terminal(
@@ -2451,6 +2437,7 @@ impl AgentPermissionGuardian<'_> {
                         .runtime_config()
                         .session
                         .overflow_margin_tokens,
+                    None,
                 ),
             })
             .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
@@ -2657,7 +2644,6 @@ fn permission_guardian_context(request: &AgentRunRequest) -> String {
 
 #[derive(Default)]
 struct ResponseCollector {
-    saw_event: bool,
     text: String,
     tool_calls: Vec<ModelToolCall>,
     tool_call_order: Vec<String>,
@@ -2670,14 +2656,10 @@ impl LlmEventSink for ResponseCollector {
     fn push(&mut self, event: LlmEvent) -> Result<(), crate::error::LlmError> {
         match event {
             LlmEvent::TextDelta(delta) => {
-                self.saw_event = true;
                 self.text.push_str(&delta);
             }
-            LlmEvent::ReasoningSummaryDelta(_) => {
-                self.saw_event = true;
-            }
+            LlmEvent::ReasoningSummaryDelta(_) => {}
             LlmEvent::ToolCallStart { call_id, tool_name } => {
-                self.saw_event = true;
                 if !self.tool_call_order.iter().any(|seen| seen == &call_id) {
                     self.tool_call_order.push(call_id.clone());
                 }
@@ -2685,15 +2667,12 @@ impl LlmEventSink for ResponseCollector {
                 self.tool_call_args.entry(call_id).or_default();
             }
             LlmEvent::ToolCallArgsDelta { call_id, delta } => {
-                self.saw_event = true;
                 self.tool_call_args
                     .entry(call_id)
                     .or_default()
                     .push_str(&delta);
             }
-            LlmEvent::Finished { .. } => {
-                self.saw_event = true;
-            }
+            LlmEvent::Finished { .. } => {}
         }
         self.rebuild_tool_calls();
         Ok(())
@@ -2804,10 +2783,6 @@ impl LlmEventSink for StreamingResponseCollector<'_> {
 }
 
 impl ResponseCollector {
-    fn is_empty(&self) -> bool {
-        !self.saw_event
-    }
-
     fn rebuild_tool_calls(&mut self) {
         let calls = self
             .tool_call_order
@@ -2870,8 +2845,10 @@ fn run_metrics(
 fn request_diagnostics(
     request: &ChatRequest,
     overflow_margin_tokens: usize,
+    context_window: Option<ContextWindowTokenStatus>,
 ) -> RequestDiagnosticsPart {
-    let context_window = ContextWindowTokenStatus::for_request(request, overflow_margin_tokens);
+    let context_window = context_window
+        .unwrap_or_else(|| ContextWindowTokenStatus::for_request(request, overflow_margin_tokens));
     RequestDiagnosticsPart {
         provider: "openai_compat".to_string(),
         model_name: request.model.name.clone(),
@@ -2911,6 +2888,7 @@ fn request_diagnostics(
                 input_schema: tool.input_schema.clone(),
             })
             .collect(),
+        wire: crate::llm::request_diagnostics::http_request_wire_diagnostic(request).ok(),
         context_window: Some(context_window),
         messages: request.messages.iter().map(message_diagnostic).collect(),
     }
@@ -2920,6 +2898,24 @@ fn message_diagnostic(message: &ModelMessage) -> RequestMessageDiagnostic {
     match message {
         ModelMessage::System { content } => RequestMessageDiagnostic {
             role: "system".to_string(),
+            content_chars: Some(content.chars().count()),
+            content_markers: content_markers(content),
+            image_count: 0,
+            image_bytes: 0,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        },
+        ModelMessage::Developer { content } => RequestMessageDiagnostic {
+            role: "developer".to_string(),
+            content_chars: Some(content.chars().count()),
+            content_markers: content_markers(content),
+            image_count: 0,
+            image_bytes: 0,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        },
+        ModelMessage::Agent { content } => RequestMessageDiagnostic {
+            role: "agent".to_string(),
             content_chars: Some(content.chars().count()),
             content_markers: content_markers(content),
             image_count: 0,
@@ -3203,6 +3199,134 @@ fn goal_token_delta(usage: Option<&TokenUsage>) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_ownership_checkpoint_is_limited_to_fresh_proactive_tool_root_turns() {
+        let cases = [
+            (
+                true,
+                false,
+                mode::ModeKind::Default,
+                Some(MultiAgentMode::Proactive),
+                true,
+                RootOwnershipState::Awaiting,
+            ),
+            (
+                false,
+                false,
+                mode::ModeKind::Default,
+                Some(MultiAgentMode::Proactive),
+                true,
+                RootOwnershipState::NotRequired,
+            ),
+            (
+                true,
+                true,
+                mode::ModeKind::Default,
+                Some(MultiAgentMode::Proactive),
+                true,
+                RootOwnershipState::NotRequired,
+            ),
+            (
+                true,
+                false,
+                mode::ModeKind::Default,
+                Some(MultiAgentMode::ExplicitRequestOnly),
+                true,
+                RootOwnershipState::NotRequired,
+            ),
+            (
+                true,
+                false,
+                mode::ModeKind::Plan,
+                Some(MultiAgentMode::Proactive),
+                true,
+                RootOwnershipState::NotRequired,
+            ),
+            (
+                true,
+                false,
+                mode::ModeKind::Default,
+                None,
+                true,
+                RootOwnershipState::NotRequired,
+            ),
+            (
+                true,
+                false,
+                mode::ModeKind::Default,
+                Some(MultiAgentMode::Proactive),
+                false,
+                RootOwnershipState::NotRequired,
+            ),
+        ];
+
+        for (fresh, child, mode_kind, multi_agent_mode, supports_tools, expected) in cases {
+            assert_eq!(
+                RootOwnershipState::for_turn(
+                    fresh,
+                    child,
+                    mode_kind,
+                    multi_agent_mode,
+                    supports_tools,
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn root_ownership_freshness_comes_from_the_canonical_current_turn_user_item() {
+        let session_id = crate::session::SessionId::new();
+        let previous_turn_id = TurnId::new();
+        let current_turn_id = TurnId::new();
+        let user_item = |turn_id| HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id,
+            scope: HistoryScope::Turn { turn_id },
+            sequence_no: 0,
+            created_at_ms: SystemClock::now_ms(),
+            payload: HistoryItemPayload::UserTurn {
+                content: vec![ContentPart::Text {
+                    text: "work".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+            },
+        };
+
+        let continuation_context =
+            context_manager::ContextManager::rehydrate(vec![user_item(previous_turn_id)]);
+        assert!(!has_canonical_user_turn(
+            &continuation_context,
+            current_turn_id
+        ));
+
+        let fresh_context =
+            context_manager::ContextManager::rehydrate(vec![user_item(current_turn_id)]);
+        assert!(has_canonical_user_turn(&fresh_context, current_turn_id));
+    }
+
+    #[test]
+    fn root_ownership_applies_one_settled_response_with_spawn_precedence() {
+        let mut state = RootOwnershipState::Awaiting;
+
+        state.apply_settled_response(false, false);
+        assert_eq!(state, RootOwnershipState::Awaiting);
+
+        state.apply_settled_response(false, true);
+        assert_eq!(state, RootOwnershipState::RootLocal);
+
+        state.apply_settled_response(true, true);
+        assert_eq!(state, RootOwnershipState::Delegated);
+
+        state.apply_settled_response(false, true);
+        assert_eq!(state, RootOwnershipState::RootLocal);
+
+        let mut bypassed = RootOwnershipState::NotRequired;
+        bypassed.apply_settled_response(true, true);
+        assert_eq!(bypassed, RootOwnershipState::NotRequired);
+    }
     use async_trait::async_trait;
     use camino::Utf8PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3226,14 +3350,462 @@ mod tests {
     use crate::tool::truncate::ToolTruncator;
     use crate::workspace::WorkspaceDiscovery;
 
+    #[test]
+    fn multi_agent_mode_instructions_keep_codex_envelopes_and_local_handoff_hint() {
+        assert_eq!(
+            include_str!("../../assets/prompts/multi_agent_explicit.md").trim(),
+            "<multi_agent_mode>\nDo not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.\n</multi_agent_mode>"
+        );
+        let proactive = include_str!("../../assets/prompts/multi_agent_proactive.md").trim();
+        assert!(proactive.starts_with("<multi_agent_mode>\n"));
+        assert!(proactive.ends_with("\n</multi_agent_mode>"));
+        assert!(proactive.contains("bounded parallel work"));
+        assert!(proactive.contains("context-isolated sequential handoffs"));
+        assert!(proactive.contains("Set `fork_turns` explicitly"));
+        assert!(proactive.contains("named workspace inputs"));
+        assert!(proactive.contains("surrounding conversation context"));
+    }
+
+    #[tokio::test]
+    async fn multi_agent_context_uses_codex_developer_role_and_order() {
+        let mut config = ResolvedConfig::default();
+        config.multi_agent.enabled = true;
+        config.multi_agent.mode = MultiAgentMode::Proactive;
+        let run = run_scripted(
+            config,
+            vec![ScriptedResponse {
+                events: vec![LlmEvent::TextDelta("done".to_string())],
+                finish_reason: FinishReason::Stop,
+            }],
+        )
+        .await
+        .expect("run");
+        let request = &run.requests[0];
+
+        assert!(!request.system_prompt.contains("<multi_agent_mode>"));
+        assert!(matches!(
+            &request.messages[0],
+            ModelMessage::Developer { content }
+                if content.starts_with("You are `/root`, the primary agent")
+                    && content.contains("There are 4 available concurrency slots")
+                    && content.contains("Message Type: MESSAGE | FINAL_ANSWER")
+                    && content.contains("workspace tools remain unavailable")
+                    && content.contains("read-only discovery package")
+                    && content.contains("root remains on collaboration tools")
+                    && content.contains("Do not read delegated inputs")
+                    && content.contains("distinct, non-overlapping immediate blocker")
+                    && content.contains("Do not use it merely to unlock tools")
+                    && content.contains("Before broad repository investigation")
+                    && content.contains("form a succinct high-level plan")
+                    && content.contains("the immediate blocker to keep local")
+                    && content.contains("concrete, bounded, independently verifiable child package")
+                    && content.contains("A task packet is ready when")
+                    && content.contains("may name shared-workspace files for the child to inspect")
+                    && content.contains("does not need to contain their contents or findings")
+                    && content.contains("Do not read delegated inputs merely to restate them")
+                    && content.contains("Use one writer for overlapping shared targets")
+        ));
+        assert!(matches!(
+            &request.messages[1],
+            ModelMessage::Developer { content }
+                if content == include_str!("../../assets/prompts/multi_agent_proactive.md").trim()
+                    && content.contains("context-isolated sequential handoffs")
+                    && content.contains("Set `fork_turns` explicitly")
+        ));
+        assert!(matches!(&request.messages[2], ModelMessage::User { .. }));
+    }
+
+    fn request_tool_names(request: &ChatRequest) -> Vec<String> {
+        request.tools.iter().map(|tool| tool.name.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn proactive_root_ownership_stays_pending_until_a_decision_tool_completes() {
+        let mut config = ResolvedConfig::default();
+        config.multi_agent.enabled = true;
+        config.multi_agent.mode = MultiAgentMode::Proactive;
+        config.permissions.access_mode = AccessMode::FullAccess;
+        let run = run_scripted(
+            config,
+            vec![
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "invalid_plan".to_string(),
+                            tool_name: "update_plan".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "invalid_plan".to_string(),
+                            delta: r#"{"plan":[{"step":"","status":"in_progress"}]}"#.to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "root_local_plan".to_string(),
+                            tool_name: "update_plan".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "root_local_plan".to_string(),
+                            delta: r#"{"explanation":"Root owns the immediate blocker because delegation cannot proceed before this check.","plan":[{"step":"Inspect the immediate blocker","status":"in_progress"}]}"#.to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "list_after_owner".to_string(),
+                            tool_name: "list".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "list_after_owner".to_string(),
+                            delta: r#"{"path":"."}"#.to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("run");
+        let summary = run.summary.expect("summary");
+
+        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_eq!(run.requests.len(), 4);
+        assert_eq!(
+            request_tool_names(&run.requests[0]),
+            vec!["spawn_agent".to_string(), "update_plan".to_string()]
+        );
+        assert_eq!(
+            request_tool_names(&run.requests[1]),
+            vec!["spawn_agent".to_string(), "update_plan".to_string()]
+        );
+        assert!(request_tool_names(&run.requests[2]).contains(&"list".to_string()));
+        assert!(request_tool_names(&run.requests[3]).contains(&"list".to_string()));
+        assert_canonical_tool_statuses(
+            &run.store,
+            run.session_id,
+            &[
+                ToolLifecycleStatus::Failed,
+                ToolLifecycleStatus::Completed,
+                ToolLifecycleStatus::Completed,
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_root_ownership_cannot_unlock_an_unadvertised_same_response_tool() {
+        let mut config = ResolvedConfig::default();
+        config.multi_agent.enabled = true;
+        config.multi_agent.mode = MultiAgentMode::Proactive;
+        config.permissions.access_mode = AccessMode::FullAccess;
+        let run = run_scripted(
+            config,
+            vec![
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "root_local_plan".to_string(),
+                            tool_name: "update_plan".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "root_local_plan".to_string(),
+                            delta: r#"{"explanation":"Root owns the immediate blocker because it must establish the local invariant first.","plan":[{"step":"Establish the local invariant","status":"in_progress"}]}"#.to_string(),
+                        },
+                        LlmEvent::ToolCallStart {
+                            call_id: "early_list".to_string(),
+                            tool_name: "list".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "early_list".to_string(),
+                            delta: r#"{"path":"."}"#.to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "list_after_owner".to_string(),
+                            tool_name: "list".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "list_after_owner".to_string(),
+                            delta: r#"{"path":"."}"#.to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("run");
+        let summary = run.summary.expect("summary");
+
+        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_eq!(run.requests.len(), 3);
+        assert_eq!(
+            request_tool_names(&run.requests[0]),
+            vec!["spawn_agent".to_string(), "update_plan".to_string()]
+        );
+        assert!(request_tool_names(&run.requests[1]).contains(&"list".to_string()));
+        assert_canonical_tool_statuses(
+            &run.store,
+            run.session_id,
+            &[
+                ToolLifecycleStatus::Completed,
+                ToolLifecycleStatus::Failed,
+                ToolLifecycleStatus::Completed,
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_response_rejects_workspace_siblings_even_when_spawn_fails() {
+        let mut config = ResolvedConfig::default();
+        config.multi_agent.enabled = true;
+        config.multi_agent.mode = MultiAgentMode::Proactive;
+        config.permissions.access_mode = AccessMode::FullAccess;
+        let run = run_scripted(
+            config,
+            vec![
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "root_local_plan".to_string(),
+                            tool_name: "update_plan".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "root_local_plan".to_string(),
+                            delta: r#"{"explanation":"Root owns the current invariant because no delegated input exists yet.","plan":[{"step":"Establish the current invariant","status":"in_progress"}]}"#.to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "spawn_worker".to_string(),
+                            tool_name: "spawn_agent".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "spawn_worker".to_string(),
+                            delta: r#"{"task_name":"worker","message":"Inspect the assigned package.","fork_turns":"none"}"#.to_string(),
+                        },
+                        LlmEvent::ToolCallStart {
+                            call_id: "duplicate_read".to_string(),
+                            tool_name: "list".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "duplicate_read".to_string(),
+                            delta: r#"{"path":"."}"#.to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("delegated".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("run");
+        let summary = run.summary.expect("summary");
+
+        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_eq!(run.requests.len(), 3);
+        assert_canonical_tool_statuses(
+            &run.store,
+            run.session_id,
+            &[
+                ToolLifecycleStatus::Completed,
+                ToolLifecycleStatus::Failed,
+                ToolLifecycleStatus::Failed,
+            ],
+        );
+        assert!(request_tool_names(&run.requests[1]).contains(&"list".to_string()));
+        assert!(
+            request_tool_names(&run.requests[2]).contains(&"list".to_string()),
+            "a failed spawn must preserve the prior root-local owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_multi_agent_mode_does_not_apply_the_proactive_spawn_sibling_guard() {
+        let mut config = ResolvedConfig::default();
+        config.multi_agent.enabled = true;
+        config.multi_agent.mode = MultiAgentMode::ExplicitRequestOnly;
+        config.permissions.access_mode = AccessMode::FullAccess;
+        let run = run_scripted(
+            config,
+            vec![
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "explicit_spawn".to_string(),
+                            tool_name: "spawn_agent".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "explicit_spawn".to_string(),
+                            delta: r#"{"task_name":"worker","message":"Inspect the assigned package.","fork_turns":"none"}"#.to_string(),
+                        },
+                        LlmEvent::ToolCallStart {
+                            call_id: "explicit_list".to_string(),
+                            tool_name: "list".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "explicit_list".to_string(),
+                            delta: r#"{"path":"."}"#.to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("run");
+        let summary = run.summary.expect("summary");
+
+        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_canonical_tool_statuses(
+            &run.store,
+            run.session_id,
+            &[ToolLifecycleStatus::Failed, ToolLifecycleStatus::Completed],
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_root_ownership_survives_compaction_after_root_local_decision() {
+        let mut config = ResolvedConfig::default();
+        config.multi_agent.enabled = true;
+        config.multi_agent.mode = MultiAgentMode::Proactive;
+        config.permissions.access_mode = AccessMode::FullAccess;
+        config.model.context_window = 68_000;
+        config.model.max_output_tokens = 512;
+        config.session.overflow_margin_tokens = 128;
+        let run = run_scripted_with_control_and_tool(
+            config,
+            vec![
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "root_local_plan".to_string(),
+                            tool_name: "update_plan".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "root_local_plan".to_string(),
+                            delta: r#"{"explanation":"Root owns the immediate blocker because it must establish this invariant before delegation can help.","plan":[{"step":"Establish the invariant","status":"in_progress"}]}"#.to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "large_read".to_string(),
+                            tool_name: "read".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "large_read".to_string(),
+                            delta: "{}".to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        "Root-local ownership is established; continue with the invariant."
+                            .to_string(),
+                    )],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "list_after_compaction".to_string(),
+                            tool_name: "list".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "list_after_compaction".to_string(),
+                            delta: r#"{"path":"."}"#.to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            RunControl::new(),
+            Arc::new(LargeReadOutputTool {
+                output_chars: 250_000,
+            }),
+        )
+        .await
+        .expect("run");
+        let summary = run.summary.expect("summary");
+
+        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_eq!(run.requests.len(), 5);
+        assert_eq!(
+            request_tool_names(&run.requests[0]),
+            vec!["spawn_agent".to_string(), "update_plan".to_string()]
+        );
+        assert!(request_tool_names(&run.requests[1]).contains(&"read".to_string()));
+        assert!(run.requests[2].tools.is_empty(), "compaction is tool-less");
+        assert!(
+            request_tool_names(&run.requests[3]).contains(&"list".to_string()),
+            "compaction must not reset the settled root-local owner"
+        );
+        assert_canonical_tool_statuses(
+            &run.store,
+            run.session_id,
+            &[
+                ToolLifecycleStatus::Completed,
+                ToolLifecycleStatus::Completed,
+                ToolLifecycleStatus::Completed,
+            ],
+        );
+        assert!(
+            run.store
+                .protocol_event_store()
+                .list_history_items_for_session(run.session_id)
+                .expect("canonical history")
+                .iter()
+                .any(|item| matches!(item.payload, HistoryItemPayload::Compaction { .. }))
+        );
+    }
+
     struct ScriptedClient {
-        responses: Mutex<Vec<ScriptedResponse>>,
+        outcomes: Mutex<Vec<ScriptedOutcome>>,
         requests: Arc<Mutex<Vec<ChatRequest>>>,
     }
 
     struct ScriptedResponse {
         events: Vec<LlmEvent>,
         finish_reason: FinishReason,
+    }
+
+    enum ScriptedOutcome {
+        Response(ScriptedResponse),
+        Error(LlmError),
     }
 
     #[async_trait(?Send)]
@@ -3245,7 +3817,10 @@ mod tests {
             sink: &mut dyn LlmEventSink,
         ) -> Result<LlmResponseSummary, LlmError> {
             self.requests.lock().expect("requests mutex").push(request);
-            let response = self.responses.lock().expect("responses mutex").remove(0);
+            let response = match self.outcomes.lock().expect("outcomes mutex").remove(0) {
+                ScriptedOutcome::Response(response) => response,
+                ScriptedOutcome::Error(error) => return Err(error),
+            };
             let transport_error_usage = if response.finish_reason == FinishReason::Error {
                 response.events.iter().find_map(|event| match event {
                     LlmEvent::Finished {
@@ -3327,7 +3902,7 @@ mod tests {
         )
     }
 
-    fn compaction_batch_template() -> ChatRequest {
+    fn compaction_request_template() -> ChatRequest {
         let model = ModelProfile {
             name: "test".to_string(),
             context_window: 1,
@@ -3364,20 +3939,6 @@ mod tests {
         )
     }
 
-    fn set_compaction_input_capacity(
-        template: &mut ChatRequest,
-        overflow_margin_tokens: usize,
-        input_capacity_tokens: u32,
-    ) {
-        let empty_request = compaction_request_with_content(template, String::new());
-        let baseline = ContextWindowTokenStatus::for_request(&empty_request, 0);
-        template.model.context_window = baseline
-            .active_context_tokens
-            .saturating_add(template.model.max_output_tokens)
-            .saturating_add(overflow_margin_tokens.min(u32::MAX as usize) as u32)
-            .saturating_add(input_capacity_tokens);
-    }
-
     #[test]
     fn compaction_collector_projects_provider_phase_without_exposing_summary_delta() {
         let response_id = ModelResponseId::new();
@@ -3388,6 +3949,7 @@ mod tests {
             attempt: 1,
             elapsed_ms: 42,
             terminal_status: None,
+            usage: None,
             failure: None,
         };
         let mut sink = CapturingSink::default();
@@ -3420,55 +3982,782 @@ mod tests {
     }
 
     #[test]
-    fn compaction_batches_cover_one_giant_item_without_exceeding_the_model_window() {
-        let overflow_margin_tokens = 8;
-        let mut template = compaction_batch_template();
-        set_compaction_input_capacity(&mut template, overflow_margin_tokens, 64);
-        assert!(compaction_content_fits(
-            &template,
-            "",
-            overflow_margin_tokens
+    fn compaction_request_preserves_native_history_and_appends_checkpoint_prompt() {
+        let mut template = compaction_request_template();
+        template.system_prompt = "current system and world state".to_string();
+        template.messages = vec![
+            ModelMessage::User {
+                content: "original task".to_string(),
+            },
+            ModelMessage::User {
+                content: format!(
+                    "{}\n\n## Verified progress and decisions\n- [Verified] cancel_contract.md exists — Evidence: direct file read\n- [Verified] 10 integration tests exist — Evidence: earlier checkpoint",
+                    include_str!("../../assets/prompts/compaction_summary_prefix.md").trim()
+                ),
+            },
+            ModelMessage::AssistantToolCalls {
+                content: Some("I will check the directory again.".to_string()),
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call-list".to_string(),
+                    tool_name: "list".to_string(),
+                    arguments_json: r#"{"path":"."}"#.to_string(),
+                }],
+            },
+            ModelMessage::Tool {
+                call_id: "call-list".to_string(),
+                tool_name: "list".to_string(),
+                result: "Showing the first 50 entries; output truncated".to_string(),
+                metadata: serde_json::Value::Null,
+            },
+            ModelMessage::AssistantToolCalls {
+                content: Some("The file update is complete.".to_string()),
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call-1".to_string(),
+                    tool_name: "write".to_string(),
+                    arguments_json: r#"{"path":"task.md"}"#.to_string(),
+                }],
+            },
+            ModelMessage::Tool {
+                call_id: "call-1".to_string(),
+                tool_name: "write".to_string(),
+                result: "Exit code: 1; file unchanged".to_string(),
+                metadata: serde_json::Value::Null,
+            },
+            ModelMessage::AssistantToolCalls {
+                content: Some(
+                    "The write failed. Do not repeat that form unchanged; use apply_patch next."
+                        .to_string(),
+                ),
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call-recovery-read".to_string(),
+                    tool_name: "read".to_string(),
+                    arguments_json: r#"{"path":"task.md"}"#.to_string(),
+                }],
+            },
+            ModelMessage::Tool {
+                call_id: "call-recovery-read".to_string(),
+                tool_name: "read".to_string(),
+                result: "original contents".to_string(),
+                metadata: serde_json::Value::Null,
+            },
+        ];
+        template.tools = vec![ToolSchema {
+            name: "write".to_string(),
+            description: "write a file".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        template.tool_choice = Some(crate::llm::ProviderToolChoice::Required);
+        template.parallel_tool_calls = true;
+
+        let compact = compaction_request_with_messages(&template, template.messages.clone());
+
+        assert_eq!(compact.system_prompt, "current system and world state");
+        assert!(compact.tools.is_empty());
+        assert!(compact.tool_choice.is_none());
+        assert!(!compact.parallel_tool_calls);
+        assert!(matches!(
+            compact.messages.as_slice(),
+            [
+                ModelMessage::User { content: user },
+                ModelMessage::User { content: older_checkpoint },
+                ModelMessage::AssistantToolCalls { tool_calls: list_calls, .. },
+                ModelMessage::Tool { result: list_result, .. },
+                ModelMessage::AssistantToolCalls { tool_calls: write_calls, .. },
+                ModelMessage::Tool { result: write_result, .. },
+                ModelMessage::AssistantToolCalls { content: recovery, tool_calls: recovery_calls },
+                ModelMessage::Tool { result: recovery_read, .. },
+                ModelMessage::User { content: prompt },
+            ] if user == "original task"
+                && older_checkpoint.contains("[Verified] cancel_contract.md exists")
+                && matches!(list_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "list")
+                && list_result.contains("output truncated")
+                && matches!(write_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "write")
+                && write_result == "Exit code: 1; file unchanged"
+                && recovery.as_deref().is_some_and(|content| content.contains("use apply_patch next"))
+                && matches!(recovery_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "read")
+                && recovery_read == "original contents"
+                && prompt.contains("CONTEXT CHECKPOINT COMPACTION")
         ));
-        let source = "巨大な単一入力".repeat(1_000);
+        let checkpoint_prompt = match compact.messages.last() {
+            Some(ModelMessage::User { content }) => content,
+            other => panic!("expected final checkpoint User prompt, got {other:?}"),
+        };
+        assert!(checkpoint_prompt.contains("latest user or delegated `NEW_TASK` objective"));
+        assert!(checkpoint_prompt.contains("material delegated results"));
+        assert!(checkpoint_prompt.contains("latest explicit recovery"));
+        assert!(checkpoint_prompt.contains("must not be repeated unchanged"));
+        assert!(checkpoint_prompt.contains("selected fallback"));
+        assert!(checkpoint_prompt.contains("Do not claim the fallback succeeded"));
+        assert!(checkpoint_prompt.contains("truncated or incomplete"));
+        let mut previous_section = 0;
+        for section in [
+            "## Current progress and decisions",
+            "## Important context and constraints",
+            "## Failed attempts and recovery",
+            "## Remaining work",
+        ] {
+            let section_index = checkpoint_prompt
+                .find(section)
+                .unwrap_or_else(|| panic!("missing checkpoint section {section}"));
+            assert!(
+                section_index >= previous_section,
+                "checkpoint sections must retain their contract order"
+            );
+            previous_section = section_index;
+        }
+        assert!(
+            checkpoint_prompt.len() < 2_000,
+            "checkpoint instructions should remain short"
+        );
 
-        let batches = build_compaction_batches(
-            &template,
-            std::slice::from_ref(&source),
-            overflow_margin_tokens,
-        )
-        .expect("split giant compaction source");
-
-        assert!(batches.len() > 1);
-        assert_eq!(batches.concat(), source);
-        assert!(batches.into_iter().all(|batch| compaction_content_fits(
-            &template,
-            &batch,
-            overflow_margin_tokens
-        )));
+        let prompt_only = compaction_request_with_messages(&template, Vec::new());
+        assert_eq!(prompt_only.system_prompt, template.system_prompt);
+        assert!(matches!(
+            prompt_only.messages.as_slice(),
+            [ModelMessage::User { content }]
+                if content == include_str!("../../assets/prompts/compaction.md").trim()
+        ));
     }
 
     #[test]
-    fn compaction_batches_reject_an_envelope_with_no_model_input_capacity() {
-        let overflow_margin_tokens = 8;
-        let mut template = compaction_batch_template();
-        set_compaction_input_capacity(&mut template, overflow_margin_tokens, 0);
+    fn removing_the_oldest_compaction_item_matches_provider_native_granularity() {
+        let assistant = ModelMessage::AssistantToolCalls {
+            content: Some("inspect both files".to_string()),
+            tool_calls: vec![
+                ModelToolCall {
+                    call_id: "call-1".to_string(),
+                    tool_name: "read".to_string(),
+                    arguments_json: r#"{"path":"a.txt"}"#.to_string(),
+                },
+                ModelToolCall {
+                    call_id: "call-2".to_string(),
+                    tool_name: "read".to_string(),
+                    arguments_json: r#"{"path":"b.txt"}"#.to_string(),
+                },
+            ],
+        };
+        let first_output = ModelMessage::Tool {
+            call_id: "call-1".to_string(),
+            tool_name: "read".to_string(),
+            result: "a".to_string(),
+            metadata: serde_json::Value::Null,
+        };
+        let second_output = ModelMessage::Tool {
+            call_id: "call-2".to_string(),
+            tool_name: "read".to_string(),
+            result: "b".to_string(),
+            metadata: serde_json::Value::Null,
+        };
+        let newest = ModelMessage::User {
+            content: "latest instruction".to_string(),
+        };
 
-        assert!(!compaction_content_fits(
-            &template,
-            "",
-            overflow_margin_tokens
-        ));
-        let error = build_compaction_batches(
-            &template,
-            &["canonical source".to_string()],
-            overflow_margin_tokens,
-        )
-        .expect_err("an exhausted compaction envelope must fail closed");
+        let mut messages = vec![
+            assistant.clone(),
+            first_output.clone(),
+            second_output.clone(),
+            newest.clone(),
+        ];
+        remove_oldest_compaction_message(&mut messages);
         assert!(matches!(
-            error,
-            AgentError::Message(message)
-                if message.contains("no model input capacity after output and safety reservation")
+            messages.as_slice(),
+            [
+                ModelMessage::AssistantToolCalls { content: None, tool_calls },
+                ModelMessage::Tool { call_id: first, .. },
+                ModelMessage::Tool { call_id: second, .. },
+                ModelMessage::User { content },
+            ] if tool_calls.len() == 2
+                && first == "call-1"
+                && second == "call-2"
+                && content == "latest instruction"
         ));
+        remove_oldest_compaction_message(&mut messages);
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                ModelMessage::AssistantToolCalls { content: None, tool_calls },
+                ModelMessage::Tool { call_id, .. },
+                ModelMessage::User { content },
+            ] if matches!(tool_calls.as_slice(), [ModelToolCall { call_id: remaining, .. }] if remaining == "call-2")
+                && call_id == "call-2"
+                && content == "latest instruction"
+        ));
+        remove_oldest_compaction_message(&mut messages);
+        assert!(matches!(
+            messages.as_slice(),
+            [ModelMessage::User { content }] if content == "latest instruction"
+        ));
+
+        let mut output_first = vec![first_output, assistant, second_output];
+        remove_oldest_compaction_message(&mut output_first);
+        assert!(matches!(
+            output_first.as_slice(),
+            [
+                ModelMessage::AssistantToolCalls { content: Some(content), tool_calls },
+                ModelMessage::Tool { call_id, .. },
+            ] if content == "inspect both files"
+                && matches!(tool_calls.as_slice(), [ModelToolCall { call_id: remaining, .. }] if remaining == "call-2")
+                && call_id == "call-2"
+        ));
+
+        let system = ModelMessage::System {
+            content: "base instructions".to_string(),
+        };
+        let oldest = ModelMessage::User {
+            content: "oldest".to_string(),
+        };
+        let mut ordinary = vec![
+            system.clone(),
+            ModelMessage::Developer {
+                content: "current developer context".to_string(),
+            },
+            oldest.clone(),
+            newest.clone(),
+        ];
+        remove_oldest_compaction_message(&mut ordinary);
+        assert!(matches!(
+            ordinary.as_slice(),
+            [
+                ModelMessage::System { content: base },
+                ModelMessage::User { content: old },
+                ModelMessage::User { content: latest }
+            ] if base == "base instructions" && old == "oldest" && latest == "latest instruction"
+        ));
+        remove_oldest_compaction_message(&mut ordinary);
+        assert!(matches!(
+            ordinary.as_slice(),
+            [
+                ModelMessage::System { content: base },
+                ModelMessage::User { content: latest }
+            ] if base == "base instructions" && latest == "latest instruction"
+        ));
+        remove_oldest_compaction_message(&mut ordinary);
+        assert!(matches!(
+            ordinary.as_slice(),
+            [ModelMessage::System { content }] if content == "base instructions"
+        ));
+        assert!(!has_removable_compaction_message(&ordinary));
+    }
+
+    #[test]
+    fn bounded_compaction_users_keep_newest_messages_and_truncate_the_boundary() {
+        let boundary = format!("HEAD-{}-TAIL", "x".repeat(100_000));
+        let messages = vec![boundary, "latest instruction".to_string()];
+
+        let preserved = bounded_compaction_user_messages(&messages);
+
+        assert_eq!(preserved.len(), 2);
+        assert!(preserved[0].starts_with("HEAD-"));
+        assert!(preserved[0].ends_with("-TAIL"));
+        assert!(preserved[0].contains("compaction checkpoint truncated"));
+        assert_eq!(preserved[1], "latest instruction");
+        assert!(
+            preserved
+                .iter()
+                .map(|message| estimate_text_tokens(message))
+                .sum::<usize>()
+                <= COMPACTION_USER_MESSAGE_MAX_TOKENS
+        );
+    }
+
+    #[test]
+    fn goal_steering_precedes_the_final_compaction_summary() {
+        let mut messages = vec![
+            ModelMessage::User {
+                content: "original task".to_string(),
+            },
+            context_manager::semantic_compaction_message("checkpoint"),
+        ];
+        let goal = ModelMessage::User {
+            content: "active goal steering".to_string(),
+        };
+
+        insert_before_final_compaction_summary(&mut messages, goal);
+
+        assert!(matches!(
+            messages.as_slice(),
+            [
+                ModelMessage::User { content: original },
+                ModelMessage::User { content: goal },
+                summary,
+            ] if original == "original task"
+                && goal == "active goal steering"
+                && context_manager::is_semantic_compaction_message(summary)
+        ));
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_checkpoints_the_real_user_anchor_in_the_next_request() {
+        const RECOVERY_CHECKPOINT: &str = "\
+## Current progress and decisions
+- A child returned the repository inspection and the root integrated it.
+## Important context and constraints
+- Keep the existing response contract.
+## Failed attempts and recovery
+- Do not repeat the malformed patch unchanged; use the write fallback next. The fallback is pending.
+## Remaining work
+- Apply the selected write fallback.";
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 68_000;
+        config.model.max_output_tokens = 512;
+        config.session.overflow_margin_tokens = 128;
+        let run = run_scripted_with_control_and_tool(
+            config,
+            vec![
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "large-read".to_string(),
+                            tool_name: "read".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "large-read".to_string(),
+                            delta: "{}".to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(RECOVERY_CHECKPOINT.to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            RunControl::new(),
+            Arc::new(LargeReadOutputTool {
+                output_chars: 250_000,
+            }),
+        )
+        .await
+        .expect("scripted compaction run");
+        run.summary.expect("run completes after compaction");
+
+        assert!(run.events.iter().any(|event| matches!(
+            event,
+            RunEvent::RecoverableRuntimeFeedback { message, .. }
+                if message == COMPACTION_ACCURACY_WARNING
+        )));
+
+        assert_eq!(run.requests.len(), 3);
+        let first = &run.requests[0];
+        let compact = &run.requests[1];
+        let resumed = &run.requests[2];
+        assert_eq!(compact.system_prompt, first.system_prompt);
+        assert!(!compact.system_prompt.contains("<tools>"));
+        assert!(compact.tools.is_empty());
+        let compact_anchors = compact
+            .messages
+            .iter()
+            .skip_while(|message| matches!(message, ModelMessage::Developer { .. }))
+            .take_while(|message| matches!(message, ModelMessage::User { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(compact_anchors.len(), 2);
+        assert!(compact_anchors.iter().all(
+            |message| matches!(message, ModelMessage::User { content } if content == "write hello.txt")
+        ));
+        assert!(matches!(
+            &compact.messages[compact.messages.len() - 3..],
+            [
+                ModelMessage::AssistantToolCalls { tool_calls, .. },
+                ModelMessage::Tool { result, .. },
+                ModelMessage::User { content: prompt },
+            ] if matches!(tool_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "read")
+                && result.len() == 250_000
+                && prompt.contains("CONTEXT CHECKPOINT COMPACTION")
+        ));
+        let (summary_message, retained_messages) = resumed
+            .messages
+            .split_last()
+            .expect("resumed request has a summary");
+        assert!(matches!(
+            retained_messages,
+            [
+                ModelMessage::Developer { .. },
+                ModelMessage::Developer { .. },
+                ModelMessage::User { content },
+            ] if content == "write hello.txt"
+        ));
+        assert!(matches!(
+            summary_message,
+            ModelMessage::User { content: summary }
+                if summary.contains("Another language model started")
+                    && summary.contains("child returned the repository inspection")
+                    && summary.contains("Do not repeat the malformed patch unchanged")
+                    && summary.contains("use the write fallback next")
+                    && summary.contains("The fallback is pending")
+                    && !summary.contains("write hello.txt")
+        ));
+
+        let history = run
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(run.session_id)
+            .expect("canonical history");
+        assert!(!history.iter().any(|item| matches!(
+            &item.payload,
+            HistoryItemPayload::Error { message } if message == COMPACTION_ACCURACY_WARNING
+        )));
+        let user_id = history
+            .iter()
+            .find_map(|item| {
+                matches!(item.payload, HistoryItemPayload::UserTurn { .. }).then_some(item.id)
+            })
+            .expect("real user item");
+        let (replacement_ids, preserved_user_messages) = history
+            .iter()
+            .find_map(|item| match &item.payload {
+                HistoryItemPayload::Compaction {
+                    replacement_item_ids,
+                    preserved_user_messages,
+                    ..
+                } => Some((replacement_item_ids, preserved_user_messages)),
+                _ => None,
+            })
+            .expect("compaction checkpoint");
+        assert!(replacement_ids.contains(&user_id));
+        assert_eq!(preserved_user_messages, &["write hello.txt"]);
+    }
+
+    #[tokio::test]
+    async fn compaction_retries_context_overflow_after_removing_the_oldest_item() {
+        const CHECKPOINT: &str = "Continue after the oversized read.";
+
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 68_000;
+        config.model.max_output_tokens = 512;
+        config.session.overflow_margin_tokens = 128;
+        let run = run_scripted_internal_with_pending_steers(
+            config,
+            vec![
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "overflow-read".to_string(),
+                            tool_name: "read".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "overflow-read".to_string(),
+                            delta: "{}".to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                }),
+                ScriptedOutcome::Error(LlmError::ProviderRejected {
+                    status: Some(400),
+                    code: Some("context_length_exceeded".to_string()),
+                    param: None,
+                    message: "maximum context length exceeded".to_string(),
+                }),
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(CHECKPOINT.to_string())],
+                    finish_reason: FinishReason::Stop,
+                }),
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                }),
+            ],
+            None,
+            Vec::new(),
+            crate::cli::ReviewDecision::Approved,
+            RunControl::new(),
+            Some(Arc::new(LargeReadOutputTool {
+                output_chars: 250_000,
+            })),
+            false,
+        )
+        .await
+        .expect("scripted context-overflow retry run");
+
+        run.summary.expect("run succeeds after compact retry");
+        assert_eq!(run.requests.len(), 4);
+        let compact = &run.requests[1];
+        let retry = &run.requests[2];
+        assert_eq!(retry.messages.len(), compact.messages.len() - 1);
+        assert_eq!(retry.system_prompt, compact.system_prompt);
+        assert!(matches!(
+            (compact.messages.first(), retry.messages.first()),
+            (
+                Some(ModelMessage::Developer { .. }),
+                Some(ModelMessage::Developer { .. })
+            )
+        ));
+        let leading_user_anchors = |request: &ChatRequest| {
+            request
+                .messages
+                .iter()
+                .skip_while(|message| matches!(message, ModelMessage::Developer { .. }))
+                .take_while(|message| {
+                    matches!(message, ModelMessage::User { content } if content == "write hello.txt")
+                })
+                .count()
+        };
+        assert_eq!(leading_user_anchors(compact), 2);
+        assert_eq!(leading_user_anchors(retry), 2);
+        assert!(matches!(
+            (compact.messages.last(), retry.messages.last()),
+            (
+                Some(ModelMessage::User { content: first_prompt }),
+                Some(ModelMessage::User { content: retry_prompt }),
+            ) if first_prompt == include_str!("../../assets/prompts/compaction.md").trim()
+                && retry_prompt == first_prompt
+        ));
+        assert!(run.events.iter().any(|event| matches!(
+            event,
+            RunEvent::RecoverableRuntimeFeedback { message, .. }
+                if message == COMPACTION_ACCURACY_WARNING
+        )));
+    }
+
+    #[tokio::test]
+    async fn compaction_does_not_trim_or_retry_a_non_context_provider_failure() {
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 72_000;
+        config.model.max_output_tokens = 512;
+        config.session.overflow_margin_tokens = 128;
+        let run = run_scripted_internal_with_pending_steers(
+            config,
+            vec![
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "invalid-read".to_string(),
+                            tool_name: "read".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "invalid-read".to_string(),
+                            delta: "{}".to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                }),
+                ScriptedOutcome::Error(LlmError::ProviderRejected {
+                    status: Some(400),
+                    code: Some("invalid_request".to_string()),
+                    param: None,
+                    message: "request is invalid".to_string(),
+                }),
+            ],
+            None,
+            Vec::new(),
+            crate::cli::ReviewDecision::Approved,
+            RunControl::new(),
+            Some(Arc::new(LargeReadOutputTool {
+                output_chars: 350_000,
+            })),
+            false,
+        )
+        .await
+        .expect("scripted non-context failure run");
+
+        let error = run.summary.expect_err("provider failure must propagate");
+        assert!(error.to_string().contains("invalid_request"));
+        assert_eq!(run.requests.len(), 2);
+        assert!(
+            !run.events
+                .iter()
+                .any(|event| matches!(event, RunEvent::CompactionCompleted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_automatic_compaction_uses_one_native_codex_request() {
+        const CHECKPOINT: &str =
+            "Preserve the user's task and continue from the completed oversized read.";
+
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 72_000;
+        config.model.max_output_tokens = 512;
+        config.session.overflow_margin_tokens = 128;
+        let run = run_scripted_with_control_and_tool(
+            config,
+            vec![
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "oversized-read".to_string(),
+                            tool_name: "read".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "oversized-read".to_string(),
+                            delta: "{}".to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(CHECKPOINT.to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            RunControl::new(),
+            Arc::new(LargeReadOutputTool {
+                output_chars: 350_000,
+            }),
+        )
+        .await
+        .expect("scripted oversized compaction run");
+        let summary = run.summary.as_ref().expect("run succeeds after compaction");
+
+        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_eq!(summary.metrics().model_request_count, run.requests.len());
+        assert_eq!(run.requests.len(), 3);
+        let first = &run.requests[0];
+        let compact = &run.requests[1];
+        let resumed = &run.requests[2];
+        assert_eq!(compact.system_prompt, first.system_prompt);
+        assert!(compact.tools.is_empty());
+        assert!(compact.tool_choice.is_none());
+        assert!(!compact.parallel_tool_calls);
+        assert!(matches!(
+            &compact.messages[compact.messages.len() - 3..],
+            [
+                ModelMessage::AssistantToolCalls { tool_calls, .. },
+                ModelMessage::Tool { result, .. },
+                ModelMessage::User { content: prompt },
+            ] if matches!(tool_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "read")
+                && result.len() == 350_000
+                && prompt == include_str!("../../assets/prompts/compaction.md").trim()
+        ));
+        assert!(!compact.messages.iter().any(|message| matches!(
+            message,
+            ModelMessage::User { content } if content.contains("[partial summary")
+        )));
+
+        let (checkpoint_message, anchors) = resumed
+            .messages
+            .split_last()
+            .expect("resumed request has a checkpoint");
+        assert!(matches!(
+            anchors,
+            [
+                ModelMessage::Developer { .. },
+                ModelMessage::Developer { .. },
+                ModelMessage::User { content },
+            ] if content == "write hello.txt"
+        ));
+        assert!(context_manager::is_semantic_compaction_message(
+            checkpoint_message
+        ));
+        assert!(matches!(
+            checkpoint_message,
+            ModelMessage::User { content }
+                if content.starts_with(
+                    include_str!("../../assets/prompts/compaction_summary_prefix.md").trim()
+                ) && content.ends_with(CHECKPOINT)
+        ));
+
+        let history = run
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(run.session_id)
+            .expect("canonical history");
+        let user_id = history
+            .iter()
+            .find_map(|item| {
+                matches!(item.payload, HistoryItemPayload::UserTurn { .. }).then_some(item.id)
+            })
+            .expect("real user item");
+        let (layout, preserved_user_messages, durable_summary, replacement_item_ids) = history
+            .iter()
+            .find_map(|item| match &item.payload {
+                HistoryItemPayload::Compaction {
+                    layout,
+                    preserved_user_messages,
+                    summary,
+                    replacement_item_ids,
+                    ..
+                } => Some((
+                    layout,
+                    preserved_user_messages,
+                    summary,
+                    replacement_item_ids,
+                )),
+                _ => None,
+            })
+            .expect("durable compaction checkpoint");
+        assert_eq!(
+            *layout,
+            crate::protocol::CompactionLayout::UserAnchoredCheckpoint
+        );
+        assert_eq!(preserved_user_messages, &["write hello.txt"]);
+        assert_eq!(durable_summary, CHECKPOINT);
+        assert!(replacement_item_ids.contains(&user_id));
+        assert!(run.events.iter().any(|event| matches!(
+            event,
+            RunEvent::RecoverableRuntimeFeedback { message, .. }
+                if message == COMPACTION_ACCURACY_WARNING
+        )));
+    }
+
+    #[tokio::test]
+    async fn cancelled_compaction_does_not_commit_a_partial_checkpoint() {
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 68_000;
+        config.model.max_output_tokens = 512;
+        config.session.overflow_margin_tokens = 128;
+        let run = run_scripted_with_control_and_tool(
+            config,
+            vec![
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "large-read".to_string(),
+                            tool_name: "read".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "large-read".to_string(),
+                            delta: "{}".to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        "partial checkpoint that must not become durable".to_string(),
+                    )],
+                    finish_reason: FinishReason::Cancelled,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done without compaction".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            RunControl::new(),
+            Arc::new(LargeReadOutputTool {
+                output_chars: 250_000,
+            }),
+        )
+        .await
+        .expect("scripted cancelled compaction run");
+
+        run.summary.expect("run continues below the hard limit");
+        assert_eq!(run.requests.len(), 3);
+        assert!(run.events.iter().any(|event| matches!(
+            event,
+            RunEvent::RecoverableRuntimeFeedback { message, .. }
+                if message.contains("semantic compaction was cancelled")
+        )));
+        assert!(
+            !run.events
+                .iter()
+                .any(|event| matches!(event, RunEvent::CompactionCompleted { .. }))
+        );
+        assert!(
+            !run.store
+                .protocol_event_store()
+                .list_history_items_for_session(run.session_id)
+                .expect("canonical history")
+                .iter()
+                .any(|item| matches!(item.payload, HistoryItemPayload::Compaction { .. }))
+        );
     }
 
     #[tokio::test]
@@ -3502,6 +4791,7 @@ mod tests {
             .expect("new turn admission");
         let event = RunEvent::CompactionCompleted {
             summarized_messages: 1,
+            preserved_user_messages: vec!["the earlier user requested a file update".to_string()],
             summary: "the earlier user requested a file update".to_string(),
             replacement_item_ids: vec![replacement_item_id],
         };
@@ -3736,6 +5026,38 @@ mod tests {
     struct CooperativeCleanupTool {
         started: Arc<tokio::sync::Barrier>,
         cleanup_completed: Arc<AtomicBool>,
+    }
+
+    struct LargeReadOutputTool {
+        output_chars: usize,
+    }
+
+    #[async_trait(?Send)]
+    impl crate::tool::registry::Tool for LargeReadOutputTool {
+        fn spec(&self) -> crate::tool::ToolSpec {
+            crate::tool::ToolSpec {
+                name: ToolName::Read,
+                effect: crate::tool::ToolEffectPolicy::read(),
+                description: "deterministic large read output for compaction tests",
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _raw_arguments: Value,
+            _ctx: crate::tool::context::ToolContext<'_>,
+        ) -> Result<ToolResult, crate::error::ToolError> {
+            Ok(ToolResult {
+                title: "large read fixture".to_string(),
+                output_text: "x".repeat(self.output_chars),
+                metadata: serde_json::json!({"fixture": "large_read"}),
+                truncated_output_path: None,
+                recorded_changes: Vec::new(),
+                change_summaries: Vec::new(),
+                _internal_file_lease: None,
+            })
+        }
     }
 
     #[async_trait(?Send)]
@@ -4079,6 +5401,24 @@ mod tests {
         );
         assert_eq!(summary.failed_tool_count(), 0);
         assert_eq!(summary.metrics().model_request_count, 2);
+        let context_sources = run
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                RunEvent::ModelRequestPrepared { diagnostics, .. } => diagnostics
+                    .context_window
+                    .as_ref()
+                    .map(|status| status.source),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            context_sources,
+            vec![
+                crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
+                crate::context::ActiveContextTokenSource::ProviderUsageWithLocalEstimate,
+            ]
+        );
         assert_eq!(
             summary
                 .metrics()
@@ -4139,6 +5479,26 @@ mod tests {
         }));
         assert!(run.requests[0].system_prompt.contains("<world_state>"));
         assert!(run.requests[0].system_prompt.contains("<current_time"));
+        assert!(!run.requests[0].system_prompt.contains("<tools>"));
+        let requested_tool_names = run.requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        assert!(!requested_tool_names.is_empty());
+        let first_request_diagnostics = run
+            .events
+            .iter()
+            .find_map(|event| match event {
+                RunEvent::ModelRequestPrepared { diagnostics, .. } => Some(diagnostics),
+                _ => None,
+            })
+            .expect("first request diagnostics");
+        assert_eq!(first_request_diagnostics.tool_names, requested_tool_names);
+        assert_eq!(
+            first_request_diagnostics.tool_schemas.len(),
+            run.requests[0].tools.len()
+        );
         assert!(summary.final_response_id().is_some());
     }
 
@@ -4195,7 +5555,6 @@ mod tests {
         assert!(guardian_request.tools.is_empty());
         assert!(!guardian_request.parallel_tool_calls);
         assert!(guardian_request.reasoning.is_none());
-        assert!(guardian_request.responses_continuation.is_none());
         assert!(guardian_request.temperature.is_none());
         assert!(guardian_request.top_p.is_none());
         assert!(guardian_request.top_k.is_none());
@@ -5317,6 +6676,22 @@ mod tests {
                 .iter()
                 .any(|event| has_terminal_status(event, SessionStatus::Cancelled))
         );
+        let terminal = run
+            .store
+            .protocol_event_store()
+            .list_runtime_events_for_session(run.session_id)
+            .expect("runtime events")
+            .into_iter()
+            .rev()
+            .find_map(|event| match event.msg {
+                crate::protocol::RuntimeEventMsg::TurnTerminal { terminal } => Some(*terminal),
+                _ => None,
+            })
+            .expect("canonical failure terminal");
+        assert_eq!(
+            terminal.metrics.token_usage.map(|usage| usage.total_tokens),
+            Some(15)
+        );
     }
 
     #[tokio::test]
@@ -5374,12 +6749,57 @@ mod tests {
                 terminal.final_response_id, None,
                 "an uncommitted provider response must not become durable response lineage"
             );
+            assert_eq!(
+                terminal.metrics.token_usage.map(|usage| usage.total_tokens),
+                Some(15)
+            );
             assert!(
                 !run.events
                     .iter()
                     .any(|event| has_terminal_status(event, SessionStatus::Completed))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn incomplete_provider_usage_remains_terminal_telemetry_without_response_lineage() {
+        let incomplete_usage = TokenUsage {
+            prompt_tokens: 71,
+            completion_tokens: 8,
+            total_tokens: 79,
+            reasoning_tokens: Some(3),
+        };
+        let run = run_scripted(
+            ResolvedConfig::default(),
+            vec![ScriptedResponse {
+                events: vec![LlmEvent::Finished {
+                    finish_reason: FinishReason::Error,
+                    usage: Some(incomplete_usage.clone()),
+                }],
+                finish_reason: FinishReason::Error,
+            }],
+        )
+        .await
+        .expect("run fixture");
+
+        assert!(matches!(
+            run.summary,
+            Err(AgentError::Llm(LlmError::IncompleteResponse { .. }))
+        ));
+        let terminal = run
+            .store
+            .protocol_event_store()
+            .list_runtime_events_for_session(run.session_id)
+            .expect("runtime events")
+            .into_iter()
+            .rev()
+            .find_map(|event| match event.msg {
+                crate::protocol::RuntimeEventMsg::TurnTerminal { terminal } => Some(*terminal),
+                _ => None,
+            })
+            .expect("canonical failure terminal");
+        assert_eq!(terminal.final_response_id, None);
+        assert_eq!(terminal.metrics.token_usage, Some(incomplete_usage));
     }
 
     #[tokio::test]
@@ -5420,6 +6840,22 @@ mod tests {
                     .expect("session")
                     .status,
                 SessionStatus::Failed
+            );
+            let terminal = run
+                .store
+                .protocol_event_store()
+                .list_runtime_events_for_session(run.session_id)
+                .expect("runtime events")
+                .into_iter()
+                .rev()
+                .find_map(|event| match event.msg {
+                    crate::protocol::RuntimeEventMsg::TurnTerminal { terminal } => Some(*terminal),
+                    _ => None,
+                })
+                .expect("canonical failure terminal");
+            assert_eq!(
+                terminal.metrics.token_usage.map(|usage| usage.total_tokens),
+                Some(15)
             );
             assert!(!run.root.join("must-not-exist.txt").exists());
         }
@@ -5473,10 +6909,10 @@ mod tests {
 
         let run = run_scripted_internal_with_pending_steers(
             ResolvedConfig::default(),
-            vec![ScriptedResponse {
+            vec![ScriptedOutcome::Response(ScriptedResponse {
                 events: vec![LlmEvent::TextDelta("done".to_string())],
                 finish_reason: FinishReason::Stop,
-            }],
+            })],
             None,
             pending_steers,
             crate::cli::ReviewDecision::Approved,
@@ -5648,15 +7084,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_overflow_fails_explicitly_without_compaction_or_history_loss() {
+    async fn provider_context_overflow_exhausts_oldest_items_without_history_loss() {
         let mut config = ResolvedConfig::default();
-        config.session.overflow_margin_tokens = 200_000;
-        let run = run_scripted(
+        config.model.context_window = 131_072;
+        config.model.max_output_tokens = 512;
+        config.session.overflow_margin_tokens = 128;
+        let mut outcomes = vec![ScriptedOutcome::Response(ScriptedResponse {
+            events: vec![
+                LlmEvent::ToolCallStart {
+                    call_id: "overflow-read".to_string(),
+                    tool_name: "read".to_string(),
+                },
+                LlmEvent::ToolCallArgsDelta {
+                    call_id: "overflow-read".to_string(),
+                    delta: "{}".to_string(),
+                },
+            ],
+            finish_reason: FinishReason::ToolCall,
+        })];
+        outcomes.extend((0..8).map(|_| {
+            ScriptedOutcome::Error(LlmError::ProviderRejected {
+                status: Some(400),
+                code: Some("context_length_exceeded".to_string()),
+                param: None,
+                message: "maximum context length exceeded".to_string(),
+            })
+        }));
+        let run = run_scripted_internal_with_pending_steers(
             config,
-            vec![ScriptedResponse {
-                events: vec![LlmEvent::TextDelta("must not be requested".to_string())],
-                finish_reason: FinishReason::Stop,
-            }],
+            outcomes,
+            None,
+            Vec::new(),
+            crate::cli::ReviewDecision::Approved,
+            RunControl::new(),
+            Some(Arc::new(LargeReadOutputTool {
+                output_chars: 530_000,
+            })),
+            false,
         )
         .await
         .expect("run setup");
@@ -5669,10 +7133,38 @@ mod tests {
             .expect("history");
 
         assert!(
-            error_text.contains("history was left unchanged"),
+            error_text.contains("context_length_exceeded"),
             "unexpected overflow error: {error_text}"
         );
-        assert!(run.requests.is_empty());
+        assert_eq!(run.requests.len(), 7);
+        assert!(
+            run.requests
+                .iter()
+                .skip(1)
+                .all(|request| request.system_prompt == run.requests[1].system_prompt)
+        );
+        assert!(matches!(
+            run.requests.last().and_then(|request| request.messages.last()),
+            Some(ModelMessage::User { content })
+                if content == include_str!("../../assets/prompts/compaction.md").trim()
+        ));
+        assert_eq!(
+            run.requests
+                .last()
+                .expect("prompt-only compaction attempt")
+                .messages
+                .len(),
+            1
+        );
+        assert!(matches!(
+            run.requests
+                .last()
+                .expect("prompt-only compaction attempt")
+                .messages
+                .as_slice(),
+            [ModelMessage::User { content }]
+                if content == include_str!("../../assets/prompts/compaction.md").trim()
+        ));
         assert!(
             !run.events
                 .iter()
@@ -6254,7 +7746,7 @@ mod tests {
     }
 
     #[test]
-    fn history_projection_replays_compaction_summary_and_skips_replaced_items() {
+    fn history_projection_places_checkpoint_before_retained_late_input() {
         let session_id = crate::session::SessionId::new();
         let turn_id = TurnId::new();
         let old_id = crate::protocol::HistoryItemId::new();
@@ -6297,6 +7789,8 @@ mod tests {
                 created_at_ms: 300,
                 payload: HistoryItemPayload::Compaction {
                     mode: crate::protocol::CompactionMode::Automatic,
+                    layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                    preserved_user_messages: vec!["old detail".to_string()],
                     summary: "old detail summary".to_string(),
                     replacement_item_ids: vec![old_id],
                 },
@@ -6305,15 +7799,19 @@ mod tests {
 
         let messages = messages_from_history(&items);
 
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         assert!(matches!(
             &messages[0],
+            ModelMessage::User { content } if content == "old detail"
+        ));
+        assert!(matches!(
+            &messages[1],
             ModelMessage::User { content }
                 if content.contains("old detail summary")
                     && !content.contains("recent detail")
         ));
         assert!(matches!(
-            &messages[1],
+            &messages[2],
             ModelMessage::User { content } if content == "recent detail"
         ));
     }
@@ -6494,7 +7992,10 @@ mod tests {
     ) -> Result<ScriptedRun, AgentError> {
         run_scripted_internal_with_pending_steers(
             config,
-            responses,
+            responses
+                .into_iter()
+                .map(ScriptedOutcome::Response)
+                .collect(),
             goal,
             pending_steer.into_iter().collect(),
             review_decision,
@@ -6508,7 +8009,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     async fn run_scripted_internal_with_pending_steers(
         config: ResolvedConfig,
-        responses: Vec<ScriptedResponse>,
+        outcomes: Vec<ScriptedOutcome>,
         goal: Option<(&str, ThreadGoalStatus, Option<i64>)>,
         pending_steers: Vec<SteerTurn>,
         review_decision: crate::cli::ReviewDecision,
@@ -6601,7 +8102,7 @@ mod tests {
         }
         let requests = Arc::new(Mutex::new(Vec::new()));
         let llm = Arc::new(ScriptedClient {
-            responses: Mutex::new(responses),
+            outcomes: Mutex::new(outcomes),
             requests: Arc::clone(&requests),
         });
         let agent = AgentLoop::new(llm, registry, store.clone(), PromptBuilder, tool_services);

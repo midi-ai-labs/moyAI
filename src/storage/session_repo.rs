@@ -1339,6 +1339,7 @@ impl SqliteSessionRepository {
             summarized_messages,
             summary,
             replacement_item_ids,
+            ..
         } = event
         else {
             return Err(StorageError::Message(
@@ -1839,6 +1840,52 @@ impl SqliteSessionRepository {
         let protocol_terminal = terminal_for_turn_in_connection(&transaction, session_id, turn_id)?;
         transaction.commit()?;
         Ok(protocol_terminal)
+    }
+
+    pub async fn latest_durable_terminal_before_turn(
+        &self,
+        session_id: SessionId,
+        current_turn_id: TurnId,
+    ) -> Result<Option<DurableTurnTerminal>, StorageError> {
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let previous_turn_id = transaction
+            .query_row(
+                "SELECT runtime_event.turn_id
+                 FROM protocol_runtime_events AS runtime_event
+                 JOIN protocol_item_append_order AS append_order
+                   ON append_order.session_id = runtime_event.session_id
+                  AND append_order.source_kind = 'runtime_event'
+                  AND append_order.source_id = runtime_event.id
+                 WHERE runtime_event.session_id = ?1
+                   AND runtime_event.turn_id <> ?2
+                   AND json_extract(runtime_event.msg_json, '$.kind') = 'turn_terminal'
+                   AND append_order.append_position < COALESCE(
+                       (SELECT MIN(current_order.append_position)
+                        FROM protocol_item_append_order AS current_order
+                        WHERE current_order.session_id = ?1
+                          AND current_order.turn_id = ?2),
+                       9223372036854775807
+                   )
+                 ORDER BY append_order.append_position DESC
+                 LIMIT 1",
+                params![session_id.to_string(), current_turn_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let terminal = match previous_turn_id {
+            Some(turn_id) => {
+                let turn_id = turn_id.parse::<TurnId>().map_err(|_| {
+                    StorageError::Message(format!(
+                        "session {session_id} has an invalid prior terminal turn identity"
+                    ))
+                })?;
+                terminal_for_turn_in_connection(&transaction, session_id, turn_id)?
+            }
+            None => None,
+        };
+        transaction.commit()?;
+        Ok(terminal)
     }
 
     pub async fn has_fresh_run_admission(
@@ -3424,7 +3471,7 @@ fn append_interrupted_live_snapshot_marker_in_transaction(
             outcome: TurnTerminalOutcome::Interrupted {
                 cause: crate::protocol::TurnInterruptionCause::AgentInterrupted,
             },
-            final_response_id: snapshot.final_response_id,
+            final_response_id: None,
             tool_call_count: snapshot.tool_call_count,
             failed_tool_count: snapshot.failed_tool_count,
             change_count: snapshot.change_count,
@@ -3447,7 +3494,6 @@ fn append_interrupted_live_snapshot_marker_in_transaction(
 
 #[derive(Debug)]
 struct CanonicalTurnSnapshot {
-    final_response_id: Option<ModelResponseId>,
     tool_call_count: usize,
     failed_tool_count: usize,
     change_count: usize,
@@ -3476,23 +3522,16 @@ fn canonical_turn_snapshot_in_transaction(
             )?
             .collect::<Result<Vec<_>, _>>()?
     };
-    let mut final_response_id = None;
     let mut tool_calls = Vec::<(ToolCallId, crate::tool::ToolName)>::new();
     let mut settled_tool_calls = HashSet::<ToolCallId>::new();
     let mut failed_tool_count = 0usize;
     let mut change_count = 0usize;
     for payload_json in payloads {
         match serde_json::from_str::<HistoryItemPayload>(&payload_json)? {
-            HistoryItemPayload::AssistantMessage { response_id, .. } => {
-                final_response_id = Some(response_id);
-            }
+            HistoryItemPayload::AssistantMessage { .. } => {}
             HistoryItemPayload::ToolCall {
-                call_id,
-                response_id,
-                tool_name,
-                ..
+                call_id, tool_name, ..
             } => {
-                final_response_id = Some(response_id);
                 tool_calls.push((call_id, crate::tool::ToolName::parse(&tool_name)));
             }
             HistoryItemPayload::ToolOutput {
@@ -3519,7 +3558,6 @@ fn canonical_turn_snapshot_in_transaction(
         .filter(|(call_id, _)| !settled_tool_calls.contains(call_id))
         .collect();
     Ok(CanonicalTurnSnapshot {
-        final_response_id,
         tool_call_count,
         failed_tool_count,
         change_count,
@@ -4440,7 +4478,7 @@ fn recover_expired_run_admission_in_transaction(
                 outcome: TurnTerminalOutcome::Failed {
                     error: EXPIRED_RUN_RECOVERY_REASON.to_string(),
                 },
-                final_response_id: snapshot.final_response_id,
+                final_response_id: None,
                 tool_call_count: snapshot.tool_call_count,
                 failed_tool_count: snapshot
                     .failed_tool_count
@@ -5663,6 +5701,72 @@ mod tests {
                 .expect("unrelated terminal lease outcome"),
             RunAdmissionLeaseRenewalOutcome::SupersededOrExpired
         ));
+    }
+
+    #[tokio::test]
+    async fn latest_terminal_before_turn_excludes_current_and_uses_append_order() {
+        let (store, session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let (first_admission_id, first_turn_id) = active_turn(&store, session_id).await;
+        let mut first_terminal = completed_terminal(session_id);
+        let RunEvent::TurnTerminal { terminal, .. } = &mut first_terminal else {
+            unreachable!("completed terminal helper must be terminal")
+        };
+        terminal.change_count = 1;
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    first_admission_id,
+                    &first_terminal,
+                    first_turn_id,
+                    Some(900),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("complete first turn"),
+            AdmittedTerminalCommit::Applied
+        );
+
+        let (second_admission_id, second_turn_id) = active_turn(&store, session_id).await;
+        let mut second_terminal = completed_terminal(session_id);
+        let RunEvent::TurnTerminal { terminal, .. } = &mut second_terminal else {
+            unreachable!("completed terminal helper must be terminal")
+        };
+        terminal.change_count = 2;
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    session_id,
+                    second_admission_id,
+                    &second_terminal,
+                    second_turn_id,
+                    Some(1),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("complete second turn"),
+            AdmittedTerminalCommit::Applied
+        );
+
+        let (_, current_turn_id) = active_turn(&store, session_id).await;
+        let latest = repository
+            .latest_durable_terminal_before_turn(session_id, current_turn_id)
+            .await
+            .expect("latest prior terminal")
+            .expect("second terminal");
+        assert_eq!(latest.change_count, 2);
+
+        let before_second = repository
+            .latest_durable_terminal_before_turn(session_id, second_turn_id)
+            .await
+            .expect("terminal before second")
+            .expect("first terminal");
+        assert_eq!(before_second.change_count, 1);
     }
 
     #[tokio::test]
@@ -6942,7 +7046,7 @@ mod tests {
             terminal.outcome,
             TurnTerminalOutcome::Interrupted { .. }
         ));
-        assert_eq!(terminal.final_response_id, Some(response_id));
+        assert_eq!(terminal.final_response_id, None);
         assert_eq!(terminal.tool_call_count, 1);
         assert_eq!(terminal.failed_tool_count, 0);
         assert_eq!(terminal.change_count, 0);
@@ -7046,7 +7150,7 @@ mod tests {
             .await
             .expect("terminal read")
             .expect("recovery terminal");
-        assert_eq!(terminal.final_response_id, Some(response_id));
+        assert_eq!(terminal.final_response_id, None);
         assert_eq!(terminal.tool_call_count, 1);
         assert_eq!(terminal.failed_tool_count, 1);
         assert_eq!(terminal.change_count, 0);
@@ -7161,7 +7265,7 @@ mod tests {
             .await
             .expect("terminal read")
             .expect("recovery terminal");
-        assert_eq!(terminal.final_response_id, Some(response_id));
+        assert_eq!(terminal.final_response_id, None);
         assert_eq!(terminal.tool_call_count, 1);
         assert_eq!(terminal.failed_tool_count, 0);
         assert_eq!(terminal.change_count, 2);

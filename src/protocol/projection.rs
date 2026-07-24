@@ -256,11 +256,14 @@ fn project_history_item(
         },
         RunEvent::CompactionCompleted {
             summarized_messages,
+            preserved_user_messages,
             summary,
             replacement_item_ids,
             ..
         } => HistoryItemPayload::Compaction {
             mode: crate::protocol::CompactionMode::Automatic,
+            layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+            preserved_user_messages: preserved_user_messages.clone(),
             summary: if summary.trim().is_empty() {
                 format!("summarized {summarized_messages} messages")
             } else {

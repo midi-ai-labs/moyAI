@@ -18,6 +18,7 @@
 - `case3`: same-session の docs-only redesign と実装 turn を分離する core continuation smoke
 - `case4`: `task.md` による段階的な source/design/test 作成
 - `case5`: long-context repository から文書3点を生成する docs smoke
+- `case5_2`: case5 の調査結果を引き継ぎ、restart-safe / idempotent cancellation を設計・実装し、app再起動後の回帰修正まで行う比較 benchmark
 - `case6`: read-only Windows system diagnostics の optional exploratory smoke
 - `case7`: Docling を使う structured-document batch smoke
 

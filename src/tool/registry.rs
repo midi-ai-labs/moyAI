@@ -350,6 +350,7 @@ mod tests {
     #[test]
     fn core_agent_for_config_omits_external_tools_when_disabled() {
         let mut config = crate::config::ResolvedConfig::default();
+        config.multi_agent.enabled = false;
         config.docling.enabled = false;
         config.mcp.enabled = false;
 
@@ -379,8 +380,8 @@ mod tests {
 
     #[test]
     fn core_agent_for_config_includes_multi_agent_tools_only_when_enabled() {
-        let mut config = crate::config::ResolvedConfig::default();
-        config.multi_agent.enabled = true;
+        let config = crate::config::ResolvedConfig::default();
+        assert!(config.multi_agent.enabled);
 
         let names = super::ToolRegistry::core_agent_for_config(&config).available_tool_names();
 

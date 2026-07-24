@@ -72,7 +72,7 @@ impl Tool for SpawnAgentTool {
         ToolSpec {
             name: ToolName::SpawnAgent,
             effect: crate::tool::ToolEffectPolicy::mutation(),
-            description: "Spawn an agent for a concrete, bounded task that can run independently alongside useful local work. The child has a canonical task path and the same workspace and permissions. This medium profile supports one child level, so only the root agent can spawn.",
+            description: "Spawn an agent for one concrete, bounded, self-contained work package with a verifiable outcome. A package may run concurrently or after a prerequisite result; it is independent when it has a clear scope, a single mutation owner when it writes, and a result the parent can integrate without repeating the work. A self-contained package may name shared-workspace inputs for the child to inspect; the parent need not read their contents first. The child has a canonical task path and the same workspace and permissions. This medium profile supports one child level, so only the root agent can spawn.",
             input_schema: json!({
                 "type": "object",
                 "required": ["task_name", "message"],
@@ -84,7 +84,7 @@ impl Tool for SpawnAgentTool {
                     },
                     "message": {
                         "type": "string",
-                        "description": "Initial plain-text task for the new agent."
+                        "description": "Task packet for the new agent. Assign one verifiable outcome and include the objective, known context or workspace inputs to inspect, scope and exclusions, mutation policy, acceptance criteria, and evidence to return. Named workspace paths are sufficient; the parent need not read those inputs first."
                     },
                     "fork_turns": {
                         "type": "string",
@@ -461,6 +461,25 @@ mod tests {
             spec.input_schema["properties"]["fork_turns"]["enum"],
             json!(["none", "all"])
         );
+        let message_description = spec.input_schema["properties"]["message"]["description"]
+            .as_str()
+            .expect("message description");
+        assert!(message_description.contains("objective"));
+        assert!(message_description.contains("one verifiable outcome"));
+        assert!(message_description.contains("workspace inputs to inspect"));
+        assert!(message_description.contains("parent need not read those inputs first"));
+        assert!(message_description.contains("acceptance criteria"));
+        assert!(message_description.contains("evidence"));
+        assert!(spec.description.contains("after a prerequisite result"));
+        assert!(
+            spec.description
+                .contains("single mutation owner when it writes")
+        );
+        assert!(
+            spec.description
+                .contains("parent need not read their contents first")
+        );
+        assert!(spec.description.contains("without repeating the work"));
         assert!(spec.input_schema["properties"].get("agent_type").is_none());
         assert!(spec.input_schema["properties"].get("model").is_none());
     }

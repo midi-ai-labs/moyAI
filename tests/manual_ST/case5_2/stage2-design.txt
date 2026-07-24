@@ -1,0 +1,16 @@
+先ほど作成した4文書とcurrent implementationを根拠に、simulation cancellationをrestart-safeかつidempotentにする変更設計を `cancel_contract.md` としてcurrent directory直下に作成してください。
+
+このturnでは設計だけを行い、実装コード、設定、既存test、先ほどの4文書は変更しないでください。
+
+設計するobservable contract:
+- SQLiteに `pending` または `running` のrunが存在すれば、同じprocessにlive controllerがあるか、backend再起動後でcontrollerがないかにかかわらず、cancel APIはHTTP 200と正確に `{"cancelled": true}` を返し、runを `cancelled` として永続化する。
+- live controllerがある場合は従来どおりcancel signalも送る。
+- 最初の有効なcancelでだけ `finished_at` を設定し、run artifactの `state.json` とDBを一致させる。
+- 既に `cancelled` のrunへの再cancelはHTTP 200と同じJSONを返すが、field、timestamp、DB、artifactを変更しない。
+- unknown run IDはHTTP 404と `{"detail": "Run not found"}` を返す。
+- `completed` または `failed` はHTTP 409と `{"detail": "Run already finished"}` を返し、状態を変更しない。
+- 成功responseの既存JSON shapeとfrontend clientの互換性を維持する。不要なfrontend変更を行わない。
+- 200 responseをOpenAPI上も `cancelled: boolean` として明示する。
+- dependencyを追加しない。
+
+`cancel_contract.md` にはstate transition、service/API責務、persistence順序、race consideration、変更候補file、unit/integration test matrixを記載してください。実装から確認できない点を推測で確定しないでください。

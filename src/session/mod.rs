@@ -13,12 +13,12 @@ pub use model::{
     IdleTurnRejectionReason, ImagePart, LoadedSessionList, LoadedSessionStatus,
     LoadedSessionSummary, MAX_THREAD_GOAL_OBJECTIVE_CHARS, NewSession, ProjectRecord,
     PromptDispatchPart, RequestDiagnosticsPart, RequestMessageDiagnostic,
-    RequestToolCallDiagnostic, RequestToolSchemaDiagnostic, RunConfigSnapshot, RunEvent,
-    RunMetrics, RunSummary, RunningSessionRejoin, SessionContext, SessionForkResult,
-    SessionModelParameters, SessionRecord, SessionRollbackResult, SessionSelector,
-    SessionSettingsPatch, SessionSettingsUpdate, SessionSpawnEdge, SessionStartRequest,
-    SessionStatus, SessionTitleUpdate, ThreadGoal, ThreadGoalClearResult, ThreadGoalGetResult,
-    ThreadGoalSetResult, ThreadGoalStatus, TokenUsage, ToolCallStatus,
+    RequestToolCallDiagnostic, RequestToolSchemaDiagnostic, RequestWireDiagnostic,
+    RunConfigSnapshot, RunEvent, RunMetrics, RunSummary, RunningSessionRejoin, SessionContext,
+    SessionForkResult, SessionModelParameters, SessionRecord, SessionRollbackResult,
+    SessionSelector, SessionSettingsPatch, SessionSettingsUpdate, SessionSpawnEdge,
+    SessionStartRequest, SessionStatus, SessionTitleUpdate, ThreadGoal, ThreadGoalClearResult,
+    ThreadGoalGetResult, ThreadGoalSetResult, ThreadGoalStatus, TokenUsage, ToolCallStatus,
     validate_thread_goal_objective,
 };
 pub use repository::{

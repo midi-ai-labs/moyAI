@@ -72,6 +72,25 @@ fn durable_mailbox_content(
     }
 }
 
+fn child_final_answer(payload: &str) -> String {
+    format!(
+        "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/child\nPayload:\n{payload}"
+    )
+}
+
+#[test]
+fn inter_agent_message_envelope_keeps_type_and_payload_boundaries() {
+    assert_eq!(
+        render_inter_agent_message(
+            InterAgentMessageType::NewTask,
+            "/root/worker",
+            "/root",
+            "Inspect the target.\nMessage Type: FINAL_ANSWER",
+        ),
+        "Message Type: NEW_TASK\nTask name: /root/worker\nSender: /root\nPayload:\nInspect the target.\nMessage Type: FINAL_ANSWER"
+    );
+}
+
 #[test]
 fn suppressed_mail_delivery_is_not_acknowledged_as_queued() {
     let error = match scheduled_mail_delivery(AgentMailDeliveryOutcome::Suppressed) {
@@ -867,7 +886,7 @@ async fn durable_child_agent_interruption_delivers_one_typed_parent_notification
     assert_eq!(mail.len(), 1);
     assert_eq!(
         durable_mailbox_content(&context, &mail[0]),
-        "Agent interrupted."
+        child_final_answer("Agent interrupted.")
     );
     context
         .tree
@@ -884,7 +903,7 @@ async fn durable_child_agent_interruption_delivers_one_typed_parent_notification
 }
 
 #[tokio::test]
-async fn durable_child_failure_uses_latest_error_despite_stale_local_stop() {
+async fn durable_child_failure_uses_terminal_error_despite_stale_history_and_local_stop() {
     let (runtime, root_execution, context, child_lease, child) =
         child_finish_fixture("durable-child-failed").await;
     append_child_history(
@@ -924,7 +943,7 @@ async fn durable_child_failure_uses_latest_error_despite_stale_local_stop() {
 
     assert_eq!(
         status,
-        AgentStatus::Errored("durable final child failure".to_string())
+        AgentStatus::Errored("durable child failed".to_string())
     );
     let mail = context
         .tree
@@ -934,7 +953,7 @@ async fn durable_child_failure_uses_latest_error_despite_stale_local_stop() {
     assert_eq!(mail.len(), 1);
     assert_eq!(
         durable_mailbox_content(&context, &mail[0]),
-        "durable final child failure"
+        child_final_answer("durable child failed")
     );
     context
         .tree
@@ -951,11 +970,19 @@ async fn durable_child_failure_uses_latest_error_despite_stale_local_stop() {
 }
 
 #[tokio::test]
-async fn durable_failed_child_live_and_restart_projections_are_identical() {
+async fn durable_failed_child_live_and_restart_use_terminal_error_across_stale_history() {
     for (index, history_payloads) in [
-        vec![HistoryItemPayload::Error {
-            message: "durable failed error".to_string(),
-        }],
+        vec![
+            HistoryItemPayload::AssistantMessage {
+                response_id: ModelResponseId::new(),
+                content: vec![ContentPart::Text {
+                    text: "partial durable assistant output".to_string(),
+                }],
+            },
+            HistoryItemPayload::Error {
+                message: "stale durable history error".to_string(),
+            },
+        ],
         vec![HistoryItemPayload::AssistantMessage {
             response_id: ModelResponseId::new(),
             content: vec![ContentPart::Text {
@@ -967,11 +994,37 @@ async fn durable_failed_child_live_and_restart_projections_are_identical() {
     .into_iter()
     .enumerate()
     {
-        let (runtime, root_execution, context, child_lease, mut child) =
+        let (runtime, root_execution, context, child_lease, child) =
             child_finish_fixture(&format!("durable-failed-equality-{index}")).await;
+        let root_session_id = context.root_session_id();
+        runtime
+            .store
+            .session_repo()
+            .insert_session_spawn_edge(
+                root_session_id,
+                root_session_id,
+                child.session.id,
+                "/root/child",
+                "child",
+            )
+            .await
+            .expect("failed child spawn edge");
         for payload in history_payloads {
             append_child_history(&runtime, child.session.id, payload);
         }
+        terminalize_test_session(
+            &runtime,
+            child.session.id,
+            TurnId::new(),
+            &terminal_event(
+                child.session.id,
+                TurnTerminalOutcome::Failed {
+                    error: "durable child failed".to_string(),
+                },
+                None,
+            ),
+        )
+        .await;
         let result = Ok(terminal_summary(
             child.session.id,
             TurnTerminalOutcome::Failed {
@@ -983,20 +1036,22 @@ async fn durable_failed_child_live_and_restart_projections_are_identical() {
             .finish_agent_turn(&context, &result, None)
             .await
             .status;
-        let history = runtime
-            .store
-            .protocol_event_store()
-            .list_history_items_for_session(child.session.id)
-            .expect("child history");
-        child.session.status = SessionStatus::Failed;
-        let restarted_status = rehydrated_agent_state(
-            child.session.id,
-            child.session.status,
-            durable_child_result(SessionStatus::Failed, &history),
-            None,
-        )
-        .expect("rehydrated failed child");
+        let store = runtime.store.clone();
+        let restarted_runtime =
+            AgentRuntime::new(store.clone(), crate::session::SessionService::new(store));
+        let restarted_status = restarted_runtime
+            .durable_activity_records(root_session_id)
+            .await
+            .expect("restarted durable child projection")
+            .into_iter()
+            .find(|record| record.session_id == child.session.id)
+            .expect("restarted failed child")
+            .status;
 
+        assert_eq!(
+            live_status,
+            AgentStatus::Errored("durable child failed".to_string())
+        );
         assert_eq!(live_status, restarted_status);
         let mail = context
             .tree
@@ -1006,7 +1061,7 @@ async fn durable_failed_child_live_and_restart_projections_are_identical() {
         assert_eq!(mail.len(), 1);
         assert_eq!(
             durable_mailbox_content(&context, &mail[0]),
-            agent_status_result(&restarted_status)
+            child_final_answer(&agent_status_result(&restarted_status))
         );
         context
             .tree
@@ -1038,13 +1093,17 @@ async fn durable_child_success_matches_rehydrated_canonical_history() {
             }],
         },
     );
-    let history = runtime
+    let projection = runtime
         .store
         .protocol_event_store()
-        .list_history_items_for_session(child.session.id)
-        .expect("child history");
+        .durable_child_result_projection(child.session.id)
+        .expect("completed child projection");
     assert_eq!(
-        durable_child_result(SessionStatus::Completed, &history),
+        durable_child_result_from_projection(
+            SessionStatus::Completed,
+            projection.latest_assistant_content.as_deref(),
+            projection.latest_error.as_deref(),
+        ),
         Some(content.clone())
     );
     let result = Ok(terminal_summary(
@@ -1070,7 +1129,10 @@ async fn durable_child_success_matches_rehydrated_canonical_history() {
         .drain_mailbox(&AgentPath::root())
         .expect("root mailbox");
     assert_eq!(mail.len(), 1);
-    assert_eq!(durable_mailbox_content(&context, &mail[0]), content);
+    assert_eq!(
+        durable_mailbox_content(&context, &mail[0]),
+        child_final_answer(&content)
+    );
     context
         .tree
         .control
@@ -1137,7 +1199,7 @@ async fn completed_child_result_uses_terminal_response_identity_without_history_
     assert_eq!(mail.len(), 1);
     assert_eq!(
         durable_mailbox_content(&context, &mail[0]),
-        "terminal response result"
+        child_final_answer("terminal response result")
     );
     context
         .tree
@@ -1229,7 +1291,7 @@ async fn child_result_delivery_survives_parent_durable_success_before_marker_rel
         matches!(
             &item.payload,
             HistoryItemPayload::InterAgentCommunication { communication }
-                if communication.content == content
+                if communication.content == child_final_answer(&content)
         )
     }));
     let mail = context
@@ -1238,7 +1300,10 @@ async fn child_result_delivery_survives_parent_durable_success_before_marker_rel
         .drain_mailbox(&AgentPath::root())
         .expect("root mailbox");
     assert_eq!(mail.len(), 1);
-    assert_eq!(durable_mailbox_content(&context, &mail[0]), content);
+    assert_eq!(
+        durable_mailbox_content(&context, &mail[0]),
+        child_final_answer(&content)
+    );
     context
         .tree
         .control
@@ -1547,6 +1612,19 @@ async fn process_restart_rehydrates_durable_child_for_listing_followup_and_name_
         )
         .await
         .expect("follow-up resolves restored child");
+    let child_history = store
+        .protocol_event_store()
+        .list_history_items_for_session(child_session.session.id)
+        .expect("follow-up history");
+    assert!(child_history.iter().any(|item| matches!(
+        &item.payload,
+        HistoryItemPayload::InterAgentCommunication { communication }
+            if communication.author == "/root"
+                && communication.recipient == "/root/research"
+                && communication.trigger_turn
+                && communication.content
+                    == "Message Type: NEW_TASK\nTask name: /root/research\nSender: /root\nPayload:\nreview the new request"
+    )));
     assert_eq!(
         store
             .session_repo()
@@ -1812,57 +1890,6 @@ async fn durable_cancelled_projection_uses_the_canonical_typed_cause() {
     assert_eq!(typed.status, AgentStatus::Interrupted);
 }
 
-#[test]
-fn failed_durable_child_prefers_latest_error_over_partial_assistant_text() {
-    let session_id = SessionId::new();
-    let turn_id = TurnId::new();
-    let history = vec![
-        HistoryItem {
-            id: HistoryItemId::new(),
-            session_id,
-            scope: HistoryScope::Turn { turn_id },
-            sequence_no: 0,
-            created_at_ms: SystemClock::now_ms(),
-            payload: HistoryItemPayload::AssistantMessage {
-                response_id: ModelResponseId::new(),
-                content: vec![ContentPart::Text {
-                    text: "partial assistant output".to_string(),
-                }],
-            },
-        },
-        HistoryItem {
-            id: HistoryItemId::new(),
-            session_id,
-            scope: HistoryScope::Turn { turn_id },
-            sequence_no: 1,
-            created_at_ms: SystemClock::now_ms(),
-            payload: HistoryItemPayload::Error {
-                message: "recoverable provider error".to_string(),
-            },
-        },
-        HistoryItem {
-            id: HistoryItemId::new(),
-            session_id,
-            scope: HistoryScope::Turn { turn_id },
-            sequence_no: 2,
-            created_at_ms: SystemClock::now_ms(),
-            payload: HistoryItemPayload::Error {
-                message: "final child failure".to_string(),
-            },
-        },
-    ];
-
-    assert_eq!(
-        durable_child_result(SessionStatus::Failed, &history),
-        Some("final child failure".to_string())
-    );
-    assert_eq!(
-        durable_child_result(SessionStatus::Completed, &history),
-        Some("partial assistant output".to_string()),
-        "successful children retain the latest assistant result"
-    );
-}
-
 #[tokio::test]
 async fn sub_agent_spawn_is_rejected_before_session_or_tree_side_effects() {
     let (runtime, session, config) = direct_runtime_fixture("spawn-depth", 3).await;
@@ -1989,6 +2016,257 @@ async fn sub_agent_spawn_is_rejected_before_session_or_tree_side_effects() {
         execution,
         &Ok(terminal_summary(
             session.session.id,
+            TurnTerminalOutcome::Completed,
+        )),
+        None,
+    );
+}
+
+#[tokio::test]
+async fn spawn_launch_failure_rolls_back_without_started_activity() {
+    let (runtime, session, config) = direct_runtime_fixture("spawn-launch-rollback", 2).await;
+    let execution = runtime
+        .begin_root(
+            &session,
+            captured_turn_config(config),
+            SharedConfirmationPrompt::new(AllowPrompt),
+            RunControl::new(),
+        )
+        .await
+        .expect("root execution");
+    bind_test_root_turn(&runtime, &execution).await;
+
+    let error = execution
+        .context
+        .spawn_agent(
+            "worker",
+            "bounded task".to_string(),
+            AgentForkTurns::None,
+            "spawn_rollback_activity".to_string(),
+        )
+        .await
+        .expect_err("unbound run service must reject the worker launch");
+
+    assert!(error.contains("not bound to an active run service"));
+    assert!(
+        runtime
+            .store
+            .session_repo()
+            .list_session_spawn_edges(session.session.id)
+            .await
+            .expect("spawn edges after rollback")
+            .is_empty()
+    );
+    assert!(
+        execution
+            .context
+            .tree
+            .control
+            .list_agents(None)
+            .expect("agents after rollback")
+            .iter()
+            .all(|agent| agent.path.is_root())
+    );
+    assert!(
+        execution
+            .context
+            .tree
+            .metadata
+            .lock()
+            .expect("metadata after rollback")
+            .keys()
+            .all(AgentPath::is_root)
+    );
+    let root_history = runtime
+        .store
+        .protocol_event_store()
+        .list_history_items_for_session(session.session.id)
+        .expect("root history after rollback");
+    assert!(!root_history.iter().any(|item| matches!(
+        &item.payload,
+        HistoryItemPayload::SubAgentActivity {
+            activity_id,
+            activity_kind: SubAgentActivityKind::Started,
+            ..
+        } if activity_id == "spawn_rollback_activity"
+    )));
+
+    runtime.complete_root(
+        execution,
+        &Ok(terminal_summary(
+            session.session.id,
+            TurnTerminalOutcome::Completed,
+        )),
+        None,
+    );
+}
+
+#[tokio::test]
+async fn pending_init_child_accepts_mail_before_durable_admission() {
+    let (runtime, root_session, config) = direct_runtime_fixture("pending-init-mail", 2).await;
+    let root_execution = runtime
+        .begin_root(
+            &root_session,
+            captured_turn_config(config.clone()),
+            SharedConfirmationPrompt::new(AllowPrompt),
+            RunControl::new(),
+        )
+        .await
+        .expect("root execution");
+    bind_test_root_turn(&runtime, &root_execution).await;
+    let tree = root_execution.context.tree.clone();
+    let child = runtime
+        .session_service
+        .start_or_resume(
+            SessionStartRequest {
+                selector: SessionSelector::New,
+                title: Some("pending-init-child".to_string()),
+                cwd: root_session.workspace.cwd.clone(),
+                model: config.model.model.clone(),
+                base_url: config.model.base_url.clone(),
+                access_mode: config.permissions.access_mode,
+            },
+            root_session.workspace.clone(),
+        )
+        .await
+        .expect("child session");
+    let child_path = AgentPath::root().join("pending").expect("child path");
+    let (_, child_lease) = tree
+        .control
+        .register_child(
+            &AgentPath::root(),
+            "pending",
+            child.session.id,
+            Some("Starting assigned task".to_string()),
+        )
+        .expect("child registration");
+    let child_context = AgentRunContext {
+        runtime: runtime.clone(),
+        tree: tree.clone(),
+        path: child_path.clone(),
+        session_id: child.session.id,
+        execution: child_lease.scope(),
+        root_turn_owner: Arc::clone(&root_execution.context.root_turn_owner),
+        config: captured_turn_config(config),
+        workspace: child.workspace.clone(),
+    };
+
+    assert!(matches!(
+        tree.control
+            .list_agents(Some(&child_path))
+            .expect("pending child")[0]
+            .status,
+        AgentStatus::PendingInit
+    ));
+    assert!(
+        runtime
+            .store
+            .session_repo()
+            .fresh_running_turn_for_session(child.session.id)
+            .await
+            .expect("pre-admission child state")
+            .is_none()
+    );
+
+    root_execution
+        .context
+        .send_message(
+            "pending",
+            "ordinary evidence".to_string(),
+            false,
+            "pending_message".to_string(),
+        )
+        .await
+        .expect("pending child message");
+    root_execution
+        .context
+        .send_message(
+            "pending",
+            "next bounded task".to_string(),
+            true,
+            "pending_followup".to_string(),
+        )
+        .await
+        .expect("pending child follow-up");
+
+    let pending = tree
+        .control
+        .list_agents(Some(&child_path))
+        .expect("pending child after mail")
+        .into_iter()
+        .next()
+        .expect("pending child snapshot");
+    assert_eq!(pending.status, AgentStatus::PendingInit);
+    assert_eq!(pending.pending_mail_count, 2);
+    let child_history = runtime
+        .store
+        .protocol_event_store()
+        .list_history_items_for_session(child.session.id)
+        .expect("pending child history");
+    assert_eq!(
+        child_history
+            .iter()
+            .filter(|item| matches!(
+                &item.payload,
+                HistoryItemPayload::InterAgentCommunication { .. }
+            ))
+            .count(),
+        2
+    );
+    assert!(
+        child_history
+            .iter()
+            .all(|item| item.scope.turn_id().is_none())
+    );
+
+    let child_turn_id = TurnId::new();
+    let admission = runtime
+        .store
+        .session_repo()
+        .admit_session_turn(child.session.id, child_turn_id)
+        .await
+        .expect("child admission")
+        .expect("child admission owner");
+    child_context
+        .mark_durable_turn_admitted()
+        .expect("publish admitted child");
+    let running = tree
+        .control
+        .list_agents(Some(&child_path))
+        .expect("running child")
+        .into_iter()
+        .next()
+        .expect("running child snapshot");
+    assert_eq!(running.status, AgentStatus::Running);
+    assert_eq!(
+        running.last_activity.as_deref(),
+        Some("Running assigned task")
+    );
+
+    child_context
+        .cancel_for_durable_terminal()
+        .expect("close pending child mailbox");
+    terminalize_admitted_test_session(
+        &runtime,
+        child.session.id,
+        admission.admission_id,
+        child_turn_id,
+        &terminal_event(
+            child.session.id,
+            TurnTerminalOutcome::Interrupted {
+                cause: TurnInterruptionCause::AgentInterrupted,
+            },
+            None,
+        ),
+    )
+    .await;
+    tree.control
+        .complete_execution(child_lease, InactiveAgentStatus::Interrupted, None)
+        .expect("complete pending child");
+    runtime.complete_root(
+        root_execution,
+        &Ok(terminal_summary(
+            root_session.session.id,
             TurnTerminalOutcome::Completed,
         )),
         None,
@@ -2710,6 +2988,8 @@ async fn root_context_durable_terminal_accessor_cancels_the_whole_tree() {
 struct AgentScriptState {
     root_calls: AtomicUsize,
     child_calls: AtomicUsize,
+    child_uses_list: AtomicBool,
+    root_plans_before_spawn_with_sibling: AtomicBool,
     requests: Mutex<Vec<ChatRequest>>,
 }
 
@@ -2739,7 +3019,9 @@ impl LlmClient for DetachedGoalScriptClient {
         sink: &mut dyn LlmEventSink,
     ) -> Result<LlmResponseSummary, LlmError> {
         let is_child = request.messages.iter().any(|message| {
-            matches!(message, ModelMessage::User { content } if content.contains(DETACHED_CHILD_ASSIGNMENT))
+            matches!(message, ModelMessage::Agent { content }
+                if content.contains("Message Type: NEW_TASK")
+                    && content.contains(DETACHED_CHILD_ASSIGNMENT))
         });
         if is_child {
             let call = self.state.child_calls.fetch_add(1, Ordering::SeqCst);
@@ -2772,7 +3054,7 @@ impl LlmClient for DetachedGoalScriptClient {
                     json!({
                         "task_name": "detached",
                         "message": DETACHED_CHILD_ASSIGNMENT,
-                        "fork_turns": "all"
+                        "fork_turns": "none"
                     }),
                 )?;
                 Ok(response_summary(FinishReason::ToolCall))
@@ -2794,8 +3076,8 @@ impl LlmClient for DetachedGoalScriptClient {
             }
             2 => {
                 let saw_child_result = request.messages.iter().any(|message| {
-                    matches!(message, ModelMessage::User { content }
-                        if content.contains("<inter_agent_message")
+                    matches!(message, ModelMessage::Agent { content }
+                        if content.contains("Message Type: FINAL_ANSWER")
                             && content.contains(DETACHED_CHILD_RESULT))
                 });
                 self.state
@@ -2837,7 +3119,9 @@ impl LlmClient for AgentScriptClient {
         sink: &mut dyn LlmEventSink,
     ) -> Result<LlmResponseSummary, LlmError> {
         let is_child = request.messages.iter().any(|message| {
-            matches!(message, ModelMessage::User { content } if content.contains(CHILD_ASSIGNMENT))
+            matches!(message, ModelMessage::Agent { content }
+                if content.contains("Message Type: NEW_TASK")
+                    && content.contains(CHILD_ASSIGNMENT))
         });
         self.state
             .requests
@@ -2847,6 +3131,22 @@ impl LlmClient for AgentScriptClient {
 
         if is_child {
             let call = self.state.child_calls.fetch_add(1, Ordering::SeqCst);
+            if self.state.child_uses_list.load(Ordering::SeqCst) {
+                return match call {
+                    0 => {
+                        emit_tool_call(sink, "child_list", "list", json!({"path": "."}))?;
+                        Ok(response_summary(FinishReason::ToolCall))
+                    }
+                    1 => {
+                        sink.push(LlmEvent::TextDelta(CHILD_RESULT.to_string()))?;
+                        Ok(response_summary(FinishReason::Stop))
+                    }
+                    _ => Err(LlmError::Message(format!(
+                        "unexpected child model request {}",
+                        call + 1
+                    ))),
+                };
+            }
             if call != 0 {
                 return Err(LlmError::Message(format!(
                     "unexpected child model request {}",
@@ -2856,6 +3156,67 @@ impl LlmClient for AgentScriptClient {
             tokio::time::sleep(Duration::from_millis(75)).await;
             sink.push(LlmEvent::TextDelta(CHILD_RESULT.to_string()))?;
             return Ok(response_summary(FinishReason::Stop));
+        }
+
+        if self
+            .state
+            .root_plans_before_spawn_with_sibling
+            .load(Ordering::SeqCst)
+        {
+            return match self.state.root_calls.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    emit_tool_call(
+                        sink,
+                        "root_local_plan",
+                        "update_plan",
+                        json!({
+                            "explanation": "Root owns a distinct initial coordination blocker.",
+                            "plan": [{
+                                "step": "Establish the initial coordination boundary",
+                                "status": "in_progress"
+                            }]
+                        }),
+                    )?;
+                    Ok(response_summary(FinishReason::ToolCall))
+                }
+                1 => {
+                    sink.push(LlmEvent::TextDelta(ROOT_PLAN.to_string()))?;
+                    emit_tool_call(
+                        sink,
+                        "spawn_1",
+                        "spawn_agent",
+                        json!({
+                            "task_name": "worker",
+                            "message": CHILD_ASSIGNMENT,
+                            "fork_turns": "all"
+                        }),
+                    )?;
+                    emit_tool_call(sink, "duplicate_root_list", "list", json!({"path": "."}))?;
+                    Ok(response_summary(FinishReason::ToolCall))
+                }
+                2 => {
+                    emit_tool_call(sink, "wait_1", "wait_agent", json!({"timeout_ms": 10_000}))?;
+                    Ok(response_summary(FinishReason::ToolCall))
+                }
+                3 => {
+                    let received_child_result = request.messages.iter().any(|message| {
+                        matches!(message, ModelMessage::Agent { content }
+                            if content.contains("Message Type: FINAL_ANSWER")
+                                && content.contains(CHILD_RESULT))
+                    });
+                    if !received_child_result {
+                        return Err(LlmError::Message(
+                            "root resumed without the child's durable communication".to_string(),
+                        ));
+                    }
+                    sink.push(LlmEvent::TextDelta(ROOT_RESULT.to_string()))?;
+                    Ok(response_summary(FinishReason::Stop))
+                }
+                call => Err(LlmError::Message(format!(
+                    "unexpected root model request {}",
+                    call + 1
+                ))),
+            };
         }
 
         match self.state.root_calls.fetch_add(1, Ordering::SeqCst) {
@@ -2879,8 +3240,8 @@ impl LlmClient for AgentScriptClient {
             }
             2 => {
                 let received_child_result = request.messages.iter().any(|message| {
-                    matches!(message, ModelMessage::User { content }
-                        if content.contains("<inter_agent_message")
+                    matches!(message, ModelMessage::Agent { content }
+                        if content.contains("Message Type: FINAL_ANSWER")
                             && content.contains(CHILD_RESULT))
                 });
                 if !received_child_result {
@@ -3441,11 +3802,33 @@ async fn idle_goal_continuation_waits_for_detached_child_and_loads_its_result() 
             .status,
         ThreadGoalStatus::Complete
     );
+    let edges = store
+        .session_repo()
+        .list_session_spawn_edges(summary.session_id())
+        .await
+        .expect("detached child edge");
+    assert_eq!(edges.len(), 1);
+    let child_history = store
+        .protocol_event_store()
+        .list_history_items_for_session(edges[0].child_session_id)
+        .expect("fork-none child history");
+    assert!(
+        !child_history
+            .iter()
+            .any(|item| matches!(&item.payload, HistoryItemPayload::UserTurn { .. }))
+    );
+    assert!(child_history.iter().any(|item| matches!(
+        &item.payload,
+        HistoryItemPayload::InterAgentCommunication { communication }
+            if communication.trigger_turn
+                && communication.content.contains("Message Type: NEW_TASK")
+                && communication.content.contains(DETACHED_CHILD_ASSIGNMENT)
+    )));
     provider_server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_context() {
+async fn proactive_root_ownership_rejects_spawn_sibling_and_keeps_root_collaboration_only() {
     let (base_url, provider_server) = start_probe_provider().await;
     let temp = tempfile::tempdir().expect("tempdir");
     let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 tempdir");
@@ -3473,7 +3856,7 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
     config.model.max_retries = 0;
     config.permissions.access_mode = AccessMode::FullAccess;
     config.multi_agent.enabled = true;
-    config.multi_agent.mode = MultiAgentMode::ExplicitRequestOnly;
+    config.multi_agent.mode = MultiAgentMode::Proactive;
     config.multi_agent.max_concurrent_agents = 3;
     config.multi_agent.max_concurrent_model_requests = 1;
 
@@ -3533,6 +3916,10 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
     };
     let registry = ToolRegistry::core_agent_for_config(&config);
     let script = Arc::new(AgentScriptState::default());
+    script.child_uses_list.store(true, Ordering::SeqCst);
+    script
+        .root_plans_before_spawn_with_sibling
+        .store(true, Ordering::SeqCst);
     let llm = Arc::new(AgentScriptClient {
         state: Arc::clone(&script),
     });
@@ -3588,8 +3975,8 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
 
     assert_eq!(summary.status(), SessionStatus::Completed);
     assert_eq!(summary.session_id(), root_session.session.id);
-    assert_eq!(script.root_calls.load(Ordering::SeqCst), 3);
-    assert_eq!(script.child_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(script.root_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(script.child_calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         session_service
             .get_session(summary.session_id())
@@ -3661,12 +4048,32 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
             ..
         } if tool_name == "spawn_agent"
     )));
+    let rejected_root_list_call_id = root_history
+        .iter()
+        .find_map(|item| match &item.payload {
+            HistoryItemPayload::ToolCall {
+                call_id, tool_name, ..
+            } if tool_name == "list" => Some(call_id),
+            _ => None,
+        })
+        .expect("root list sibling call");
+    assert!(root_history.iter().any(|item| matches!(
+        &item.payload,
+        HistoryItemPayload::ToolOutput {
+            call_id,
+            status: crate::protocol::ToolLifecycleStatus::Failed,
+            output_text,
+            ..
+        } if call_id == rejected_root_list_call_id
+            && output_text.contains("unavailable in a response that also delegates root ownership")
+    )));
     assert!(root_history.iter().any(|item| {
         matches!(
             &item.payload,
             HistoryItemPayload::InterAgentCommunication { communication }
                 if communication.author == "/root/worker"
                     && communication.recipient == "/root"
+                    && communication.content.contains("Message Type: FINAL_ANSWER")
                     && communication.content.contains(CHILD_RESULT)
                     && !communication.trigger_turn
         )
@@ -3683,7 +4090,7 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
                 if content_contains(content, ROOT_TASK)
         )
     }));
-    assert!(child_history.iter().any(|item| {
+    assert!(!child_history.iter().any(|item| {
         matches!(
             &item.payload,
             HistoryItemPayload::AssistantMessage { content, .. }
@@ -3693,32 +4100,96 @@ async fn scripted_provider_runs_parent_child_parent_with_durable_filtered_contex
     assert!(child_history.iter().any(|item| {
         matches!(
             &item.payload,
-            HistoryItemPayload::UserTurn { content, .. }
-                if content_contains(content, CHILD_ASSIGNMENT)
+            HistoryItemPayload::InterAgentCommunication { communication }
+                if communication.author == "/root"
+                    && communication.recipient == "/root/worker"
+                    && communication.trigger_turn
+                    && communication.content.contains("Message Type: NEW_TASK")
+                    && communication.content.contains(CHILD_ASSIGNMENT)
         )
     }));
-    assert!(!child_history.iter().any(|item| matches!(
-        item.payload,
-        HistoryItemPayload::ToolCall { .. }
-            | HistoryItemPayload::ToolOutput { .. }
-            | HistoryItemPayload::SubAgentActivity { .. }
+    assert!(child_history.iter().any(|item| matches!(
+        &item.payload,
+        HistoryItemPayload::ToolCall { tool_name, .. } if tool_name == "list"
     )));
+    assert!(child_history.iter().any(|item| matches!(
+        &item.payload,
+        HistoryItemPayload::ToolOutput {
+            status: crate::protocol::ToolLifecycleStatus::Completed,
+            ..
+        }
+    )));
+    assert!(
+        !child_history
+            .iter()
+            .any(|item| matches!(item.payload, HistoryItemPayload::SubAgentActivity { .. }))
+    );
 
     let requests = script.requests.lock().expect("request capture mutex");
+    let root_requests = requests
+        .iter()
+        .filter(|request| {
+            !request.messages.iter().any(|message| {
+                matches!(message, ModelMessage::Agent { content }
+                    if content.contains("Message Type: NEW_TASK")
+                        && content.contains(CHILD_ASSIGNMENT))
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(root_requests.len(), 4);
+    assert_eq!(
+        root_requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["spawn_agent", "update_plan"]
+    );
+    let delegated_root_tools = vec![
+        "followup_task",
+        "interrupt_agent",
+        "list_agents",
+        "send_message",
+        "spawn_agent",
+        "update_plan",
+        "wait_agent",
+    ];
+    assert!(
+        root_requests[1]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "list"),
+        "successful root-local planning must restore the normal workspace surface"
+    );
+    for request in &root_requests[2..] {
+        assert_eq!(
+            request
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            delegated_root_tools
+        );
+    }
     let child_request = requests
         .iter()
         .find(|request| {
             request.messages.iter().any(|message| {
-                matches!(message, ModelMessage::User { content } if content.contains(CHILD_ASSIGNMENT))
+                matches!(message, ModelMessage::Agent { content }
+                    if content.contains("Message Type: NEW_TASK")
+                        && content.contains(CHILD_ASSIGNMENT))
             })
         })
         .expect("captured child request");
-    assert!(child_request.system_prompt.contains("## Sub-agent"));
-    assert!(
-        child_request
-            .system_prompt
-            .contains("bounded task assigned by your parent")
-    );
+    assert!(!child_request.system_prompt.contains("## Sub-agent"));
+    assert!(matches!(
+        child_request.messages.first(),
+        Some(ModelMessage::Developer { content })
+            if content.starts_with("You are an agent in a team of agents")
+                && content.contains("immediately delivered back to your parent agent")
+                && content.contains("Message Type: NEW_TASK | MESSAGE | FINAL_ANSWER")
+                && content.contains("verified evidence")
+    ));
     let tool_names = child_request
         .tools
         .iter()

@@ -42,17 +42,10 @@ impl ModelPolicy {
                 .max_output_tokens
                 .saturating_add(config.session.overflow_margin_tokens as u32),
         );
-        // Keep the normal working set below 40% of the advertised context.
-        // For the default 131,072-token profile this triggers before a roughly
-        // 52k-token full-history resend, while the hard request limit remains a
-        // separate last-resort safety boundary.
-        let working_context_target = config.model.context_window.saturating_mul(2) / 5;
-        let compact_margin = config
-            .model
-            .max_output_tokens
-            .saturating_add(config.session.overflow_margin_tokens as u32)
-            .saturating_add(config.model.context_window / 20);
-        let legacy_margin_limit = config.model.context_window.saturating_sub(compact_margin);
+        // Match Codex's local-compaction trigger at 90% of the advertised
+        // context. The hard request limit remains an independent upper bound
+        // for profiles with large output reservations.
+        let working_context_target = config.model.context_window.saturating_mul(9) / 10;
         Self {
             id: config.model.model.clone(),
             base_instructions: format!(
@@ -62,9 +55,7 @@ impl ModelPolicy {
             ),
             default_reasoning: config.model.reasoning_effort.clone(),
             context_window: config.model.context_window,
-            working_context_token_limit: working_context_target
-                .min(hard_request_limit)
-                .min(legacy_margin_limit),
+            working_context_token_limit: working_context_target.min(hard_request_limit),
             max_output_tokens: config.model.max_output_tokens,
             input_modalities,
             supports_tools: config.model.supports_tools,
@@ -108,7 +99,6 @@ impl ProviderCapabilities {
                 .unwrap_or(ProviderReasoningCapability::Unsupported),
             ProviderApiMode::Responses => ProviderReasoningCapability::Responses {
                 supports_summary: true,
-                supports_previous_response_id: true,
             },
         };
         Self {
@@ -245,10 +235,21 @@ mod tests {
     }
 
     #[test]
-    fn default_working_context_triggers_before_fifty_two_k_resend() {
+    fn default_working_context_clamps_the_ninety_percent_target_to_the_hard_request_limit() {
         let config = ResolvedConfig::default();
         let policy = ModelPolicy::from_config(&config);
-        assert!(policy.working_context_token_limit <= 52_428);
+        let working_context_target = config.model.context_window.saturating_mul(9) / 10;
+        let hard_request_limit = config.model.context_window.saturating_sub(
+            config
+                .model
+                .max_output_tokens
+                .saturating_add(config.session.overflow_margin_tokens as u32),
+        );
+        assert_eq!(
+            policy.working_context_token_limit,
+            working_context_target.min(hard_request_limit)
+        );
+        assert_eq!(policy.working_context_token_limit, hard_request_limit);
         assert!(policy.working_context_token_limit < config.model.context_window);
     }
 }

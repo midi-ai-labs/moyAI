@@ -128,20 +128,14 @@ impl WorldStateSection for EnvironmentSection {
     }
 
     fn render(&self) -> String {
-        let tools = if self.tools.is_empty() {
-            "none".to_string()
-        } else {
-            self.tools.join(", ")
-        };
         format!(
-            "<environment_context>\n<workspace_root>{}</workspace_root>\n<cwd>{}</cwd>\n<access_mode>{}</access_mode>\n<permission_profile>{}</permission_profile>\n<model>{}</model>\n<shell>{}</shell>\n<tools>{}</tools>\n</environment_context>",
+            "<environment_context>\n<workspace_root>{}</workspace_root>\n<cwd>{}</cwd>\n<access_mode>{}</access_mode>\n<permission_profile>{}</permission_profile>\n<model>{}</model>\n<shell>{}</shell>\n</environment_context>",
             escape_xml_text(self.workspace_root.as_str()),
             escape_xml_text(self.cwd.as_str()),
             escape_xml_text(self.access_mode.as_str()),
             escape_xml_text(&self.permission_profile_summary),
             escape_xml_text(&self.model),
             escape_xml_text(&self.shell_family),
-            escape_xml_text(&tools),
         )
     }
 }
@@ -696,7 +690,8 @@ mod tests {
 
         assert!(!environment_rendered.contains("</model><forged"));
         assert!(environment_rendered.contains("model&lt;/model&gt;&lt;forged"));
-        assert!(environment_rendered.contains("read&lt;/tools&gt;&lt;forged&gt;"));
+        assert!(!environment_rendered.contains("<tools>"));
+        assert!(!environment_rendered.contains("read&lt;/tools&gt;&lt;forged&gt;"));
         assert!(instructions_rendered.contains("source=\"rules&quot; injected=&quot;true\""));
         assert!(instructions_rendered.contains("Follow &lt;unsafe&gt; &amp; verify."));
     }

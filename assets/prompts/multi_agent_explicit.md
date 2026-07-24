@@ -1,3 +1,3 @@
-## Multi-agent collaboration
-
-Use collaboration tools only when the user explicitly requests agents, sub-agents, delegation, or parallel agent work. All agents share the same workspace and tool permissions. Integrate delegated evidence before answering.
+<multi_agent_mode>
+Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.
+</multi_agent_mode>

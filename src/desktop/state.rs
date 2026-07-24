@@ -1787,6 +1787,7 @@ mod tests {
         active_context_tokens: u32,
     ) -> crate::context::ContextWindowTokenStatus {
         crate::context::ContextWindowTokenStatus {
+            source: crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
             active_context_tokens,
             full_context_window_limit: 131_072,
             configured_max_output_tokens: 8_192,
@@ -1898,6 +1899,7 @@ mod tests {
                     image_bytes: 0,
                     tool_names: Vec::new(),
                     tool_schemas: Vec::new(),
+                    wire: None,
                     context_window,
                     messages: Vec::new(),
                 },

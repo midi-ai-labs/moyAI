@@ -365,6 +365,62 @@ pub struct InterAgentCommunication {
     pub trigger_turn: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterAgentMessageType {
+    NewTask,
+    Message,
+    FinalAnswer,
+}
+
+impl InterAgentMessageType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NewTask => "NEW_TASK",
+            Self::Message => "MESSAGE",
+            Self::FinalAnswer => "FINAL_ANSWER",
+        }
+    }
+}
+
+pub(crate) fn render_inter_agent_message(
+    message_type: InterAgentMessageType,
+    recipient: &str,
+    author: &str,
+    payload: &str,
+) -> String {
+    format!(
+        "Message Type: {}\nTask name: {recipient}\nSender: {author}\nPayload:\n{payload}",
+        message_type.as_str()
+    )
+}
+
+pub(crate) fn is_rendered_inter_agent_message(communication: &InterAgentCommunication) -> bool {
+    let Some((header, _payload)) = communication.content.split_once("\nPayload:\n") else {
+        return false;
+    };
+    let mut lines = header.lines();
+    let Some(message_type) = lines
+        .next()
+        .and_then(|line| line.strip_prefix("Message Type: "))
+    else {
+        return false;
+    };
+    let task_name_matches = lines
+        .next()
+        .and_then(|line| line.strip_prefix("Task name: "))
+        .is_some_and(|task_name| task_name == communication.recipient);
+    let sender_matches = lines
+        .next()
+        .and_then(|line| line.strip_prefix("Sender: "))
+        .is_some_and(|sender| sender == communication.author);
+    let type_matches = match (communication.trigger_turn, message_type) {
+        (true, "NEW_TASK") => true,
+        (false, "MESSAGE" | "FINAL_ANSWER") => true,
+        _ => false,
+    };
+    task_name_matches && sender_matches && type_matches && lines.next().is_none()
+}
+
 impl RuntimeEvent {
     pub fn terminal_outcome(&self) -> Option<&TurnTerminalOutcome> {
         match &self.msg {
@@ -501,6 +557,24 @@ pub(crate) fn compacted_history_item_ids(items: &[HistoryItem]) -> HashSet<Histo
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionLayout {
+    /// v1.0.0 and earlier replaced an old prefix and projected its summary at
+    /// the earliest replaced position, before the retained raw suffix.
+    #[default]
+    LegacyPrefix,
+    /// Current checkpoints carry bounded real-user inputs and append the
+    /// latest summary after those inputs.
+    UserAnchoredCheckpoint,
+}
+
+impl CompactionLayout {
+    pub const fn appends_checkpoint(self) -> bool {
+        matches!(self, Self::UserAnchoredCheckpoint)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HistoryItemPayload {
@@ -577,6 +651,10 @@ pub enum HistoryItemPayload {
     },
     Compaction {
         mode: CompactionMode,
+        #[serde(default)]
+        layout: CompactionLayout,
+        #[serde(default)]
+        preserved_user_messages: Vec<String>,
         summary: String,
         replacement_item_ids: Vec<HistoryItemId>,
     },

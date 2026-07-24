@@ -1422,6 +1422,7 @@ mod tests {
                 attempt: 1,
                 elapsed_ms: 604,
                 terminal_status: None,
+                usage: None,
                 failure: None,
             },
         });
@@ -1561,6 +1562,7 @@ mod tests {
     fn latest_context_window_survives_same_session_reload() {
         let session_id = SessionId::new();
         let status = ContextWindowTokenStatus {
+            source: crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
             active_context_tokens: 2_100,
             full_context_window_limit: 131_072,
             configured_max_output_tokens: 8_192,
@@ -1586,6 +1588,7 @@ mod tests {
         let mut state = AppState {
             current_session_id: Some(previous_session_id),
             latest_context_window: Some(ContextWindowTokenStatus {
+                source: crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
                 active_context_tokens: 2_100,
                 full_context_window_limit: 131_072,
                 configured_max_output_tokens: 8_192,

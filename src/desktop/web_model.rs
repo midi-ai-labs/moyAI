@@ -1857,6 +1857,7 @@ mod tests {
     #[test]
     fn token_meter_projection_formats_estimated_usage() {
         let status = crate::context::ContextWindowTokenStatus {
+            source: crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
             active_context_tokens: 12_345,
             full_context_window_limit: 131_072,
             configured_max_output_tokens: 8_192,
@@ -1875,6 +1876,7 @@ mod tests {
     #[test]
     fn token_meter_projection_marks_reached_limit() {
         let status = crate::context::ContextWindowTokenStatus {
+            source: crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
             active_context_tokens: 130_000,
             full_context_window_limit: 131_072,
             configured_max_output_tokens: 8_192,

@@ -58,6 +58,15 @@ pub enum ModelMessage {
     System {
         content: String,
     },
+    Developer {
+        content: String,
+    },
+    /// A canonical inter-agent input. OpenAI-compatible transports that do
+    /// not support Codex's `agent_message` item project this to `user` only
+    /// at the provider boundary.
+    Agent {
+        content: String,
+    },
     User {
         content: String,
     },
@@ -117,7 +126,6 @@ pub struct ChatRequest {
     pub(crate) tools: Vec<ToolSchema>,
     pub(crate) reasoning: Option<ReasoningRequest>,
     pub(crate) reasoning_capability: ProviderReasoningCapability,
-    pub(crate) responses_continuation: Option<ResponsesContinuation>,
     pub(crate) tool_choice: Option<ProviderToolChoice>,
     pub(crate) parallel_tool_calls: bool,
     extra_headers: BTreeMap<String, String>,
@@ -142,10 +150,6 @@ impl fmt::Debug for ChatRequest {
             .field("tool_count", &self.tools.len())
             .field("reasoning", &self.reasoning)
             .field("reasoning_capability", &self.reasoning_capability)
-            .field(
-                "responses_continuation_present",
-                &self.responses_continuation.is_some(),
-            )
             .field("tool_choice", &self.tool_choice)
             .field("parallel_tool_calls", &self.parallel_tool_calls)
             .field("extra_headers", &"<redacted>")
@@ -159,15 +163,6 @@ impl fmt::Debug for ChatRequest {
             .field("extra_body_present", &self.extra_body.is_some())
             .finish()
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResponsesContinuation {
-    pub previous_response_id: String,
-    /// Index into the non-system messages in `ChatRequest.messages`. Messages
-    /// before this point are already represented by `previous_response_id`;
-    /// system messages always remain part of the current `instructions` projection.
-    pub input_start: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,7 +277,6 @@ impl ChatRequest {
             tools,
             reasoning,
             reasoning_capability,
-            responses_continuation: None,
             tool_choice: None,
             parallel_tool_calls: false,
             extra_headers,
@@ -389,41 +383,6 @@ impl ChatRequest {
             return Err(LlmError::Message(
                 "ChatRequest image content requires a vision-capable model profile".to_string(),
             ));
-        }
-        if let Some(continuation) = &self.responses_continuation {
-            if self.provider.api_mode() != ProviderApiMode::Responses {
-                return Err(LlmError::Message(
-                    "previous_response_id continuation requires the Responses API".to_string(),
-                ));
-            }
-            if continuation.previous_response_id.trim().is_empty() {
-                return Err(LlmError::Message(
-                    "Responses continuation requires a non-empty previous_response_id".to_string(),
-                ));
-            }
-            let non_system_message_count = self
-                .messages
-                .iter()
-                .filter(|message| !matches!(message, ModelMessage::System { .. }))
-                .count();
-            if continuation.input_start > non_system_message_count {
-                return Err(LlmError::Message(format!(
-                    "Responses continuation input_start {} exceeds non-system message count {}",
-                    continuation.input_start, non_system_message_count
-                )));
-            }
-            if !matches!(
-                self.reasoning_capability,
-                ProviderReasoningCapability::Responses {
-                    supports_previous_response_id: true,
-                    ..
-                }
-            ) {
-                return Err(LlmError::Message(
-                    "Responses continuation requires advertised previous_response_id support"
-                        .to_string(),
-                ));
-            }
         }
         Ok(())
     }
@@ -840,7 +799,6 @@ mod tests {
             None,
             ProviderReasoningCapability::Responses {
                 supports_summary: true,
-                supports_previous_response_id: true,
             },
             std::collections::BTreeMap::from([(
                 "Authorization".to_string(),
@@ -1094,7 +1052,6 @@ mod tests {
             },
             ProviderReasoningCapability::Responses {
                 supports_summary: true,
-                supports_previous_response_id: true,
             },
         ] {
             assert!(
@@ -1123,7 +1080,6 @@ mod tests {
                 Some(&effort),
                 ProviderReasoningCapability::Responses {
                     supports_summary: true,
-                    supports_previous_response_id: true,
                 },
             )
             .is_err()
@@ -1178,7 +1134,6 @@ mod tests {
                 Some(&request),
                 ProviderReasoningCapability::Responses {
                     supports_summary: true,
-                    supports_previous_response_id: true,
                 },
             )
             .is_ok()
@@ -1188,7 +1143,6 @@ mod tests {
                 Some(&request),
                 ProviderReasoningCapability::Responses {
                     supports_summary: false,
-                    supports_previous_response_id: true,
                 },
             )
             .is_err()

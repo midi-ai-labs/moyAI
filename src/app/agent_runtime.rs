@@ -10,8 +10,9 @@ use crate::cli::{EventRenderer, OutputMode, SharedConfirmationPrompt};
 use crate::config::{ResolvedConfig, ResolvedTurnConfig};
 use crate::error::{AppRunError, CliRenderError};
 use crate::protocol::{
-    ContentPart, HistoryItemId, HistoryItemPayload, InterAgentCommunication, ProtocolEventStore,
-    SubAgentActivityKind, TurnId, TurnInterruptionCause,
+    ContentPart, HistoryItemId, HistoryItemPayload, InterAgentCommunication, InterAgentMessageType,
+    ProtocolEventStore, SubAgentActivityKind, TurnId, TurnInterruptionCause, TurnTerminalOutcome,
+    render_inter_agent_message,
 };
 use crate::runtime::{
     ActiveAgentStatus, AgentControl, AgentControlError, AgentExecutionLease, AgentExecutionScope,
@@ -116,6 +117,18 @@ impl AgentRunContext {
 
     pub(crate) fn model_request_gate(&self) -> Arc<tokio::sync::Semaphore> {
         self.tree.model_request_gate()
+    }
+
+    pub(crate) fn mark_durable_turn_admitted(&self) -> Result<(), String> {
+        if !self.is_sub_agent() {
+            return Ok(());
+        }
+        self.execution
+            .set_status_and_activity(
+                ActiveAgentStatus::Running,
+                Some("Running assigned task".to_string()),
+            )
+            .map_err(agent_control_error)
     }
 
     fn effective_config(&self) -> ResolvedConfig {
@@ -1077,13 +1090,18 @@ impl AgentRuntime {
                     activity_owner: Some(activity_owner),
                 },
             );
-        if let Err(error) = self.append_activity(
-            caller,
-            &activity_id,
-            child_session_id,
-            &child_path,
-            SubAgentActivityKind::Started,
-        ) {
+        let initial_task = InterAgentCommunication {
+            author: caller.path.to_string(),
+            recipient: child_path.to_string(),
+            content: render_inter_agent_message(
+                InterAgentMessageType::NewTask,
+                child_path.as_str(),
+                caller.path.as_str(),
+                &message,
+            ),
+            trigger_turn: true,
+        };
+        if let Err(error) = self.append_communication(child_session_id, initial_task, false) {
             return match self
                 .rollback_spawn(&caller.tree, lease, child_session_id)
                 .await
@@ -1105,7 +1123,7 @@ impl AgentRuntime {
             config: Arc::clone(&caller.config),
             workspace: caller.workspace.clone(),
         };
-        if let Err(failure) = self.launch_agent_turn(child_context, lease, message) {
+        if let Err(failure) = self.launch_agent_turn(child_context, lease, String::new()) {
             let AgentLaunchFailure { message, lease, .. } = failure;
             return match self
                 .rollback_spawn(&caller.tree, lease, child_session_id)
@@ -1116,6 +1134,20 @@ impl AgentRuntime {
                     "{message}; failed to roll back the uncommitted child registration: {cleanup_error}"
                 )),
             };
+        }
+        // Launch success is the spawn commit point. Activity is a best-effort
+        // client projection and must not make the caller observe a failed spawn
+        // after the child execution has already started.
+        if let Err(error) = self.append_activity(
+            caller,
+            &activity_id,
+            child_session_id,
+            &child_path,
+            SubAgentActivityKind::Started,
+        ) {
+            caller.set_activity(format!(
+                "child {child_path} started, but its activity projection failed: {error}"
+            ));
         }
         Ok(snapshot)
     }
@@ -1168,13 +1200,27 @@ impl AgentRuntime {
             .into_iter()
             .find(|agent| agent.path == recipient_path)
             .ok_or_else(|| format!("agent `{recipient_path}` was not found"))?;
+        let message_type = if trigger_turn {
+            InterAgentMessageType::NewTask
+        } else {
+            InterAgentMessageType::Message
+        };
         let communication = InterAgentCommunication {
             author: caller.path.to_string(),
             recipient: recipient_path.to_string(),
-            content: message.clone(),
+            content: render_inter_agent_message(
+                message_type,
+                recipient_path.as_str(),
+                caller.path.as_str(),
+                &message,
+            ),
             trigger_turn,
         };
-        let require_active_recipient = recipient.is_active;
+        // PendingInit intentionally precedes durable RunService admission. Mail
+        // sent in that window is session-scoped and becomes part of the first
+        // turn; once the control projection is Running, storage must observe
+        // the matching active admission or fail closed.
+        let require_active_recipient = matches!(recipient.status, AgentStatus::Running);
         let delivery = caller
             .tree
             .control
@@ -1270,7 +1316,6 @@ impl AgentRuntime {
                     runtime.complete_child_before_run(&context, lease, completion);
                     return;
                 }
-                context.set_activity("Running assigned task");
                 let mut confirmation = context.confirmation_prompt();
                 let mut renderer = AgentEventRenderer;
                 let local = match tokio::runtime::Builder::new_current_thread()
@@ -1301,9 +1346,9 @@ impl AgentRuntime {
                     .block_on(runtime.materialize_context_config_and_sync_session(&run_context));
                 let result = match config {
                     Ok(config) => {
-                        // The non-cloneable lease still owns its marker after activation. Recheck
-                        // its turn-scoped terminal owner immediately before RunService can admit
-                        // the durable turn, without publishing a duplicate Running transition.
+                        // The non-cloneable lease still owns its marker after preflight. Recheck
+                        // cancellation immediately before RunService admits the durable turn;
+                        // RunService publishes Running only after that admission exists.
                         if let Some(completion) =
                             child_completion_before_run_admission(&request_run_control)
                         {
@@ -1488,7 +1533,12 @@ impl AgentRuntime {
         let communication = InterAgentCommunication {
             author: context.path.to_string(),
             recipient: parent.to_string(),
-            content: content.clone(),
+            content: render_inter_agent_message(
+                InterAgentMessageType::FinalAnswer,
+                parent.as_str(),
+                context.path.as_str(),
+                &content,
+            ),
             trigger_turn: false,
         };
         let delivery =
@@ -1636,16 +1686,22 @@ impl AgentRuntime {
                     ))
                 }
                 SessionStatus::Failed => {
-                    let projection = self
-                        .store
-                        .protocol_event_store()
-                        .durable_child_result_projection(summary.session_id())
-                        .map_err(|error| error.to_string())?;
-                    Ok(durable_child_result_from_projection(
-                        summary.status(),
-                        projection.latest_assistant_content.as_deref(),
-                        projection.latest_error.as_deref(),
-                    ))
+                    // The typed terminal is the sole durable owner of a failed turn's error.
+                    // History may contain partial assistant output or an earlier retryable error;
+                    // neither may replace the terminal failure delivered to the parent.
+                    let TurnTerminalOutcome::Failed { error } = &summary.terminal().outcome else {
+                        return Err(format!(
+                            "child session {} reported failed status without a failed terminal outcome",
+                            summary.session_id()
+                        ));
+                    };
+                    if error.trim().is_empty() {
+                        return Err(format!(
+                            "child session {} has an empty terminal failure error",
+                            summary.session_id()
+                        ));
+                    }
+                    Ok(Some(error.clone()))
                 }
                 SessionStatus::Cancelled | SessionStatus::Idle | SessionStatus::Running => Ok(None),
             },
@@ -1752,14 +1808,6 @@ fn effective_run_terminal_cause(
 
 fn activate_child_execution(lease: &AgentExecutionLease) -> Result<(), AgentTurnCompletion> {
     let run_control = lease.run_control();
-    if let Some(completion) = child_completion_before_run_admission(&run_control) {
-        return Err(completion);
-    }
-    if let Err(error) = lease.set_status(ActiveAgentStatus::Running) {
-        return Err(AgentTurnCompletion::new(AgentStatus::Errored(format!(
-            "child execution lease was rejected before durable turn admission: {error}"
-        ))));
-    }
     if let Some(completion) = child_completion_before_run_admission(&run_control) {
         return Err(completion);
     }
@@ -1952,36 +2000,6 @@ fn durable_child_result_from_projection(
     } else {
         assistant.or(error)
     }
-}
-
-#[cfg(test)]
-fn durable_child_result(
-    status: SessionStatus,
-    history: &[crate::protocol::HistoryItem],
-) -> Option<String> {
-    if status == SessionStatus::Failed {
-        latest_error_history_text(history).or_else(|| latest_assistant_history_text(history))
-    } else {
-        latest_assistant_history_text(history).or_else(|| latest_error_history_text(history))
-    }
-}
-
-#[cfg(test)]
-fn latest_error_history_text(history: &[crate::protocol::HistoryItem]) -> Option<String> {
-    history.iter().rev().find_map(|item| match &item.payload {
-        HistoryItemPayload::Error { message, .. } if !message.trim().is_empty() => {
-            Some(message.trim().to_string())
-        }
-        _ => None,
-    })
-}
-
-#[cfg(test)]
-fn latest_assistant_history_text(history: &[crate::protocol::HistoryItem]) -> Option<String> {
-    history.iter().rev().find_map(|item| match &item.payload {
-        HistoryItemPayload::AssistantMessage { content, .. } => content_parts_text(content, "\n"),
-        _ => None,
-    })
 }
 
 fn content_parts_text(content: &[ContentPart], separator: &str) -> Option<String> {

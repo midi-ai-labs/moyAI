@@ -1,0 +1,13 @@
+`cancel_contract.md` の設計を実装してください。
+
+制約:
+- current directory以下だけを変更すること。
+- 成功responseは正確に `{"cancelled": true}` のままとし、既存clientとの互換性を維持すること。
+- frontendの既存typeがcontractを既に満たす場合は変更しないこと。
+- dependencyを追加しないこと。
+- production codeと、restart後のcontrollerなしcancel、idempotent再cancel、404、409、DB/artifact整合性を検証するtestを変更・追加すること。
+- `README.md`、`basic_design.md`、`detail_design.md`、`evidence_matrix.md`、`cancel_contract.md` は実装と矛盾する場合だけ最小限更新すること。
+
+最後に `backend` directoryで次を実行し、結果を報告してください。
+
+`python -X utf8 -m pytest -p no:cacheprovider -q`

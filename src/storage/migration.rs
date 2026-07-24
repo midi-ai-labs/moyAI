@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
@@ -93,6 +93,8 @@ const V44_UNIQUE_TURN_TERMINAL: &str =
     include_str!("../../migrations/V44__unique_turn_terminal.sql");
 const V45_RESTORE_AUTO_REVIEW_ACCESS_MODE: &str =
     include_str!("../../migrations/V45__restore_auto_review_access_mode.sql");
+const V46_CODEX_COMPACTION_CHECKPOINT: &str =
+    include_str!("../../migrations/V46__codex_compaction_checkpoint.sql");
 const LEGACY_PLANNER_CUTOVER_VERSION: i64 = 32;
 const CANONICAL_PROTOCOL_STORAGE_VERSION: i64 = 33;
 const DROP_SESSIONS_MEMORY_MODE_VERSION: i64 = 34;
@@ -107,6 +109,9 @@ const TYPED_HISTORY_SCOPE_VERSION: i64 = 42;
 const INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION: i64 = 43;
 const UNIQUE_TURN_TERMINAL_VERSION: i64 = 44;
 const RESTORE_AUTO_REVIEW_ACCESS_MODE_VERSION: i64 = 45;
+const CODEX_COMPACTION_CHECKPOINT_VERSION: i64 = 46;
+const CODEX_COMPACTION_CHECKPOINT_NAME: &str = "codex_compaction_checkpoint";
+const COMPACTION_CHECKPOINT_MIGRATION_PAGE_SIZE: usize = 200;
 const SESSION_STATUS_DOMAIN: &[&str] = &["idle", "running", "completed", "cancelled", "failed"];
 const SESSION_ACCESS_MODE_DOMAIN: &[&str] = &["default", "auto_review", "full_access"];
 const RELEASED_V18_SESSION_STATUS_DOMAIN: &[&str] = &[
@@ -127,18 +132,25 @@ const TOOL_CALL_STATUS_DOMAIN: &[&str] = &[
 ];
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
+    if schema_migration_applied(connection, CODEX_COMPACTION_CHECKPOINT_VERSION)? {
+        validate_canonical_protocol_schema(connection)?;
+        return Ok(());
+    }
     if schema_migration_applied(connection, RESTORE_AUTO_REVIEW_ACCESS_MODE_VERSION)? {
+        run_codex_compaction_checkpoint(connection)?;
         validate_canonical_protocol_schema(connection)?;
         return Ok(());
     }
     if schema_migration_applied(connection, UNIQUE_TURN_TERMINAL_VERSION)? {
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
         validate_canonical_protocol_schema(connection)?;
         return Ok(());
     }
     if schema_migration_applied(connection, INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION)? {
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
         validate_canonical_protocol_schema(connection)?;
         return Ok(());
     }
@@ -146,6 +158,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
         validate_canonical_protocol_schema(connection)?;
         return Ok(());
     }
@@ -154,6 +167,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -163,6 +177,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -173,6 +188,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -184,6 +200,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -196,6 +213,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -209,6 +227,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -223,6 +242,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -238,6 +258,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -254,6 +275,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -277,6 +299,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
     run_indexed_internal_file_ownership(connection)?;
     run_unique_turn_terminal(connection)?;
     run_restore_auto_review_access_mode(connection)?;
+    run_codex_compaction_checkpoint(connection)?;
     validate_canonical_protocol_storage(connection)?;
     Ok(())
 }
@@ -913,6 +936,496 @@ fn run_restore_auto_review_access_mode(connection: &Connection) -> Result<(), St
         V45_RESTORE_AUTO_REVIEW_ACCESS_MODE,
         "V45 auto-review access mode restoration migration",
     )
+}
+
+fn run_codex_compaction_checkpoint(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        let _ = canonicalize_compaction_checkpoint_history(connection)?;
+        validate_compaction_checkpoint_history(connection)?;
+        connection.execute_batch(V46_CODEX_COMPACTION_CHECKPOINT)?;
+        if !schema_migration_has_exact_name(
+            connection,
+            CODEX_COMPACTION_CHECKPOINT_VERSION,
+            CODEX_COMPACTION_CHECKPOINT_NAME,
+        )? {
+            return Err(StorageError::Message(
+                "V46 compaction checkpoint migration did not record its exact schema marker"
+                    .to_string(),
+            ));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CompactionCheckpointMigrationStats {
+    pages: usize,
+    rows: usize,
+    max_page_rows: usize,
+}
+
+fn canonicalize_compaction_checkpoint_history(
+    connection: &Connection,
+) -> Result<CompactionCheckpointMigrationStats, StorageError> {
+    validate_v39_history_json(connection)?;
+    let missing_append_order = connection
+        .query_row(
+            "SELECT history.id
+             FROM protocol_history_items AS history
+             LEFT JOIN protocol_item_append_order AS append_order
+               ON append_order.session_id = history.session_id
+              AND append_order.source_kind = 'history_item'
+              AND append_order.source_id = history.id
+             WHERE json_extract(history.payload_json, '$.kind') = 'compaction'
+               AND append_order.append_position IS NULL
+             ORDER BY history.id ASC
+             LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(id) = missing_append_order {
+        return Err(StorageError::Message(format!(
+            "V46 compaction history item {id} has no canonical append-order entry"
+        )));
+    }
+
+    let mut stats = CompactionCheckpointMigrationStats::default();
+    let mut after_append_position: Option<i64> = None;
+    loop {
+        let mut statement = connection.prepare(
+            "SELECT history.id, history.session_id, history.payload_json,
+                    history.payload_sha256, append_order.append_position
+             FROM protocol_history_items AS history
+             INNER JOIN protocol_item_append_order AS append_order
+               ON append_order.session_id = history.session_id
+              AND append_order.source_kind = 'history_item'
+              AND append_order.source_id = history.id
+             WHERE (?1 IS NULL OR append_order.append_position > ?1)
+               AND json_extract(history.payload_json, '$.kind') = 'compaction'
+             ORDER BY append_order.append_position ASC
+             LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    after_append_position,
+                    i64::try_from(COMPACTION_CHECKPOINT_MIGRATION_PAGE_SIZE).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        if rows.is_empty() {
+            break;
+        }
+        stats.pages = stats.pages.saturating_add(1);
+        stats.rows = stats.rows.saturating_add(rows.len());
+        stats.max_page_rows = stats.max_page_rows.max(rows.len());
+        after_append_position = rows.last().map(|(.., append_position)| *append_position);
+
+        for (id, session_id, payload_json, payload_sha256, append_position) in rows {
+            let payload =
+                serde_json::from_str::<serde_json::Value>(&payload_json).map_err(|error| {
+                    StorageError::Message(format!(
+                        "V46 cannot inspect protocol history item {id}: invalid JSON: {error}"
+                    ))
+                })?;
+            let mut object = payload.as_object().cloned().ok_or_else(|| {
+                StorageError::Message(format!(
+                    "V46 compaction history item {id} is not a JSON object"
+                ))
+            })?;
+            if payload_sha256 != sha256_text(&payload_json) {
+                return Err(StorageError::Message(format!(
+                    "V46 compaction history item {id} has a stale payload hash"
+                )));
+            }
+
+            let has_layout = object.contains_key("layout");
+            let has_preserved_messages = object.contains_key("preserved_user_messages");
+            let legacy_payload = match (has_layout, has_preserved_messages) {
+                (false, false) => {
+                    object.insert(
+                        "layout".to_string(),
+                        serde_json::Value::String("legacy_prefix".to_string()),
+                    );
+                    object.insert(
+                        "preserved_user_messages".to_string(),
+                        serde_json::Value::Array(Vec::new()),
+                    );
+                    true
+                }
+                (true, true) => false,
+                _ => {
+                    return Err(StorageError::Message(format!(
+                        "V46 compaction history item {id} mixes legacy and current checkpoint fields"
+                    )));
+                }
+            };
+
+            let mut current = decode_current_compaction_payload(&id, &object)?;
+            if legacy_payload {
+                let crate::protocol::HistoryItemPayload::Compaction {
+                    layout,
+                    preserved_user_messages,
+                    replacement_item_ids,
+                    ..
+                } = &mut current
+                else {
+                    unreachable!("current payload was decoded as compaction");
+                };
+                let recovered = recover_legacy_compaction_user_messages(
+                    connection,
+                    &id,
+                    &session_id,
+                    append_position,
+                    replacement_item_ids,
+                )?;
+                if !recovered.is_empty() {
+                    *layout = crate::protocol::CompactionLayout::UserAnchoredCheckpoint;
+                    *preserved_user_messages = recovered;
+                }
+            }
+            let canonical_json = serde_json::to_string(&current)?;
+            connection.execute(
+                "UPDATE protocol_history_items
+                 SET payload_json = ?1, payload_sha256 = ?2
+                 WHERE id = ?3",
+                (&canonical_json, sha256_text(&canonical_json), &id),
+            )?;
+        }
+    }
+    Ok(stats)
+}
+
+fn recover_legacy_compaction_user_messages(
+    connection: &Connection,
+    root_id: &str,
+    session_id: &str,
+    root_append_position: i64,
+    replacement_item_ids: &[crate::protocol::HistoryItemId],
+) -> Result<Vec<String>, StorageError> {
+    let mut budget = crate::context::context_window::CompactionUserMessageBudget::new();
+    'replacements: for replacement_item_id in replacement_item_ids.iter().rev() {
+        let item_id = replacement_item_id.to_string();
+        let row = connection
+            .query_row(
+                "SELECT history.session_id, history.payload_json, history.payload_sha256,
+                        append_order.append_position
+                 FROM protocol_history_items AS history
+                 LEFT JOIN protocol_item_append_order AS append_order
+                   ON append_order.session_id = history.session_id
+                  AND append_order.source_kind = 'history_item'
+                  AND append_order.source_id = history.id
+                 WHERE history.id = ?1",
+                [&item_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((replacement_session_id, payload_json, payload_sha256, append_position)) = row
+        else {
+            return Err(StorageError::Message(format!(
+                "V46 legacy compaction history item {root_id} references missing replacement item {item_id}"
+            )));
+        };
+        if replacement_session_id != session_id {
+            return Err(StorageError::Message(format!(
+                "V46 legacy compaction history item {root_id} references cross-session replacement item {item_id}"
+            )));
+        }
+        let Some(append_position) = append_position else {
+            return Err(StorageError::Message(format!(
+                "V46 legacy compaction history item {root_id} references item {item_id} without a canonical append-order entry"
+            )));
+        };
+        if append_position >= root_append_position {
+            return Err(StorageError::Message(format!(
+                "V46 legacy compaction history item {root_id} has a replacement cycle or forward reference through item {item_id}"
+            )));
+        }
+        if payload_sha256 != sha256_text(&payload_json) {
+            return Err(StorageError::Message(format!(
+                "V46 legacy compaction history item {root_id} references item {item_id} with a stale payload hash"
+            )));
+        }
+        let payload =
+            serde_json::from_str::<crate::protocol::HistoryItemPayload>(&payload_json).map_err(
+                |error| {
+                    StorageError::Message(format!(
+                        "V46 legacy compaction history item {root_id} cannot decode replacement item {item_id}: {error}"
+                    ))
+                },
+            )?;
+
+        let messages = match payload {
+            crate::protocol::HistoryItemPayload::UserTurn { content, .. }
+            | crate::protocol::HistoryItemPayload::SteerTurn { content, .. } => {
+                let text = content
+                    .iter()
+                    .filter_map(|part| match part {
+                        crate::protocol::ContentPart::Text { text } => Some(text.as_str()),
+                        crate::protocol::ContentPart::Image { .. } => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    vec![text]
+                }
+            }
+            crate::protocol::HistoryItemPayload::Compaction {
+                layout,
+                preserved_user_messages,
+                ..
+            } if layout.appends_checkpoint() => preserved_user_messages,
+            _ => Vec::new(),
+        };
+        for message in messages
+            .into_iter()
+            .rev()
+            .filter(|message| !message.trim().is_empty())
+        {
+            if !budget.push_newest(message) {
+                break 'replacements;
+            }
+        }
+    }
+    Ok(budget.finish())
+}
+
+fn decode_current_compaction_payload(
+    id: &str,
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<crate::protocol::HistoryItemPayload, StorageError> {
+    const ALLOWED_FIELDS: &[&str] = &[
+        "kind",
+        "mode",
+        "layout",
+        "preserved_user_messages",
+        "summary",
+        "replacement_item_ids",
+    ];
+    let unexpected = object
+        .keys()
+        .filter(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        return Err(StorageError::Message(format!(
+            "V46 compaction history item {id} contains unexpected fields: {}",
+            unexpected.join(", ")
+        )));
+    }
+    for field in ALLOWED_FIELDS {
+        if !object.contains_key(*field) {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} has no `{field}` field"
+            )));
+        }
+    }
+
+    let current = serde_json::from_value::<crate::protocol::HistoryItemPayload>(
+        serde_json::Value::Object(object.clone()),
+    )
+    .map_err(|error| {
+        StorageError::Message(format!(
+            "V46 compaction history item {id} violates the current payload contract: {error}"
+        ))
+    })?;
+    let crate::protocol::HistoryItemPayload::Compaction {
+        layout,
+        preserved_user_messages,
+        ..
+    } = &current
+    else {
+        return Err(StorageError::Message(format!(
+            "V46 compaction history item {id} decoded as another payload kind"
+        )));
+    };
+    if matches!(layout, crate::protocol::CompactionLayout::LegacyPrefix)
+        && !preserved_user_messages.is_empty()
+    {
+        return Err(StorageError::Message(format!(
+            "V46 legacy-prefix compaction history item {id} retains user-anchor messages"
+        )));
+    }
+    Ok(current)
+}
+
+fn validate_compaction_checkpoint_history(connection: &Connection) -> Result<(), StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id, session_id, payload_json, payload_sha256
+         FROM protocol_history_items
+         ORDER BY id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, session_id, payload_json, payload_sha256) = row?;
+        let payload = serde_json::from_str::<serde_json::Value>(&payload_json).map_err(|error| {
+            StorageError::Message(format!(
+                "V46 marker exists but protocol history item {id} contains invalid JSON: {error}"
+            ))
+        })?;
+        let Some(object) = payload.as_object() else {
+            continue;
+        };
+        if object.get("kind").and_then(serde_json::Value::as_str) != Some("compaction") {
+            continue;
+        }
+        if payload_sha256 != sha256_text(&payload_json) {
+            return Err(StorageError::Message(format!(
+                "V46 marker exists but compaction history item {id} has a stale payload hash"
+            )));
+        }
+        let current = decode_current_compaction_payload(&id, object)?;
+        validate_current_compaction_storage(connection, &id, &session_id, &current)?;
+    }
+    Ok(())
+}
+
+fn validate_current_compaction_storage(
+    connection: &Connection,
+    id: &str,
+    session_id: &str,
+    payload: &crate::protocol::HistoryItemPayload,
+) -> Result<(), StorageError> {
+    let crate::protocol::HistoryItemPayload::Compaction {
+        preserved_user_messages,
+        replacement_item_ids,
+        ..
+    } = payload
+    else {
+        return Err(StorageError::Message(format!(
+            "V46 compaction history item {id} decoded as another payload kind"
+        )));
+    };
+    let anchor_tokens = preserved_user_messages
+        .iter()
+        .map(|message| crate::context::context_window::estimate_text_tokens(message))
+        .fold(0usize, usize::saturating_add);
+    if anchor_tokens > crate::context::context_window::COMPACTION_USER_MESSAGE_MAX_TOKENS {
+        return Err(StorageError::Message(format!(
+            "V46 compaction history item {id} retains {anchor_tokens} estimated user-anchor tokens, exceeding the 20000-token checkpoint bound"
+        )));
+    }
+
+    let root_append_position = connection
+        .query_row(
+            "SELECT append_position
+             FROM protocol_item_append_order
+             WHERE session_id = ?1
+               AND source_kind = 'history_item'
+               AND source_id = ?2",
+            params![session_id, id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::Message(format!(
+                "V46 compaction history item {id} has no canonical append-order entry"
+            ))
+        })?;
+
+    let mut unique_replacements = BTreeSet::new();
+    for replacement_item_id in replacement_item_ids {
+        let replacement_item_id = replacement_item_id.to_string();
+        if replacement_item_id == id {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} replaces itself"
+            )));
+        }
+        if !unique_replacements.insert(replacement_item_id.clone()) {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} repeats replacement item {replacement_item_id}"
+            )));
+        }
+        let replacement = connection
+            .query_row(
+                "SELECT history.session_id, history.payload_json, history.payload_sha256,
+                        append_order.append_position
+                 FROM protocol_history_items AS history
+                 LEFT JOIN protocol_item_append_order AS append_order
+                   ON append_order.session_id = history.session_id
+                  AND append_order.source_kind = 'history_item'
+                  AND append_order.source_id = history.id
+                 WHERE history.id = ?1",
+                [&replacement_item_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            replacement_session_id,
+            replacement_payload_json,
+            replacement_payload_sha256,
+            replacement_append_position,
+        )) = replacement
+        else {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} references missing or cross-session replacement item {replacement_item_id}"
+            )));
+        };
+        if replacement_session_id != session_id {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} references missing or cross-session replacement item {replacement_item_id}"
+            )));
+        }
+        if replacement_payload_sha256 != sha256_text(&replacement_payload_json) {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} references replacement item {replacement_item_id} with a stale payload hash"
+            )));
+        }
+        let Some(replacement_append_position) = replacement_append_position else {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} references replacement item {replacement_item_id} without a canonical append-order entry"
+            )));
+        };
+        if replacement_append_position >= root_append_position {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} has a replacement cycle or forward reference through item {replacement_item_id}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn run_raw_tool_call_history_migration(connection: &Connection) -> Result<(), StorageError> {
@@ -1794,6 +2307,20 @@ fn run_through_v36(connection: &Connection) -> Result<(), StorageError> {
 }
 
 fn validate_canonical_protocol_schema(connection: &Connection) -> Result<(), StorageError> {
+    if !schema_migration_applied(connection, CODEX_COMPACTION_CHECKPOINT_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V46 Codex compaction checkpoint marker".to_string(),
+        ));
+    }
+    if !schema_migration_has_exact_name(
+        connection,
+        CODEX_COMPACTION_CHECKPOINT_VERSION,
+        CODEX_COMPACTION_CHECKPOINT_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V46 compaction checkpoint marker has a name other than `{CODEX_COMPACTION_CHECKPOINT_NAME}`"
+        )));
+    }
     if !schema_migration_applied(connection, RESTORE_AUTO_REVIEW_ACCESS_MODE_VERSION)? {
         return Err(StorageError::Message(
             "current storage is missing the V45 auto-review access mode restoration marker"
@@ -1908,6 +2435,7 @@ fn validate_canonical_protocol_storage(connection: &Connection) -> Result<(), St
     validate_flat_session_spawn_edge_data(connection)?;
     validate_terminal_outcome_storage(connection)?;
     validate_raw_tool_call_history(connection)?;
+    validate_compaction_checkpoint_history(connection)?;
     Ok(())
 }
 
@@ -3058,6 +3586,24 @@ fn schema_migration_applied(connection: &Connection, version: i64) -> Result<boo
         .is_some())
 }
 
+fn schema_migration_has_exact_name(
+    connection: &Connection,
+    version: i64,
+    expected_name: &str,
+) -> Result<bool, StorageError> {
+    if !table_exists(connection, "moyai_schema_migrations")? {
+        return Ok(false);
+    }
+    let name = connection
+        .query_row(
+            "SELECT name FROM moyai_schema_migrations WHERE version = ?1",
+            [version],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(name.as_deref() == Some(expected_name))
+}
+
 #[cfg(test)]
 fn run_through_v30(connection: &Connection) -> Result<(), StorageError> {
     run_through_v29(connection)?;
@@ -4021,6 +4567,69 @@ mod tests {
         run_through_v42(connection);
         run_indexed_internal_file_ownership(connection).expect("V43 schema");
         run_unique_turn_terminal(connection).expect("V44 schema");
+    }
+
+    fn run_through_v45(connection: &Connection) {
+        run_through_v44(connection);
+        run_restore_auto_review_access_mode(connection).expect("V45 schema");
+    }
+
+    fn insert_v46_compaction_parent(connection: &Connection) {
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('v46-project', 'C:/workspace', 'workspace', 'none', 1, 1);
+                 INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms)
+                 VALUES ('v46-session', 'v46-project', 'session', 'completed',
+                         'C:/workspace', 'model', 'http://localhost', 2, 2, 2);",
+            )
+            .expect("V46 compaction parent rows");
+    }
+
+    fn insert_v46_compaction(
+        connection: &Connection,
+        id: &str,
+        sequence_no: i64,
+        payload_json: &str,
+        payload_sha256: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO protocol_history_items
+                 (id, session_id, scope_kind, turn_id, sequence_no,
+                  payload_json, payload_sha256, created_at_ms)
+                 VALUES (?1, 'v46-session', 'turn', 'v46-turn', ?2, ?3, ?4, ?2)",
+                params![id, sequence_no, payload_json, payload_sha256],
+            )
+            .expect("V46 compaction fixture");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, scope_kind, turn_id, sequence_no,
+                  source_kind, source_id, created_at_ms)
+                 VALUES ('v46-session', 'turn', 'v46-turn', ?1,
+                         'history_item', ?2, ?1)",
+                params![sequence_no, id],
+            )
+            .expect("V46 compaction append-order fixture");
+    }
+
+    fn insert_v46_replacement(connection: &Connection, id: &str, sequence_no: i64) {
+        let payload_json = serde_json::json!({
+            "kind": "error",
+            "message": "replacement evidence",
+        })
+        .to_string();
+        insert_v46_compaction(
+            connection,
+            id,
+            sequence_no,
+            &payload_json,
+            &sha256_text(&payload_json),
+        );
     }
 
     fn insert_tool_call_parent_rows(connection: &Connection) {
@@ -6173,7 +6782,7 @@ mod tests {
                     model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms)
                    VALUES ('auto-v45-retry', 'project-v45-retry', 'auto', 'idle', 'C:/workspace',
                            'model', 'http://localhost', 'auto_review', '{}', 2, 3, NULL);
-                   DELETE FROM moyai_schema_migrations WHERE version = 45;"#,
+                   DELETE FROM moyai_schema_migrations WHERE version IN (45, 46);"#,
             )
             .expect("missing-marker fixture");
 
@@ -6200,6 +6809,781 @@ mod tests {
 
         let error = run(&connection).expect_err("V45 marker must validate the access mode domain");
         assert!(error.to_string().contains("V45 access mode marker"));
+    }
+
+    #[test]
+    fn v46_migrates_v1_compaction_payload_and_is_idempotent() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+        let replaced_id = crate::protocol::HistoryItemId::new().to_string();
+        insert_v46_replacement(&connection, &replaced_id, 0);
+        let legacy_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "legacy checkpoint",
+            "replacement_item_ids": [replaced_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            "legacy-compaction",
+            1,
+            &legacy_payload,
+            &sha256_text(&legacy_payload),
+        );
+
+        run(&connection).expect("V46 forward migration");
+        let (migrated_json, migrated_hash) = connection
+            .query_row(
+                "SELECT payload_json, payload_sha256
+                 FROM protocol_history_items WHERE id = 'legacy-compaction'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("migrated compaction");
+        let migrated: serde_json::Value =
+            serde_json::from_str(&migrated_json).expect("current compaction JSON");
+        assert_eq!(migrated["layout"], "legacy_prefix");
+        assert_eq!(migrated["preserved_user_messages"], serde_json::json!([]));
+        assert_eq!(migrated["summary"], "legacy checkpoint");
+        assert_eq!(
+            migrated["replacement_item_ids"],
+            serde_json::json!([replaced_id])
+        );
+        assert_eq!(migrated_hash, sha256_text(&migrated_json));
+        let decoded = serde_json::from_str::<crate::protocol::HistoryItemPayload>(&migrated_json)
+            .expect("typed current compaction");
+        assert!(matches!(
+            decoded,
+            crate::protocol::HistoryItemPayload::Compaction {
+                layout: crate::protocol::CompactionLayout::LegacyPrefix,
+                preserved_user_messages,
+                ..
+            } if preserved_user_messages.is_empty()
+        ));
+        assert!(
+            schema_migration_applied(&connection, CODEX_COMPACTION_CHECKPOINT_VERSION)
+                .expect("V46 marker")
+        );
+
+        run(&connection).expect("idempotent V46 migration");
+        let second = connection
+            .query_row(
+                "SELECT payload_json, payload_sha256
+                 FROM protocol_history_items WHERE id = 'legacy-compaction'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("idempotent compaction");
+        assert_eq!(second, (migrated_json, migrated_hash));
+    }
+
+    #[test]
+    fn v46_recovers_real_user_anchors_through_nested_legacy_compactions() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+
+        let user_id = crate::protocol::HistoryItemId::new().to_string();
+        let user_payload = serde_json::json!({
+            "kind": "user_turn",
+            "content": [{
+                "kind": "text",
+                "text": "Use task.md and create all four requested documents."
+            }],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &user_id,
+            0,
+            &user_payload,
+            &sha256_text(&user_payload),
+        );
+
+        let first_compaction_id = crate::protocol::HistoryItemId::new().to_string();
+        let first_compaction_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "The source investigation is complete.",
+            "replacement_item_ids": [user_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &first_compaction_id,
+            1,
+            &first_compaction_payload,
+            &sha256_text(&first_compaction_payload),
+        );
+
+        let second_compaction_id = crate::protocol::HistoryItemId::new().to_string();
+        let second_compaction_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "Continue from the completed investigation.",
+            "replacement_item_ids": [first_compaction_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &second_compaction_id,
+            2,
+            &second_compaction_payload,
+            &sha256_text(&second_compaction_payload),
+        );
+
+        run(&connection).expect("V46 nested legacy recovery");
+
+        let migrated_json = connection
+            .query_row(
+                "SELECT payload_json FROM protocol_history_items WHERE id = ?1",
+                [&second_compaction_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("outer migrated compaction");
+        let migrated: serde_json::Value =
+            serde_json::from_str(&migrated_json).expect("outer current compaction JSON");
+        assert_eq!(migrated["layout"], "user_anchored_checkpoint");
+        assert_eq!(
+            migrated["preserved_user_messages"],
+            serde_json::json!(["Use task.md and create all four requested documents."])
+        );
+        assert!(
+            !migrated["summary"]
+                .as_str()
+                .expect("summary")
+                .contains("four requested documents")
+        );
+        assert_eq!(
+            migrated["replacement_item_ids"],
+            serde_json::json!([first_compaction_id])
+        );
+    }
+
+    #[test]
+    fn v46_preserves_effective_replacement_order_when_late_input_precedes_a_checkpoint() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+
+        let original_user_id = crate::protocol::HistoryItemId::new().to_string();
+        let late_user_id = crate::protocol::HistoryItemId::new().to_string();
+        let first_compaction_id = crate::protocol::HistoryItemId::new().to_string();
+        let second_compaction_id = crate::protocol::HistoryItemId::new().to_string();
+        let original_user_payload = serde_json::json!({
+            "kind": "user_turn",
+            "content": [{"kind": "text", "text": "original task"}],
+        })
+        .to_string();
+        let late_user_payload = serde_json::json!({
+            "kind": "steer_turn",
+            "expected_turn_id": "01J00000000000000000000000",
+            "content": [{"kind": "text", "text": "late clarification"}],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &original_user_id,
+            0,
+            &original_user_payload,
+            &sha256_text(&original_user_payload),
+        );
+        insert_v46_compaction(
+            &connection,
+            &late_user_id,
+            1,
+            &late_user_payload,
+            &sha256_text(&late_user_payload),
+        );
+        let first_compaction_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "first summary",
+            "replacement_item_ids": [original_user_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &first_compaction_id,
+            2,
+            &first_compaction_payload,
+            &sha256_text(&first_compaction_payload),
+        );
+        let second_compaction_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "second summary",
+            "replacement_item_ids": [first_compaction_id, late_user_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &second_compaction_id,
+            3,
+            &second_compaction_payload,
+            &sha256_text(&second_compaction_payload),
+        );
+
+        run(&connection).expect("V46 late-input recovery");
+
+        let migrated_json = connection
+            .query_row(
+                "SELECT payload_json FROM protocol_history_items WHERE id = ?1",
+                [&second_compaction_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("outer migrated compaction");
+        let migrated: serde_json::Value =
+            serde_json::from_str(&migrated_json).expect("outer current JSON");
+        assert_eq!(
+            migrated["preserved_user_messages"],
+            serde_json::json!(["original task", "late clarification"])
+        );
+    }
+
+    #[test]
+    fn v46_legacy_recovery_follows_append_order_instead_of_row_id_order() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+
+        let user_id = "01J00000000000000000000000";
+        let inner_compaction_id = "01J0000000000000000000000Z";
+        let later_user_id = "01J00000000000000000000002";
+        let outer_compaction_id = "01J00000000000000000000001";
+        assert!(outer_compaction_id < inner_compaction_id);
+
+        let original_user = format!("HEAD-{}-TAIL", "x".repeat(100_000));
+        let user_payload = serde_json::json!({
+            "kind": "user_turn",
+            "content": [{"kind": "text", "text": original_user}],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            user_id,
+            0,
+            &user_payload,
+            &sha256_text(&user_payload),
+        );
+        let inner_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "inner summary",
+            "replacement_item_ids": [user_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            inner_compaction_id,
+            1,
+            &inner_payload,
+            &sha256_text(&inner_payload),
+        );
+        let later_user_payload = serde_json::json!({
+            "kind": "user_turn",
+            "content": [{"kind": "text", "text": "latest instruction"}],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            later_user_id,
+            2,
+            &later_user_payload,
+            &sha256_text(&later_user_payload),
+        );
+        let outer_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "outer summary",
+            "replacement_item_ids": [inner_compaction_id, later_user_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            outer_compaction_id,
+            3,
+            &outer_payload,
+            &sha256_text(&outer_payload),
+        );
+
+        run(&connection).expect("append-ordered V46 recovery");
+
+        let outer_json = connection
+            .query_row(
+                "SELECT payload_json FROM protocol_history_items WHERE id = ?1",
+                [outer_compaction_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("outer migrated compaction");
+        let outer: serde_json::Value =
+            serde_json::from_str(&outer_json).expect("outer current JSON");
+        let anchors = outer["preserved_user_messages"]
+            .as_array()
+            .expect("outer anchors");
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors[1], "latest instruction");
+        assert_eq!(
+            anchors[0]
+                .as_str()
+                .expect("boundary anchor")
+                .matches("compaction checkpoint truncated")
+                .count(),
+            1
+        );
+        assert!(
+            anchors[0]
+                .as_str()
+                .expect("boundary anchor")
+                .starts_with("HEAD-")
+        );
+        assert!(
+            anchors[0]
+                .as_str()
+                .expect("boundary anchor")
+                .ends_with("-TAIL")
+        );
+    }
+
+    #[test]
+    fn v46_legacy_replacement_cycle_rolls_back_without_a_marker() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+
+        let first_id = crate::protocol::HistoryItemId::new().to_string();
+        let second_id = crate::protocol::HistoryItemId::new().to_string();
+        let first_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "first legacy summary",
+            "replacement_item_ids": [second_id],
+        })
+        .to_string();
+        let second_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "second legacy summary",
+            "replacement_item_ids": [first_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &first_id,
+            0,
+            &first_payload,
+            &sha256_text(&first_payload),
+        );
+        insert_v46_compaction(
+            &connection,
+            &second_id,
+            1,
+            &second_payload,
+            &sha256_text(&second_payload),
+        );
+        let before = text_snapshot(
+            &connection,
+            "SELECT json_group_array(json_array(id, payload_json, payload_sha256))
+             FROM (SELECT id, payload_json, payload_sha256 FROM protocol_history_items ORDER BY id)",
+        );
+
+        let error = run(&connection).expect_err("cyclic V46 lineage must fail");
+
+        assert!(error.to_string().contains("replacement cycle"));
+        let after = text_snapshot(
+            &connection,
+            "SELECT json_group_array(json_array(id, payload_json, payload_sha256))
+             FROM (SELECT id, payload_json, payload_sha256 FROM protocol_history_items ORDER BY id)",
+        );
+        assert_eq!(after, before);
+        assert!(
+            !schema_migration_applied(&connection, CODEX_COMPACTION_CHECKPOINT_VERSION)
+                .expect("rolled-back V46 marker")
+        );
+    }
+
+    #[test]
+    fn v46_full_audit_rejects_a_cycle_between_current_checkpoints() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh current schema");
+        insert_v46_compaction_parent(&connection);
+
+        let first_id = crate::protocol::HistoryItemId::new().to_string();
+        let second_id = crate::protocol::HistoryItemId::new().to_string();
+        let first_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "layout": "user_anchored_checkpoint",
+            "preserved_user_messages": ["first task"],
+            "summary": "first current summary",
+            "replacement_item_ids": [second_id],
+        })
+        .to_string();
+        let second_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "layout": "user_anchored_checkpoint",
+            "preserved_user_messages": ["second task"],
+            "summary": "second current summary",
+            "replacement_item_ids": [first_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &first_id,
+            0,
+            &first_payload,
+            &sha256_text(&first_payload),
+        );
+        insert_v46_compaction(
+            &connection,
+            &second_id,
+            1,
+            &second_payload,
+            &sha256_text(&second_payload),
+        );
+
+        let error = validate_canonical_protocol_storage(&connection)
+            .expect_err("current checkpoint cycle must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("replacement cycle or forward reference")
+        );
+    }
+
+    #[test]
+    fn v46_reapplication_preserves_user_anchored_checkpoint_payload() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+        let replacement_id = crate::protocol::HistoryItemId::new().to_string();
+        insert_v46_replacement(&connection, &replacement_id, 0);
+        let checkpoint_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "layout": "user_anchored_checkpoint",
+            "preserved_user_messages": ["follow task.md", "keep auto review"],
+            "summary": "continue implementation",
+            "replacement_item_ids": [replacement_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            "current-compaction",
+            1,
+            &checkpoint_payload,
+            &sha256_text(&checkpoint_payload),
+        );
+        run(&connection).expect("initial V46 migration");
+        let first = connection
+            .query_row(
+                "SELECT payload_json, payload_sha256
+                 FROM protocol_history_items WHERE id = 'current-compaction'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("canonical checkpoint");
+
+        connection
+            .execute(
+                "DELETE FROM moyai_schema_migrations WHERE version = ?1",
+                [CODEX_COMPACTION_CHECKPOINT_VERSION],
+            )
+            .expect("remove V46 marker");
+        run(&connection).expect("reapply V46");
+        let second = connection
+            .query_row(
+                "SELECT payload_json, payload_sha256
+                 FROM protocol_history_items WHERE id = 'current-compaction'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("reapplied checkpoint");
+        assert_eq!(second, first);
+        let value: serde_json::Value =
+            serde_json::from_str(&second.0).expect("reapplied checkpoint JSON");
+        assert_eq!(
+            value["preserved_user_messages"],
+            serde_json::json!(["follow task.md", "keep auto review"])
+        );
+    }
+
+    #[test]
+    fn v46_mixed_payload_rolls_back_all_rewrites_and_marker() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+        let replacement_id = crate::protocol::HistoryItemId::new().to_string();
+        insert_v46_replacement(&connection, &replacement_id, 0);
+        let valid_legacy = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "first row would migrate",
+            "replacement_item_ids": [replacement_id],
+        })
+        .to_string();
+        let mixed = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "layout": "user_anchored_checkpoint",
+            "summary": "missing preserved messages",
+            "replacement_item_ids": [],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            "a-valid-compaction",
+            1,
+            &valid_legacy,
+            &sha256_text(&valid_legacy),
+        );
+        insert_v46_compaction(
+            &connection,
+            "z-mixed-compaction",
+            2,
+            &mixed,
+            &sha256_text(&mixed),
+        );
+        let before = text_snapshot(
+            &connection,
+            "SELECT json_group_array(json_array(id, payload_json, payload_sha256))
+             FROM (SELECT id, payload_json, payload_sha256 FROM protocol_history_items ORDER BY id)",
+        );
+
+        let error = run(&connection).expect_err("mixed V46 payload must fail");
+        assert!(error.to_string().contains("mixes legacy and current"));
+        let after = text_snapshot(
+            &connection,
+            "SELECT json_group_array(json_array(id, payload_json, payload_sha256))
+             FROM (SELECT id, payload_json, payload_sha256 FROM protocol_history_items ORDER BY id)",
+        );
+        assert_eq!(after, before);
+        assert!(
+            !schema_migration_applied(&connection, CODEX_COMPACTION_CHECKPOINT_VERSION)
+                .expect("rolled-back V46 marker")
+        );
+    }
+
+    #[test]
+    fn v46_rejects_stale_compaction_hash_without_rewriting_data() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+        let legacy_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "hash must be trusted",
+            "replacement_item_ids": [],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            "stale-hash-compaction",
+            1,
+            &legacy_payload,
+            "stale",
+        );
+
+        let error = run(&connection).expect_err("stale V46 hash must fail");
+        assert!(error.to_string().contains("stale payload hash"));
+        let stored = connection
+            .query_row(
+                "SELECT payload_json, payload_sha256
+                 FROM protocol_history_items WHERE id = 'stale-hash-compaction'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("unmodified stale row");
+        assert_eq!(stored, (legacy_payload, "stale".to_string()));
+        assert!(
+            !schema_migration_applied(&connection, CODEX_COMPACTION_CHECKPOINT_VERSION)
+                .expect("absent V46 marker")
+        );
+    }
+
+    #[test]
+    fn v46_marker_is_fast_path_and_full_audit_checks_payload_contract() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh current schema");
+        connection
+            .execute(
+                "DELETE FROM moyai_schema_migrations WHERE version = ?1",
+                [CODEX_COMPACTION_CHECKPOINT_VERSION],
+            )
+            .expect("remove V46 marker");
+        let marker_error = validate_canonical_protocol_schema(&connection)
+            .expect_err("schema validation must require V46 marker");
+        assert!(
+            marker_error
+                .to_string()
+                .contains("V46 Codex compaction checkpoint marker")
+        );
+        connection
+            .execute_batch(V46_CODEX_COMPACTION_CHECKPOINT)
+            .expect("restore V46 marker");
+
+        insert_v46_compaction_parent(&connection);
+        let invalid_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "layout": "unknown_layout",
+            "preserved_user_messages": [],
+            "summary": "invalid current checkpoint",
+            "replacement_item_ids": [],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            "invalid-current-compaction",
+            1,
+            &invalid_payload,
+            &sha256_text(&invalid_payload),
+        );
+
+        run(&connection).expect("current fast path must remain marker and schema only");
+        let audit_error = validate_canonical_protocol_storage(&connection)
+            .expect_err("full audit must inspect V46 payloads");
+        assert!(
+            audit_error
+                .to_string()
+                .contains("violates the current payload contract")
+        );
+    }
+
+    #[test]
+    fn v46_marker_requires_the_exact_migration_name() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh current schema");
+        connection
+            .execute(
+                "UPDATE moyai_schema_migrations SET name = 'wrong_v46_name' WHERE version = ?1",
+                [CODEX_COMPACTION_CHECKPOINT_VERSION],
+            )
+            .expect("corrupt V46 marker name");
+
+        let error = run(&connection).expect_err("V46 marker name must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("name other than `codex_compaction_checkpoint`")
+        );
+    }
+
+    #[test]
+    fn v46_rewrite_pages_only_compaction_rows() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+
+        let large_non_compaction = serde_json::json!({
+            "kind": "error",
+            "message": "x".repeat(1_000_000),
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            "000-large-non-compaction",
+            0,
+            &large_non_compaction,
+            &sha256_text(&large_non_compaction),
+        );
+        for index in 0..=COMPACTION_CHECKPOINT_MIGRATION_PAGE_SIZE {
+            let payload = serde_json::json!({
+                "kind": "compaction",
+                "mode": "automatic",
+                "summary": format!("legacy checkpoint {index}"),
+                "replacement_item_ids": [],
+            })
+            .to_string();
+            insert_v46_compaction(
+                &connection,
+                &format!("compaction-{index:03}"),
+                i64::try_from(index + 1).expect("fixture sequence"),
+                &payload,
+                &sha256_text(&payload),
+            );
+        }
+
+        let stats = canonicalize_compaction_checkpoint_history(&connection)
+            .expect("bounded V46 canonicalization");
+
+        assert_eq!(stats.pages, 2);
+        assert_eq!(stats.rows, COMPACTION_CHECKPOINT_MIGRATION_PAGE_SIZE + 1);
+        assert_eq!(
+            stats.max_page_rows,
+            COMPACTION_CHECKPOINT_MIGRATION_PAGE_SIZE
+        );
+        let stored_non_compaction = connection
+            .query_row(
+                "SELECT payload_json FROM protocol_history_items
+                 WHERE id = '000-large-non-compaction'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("non-compaction payload");
+        assert_eq!(stored_non_compaction, large_non_compaction);
+    }
+
+    #[test]
+    fn v46_full_audit_rejects_invalid_lineage_and_oversized_anchors() {
+        let missing_replacement = Connection::open_in_memory().expect("database");
+        run(&missing_replacement).expect("fresh current schema");
+        insert_v46_compaction_parent(&missing_replacement);
+        let missing_replacement_id = crate::protocol::HistoryItemId::new().to_string();
+        let missing_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "layout": "user_anchored_checkpoint",
+            "preserved_user_messages": ["retain the user task"],
+            "summary": "continue from the checkpoint",
+            "replacement_item_ids": [missing_replacement_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &missing_replacement,
+            "missing-lineage-compaction",
+            1,
+            &missing_payload,
+            &sha256_text(&missing_payload),
+        );
+        let lineage_error = validate_canonical_protocol_storage(&missing_replacement)
+            .expect_err("full audit must reject missing replacement lineage");
+        assert!(
+            lineage_error
+                .to_string()
+                .contains("missing or cross-session replacement item")
+        );
+
+        let oversized_anchor = Connection::open_in_memory().expect("database");
+        run(&oversized_anchor).expect("fresh current schema");
+        insert_v46_compaction_parent(&oversized_anchor);
+        let oversized_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "layout": "user_anchored_checkpoint",
+            "preserved_user_messages": ["x".repeat(80_004)],
+            "summary": "continue from the checkpoint",
+            "replacement_item_ids": [],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &oversized_anchor,
+            "oversized-anchor-compaction",
+            1,
+            &oversized_payload,
+            &sha256_text(&oversized_payload),
+        );
+        let anchor_error = validate_canonical_protocol_storage(&oversized_anchor)
+            .expect_err("full audit must enforce the user-anchor budget");
+        assert!(
+            anchor_error
+                .to_string()
+                .contains("exceeding the 20000-token checkpoint bound")
+        );
     }
 
     #[test]
@@ -6755,7 +8139,7 @@ mod tests {
         connection
             .execute_batch(
                 "DROP INDEX idx_protocol_runtime_events_unique_turn_terminal;
-                 DELETE FROM moyai_schema_migrations WHERE version IN (44, 45);",
+                 DELETE FROM moyai_schema_migrations WHERE version IN (44, 45, 46);",
             )
             .expect("restore V43 fixture");
         let terminal = crate::session::DurableTurnTerminal {

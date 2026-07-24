@@ -12,14 +12,11 @@ use crate::llm::contract::{
 use crate::session::{FinishReason, TokenUsage};
 
 /// Transport-only options for projecting a provider-neutral request onto the
-/// Responses API. `input_start` indexes non-system `ModelMessage`s; expanding a
-/// message into multiple Responses input items does not change that index.
+/// Responses API.
 #[derive(Debug, Clone, Copy)]
 pub struct ResponsesRequestOptions<'a> {
     pub reasoning_request: Option<&'a ReasoningRequest>,
     pub reasoning_capability: ProviderReasoningCapability,
-    pub previous_response_id: Option<&'a str>,
-    pub input_start: usize,
 }
 
 impl Default for ResponsesRequestOptions<'_> {
@@ -27,30 +24,15 @@ impl Default for ResponsesRequestOptions<'_> {
         Self {
             reasoning_request: None,
             reasoning_capability: ProviderReasoningCapability::Unsupported,
-            previous_response_id: None,
-            input_start: 0,
         }
     }
 }
 
 impl<'a> ResponsesRequestOptions<'a> {
     pub fn from_request(request: &'a ChatRequest) -> Self {
-        let (previous_response_id, input_start) = request
-            .responses_continuation
-            .as_ref()
-            .map(|continuation| {
-                (
-                    Some(continuation.previous_response_id.as_str()),
-                    continuation.input_start,
-                )
-            })
-            .unwrap_or((None, 0));
-
         Self {
             reasoning_request: request.reasoning.as_ref(),
             reasoning_capability: request.reasoning_capability,
-            previous_response_id,
-            input_start,
         }
     }
 }
@@ -66,29 +48,15 @@ pub fn to_responses_request(
         ));
     }
 
-    let non_system_messages = request
-        .messages
-        .iter()
-        .filter(|message| !matches!(message, ModelMessage::System { .. }))
-        .collect::<Vec<_>>();
-    if options.input_start > non_system_messages.len() {
-        return Err(LlmError::Message(format!(
-            "Responses input_start {} exceeds non-system message count {}",
-            options.input_start,
-            non_system_messages.len()
-        )));
-    }
-    if options.input_start > 0 && options.previous_response_id.is_none() {
-        return Err(LlmError::Message(
-            "Responses input_start requires previous_response_id continuity".to_string(),
-        ));
-    }
-
-    validate_previous_response_id(options)?;
     let reasoning = responses_reasoning(options)?;
 
     let mut input = Vec::new();
-    for message in non_system_messages.into_iter().skip(options.input_start) {
+    for message in request.messages.iter().filter(|message| {
+        !matches!(
+            message,
+            ModelMessage::System { .. } | ModelMessage::Developer { .. }
+        )
+    }) {
         append_input_items(message, &mut input);
     }
 
@@ -132,7 +100,7 @@ pub fn to_responses_request(
         "max_output_tokens".to_string(),
         json!(request.effective_max_output_tokens()),
     );
-    body.insert("store".to_string(), Value::Bool(true));
+    body.insert("store".to_string(), Value::Bool(false));
     body.insert("stream".to_string(), Value::Bool(true));
 
     if let Some(temperature) = request.temperature {
@@ -163,12 +131,6 @@ pub fn to_responses_request(
 
     if let Some(reasoning) = reasoning {
         body.insert("reasoning".to_string(), reasoning);
-    }
-    if let Some(previous_response_id) = options.previous_response_id {
-        body.insert(
-            "previous_response_id".to_string(),
-            json!(previous_response_id),
-        );
     }
     if let Some(extra) = &request.extra_body {
         merge_extra_body(&mut body, extra.clone());
@@ -220,29 +182,6 @@ fn is_runtime_owned_responses_request_key(key: &str) -> bool {
     )
 }
 
-fn validate_previous_response_id(options: ResponsesRequestOptions<'_>) -> Result<(), LlmError> {
-    let Some(previous_response_id) = options.previous_response_id else {
-        return Ok(());
-    };
-    if previous_response_id.trim().is_empty() {
-        return Err(LlmError::Message(
-            "Responses previous_response_id must not be empty".to_string(),
-        ));
-    }
-    if !matches!(
-        options.reasoning_capability,
-        ProviderReasoningCapability::Responses {
-            supports_previous_response_id: true,
-            ..
-        }
-    ) {
-        return Err(LlmError::Message(
-            "Responses continuation requires advertised previous_response_id support".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn responses_reasoning(options: ResponsesRequestOptions<'_>) -> Result<Option<Value>, LlmError> {
     let Some(reasoning) = validate_responses_reasoning_request(
         options.reasoning_request,
@@ -275,12 +214,13 @@ fn reasoning_summary_name(summary: ReasoningSummary) -> &'static str {
 }
 
 fn instructions(request: &ChatRequest) -> String {
-    // Responses does not carry prior `instructions` forward with
-    // `previous_response_id`, so current system guidance is projected on every
-    // request instead of becoming another incremental input item.
+    // HTTP Responses receives the complete canonical input on every request,
+    // including the current system guidance.
     std::iter::once(request.system_prompt.clone())
         .chain(request.messages.iter().filter_map(|message| match message {
-            ModelMessage::System { content } => Some(content.clone()),
+            ModelMessage::System { content } | ModelMessage::Developer { content } => {
+                Some(content.clone())
+            }
             _ => None,
         }))
         .filter(|instruction| !instruction.trim().is_empty())
@@ -290,7 +230,11 @@ fn instructions(request: &ChatRequest) -> String {
 
 fn append_input_items(message: &ModelMessage, input: &mut Vec<Value>) {
     match message {
-        ModelMessage::System { .. } => {}
+        ModelMessage::System { .. } | ModelMessage::Developer { .. } => {}
+        ModelMessage::Agent { content } => input.push(message_item(
+            "user",
+            vec![json!({ "type": "input_text", "text": content })],
+        )),
         ModelMessage::User { content } => input.push(message_item(
             "user",
             vec![json!({ "type": "input_text", "text": content })],
@@ -1937,9 +1881,7 @@ mod tests {
     use crate::config::model::{ProviderApiMode, ReasoningEffort};
     use crate::config::{ProviderDeadlines, ProviderMetadataMode, ProviderTarget};
     use crate::error::ProviderStreamLimit;
-    use crate::llm::contract::{
-        ModelCapabilities, ModelProfile, ModelToolCall, ResponsesContinuation, ToolSchema,
-    };
+    use crate::llm::contract::{ModelCapabilities, ModelProfile, ModelToolCall, ToolSchema};
 
     fn request(messages: Vec<ModelMessage>) -> ChatRequest {
         let model = ModelProfile {
@@ -1994,12 +1936,11 @@ mod tests {
     fn responses_capability() -> ProviderReasoningCapability {
         ProviderReasoningCapability::Responses {
             supports_summary: true,
-            supports_previous_response_id: true,
         }
     }
 
     #[test]
-    fn request_uses_non_system_message_index_and_standard_wire_shapes() {
+    fn request_replays_complete_non_system_history_and_standard_wire_shapes() {
         let request = request(vec![
             ModelMessage::System {
                 content: "Additional policy".to_string(),
@@ -2032,8 +1973,6 @@ mod tests {
             ResponsesRequestOptions {
                 reasoning_request: Some(&reasoning),
                 reasoning_capability: responses_capability(),
-                previous_response_id: Some("resp_previous"),
-                input_start: 1,
             },
         )
         .expect("request should serialize");
@@ -2042,8 +1981,8 @@ mod tests {
             wire["instructions"],
             json!("Base instructions\n\nAdditional policy")
         );
-        assert_eq!(wire["previous_response_id"], json!("resp_previous"));
-        assert_eq!(wire["store"], json!(true));
+        assert!(wire.get("previous_response_id").is_none());
+        assert_eq!(wire["store"], json!(false));
         assert_eq!(wire["stream"], json!(true));
         assert_eq!(wire["parallel_tool_calls"], json!(true));
         assert_eq!(wire["max_output_tokens"], json!(4_096));
@@ -2060,36 +1999,40 @@ mod tests {
         assert!(wire["tools"][0].get("strict").is_none());
 
         let input = wire["input"].as_array().expect("input array");
-        assert_eq!(input.len(), 3);
+        assert_eq!(input.len(), 4);
         assert_eq!(input[0]["type"], json!("message"));
-        assert_eq!(input[0]["role"], json!("assistant"));
-        assert_eq!(input[1]["type"], json!("function_call"));
-        assert_eq!(input[1]["call_id"], json!("call_1"));
-        assert_eq!(input[2]["type"], json!("function_call_output"));
-        assert_eq!(input[2]["output"], json!("contents"));
+        assert_eq!(input[0]["role"], json!("user"));
+        assert_eq!(input[0]["content"][0]["text"], json!("Already represented"));
+        assert_eq!(input[1]["type"], json!("message"));
+        assert_eq!(input[1]["role"], json!("assistant"));
+        assert_eq!(input[2]["type"], json!("function_call"));
+        assert_eq!(input[2]["call_id"], json!("call_1"));
+        assert_eq!(input[3]["type"], json!("function_call_output"));
+        assert_eq!(input[3]["output"], json!("contents"));
     }
 
     #[test]
-    fn compacted_full_history_keeps_its_user_query_before_tool_led_suffix() {
-        let compacted_context =
-            "Earlier conversation context was compacted.\nContinue the calculator task.";
+    fn compacted_history_keeps_the_real_user_anchor_before_the_latest_summary() {
+        let user_task = "Continue the calculator task.";
+        let compacted_context = format!(
+            "{}\nThe tests were inspected and the implementation remains pending.",
+            include_str!("../../assets/prompts/compaction_summary_prefix.md").trim()
+        );
         let request = request(vec![
+            ModelMessage::Developer {
+                content: "<multi_agent_mode>proactive</multi_agent_mode>".to_string(),
+            },
+            ModelMessage::Developer {
+                content: "<sub_agent>Return verified evidence.</sub_agent>".to_string(),
+            },
+            ModelMessage::Agent {
+                content: "Message Type: NEW_TASK\nPayload:\nInspect the calculator.".to_string(),
+            },
             ModelMessage::User {
-                content: compacted_context.to_string(),
+                content: user_task.to_string(),
             },
-            ModelMessage::AssistantToolCalls {
-                content: Some("I will inspect the tests.".to_string()),
-                tool_calls: vec![ModelToolCall {
-                    call_id: "call_1".to_string(),
-                    tool_name: "read_file".to_string(),
-                    arguments_json: r#"{"path":"test_calculator.py"}"#.to_string(),
-                }],
-            },
-            ModelMessage::Tool {
-                call_id: "call_1".to_string(),
-                tool_name: "read_file".to_string(),
-                result: "test contents".to_string(),
-                metadata: Value::Null,
+            ModelMessage::User {
+                content: compacted_context.clone(),
             },
         ]);
 
@@ -2102,28 +2045,35 @@ mod tests {
         )
         .expect("cursor-less compacted Responses request");
 
-        assert_eq!(wire["instructions"], json!("Base instructions"));
+        assert_eq!(
+            wire["instructions"],
+            json!(
+                "Base instructions\n\n<multi_agent_mode>proactive</multi_agent_mode>\n\n<sub_agent>Return verified evidence.</sub_agent>"
+            )
+        );
         assert!(wire.get("previous_response_id").is_none());
         assert_eq!(
             wire["input"],
             json!([{
                 "type": "message",
                 "role": "user",
-                "content": [{ "type": "input_text", "text": compacted_context }]
+                "content": [{ "type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\nInspect the calculator." }]
             }, {
                 "type": "message",
-                "role": "assistant",
-                "content": [{ "type": "output_text", "text": "I will inspect the tests." }]
+                "role": "user",
+                "content": [{ "type": "input_text", "text": user_task }]
             }, {
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "read_file",
-                "arguments": r#"{"path":"test_calculator.py"}"#
-            }, {
-                "type": "function_call_output",
-                "call_id": "call_1",
-                "output": "test contents"
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": compacted_context }]
             }])
+        );
+        assert!(
+            !wire["input"]
+                .as_array()
+                .expect("input array")
+                .iter()
+                .any(|item| item["role"] == json!("developer"))
         );
     }
 
@@ -2159,15 +2109,13 @@ mod tests {
             ResponsesRequestOptions {
                 reasoning_request: Some(&reasoning),
                 reasoning_capability: responses_capability(),
-                previous_response_id: Some("resp_previous"),
-                input_start: 0,
             },
         )
         .expect("request should preserve explicit provider settings");
 
         assert_eq!(wire["model"], json!("gpt-test"));
         assert_eq!(wire["input"][0]["role"], json!("user"));
-        assert_eq!(wire["previous_response_id"], json!("resp_previous"));
+        assert!(wire.get("previous_response_id").is_none());
         assert_eq!(
             wire["reasoning"],
             json!({ "effort": "high", "summary": "concise" })
@@ -2218,20 +2166,10 @@ mod tests {
     }
 
     #[test]
-    fn request_rejects_invalid_continuation_and_reasoning_capability() {
+    fn request_rejects_invalid_reasoning_capability() {
         let request = request(vec![ModelMessage::System {
             content: "Only system".to_string(),
         }]);
-        let no_previous = to_responses_request(
-            &request,
-            ResponsesRequestOptions {
-                input_start: 1,
-                reasoning_capability: responses_capability(),
-                ..ResponsesRequestOptions::default()
-            },
-        );
-        assert!(no_previous.is_err());
-
         let reasoning = ReasoningRequest {
             effort: Some(ReasoningEffort::Medium),
             summary: ReasoningSummary::None,
@@ -2256,15 +2194,10 @@ mod tests {
             effort: Some(ReasoningEffort::Low),
             summary: ReasoningSummary::Concise,
         });
-        request.responses_continuation = Some(ResponsesContinuation {
-            previous_response_id: "resp_1".to_string(),
-            input_start: 0,
-        });
 
         let options = ResponsesRequestOptions::from_request(&request);
-        assert_eq!(options.previous_response_id, Some("resp_1"));
-        assert_eq!(options.input_start, 0);
         assert_eq!(options.reasoning_request, request.reasoning.as_ref());
+        assert_eq!(options.reasoning_capability, request.reasoning_capability);
     }
 
     #[test]

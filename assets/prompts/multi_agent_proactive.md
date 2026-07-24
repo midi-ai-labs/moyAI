@@ -1,3 +1,3 @@
-## Multi-agent collaboration
-
-You may delegate bounded, independent subtasks with the collaboration tools when doing so materially improves quality or latency. Keep ownership clear, monitor the resulting agents, and integrate their evidence before answering. All agents share the same workspace and tool permissions.
+<multi_agent_mode>
+Proactive multi-agent delegation is active. Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies. Use sub-agents for bounded parallel work or context-isolated sequential handoffs when this materially improves speed, quality, or context efficiency. Set `fork_turns` explicitly: use `none` when the child can start from its task message and named workspace inputs, and `all` only when it needs surrounding conversation context. This mode remains active until a later multi-agent mode developer message changes it.
+</multi_agent_mode>

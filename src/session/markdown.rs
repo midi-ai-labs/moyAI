@@ -802,9 +802,25 @@ fn push_request_diagnostics(output: &mut String, value: &RequestDiagnosticsPart)
     push_metadata_line(output, "Tool Count", &value.tool_count.to_string());
     push_metadata_line(
         output,
-        "Provider Message Count",
+        "Prepared Model Message Count",
         &value.provider_message_count.to_string(),
     );
+    if let Some(wire) = &value.wire {
+        push_metadata_line(output, "Wire Transport", &wire.transport);
+        push_metadata_line(output, "Wire API Mode", &wire.api_mode);
+        push_metadata_line(output, "Wire Input Kind", &wire.input_kind);
+        push_metadata_line(output, "Wire Input Count", &wire.input_count.to_string());
+        push_metadata_line(
+            output,
+            "Wire Serialized Body Bytes",
+            &wire.serialized_body_bytes.to_string(),
+        );
+        push_metadata_line(
+            output,
+            "Wire Continuation Present",
+            &wire.continuation_present.to_string(),
+        );
+    }
     if value.image_count > 0 {
         push_metadata_line(output, "Image Count", &value.image_count.to_string());
         push_metadata_line(output, "Image Bytes", &value.image_bytes.to_string());
@@ -820,6 +836,11 @@ fn push_request_diagnostics(output: &mut String, value: &RequestDiagnosticsPart)
         );
     }
     if let Some(context_window) = &value.context_window {
+        push_metadata_line(
+            output,
+            "Active Context Token Source",
+            context_window.source.key(),
+        );
         push_metadata_line(
             output,
             "Active Context Tokens (estimated)",
@@ -925,6 +946,52 @@ mod tests {
         CanonicalHistoryPage, CanonicalTurnPage, ProjectId, SessionId, SessionModelParameters,
         SessionRecord, SessionStatus,
     };
+
+    #[test]
+    fn request_diagnostics_markdown_distinguishes_prepared_history_from_wire_input() {
+        let diagnostics: RequestDiagnosticsPart = serde_json::from_value(serde_json::json!({
+            "provider": "openai_compat",
+            "model_name": "fixture-model",
+            "base_url": "http://localhost:1234/v1",
+            "request_timeout_ms": 30_000,
+            "stream_idle_timeout_ms": 30_000,
+            "system_prompt_chars": 10,
+            "tool_count": 0,
+            "provider_message_count": 19,
+            "messages": [],
+            "context_window": {
+                "source": "provider_usage_with_local_estimate",
+                "active_context_tokens": 1234,
+                "full_context_window_limit": 32768,
+                "configured_max_output_tokens": 512,
+                "overflow_margin_tokens": 128,
+                "tokens_until_limit": 30894,
+                "token_limit_reached": false
+            },
+            "wire": {
+                "transport": "http",
+                "api_mode": "responses",
+                "input_kind": "input_items",
+                "input_count": 7,
+                "serialized_body_bytes": 12_345,
+                "continuation_present": false
+            }
+        }))
+        .expect("request diagnostics fixture");
+        let mut markdown = String::new();
+
+        push_request_diagnostics(&mut markdown, &diagnostics);
+
+        assert!(markdown.contains("Prepared Model Message Count: 19"));
+        assert!(
+            markdown.contains("Active Context Token Source: provider_usage_with_local_estimate")
+        );
+        assert!(markdown.contains("Wire API Mode: responses"));
+        assert!(markdown.contains("Wire Input Kind: input_items"));
+        assert!(markdown.contains("Wire Input Count: 7"));
+        assert!(markdown.contains("Wire Serialized Body Bytes: 12345"));
+        assert!(markdown.contains("Wire Continuation Present: false"));
+    }
 
     #[test]
     fn history_markdown_preserves_canonical_cross_turn_order() {

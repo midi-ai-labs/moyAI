@@ -7,9 +7,29 @@ const MESSAGE_OVERHEAD_TOKENS: usize = 8;
 const TOOL_SCHEMA_OVERHEAD_TOKENS: usize = 16;
 const MIN_IMAGE_RESERVATION_TOKENS: usize = 1_024;
 const DECODED_IMAGE_BYTES_PER_RESERVED_TOKEN: usize = 128;
+pub(crate) const COMPACTION_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveContextTokenSource {
+    #[default]
+    FullPreparedRequestEstimate,
+    ProviderUsageWithLocalEstimate,
+}
+
+impl ActiveContextTokenSource {
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::FullPreparedRequestEstimate => "full_prepared_request_estimate",
+            Self::ProviderUsageWithLocalEstimate => "provider_usage_with_local_estimate",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextWindowTokenStatus {
+    #[serde(default)]
+    pub source: ActiveContextTokenSource,
     pub active_context_tokens: u32,
     pub full_context_window_limit: u32,
     pub configured_max_output_tokens: u32,
@@ -21,6 +41,35 @@ pub struct ContextWindowTokenStatus {
 impl ContextWindowTokenStatus {
     pub fn for_request(request: &ChatRequest, overflow_margin_tokens: usize) -> Self {
         let active_context_tokens = estimate_request_tokens(request);
+        Self::from_active_context_tokens(
+            request,
+            overflow_margin_tokens,
+            active_context_tokens,
+            ActiveContextTokenSource::FullPreparedRequestEstimate,
+        )
+    }
+
+    pub(crate) fn from_provider_usage(
+        request: &ChatRequest,
+        overflow_margin_tokens: usize,
+        provider_total_tokens: u32,
+        local_messages: &[ModelMessage],
+    ) -> Self {
+        let local_tokens = estimate_model_messages_tokens(local_messages);
+        Self::from_active_context_tokens(
+            request,
+            overflow_margin_tokens,
+            provider_total_tokens.saturating_add(local_tokens),
+            ActiveContextTokenSource::ProviderUsageWithLocalEstimate,
+        )
+    }
+
+    fn from_active_context_tokens(
+        request: &ChatRequest,
+        overflow_margin_tokens: usize,
+        active_context_tokens: u32,
+        source: ActiveContextTokenSource,
+    ) -> Self {
         let full_context_window_limit = request.model.context_window;
         let configured_max_output_tokens = request.model.max_output_tokens;
         let overflow_margin_tokens = overflow_margin_tokens.min(u32::MAX as usize) as u32;
@@ -29,6 +78,7 @@ impl ContextWindowTokenStatus {
             - i64::from(active_context_tokens)
             - i64::from(reserved);
         Self {
+            source,
             active_context_tokens,
             full_context_window_limit,
             configured_max_output_tokens,
@@ -67,6 +117,8 @@ fn estimate_request_tokens(request: &ChatRequest) -> u32 {
 fn message_tokens(message: &ModelMessage) -> usize {
     let content_tokens = match message {
         ModelMessage::System { content }
+        | ModelMessage::Developer { content }
+        | ModelMessage::Agent { content }
         | ModelMessage::User { content }
         | ModelMessage::Assistant { content } => estimate_text_tokens(content),
         ModelMessage::UserParts { parts } => parts
@@ -106,21 +158,130 @@ fn message_tokens(message: &ModelMessage) -> usize {
     MESSAGE_OVERHEAD_TOKENS.saturating_add(content_tokens)
 }
 
-/// Transport-neutral conservative estimate used before the provider can report usage.
-/// ASCII is reserved at two bytes per token, while every non-ASCII scalar reserves
-/// half of its UTF-8 width rounded up. This deliberately over-reserves ordinary prose
-/// and avoids treating four CJK scalars as one token.
-fn estimate_text_tokens(text: &str) -> usize {
-    let mut ascii_bytes = 0usize;
-    let mut non_ascii_tokens = 0usize;
-    for character in text.chars() {
-        if character.is_ascii() {
-            ascii_bytes = ascii_bytes.saturating_add(1);
-        } else {
-            non_ascii_tokens = non_ascii_tokens.saturating_add(character.len_utf8().div_ceil(2));
+/// Codex-compatible coarse estimate used before the provider can report usage.
+/// This is a byte-based lower bound rather than a tokenizer-accurate count.
+pub(crate) fn estimate_text_tokens(text: &str) -> usize {
+    text.len().div_ceil(4)
+}
+
+pub(crate) fn estimate_model_messages_tokens(messages: &[ModelMessage]) -> u32 {
+    messages
+        .iter()
+        .map(message_tokens)
+        .fold(0usize, usize::saturating_add)
+        .min(u32::MAX as usize) as u32
+}
+
+/// Keeps both ends of a durable user checkpoint while respecting the same
+/// Codex-compatible estimator used for prepared requests.
+pub(crate) fn truncate_text_to_estimated_tokens(text: &str, max_tokens: usize) -> String {
+    if max_tokens == 0 {
+        return String::new();
+    }
+    if estimate_text_tokens(text) <= max_tokens {
+        return text.to_string();
+    }
+
+    const MARKER: &str = "\n[... compaction checkpoint truncated ...]\n";
+    let marker_tokens = estimate_text_tokens(MARKER);
+    if marker_tokens >= max_tokens {
+        return prefix_within_estimated_tokens(text, max_tokens).to_string();
+    }
+
+    let content_tokens = max_tokens - marker_tokens;
+    let head_budget = content_tokens.div_ceil(2);
+    let tail_budget = content_tokens / 2;
+    let head = prefix_within_estimated_tokens(text, head_budget);
+    let tail_source = &text[head.len()..];
+    let tail = suffix_within_estimated_tokens(tail_source, tail_budget);
+    let truncated = format!("{head}{MARKER}{tail}");
+    debug_assert!(estimate_text_tokens(&truncated) <= max_tokens);
+    truncated
+}
+
+pub(crate) struct CompactionUserMessageBudget {
+    remaining_tokens: usize,
+    newest_first: Vec<String>,
+}
+
+impl CompactionUserMessageBudget {
+    pub(crate) fn new() -> Self {
+        Self {
+            remaining_tokens: COMPACTION_USER_MESSAGE_MAX_TOKENS,
+            newest_first: Vec::new(),
         }
     }
-    ascii_bytes.div_ceil(2).saturating_add(non_ascii_tokens)
+
+    /// Adds one candidate while walking messages from newest to oldest.
+    /// Returns whether an older candidate can still contribute.
+    pub(crate) fn push_newest(&mut self, message: String) -> bool {
+        let message_tokens = estimate_text_tokens(&message);
+        if message_tokens <= self.remaining_tokens {
+            self.newest_first.push(message);
+            self.remaining_tokens = self.remaining_tokens.saturating_sub(message_tokens);
+            return self.remaining_tokens > 0;
+        }
+        let boundary = truncate_text_to_estimated_tokens(&message, self.remaining_tokens);
+        if !boundary.is_empty() {
+            self.newest_first.push(boundary);
+        }
+        self.remaining_tokens = 0;
+        false
+    }
+
+    pub(crate) fn finish(mut self) -> Vec<String> {
+        self.newest_first.reverse();
+        self.newest_first
+    }
+}
+
+pub(crate) fn bounded_compaction_user_messages(messages: &[String]) -> Vec<String> {
+    let mut budget = CompactionUserMessageBudget::new();
+    for message in messages.iter().rev() {
+        if !budget.push_newest(message.clone()) {
+            break;
+        }
+    }
+    budget.finish()
+}
+
+fn prefix_within_estimated_tokens(text: &str, max_tokens: usize) -> &str {
+    let boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(text.len()))
+        .collect::<Vec<_>>();
+    let mut low = 0usize;
+    let mut high = boundaries.len();
+    while low + 1 < high {
+        let middle = low + (high - low) / 2;
+        if estimate_text_tokens(&text[..boundaries[middle]]) <= max_tokens {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    &text[..boundaries[low]]
+}
+
+fn suffix_within_estimated_tokens(text: &str, max_tokens: usize) -> &str {
+    let boundaries = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(text.len()))
+        .collect::<Vec<_>>();
+    let mut low = 0usize;
+    let mut high = boundaries.len();
+    while low + 1 < high {
+        let middle = low + (high - low) / 2;
+        let start = boundaries[boundaries.len() - 1 - middle];
+        if estimate_text_tokens(&text[start..]) <= max_tokens {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    &text[boundaries[boundaries.len() - 1 - low]..]
 }
 
 /// Images do not enter the model as base64 text. Until a provider exposes an exact
@@ -147,6 +308,34 @@ fn image_reservation(data_base64: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
+    #[test]
+    fn text_estimator_matches_codex_utf8_byte_approximation() {
+        assert_eq!(super::estimate_text_tokens(""), 0);
+        assert_eq!(super::estimate_text_tokens("abcd"), 1);
+        assert_eq!(super::estimate_text_tokens("abcde"), 2);
+        assert_eq!(super::estimate_text_tokens("資料"), 2);
+    }
+
+    #[test]
+    fn text_truncation_keeps_both_ends_within_estimated_budget() {
+        let source = format!("HEAD-{}-TAIL", "中間content".repeat(1_000));
+
+        let truncated = super::truncate_text_to_estimated_tokens(&source, 80);
+
+        assert!(truncated.starts_with("HEAD-"));
+        assert!(truncated.ends_with("-TAIL"));
+        assert!(truncated.contains("compaction checkpoint truncated"));
+        assert!(super::estimate_text_tokens(&truncated) <= 80);
+    }
+
+    #[test]
+    fn text_truncation_handles_zero_and_tiny_budgets() {
+        assert_eq!(super::truncate_text_to_estimated_tokens("abcdef", 0), "");
+        let tiny = super::truncate_text_to_estimated_tokens("abcdef", 1);
+        assert!(!tiny.is_empty());
+        assert!(super::estimate_text_tokens(&tiny) <= 1);
+    }
 
     use crate::config::model::{ProviderApiMode, ProviderReasoningCapability};
     use crate::config::{ProviderDeadlines, ProviderMetadataMode, ProviderTarget};
@@ -201,7 +390,25 @@ mod tests {
     }
 
     #[test]
-    fn prepared_request_reserves_cjk_and_non_ascii_tool_payloads_conservatively() {
+    fn context_window_status_defaults_legacy_diagnostics_to_full_request_estimate() {
+        let status: super::ContextWindowTokenStatus = serde_json::from_value(serde_json::json!({
+            "active_context_tokens": 100,
+            "full_context_window_limit": 1_000,
+            "configured_max_output_tokens": 100,
+            "overflow_margin_tokens": 10,
+            "tokens_until_limit": 790,
+            "token_limit_reached": false
+        }))
+        .expect("legacy context status");
+
+        assert_eq!(
+            status.source,
+            super::ActiveContextTokenSource::FullPreparedRequestEstimate
+        );
+    }
+
+    #[test]
+    fn prepared_request_estimate_counts_non_ascii_messages_and_tool_payloads() {
         let mut request = request_with(
             ProviderApiMode::ChatCompletions,
             vec![
@@ -231,10 +438,8 @@ mod tests {
             }],
         );
         let estimated = super::estimate_request_tokens(&request);
-        assert!(
-            estimated > 500,
-            "CJK request was under-reserved: {estimated}"
-        );
+        let empty_request = request_with(ProviderApiMode::ChatCompletions, Vec::new(), Vec::new());
+        assert!(estimated > super::estimate_request_tokens(&empty_request));
 
         let margin = 37u32;
         request.model.context_window = estimated

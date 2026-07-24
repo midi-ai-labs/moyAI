@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_MODEL_BASE_URL: &str = "http://127.0.0.1:1234";
 pub const DEFAULT_MODEL_NAME: &str = "qwen/qwen3.6-35b-a3b";
 pub const DEFAULT_MODEL_CONTEXT_WINDOW: u32 = 131_072;
-pub const DEFAULT_MODEL_MAX_OUTPUT_TOKENS: u32 = 8_192;
+pub const DEFAULT_MODEL_MAX_OUTPUT_TOKENS: u32 = 16_384;
+pub const DEFAULT_MODEL_REQUEST_TIMEOUT_MS: u64 = 600_000;
+pub const DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS: u64 = 600_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,7 +123,6 @@ pub enum ProviderReasoningCapability {
     },
     Responses {
         supports_summary: bool,
-        supports_previous_response_id: bool,
     },
 }
 
@@ -572,8 +573,8 @@ impl Default for ResolvedConfig {
                 reasoning_summary: ReasoningSummary::None,
                 api_key_env: None,
                 extra_headers: BTreeMap::new(),
-                request_timeout_ms: 300_000,
-                stream_idle_timeout_ms: 300_000,
+                request_timeout_ms: DEFAULT_MODEL_REQUEST_TIMEOUT_MS,
+                stream_idle_timeout_ms: DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS,
                 connect_timeout_ms: 10_000,
                 max_retries: 2,
                 context_window: DEFAULT_MODEL_CONTEXT_WINDOW,
@@ -598,7 +599,7 @@ impl Default for ResolvedConfig {
                 overflow_margin_tokens: 1_024,
             },
             multi_agent: MultiAgentConfig {
-                enabled: false,
+                enabled: true,
                 mode: MultiAgentMode::ExplicitRequestOnly,
                 max_concurrent_agents: 4,
                 max_concurrent_model_requests: 1,
@@ -1140,14 +1141,12 @@ mod reasoning_contract_tests {
         assert!(ChatCompletionsReasoningParameters::EffortAndSummary.supports_summary());
         let responses = ProviderReasoningCapability::Responses {
             supports_summary: true,
-            supports_previous_response_id: true,
         };
         assert_eq!(responses.api_mode(), Some(ProviderApiMode::Responses));
         assert!(matches!(
             responses,
             ProviderReasoningCapability::Responses {
                 supports_summary: true,
-                supports_previous_response_id: true,
             }
         ));
         assert_eq!(ProviderReasoningCapability::Unsupported.api_mode(), None);
@@ -1171,5 +1170,15 @@ mod reasoning_contract_tests {
         assert_eq!(model.reasoning_effort, None);
         assert_eq!(model.reasoning_summary, ReasoningSummary::None);
         assert!(!model.supports_reasoning);
+    }
+
+    #[test]
+    fn multi_agent_defaults_match_codex_availability_without_proactive_delegation() {
+        let multi_agent = super::ResolvedConfig::default().multi_agent;
+
+        assert!(multi_agent.enabled);
+        assert_eq!(multi_agent.mode, super::MultiAgentMode::ExplicitRequestOnly);
+        assert_eq!(multi_agent.max_concurrent_agents, 4);
+        assert_eq!(multi_agent.max_concurrent_model_requests, 1);
     }
 }

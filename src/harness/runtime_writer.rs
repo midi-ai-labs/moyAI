@@ -676,6 +676,7 @@ mod tests {
                 image_bytes: 0,
                 tool_names: Vec::new(),
                 tool_schemas: Vec::new(),
+                wire: None,
                 context_window: None,
                 messages: Vec::new(),
             },

@@ -17,6 +17,32 @@ pub enum AgentToolRole {
     Child,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootOwnershipToolSurface {
+    Normal,
+    AwaitingDecision,
+    DelegatedCollaboration,
+}
+
+impl RootOwnershipToolSurface {
+    pub(crate) fn allows_tool(self, name: &str) -> bool {
+        match self {
+            Self::Normal => true,
+            Self::AwaitingDecision => matches!(name, "spawn_agent" | "update_plan"),
+            Self::DelegatedCollaboration => matches!(
+                name,
+                "spawn_agent"
+                    | "send_message"
+                    | "followup_task"
+                    | "wait_agent"
+                    | "interrupt_agent"
+                    | "list_agents"
+                    | "update_plan"
+            ),
+        }
+    }
+}
+
 impl ToolSpecPlan {
     pub fn build(step: &StepContext, registry: &ToolRegistry) -> Self {
         Self::build_for_agent(step, registry, AgentToolRole::Root)
@@ -26,6 +52,20 @@ impl ToolSpecPlan {
         step: &StepContext,
         registry: &ToolRegistry,
         agent_role: AgentToolRole,
+    ) -> Self {
+        Self::build_for_agent_with_root_ownership(
+            step,
+            registry,
+            agent_role,
+            RootOwnershipToolSurface::Normal,
+        )
+    }
+
+    pub(crate) fn build_for_agent_with_root_ownership(
+        step: &StepContext,
+        registry: &ToolRegistry,
+        agent_role: AgentToolRole,
+        root_ownership_surface: RootOwnershipToolSurface,
     ) -> Self {
         if !step.turn.policy.model.supports_tools {
             return Self {
@@ -53,6 +93,9 @@ impl ToolSpecPlan {
             });
         } else if agent_role == AgentToolRole::Child {
             router.retain_tools(|name| name != "spawn_agent");
+        }
+        if agent_role == AgentToolRole::Root {
+            router.retain_tools(|name| root_ownership_surface.allows_tool(name));
         }
         if !step.external_tools.docling_enabled {
             router.retain_tools(|name| name != "docling_convert");
@@ -217,6 +260,62 @@ mod tests {
             );
         }
         assert_eq!(child.tool_names(), child.router().available_tool_names());
+    }
+
+    #[test]
+    fn pending_root_ownership_exposes_only_existing_plan_or_spawn_decisions() {
+        let mut config = ResolvedConfig::default();
+        config.multi_agent.enabled = true;
+        config.multi_agent.mode = crate::config::MultiAgentMode::Proactive;
+        let registry = ToolRegistry::core_agent_for_config(&config);
+        let step = step_for_config(ModeKind::Default, &config);
+
+        let pending = ToolSpecPlan::build_for_agent_with_root_ownership(
+            &step,
+            &registry,
+            AgentToolRole::Root,
+            RootOwnershipToolSurface::AwaitingDecision,
+        );
+        let delegated = ToolSpecPlan::build_for_agent_with_root_ownership(
+            &step,
+            &registry,
+            AgentToolRole::Root,
+            RootOwnershipToolSurface::DelegatedCollaboration,
+        );
+        let child = ToolSpecPlan::build_for_agent_with_root_ownership(
+            &step,
+            &registry,
+            AgentToolRole::Child,
+            RootOwnershipToolSurface::DelegatedCollaboration,
+        );
+
+        assert_eq!(
+            pending.tool_names(),
+            vec!["spawn_agent".to_string(), "update_plan".to_string()]
+        );
+        assert_eq!(
+            pending.tool_names(),
+            pending.router().available_tool_names()
+        );
+        assert_eq!(
+            delegated.tool_names(),
+            vec![
+                "followup_task".to_string(),
+                "interrupt_agent".to_string(),
+                "list_agents".to_string(),
+                "send_message".to_string(),
+                "spawn_agent".to_string(),
+                "update_plan".to_string(),
+                "wait_agent".to_string(),
+            ]
+        );
+        assert_eq!(
+            delegated.tool_names(),
+            delegated.router().available_tool_names()
+        );
+        assert!(!delegated.tool_names().contains(&"read".to_string()));
+        assert!(child.tool_names().contains(&"read".to_string()));
+        assert!(!child.tool_names().contains(&"spawn_agent".to_string()));
     }
 
     #[test]

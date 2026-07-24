@@ -1,0 +1,3 @@
+current directory の `task.md` に従って作業してください。
+
+作業対象はcurrent directory以下のみです。

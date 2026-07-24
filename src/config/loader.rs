@@ -761,9 +761,9 @@ mod tests {
         assert!(text.contains("reasoning_summary = \"none\""));
         assert!(!text.contains("chat_completions_reasoning_parameters"));
         assert!(!text.contains("reasoning_effort"));
-        assert!(text.contains("request_timeout_ms = 300000"));
-        assert!(text.contains("stream_idle_timeout_ms = 300000"));
-        assert!(text.contains("max_output_tokens = 8192"));
+        assert!(text.contains("request_timeout_ms = 600000"));
+        assert!(text.contains("stream_idle_timeout_ms = 600000"));
+        assert!(text.contains("max_output_tokens = 16384"));
         assert!(!text.contains("prompt_profile"));
         assert!(!text.contains("max_steps_per_turn"));
         assert!(text.contains("[docling]"));
@@ -772,7 +772,14 @@ mod tests {
         assert!(text.contains("base_url = \"http://127.0.0.1:8123/mcp\""));
         assert!(text.contains("[permissions]"));
         assert!(!text.contains("[agent]"));
-        toml::from_str::<PartialResolvedConfig>(&text).expect("generated config parses");
+        let generated =
+            toml::from_str::<PartialResolvedConfig>(&text).expect("generated config parses");
+        assert_eq!(
+            generated
+                .multi_agent
+                .and_then(|multi_agent| multi_agent.enabled),
+            Some(true)
+        );
     }
 
     #[test]
@@ -784,6 +791,7 @@ mod tests {
             document["permissions"]["access_mode"].as_str(),
             Some("default")
         );
+        assert_eq!(document["multi_agent"]["enabled"].as_bool(), Some(true));
         assert_eq!(
             document["model"]["provider_api_mode"].as_str(),
             Some("responses")

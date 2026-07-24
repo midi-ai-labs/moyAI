@@ -548,6 +548,21 @@ pub struct RequestMessageDiagnostic {
     pub tool_call_id: Option<String>,
 }
 
+/// Redacted facts derived from the exact serialized provider request.
+///
+/// The body itself is deliberately not retained. `input_count` refers to the
+/// transport-native collection named by `input_kind` (for example Responses
+/// `input` items or Chat Completions `messages`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestWireDiagnostic {
+    pub transport: String,
+    pub api_mode: String,
+    pub input_kind: String,
+    pub input_count: usize,
+    pub serialized_body_bytes: u64,
+    pub continuation_present: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestDiagnosticsPart {
     pub provider: String,
@@ -582,6 +597,8 @@ pub struct RequestDiagnosticsPart {
     pub tool_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_schemas: Vec<RequestToolSchemaDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire: Option<RequestWireDiagnostic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<crate::context::ContextWindowTokenStatus>,
     pub messages: Vec<RequestMessageDiagnostic>,
@@ -902,7 +919,7 @@ impl fmt::Debug for RunConfigSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -995,6 +1012,8 @@ pub enum RunEvent {
     },
     CompactionCompleted {
         summarized_messages: usize,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        preserved_user_messages: Vec<String>,
         summary: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         replacement_item_ids: Vec<crate::protocol::HistoryItemId>,
@@ -1043,5 +1062,50 @@ impl RunEvent {
             | Self::PermissionRequested { .. }
             | Self::PermissionResolved { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_diagnostics_keeps_legacy_records_without_wire_facts_compatible() {
+        let legacy = serde_json::json!({
+            "provider": "openai_compat",
+            "model_name": "fixture-model",
+            "base_url": "http://localhost:1234/v1",
+            "request_timeout_ms": 30_000,
+            "stream_idle_timeout_ms": 30_000,
+            "system_prompt_chars": 10,
+            "tool_count": 0,
+            "provider_message_count": 2,
+            "messages": []
+        });
+
+        let diagnostics: RequestDiagnosticsPart =
+            serde_json::from_value(legacy).expect("legacy request diagnostics");
+
+        assert_eq!(diagnostics.wire, None);
+        let serialized = serde_json::to_value(diagnostics).expect("serialize diagnostics");
+        assert!(serialized.get("wire").is_none());
+    }
+
+    #[test]
+    fn request_diagnostics_round_trips_redacted_wire_facts() {
+        let wire = RequestWireDiagnostic {
+            transport: "http".to_string(),
+            api_mode: "responses".to_string(),
+            input_kind: "input_items".to_string(),
+            input_count: 7,
+            serialized_body_bytes: 12_345,
+            continuation_present: false,
+        };
+        let value = serde_json::to_value(&wire).expect("serialize wire facts");
+
+        assert_eq!(
+            serde_json::from_value::<RequestWireDiagnostic>(value).expect("deserialize wire facts"),
+            wire
+        );
     }
 }

@@ -3,8 +3,12 @@ use std::collections::{HashMap, HashSet};
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
-use crate::llm::{ModelContentPart, ModelMessage, ModelToolCall};
-use crate::protocol::{ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload};
+use crate::context::ContextWindowTokenStatus;
+use crate::llm::{ChatRequest, ModelContentPart, ModelMessage, ModelToolCall};
+use crate::protocol::{
+    ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload, ModelResponseId,
+};
+use crate::session::{DurableTurnTerminal, TokenUsage};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryRevision(String);
@@ -23,6 +27,18 @@ pub struct ContextManager {
     canonical_count: usize,
     steer_count: usize,
     agent_communication_count: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ActiveContextTokenState {
+    provider_baseline: Option<ProviderTokenBaseline>,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderTokenBaseline {
+    response_id: ModelResponseId,
+    total_tokens: u32,
+    known_item_ids: HashSet<HistoryItemId>,
 }
 
 /// Transient owner used while storage streams one fenced active-history view.
@@ -81,8 +97,9 @@ impl ContextManager {
     ///
     /// The durable stream remains append-only. A compaction append updates the
     /// active in-memory view by removing its replacement IDs and inserting the
-    /// summary at their earliest model position; replaced raw content is never
-    /// reloaded merely to detect this change.
+    /// checkpoint at the earliest replaced position. Inputs committed while
+    /// compaction was running therefore remain after the checkpoint; replaced
+    /// raw content is never reloaded merely to detect this change.
     pub fn ingest_committed_delta(
         &mut self,
         history_items: Vec<HistoryItem>,
@@ -176,7 +193,9 @@ impl ContextManager {
         self.history_items.iter().any(|item| {
             matches!(
                 item.payload,
-                HistoryItemPayload::UserTurn { .. } | HistoryItemPayload::Compaction { .. }
+                HistoryItemPayload::UserTurn { .. }
+                    | HistoryItemPayload::InterAgentCommunication { .. }
+                    | HistoryItemPayload::Compaction { .. }
             )
         })
     }
@@ -207,6 +226,123 @@ impl ContextManager {
             .filter(|item| !replaced.contains(&item.id))
             .map(|item| item.id)
             .collect()
+    }
+
+    fn active_item_ids_through_model_response(
+        &self,
+        response_id: ModelResponseId,
+    ) -> Option<HashSet<HistoryItemId>> {
+        let active = self.active_history_items();
+        if latest_model_response_id(&active) != Some(response_id) {
+            return None;
+        }
+        let last_response_index = active.iter().rposition(|item| {
+            matches!(
+                item.payload,
+                HistoryItemPayload::AssistantMessage {
+                    response_id: item_response_id,
+                    ..
+                } | HistoryItemPayload::ToolCall {
+                    response_id: item_response_id,
+                    ..
+                } if item_response_id == response_id
+            )
+        })?;
+        Some(
+            active[..=last_response_index]
+                .iter()
+                .map(|item| item.id)
+                .collect(),
+        )
+    }
+
+    fn active_history_items(&self) -> Vec<&HistoryItem> {
+        let replaced = crate::protocol::compacted_history_item_ids(&self.history_items);
+        self.history_items
+            .iter()
+            .filter(|item| !replaced.contains(&item.id))
+            .collect()
+    }
+
+    fn local_messages_after_provider_baseline(
+        &self,
+        baseline: &ProviderTokenBaseline,
+        supports_images: bool,
+    ) -> Option<Vec<ModelMessage>> {
+        let active = self.active_history_items();
+        if latest_model_response_id(&active) != Some(baseline.response_id) {
+            return None;
+        }
+
+        let tool_calls = active
+            .iter()
+            .filter_map(|item| match &item.payload {
+                HistoryItemPayload::ToolCall {
+                    call_id,
+                    model_call_id,
+                    tool_name,
+                    ..
+                } => Some((
+                    *call_id,
+                    (
+                        if model_call_id.trim().is_empty() {
+                            call_id.to_string()
+                        } else {
+                            model_call_id.clone()
+                        },
+                        tool_name.clone(),
+                    ),
+                )),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        let mut messages = Vec::new();
+        for item in active {
+            if baseline.known_item_ids.contains(&item.id) {
+                continue;
+            }
+            match &item.payload {
+                HistoryItemPayload::UserTurn { content, .. }
+                | HistoryItemPayload::SteerTurn { content, .. } => {
+                    messages.push(user_message_from_content(content, supports_images));
+                }
+                HistoryItemPayload::InterAgentCommunication { communication } => {
+                    messages.push(inter_agent_input_message(communication));
+                }
+                HistoryItemPayload::AssistantMessage { response_id, .. }
+                | HistoryItemPayload::ToolCall { response_id, .. }
+                    if *response_id == baseline.response_id => {}
+                HistoryItemPayload::AssistantMessage { .. }
+                | HistoryItemPayload::ToolCall { .. }
+                | HistoryItemPayload::Compaction { .. } => return None,
+                HistoryItemPayload::ToolOutput {
+                    call_id,
+                    output_text,
+                    metadata,
+                    ..
+                } => {
+                    let (model_call_id, tool_name) = tool_calls.get(call_id)?;
+                    messages.push(ModelMessage::Tool {
+                        call_id: model_call_id.clone(),
+                        tool_name: tool_name.clone(),
+                        result: model_visible_tool_output(tool_name, output_text, metadata),
+                        metadata: serde_json::Value::Null,
+                    });
+                }
+                HistoryItemPayload::Error { message } => {
+                    messages.push(ModelMessage::Assistant {
+                        content: format!("Previous run ended with an error: {message}"),
+                    });
+                }
+                HistoryItemPayload::SubAgentActivity { .. }
+                | HistoryItemPayload::CollaborationModeInstruction { .. }
+                | HistoryItemPayload::RequestDiagnostics { .. }
+                | HistoryItemPayload::WorldState { .. }
+                | HistoryItemPayload::ApprovalDecision { .. }
+                | HistoryItemPayload::FileChange { .. } => {}
+            }
+        }
+        Some(messages)
     }
 
     pub fn semantic_compaction_units(&self) -> Vec<Vec<HistoryItemId>> {
@@ -275,6 +411,11 @@ impl ContextManager {
             })
             .filter_map(|(_, items)| items.iter().map(|(index, _)| *index).min())
             .min();
+        if first_unsettled_response_index.is_some() {
+            // Keep the compaction source stable and complete. The response becomes
+            // one semantic unit only after every call has its matching output.
+            return Vec::new();
+        }
 
         let mut units = Vec::<(usize, Vec<HistoryItemId>)>::new();
         for (response_id, mut items) in response_items {
@@ -305,33 +446,121 @@ impl ContextManager {
             }
         }
         units.sort_by_key(|(index, _)| *index);
-        units
-            .into_iter()
-            .take_while(|(index, _)| {
-                first_unsettled_response_index.is_none_or(|blocked| *index < blocked)
-            })
-            .map(|(_, item_ids)| item_ids)
-            .collect()
+        units.into_iter().map(|(_, item_ids)| item_ids).collect()
     }
 
-    pub fn compaction_segments_for_units(
-        &self,
-        units: &[Vec<HistoryItemId>],
-        supports_images: bool,
-    ) -> Vec<String> {
-        units
+    pub fn compaction_user_messages_for_items(&self, item_ids: &[HistoryItemId]) -> Vec<String> {
+        let selected = item_ids.iter().copied().collect::<HashSet<_>>();
+        let replaced = crate::protocol::compacted_history_item_ids(&self.history_items);
+        let mut seen = HashSet::new();
+        self.history_items
             .iter()
-            .filter_map(|unit| {
-                let rendered = self
-                    .model_messages_for_items(unit, supports_images)
-                    .iter()
-                    .map(render_model_message_for_compaction)
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                (!rendered.trim().is_empty()).then_some(rendered)
+            .filter(|item| {
+                selected.contains(&item.id) && !replaced.contains(&item.id) && seen.insert(item.id)
+            })
+            .flat_map(|item| match &item.payload {
+                HistoryItemPayload::UserTurn { content, .. }
+                | HistoryItemPayload::SteerTurn { content, .. } => {
+                    let text = content_text(content);
+                    if text.trim().is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![text]
+                    }
+                }
+                HistoryItemPayload::InterAgentCommunication { communication }
+                    if communication.trigger_turn =>
+                {
+                    let text = inter_agent_input_text(communication);
+                    if text.trim().is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![text]
+                    }
+                }
+                HistoryItemPayload::Compaction {
+                    layout,
+                    preserved_user_messages,
+                    ..
+                } if layout.appends_checkpoint() => preserved_user_messages.clone(),
+                _ => Vec::new(),
             })
             .collect()
     }
+}
+
+impl ActiveContextTokenState {
+    pub(crate) fn rehydrate(
+        context: &ContextManager,
+        terminal: Option<&DurableTurnTerminal>,
+    ) -> Self {
+        let provider_baseline = terminal.and_then(|terminal| {
+            if !matches!(
+                terminal.outcome,
+                crate::protocol::TurnTerminalOutcome::Completed
+            ) {
+                return None;
+            }
+            let response_id = terminal.final_response_id?;
+            let usage = terminal.metrics.token_usage.as_ref()?;
+            let known_item_ids = context.active_item_ids_through_model_response(response_id)?;
+            Some(ProviderTokenBaseline {
+                response_id,
+                total_tokens: usage.total_tokens,
+                known_item_ids,
+            })
+        });
+        Self { provider_baseline }
+    }
+
+    pub(crate) fn status_for_request(
+        &self,
+        context: &ContextManager,
+        request: &ChatRequest,
+        supports_images: bool,
+        overflow_margin_tokens: usize,
+    ) -> ContextWindowTokenStatus {
+        if let Some(baseline) = &self.provider_baseline
+            && let Some(local_messages) =
+                context.local_messages_after_provider_baseline(baseline, supports_images)
+        {
+            return ContextWindowTokenStatus::from_provider_usage(
+                request,
+                overflow_margin_tokens,
+                baseline.total_tokens,
+                &local_messages,
+            );
+        }
+        ContextWindowTokenStatus::for_request(request, overflow_margin_tokens)
+    }
+
+    pub(crate) fn record_provider_response(
+        &mut self,
+        response_id: ModelResponseId,
+        usage: Option<&TokenUsage>,
+        known_item_ids: Vec<HistoryItemId>,
+    ) {
+        self.provider_baseline = usage.map(|usage| ProviderTokenBaseline {
+            response_id,
+            total_tokens: usage.total_tokens,
+            known_item_ids: known_item_ids.into_iter().collect(),
+        });
+    }
+
+    pub(crate) fn reset_after_compaction(&mut self) {
+        self.provider_baseline = None;
+    }
+}
+
+fn latest_model_response_id(active_items: &[&HistoryItem]) -> Option<ModelResponseId> {
+    active_items
+        .iter()
+        .rev()
+        .find_map(|item| match item.payload {
+            HistoryItemPayload::AssistantMessage { response_id, .. }
+            | HistoryItemPayload::ToolCall { response_id, .. } => Some(response_id),
+            _ => None,
+        })
 }
 
 impl ActiveHistoryContextBuilder {
@@ -356,60 +585,6 @@ impl ActiveHistoryContextBuilder {
     }
 }
 
-fn render_model_message_for_compaction(message: &ModelMessage) -> String {
-    match message {
-        ModelMessage::System { content } => format!("[system]\n{content}"),
-        ModelMessage::User { content } => format!("[user]\n{content}"),
-        ModelMessage::UserParts { parts } => {
-            let content = parts
-                .iter()
-                .map(|part| match part {
-                    ModelContentPart::Text { text } => text.clone(),
-                    ModelContentPart::Image { mime_type, .. } => {
-                        format!(
-                            "[image input: {mime_type}; binary data omitted from summary request]"
-                        )
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("[user]\n{content}")
-        }
-        ModelMessage::Assistant { content } => format!("[assistant]\n{content}"),
-        ModelMessage::AssistantToolCalls {
-            content,
-            tool_calls,
-        } => {
-            let calls = tool_calls
-                .iter()
-                .map(|call| {
-                    format!(
-                        "tool_call {} {} {}",
-                        call.call_id, call.tool_name, call.arguments_json
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!(
-                "[assistant]\n{}{}{}",
-                content.as_deref().unwrap_or_default(),
-                if content.is_some() && !calls.is_empty() {
-                    "\n"
-                } else {
-                    ""
-                },
-                calls
-            )
-        }
-        ModelMessage::Tool {
-            call_id,
-            tool_name,
-            result,
-            ..
-        } => format!("[tool {tool_name} {call_id}]\n{result}"),
-    }
-}
-
 fn revision_for(items: &[HistoryItem]) -> HistoryRevision {
     let mut hash = Sha256::new();
     for item in items {
@@ -430,7 +605,7 @@ fn project_model_messages(
     history_items: &[HistoryItem],
     supports_images: bool,
 ) -> Vec<ModelMessage> {
-    let mut projected = Vec::<(usize, u8, ModelMessage)>::new();
+    let mut projected = Vec::<(usize, usize, ModelMessage)>::new();
     let index_by_id = history_items
         .iter()
         .enumerate()
@@ -461,6 +636,7 @@ fn project_model_messages(
             HistoryItemPayload::AssistantMessage {
                 response_id,
                 content,
+                ..
             } => {
                 response_first_index
                     .entry(*response_id)
@@ -556,6 +732,7 @@ fn project_model_messages(
             HistoryItemPayload::AssistantMessage {
                 response_id,
                 content,
+                ..
             } => {
                 if calls_by_response.contains_key(response_id) {
                     continue;
@@ -575,35 +752,56 @@ fn project_model_messages(
             HistoryItemPayload::ToolOutput {
                 call_id,
                 output_text,
+                metadata,
                 ..
             } => {
                 let call_id_text = call_id.to_string();
                 if let Some((model_call_id, tool_name)) =
                     tool_names_by_call.get(&call_id_text).cloned()
                 {
+                    let result = model_visible_tool_output(&tool_name, output_text, metadata);
                     projected.push((
                         index,
                         1,
                         ModelMessage::Tool {
                             call_id: model_call_id,
                             tool_name,
-                            result: output_text.clone(),
+                            result,
                             metadata: serde_json::Value::Null,
                         },
                     ));
                 }
             }
             HistoryItemPayload::Compaction {
+                layout,
+                preserved_user_messages,
                 summary,
                 replacement_item_ids,
                 ..
             } => {
-                let insertion_index = replacement_item_ids
-                    .iter()
-                    .filter_map(|id| index_by_id.get(id).copied())
-                    .min()
-                    .unwrap_or(index);
-                projected.push((insertion_index, 0, semantic_compaction_message(summary)));
+                if layout.appends_checkpoint() {
+                    for (priority, message) in preserved_user_messages.iter().enumerate() {
+                        projected.push((
+                            index,
+                            priority,
+                            ModelMessage::User {
+                                content: message.clone(),
+                            },
+                        ));
+                    }
+                    projected.push((
+                        index,
+                        preserved_user_messages.len(),
+                        semantic_compaction_message(summary),
+                    ));
+                } else {
+                    let insertion_index = replacement_item_ids
+                        .iter()
+                        .filter_map(|id| index_by_id.get(id).copied())
+                        .min()
+                        .unwrap_or(index);
+                    projected.push((insertion_index, 0, semantic_compaction_message(summary)));
+                }
             }
             HistoryItemPayload::Error { message, .. } => projected.push((
                 index,
@@ -622,13 +820,58 @@ fn project_model_messages(
         .collect()
 }
 
+fn model_visible_tool_output(
+    tool_name: &str,
+    output_text: &str,
+    metadata: &serde_json::Value,
+) -> String {
+    let preview_truncated = metadata
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if tool_name == "read" {
+        if preview_truncated {
+            return format!("{output_text}\n\nWarning: truncated output.");
+        }
+        let total_lines = metadata
+            .get("total_lines")
+            .and_then(serde_json::Value::as_u64);
+        let end_line = metadata.get("end_line").and_then(serde_json::Value::as_u64);
+        if let (Some(total_lines), Some(end_line)) = (total_lines, end_line)
+            && end_line < total_lines
+        {
+            let next_offset = end_line.saturating_add(1);
+            return format!(
+                "{output_text}\n\nWarning: truncated output.\nTotal output lines: {total_lines}. Continue with `read` using `offset`: {next_offset}."
+            );
+        }
+        return output_text.to_string();
+    }
+    if matches!(tool_name, "list" | "glob" | "grep" | "inspect_directory") && preview_truncated {
+        return format!("{output_text}\n\nWarning: truncated output.");
+    }
+    output_text.to_string()
+}
+
 pub(super) fn semantic_compaction_message(summary: &str) -> ModelMessage {
     ModelMessage::User {
         content: format!(
-            "Earlier conversation context was compacted.\n{}",
+            "{}\n{}",
+            include_str!("../../assets/prompts/compaction_summary_prefix.md").trim(),
             summary.trim()
         ),
     }
+}
+
+pub(super) fn is_semantic_compaction_message(message: &ModelMessage) -> bool {
+    let prefix = include_str!("../../assets/prompts/compaction_summary_prefix.md").trim();
+    matches!(
+        message,
+        ModelMessage::User { content }
+            if content
+                .strip_prefix(prefix)
+                .is_some_and(|suffix| suffix.starts_with('\n'))
+    )
 }
 
 fn user_message_from_content(content: &[ContentPart], supports_images: bool) -> ModelMessage {
@@ -669,23 +912,25 @@ fn user_message_from_content(content: &[ContentPart], supports_images: bool) -> 
 fn inter_agent_input_message(
     communication: &crate::protocol::InterAgentCommunication,
 ) -> ModelMessage {
-    ModelMessage::User {
-        content: format!(
-            "<inter_agent_message author=\"{}\" recipient=\"{}\">\n{}\n</inter_agent_message>",
-            escape_model_envelope_text(&communication.author.to_string()),
-            escape_model_envelope_text(&communication.recipient.to_string()),
-            escape_model_envelope_text(&communication.content),
-        ),
+    ModelMessage::Agent {
+        content: inter_agent_input_text(communication),
     }
 }
 
-fn escape_model_envelope_text(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+fn inter_agent_input_text(communication: &crate::protocol::InterAgentCommunication) -> String {
+    if crate::protocol::is_rendered_inter_agent_message(communication) {
+        return communication.content.clone();
+    }
+    crate::protocol::render_inter_agent_message(
+        if communication.trigger_turn {
+            crate::protocol::InterAgentMessageType::NewTask
+        } else {
+            crate::protocol::InterAgentMessageType::Message
+        },
+        &communication.recipient,
+        &communication.author,
+        &communication.content,
+    )
 }
 
 fn content_text(content: &[ContentPart]) -> String {
@@ -701,9 +946,15 @@ fn content_text(content: &[ContentPart]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::config::model::{ProviderApiMode, ProviderReasoningCapability};
+    use crate::config::{ProviderDeadlines, ProviderMetadataMode, ProviderTarget};
+    use crate::context::ActiveContextTokenSource;
+    use crate::llm::{ModelCapabilities, ModelProfile};
     use crate::protocol::{HistoryScope, ModelResponseId, ToolLifecycleStatus, TurnId};
-    use crate::session::{SessionId, ToolCallId};
+    use crate::session::{ImagePart, RunMetrics, SessionId, ToolCallId};
 
     fn user_item(text: &str) -> HistoryItem {
         let session_id = SessionId::new();
@@ -723,6 +974,337 @@ mod tests {
                 editor_context: None,
             },
         }
+    }
+
+    fn token_status_request(messages: Vec<ModelMessage>) -> ChatRequest {
+        let model = ModelProfile {
+            name: "test".to_string(),
+            context_window: 32_768,
+            max_output_tokens: 512,
+            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            capabilities: ModelCapabilities {
+                supports_tools: true,
+                supports_reasoning: false,
+                supports_images: false,
+            },
+        };
+        let provider = ProviderTarget::new(
+            "http://localhost",
+            &model.name,
+            model.provider_metadata_mode,
+            ProviderApiMode::ChatCompletions,
+            ProviderDeadlines {
+                response_start_timeout_ms: 1,
+                stream_idle_timeout_ms: 1,
+                connect_timeout_ms: 1,
+                max_connect_retries: 0,
+            },
+        )
+        .expect("provider target");
+        ChatRequest::new(
+            provider,
+            model,
+            "runtime prompt".to_string(),
+            messages,
+            Vec::new(),
+            None,
+            ProviderReasoningCapability::Unsupported,
+            BTreeMap::new(),
+        )
+    }
+
+    fn provider_tool_round() -> (ContextManager, HistoryItemId, ModelResponseId) {
+        let user = user_item("inspect the file");
+        let response_id = ModelResponseId::new();
+        let call_id = ToolCallId::new();
+        let tool_call = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: user.session_id,
+            scope: user.scope,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::ToolCall {
+                call_id,
+                response_id,
+                model_call_id: "call_1".to_string(),
+                tool_name: "read".to_string(),
+                arguments_json: r#"{"path":"task.md"}"#.to_string(),
+            },
+        };
+        let tool_output = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: user.session_id,
+            scope: user.scope,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::ToolOutput {
+                call_id,
+                status: ToolLifecycleStatus::Completed,
+                title: "read".to_string(),
+                output_text: "local tool output after provider response".to_string(),
+                metadata: serde_json::Value::Null,
+                success: Some(true),
+            },
+        };
+        let user_id = user.id;
+        (
+            ContextManager::rehydrate(vec![user, tool_call, tool_output]),
+            user_id,
+            response_id,
+        )
+    }
+
+    fn usage(total_tokens: u32) -> TokenUsage {
+        TokenUsage {
+            prompt_tokens: total_tokens,
+            completion_tokens: 0,
+            total_tokens,
+            reasoning_tokens: None,
+        }
+    }
+
+    #[test]
+    fn provider_usage_drives_the_next_step_with_only_local_suffix_estimated() {
+        let (context, user_id, response_id) = provider_tool_round();
+        let request = token_status_request(context.model_messages(false));
+        let mut state = ActiveContextTokenState::default();
+        state.record_provider_response(response_id, Some(&usage(1_000)), vec![user_id]);
+
+        let status = state.status_for_request(&context, &request, false, 128);
+
+        assert_eq!(
+            status.source,
+            ActiveContextTokenSource::ProviderUsageWithLocalEstimate
+        );
+        assert!(status.active_context_tokens > 1_000);
+        assert!(
+            status.active_context_tokens
+                < ContextWindowTokenStatus::for_request(&request, 128).active_context_tokens
+                    + 1_000
+        );
+    }
+
+    #[test]
+    fn missing_provider_usage_falls_back_to_the_full_prepared_request_estimate() {
+        let (context, user_id, response_id) = provider_tool_round();
+        let request = token_status_request(context.model_messages(false));
+        let mut state = ActiveContextTokenState::default();
+        state.record_provider_response(response_id, None, vec![user_id]);
+
+        let status = state.status_for_request(&context, &request, false, 128);
+        let expected = ContextWindowTokenStatus::for_request(&request, 128);
+
+        assert_eq!(
+            status.source,
+            ActiveContextTokenSource::FullPreparedRequestEstimate
+        );
+        assert_eq!(status, expected);
+    }
+
+    #[test]
+    fn compaction_reset_forces_a_full_local_recompute() {
+        let (context, user_id, response_id) = provider_tool_round();
+        let request = token_status_request(context.model_messages(false));
+        let mut state = ActiveContextTokenState::default();
+        state.record_provider_response(response_id, Some(&usage(1_000)), vec![user_id]);
+        assert_eq!(
+            state
+                .status_for_request(&context, &request, false, 128)
+                .source,
+            ActiveContextTokenSource::ProviderUsageWithLocalEstimate
+        );
+
+        state.reset_after_compaction();
+
+        assert_eq!(
+            state
+                .status_for_request(&context, &request, false, 128)
+                .source,
+            ActiveContextTokenSource::FullPreparedRequestEstimate
+        );
+    }
+
+    #[test]
+    fn durable_terminal_rehydrates_only_a_matching_latest_model_response() {
+        let first_user = user_item("first turn");
+        let response_id = ModelResponseId::new();
+        let response = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: first_user.session_id,
+            scope: first_user.scope,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::AssistantMessage {
+                response_id,
+                content: vec![ContentPart::Text {
+                    text: "done".to_string(),
+                }],
+            },
+        };
+        let mut next_user = user_item("second turn local input");
+        next_user.session_id = first_user.session_id;
+        next_user.sequence_no = 3;
+        next_user.created_at_ms = 3;
+        let context = ContextManager::rehydrate(vec![first_user, response, next_user]);
+        let request = token_status_request(context.model_messages(false));
+        let terminal = DurableTurnTerminal {
+            outcome: crate::protocol::TurnTerminalOutcome::Completed,
+            final_response_id: Some(response_id),
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: RunMetrics {
+                token_usage: Some(usage(700)),
+                ..RunMetrics::default()
+            },
+        };
+
+        let state = ActiveContextTokenState::rehydrate(&context, Some(&terminal));
+        let status = state.status_for_request(&context, &request, false, 128);
+
+        assert_eq!(
+            status.source,
+            ActiveContextTokenSource::ProviderUsageWithLocalEstimate
+        );
+        assert!(status.active_context_tokens > 700);
+
+        let mut failed = terminal.clone();
+        failed.outcome = crate::protocol::TurnTerminalOutcome::Failed {
+            error: "provider request failed after reporting usage".to_string(),
+        };
+        let failed_fallback = ActiveContextTokenState::rehydrate(&context, Some(&failed))
+            .status_for_request(&context, &request, false, 128);
+        assert_eq!(
+            failed_fallback.source,
+            ActiveContextTokenSource::FullPreparedRequestEstimate
+        );
+
+        let mut mismatched = terminal;
+        mismatched.final_response_id = Some(ModelResponseId::new());
+        let fallback = ActiveContextTokenState::rehydrate(&context, Some(&mismatched))
+            .status_for_request(&context, &request, false, 128);
+        assert_eq!(
+            fallback.source,
+            ActiveContextTokenSource::FullPreparedRequestEstimate
+        );
+    }
+
+    #[test]
+    fn paginated_tool_output_exposes_a_durable_truncation_warning() {
+        let projected = model_visible_tool_output(
+            "grep",
+            "first page",
+            &serde_json::json!({
+                "truncated": true,
+                "continuation": "next\npage"
+            }),
+        );
+
+        assert_eq!(projected, "first page\n\nWarning: truncated output.");
+    }
+
+    #[test]
+    fn read_output_uses_a_repeatable_offset_instead_of_an_opaque_cursor() {
+        assert_eq!(
+            model_visible_tool_output(
+                "read",
+                "first 2,000 lines",
+                &serde_json::json!({
+                    "truncated": false,
+                    "end_line": 2_000,
+                    "total_lines": 2_400
+                })
+            ),
+            "first 2,000 lines\n\nWarning: truncated output.\nTotal output lines: 2400. Continue with `read` using `offset`: 2001."
+        );
+        assert_eq!(
+            model_visible_tool_output(
+                "read",
+                "preview",
+                &serde_json::json!({
+                    "truncated": true,
+                    "end_line": 100,
+                    "total_lines": 100
+                })
+            ),
+            "preview\n\nWarning: truncated output."
+        );
+    }
+
+    #[test]
+    fn complete_and_unrelated_tool_outputs_are_unchanged() {
+        let metadata = serde_json::json!({
+            "truncated": true,
+            "continuation": "next-page"
+        });
+
+        assert_eq!(
+            model_visible_tool_output("shell", "shell preview", &metadata),
+            "shell preview"
+        );
+        assert_eq!(
+            model_visible_tool_output(
+                "list",
+                "complete list",
+                &serde_json::json!({"truncated": false})
+            ),
+            "complete list"
+        );
+    }
+
+    #[test]
+    fn canonical_paginated_tool_output_projects_only_a_stable_warning() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let response_id = ModelResponseId::new();
+        let call_id = ToolCallId::new();
+        let projected = ContextManager::rehydrate(vec![
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: 0,
+                created_at_ms: 1,
+                payload: HistoryItemPayload::ToolCall {
+                    call_id,
+                    response_id,
+                    model_call_id: "provider-list-call".to_string(),
+                    tool_name: "list".to_string(),
+                    arguments_json: serde_json::json!({"path": "."}).to_string(),
+                },
+            },
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: 1,
+                created_at_ms: 2,
+                payload: HistoryItemPayload::ToolOutput {
+                    call_id,
+                    status: ToolLifecycleStatus::Completed,
+                    title: "list".to_string(),
+                    output_text: "first page".to_string(),
+                    metadata: serde_json::json!({
+                        "truncated": true,
+                        "continuation": "list-next-page"
+                    }),
+                    success: Some(true),
+                },
+            },
+        ])
+        .model_messages(false);
+
+        assert!(matches!(
+            projected.as_slice(),
+            [
+                ModelMessage::AssistantToolCalls { tool_calls, .. },
+                ModelMessage::Tool { result, .. },
+            ] if matches!(tool_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "list")
+                && result.contains("first page")
+                && result.contains("Warning: truncated output")
+                && !result.contains("list-next-page")
+                && !result.contains("cursor")
+        ));
     }
 
     #[test]
@@ -775,7 +1357,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_delta_replaces_active_raw_items_without_full_rehydrate() {
+    fn compaction_delta_keeps_late_input_after_checkpoint_without_full_rehydrate() {
         let first = user_item("first");
         let mut second = user_item("second");
         second.session_id = first.session_id;
@@ -800,6 +1382,8 @@ mod tests {
             created_at_ms: 4,
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                preserved_user_messages: vec!["first".to_string(), "second".to_string()],
                 summary: "first and second summarized".to_string(),
                 replacement_item_ids: vec![first.id, second.id],
             },
@@ -820,13 +1404,66 @@ mod tests {
         );
         assert!(matches!(
             context.model_messages(false).as_slice(),
-            [ModelMessage::User { content }, ModelMessage::User { content: tail_text }]
-                if content.contains("first and second summarized") && tail_text == "tail"
+            [
+                ModelMessage::User { content: first_text },
+                ModelMessage::User { content: second_text },
+                ModelMessage::User { content },
+                ModelMessage::User { content: tail_text },
+            ] if first_text == "first"
+                && second_text == "second"
+                && content.contains("first and second summarized")
+                && tail_text == "tail"
         ));
     }
 
     #[test]
-    fn partial_compaction_anchors_a_retained_tool_suffix_with_user_context() {
+    fn legacy_compaction_keeps_summary_at_the_replaced_prefix_position() {
+        let first = user_item("first");
+        let mut tail = user_item("tail");
+        tail.session_id = first.session_id;
+        tail.scope = first.scope;
+        tail.sequence_no = 2;
+        let mut context = ContextManager::from_active_history(
+            vec![first.clone(), tail.clone()],
+            Some(2),
+            2,
+            0,
+            0,
+        );
+        let summary = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: first.session_id,
+            scope: first.scope,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::Compaction {
+                mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::LegacyPrefix,
+                preserved_user_messages: Vec::new(),
+                summary: "legacy summary".to_string(),
+                replacement_item_ids: vec![first.id],
+            },
+        };
+
+        let _ = context.ingest_committed_delta(vec![summary.clone()], Some(3));
+
+        assert_eq!(
+            context
+                .history_items()
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![summary.id, tail.id]
+        );
+        assert!(matches!(
+            context.model_messages(false).as_slice(),
+            [ModelMessage::User { content }, ModelMessage::User { content: tail_text }]
+                if content.contains("legacy summary") && tail_text == "tail"
+        ));
+    }
+
+    #[test]
+    fn compaction_retains_real_user_input_and_replaces_settled_tool_evidence() {
         let old = user_item("old request detail");
         let response_id = ModelResponseId::new();
         let call_id = ToolCallId::new();
@@ -885,8 +1522,10 @@ mod tests {
             created_at_ms: 5,
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                preserved_user_messages: Vec::new(),
                 summary: "Continue the retained inspection.".to_string(),
-                replacement_item_ids: vec![old.id],
+                replacement_item_ids: retained.iter().map(|item| item.id).collect(),
             },
         };
 
@@ -897,13 +1536,95 @@ mod tests {
         assert!(matches!(
             projected.as_slice(),
             [
-                ModelMessage::User { content },
-                ModelMessage::AssistantToolCalls { tool_calls, .. },
-                ModelMessage::Tool { call_id, result, .. }
-            ] if content.contains("Continue the retained inspection.")
-                && matches!(tool_calls.as_slice(), [ModelToolCall { call_id, .. }] if call_id == "call-retained")
-                && call_id == "call-retained"
-                && result == "retained contents"
+                ModelMessage::User { content: original },
+                ModelMessage::User { content: summary },
+            ] if original == "old request detail"
+                && summary.contains("Continue the retained inspection.")
+        ));
+    }
+
+    #[test]
+    fn repeated_compaction_keeps_real_users_and_replaces_the_prior_summary() {
+        let first_user = user_item("original task");
+        let mut first_assistant = user_item("unused");
+        first_assistant.session_id = first_user.session_id;
+        first_assistant.scope = first_user.scope;
+        first_assistant.sequence_no = 2;
+        first_assistant.payload = HistoryItemPayload::AssistantMessage {
+            response_id: ModelResponseId::new(),
+            content: vec![ContentPart::Text {
+                text: "first work".to_string(),
+            }],
+        };
+        let mut context = ContextManager::from_active_history(
+            vec![first_user.clone(), first_assistant.clone()],
+            Some(2),
+            2,
+            0,
+            0,
+        );
+        let first_summary = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: first_user.session_id,
+            scope: first_user.scope,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::Compaction {
+                mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                preserved_user_messages: vec!["original task".to_string()],
+                summary: "first checkpoint".to_string(),
+                replacement_item_ids: vec![first_user.id, first_assistant.id],
+            },
+        };
+        let _ = context.ingest_committed_delta(vec![first_summary.clone()], Some(3));
+
+        let mut second_user = user_item("latest instruction");
+        second_user.session_id = first_user.session_id;
+        second_user.scope = first_user.scope;
+        second_user.sequence_no = 4;
+        let mut second_assistant = first_assistant.clone();
+        second_assistant.id = HistoryItemId::new();
+        second_assistant.sequence_no = 5;
+        if let HistoryItemPayload::AssistantMessage { content, .. } = &mut second_assistant.payload
+        {
+            *content = vec![ContentPart::Text {
+                text: "second work".to_string(),
+            }];
+        }
+        let _ = context
+            .ingest_committed_delta(vec![second_user.clone(), second_assistant.clone()], Some(5));
+        let second_summary = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: first_user.session_id,
+            scope: first_user.scope,
+            sequence_no: 6,
+            created_at_ms: 6,
+            payload: HistoryItemPayload::Compaction {
+                mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                preserved_user_messages: vec![
+                    "original task".to_string(),
+                    "latest instruction".to_string(),
+                ],
+                summary: "latest checkpoint".to_string(),
+                replacement_item_ids: vec![first_summary.id, second_user.id, second_assistant.id],
+            },
+        };
+
+        let _ = context.ingest_committed_delta(vec![second_summary], Some(6));
+        let projected = context.model_messages(false);
+
+        assert!(matches!(
+            projected.as_slice(),
+            [
+                ModelMessage::User { content: first },
+                ModelMessage::User { content: second },
+                ModelMessage::User { content: summary },
+            ] if first == "original task"
+                && second == "latest instruction"
+                && summary.contains("latest checkpoint")
+                && !summary.contains("first checkpoint")
         ));
     }
 
@@ -918,54 +1639,227 @@ mod tests {
     }
 
     #[test]
-    fn inter_agent_communications_replay_as_provenanced_external_input() {
+    fn inter_agent_communications_replay_as_codex_style_agent_messages() {
         let session_id = SessionId::new();
         let communications = [
-            ("/root", "/root/child", "Inspect <state> & report."),
-            ("/root/child", "/root", "Finished the requested review."),
+            ("/root", "/root/child", "Inspect <state> & report.", true),
+            (
+                "/root/child",
+                "/root",
+                "Finished the requested review.",
+                false,
+            ),
         ];
         let items = communications
             .into_iter()
             .enumerate()
-            .map(|(index, (author, recipient, content))| HistoryItem {
-                id: HistoryItemId::new(),
-                session_id,
-                scope: HistoryScope::Session,
-                sequence_no: index as i64,
-                created_at_ms: index as i64,
-                payload: HistoryItemPayload::InterAgentCommunication {
-                    communication: crate::protocol::InterAgentCommunication {
-                        author: author.to_string(),
-                        recipient: recipient.to_string(),
-                        content: content.to_string(),
-                        trigger_turn: true,
+            .map(
+                |(index, (author, recipient, content, trigger_turn))| HistoryItem {
+                    id: HistoryItemId::new(),
+                    session_id,
+                    scope: HistoryScope::Session,
+                    sequence_no: index as i64,
+                    created_at_ms: index as i64,
+                    payload: HistoryItemPayload::InterAgentCommunication {
+                        communication: crate::protocol::InterAgentCommunication {
+                            author: author.to_string(),
+                            recipient: recipient.to_string(),
+                            content: content.to_string(),
+                            trigger_turn,
+                        },
                     },
                 },
-            })
+            )
             .collect::<Vec<_>>();
 
-        let projected = ContextManager::rehydrate(items).model_messages(false);
+        let context = ContextManager::rehydrate(items);
+        assert!(context.has_model_context());
+        let projected = context.model_messages(false);
 
         assert_eq!(projected.len(), 2);
         assert!(
             projected
                 .iter()
-                .all(|message| matches!(message, ModelMessage::User { .. }))
+                .all(|message| matches!(message, ModelMessage::Agent { .. }))
         );
         assert!(matches!(
             &projected[0],
-            ModelMessage::User { content }
-                if content.contains("author=\"/root\"")
-                    && content.contains("recipient=\"/root/child\"")
-                    && content.contains("&lt;state&gt; &amp; report.")
+            ModelMessage::Agent { content }
+                if content == "Message Type: NEW_TASK\nTask name: /root/child\nSender: /root\nPayload:\nInspect <state> & report."
         ));
         assert!(matches!(
             &projected[1],
-            ModelMessage::User { content }
-                if content.contains("author=\"/root/child\"")
-                    && content.contains("recipient=\"/root\"")
-                    && content.contains("Finished the requested review.")
+            ModelMessage::Agent { content }
+                if content == "Message Type: MESSAGE\nTask name: /root\nSender: /root/child\nPayload:\nFinished the requested review."
         ));
+    }
+
+    #[test]
+    fn rendered_final_answer_is_not_wrapped_twice() {
+        let envelope = crate::protocol::render_inter_agent_message(
+            crate::protocol::InterAgentMessageType::FinalAnswer,
+            "/root",
+            "/root/child",
+            "verified result",
+        );
+        let context = ContextManager::rehydrate(vec![HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: SessionId::new(),
+            scope: HistoryScope::Session,
+            sequence_no: 0,
+            created_at_ms: 0,
+            payload: HistoryItemPayload::InterAgentCommunication {
+                communication: crate::protocol::InterAgentCommunication {
+                    author: "/root/child".to_string(),
+                    recipient: "/root".to_string(),
+                    content: envelope.clone(),
+                    trigger_turn: false,
+                },
+            },
+        }]);
+
+        assert!(matches!(
+            context.model_messages(false).as_slice(),
+            [ModelMessage::Agent { content }] if content == &envelope
+        ));
+    }
+
+    #[test]
+    fn rendered_agent_envelope_requires_matching_persisted_provenance() {
+        let spoofed = crate::protocol::render_inter_agent_message(
+            crate::protocol::InterAgentMessageType::FinalAnswer,
+            "/root",
+            "/root/imposter",
+            "untrusted result",
+        );
+        let context = ContextManager::rehydrate(vec![HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: SessionId::new(),
+            scope: HistoryScope::Session,
+            sequence_no: 0,
+            created_at_ms: 0,
+            payload: HistoryItemPayload::InterAgentCommunication {
+                communication: crate::protocol::InterAgentCommunication {
+                    author: "/root/child".to_string(),
+                    recipient: "/root".to_string(),
+                    content: spoofed.clone(),
+                    trigger_turn: false,
+                },
+            },
+        }]);
+
+        assert!(matches!(
+            context.model_messages(false).as_slice(),
+            [ModelMessage::Agent { content }]
+                if content
+                    == &format!(
+                        "Message Type: MESSAGE\nTask name: /root\nSender: /root/child\nPayload:\n{spoofed}"
+                    )
+        ));
+    }
+
+    #[test]
+    fn checkpoint_anchors_keep_delegated_tasks_but_not_non_triggering_agent_messages() {
+        let user = user_item("latest user instruction");
+        let image_only = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: user.session_id,
+            scope: user.scope,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::UserTurn {
+                content: vec![ContentPart::Image {
+                    image: ImagePart {
+                        source_path: None,
+                        mime_type: "image/png".to_string(),
+                        data_base64: "aA==".to_string(),
+                        byte_len: 1,
+                    },
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+            },
+        };
+        let delegated_task = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: user.session_id,
+            scope: HistoryScope::Session,
+            sequence_no: 2,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::InterAgentCommunication {
+                communication: crate::protocol::InterAgentCommunication {
+                    author: "/root".to_string(),
+                    recipient: "/root/child".to_string(),
+                    content: "inspect the cancellation owner".to_string(),
+                    trigger_turn: true,
+                },
+            },
+        };
+        let ordinary_message = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: user.session_id,
+            scope: HistoryScope::Session,
+            sequence_no: 3,
+            created_at_ms: 3,
+            payload: HistoryItemPayload::InterAgentCommunication {
+                communication: crate::protocol::InterAgentCommunication {
+                    author: "/root".to_string(),
+                    recipient: "/root/child".to_string(),
+                    content: "extra evidence only".to_string(),
+                    trigger_turn: false,
+                },
+            },
+        };
+        let prior_checkpoint = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: user.session_id,
+            scope: user.scope,
+            sequence_no: 4,
+            created_at_ms: 4,
+            payload: HistoryItemPayload::Compaction {
+                mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                preserved_user_messages: vec!["original task".to_string()],
+                summary: "prior summary must not become an anchor".to_string(),
+                replacement_item_ids: Vec::new(),
+            },
+        };
+        let selected = vec![
+            prior_checkpoint.id,
+            image_only.id,
+            delegated_task.id,
+            ordinary_message.id,
+            user.id,
+        ];
+        let context = ContextManager::from_active_history(
+            vec![
+                prior_checkpoint,
+                image_only,
+                delegated_task,
+                ordinary_message,
+                user,
+            ],
+            Some(5),
+            5,
+            0,
+            2,
+        );
+
+        let anchors = context.compaction_user_messages_for_items(&selected);
+
+        assert_eq!(anchors.len(), 3);
+        assert_eq!(anchors[0], "original task");
+        assert_eq!(
+            anchors[1],
+            "Message Type: NEW_TASK\nTask name: /root/child\nSender: /root\nPayload:\ninspect the cancellation owner"
+        );
+        assert_eq!(anchors[2], "latest user instruction");
+        assert!(
+            anchors
+                .iter()
+                .all(|anchor| !anchor.contains("prior summary")
+                    && !anchor.contains("extra evidence only"))
+        );
     }
 
     #[test]
@@ -1180,7 +2074,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_compaction_stops_before_an_unsettled_response() {
+    fn semantic_compaction_waits_for_an_unsettled_response() {
         let session_id = SessionId::new();
         let turn_id = TurnId::new();
         let response_id = ModelResponseId::new();
@@ -1215,19 +2109,16 @@ mod tests {
         };
         let context = ContextManager::rehydrate(vec![first.clone(), pending_call, later]);
 
-        assert_eq!(context.semantic_compaction_units(), vec![vec![first.id]]);
+        assert!(context.semantic_compaction_units().is_empty());
     }
 
     #[test]
-    fn a_single_large_model_visible_item_is_a_valid_compaction_unit() {
+    fn a_single_large_model_visible_item_remains_one_compaction_unit() {
         let item = user_item(&"x".repeat(128_000));
         let context = ContextManager::rehydrate(vec![item.clone()]);
 
         let units = context.semantic_compaction_units();
-        let segments = context.compaction_segments_for_units(&units, false);
 
         assert_eq!(units, vec![vec![item.id]]);
-        assert_eq!(segments.len(), 1);
-        assert!(segments[0].contains(&"x".repeat(1_024)));
     }
 }

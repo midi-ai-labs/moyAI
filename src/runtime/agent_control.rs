@@ -1777,6 +1777,21 @@ impl AgentExecutionScope {
         self.control
             .mutate_execution(&self.path, &marker, |agent| agent.last_activity = activity)
     }
+
+    pub fn set_status_and_activity(
+        &self,
+        status: ActiveAgentStatus,
+        activity: Option<String>,
+    ) -> Result<(), AgentControlError> {
+        let marker = self
+            .marker
+            .upgrade()
+            .ok_or_else(|| AgentControlError::StaleExecution(self.path.clone()))?;
+        self.control.mutate_execution(&self.path, &marker, |agent| {
+            agent.status = status.into();
+            agent.last_activity = activity;
+        })
+    }
 }
 
 impl Drop for AgentExecutionLease {

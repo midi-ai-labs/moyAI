@@ -8,7 +8,8 @@ use crate::error::StorageError;
 use crate::protocol::{
     ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload, HistoryScope, ModeKind,
     ModelResponseId, RuntimeEvent, RuntimeEventId, RuntimeEventMsg, SubAgentActivityKind, TurnId,
-    TurnInterruptionCause, TurnItem, TurnItemId, TurnItemPayload, project_sub_agent_activity,
+    TurnInterruptionCause, TurnItem, TurnItemId, TurnItemPayload, TurnTerminalOutcome,
+    project_sub_agent_activity,
 };
 use crate::runtime::SystemClock;
 use crate::session::{AdmissionId, SessionId, SessionSpawnEdge};
@@ -327,6 +328,12 @@ pub(crate) struct DurableChildResultProjection {
     pub latest_error: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct RetainedChildTerminalProjection {
+    failure_error: Option<String>,
+    interruption_cause: Option<TurnInterruptionCause>,
+}
+
 impl SqliteProtocolEventStore {
     pub fn new(connection: Arc<Mutex<Connection>>) -> Self {
         Self { connection }
@@ -449,6 +456,11 @@ impl SqliteProtocolEventStore {
                 error_payload,
                 terminal_payload,
             ) = row?;
+            let terminal = optional_child_terminal_projection(terminal_payload)?;
+            let latest_error = match terminal.failure_error {
+                Some(error) => Some(error),
+                None => optional_error_message(error_payload)?,
+            };
             items.push(RetainedDirectChildProjection {
                 edge: SessionSpawnEdge {
                     root_session_id: parse_session_id(&edge_root, "retained child root")?,
@@ -461,8 +473,8 @@ impl SqliteProtocolEventStore {
                 session_status,
                 latest_task_content: optional_input_content(task_payload)?,
                 latest_assistant_content: optional_assistant_content(assistant_payload)?,
-                latest_error: optional_error_message(error_payload)?,
-                interruption_cause: optional_terminal_interruption_cause(terminal_payload)?,
+                latest_error,
+                interruption_cause: terminal.interruption_cause,
             });
         }
         drop(statement);
@@ -1331,12 +1343,44 @@ fn fork_agent_context_in_transaction(
 ) -> Result<AgentContextForkStats, StorageError> {
     ensure_empty_protocol_target(transaction, target_session_id, "agent context")?;
 
+    // Codex forks assistant messages only when their response-owned phase is
+    // FinalAnswer. OpenAI-compatible local providers do not expose that phase,
+    // so the durable completed terminal and its exact canonical response bundle
+    // jointly own the equivalent classification. Gather only turns that can
+    // contribute an active assistant item, then validate against all canonical
+    // response items so compaction and page boundaries cannot erase evidence.
+    let mut assistant_turn_ids = Vec::new();
+    let mut collect_assistant_turns = |source_page: ActiveHistoryPage| {
+        for item in source_page.items {
+            if matches!(item.payload, HistoryItemPayload::AssistantMessage { .. })
+                && let Some(turn_id) = item.scope.turn_id()
+            {
+                assistant_turn_ids.push(turn_id);
+            }
+        }
+        Ok(())
+    };
+    let classification_traversal = traverse_active_history_in_transaction(
+        transaction,
+        source_session_id,
+        expected_fence,
+        MAX_PROTOCOL_PAGE_LIMIT,
+        &mut collect_assistant_turns,
+    )?;
+    let final_answer_item_ids = final_answer_history_item_ids_for_turns(
+        transaction,
+        source_session_id,
+        &assistant_turn_ids,
+    )?;
+
     let mut copied_items = 0usize;
     let mut copy_page = |source_page: ActiveHistoryPage| {
         let source_item_count = source_page.items.len();
         let mut forked_page = Vec::with_capacity(source_item_count);
         for item in source_page.items {
-            let Some(payload) = fork_agent_context_payload(item.payload) else {
+            let include_assistant_message = final_answer_item_ids.contains(&item.id);
+            let Some(payload) = fork_agent_context_payload(item.payload, include_assistant_message)
+            else {
                 continue;
             };
             forked_page.push(HistoryItem {
@@ -1356,7 +1400,7 @@ fn fork_agent_context_in_transaction(
     let _traversal = traverse_active_history_in_transaction(
         transaction,
         source_session_id,
-        expected_fence,
+        Some(classification_traversal.snapshot),
         MAX_PROTOCOL_PAGE_LIMIT,
         &mut copy_page,
     )?;
@@ -1825,7 +1869,10 @@ fn ensure_protocol_source_exists(
     )))
 }
 
-fn fork_agent_context_payload(payload: HistoryItemPayload) -> Option<HistoryItemPayload> {
+fn fork_agent_context_payload(
+    payload: HistoryItemPayload,
+    include_assistant_message: bool,
+) -> Option<HistoryItemPayload> {
     match payload {
         HistoryItemPayload::UserTurn { content, .. } => Some(HistoryItemPayload::UserTurn {
             content,
@@ -1835,26 +1882,226 @@ fn fork_agent_context_payload(payload: HistoryItemPayload) -> Option<HistoryItem
         HistoryItemPayload::AssistantMessage {
             response_id,
             content,
-        } => Some(HistoryItemPayload::AssistantMessage {
+        } if include_assistant_message => Some(HistoryItemPayload::AssistantMessage {
             response_id,
             content,
         }),
+        HistoryItemPayload::AssistantMessage { .. } => None,
         HistoryItemPayload::CollaborationModeInstruction { mode } => {
             Some(HistoryItemPayload::CollaborationModeInstruction { mode })
         }
-        HistoryItemPayload::Compaction { mode, summary, .. } => {
-            // The child receives the parent's current semantic summary, not the
-            // replaced raw history. Empty replacement lineage makes the copied
-            // summary a standalone active context item without inventing an
-            // assistant response or retaining inactive parent details.
+        HistoryItemPayload::Compaction {
+            mode,
+            layout,
+            preserved_user_messages,
+            summary,
+            ..
+        } => {
+            // The child receives the parent's active checkpoint, including any
+            // bounded user anchors, but never resurrects replaced raw history.
+            // Empty replacement lineage makes the copy standalone.
             Some(HistoryItemPayload::Compaction {
                 mode,
+                layout,
+                preserved_user_messages,
                 summary,
                 replacement_item_ids: Vec::new(),
             })
         }
         _ => None,
     }
+}
+
+#[derive(Default)]
+struct ForkResponseBundle {
+    assistant_items: Vec<(HistoryItemId, Vec<ContentPart>)>,
+    has_tool_call: bool,
+}
+
+fn final_answer_history_item_ids_for_turns(
+    connection: &Connection,
+    session_id: SessionId,
+    turn_ids: &[TurnId],
+) -> Result<HashSet<HistoryItemId>, StorageError> {
+    let mut seen = HashSet::new();
+    let mut selected = HashSet::new();
+    for turn_id in turn_ids
+        .iter()
+        .copied()
+        .filter(|turn_id| seen.insert(*turn_id))
+    {
+        let Some((terminal, terminal_append_position)) =
+            unique_terminal_for_turn(connection, session_id, turn_id)?
+        else {
+            continue;
+        };
+        if !matches!(
+            terminal.outcome,
+            crate::protocol::TurnTerminalOutcome::Completed
+        ) {
+            continue;
+        }
+
+        let history =
+            canonical_turn_history_with_append_positions(connection, session_id, turn_id)?;
+        let mut bundles = HashMap::<ModelResponseId, ForkResponseBundle>::new();
+        let mut latest_response_id = None;
+        for (item, append_position) in history {
+            let response_id = match item.payload {
+                HistoryItemPayload::AssistantMessage {
+                    response_id,
+                    content,
+                } => {
+                    bundles
+                        .entry(response_id)
+                        .or_default()
+                        .assistant_items
+                        .push((item.id, content));
+                    response_id
+                }
+                HistoryItemPayload::ToolCall { response_id, .. } => {
+                    bundles.entry(response_id).or_default().has_tool_call = true;
+                    response_id
+                }
+                _ => continue,
+            };
+            if append_position >= terminal_append_position {
+                return Err(StorageError::Message(format!(
+                    "agent context fork found response {response_id} at or after the terminal boundary for session {session_id} turn {turn_id}"
+                )));
+            }
+            latest_response_id = Some(response_id);
+        }
+
+        let explicit_response_id = terminal.final_response_id;
+        let Some(final_response_id) = explicit_response_id.or(latest_response_id) else {
+            continue;
+        };
+        if explicit_response_id.is_some() && latest_response_id != Some(final_response_id) {
+            return Err(StorageError::Message(format!(
+                "completed terminal for session {session_id} turn {turn_id} references response {final_response_id}, but that is not the latest canonical response bundle"
+            )));
+        }
+        let Some(bundle) = bundles.remove(&final_response_id) else {
+            if explicit_response_id.is_some() {
+                return Err(StorageError::Message(format!(
+                    "completed terminal for session {session_id} turn {turn_id} references missing response {final_response_id}"
+                )));
+            }
+            continue;
+        };
+        let valid_assistant = matches!(
+            bundle.assistant_items.as_slice(),
+            [(_item_id, content)]
+                if matches!(content.as_slice(), [ContentPart::Text { text }] if !text.trim().is_empty())
+        );
+        if bundle.has_tool_call || !valid_assistant {
+            if explicit_response_id.is_some() {
+                return Err(StorageError::Message(format!(
+                    "completed terminal for session {session_id} turn {turn_id} references response {final_response_id}, but its canonical bundle is not one plain final assistant message"
+                )));
+            }
+            continue;
+        }
+        selected.insert(bundle.assistant_items[0].0);
+    }
+    Ok(selected)
+}
+
+fn unique_terminal_for_turn(
+    connection: &Connection,
+    session_id: SessionId,
+    turn_id: TurnId,
+) -> Result<Option<(crate::session::DurableTurnTerminal, i64)>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT runtime.msg_json, append_order.append_position
+         FROM protocol_runtime_events AS runtime
+         INNER JOIN protocol_item_append_order AS append_order
+           ON append_order.session_id = runtime.session_id
+          AND append_order.source_kind = 'runtime_event'
+          AND append_order.source_id = runtime.id
+         WHERE runtime.session_id = ?1 AND runtime.turn_id = ?2
+           AND json_extract(runtime.msg_json, '$.kind') = 'turn_terminal'
+         ORDER BY append_order.append_position DESC
+         LIMIT 2",
+    )?;
+    let mut rows = statement.query(params![session_id.to_string(), turn_id.to_string()])?;
+    let Some(first) = rows.next()? else {
+        return Ok(None);
+    };
+    let terminal_json = first.get::<_, String>(0)?;
+    let append_position = first.get::<_, i64>(1)?;
+    if rows.next()?.is_some() {
+        return Err(StorageError::Message(format!(
+            "agent context fork found duplicate terminal events for session {session_id} turn {turn_id}"
+        )));
+    }
+    let RuntimeEventMsg::TurnTerminal { terminal } =
+        serde_json::from_str::<RuntimeEventMsg>(&terminal_json)?
+    else {
+        return Err(StorageError::Message(
+            "terminal runtime-event discriminator did not decode as TurnTerminal".to_string(),
+        ));
+    };
+    Ok(Some((*terminal, append_position)))
+}
+
+fn canonical_turn_history_with_append_positions(
+    connection: &Connection,
+    session_id: SessionId,
+    turn_id: TurnId,
+) -> Result<Vec<(HistoryItem, i64)>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT history.id, history.scope_kind, history.turn_id, history.sequence_no,
+                history.payload_json, history.created_at_ms, append_order.append_position
+         FROM protocol_history_items AS history
+         INNER JOIN protocol_item_append_order AS append_order
+           ON append_order.session_id = history.session_id
+          AND append_order.source_kind = 'history_item'
+          AND append_order.source_id = history.id
+         WHERE history.session_id = ?1 AND history.turn_id = ?2
+         ORDER BY append_order.append_position ASC",
+    )?;
+    let rows = statement.query_map(
+        params![session_id.to_string(), turn_id.to_string()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        },
+    )?;
+    let mut items = Vec::new();
+    for row in rows {
+        let (
+            id,
+            scope_kind,
+            stored_turn_id,
+            sequence_no,
+            payload_json,
+            created_at_ms,
+            append_position,
+        ) = row?;
+        items.push((
+            decode_history_item(
+                session_id,
+                id,
+                scope_kind,
+                stored_turn_id,
+                sequence_no,
+                payload_json,
+                created_at_ms,
+                "agent context final-answer classification",
+            )?,
+            append_position,
+        ));
+    }
+    Ok(items)
 }
 
 fn latest_collaboration_mode_from_connection(
@@ -2561,14 +2808,31 @@ fn optional_error_message(payload_json: Option<String>) -> Result<Option<String>
     }
 }
 
-fn optional_terminal_interruption_cause(
+fn optional_child_terminal_projection(
     payload_json: Option<String>,
-) -> Result<Option<TurnInterruptionCause>, StorageError> {
+) -> Result<RetainedChildTerminalProjection, StorageError> {
     let Some(payload_json) = payload_json else {
-        return Ok(None);
+        return Ok(RetainedChildTerminalProjection::default());
     };
     match serde_json::from_str::<RuntimeEventMsg>(&payload_json)? {
-        RuntimeEventMsg::TurnTerminal { terminal } => Ok(terminal.interruption_cause()),
+        RuntimeEventMsg::TurnTerminal { terminal } => match terminal.outcome {
+            TurnTerminalOutcome::Completed => Ok(RetainedChildTerminalProjection::default()),
+            TurnTerminalOutcome::Interrupted { cause } => Ok(RetainedChildTerminalProjection {
+                failure_error: None,
+                interruption_cause: Some(cause),
+            }),
+            TurnTerminalOutcome::Failed { error } => {
+                if error.trim().is_empty() {
+                    return Err(StorageError::Message(
+                        "child terminal projection decoded an empty failure error".to_string(),
+                    ));
+                }
+                Ok(RetainedChildTerminalProjection {
+                    failure_error: Some(error),
+                    interruption_cause: None,
+                })
+            }
+        },
         _ => Err(StorageError::Message(
             "child terminal projection decoded a non-terminal runtime event".to_string(),
         )),
@@ -2864,6 +3128,8 @@ fn fork_history_payload_for_session(
     match payload {
         HistoryItemPayload::Compaction {
             mode,
+            layout,
+            preserved_user_messages,
             summary,
             replacement_item_ids,
         } => {
@@ -2880,6 +3146,8 @@ fn fork_history_payload_for_session(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(HistoryItemPayload::Compaction {
                 mode,
+                layout,
+                preserved_user_messages,
                 summary,
                 replacement_item_ids,
             })
@@ -3943,7 +4211,7 @@ mod tests {
     }
 
     #[test]
-    fn active_history_hydration_pages_hide_replaced_rows_and_preserve_summary_position() {
+    fn active_history_hydration_places_checkpoint_before_retained_late_input() {
         let connection = Arc::new(Mutex::new(
             Connection::open_in_memory().expect("in-memory db"),
         ));
@@ -3970,6 +4238,8 @@ mod tests {
             created_at_ms: 400,
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                preserved_user_messages: vec!["first".to_string(), "second".to_string()],
                 summary: "first and second summarized".to_string(),
                 replacement_item_ids: vec![first.id, second.id],
             },
@@ -3997,6 +4267,8 @@ mod tests {
             created_at_ms: 500,
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                preserved_user_messages: vec!["first".to_string(), "second".to_string()],
                 summary: "nested summary".to_string(),
                 replacement_item_ids: vec![summary.id],
             },
@@ -4019,6 +4291,51 @@ mod tests {
             vec![tail.id, nested_summary.id],
             "identity reads follow durable append order, independent of model ordering"
         );
+    }
+
+    #[test]
+    fn active_history_hydration_preserves_legacy_summary_prefix_position() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let replaced = history_user_turn(session_id, turn_id, 0, 100, "old prefix");
+        let tail = history_user_turn(session_id, turn_id, 1, 200, "retained suffix");
+        for item in [&replaced, &tail] {
+            store
+                .seed_history_item_for_test(item)
+                .expect("history append");
+        }
+        let summary = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            scope: HistoryScope::Turn { turn_id },
+            sequence_no: 2,
+            created_at_ms: 300,
+            payload: HistoryItemPayload::Compaction {
+                mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::LegacyPrefix,
+                preserved_user_messages: Vec::new(),
+                summary: "legacy summary".to_string(),
+                replacement_item_ids: vec![replaced.id],
+            },
+        };
+        store
+            .seed_history_item_for_test(&summary)
+            .expect("legacy compaction append");
+
+        let (snapshot, pages) =
+            active_history_pages_for_test(&store, session_id, 1).expect("active pages");
+
+        assert_eq!(snapshot.active_count, 2);
+        assert_eq!(pages[0].items[0].id, summary.id);
+        assert_eq!(pages[1].items[0].id, tail.id);
     }
 
     #[test]
@@ -4047,6 +4364,8 @@ mod tests {
             created_at_ms: 200,
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                preserved_user_messages: vec!["old detail".to_string()],
                 summary: "old detail summary".to_string(),
                 replacement_item_ids: vec![replaced.id],
             },
@@ -4068,6 +4387,8 @@ mod tests {
         assert_eq!(copied, (2, 0));
         assert_ne!(forked[0].id, replaced.id);
         let HistoryItemPayload::Compaction {
+            layout,
+            preserved_user_messages,
             replacement_item_ids,
             ..
         } = &forked[1].payload
@@ -4076,6 +4397,11 @@ mod tests {
         };
         assert_eq!(replacement_item_ids.as_slice(), &[forked[0].id]);
         assert!(!replacement_item_ids.contains(&replaced.id));
+        assert_eq!(
+            *layout,
+            crate::protocol::CompactionLayout::UserAnchoredCheckpoint
+        );
+        assert_eq!(preserved_user_messages, &["old detail"]);
     }
 
     #[test]
@@ -4129,6 +4455,8 @@ mod tests {
             created_at_ms: i64::try_from(item_count.saturating_add(1)).unwrap_or(i64::MAX),
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::LegacyPrefix,
+                preserved_user_messages: Vec::new(),
                 summary: "cross-page history summary".to_string(),
                 replacement_item_ids: replacement_item_ids.clone(),
             },
@@ -4401,6 +4729,20 @@ mod tests {
                 editor_context: None,
             },
         };
+        let intermediate_assistant = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: source_session_id,
+            scope: HistoryScope::Turn { turn_id },
+            sequence_no: 1,
+            created_at_ms: 20,
+            payload: HistoryItemPayload::AssistantMessage {
+                response_id: crate::protocol::ModelResponseId::new(),
+                content: vec![ContentPart::Text {
+                    text: "parent planning in progress".to_string(),
+                }],
+            },
+        };
+        let final_response_id = crate::protocol::ModelResponseId::new();
         let assistant = HistoryItem {
             id: HistoryItemId::new(),
             session_id: source_session_id,
@@ -4408,7 +4750,7 @@ mod tests {
             sequence_no: 2,
             created_at_ms: 30,
             payload: HistoryItemPayload::AssistantMessage {
-                response_id: crate::protocol::ModelResponseId::new(),
+                response_id: final_response_id,
                 content: vec![ContentPart::Text {
                     text: "parent result".to_string(),
                 }],
@@ -4429,11 +4771,24 @@ mod tests {
                 },
             },
         };
-        for item in [&user_turn, &assistant, &communication] {
+        for item in [
+            &user_turn,
+            &intermediate_assistant,
+            &assistant,
+            &communication,
+        ] {
             store
                 .seed_history_item_for_test(item)
                 .expect("source append");
         }
+        let mut terminal = completed_terminal_event(source_session_id, turn_id, 4);
+        let RuntimeEventMsg::TurnTerminal { terminal: payload } = &mut terminal.msg else {
+            unreachable!("completed terminal fixture must remain a terminal event");
+        };
+        payload.final_response_id = Some(final_response_id);
+        store
+            .seed_runtime_event_for_test(&terminal)
+            .expect("source terminal");
 
         let copied = store
             .fork_agent_context(source_session_id, target_session_id)
@@ -4463,6 +4818,11 @@ mod tests {
                 ..
             } if matches!(content.as_slice(), [ContentPart::Text { text }] if text == "parent result")
         ));
+        assert!(!forked.iter().any(|item| matches!(
+            &item.payload,
+            HistoryItemPayload::AssistantMessage { content, .. }
+                if matches!(content.as_slice(), [ContentPart::Text { text }] if text == "parent planning in progress")
+        )));
         assert!(
             store
                 .list_turn_items_for_session(target_session_id)
@@ -4485,6 +4845,178 @@ mod tests {
                 .sequence_no,
             3
         );
+    }
+
+    #[test]
+    fn fork_agent_context_drops_assistant_from_failed_terminal_even_with_response_id() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let source_session_id = SessionId::new();
+        let target_session_id = SessionId::new();
+        {
+            let locked = store.connection.lock().expect("sqlite mutex");
+            seed_fork_sessions(&locked, &[source_session_id, target_session_id]);
+        }
+        let turn_id = TurnId::new();
+        let response_id = ModelResponseId::new();
+        store
+            .seed_history_item_for_test(&HistoryItem {
+                id: HistoryItemId::new(),
+                session_id: source_session_id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: 0,
+                created_at_ms: 10,
+                payload: HistoryItemPayload::AssistantMessage {
+                    response_id,
+                    content: vec![ContentPart::Text {
+                        text: "partial result before failure".to_string(),
+                    }],
+                },
+            })
+            .expect("failed-turn assistant");
+        let mut terminal = completed_terminal_event(source_session_id, turn_id, 1);
+        let RuntimeEventMsg::TurnTerminal { terminal: payload } = &mut terminal.msg else {
+            unreachable!("terminal fixture");
+        };
+        payload.outcome = crate::protocol::TurnTerminalOutcome::Failed {
+            error: "provider failed".to_string(),
+        };
+        payload.final_response_id = Some(response_id);
+        store
+            .seed_runtime_event_for_test(&terminal)
+            .expect("failed terminal");
+
+        assert_eq!(
+            store
+                .fork_agent_context(source_session_id, target_session_id)
+                .expect("failed-turn fork"),
+            0
+        );
+    }
+
+    #[test]
+    fn fork_agent_context_recovers_unique_plain_completed_response_without_terminal_id() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let source_session_id = SessionId::new();
+        let target_session_id = SessionId::new();
+        {
+            let locked = store.connection.lock().expect("sqlite mutex");
+            seed_fork_sessions(&locked, &[source_session_id, target_session_id]);
+        }
+        let turn_id = TurnId::new();
+        store
+            .seed_history_item_for_test(&HistoryItem {
+                id: HistoryItemId::new(),
+                session_id: source_session_id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: 0,
+                created_at_ms: 10,
+                payload: HistoryItemPayload::AssistantMessage {
+                    response_id: ModelResponseId::new(),
+                    content: vec![ContentPart::Text {
+                        text: "recoverable legacy final".to_string(),
+                    }],
+                },
+            })
+            .expect("legacy assistant");
+        store
+            .seed_runtime_event_for_test(&completed_terminal_event(source_session_id, turn_id, 1))
+            .expect("completed terminal without response id");
+
+        assert_eq!(
+            store
+                .fork_agent_context(source_session_id, target_session_id)
+                .expect("legacy-compatible fork"),
+            1
+        );
+        assert!(store
+            .list_history_items_for_session(target_session_id)
+            .expect("forked legacy history")
+            .iter()
+            .any(|item| matches!(
+                &item.payload,
+                HistoryItemPayload::AssistantMessage { content, .. }
+                    if matches!(content.as_slice(), [ContentPart::Text { text }] if text == "recoverable legacy final")
+            )));
+    }
+
+    #[test]
+    fn fork_agent_context_rejects_completed_terminal_that_owns_a_tool_response() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let source_session_id = SessionId::new();
+        let target_session_id = SessionId::new();
+        {
+            let locked = store.connection.lock().expect("sqlite mutex");
+            seed_fork_sessions(&locked, &[source_session_id, target_session_id]);
+        }
+        let turn_id = TurnId::new();
+        let response_id = ModelResponseId::new();
+        for item in [
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id: source_session_id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: 0,
+                created_at_ms: 10,
+                payload: HistoryItemPayload::AssistantMessage {
+                    response_id,
+                    content: vec![ContentPart::Text {
+                        text: "I will inspect it.".to_string(),
+                    }],
+                },
+            },
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id: source_session_id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: 1,
+                created_at_ms: 20,
+                payload: HistoryItemPayload::ToolCall {
+                    call_id: crate::session::ToolCallId::new(),
+                    response_id,
+                    model_call_id: "call-1".to_string(),
+                    tool_name: "read_file".to_string(),
+                    arguments_json: "{}".to_string(),
+                },
+            },
+        ] {
+            store
+                .seed_history_item_for_test(&item)
+                .expect("tool response bundle");
+        }
+        let mut terminal = completed_terminal_event(source_session_id, turn_id, 2);
+        let RuntimeEventMsg::TurnTerminal { terminal: payload } = &mut terminal.msg else {
+            unreachable!("terminal fixture");
+        };
+        payload.final_response_id = Some(response_id);
+        store
+            .seed_runtime_event_for_test(&terminal)
+            .expect("inconsistent completed terminal");
+
+        let error = store
+            .fork_agent_context(source_session_id, target_session_id)
+            .expect_err("tool response cannot be a final answer");
+        assert!(error.to_string().contains("not one plain final assistant"));
     }
 
     #[test]
@@ -4526,6 +5058,8 @@ mod tests {
             created_at_ms: 30,
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::LegacyPrefix,
+                preserved_user_messages: Vec::new(),
                 summary: "the earlier exchange established the compacted contract".to_string(),
                 replacement_item_ids: vec![old_user.id, old_assistant.id],
             },
@@ -4557,10 +5091,14 @@ mod tests {
         assert!(matches!(
             &forked[0].payload,
             HistoryItemPayload::Compaction {
+                layout: crate::protocol::CompactionLayout::LegacyPrefix,
+                preserved_user_messages,
                 summary,
                 replacement_item_ids,
                 ..
-            } if summary.contains("compacted contract") && replacement_item_ids.is_empty()
+            } if preserved_user_messages.is_empty()
+                && summary.contains("compacted contract")
+                && replacement_item_ids.is_empty()
         ));
         assert!(matches!(
             &forked[1].payload,
@@ -4577,6 +5115,35 @@ mod tests {
                 crate::llm::ModelMessage::User { content: current }
             ] if summary.contains("compacted contract")
                 && current == "continue from the compacted contract"
+        ));
+    }
+
+    #[test]
+    fn agent_context_fork_payload_keeps_new_checkpoint_anchors() {
+        let payload = HistoryItemPayload::Compaction {
+            mode: crate::protocol::CompactionMode::Automatic,
+            layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+            preserved_user_messages: vec![
+                "original task".to_string(),
+                "latest instruction".to_string(),
+            ],
+            summary: "latest checkpoint".to_string(),
+            replacement_item_ids: vec![HistoryItemId::new()],
+        };
+
+        let forked = fork_agent_context_payload(payload, false).expect("forked payload");
+
+        assert!(matches!(
+            forked,
+            HistoryItemPayload::Compaction {
+                layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                preserved_user_messages,
+                summary,
+                replacement_item_ids,
+                ..
+            } if preserved_user_messages == ["original task", "latest instruction"]
+                && summary == "latest checkpoint"
+                && replacement_item_ids.is_empty()
         ));
     }
 
@@ -4658,6 +5225,8 @@ mod tests {
             created_at_ms: 100,
             payload: HistoryItemPayload::Compaction {
                 mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::LegacyPrefix,
+                preserved_user_messages: Vec::new(),
                 summary: "the obsolete prefix is summarized once".to_string(),
                 replacement_item_ids,
             },

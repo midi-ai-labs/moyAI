@@ -213,5 +213,7 @@ pub struct ProviderPhaseEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_status: Option<ProviderTerminalStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::session::TokenUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<ProviderFailure>,
 }

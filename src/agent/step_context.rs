@@ -145,5 +145,13 @@ mod tests {
             serde_json::json!(["read", "write"]),
             "meaningful step state remains refreshable"
         );
+        assert!(
+            !step.world_state.rendered.contains("<tools>"),
+            "tool availability belongs to the request schema, not model-visible world state"
+        );
+        assert!(
+            !step.world_state.rendered.contains(">read, write<"),
+            "diagnostic tool names must not leak into model-visible world state"
+        );
     }
 }
