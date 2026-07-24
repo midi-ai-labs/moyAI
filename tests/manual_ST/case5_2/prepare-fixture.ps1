@@ -37,6 +37,7 @@ function Test-ExcludedPath([string]$relativePath) {
         "node_modules",
         "__pycache__",
         ".pytest_cache",
+        ".moyai",
         ".venv",
         ".next",
         ".test-dist",
