@@ -470,6 +470,11 @@ impl ResolvedConfig {
                 "config field `model.request_timeout_ms` must be greater than zero".to_string(),
             );
         }
+        if self.model.context_window == 0 {
+            return Err(
+                "config field `model.context_window` must be greater than zero".to_string(),
+            );
+        }
         for (field, value) in [
             ("model.temperature", self.model.temperature),
             ("model.top_p", self.model.top_p),

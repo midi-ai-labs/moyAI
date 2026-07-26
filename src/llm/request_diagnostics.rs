@@ -1,11 +1,22 @@
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 use crate::config::model::ProviderApiMode;
 use crate::error::LlmError;
+use crate::llm::ProviderRequestId;
 use crate::llm::contract::ChatRequest;
 use crate::llm::openai_compat::to_openai_request_with_reasoning;
 use crate::llm::responses::{ResponsesRequestOptions, to_responses_request};
 use crate::session::RequestWireDiagnostic;
+
+const HTTP_REQUEST_CAPTURE_DIR_ENV: &str = "MOYAI_HTTP_REQUEST_CAPTURE_DIR";
+static HTTP_REQUEST_CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Derives redacted diagnostics from the same provider DTO and bounded
 /// serialization used by the HTTP transport. The request body itself is never
@@ -54,11 +65,152 @@ pub(crate) fn http_request_wire_diagnostic(
     })
 }
 
+/// Opt-in, task-local capture of the exact prepared outbound HTTP request DTO.
+///
+/// Full prompts can contain workspace content and user secrets, so this is
+/// deliberately disabled unless an absolute capture directory is supplied via
+/// `MOYAI_HTTP_REQUEST_CAPTURE_DIR`. The capture does not prove that a network
+/// attempt started or that the provider received the body. Its request ID joins
+/// it to the runtime provider-phase events that own attempt and outcome facts.
+/// Write failures abort request preparation instead of silently omitting the
+/// configured evidence.
+pub(crate) fn capture_http_request_wire_body(
+    request_id: &ProviderRequestId,
+    api_mode: ProviderApiMode,
+    endpoint_path: &str,
+    body: &[u8],
+) -> Result<(), LlmError> {
+    let Some(directory) = std::env::var_os(HTTP_REQUEST_CAPTURE_DIR_ENV) else {
+        return Ok(());
+    };
+    let directory = PathBuf::from(directory);
+    if !directory.is_absolute() {
+        return Err(LlmError::Message(format!(
+            "{HTTP_REQUEST_CAPTURE_DIR_ENV} must be an absolute directory"
+        )));
+    }
+    capture_http_request_wire_body_in(&directory, request_id, api_mode, endpoint_path, body)
+}
+
+fn capture_http_request_wire_body_in(
+    directory: &Path,
+    request_id: &ProviderRequestId,
+    api_mode: ProviderApiMode,
+    endpoint_path: &str,
+    body: &[u8],
+) -> Result<(), LlmError> {
+    prepare_capture_directory(directory)?;
+    let sequence = HTTP_REQUEST_CAPTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mode = match api_mode {
+        ProviderApiMode::ChatCompletions => "chat_completions",
+        ProviderApiMode::Responses => "responses",
+    };
+    let stem = format!(
+        "{timestamp_ms:020}-{:010}-{sequence:010}-{mode}",
+        std::process::id()
+    );
+    let body_path = directory.join(format!("{stem}.request.json"));
+    write_new_capture_file(&body_path, body)?;
+    let metadata = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 2,
+        "transport": "http",
+        "capture_stage": "prepared",
+        "request_id": request_id.as_str(),
+        "captured_at_unix_ms": timestamp_ms,
+        "process_id": std::process::id(),
+        "sequence": sequence,
+        "api_mode": mode,
+        "endpoint_path": endpoint_path,
+        "request_body_file": body_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default(),
+        "request_body_bytes": body.len(),
+    }))
+    .map_err(|error| {
+        LlmError::Message(format!(
+            "failed to encode request capture metadata: {error}"
+        ))
+    })?;
+    write_new_capture_file(&directory.join(format!("{stem}.metadata.json")), &metadata)
+}
+
+fn prepare_capture_directory(directory: &Path) -> Result<(), LlmError> {
+    #[cfg(unix)]
+    {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(directory).map_err(|error| {
+            LlmError::Message(format!(
+                "failed to create HTTP request capture directory `{}`: {error}",
+                directory.display()
+            ))
+        })?;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                LlmError::Message(format!(
+                    "failed to secure HTTP request capture directory `{}`: {error}",
+                    directory.display()
+                ))
+            },
+        )?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(directory).map_err(|error| {
+            LlmError::Message(format!(
+                "failed to create HTTP request capture directory `{}`: {error}",
+                directory.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn write_new_capture_file(path: &Path, bytes: &[u8]) -> Result<(), LlmError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).map_err(|error| {
+        LlmError::Message(format!(
+            "failed to create HTTP request capture `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| {
+            LlmError::Message(format!(
+                "failed to secure HTTP request capture `{}`: {error}",
+                path.display()
+            ))
+        })?;
+    file.write_all(bytes).map_err(|error| {
+        LlmError::Message(format!(
+            "failed to write HTTP request capture `{}`: {error}",
+            path.display()
+        ))
+    })?;
+    file.sync_all().map_err(|error| {
+        LlmError::Message(format!(
+            "failed to flush HTTP request capture `{}`: {error}",
+            path.display()
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use serde_json::Value;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
     use crate::config::model::{ProviderApiMode, ProviderReasoningCapability};
@@ -144,6 +296,89 @@ mod tests {
         assert_eq!(diagnostics.input_count, 4);
         assert_eq!(diagnostics.serialized_body_bytes, expected_bytes);
         assert!(!diagnostics.continuation_present);
+    }
+
+    #[test]
+    fn explicit_wire_capture_writes_exact_body_and_separate_metadata() {
+        let directory = tempfile::tempdir().expect("capture tempdir");
+        let body = br#"{"messages":[{"role":"user","content":"full prompt"}]}"#;
+        let request_id = ProviderRequestId::new();
+
+        capture_http_request_wire_body_in(
+            directory.path(),
+            &request_id,
+            ProviderApiMode::ChatCompletions,
+            "v1/chat/completions",
+            body,
+        )
+        .expect("capture");
+
+        let mut entries = std::fs::read_dir(directory.path())
+            .expect("capture entries")
+            .map(|entry| entry.expect("entry").path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(entries.len(), 2);
+        let request_path = entries
+            .iter()
+            .find(|path| path.to_string_lossy().ends_with(".request.json"))
+            .expect("request body");
+        let metadata_path = entries
+            .iter()
+            .find(|path| path.to_string_lossy().ends_with(".metadata.json"))
+            .expect("metadata");
+        assert_eq!(std::fs::read(request_path).expect("request bytes"), body);
+        let metadata: Value =
+            serde_json::from_slice(&std::fs::read(metadata_path).expect("metadata bytes"))
+                .expect("metadata json");
+        assert_eq!(metadata["api_mode"], "chat_completions");
+        assert_eq!(metadata["endpoint_path"], "v1/chat/completions");
+        assert_eq!(metadata["request_body_bytes"], body.len());
+        assert_eq!(metadata["schema_version"], 2);
+        assert_eq!(metadata["transport"], "http");
+        assert_eq!(metadata["capture_stage"], "prepared");
+        assert_eq!(metadata["request_id"], request_id.as_str());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_wire_capture_enforces_owner_only_unix_permissions() {
+        let root = tempfile::tempdir().expect("capture root");
+        let directory = root.path().join("capture");
+        std::fs::create_dir(&directory).expect("permissive capture directory");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777))
+            .expect("permissive directory mode");
+
+        capture_http_request_wire_body_in(
+            &directory,
+            &ProviderRequestId::new(),
+            ProviderApiMode::Responses,
+            "v1/responses",
+            br#"{"input":[]}"#,
+        )
+        .expect("secure capture");
+
+        assert_eq!(
+            std::fs::metadata(&directory)
+                .expect("directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        for entry in std::fs::read_dir(&directory).expect("capture entries") {
+            let path = entry.expect("capture entry").path();
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("capture metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "capture file was not owner-only: {}",
+                path.display()
+            );
+        }
     }
 
     fn request(api_mode: ProviderApiMode, messages: Vec<ModelMessage>) -> ChatRequest {

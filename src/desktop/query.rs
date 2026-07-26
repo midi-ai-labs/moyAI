@@ -352,6 +352,7 @@ pub fn build_session_detail(
 struct TurnTranscriptGroup {
     turn_id: Option<crate::protocol::TurnId>,
     user_body: String,
+    user_history_item_id: Option<crate::protocol::HistoryItemId>,
     assistant_bodies: Vec<String>,
     tool_rows: Vec<String>,
     file_change_items: Vec<crate::protocol::TurnItem>,
@@ -421,6 +422,7 @@ pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed(
                 );
                 current.turn_id = Some(item.turn_id);
                 current.user_body = text.clone();
+                current.user_history_item_id = item.source_item_id;
             }
             crate::protocol::TurnItemPayload::SteerMessage { text } => {
                 let elapsed_ms = current
@@ -436,6 +438,7 @@ pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed(
                 );
                 current.turn_id = Some(item.turn_id);
                 current.user_body = text.clone();
+                current.user_history_item_id = item.source_item_id;
             }
             crate::protocol::TurnItemPayload::AgentMessage { text } => {
                 current.assistant_bodies.push(text.clone());
@@ -621,16 +624,21 @@ fn flush_turn_transcript_group(
 ) {
     if !group.has_content() {
         group.turn_id = None;
+        group.user_history_item_id = None;
         return;
     }
     if !group.user_body.trim().is_empty() {
-        rows.push(desktop_transcript_row(
+        let mut row = desktop_transcript_row(
             DesktopTranscriptRowKind::User,
             String::new(),
             "ユーザー依頼".to_string(),
             group.user_body.trim().to_string(),
             Vec::new(),
-        ));
+        );
+        row.stable_history_identity = group
+            .user_history_item_id
+            .map(|item_id| item_id.to_string());
+        rows.push(row);
     }
     let has_work_summary = turn_group_has_work_summary(group);
     rows.extend(group.system_rows.drain(..));
@@ -680,6 +688,7 @@ fn flush_turn_transcript_group(
     }
 
     group.user_body.clear();
+    group.user_history_item_id = None;
     group.assistant_bodies.clear();
     group.tool_rows.clear();
     group.file_change_items.clear();
@@ -1624,6 +1633,7 @@ mod tests {
                 has_more: false,
                 items: turn_items,
             },
+            pending_turn_inputs: Vec::new(),
             turn_elapsed_ms,
             latest_turn_id,
             active_turn_id: None,

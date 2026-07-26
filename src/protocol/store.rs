@@ -14,8 +14,8 @@ use crate::protocol::{
 use crate::runtime::SystemClock;
 use crate::session::{AdmissionId, SessionId, SessionSpawnEdge};
 use crate::storage::session_repo::{
-    SessionProtocolWriteAuthority, fresh_active_admission_matches_in_connection,
-    normalize_run_lease_now_ms,
+    DeferredAgentCompletionKind, OwnerResumeRequestId, SessionProtocolWriteAuthority,
+    fresh_active_admission_matches_in_connection, normalize_run_lease_now_ms,
 };
 
 pub trait ProtocolEventStore {
@@ -65,6 +65,12 @@ pub trait ProtocolEventStore {
         after_append_position: Option<i64>,
         limit: usize,
     ) -> Result<ProtocolPage<HistoryItem>, StorageError>;
+    /// Reads exact real-user authority from the append-only root history under
+    /// one bounded storage snapshot. Compaction never hides these source rows.
+    fn canonical_user_authority_items_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<HistoryItem>, StorageError>;
     /// Visits the active model-context view in bounded keyset pages under one
     /// immutable storage snapshot. Whole-stream validation and compaction
     /// lineage resolution run once before the first page.
@@ -134,11 +140,20 @@ pub trait ProtocolEventStore {
         source_session_id: SessionId,
         target_session_id: SessionId,
     ) -> Result<usize, StorageError>;
+    fn fork_agent_context_recent(
+        &self,
+        source_session_id: SessionId,
+        target_session_id: SessionId,
+        turns: usize,
+    ) -> Result<usize, StorageError>;
 }
 
 /// One storage page is deliberately small enough to bound SQLite row decoding,
 /// model-context hydration, explicit export, and UI snapshots with one contract.
 pub const MAX_PROTOCOL_PAGE_LIMIT: usize = 200;
+pub const MAX_CANONICAL_USER_AUTHORITY_ITEMS: usize = 64;
+pub const MAX_CANONICAL_USER_AUTHORITY_SOURCE_ITEMS: usize = 4_096;
+pub const MAX_CANONICAL_USER_AUTHORITY_SOURCE_CHARS: usize = 16_000_000;
 
 const LATEST_COLLABORATION_MODE_SQL: &str = "SELECT history.payload_json
      FROM protocol_history_items AS history
@@ -212,15 +227,12 @@ pub struct ActiveHistoryPage {
 
 /// The immutable source snapshot shared by every page in one traversal.
 ///
-/// Active pages exclude rows hidden by committed compaction. The durable counts
-/// still describe the complete canonical stream so terminal admission never
-/// mistakes compacted input for unseen input.
+/// Active pages exclude rows hidden by committed compaction. The canonical
+/// count still describes the complete append-only stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveHistorySnapshot {
     pub append_fence: Option<i64>,
     pub canonical_count: usize,
-    pub steer_count: usize,
-    pub agent_communication_count: usize,
     pub active_count: usize,
 }
 
@@ -308,20 +320,31 @@ struct CanonicalForkStats {
     source_fence: CanonicalProtocolFence,
 }
 
-/// Bounded durable state needed to restore or project one retained direct child.
+/// Bounded durable state needed to restore or project one retained descendant.
 ///
 /// This deliberately contains only point/latest protocol projections. Callers never need to
 /// materialize the child's complete canonical history or runtime-event stream.
 #[derive(Debug, Clone)]
-pub(crate) struct RetainedDirectChildProjection {
+pub(crate) struct RetainedDescendantProjection {
     pub edge: SessionSpawnEdge,
     pub session_status: String,
+    /// Exact active turn owned by the child in the same read snapshot as its status.
+    pub active_turn_id: Option<TurnId>,
+    /// Exact pending deferred-completion turn from the same read snapshot as trigger readiness and
+    /// OwnerResume ownership.
+    pub pending_deferred_turn_id: Option<TurnId>,
+    #[cfg(test)]
+    pub pending_deferred_completion_kind: Option<DeferredAgentCompletionKind>,
+    pub pending_trigger_history_item_id: Option<HistoryItemId>,
+    pub pending_trigger_schedule_ready: bool,
+    pub pending_owner_resume_request_id: Option<OwnerResumeRequestId>,
     pub latest_task_content: Option<Vec<ContentPart>>,
     pub latest_assistant_content: Option<Vec<ContentPart>>,
     pub latest_error: Option<String>,
     pub interruption_cause: Option<TurnInterruptionCause>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct DurableChildResultProjection {
     pub latest_assistant_content: Option<Vec<ContentPart>>,
@@ -334,17 +357,341 @@ struct RetainedChildTerminalProjection {
     interruption_cause: Option<TurnInterruptionCause>,
 }
 
+fn parse_pending_deferred_completion(
+    turn_id: Option<String>,
+    kind: Option<String>,
+) -> Result<(Option<TurnId>, Option<DeferredAgentCompletionKind>), StorageError> {
+    let turn_id = turn_id
+        .map(|turn_id| {
+            turn_id.parse::<TurnId>().map_err(|error| {
+                StorageError::Message(format!(
+                    "retained child has invalid pending deferred-completion turn id `{turn_id}`: {error}"
+                ))
+            })
+        })
+        .transpose()?;
+    let kind = kind
+        .map(|kind| match kind.as_str() {
+            "completed_early" => Ok(DeferredAgentCompletionKind::CompletedEarly),
+            "crash_failed" => Ok(DeferredAgentCompletionKind::CrashFailed),
+            other => Err(StorageError::Message(format!(
+                "retained child has unknown pending deferred-completion kind `{other}`"
+            ))),
+        })
+        .transpose()?;
+    if turn_id.is_some() != kind.is_some() {
+        return Err(StorageError::Message(
+            "retained child pending deferred-completion identity is incomplete".to_string(),
+        ));
+    }
+    Ok((turn_id, kind))
+}
+
+fn retained_descendant_page_in_transaction(
+    transaction: &Transaction<'_>,
+    root_session_id: SessionId,
+    offset: usize,
+    limit: usize,
+) -> Result<ProtocolPage<RetainedDescendantProjection>, StorageError> {
+    let total = transaction.query_row(
+        "SELECT COUNT(*) FROM session_spawn_edges WHERE root_session_id = ?1",
+        params![root_session_id.to_string()],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let total = usize::try_from(total).map_err(|_| {
+        StorageError::Message(format!(
+            "retained child count for session {root_session_id} exceeds this platform's range"
+        ))
+    })?;
+    let mut statement = transaction.prepare(
+        "SELECT edge.root_session_id, edge.parent_session_id, edge.child_session_id,
+                edge.agent_path, edge.task_name, edge.spawn_order, edge.created_at_ms,
+                child.status, child.active_turn_id,
+                (
+                    SELECT mailbox.id
+                    FROM agent_mailbox_messages AS mailbox
+                    INNER JOIN protocol_item_append_order AS trigger_order
+                      ON trigger_order.session_id =
+                         mailbox.recipient_session_id
+                     AND trigger_order.source_kind = 'mailbox_message'
+                     AND trigger_order.source_id = mailbox.id
+                    WHERE mailbox.recipient_session_id =
+                          edge.child_session_id
+                      AND mailbox.state = 'pending'
+                      AND mailbox.trigger_turn = 1
+                    ORDER BY trigger_order.append_position ASC
+                    LIMIT 1
+                ),
+                 (
+                     SELECT owner_resume.source_history_item_id
+                    FROM agent_owner_resume_requests AS owner_resume
+                    WHERE owner_resume.owner_session_id = edge.child_session_id
+                      AND owner_resume.state = 'pending'
+                    ORDER BY owner_resume.created_at_ms ASC,
+                             owner_resume.source_history_item_id ASC
+                     LIMIT 1
+                 ),
+                 CASE
+                     WHEN EXISTS (
+                         SELECT 1
+                         FROM effective_agent_deferred_completions AS deferred
+                         WHERE deferred.agent_session_id = edge.child_session_id
+                           AND deferred.state = 'pending'
+                           AND deferred.kind = 'completed_early'
+                     ) THEN 0
+                     WHEN EXISTS (
+                         SELECT 1
+                         FROM effective_agent_deferred_completions AS deferred
+                         WHERE deferred.agent_session_id = edge.child_session_id
+                           AND deferred.state = 'pending'
+                           AND deferred.kind = 'crash_failed'
+                     ) THEN 1
+                     ELSE 1
+                 END,
+                 (
+                     SELECT deferred.agent_turn_id
+                     FROM effective_agent_deferred_completions AS deferred
+                     WHERE deferred.agent_session_id = edge.child_session_id
+                       AND deferred.state = 'pending'
+                     LIMIT 1
+                 ),
+                 (
+                     SELECT deferred.kind
+                     FROM effective_agent_deferred_completions AS deferred
+                     WHERE deferred.agent_session_id = edge.child_session_id
+                       AND deferred.state = 'pending'
+                     LIMIT 1
+                 ),
+                 (
+                     SELECT history.payload_json
+                    FROM protocol_history_items AS history
+                    INNER JOIN protocol_item_append_order AS append_order
+                      ON append_order.session_id = history.session_id
+                     AND append_order.source_kind = 'history_item'
+                     AND append_order.source_id = history.id
+                    WHERE history.session_id = edge.child_session_id
+                      AND json_extract(history.payload_json, '$.kind') IN ('user_turn', 'steer_turn')
+                    ORDER BY append_order.append_position DESC
+                    LIMIT 1
+                ),
+                (
+                    SELECT history.payload_json
+                    FROM protocol_history_items AS history
+                    INNER JOIN protocol_item_append_order AS append_order
+                      ON append_order.session_id = history.session_id
+                     AND append_order.source_kind = 'history_item'
+                     AND append_order.source_id = history.id
+                    WHERE history.session_id = edge.child_session_id
+                      AND json_extract(history.payload_json, '$.kind') = 'assistant_message'
+                    ORDER BY append_order.append_position DESC
+                    LIMIT 1
+                ),
+                (
+                    SELECT history.payload_json
+                    FROM protocol_history_items AS history
+                    INNER JOIN protocol_item_append_order AS append_order
+                      ON append_order.session_id = history.session_id
+                     AND append_order.source_kind = 'history_item'
+                     AND append_order.source_id = history.id
+                    WHERE history.session_id = edge.child_session_id
+                      AND json_extract(history.payload_json, '$.kind') = 'error'
+                    ORDER BY append_order.append_position DESC
+                    LIMIT 1
+                ),
+                (
+                    SELECT runtime_event.msg_json
+                    FROM protocol_runtime_events AS runtime_event
+                    INNER JOIN protocol_item_append_order AS append_order
+                      ON append_order.session_id = runtime_event.session_id
+                     AND append_order.source_kind = 'runtime_event'
+                     AND append_order.source_id = runtime_event.id
+                    WHERE runtime_event.session_id = edge.child_session_id
+                      AND json_extract(runtime_event.msg_json, '$.kind') = 'turn_terminal'
+                    ORDER BY append_order.append_position DESC
+                    LIMIT 1
+                )
+         FROM session_spawn_edges AS edge
+         INNER JOIN sessions AS child ON child.id = edge.child_session_id
+         WHERE edge.root_session_id = ?1
+         ORDER BY edge.spawn_order ASC, edge.child_session_id ASC
+         LIMIT ?2 OFFSET ?3",
+    )?;
+    let rows = statement.query_map(
+        params![
+            root_session_id.to_string(),
+            sqlite_page_value(limit),
+            sqlite_page_value(offset)
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, bool>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<String>>(16)?,
+                row.get::<_, Option<String>>(17)?,
+            ))
+        },
+    )?;
+    let mut items = Vec::new();
+    for row in rows {
+        let (
+            edge_root,
+            parent,
+            child,
+            agent_path,
+            task_name,
+            spawn_order,
+            created_at_ms,
+            session_status,
+            active_turn_id,
+            pending_trigger_history_item_id,
+            pending_owner_resume_request_id,
+            pending_trigger_schedule_ready,
+            pending_deferred_turn_id,
+            pending_deferred_completion_kind,
+            task_payload,
+            assistant_payload,
+            error_payload,
+            terminal_payload,
+        ) = row?;
+        let terminal = optional_child_terminal_projection(terminal_payload)?;
+        let latest_error = match terminal.failure_error {
+            Some(error) => Some(error),
+            None => optional_error_message(error_payload)?,
+        };
+        let (pending_deferred_turn_id, _pending_deferred_completion_kind) =
+            parse_pending_deferred_completion(
+                pending_deferred_turn_id,
+                pending_deferred_completion_kind,
+            )?;
+        items.push(RetainedDescendantProjection {
+            edge: SessionSpawnEdge {
+                root_session_id: parse_session_id(&edge_root, "retained child root")?,
+                parent_session_id: parse_session_id(&parent, "retained child parent")?,
+                child_session_id: parse_session_id(&child, "retained child session")?,
+                agent_path,
+                task_name,
+                spawn_order: if spawn_order > 0 {
+                    u64::try_from(spawn_order).map_err(|_| {
+                        StorageError::Message(format!(
+                            "retained child {child} has invalid spawn order {spawn_order}"
+                        ))
+                    })?
+                } else {
+                    return Err(StorageError::Message(format!(
+                        "retained child {child} has invalid spawn order {spawn_order}"
+                    )));
+                },
+                created_at_ms,
+            },
+            session_status,
+            active_turn_id: active_turn_id
+                .map(|value| {
+                    value.parse::<TurnId>().map_err(|error| {
+                        StorageError::Message(format!(
+                            "retained child {child} has invalid active turn id `{value}`: {error}"
+                        ))
+                    })
+                })
+                .transpose()?,
+            pending_deferred_turn_id,
+            #[cfg(test)]
+            pending_deferred_completion_kind: _pending_deferred_completion_kind,
+            pending_trigger_history_item_id: pending_trigger_history_item_id
+                .map(|value| {
+                    value.parse::<HistoryItemId>().map_err(|error| {
+                        StorageError::Message(format!(
+                            "retained child {child} has invalid pending trigger history id `{value}`: {error}"
+                        ))
+                    })
+                })
+                .transpose()?,
+            pending_trigger_schedule_ready,
+            pending_owner_resume_request_id: pending_owner_resume_request_id
+                .map(|value| {
+                    value.parse::<OwnerResumeRequestId>().map_err(|error| {
+                        StorageError::Message(format!(
+                            "retained child {child} has invalid owner-resume request id `{value}`: {error}"
+                        ))
+                    })
+                })
+                .transpose()?,
+            latest_task_content: optional_input_content(task_payload)?,
+            latest_assistant_content: optional_assistant_content(assistant_payload)?,
+            latest_error,
+            interruption_cause: terminal.interruption_cause,
+        });
+    }
+    drop(statement);
+    Ok(ProtocolPage {
+        offset,
+        limit,
+        total,
+        items,
+        next_cursor: None,
+    })
+}
+
 impl SqliteProtocolEventStore {
     pub fn new(connection: Arc<Mutex<Connection>>) -> Self {
         Self { connection }
     }
 
-    pub(crate) fn retained_direct_child_page(
+    pub(crate) fn canonical_user_authority_items_for_session_with_interrupt<G, F>(
+        &self,
+        session_id: SessionId,
+        on_query_ready: impl FnOnce(rusqlite::InterruptHandle) -> Result<G, StorageError>,
+        should_interrupt: F,
+    ) -> Result<Vec<HistoryItem>, StorageError>
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
+        let mut connection = match self.connection.try_lock() {
+            Ok(connection) => connection,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(StorageError::Message(
+                    "canonical user authority storage is busy".to_string(),
+                ));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(StorageError::Message(
+                    "canonical user authority storage lock is poisoned".to_string(),
+                ));
+            }
+        };
+        let query_guard = on_query_ready(connection.get_interrupt_handle())?;
+        connection.progress_handler(1, Some(should_interrupt));
+        let result = (|| {
+            let transaction = connection.transaction()?;
+            let items = canonical_user_authority_items_from_connection(&transaction, session_id)?;
+            transaction.commit()?;
+            Ok(items)
+        })();
+        connection.progress_handler(0, None::<fn() -> bool>);
+        drop(query_guard);
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_descendant_page(
         &self,
         root_session_id: SessionId,
         offset: usize,
         limit: usize,
-    ) -> Result<ProtocolPage<RetainedDirectChildProjection>, StorageError> {
+    ) -> Result<ProtocolPage<RetainedDescendantProjection>, StorageError> {
         if limit == 0 || limit > MAX_PROTOCOL_PAGE_LIMIT {
             return Err(StorageError::Message(format!(
                 "retained child page limit must be between 1 and {MAX_PROTOCOL_PAGE_LIMIT}, got {limit}"
@@ -352,140 +699,87 @@ impl SqliteProtocolEventStore {
         }
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction()?;
-        let total = transaction.query_row(
-            "SELECT COUNT(*) FROM session_spawn_edges WHERE root_session_id = ?1",
-            params![root_session_id.to_string()],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let total = usize::try_from(total).map_err(|_| {
-            StorageError::Message(format!(
-                "retained child count for session {root_session_id} exceeds this platform's range"
-            ))
-        })?;
-        let mut statement = transaction.prepare(
-            "SELECT edge.root_session_id, edge.parent_session_id, edge.child_session_id,
-                    edge.agent_path, edge.task_name, edge.created_at_ms, child.status,
-                    (
-                        SELECT history.payload_json
-                        FROM protocol_history_items AS history
-                        INNER JOIN protocol_item_append_order AS append_order
-                          ON append_order.session_id = history.session_id
-                         AND append_order.source_kind = 'history_item'
-                         AND append_order.source_id = history.id
-                        WHERE history.session_id = edge.child_session_id
-                          AND json_extract(history.payload_json, '$.kind') IN ('user_turn', 'steer_turn')
-                        ORDER BY append_order.append_position DESC
-                        LIMIT 1
-                    ),
-                    (
-                        SELECT history.payload_json
-                        FROM protocol_history_items AS history
-                        INNER JOIN protocol_item_append_order AS append_order
-                          ON append_order.session_id = history.session_id
-                         AND append_order.source_kind = 'history_item'
-                         AND append_order.source_id = history.id
-                        WHERE history.session_id = edge.child_session_id
-                          AND json_extract(history.payload_json, '$.kind') = 'assistant_message'
-                        ORDER BY append_order.append_position DESC
-                        LIMIT 1
-                    ),
-                    (
-                        SELECT history.payload_json
-                        FROM protocol_history_items AS history
-                        INNER JOIN protocol_item_append_order AS append_order
-                          ON append_order.session_id = history.session_id
-                         AND append_order.source_kind = 'history_item'
-                         AND append_order.source_id = history.id
-                        WHERE history.session_id = edge.child_session_id
-                          AND json_extract(history.payload_json, '$.kind') = 'error'
-                        ORDER BY append_order.append_position DESC
-                        LIMIT 1
-                    ),
-                    (
-                        SELECT runtime_event.msg_json
-                        FROM protocol_runtime_events AS runtime_event
-                        INNER JOIN protocol_item_append_order AS append_order
-                          ON append_order.session_id = runtime_event.session_id
-                         AND append_order.source_kind = 'runtime_event'
-                         AND append_order.source_id = runtime_event.id
-                        WHERE runtime_event.session_id = edge.child_session_id
-                          AND json_extract(runtime_event.msg_json, '$.kind') = 'turn_terminal'
-                        ORDER BY append_order.append_position DESC
-                        LIMIT 1
-                    )
-             FROM session_spawn_edges AS edge
-             INNER JOIN sessions AS child ON child.id = edge.child_session_id
-             WHERE edge.root_session_id = ?1
-             ORDER BY edge.created_at_ms ASC, edge.child_session_id ASC
-             LIMIT ?2 OFFSET ?3",
-        )?;
-        let rows = statement.query_map(
-            params![
-                root_session_id.to_string(),
-                sqlite_page_value(limit),
-                sqlite_page_value(offset)
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                    row.get::<_, Option<String>>(10)?,
-                ))
-            },
-        )?;
-        let mut items = Vec::new();
-        for row in rows {
-            let (
-                edge_root,
-                parent,
-                child,
-                agent_path,
-                task_name,
-                created_at_ms,
-                session_status,
-                task_payload,
-                assistant_payload,
-                error_payload,
-                terminal_payload,
-            ) = row?;
-            let terminal = optional_child_terminal_projection(terminal_payload)?;
-            let latest_error = match terminal.failure_error {
-                Some(error) => Some(error),
-                None => optional_error_message(error_payload)?,
-            };
-            items.push(RetainedDirectChildProjection {
-                edge: SessionSpawnEdge {
-                    root_session_id: parse_session_id(&edge_root, "retained child root")?,
-                    parent_session_id: parse_session_id(&parent, "retained child parent")?,
-                    child_session_id: parse_session_id(&child, "retained child session")?,
-                    agent_path,
-                    task_name,
-                    created_at_ms,
-                },
-                session_status,
-                latest_task_content: optional_input_content(task_payload)?,
-                latest_assistant_content: optional_assistant_content(assistant_payload)?,
-                latest_error,
-                interruption_cause: terminal.interruption_cause,
-            });
-        }
-        drop(statement);
+        let page =
+            retained_descendant_page_in_transaction(&transaction, root_session_id, offset, limit)?;
         transaction.commit()?;
-        Ok(ProtocolPage {
-            offset,
-            limit,
-            total,
-            items,
-            next_cursor: None,
-        })
+        Ok(page)
+    }
+
+    /// Reads the entire bounded retained tree under one SQLite read transaction.
+    ///
+    /// Hydration must not compose independently-timed pages with deferred-completion state from
+    /// another query: a child terminal event may release deferred ownership between those reads.
+    pub(crate) fn retained_descendant_snapshot(
+        &self,
+        root_session_id: SessionId,
+        max_items: usize,
+    ) -> Result<Vec<RetainedDescendantProjection>, StorageError> {
+        self.retained_descendant_snapshot_with_page_observer(
+            root_session_id,
+            max_items,
+            &mut |_| Ok(()),
+        )
+    }
+
+    fn retained_descendant_snapshot_with_page_observer(
+        &self,
+        root_session_id: SessionId,
+        max_items: usize,
+        after_page: &mut dyn FnMut(usize) -> Result<(), StorageError>,
+    ) -> Result<Vec<RetainedDescendantProjection>, StorageError> {
+        if max_items == 0 {
+            return Err(StorageError::Message(
+                "retained child snapshot bound must be at least 1".to_string(),
+            ));
+        }
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let first_limit = max_items.min(MAX_PROTOCOL_PAGE_LIMIT);
+        let first =
+            retained_descendant_page_in_transaction(&transaction, root_session_id, 0, first_limit)?;
+        if first.total > max_items {
+            return Err(StorageError::Message(format!(
+                "session {root_session_id} retains {} descendants, exceeding the supported maximum {max_items}",
+                first.total
+            )));
+        }
+        let total = first.total;
+        let mut items = first.items;
+        after_page(items.len())?;
+        while items.len() < total {
+            let remaining = total.saturating_sub(items.len());
+            let page = retained_descendant_page_in_transaction(
+                &transaction,
+                root_session_id,
+                items.len(),
+                remaining.min(MAX_PROTOCOL_PAGE_LIMIT),
+            )?;
+            if page.total != total {
+                return Err(StorageError::Message(format!(
+                    "retained child projection for session {root_session_id} changed within one storage snapshot"
+                )));
+            }
+            if page.items.is_empty() {
+                return Err(StorageError::Message(format!(
+                    "retained child projection for session {root_session_id} made no progress at offset {}",
+                    items.len()
+                )));
+            }
+            items.extend(page.items);
+            after_page(items.len())?;
+        }
+        transaction.commit()?;
+        Ok(items)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_descendant_snapshot_observing_pages(
+        &self,
+        root_session_id: SessionId,
+        max_items: usize,
+        after_page: &mut dyn FnMut(usize) -> Result<(), StorageError>,
+    ) -> Result<Vec<RetainedDescendantProjection>, StorageError> {
+        self.retained_descendant_snapshot_with_page_observer(root_session_id, max_items, after_page)
     }
 
     pub(crate) fn assistant_content_for_response(
@@ -514,6 +808,7 @@ impl SqliteProtocolEventStore {
         optional_assistant_content(payload)
     }
 
+    #[cfg(test)]
     pub(crate) fn durable_child_result_projection(
         &self,
         session_id: SessionId,
@@ -703,6 +998,7 @@ impl SqliteProtocolEventStore {
     pub(crate) fn append_sub_agent_activity(
         &self,
         root_session_id: SessionId,
+        caller_session_id: SessionId,
         originating_admission_id: AdmissionId,
         originating_turn_id: TurnId,
         activity_id: String,
@@ -713,20 +1009,32 @@ impl SqliteProtocolEventStore {
         let now = normalize_run_lease_now_ms(SystemClock::now_ms());
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owns_root_turn = fresh_active_admission_matches_in_connection(
+        let owns_caller_turn = fresh_active_admission_matches_in_connection(
             &transaction,
-            root_session_id,
+            caller_session_id,
             originating_admission_id,
             originating_turn_id,
             now,
         )?;
-        let owned_lineage = owns_root_turn
+        let caller_belongs_to_tree = caller_session_id == root_session_id
+            || transaction
+                .query_row(
+                    "SELECT 1
+                     FROM session_spawn_edges
+                     WHERE root_session_id = ?1
+                       AND child_session_id = ?2",
+                    params![root_session_id.to_string(), caller_session_id.to_string()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+        let owned_lineage = owns_caller_turn
+            && caller_belongs_to_tree
             && transaction
                 .query_row(
                     "SELECT 1
                      FROM session_spawn_edges AS edge
                      WHERE edge.root_session_id = ?1
-                       AND edge.parent_session_id = ?1
                        AND edge.child_session_id = ?2
                        AND edge.agent_path = ?3",
                     params![
@@ -740,11 +1048,11 @@ impl SqliteProtocolEventStore {
                 .is_some();
         if !owned_lineage {
             return Err(StorageError::Message(format!(
-                "sub-agent activity owner or retained direct-child identity is stale for root session {root_session_id} admission {originating_admission_id} turn {originating_turn_id}"
+                "sub-agent activity owner session {caller_session_id} admission {originating_admission_id} turn {originating_turn_id} or retained descendant identity is stale for root session {root_session_id}"
             )));
         }
         let projection = project_sub_agent_activity(
-            root_session_id,
+            caller_session_id,
             originating_turn_id,
             0,
             activity_id,
@@ -847,6 +1155,7 @@ impl SqliteProtocolEventStore {
             source_session_id,
             target_session_id,
             expected_fence,
+            None,
         )?;
         transaction.commit()?;
         Ok(stats)
@@ -1107,6 +1416,17 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
         Ok(page)
     }
 
+    fn canonical_user_authority_items_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<HistoryItem>, StorageError> {
+        self.canonical_user_authority_items_for_session_with_interrupt(
+            session_id,
+            |_| Ok(()),
+            || false,
+        )
+    }
+
     fn visit_active_history_pages_for_session(
         &self,
         session_id: SessionId,
@@ -1329,6 +1649,36 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
             source_session_id,
             target_session_id,
             None,
+            None,
+        )?;
+        transaction.commit()?;
+        Ok(stats.copied_items)
+    }
+
+    fn fork_agent_context_recent(
+        &self,
+        source_session_id: SessionId,
+        target_session_id: SessionId,
+        turns: usize,
+    ) -> Result<usize, StorageError> {
+        if turns == 0 {
+            return Err(StorageError::Message(
+                "recent agent context fork requires at least one turn".to_string(),
+            ));
+        }
+        if source_session_id == target_session_id {
+            return Err(StorageError::Message(
+                "cannot fork agent context into the same session".to_string(),
+            ));
+        }
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stats = fork_agent_context_in_transaction(
+            &transaction,
+            source_session_id,
+            target_session_id,
+            None,
+            Some(turns),
         )?;
         transaction.commit()?;
         Ok(stats.copied_items)
@@ -1340,6 +1690,7 @@ fn fork_agent_context_in_transaction(
     source_session_id: SessionId,
     target_session_id: SessionId,
     expected_fence: Option<ActiveHistorySnapshot>,
+    recent_turns: Option<usize>,
 ) -> Result<AgentContextForkStats, StorageError> {
     ensure_empty_protocol_target(transaction, target_session_id, "agent context")?;
 
@@ -1350,8 +1701,12 @@ fn fork_agent_context_in_transaction(
     // contribute an active assistant item, then validate against all canonical
     // response items so compaction and page boundaries cannot erase evidence.
     let mut assistant_turn_ids = Vec::new();
+    let mut boundary_count = 0usize;
     let mut collect_assistant_turns = |source_page: ActiveHistoryPage| {
         for item in source_page.items {
+            if is_agent_fork_turn_boundary(&item.payload) {
+                boundary_count = boundary_count.saturating_add(1);
+            }
             if matches!(item.payload, HistoryItemPayload::AssistantMessage { .. })
                 && let Some(turn_id) = item.scope.turn_id()
             {
@@ -1374,10 +1729,22 @@ fn fork_agent_context_in_transaction(
     )?;
 
     let mut copied_items = 0usize;
+    let mut boundaries_to_skip = recent_turns.map(|turns| boundary_count.saturating_sub(turns));
+    let mut copy_started = recent_turns.is_none();
     let mut copy_page = |source_page: ActiveHistoryPage| {
         let source_item_count = source_page.items.len();
         let mut forked_page = Vec::with_capacity(source_item_count);
         for item in source_page.items {
+            if is_agent_fork_turn_boundary(&item.payload) {
+                if boundaries_to_skip.is_some_and(|remaining| remaining > 0) {
+                    boundaries_to_skip = boundaries_to_skip.map(|remaining| remaining - 1);
+                    continue;
+                }
+                copy_started = true;
+            }
+            if !copy_started {
+                continue;
+            }
             let include_assistant_message = final_answer_item_ids.contains(&item.id);
             let Some(payload) = fork_agent_context_payload(item.payload, include_assistant_message)
             else {
@@ -1392,6 +1759,7 @@ fn fork_agent_context_in_transaction(
         }
         for item in &forked_page {
             insert_history_item(transaction, item)?;
+            insert_forked_turn_steer_provenance(transaction, item)?;
         }
         seed_history_turn_sequence_allocators(transaction, target_session_id, &forked_page)?;
         copied_items = copied_items.saturating_add(forked_page.len());
@@ -1413,6 +1781,37 @@ fn fork_agent_context_in_transaction(
         #[cfg(test)]
         source_fence: _traversal.snapshot,
     })
+}
+
+/// Copies the model-visible parent context as one part of the durable spawn transaction.
+///
+/// The caller owns validation of the root turn and insertion of the lineage edge. Keeping this
+/// helper transaction-scoped prevents a retained child from becoming visible between its context
+/// fork and initial task delivery.
+pub(crate) fn fork_agent_context_in_transaction_for_spawn(
+    transaction: &Transaction<'_>,
+    source_session_id: SessionId,
+    target_session_id: SessionId,
+    recent_turns: Option<usize>,
+) -> Result<usize, StorageError> {
+    if source_session_id == target_session_id {
+        return Err(StorageError::Message(
+            "cannot fork agent context into the same session".to_string(),
+        ));
+    }
+    if recent_turns == Some(0) {
+        return Err(StorageError::Message(
+            "recent agent context fork requires at least one turn".to_string(),
+        ));
+    }
+    fork_agent_context_in_transaction(
+        transaction,
+        source_session_id,
+        target_session_id,
+        None,
+        recent_turns,
+    )
+    .map(|stats| stats.copied_items)
 }
 
 pub(crate) fn fork_canonical_items_in_transaction(
@@ -1537,6 +1936,7 @@ fn fork_canonical_items_with_stats_in_transaction(
             }
             for item in &forked_page {
                 insert_history_item(transaction, item)?;
+                insert_forked_turn_steer_provenance(transaction, item)?;
             }
             seed_history_turn_sequence_allocators(transaction, target_session_id, &forked_page)?;
             copied_history_items = copied_history_items.saturating_add(forked_page.len());
@@ -1548,7 +1948,6 @@ fn fork_canonical_items_with_stats_in_transaction(
                 source_fence.history_count,
             )?;
         }
-
         let mut turn_copy_offset = 0usize;
         let mut copied_turn_items = 0usize;
         while turn_copy_offset < source_fence.turn_count {
@@ -1879,6 +2278,17 @@ fn fork_agent_context_payload(
             prompt_dispatch: None,
             editor_context: None,
         }),
+        HistoryItemPayload::SteerTurn {
+            expected_turn_id,
+            content,
+            additional_context,
+            client_user_message_id,
+        } => Some(HistoryItemPayload::SteerTurn {
+            expected_turn_id,
+            content,
+            additional_context,
+            client_user_message_id,
+        }),
         HistoryItemPayload::AssistantMessage {
             response_id,
             content,
@@ -1910,6 +2320,19 @@ fn fork_agent_context_payload(
         }
         _ => None,
     }
+}
+
+fn is_agent_fork_turn_boundary(payload: &HistoryItemPayload) -> bool {
+    matches!(
+        payload,
+        HistoryItemPayload::UserTurn { .. }
+            | HistoryItemPayload::SteerTurn { .. }
+            | HistoryItemPayload::Compaction { .. }
+    ) || matches!(
+        payload,
+        HistoryItemPayload::InterAgentCommunication { communication }
+            if communication.trigger_turn
+    )
 }
 
 #[derive(Default)]
@@ -2360,6 +2783,106 @@ fn history_item_page_from_connection(
     })
 }
 
+fn canonical_user_authority_items_from_connection(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<Vec<HistoryItem>, StorageError> {
+    let source_fetch_limit = MAX_CANONICAL_USER_AUTHORITY_SOURCE_ITEMS.saturating_add(1);
+    let source_count = connection.query_row(
+        "SELECT COUNT(*)
+         FROM (
+             SELECT 1
+             FROM protocol_item_append_order
+                  INDEXED BY idx_protocol_item_append_order_session_position
+             WHERE session_id = ?1
+               AND source_kind = 'history_item'
+             ORDER BY append_position ASC
+             LIMIT ?2
+         )",
+        params![
+            session_id.to_string(),
+            sqlite_page_value(source_fetch_limit)
+        ],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if source_count > sqlite_page_value(MAX_CANONICAL_USER_AUTHORITY_SOURCE_ITEMS) {
+        return Err(StorageError::Message(format!(
+            "canonical user authority source for root session {session_id} exceeds the bounded history limit of {MAX_CANONICAL_USER_AUTHORITY_SOURCE_ITEMS} items"
+        )));
+    }
+
+    let source_payload_chars = connection.query_row(
+        "SELECT COALESCE(SUM(LENGTH(history.payload_json)), 0)
+         FROM protocol_item_append_order AS append_order
+              INDEXED BY idx_protocol_item_append_order_session_position
+         INNER JOIN protocol_history_items AS history
+           ON history.session_id = append_order.session_id
+          AND history.id = append_order.source_id
+         WHERE append_order.session_id = ?1
+           AND append_order.source_kind = 'history_item'",
+        params![session_id.to_string()],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if source_payload_chars > sqlite_page_value(MAX_CANONICAL_USER_AUTHORITY_SOURCE_CHARS) {
+        return Err(StorageError::Message(format!(
+            "canonical user authority source for root session {session_id} exceeds the bounded payload limit of {MAX_CANONICAL_USER_AUTHORITY_SOURCE_CHARS} characters"
+        )));
+    }
+
+    let authority_fetch_limit = MAX_CANONICAL_USER_AUTHORITY_ITEMS.saturating_add(1);
+    let mut statement = connection.prepare(
+        "SELECT history.id, history.scope_kind, history.turn_id, history.sequence_no,
+                history.payload_json, history.created_at_ms
+         FROM protocol_item_append_order AS append_order
+              INDEXED BY idx_protocol_item_append_order_session_position
+         INNER JOIN protocol_history_items AS history
+           ON history.session_id = append_order.session_id
+          AND history.id = append_order.source_id
+         WHERE append_order.session_id = ?1
+           AND append_order.source_kind = 'history_item'
+           AND json_extract(history.payload_json, '$.kind')
+               IN ('user_turn', 'steer_turn')
+         ORDER BY append_order.append_position ASC
+         LIMIT ?2",
+    )?;
+    let rows = statement.query_map(
+        params![
+            session_id.to_string(),
+            sqlite_page_value(authority_fetch_limit)
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        },
+    )?;
+    let mut items = Vec::new();
+    for row in rows {
+        let (id, scope_kind, turn_id, sequence_no, payload_json, created_at_ms) = row?;
+        items.push(decode_history_item(
+            session_id,
+            id,
+            scope_kind,
+            turn_id,
+            sequence_no,
+            payload_json,
+            created_at_ms,
+            "canonical user authority item",
+        )?);
+    }
+    if items.len() > MAX_CANONICAL_USER_AUTHORITY_ITEMS {
+        return Err(StorageError::Message(format!(
+            "canonical user authority for root session {session_id} has more than {MAX_CANONICAL_USER_AUTHORITY_ITEMS} items"
+        )));
+    }
+    Ok(items)
+}
+
 fn traverse_active_history_in_transaction(
     transaction: &Transaction<'_>,
     session_id: SessionId,
@@ -2493,11 +3016,31 @@ fn prepare_active_history_snapshot(
         params![session_id.to_string()],
         |row| row.get::<_, Option<i64>>(0),
     )?;
-    let steer_count = history_payload_kind_count(connection, session_id, "steer_turn")?;
-    let agent_communication_count =
-        history_payload_kind_count(connection, session_id, "inter_agent_communication")?;
     let active_count = connection.execute(
-        "WITH RECURSIVE replacement_tree(compaction_id, replaced_id) AS (
+        "WITH RECURSIVE fenced_scope(
+             root_session_id,
+             stopped_session_id,
+             after_append_position,
+             session_id
+         ) AS (
+             SELECT
+                 fence.root_session_id,
+                 fence.stopped_session_id,
+                 fence.after_append_position,
+                 fence.stopped_session_id
+             FROM agent_tree_stop_fences AS fence
+             UNION ALL
+             SELECT
+                 parent.root_session_id,
+                 parent.stopped_session_id,
+                 parent.after_append_position,
+                 edge.child_session_id
+             FROM fenced_scope AS parent
+             INNER JOIN session_spawn_edges AS edge
+               ON edge.root_session_id = parent.root_session_id
+              AND edge.parent_session_id = parent.session_id
+         ),
+         replacement_tree(compaction_id, replaced_id) AS (
              SELECT compaction.id, CAST(replacement.value AS TEXT)
              FROM protocol_history_items AS compaction
              JOIN json_each(
@@ -2543,6 +3086,22 @@ fn prepare_active_history_snapshot(
               AND append_order.source_kind = 'history_item'
               AND append_order.source_id = history.id
              WHERE history.session_id = ?1
+               AND NOT (
+                   history.scope_kind = 'session'
+                   AND json_extract(history.payload_json, '$.kind') =
+                       'inter_agent_communication'
+                   AND json_extract(
+                         history.payload_json,
+                         '$.communication.trigger_turn'
+                       ) = 1
+                   AND EXISTS (
+                       SELECT 1
+                       FROM fenced_scope AS fence
+                       WHERE fence.session_id = history.session_id
+                         AND append_order.append_position <=
+                             fence.after_append_position
+                   )
+               )
                AND NOT EXISTS (
                    SELECT 1
                    FROM protocol_history_items AS compaction
@@ -2569,8 +3128,6 @@ fn prepare_active_history_snapshot(
     Ok(ActiveHistorySnapshot {
         append_fence,
         canonical_count,
-        steer_count,
-        agent_communication_count,
         active_count,
     })
 }
@@ -2674,26 +3231,6 @@ fn active_history_cursor_advances(
     next.effective_position > previous.effective_position
         || (next.effective_position == previous.effective_position
             && next.append_position > previous.append_position)
-}
-
-fn history_payload_kind_count(
-    connection: &Connection,
-    session_id: SessionId,
-    kind: &'static str,
-) -> Result<usize, StorageError> {
-    let count = connection.query_row(
-        "SELECT COUNT(*)
-         FROM protocol_history_items
-         WHERE session_id = ?1
-           AND json_extract(payload_json, '$.kind') = ?2",
-        params![session_id.to_string(), kind],
-        |row| row.get::<_, i64>(0),
-    )?;
-    usize::try_from(count).map_err(|_| {
-        StorageError::Message(format!(
-            "canonical history kind `{kind}` count exceeds this platform's range"
-        ))
-    })
 }
 
 fn history_items_by_id_from_connection(
@@ -3304,22 +3841,27 @@ pub(crate) fn insert_session_owned_event_bundle_in_transaction(
     insert_event_bundle_unchecked(transaction, event, history_item, turn_item)
 }
 
-pub(crate) fn insert_idle_inter_agent_history_in_transaction(
+pub(crate) fn insert_mailbox_append_order_in_transaction(
     _authority: &SessionProtocolWriteAuthority,
     transaction: &Transaction<'_>,
     session_id: SessionId,
-    communication: crate::protocol::InterAgentCommunication,
-) -> Result<HistoryItemId, StorageError> {
-    let item = HistoryItem {
-        id: HistoryItemId::new(),
-        session_id,
-        scope: HistoryScope::Session,
-        sequence_no: claim_session_history_sequence_in_transaction(transaction, session_id, 0)?,
-        created_at_ms: SystemClock::now_ms(),
-        payload: HistoryItemPayload::InterAgentCommunication { communication },
-    };
-    insert_history_item(transaction, &item)?;
-    Ok(item.id)
+    message_id: HistoryItemId,
+    created_at_ms: i64,
+) -> Result<i64, StorageError> {
+    transaction
+        .query_row(
+            "INSERT INTO protocol_item_append_order
+                (session_id, scope_kind, turn_id, sequence_no, source_kind, source_id, created_at_ms)
+             VALUES (?1, 'session', NULL, 0, 'mailbox_message', ?2, ?3)
+             RETURNING append_position",
+            params![
+                session_id.to_string(),
+                message_id.to_string(),
+                created_at_ms
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(StorageError::from)
 }
 
 fn insert_event_bundle_unchecked(
@@ -3618,6 +4160,53 @@ fn insert_history_item(
         "history_item",
         &item.id.to_string(),
         item.created_at_ms,
+    )?;
+    Ok(())
+}
+
+fn insert_forked_turn_steer_provenance(
+    transaction: &Transaction<'_>,
+    item: &HistoryItem,
+) -> Result<(), StorageError> {
+    if !matches!(item.payload, HistoryItemPayload::SteerTurn { .. }) {
+        return Ok(());
+    }
+    let Some(turn_id) = item.turn_id() else {
+        return Err(StorageError::Message(format!(
+            "forked SteerTurn {} is not scoped to a turn",
+            item.id
+        )));
+    };
+    let payload_json = serde_json::to_string(&item.payload)?;
+    transaction.execute(
+        "INSERT INTO turn_steer_inputs (
+             id,
+             session_id,
+             admission_id,
+             turn_id,
+             payload_json,
+             payload_sha256,
+             origin_kind,
+             state,
+             delivered_history_item_id,
+             resolved_by_terminal_event_id,
+             accepted_at_ms,
+             delivered_at_ms,
+             discarded_at_ms,
+             updated_at_ms
+         )
+         VALUES (
+             ?1, ?2, NULL, ?3, ?4, ?5, 'fork', 'delivered',
+             ?1, NULL, ?6, ?6, NULL, ?6
+         )",
+        params![
+            item.id.to_string(),
+            item.session_id.to_string(),
+            turn_id.to_string(),
+            payload_json,
+            hash_text(&payload_json),
+            item.created_at_ms,
+        ],
     )?;
     Ok(())
 }
@@ -4294,6 +4883,348 @@ mod tests {
     }
 
     #[test]
+    fn canonical_user_authority_snapshot_is_exact_after_large_execution_history_and_compaction() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let restricted = history_user_turn(
+            session_id,
+            turn_id,
+            0,
+            100,
+            "operate only inside the current workspace",
+        );
+        let mut history = vec![restricted.clone()];
+        history.extend((0..300).map(|index| HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            scope: HistoryScope::Turn { turn_id },
+            sequence_no: i64::from(index) + 1,
+            created_at_ms: i64::from(index) + 101,
+            payload: HistoryItemPayload::AssistantMessage {
+                response_id: ModelResponseId::new(),
+                content: vec![ContentPart::Text {
+                    text: format!("bounded execution evidence {index}: {}", "x".repeat(128)),
+                }],
+            },
+        }));
+        let continued = history_user_turn(
+            session_id,
+            turn_id,
+            301,
+            500,
+            "continue with the remaining task",
+        );
+        history.push(continued.clone());
+        history.push(HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            scope: HistoryScope::Turn { turn_id },
+            sequence_no: 302,
+            created_at_ms: 501,
+            payload: HistoryItemPayload::Compaction {
+                mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                preserved_user_messages: vec![
+                    "operate only inside the current workspace".to_string(),
+                ],
+                summary: "execution evidence compacted".to_string(),
+                replacement_item_ids: vec![restricted.id],
+            },
+        });
+        seed_history_batch_for_test(&store, &history);
+
+        let authority = store
+            .canonical_user_authority_items_for_session(session_id)
+            .expect("bounded durable user authority");
+
+        assert_eq!(
+            authority.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![restricted.id, continued.id]
+        );
+        assert!(matches!(
+            &authority[0].payload,
+            HistoryItemPayload::UserTurn { content, .. }
+                if matches!(
+                    content.as_slice(),
+                    [ContentPart::Text { text }]
+                        if text == "operate only inside the current workspace"
+                )
+        ));
+        assert!(matches!(
+            &authority[1].payload,
+            HistoryItemPayload::UserTurn { content, .. }
+                if matches!(
+                    content.as_slice(),
+                    [ContentPart::Text { text }]
+                        if text == "continue with the remaining task"
+                )
+        ));
+    }
+
+    #[test]
+    fn canonical_user_authority_read_fails_closed_instead_of_waiting_for_a_busy_connection() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(Arc::clone(&connection));
+        let _busy = connection.lock().expect("hold canonical connection");
+
+        let error = store
+            .canonical_user_authority_items_for_session(SessionId::new())
+            .expect_err("Guardian authority must not wait behind another storage owner");
+
+        assert!(error.to_string().contains("storage is busy"));
+    }
+
+    #[test]
+    fn canonical_user_authority_progress_handler_interrupts_and_is_cleared_before_reuse() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let session_id = SessionId::new();
+
+        let interrupted = store
+            .canonical_user_authority_items_for_session_with_interrupt(
+                session_id,
+                |_| Ok(()),
+                || true,
+            )
+            .expect_err("cancelled authority query must be interrupted");
+        assert!(
+            interrupted
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("interrupt")
+        );
+
+        assert!(
+            store
+                .canonical_user_authority_items_for_session(session_id)
+                .expect("connection is reusable after progress-handler cleanup")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn canonical_user_authority_source_item_limit_accepts_4096_and_rejects_4097() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let user = history_user_turn(session_id, turn_id, 0, 1, "bounded root authority");
+        let mut history = vec![user.clone()];
+        history.extend(
+            (1..MAX_CANONICAL_USER_AUTHORITY_SOURCE_ITEMS).map(|index| HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: i64::try_from(index).unwrap_or(i64::MAX),
+                created_at_ms: i64::try_from(index).unwrap_or(i64::MAX).saturating_add(1),
+                payload: HistoryItemPayload::AssistantMessage {
+                    response_id: ModelResponseId::new(),
+                    content: vec![ContentPart::Text {
+                        text: "bounded non-authority row".to_string(),
+                    }],
+                },
+            }),
+        );
+        seed_history_batch_for_test(&store, &history);
+
+        let at_limit = store
+            .canonical_user_authority_items_for_session(session_id)
+            .expect("4,096 source items are accepted");
+        assert_eq!(at_limit.len(), 1);
+        assert_eq!(at_limit[0].id, user.id);
+
+        seed_history_batch_for_test(
+            &store,
+            &[HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: i64::try_from(MAX_CANONICAL_USER_AUTHORITY_SOURCE_ITEMS)
+                    .unwrap_or(i64::MAX),
+                created_at_ms: 9_999,
+                payload: HistoryItemPayload::AssistantMessage {
+                    response_id: ModelResponseId::new(),
+                    content: vec![ContentPart::Text {
+                        text: "source overflow".to_string(),
+                    }],
+                },
+            }],
+        );
+        let overflow = store
+            .canonical_user_authority_items_for_session(session_id)
+            .expect_err("4,097 source items must fail closed");
+        assert!(
+            overflow
+                .to_string()
+                .contains("bounded history limit of 4096 items")
+        );
+    }
+
+    #[test]
+    fn canonical_user_authority_item_limit_accepts_64_and_rejects_65() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let authority = (0..MAX_CANONICAL_USER_AUTHORITY_ITEMS)
+            .map(|index| {
+                history_user_turn(
+                    session_id,
+                    turn_id,
+                    i64::try_from(index).unwrap_or(i64::MAX),
+                    i64::try_from(index).unwrap_or(i64::MAX),
+                    &format!("authority {index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        seed_history_batch_for_test(&store, &authority);
+
+        assert_eq!(
+            store
+                .canonical_user_authority_items_for_session(session_id)
+                .expect("64 authority items are accepted")
+                .len(),
+            64
+        );
+
+        seed_history_batch_for_test(
+            &store,
+            &[history_user_turn(
+                session_id,
+                turn_id,
+                i64::try_from(MAX_CANONICAL_USER_AUTHORITY_ITEMS).unwrap_or(i64::MAX),
+                1_000,
+                "authority overflow",
+            )],
+        );
+        let overflow = store
+            .canonical_user_authority_items_for_session(session_id)
+            .expect_err("65 authority items must fail closed");
+        assert!(overflow.to_string().contains("has more than 64 items"));
+    }
+
+    #[test]
+    fn canonical_user_authority_source_payload_limit_accepts_exact_boundary_and_rejects_more() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let user = history_user_turn(session_id, turn_id, 0, 1, "root authority");
+        let user_chars = serde_json::to_string(&user.payload)
+            .expect("serialize user payload")
+            .chars()
+            .count();
+        let mut assistant = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            scope: HistoryScope::Turn { turn_id },
+            sequence_no: 1,
+            created_at_ms: 2,
+            payload: HistoryItemPayload::AssistantMessage {
+                response_id: ModelResponseId::new(),
+                content: vec![ContentPart::Text {
+                    text: String::new(),
+                }],
+            },
+        };
+        let empty_assistant_chars = serde_json::to_string(&assistant.payload)
+            .expect("serialize assistant payload")
+            .chars()
+            .count();
+        let filler_chars = MAX_CANONICAL_USER_AUTHORITY_SOURCE_CHARS
+            .checked_sub(user_chars.saturating_add(empty_assistant_chars))
+            .expect("payload limit accommodates fixed JSON");
+        let HistoryItemPayload::AssistantMessage { content, .. } = &mut assistant.payload else {
+            unreachable!("assistant fixture");
+        };
+        let [ContentPart::Text { text }] = content.as_mut_slice() else {
+            unreachable!("assistant text fixture");
+        };
+        *text = "x".repeat(filler_chars);
+        assert_eq!(
+            serde_json::to_string(&user.payload)
+                .expect("serialize user payload")
+                .chars()
+                .count()
+                + serde_json::to_string(&assistant.payload)
+                    .expect("serialize filled assistant payload")
+                    .chars()
+                    .count(),
+            MAX_CANONICAL_USER_AUTHORITY_SOURCE_CHARS
+        );
+        seed_history_batch_for_test(&store, &[user.clone(), assistant]);
+
+        let at_limit = store
+            .canonical_user_authority_items_for_session(session_id)
+            .expect("exact source payload limit is accepted");
+        assert_eq!(at_limit.len(), 1);
+        assert_eq!(at_limit[0].id, user.id);
+
+        seed_history_batch_for_test(
+            &store,
+            &[HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: 2,
+                created_at_ms: 3,
+                payload: HistoryItemPayload::AssistantMessage {
+                    response_id: ModelResponseId::new(),
+                    content: vec![ContentPart::Text {
+                        text: "overflow".to_string(),
+                    }],
+                },
+            }],
+        );
+        let overflow = store
+            .canonical_user_authority_items_for_session(session_id)
+            .expect_err("source payload over 16,000,000 characters must fail closed");
+        assert!(
+            overflow
+                .to_string()
+                .contains("bounded payload limit of 16000000 characters")
+        );
+    }
+
+    #[test]
     fn active_history_hydration_preserves_legacy_summary_prefix_position() {
         let connection = Arc::new(Mutex::new(
             Connection::open_in_memory().expect("in-memory db"),
@@ -4845,6 +5776,192 @@ mod tests {
                 .sequence_no,
             3
         );
+    }
+
+    #[test]
+    fn fork_agent_context_recent_counts_trigger_mail_as_a_boundary_without_copying_it() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let source_session_id = SessionId::new();
+        let target_session_id = SessionId::new();
+        {
+            let locked = store.connection.lock().expect("sqlite mutex");
+            seed_fork_sessions(&locked, &[source_session_id, target_session_id]);
+        }
+
+        let old_turn_id = TurnId::new();
+        let trigger_turn_id = TurnId::new();
+        let current_turn_id = TurnId::new();
+        let old_user = history_user_turn(
+            source_session_id,
+            old_turn_id,
+            0,
+            10,
+            "old context outside the recent window",
+        );
+        let trigger_mail = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: source_session_id,
+            scope: HistoryScope::Turn {
+                turn_id: trigger_turn_id,
+            },
+            sequence_no: 0,
+            created_at_ms: 20,
+            payload: HistoryItemPayload::InterAgentCommunication {
+                communication: crate::protocol::InterAgentCommunication {
+                    author: "/root/reviewer".to_string(),
+                    recipient: "/root".to_string(),
+                    content: "wake the owner for a new turn".to_string(),
+                    trigger_turn: true,
+                },
+            },
+        };
+        let current_user = history_user_turn(
+            source_session_id,
+            current_turn_id,
+            0,
+            30,
+            "current task inside the recent window",
+        );
+        for item in [&old_user, &trigger_mail, &current_user] {
+            store
+                .seed_history_item_for_test(item)
+                .expect("source history");
+        }
+
+        let copied = store
+            .fork_agent_context_recent(source_session_id, target_session_id, 2)
+            .expect("recent agent context fork");
+        let forked = store
+            .list_history_items_for_session(target_session_id)
+            .expect("forked recent history");
+
+        assert_eq!(copied, 1);
+        assert_eq!(forked.len(), 1);
+        assert!(matches!(
+            &forked[0].payload,
+            HistoryItemPayload::UserTurn { content, .. }
+                if matches!(content.as_slice(), [ContentPart::Text { text }]
+                    if text == "current task inside the recent window")
+        ));
+        assert!(!forked.iter().any(|item| matches!(
+            &item.payload,
+            HistoryItemPayload::InterAgentCommunication { .. }
+        )));
+    }
+
+    #[test]
+    fn fork_agent_context_recent_counts_a_compaction_checkpoint_as_one_fork_turn() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let source_session_id = SessionId::new();
+        let one_turn_target = SessionId::new();
+        let two_turn_target = SessionId::new();
+        {
+            let locked = store.connection.lock().expect("sqlite mutex");
+            seed_fork_sessions(
+                &locked,
+                &[source_session_id, one_turn_target, two_turn_target],
+            );
+        }
+
+        let compacted_turn_id = TurnId::new();
+        let current_turn_id = TurnId::new();
+        let replaced_user = history_user_turn(
+            source_session_id,
+            compacted_turn_id,
+            0,
+            10,
+            "obsolete detail",
+        );
+        let checkpoint = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id: source_session_id,
+            scope: HistoryScope::Turn {
+                turn_id: compacted_turn_id,
+            },
+            sequence_no: 1,
+            created_at_ms: 20,
+            payload: HistoryItemPayload::Compaction {
+                mode: crate::protocol::CompactionMode::Automatic,
+                layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                preserved_user_messages: vec!["original task".to_string()],
+                summary: "completed research; implementation is next".to_string(),
+                replacement_item_ids: vec![replaced_user.id],
+            },
+        };
+        let current_user = history_user_turn(
+            source_session_id,
+            current_turn_id,
+            0,
+            30,
+            "implement the planned change",
+        );
+        for item in [&replaced_user, &checkpoint, &current_user] {
+            store
+                .seed_history_item_for_test(item)
+                .expect("source history");
+        }
+
+        assert_eq!(
+            store
+                .fork_agent_context_recent(source_session_id, one_turn_target, 1)
+                .expect("one recent turn"),
+            1
+        );
+        let one_turn = store
+            .list_history_items_for_session(one_turn_target)
+            .expect("one-turn fork");
+        assert!(matches!(
+            one_turn.as_slice(),
+            [HistoryItem {
+                payload: HistoryItemPayload::UserTurn { content, .. },
+                ..
+            }] if matches!(content.as_slice(), [ContentPart::Text { text }]
+                if text == "implement the planned change")
+        ));
+
+        assert_eq!(
+            store
+                .fork_agent_context_recent(source_session_id, two_turn_target, 2)
+                .expect("checkpoint plus current turn"),
+            2
+        );
+        let two_turns = store
+            .list_history_items_for_session(two_turn_target)
+            .expect("two-turn fork");
+        assert!(matches!(
+            two_turns.as_slice(),
+            [
+                HistoryItem {
+                    payload: HistoryItemPayload::Compaction {
+                        summary,
+                        replacement_item_ids,
+                        ..
+                    },
+                    ..
+                },
+                HistoryItem {
+                    payload: HistoryItemPayload::UserTurn { content, .. },
+                    ..
+                }
+            ] if summary == "completed research; implementation is next"
+                && replacement_item_ids.is_empty()
+                && matches!(content.as_slice(), [ContentPart::Text { text }]
+                    if text == "implement the planned change")
+        ));
     }
 
     #[test]
@@ -5792,6 +6909,7 @@ mod tests {
         ));
         let root_session_id = SessionId::new();
         let child_session_id = SessionId::new();
+        let nested_session_id = SessionId::new();
         let admission_a = AdmissionId::new();
         let turn_a = TurnId::new();
         {
@@ -5838,17 +6956,42 @@ mod tests {
                 .expect("child fixture");
             locked
                 .execute(
+                    "INSERT INTO sessions
+                     (id, project_id, title, status, cwd_path, model_name, base_url,
+                      access_mode, model_parameters_json, created_at_ms, updated_at_ms,
+                      completed_at_ms)
+                     VALUES (?1, ?2, 'nested child', 'idle', 'C:/activity-fixture', 'model',
+                             'http://localhost', 'default', '{}', 1, 1, NULL)",
+                    params![nested_session_id.to_string(), project_id.to_string()],
+                )
+                .expect("nested child fixture");
+            locked
+                .execute(
                     "INSERT INTO session_spawn_edges
                      (root_session_id, parent_session_id, child_session_id, agent_path,
-                      task_name, created_at_ms)
-                     VALUES (?1, ?1, ?2, '/root/reviewer', 'reviewer', 1)",
+                      task_name, spawn_order, created_at_ms)
+                     VALUES (?1, ?1, ?2, '/root/reviewer', 'reviewer', 1, 1)",
                     params![root_session_id.to_string(), child_session_id.to_string()],
                 )
                 .expect("direct-child lineage fixture");
+            locked
+                .execute(
+                    "INSERT INTO session_spawn_edges
+                     (root_session_id, parent_session_id, child_session_id, agent_path,
+                      task_name, spawn_order, created_at_ms)
+                     VALUES (?1, ?2, ?3, '/root/reviewer/worker', 'worker', 2, 2)",
+                    params![
+                        root_session_id.to_string(),
+                        child_session_id.to_string(),
+                        nested_session_id.to_string()
+                    ],
+                )
+                .expect("nested-descendant lineage fixture");
         }
         let store = SqliteProtocolEventStore::new(Arc::clone(&connection));
         store
             .append_sub_agent_activity(
+                root_session_id,
                 root_session_id,
                 admission_a,
                 turn_a,
@@ -5886,10 +7029,38 @@ mod tests {
         ));
 
         store
-            .seed_runtime_event_for_test(&completed_terminal_event(root_session_id, turn_a, 1))
+            .append_sub_agent_activity(
+                root_session_id,
+                root_session_id,
+                admission_a,
+                turn_a,
+                "activity-nested".to_string(),
+                nested_session_id,
+                "/root/reviewer/worker".to_string(),
+                SubAgentActivityKind::Interacted,
+            )
+            .expect("nested sub-agent activity append");
+        assert!(matches!(
+            &store
+                .list_history_items(root_session_id, turn_a)
+                .expect("history with nested activity")[1]
+                .payload,
+            HistoryItemPayload::SubAgentActivity {
+                activity_id,
+                agent_session_id,
+                agent_path,
+                ..
+            } if activity_id == "activity-nested"
+                && *agent_session_id == nested_session_id
+                && agent_path == "/root/reviewer/worker"
+        ));
+
+        store
+            .seed_runtime_event_for_test(&completed_terminal_event(root_session_id, turn_a, 2))
             .expect("corrupt running-plus-terminal fixture");
         let corrupt_activity = store
             .append_sub_agent_activity(
+                root_session_id,
                 root_session_id,
                 admission_a,
                 turn_a,
@@ -5909,7 +7080,7 @@ mod tests {
                 .list_history_items(root_session_id, turn_a)
                 .expect("history after rejected corrupt activity")
                 .len(),
-            1
+            2
         );
 
         let admission_b = AdmissionId::new();
@@ -5946,6 +7117,7 @@ mod tests {
         let stale_error = store
             .append_sub_agent_activity(
                 root_session_id,
+                root_session_id,
                 admission_a,
                 turn_a,
                 "delayed-activity-a".to_string(),
@@ -5959,6 +7131,7 @@ mod tests {
         let forged_error = store
             .append_sub_agent_activity(
                 root_session_id,
+                root_session_id,
                 admission_b,
                 turn_b,
                 "forged-path".to_string(),
@@ -5970,6 +7143,7 @@ mod tests {
         assert!(forged_error.to_string().contains("stale"));
         let forged_session_error = store
             .append_sub_agent_activity(
+                root_session_id,
                 root_session_id,
                 admission_b,
                 turn_b,
@@ -5985,7 +7159,7 @@ mod tests {
                 .list_history_items(root_session_id, turn_a)
                 .expect("turn A history after stale append")
                 .len(),
-            1
+            2
         );
         assert!(
             store

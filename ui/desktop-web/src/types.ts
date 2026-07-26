@@ -27,6 +27,14 @@ export interface TranscriptRow {
   file_changes: FileChangeRow[];
 }
 
+export interface PendingTurnInput {
+  id: RowId;
+  turn_id: RowId;
+  text: string;
+  image_count: number;
+  accepted_at_ms: number;
+}
+
 export interface ProjectRow {
   project_id: RowId;
   label: string;
@@ -64,6 +72,7 @@ export interface FileChangeRow {
 export type AgentStatus =
   | "pending_init"
   | "running"
+  | "awaiting_descendants"
   | "interrupted"
   | "completed"
   | "errored"
@@ -79,6 +88,8 @@ export interface AgentActivityRow {
   result_preview: string;
   started_order: number;
   updated: boolean;
+  active_turn_id: RowId | null;
+  can_interrupt: boolean;
 }
 
 export interface AgentExecutionExpectedTarget {
@@ -176,6 +187,11 @@ export interface RunMutationTarget {
   workspacePath: string;
   sessionId: string | null;
   runtimeOwnerToken: string;
+  permissionConfirmationId: string | null;
+}
+
+export interface AgentInterruptExpectedTarget extends AgentExecutionExpectedTarget {
+  expectedTurnId: RowId;
 }
 
 export interface SessionSearchTarget {
@@ -278,6 +294,7 @@ export interface DesktopWebState {
   session_search_include_archived: boolean;
   thread_empty: boolean;
   transcript_rows: TranscriptRow[];
+  pending_turn_inputs: PendingTurnInput[];
   turn_page_offset: number;
   turn_page_limit: number;
   turn_page_total: number;

@@ -34,6 +34,15 @@ pub struct DesktopPlanProjection {
     pub steps: Vec<crate::protocol::PlanStep>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DesktopPendingTurnInputProjection {
+    pub id: String,
+    pub turn_id: String,
+    pub text: String,
+    pub image_count: usize,
+    pub accepted_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopStartupCheckProjection {
     pub key: String,
@@ -84,6 +93,8 @@ pub struct DesktopAgentActivityRow {
     pub result_preview: String,
     pub started_order: u64,
     pub updated: bool,
+    pub active_turn_id: Option<String>,
+    pub can_interrupt: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,7 +142,7 @@ impl DesktopRuntimeProjection {
     }
 
     fn blocks_new_request(&self) -> bool {
-        self.root_run_active() || self.root_run_finalizing || self.agent_tree_active
+        self.root_run_active() || self.root_run_finalizing
     }
 
     fn pre_admission_active(&self, state_busy: bool) -> bool {
@@ -157,12 +168,9 @@ pub(crate) fn navigation_admission_blocker(
     busy: bool,
     background_mutation_pending: bool,
     navigation_loading: bool,
-    agent_tree_active: bool,
     root_run_finalizing: bool,
 ) -> Option<&'static str> {
-    if agent_tree_active {
-        Some("the current agent tree is active")
-    } else if root_run_finalizing {
+    if root_run_finalizing {
         Some("the current run is finalizing")
     } else if busy {
         Some("a run is active")
@@ -262,6 +270,7 @@ pub struct DesktopRunMutationTargetProjection {
     pub workspace_path: String,
     pub session_id: Option<String>,
     pub runtime_owner_token: String,
+    pub permission_confirmation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,6 +330,7 @@ pub struct DesktopWebState {
     pub session_search_include_archived: bool,
     pub thread_empty: bool,
     pub transcript_rows: Vec<DesktopTranscriptRow>,
+    pub pending_turn_inputs: Vec<DesktopPendingTurnInputProjection>,
     pub turn_page_offset: usize,
     pub turn_page_limit: usize,
     pub turn_page_total: usize,
@@ -382,6 +392,24 @@ pub(crate) fn desktop_web_state_with_permission(
     let busy = state_busy || root_run_active;
     let pre_admission_active = runtime.pre_admission_active(state_busy);
     let detail = state.selected_detail();
+    let pending_turn_inputs = state
+        .open_session
+        .as_ref()
+        .filter(|open_session| Some(open_session.session_id()) == state.selected_session_id())
+        .map(|open_session| {
+            open_session
+                .pending_turn_inputs()
+                .iter()
+                .map(|input| DesktopPendingTurnInputProjection {
+                    id: input.id.to_string(),
+                    turn_id: input.turn_id.to_string(),
+                    text: input.text.clone(),
+                    image_count: input.image_count,
+                    accepted_at_ms: input.accepted_at_ms,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let config_editor = ConfigEditorState::from_config(&state.provider_config.effective_config);
     let (review_raw_text, review_status_text, send_enhanced_enabled, send_raw_enabled) =
         if let Some(review) = &state.app_state.prompt_review {
@@ -433,7 +461,6 @@ pub(crate) fn desktop_web_state_with_permission(
         busy,
         state.background_mutation_pending(),
         state.navigation_loading(),
-        runtime.agent_tree_active,
         runtime.root_run_finalizing,
     )
     .is_none();
@@ -609,7 +636,7 @@ pub(crate) fn desktop_web_state_with_permission(
             .collect(),
         composer_submit_mode,
         can_submit: composer_admission_open,
-        can_cancel_run: busy || pending_permission.is_some() || runtime.agent_tree_active,
+        can_cancel_run: busy || pending_permission.is_some(),
         run_target: DesktopRunMutationTargetProjection {
             workspace_path: state.snapshot.workspace_path.clone(),
             session_id: state
@@ -621,6 +648,7 @@ pub(crate) fn desktop_web_state_with_permission(
                 runtime.agent_tree_active,
                 runtime.last_root_run_epoch,
             ),
+            permission_confirmation_id: pending_permission.map(|(id, _)| id.to_string()),
         },
         busy,
         async_polling_required: state.async_polling_required()
@@ -643,6 +671,7 @@ pub(crate) fn desktop_web_state_with_permission(
         session_search_include_archived: state.view.session_search_include_archived,
         thread_empty: detail.thread_empty,
         transcript_rows: detail.transcript_rows,
+        pending_turn_inputs,
         turn_page_offset: detail.turn_page_offset,
         turn_page_limit: detail.turn_page_limit,
         turn_page_total: detail.turn_page_total,
@@ -818,6 +847,8 @@ pub(crate) fn agent_activity_projection(
             result_preview: record.result_preview,
             started_order: record.started_order,
             updated: record.updated,
+            active_turn_id: record.active_turn_id.map(|turn_id| turn_id.to_string()),
+            can_interrupt: record.can_interrupt,
         })
         .collect::<Vec<_>>();
     rows.sort_by_key(|row| row.started_order);
@@ -831,6 +862,7 @@ fn agent_status_key(status: &AgentStatus) -> &'static str {
     match status {
         AgentStatus::PendingInit => "pending_init",
         AgentStatus::Running => "running",
+        AgentStatus::AwaitingDescendants => "awaiting_descendants",
         AgentStatus::Interrupted => "interrupted",
         AgentStatus::Completed(_) => "completed",
         AgentStatus::Errored(_) => "errored",
@@ -1065,7 +1097,7 @@ fn token_meter_projection(
             level_label
         ),
         title: format!(
-            "概算 token 使用量: {} / {} ({}%). 出力予約: {}、overflow margin: {}、残り推定: {}。",
+            "概算 token 使用量: {} / {} ({}%). 設定output上限: {}、configured overflow margin: {}、残り推定: {}。",
             status.active_context_tokens,
             status.full_context_window_limit,
             percent,
@@ -1340,7 +1372,7 @@ mod tests {
     }
 
     #[test]
-    fn root_finalizing_and_agent_tree_close_the_authoritative_composer_gate() {
+    fn root_finalizing_closes_but_child_only_activity_keeps_the_composer_gate_open() {
         assert!(composer_admission_is_open(
             &DesktopRuntimeProjection::default(),
             false,
@@ -1384,7 +1416,7 @@ mod tests {
             false,
             false,
         ));
-        assert!(!composer_admission_is_open(
+        assert!(composer_admission_is_open(
             &DesktopRuntimeProjection {
                 agent_tree_active: true,
                 ..DesktopRuntimeProjection::default()
@@ -1612,11 +1644,6 @@ mod tests {
                 ..DesktopRuntimeProjection::default()
             },
             DesktopRuntimeProjection {
-                agent_tree_active: true,
-                last_root_run_epoch: 5,
-                ..DesktopRuntimeProjection::default()
-            },
-            DesktopRuntimeProjection {
                 root_run_finalizing: true,
                 last_root_run_epoch: 6,
                 ..DesktopRuntimeProjection::default()
@@ -1627,9 +1654,21 @@ mod tests {
                     .config_draft_capabilities
                     .dirty
                     .commit_enabled,
-                "run and tree ownership must close config commit"
+                "root run ownership must close config commit"
             );
         }
+        let child_only = desktop_web_state(
+            &state,
+            &DesktopRuntimeProjection {
+                agent_tree_active: true,
+                last_root_run_epoch: 5,
+                ..DesktopRuntimeProjection::default()
+            },
+        );
+        assert!(
+            child_only.config_draft_capabilities.dirty.commit_enabled,
+            "a detached child-only tree must not retain root config ownership"
+        );
     }
 
     #[test]
@@ -1748,14 +1787,15 @@ mod tests {
             .can_cancel_run
         );
         assert!(
-            desktop_web_state(
+            !desktop_web_state(
                 &state,
                 &DesktopRuntimeProjection {
                     agent_tree_active: true,
                     ..DesktopRuntimeProjection::default()
                 }
             )
-            .can_cancel_run
+            .can_cancel_run,
+            "detached child liveness is not an ordinary root Stop target"
         );
         let permission = PermissionRequest {
             access: crate::workspace::AccessKind::Shell,
@@ -1793,6 +1833,8 @@ mod tests {
                 started_order: 2,
                 updated: true,
                 is_current_turn: false,
+                active_turn_id: None,
+                can_interrupt: false,
             },
             AgentActivityRecord {
                 agent_path: "/root/runtime".to_string(),
@@ -1805,6 +1847,8 @@ mod tests {
                 started_order: 1,
                 updated: false,
                 is_current_turn: true,
+                active_turn_id: Some(crate::protocol::TurnId::new()),
+                can_interrupt: true,
             },
         ]);
 
@@ -1824,6 +1868,7 @@ mod tests {
         let cases = [
             (AgentStatus::PendingInit, "pending_init"),
             (AgentStatus::Running, "running"),
+            (AgentStatus::AwaitingDescendants, "awaiting_descendants"),
             (AgentStatus::Interrupted, "interrupted"),
             (AgentStatus::Completed(None), "completed"),
             (AgentStatus::Errored("failed".to_string()), "errored"),
@@ -1848,6 +1893,8 @@ mod tests {
             started_order: 1,
             updated: false,
             is_current_turn: false,
+            active_turn_id: None,
+            can_interrupt: false,
         }]);
 
         assert_eq!(rows[0].status, "interrupted");
@@ -1859,29 +1906,36 @@ mod tests {
         let status = crate::context::ContextWindowTokenStatus {
             source: crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
             active_context_tokens: 12_345,
-            full_context_window_limit: 131_072,
+            full_context_window_limit: 124_518,
             configured_max_output_tokens: 8_192,
             overflow_margin_tokens: 1_024,
-            tokens_until_limit: 109_511,
+            tokens_until_limit: 112_173,
             token_limit_reached: false,
         };
 
         let projection = token_meter_projection(Some(&status), 131_072);
 
-        assert_eq!(projection.label, "12.3k / 131k 低い");
+        assert_eq!(projection.label, "12.3k / 124k 低い");
         assert_eq!(projection.level, "low");
-        assert!(projection.title.contains("12345 / 131072"));
+        assert!(projection.title.contains("12345 / 124518"));
+        assert!(projection.title.contains("設定output上限: 8192"));
+        assert!(
+            projection
+                .title
+                .contains("configured overflow margin: 1024")
+        );
+        assert!(!projection.title.contains("出力予約"));
     }
 
     #[test]
     fn token_meter_projection_marks_reached_limit() {
         let status = crate::context::ContextWindowTokenStatus {
             source: crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
-            active_context_tokens: 130_000,
-            full_context_window_limit: 131_072,
+            active_context_tokens: 125_000,
+            full_context_window_limit: 124_518,
             configured_max_output_tokens: 8_192,
             overflow_margin_tokens: 1_024,
-            tokens_until_limit: -8_144,
+            tokens_until_limit: -482,
             token_limit_reached: true,
         };
 

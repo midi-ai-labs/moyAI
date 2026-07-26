@@ -29,6 +29,8 @@ pub struct SessionRuntimeEventPublisher {
 struct SessionRuntimeEventHubState {
     buffer: usize,
     senders: HashMap<SessionId, broadcast::Sender<RuntimeEvent>>,
+    published_event_order: HashMap<SessionId, VecDeque<RuntimeEventId>>,
+    published_event_ids: HashMap<SessionId, HashSet<RuntimeEventId>>,
 }
 
 pub struct SessionRuntimeEventSubscription {
@@ -117,6 +119,8 @@ impl SessionRuntimeEventHub {
             state: Arc::new(Mutex::new(SessionRuntimeEventHubState {
                 buffer: buffer.max(1),
                 senders: HashMap::new(),
+                published_event_order: HashMap::new(),
+                published_event_ids: HashMap::new(),
             })),
         }
     }
@@ -157,13 +161,33 @@ impl SessionRuntimeEventHub {
 
 impl SessionRuntimeEventPublisher {
     pub fn publish(&self, event: RuntimeEvent) -> Result<(), RuntimeError> {
-        let sender = self
-            .state
-            .lock()
-            .expect("session event hub mutex poisoned")
-            .senders
-            .get(&event.session_id)
-            .cloned();
+        let mut state = self.state.lock().expect("session event hub mutex poisoned");
+        let session_id = event.session_id;
+        if state
+            .published_event_ids
+            .get(&session_id)
+            .is_some_and(|ids| ids.contains(&event.id))
+        {
+            return Ok(());
+        }
+        let buffer = state.buffer;
+        state
+            .published_event_ids
+            .entry(session_id)
+            .or_default()
+            .insert(event.id);
+        let evicted = {
+            let order = state.published_event_order.entry(session_id).or_default();
+            order.push_back(event.id);
+            (order.len() > buffer).then(|| order.pop_front()).flatten()
+        };
+        if let Some(evicted) = evicted
+            && let Some(ids) = state.published_event_ids.get_mut(&session_id)
+        {
+            ids.remove(&evicted);
+        }
+        let sender = state.senders.get(&session_id).cloned();
+        drop(state);
         let Some(sender) = sender else {
             return Ok(());
         };
@@ -219,6 +243,15 @@ impl SessionRuntimeEventSubscription {
                 return Ok(event);
             }
         }
+    }
+
+    /// Replaces only the bounded live receiver.
+    ///
+    /// The caller retains its durable append cursor and must replay from that
+    /// cursor after a lag. A broadcast channel is a wake-up optimization, not
+    /// the owner of canonical runtime history.
+    pub fn resubscribe(&mut self) {
+        self.receiver = self.sender.subscribe();
     }
 
     pub fn with_backfill(mut self, backfill: Vec<RuntimeEvent>) -> Self {
@@ -423,6 +456,77 @@ mod tests {
                 .expect("first retained")
                 .sequence_no,
             25
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_canonical_runtime_event_id_is_published_only_once() {
+        let hub = super::SessionRuntimeEventHub::new(8);
+        let publisher = hub.publisher();
+        let session_id = SessionId::new();
+        let event = RuntimeEvent {
+            id: RuntimeEventId::new(),
+            session_id,
+            turn_id: TurnId::new(),
+            sequence_no: 4,
+            created_at_ms: 1,
+            msg: RuntimeEventMsg::Warning {
+                message: "canonical once".to_string(),
+            },
+        };
+        let mut subscription = hub.subscribe(session_id);
+
+        publisher.publish(event.clone()).expect("first publish");
+        publisher
+            .publish(event.clone())
+            .expect("deduplicated publish");
+
+        assert_eq!(
+            subscription.recv().await.expect("one live event").id,
+            event.id
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), subscription.recv())
+                .await
+                .is_err(),
+            "the same canonical event id must not be delivered twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn lagged_subscription_can_resubscribe_without_replacing_its_durable_owner() {
+        let hub = super::SessionRuntimeEventHub::new(1);
+        let publisher = hub.publisher();
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let mut subscription = hub.subscribe(session_id);
+        let event = |sequence_no| RuntimeEvent {
+            id: RuntimeEventId::new(),
+            session_id,
+            turn_id,
+            sequence_no,
+            created_at_ms: sequence_no,
+            msg: RuntimeEventMsg::Warning {
+                message: sequence_no.to_string(),
+            },
+        };
+
+        publisher.publish(event(1)).expect("first wake");
+        publisher.publish(event(2)).expect("second wake");
+        assert!(
+            subscription.recv().await.is_err(),
+            "the bounded receiver deterministically reports lag"
+        );
+
+        subscription.resubscribe();
+        publisher.publish(event(3)).expect("replacement wake");
+        assert_eq!(
+            subscription
+                .recv()
+                .await
+                .expect("wake after resubscribe")
+                .sequence_no,
+            3
         );
     }
 

@@ -106,7 +106,7 @@ impl PatchParser {
                 }
                 if hunks.is_empty() {
                     return Err(PatchError::Message(format!(
-                        "update file section `{path}` must include at least one hunk line"
+                        "update file section `{path}` must include at least one hunk; after `*** Update File: {path}`, add `@@`, then prefix each body line with one space for context, `-` for deletion, or `+` for insertion"
                     )));
                 }
                 operations.push(PatchOperation::Update {
@@ -156,6 +156,10 @@ impl PatchParser {
 
         output.extend(original_lines[cursor..].iter().cloned());
         Ok(output.join("\n"))
+    }
+
+    pub fn has_context_free_replacement(hunks: &[PatchChunk]) -> bool {
+        hunks.iter().any(is_implicit_full_rewrite)
     }
 }
 
@@ -345,7 +349,7 @@ fn parse_hunk(header: &str, lines: &[&str], index: &mut usize) -> Result<PatchCh
             Some('-') => PatchLine::Delete(line[1..].to_string()),
             _ => {
                 return Err(PatchError::Message(format!(
-                    "unexpected patch hunk line `{line}`"
+                    "unexpected patch hunk line `{line}`; every update hunk body line must start with one space for context, `-` for deletion, or `+` for insertion"
                 )));
             }
         };
@@ -385,7 +389,7 @@ fn parse_implicit_hunk(lines: &[&str], index: &mut usize) -> Result<PatchChunk, 
             Some('-') => PatchLine::Delete(line[1..].to_string()),
             _ => {
                 return Err(PatchError::Message(format!(
-                    "unexpected patch hunk line `{line}`"
+                    "unexpected patch hunk line `{line}`; every update hunk body line must start with one space for context, `-` for deletion, or `+` for insertion"
                 )));
             }
         };
@@ -450,4 +454,38 @@ fn parse_range(value: &str) -> Result<(usize, usize), PatchError> {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::PatchParser;
+
+    #[test]
+    fn invalid_update_line_reports_the_required_prefixes() {
+        let error = PatchParser::parse(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\nunprefixed\n*** End Patch",
+        )
+        .expect_err("unprefixed update line must fail");
+        let message = error.to_string();
+        for required in [
+            "one space for context",
+            "`-` for deletion",
+            "`+` for insertion",
+        ] {
+            assert!(
+                message.contains(required),
+                "patch feedback omitted `{required}`: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_update_reports_a_complete_minimal_hunk_shape() {
+        let error = PatchParser::parse("*** Begin Patch\n*** Update File: a.txt\n*** End Patch")
+            .expect_err("empty update must fail");
+        let message = error.to_string();
+        for required in ["add `@@`", "one space for context", "`-`", "`+`"] {
+            assert!(
+                message.contains(required),
+                "empty update feedback omitted `{required}`: {message}"
+            );
+        }
+    }
+}

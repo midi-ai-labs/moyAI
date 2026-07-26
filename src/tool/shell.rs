@@ -83,17 +83,22 @@ impl Tool for ShellTool {
         mut ctx: ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<ShellInput>(raw_arguments)?;
-        let permission = shell_permission_intent(ctx.workspace, ctx.config, &input)?;
-        let guarded = permission.guarded;
-        let description = permission.description;
+        let ShellPermissionIntent {
+            guarded,
+            description,
+            details,
+            targets,
+            outside_workspace,
+            risks,
+        } = shell_permission_intent(ctx.workspace, ctx.config, &input)?;
         let effect_admission = ctx
             .confirm_if_needed_with_details(
                 AccessKind::Shell,
                 description.clone(),
-                permission.details,
-                vec![guarded.absolute.clone()],
-                permission.outside_workspace,
-                permission.risks,
+                details,
+                targets,
+                outside_workspace,
+                risks,
             )
             .await?;
         let timeout_ms = input
@@ -170,6 +175,7 @@ struct ShellPermissionIntent {
     guarded: GuardedPath,
     description: String,
     details: Vec<String>,
+    targets: Vec<Utf8PathBuf>,
     outside_workspace: bool,
     risks: Vec<PermissionRisk>,
 }
@@ -210,6 +216,7 @@ fn shell_permission_intent(
         risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
     }
     let mut details = shell_permission_details(&input.command, &guarded.absolute);
+    let targets = shell_permission_targets(&guarded, &input.command);
     if requested_elevation {
         details.push(format!(
             "Requested sandbox elevation: {}",
@@ -220,9 +227,23 @@ fn shell_permission_intent(
         guarded,
         description,
         details,
+        targets,
         outside_workspace,
         risks,
     })
+}
+
+fn shell_permission_targets(guarded_workdir: &GuardedPath, command: &str) -> Vec<Utf8PathBuf> {
+    let mut targets = vec![guarded_workdir.absolute.clone()];
+    for extracted in extract_absolute_paths(&guarded_workdir.absolute, command) {
+        let target =
+            crate::workspace::project::normalize_path(&guarded_workdir.absolute, &extracted)
+                .unwrap_or(extracted);
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    targets
 }
 
 fn shell_requested_elevation(input: &ShellInput) -> Result<bool, ToolError> {
@@ -522,20 +543,25 @@ fn path_is_outside_writable_boundary(
 fn extract_absolute_paths(workdir: &Utf8Path, command: &str) -> Vec<Utf8PathBuf> {
     let mut paths = Vec::new();
     let mut quoted_path_ranges = Vec::new();
-    let quoted = Regex::new(r#""([^"]+)"|'([^']+)'"#).expect("quoted shell value regex");
-    for capture in quoted.captures_iter(command) {
-        let Some(candidate) = capture.get(1).or_else(|| capture.get(2)) else {
-            continue;
-        };
-        let resolved = if cfg!(windows) {
-            resolve_quoted_windows_path(workdir, candidate.as_str())
-        } else {
-            let path = Utf8PathBuf::from(candidate.as_str());
-            path.is_absolute().then_some(path)
-        };
-        if let Some(path) = resolved {
-            paths.push(path);
-            quoted_path_ranges.push(candidate.start()..candidate.end());
+    let quoted_values = [
+        Regex::new(r#""([^"]+)""#).expect("double-quoted shell value regex"),
+        Regex::new(r"'([^']+)'").expect("single-quoted shell value regex"),
+    ];
+    for quoted in &quoted_values {
+        for capture in quoted.captures_iter(command) {
+            let Some(candidate) = capture.get(1) else {
+                continue;
+            };
+            let resolved = if cfg!(windows) {
+                resolve_quoted_windows_path(workdir, candidate.as_str())
+            } else {
+                let path = Utf8PathBuf::from(candidate.as_str());
+                path.is_absolute().then_some(path)
+            };
+            if let Some(path) = resolved {
+                paths.push(path);
+                quoted_path_ranges.push(candidate.start()..candidate.end());
+            }
         }
     }
 
@@ -1040,6 +1066,105 @@ mod tests {
         assert!(details[2].contains("current user account"));
         assert!(details[2].contains("workspace-write OS sandbox"));
         assert!(details[2].contains("advisory network controls"));
+    }
+
+    #[test]
+    fn shell_permission_targets_include_detected_absolute_effect_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let external = if cfg!(windows) {
+            Utf8PathBuf::from(r"C:\outside\pytest-target")
+        } else {
+            Utf8PathBuf::from("/outside/pytest-target")
+        };
+        let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+            "command": format!("Remove-Item -Recurse -Force '{}'", external)
+        }))
+        .expect("shell input");
+
+        let intent =
+            super::shell_permission_intent(&workspace, &config, &input).expect("permission intent");
+
+        assert_eq!(intent.targets.first(), Some(&workspace.cwd));
+        assert!(intent.targets.contains(&external));
+        assert!(intent.outside_workspace);
+        assert!(
+            intent
+                .risks
+                .contains(&crate::tool::PermissionRisk::DestructiveDelete)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_permission_targets_extract_nested_quoted_windows_path_with_spaces() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let external = Utf8PathBuf::from(r"C:\outside folder\pytest target.txt");
+        let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+            "command": format!(
+                "powershell -NoProfile -Command \"Remove-Item -LiteralPath '{}'\"",
+                external
+            )
+        }))
+        .expect("shell input");
+
+        let intent =
+            super::shell_permission_intent(&workspace, &config, &input).expect("permission intent");
+
+        assert_eq!(intent.targets, vec![workspace.cwd.clone(), external]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_permission_targets_extract_multiple_nested_absolute_paths_exactly() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let source = Utf8PathBuf::from(r"C:\source folder\input.txt");
+        let destination = Utf8PathBuf::from(r"D:\archive folder\output.txt");
+        let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+            "command": format!(
+                "powershell -NoProfile -Command \"Copy-Item -LiteralPath '{}' -Destination '{}'\"",
+                source, destination
+            )
+        }))
+        .expect("shell input");
+
+        let intent =
+            super::shell_permission_intent(&workspace, &config, &input).expect("permission intent");
+
+        assert_eq!(
+            intent.targets,
+            vec![workspace.cwd.clone(), source, destination]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_permission_targets_extract_nested_quoted_unc_path_with_spaces() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let external = Utf8PathBuf::from(r"\\server\shared folder\pytest target.txt");
+        let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+            "command": format!(
+                "powershell -NoProfile -Command \"Remove-Item -LiteralPath '{}'\"",
+                external
+            )
+        }))
+        .expect("shell input");
+
+        let intent =
+            super::shell_permission_intent(&workspace, &config, &input).expect("permission intent");
+
+        assert_eq!(intent.targets, vec![workspace.cwd.clone(), external]);
     }
 
     #[test]

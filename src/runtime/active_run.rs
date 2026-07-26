@@ -36,6 +36,7 @@ pub enum ActiveRunInterruptOutcome {
     Applied,
     Deferred,
     AlreadyClassified,
+    TargetChanged,
     NotActive,
 }
 
@@ -77,9 +78,10 @@ impl ActiveRunRegistry {
             .unwrap_or(false)
     }
 
-    pub fn cancel(
+    pub fn cancel_turn(
         &self,
         session_id: SessionId,
+        expected_turn_id: TurnId,
         cause: TurnInterruptionCause,
     ) -> ActiveRunInterruptOutcome {
         let Ok(state) = self.lock() else {
@@ -88,6 +90,9 @@ impl ActiveRunRegistry {
         let Some(run) = state.runs.get(&session_id) else {
             return ActiveRunInterruptOutcome::NotActive;
         };
+        if run.turn_id != Some(expected_turn_id) {
+            return ActiveRunInterruptOutcome::TargetChanged;
+        }
         match run
             .control
             .request_cancel(crate::runtime::RunCancellationCause::Interruption(cause))
@@ -298,11 +303,11 @@ mod tests {
             observed
         );
         assert_eq!(
-            registry.cancel(session_id, TurnInterruptionCause::UserStop),
+            registry.cancel_turn(session_id, turn_id, TurnInterruptionCause::UserStop),
             ActiveRunInterruptOutcome::Applied
         );
         assert_eq!(
-            registry.cancel(session_id, TurnInterruptionCause::ApprovalAborted),
+            registry.cancel_turn(session_id, turn_id, TurnInterruptionCause::ApprovalAborted),
             ActiveRunInterruptOutcome::AlreadyClassified,
             "a later classification cannot replace the first interruption cause"
         );
@@ -323,10 +328,12 @@ mod tests {
         let _lease = registry
             .try_start(session_id, control.clone())
             .expect("register run");
+        let turn_id = TurnId::new();
+        _lease.set_turn_id(turn_id).expect("set turn");
 
         assert!(control.fail("provider transport failed"));
         assert_eq!(
-            registry.cancel(session_id, TurnInterruptionCause::UserStop),
+            registry.cancel_turn(session_id, turn_id, TurnInterruptionCause::UserStop),
             ActiveRunInterruptOutcome::AlreadyClassified
         );
         assert_eq!(
@@ -345,16 +352,18 @@ mod tests {
         let _lease = registry
             .try_start(session_id, control.clone())
             .expect("register run");
+        let turn_id = TurnId::new();
+        _lease.set_turn_id(turn_id).expect("set turn");
         let success_commit = control
             .begin_success_commit()
             .expect("reserve success commit");
 
         assert_eq!(
-            registry.cancel(session_id, TurnInterruptionCause::UserStop),
+            registry.cancel_turn(session_id, turn_id, TurnInterruptionCause::UserStop),
             ActiveRunInterruptOutcome::Deferred
         );
         assert_eq!(
-            registry.cancel(session_id, TurnInterruptionCause::ApprovalAborted),
+            registry.cancel_turn(session_id, turn_id, TurnInterruptionCause::ApprovalAborted),
             ActiveRunInterruptOutcome::AlreadyClassified
         );
         assert_eq!(control.cause(), None);
@@ -362,6 +371,37 @@ mod tests {
 
         assert!(success_commit.seal());
         assert!(control.success_is_sealed());
+    }
+
+    #[test]
+    fn stale_turn_cancel_does_not_interrupt_replacement_run() {
+        let registry = ActiveRunRegistry::default();
+        let session_id = SessionId::new();
+        let old_turn_id = TurnId::new();
+        let old_lease = registry
+            .try_start(session_id, RunControl::new())
+            .expect("register old run");
+        old_lease.set_turn_id(old_turn_id).expect("set old turn");
+        drop(old_lease);
+
+        let replacement_control = RunControl::new();
+        let replacement_lease = registry
+            .try_start(session_id, replacement_control.clone())
+            .expect("register replacement run");
+        let replacement_turn_id = TurnId::new();
+        replacement_lease
+            .set_turn_id(replacement_turn_id)
+            .expect("set replacement turn");
+
+        assert_eq!(
+            registry.cancel_turn(session_id, old_turn_id, TurnInterruptionCause::TreeStopped),
+            ActiveRunInterruptOutcome::TargetChanged
+        );
+        assert!(!replacement_control.is_cancelled());
+        assert_eq!(
+            registry.active_turn_id(session_id),
+            Some(replacement_turn_id)
+        );
     }
 
     #[tokio::test]

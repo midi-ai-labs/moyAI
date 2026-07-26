@@ -238,7 +238,7 @@ impl EditSafety {
     ) -> Result<(), EditError> {
         let stamp = self.get_stamp(session_id, path).ok_or_else(|| {
             EditError::Message(format!(
-                "no edit baseline exists for path `{path}` in this session"
+                "no full-content write baseline exists for path `{path}` in this session; read the complete UTF-8 file before replacing it, or use apply_patch for a targeted update when the file does not fit in one read"
             ))
         })?;
         if stamp.mtime_ms != current.mtime_ms

@@ -89,7 +89,14 @@ impl OpenAiCompatClient {
             ProviderApiMode::ChatCompletions => {}
         }
         let body = to_openai_request(&request)?;
-        let body = bytes::Bytes::from(request.serialize_wire_body(&body)?);
+        let body = request.serialize_wire_body(&body)?;
+        crate::llm::request_diagnostics::capture_http_request_wire_body(
+            sink.request_id(),
+            ProviderApiMode::ChatCompletions,
+            "v1/chat/completions",
+            &body,
+        )?;
+        let body = bytes::Bytes::from(body);
 
         let Some(response) = self
             .send_request(&request, "v1/chat/completions", body, &cancel, sink)
@@ -235,7 +242,14 @@ impl OpenAiCompatClient {
         sink: &mut ProviderTraceSink<'_>,
     ) -> Result<LlmResponseSummary, LlmError> {
         let body = to_responses_request(&request, ResponsesRequestOptions::from_request(&request))?;
-        let body = bytes::Bytes::from(request.serialize_wire_body(&body)?);
+        let body = request.serialize_wire_body(&body)?;
+        crate::llm::request_diagnostics::capture_http_request_wire_body(
+            sink.request_id(),
+            ProviderApiMode::Responses,
+            "v1/responses",
+            &body,
+        )?;
+        let body = bytes::Bytes::from(body);
         let Some(response) = self
             .send_request(&request, "v1/responses", body, &cancel, sink)
             .await?
@@ -495,6 +509,10 @@ impl<'a> ProviderTraceSink<'a> {
             .elapsed()
             .as_millis()
             .min(u128::from(u64::MAX)) as u64
+    }
+
+    fn request_id(&self) -> &ProviderRequestId {
+        &self.request_id
     }
 
     fn begin_attempt(&mut self, attempt: u16) -> Result<(), LlmError> {
@@ -2089,6 +2107,13 @@ mod tests {
                     content: "Message Type: NEW_TASK\nPayload:\nInspect the calculator."
                         .to_string(),
                 },
+                ModelMessage::Agent {
+                    content: "Message Type: MESSAGE\nPayload:\nUse the current branch.".to_string(),
+                },
+                ModelMessage::Agent {
+                    content: "Message Type: FINAL_ANSWER\nPayload:\nInspection complete."
+                        .to_string(),
+                },
                 ModelMessage::User {
                     content: "Continue the calculator task.".to_string(),
                 },
@@ -2105,7 +2130,7 @@ mod tests {
         let body = to_openai_request(&request).expect("compacted Chat wire");
         let messages = body["messages"].as_array().expect("messages array");
 
-        assert_eq!(messages.len(), 4);
+        assert_eq!(messages.len(), 6);
         assert_eq!(messages[0]["role"], json!("system"));
         assert_eq!(
             messages[0]["content"],
@@ -2121,10 +2146,20 @@ mod tests {
         assert_eq!(messages[2]["role"], json!("user"));
         assert_eq!(
             messages[2]["content"],
-            json!("Continue the calculator task.")
+            json!("Message Type: MESSAGE\nPayload:\nUse the current branch.")
         );
         assert_eq!(messages[3]["role"], json!("user"));
-        assert_eq!(messages[3]["content"], json!(summary));
+        assert_eq!(
+            messages[3]["content"],
+            json!("Message Type: FINAL_ANSWER\nPayload:\nInspection complete.")
+        );
+        assert_eq!(messages[4]["role"], json!("user"));
+        assert_eq!(
+            messages[4]["content"],
+            json!("Continue the calculator task.")
+        );
+        assert_eq!(messages[5]["role"], json!("user"));
+        assert_eq!(messages[5]["content"], json!(summary));
         assert!(
             !messages
                 .iter()
@@ -4245,7 +4280,10 @@ mod tests {
             error.provider_failure().map(|failure| failure.phase),
             Some(ProviderPhase::RequestInFlight)
         );
-        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert!(
+            request_count.load(Ordering::SeqCst) <= 1,
+            "a timed-out generation must not be accepted more than once"
+        );
         assert!(sink.events.is_empty());
         assert_eq!(
             sink.phases

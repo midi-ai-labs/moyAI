@@ -29,7 +29,7 @@ impl Tool for ReadTool {
         ToolSpec {
             name: ToolName::Read,
             effect: crate::tool::ToolEffectPolicy::read(),
-            description: "Read a bounded UTF-8 or Shift_JIS text range with line numbers. A write baseline is recorded only when a UTF-8 read exposes the complete file without output truncation.",
+            description: "Read a bounded UTF-8 or Shift_JIS text range with line numbers. A full-content write baseline is recorded only when a UTF-8 read exposes the complete file without output truncation; targeted apply_patch updates match context against the current file and do not require this baseline.",
             input_schema: json!({
                 "type": "object",
                 "required": ["path"],
@@ -139,25 +139,19 @@ impl Tool for ReadTool {
         let lines = text.lines().collect::<Vec<_>>();
         let offset = input.offset.unwrap_or(1).max(1);
         let limit = input.limit.unwrap_or(2_000).max(1);
-        let slice = lines
-            .iter()
-            .enumerate()
-            .skip(offset - 1)
-            .take(limit)
-            .map(|(index, line)| format!("{}: {}", index + 1, line))
-            .collect::<Vec<_>>();
-        let output = slice.join("\n");
-        let preview = ctx.services.truncator.preview(
-            output,
-            &ctx.config.tool_output,
-            &ctx.services.storage_paths,
+        let page = bounded_line_page(
+            &lines,
+            offset,
+            limit,
+            ctx.config.tool_output.max_lines,
+            ctx.config.tool_output.max_bytes,
         )?;
 
         let baseline = edit_baseline_decision(
             offset,
-            slice.len(),
+            page.visible_line_count,
             lines.len(),
-            preview.truncated,
+            page.has_more,
             source_encoding == crate::tool::text_encoding::TextEncoding::Utf8,
         );
 
@@ -186,24 +180,84 @@ impl Tool for ReadTool {
         )?;
         Ok(ToolResult {
             title: format!("Read {}", opened.absolute()),
-            output_text: preview.preview_text,
+            output_text: page.output_text,
             metadata: json!({
                 "path": opened.absolute(),
                 "size_bytes": size_bytes,
                 "start_line": offset,
-                "end_line": (offset - 1) + slice.len(),
+                "end_line": page.end_line,
                 "total_lines": lines.len(),
                 "encoding": source_encoding.label(),
-                "truncated": preview.truncated,
+                "truncated": page.has_more,
+                "truncation_kind": if page.has_more { Some("line_page") } else { None },
+                "next_offset": page.has_more.then(|| page.end_line.saturating_add(1)),
                 "edit_baseline": baseline.metadata(),
                 "instruction_sources": instruction_sources,
             }),
-            truncated_output_path: preview.truncated_output_path,
+            truncated_output_path: None,
             recorded_changes: Vec::new(),
             change_summaries: Vec::new(),
-            _internal_file_lease: preview.internal_file_lease,
+            _internal_file_lease: None,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundedLinePage {
+    output_text: String,
+    visible_line_count: usize,
+    end_line: usize,
+    has_more: bool,
+}
+
+fn bounded_line_page(
+    lines: &[&str],
+    offset: usize,
+    requested_limit: usize,
+    max_lines: usize,
+    max_bytes: usize,
+) -> Result<BoundedLinePage, ToolError> {
+    let offset = offset.max(1);
+    let start_index = offset.saturating_sub(1).min(lines.len());
+    let line_limit = requested_limit.max(1).min(max_lines.max(1));
+    let byte_limit = max_bytes.max(1);
+    let mut output_text = String::new();
+    let mut visible_line_count = 0usize;
+
+    for (index, line) in lines.iter().enumerate().skip(start_index).take(line_limit) {
+        let rendered = format!("{}: {}", index + 1, line);
+        if rendered.len() > byte_limit && visible_line_count == 0 {
+            return Err(ToolError::Message(format!(
+                "line {} requires {} UTF-8 bytes after numbering, exceeding tool_output.max_bytes={byte_limit}; use a targeted search or shell command for this line",
+                index + 1,
+                rendered.len()
+            )));
+        }
+        let separator_bytes = usize::from(visible_line_count > 0);
+        if output_text
+            .len()
+            .saturating_add(separator_bytes)
+            .saturating_add(rendered.len())
+            > byte_limit
+        {
+            break;
+        }
+        if separator_bytes > 0 {
+            output_text.push('\n');
+        }
+        output_text.push_str(&rendered);
+        visible_line_count = visible_line_count.saturating_add(1);
+    }
+
+    let end_line = start_index
+        .saturating_add(visible_line_count)
+        .min(lines.len());
+    Ok(BoundedLinePage {
+        output_text,
+        visible_line_count,
+        end_line,
+        has_more: end_line < lines.len(),
+    })
 }
 
 fn read_up_to_limit(reader: &mut impl Read, max_bytes: u64) -> std::io::Result<(Vec<u8>, bool)> {
@@ -393,7 +447,7 @@ mod tests {
     use crate::workspace::{AccessKind, PathGuard, WorkspaceDiscovery};
 
     use super::{
-        edit_baseline_decision, find_instruction_sources, read_up_to_limit,
+        bounded_line_page, edit_baseline_decision, find_instruction_sources, read_up_to_limit,
         record_edit_baseline_if_eligible, require_readable_file_metadata,
     };
 
@@ -628,6 +682,53 @@ mod tests {
         assert_eq!(bytes.len(), 33);
     }
 
+    #[test]
+    fn bounded_line_page_stops_before_the_first_incomplete_line() {
+        let page =
+            bounded_line_page(&["aaaa", "bbbb", "cccc"], 1, 10, 10, 15).expect("bounded page");
+
+        assert_eq!(page.output_text, "1: aaaa\n2: bbbb");
+        assert_eq!(page.visible_line_count, 2);
+        assert_eq!(page.end_line, 2);
+        assert!(page.has_more);
+        assert!(page.output_text.len() <= 15);
+    }
+
+    #[test]
+    fn bounded_line_page_applies_offset_requested_limit_and_max_lines() {
+        let limited =
+            bounded_line_page(&["one", "two", "three"], 2, 1, 10, 1_024).expect("limited page");
+        assert_eq!(limited.output_text, "2: two");
+        assert_eq!(limited.end_line, 2);
+        assert!(limited.has_more);
+
+        let max_lines =
+            bounded_line_page(&["one", "two", "three"], 1, 10, 2, 1_024).expect("line page");
+        assert_eq!(max_lines.output_text, "1: one\n2: two");
+        assert_eq!(max_lines.visible_line_count, 2);
+        assert_eq!(max_lines.end_line, 2);
+        assert!(max_lines.has_more);
+    }
+
+    #[test]
+    fn bounded_line_page_rejects_a_single_line_that_cannot_be_shown_completely() {
+        let error = bounded_line_page(&["0123456789"], 1, 1, 1, 8)
+            .expect_err("partial source lines must not be projected");
+
+        assert!(error.to_string().contains("line 1 requires"));
+        assert!(error.to_string().contains("tool_output.max_bytes=8"));
+    }
+
+    #[test]
+    fn bounded_line_page_marks_a_complete_file_as_complete() {
+        let page =
+            bounded_line_page(&["one", "two"], 1, 2_000, 2_000, 50 * 1024).expect("full page");
+
+        assert_eq!(page.output_text, "1: one\n2: two");
+        assert_eq!(page.end_line, 2);
+        assert!(!page.has_more);
+    }
+
     fn stamp_for(path: &camino::Utf8Path) -> (FileReadStamp, crate::edit::FileContentIdentity) {
         let (_, identity) = read_file_with_identity(path, 1_024).expect("read identity");
         (
@@ -658,13 +759,12 @@ mod tests {
         assert!(!decision.recorded);
         assert_eq!(decision.reason, "partial_line_range");
         assert!(safety.get_stamp(session_id, &path).is_none());
-        assert!(
-            safety
-                .assert_fresh_write(session_id, &path, &identity)
-                .expect_err("write after partial read must be rejected")
-                .to_string()
-                .contains("no edit baseline exists")
-        );
+        let error = safety
+            .assert_fresh_write(session_id, &path, &identity)
+            .expect_err("write after partial read must be rejected")
+            .to_string();
+        assert!(error.contains("no full-content write baseline exists"));
+        assert!(error.contains("use apply_patch for a targeted update"));
     }
 
     #[test]
@@ -684,13 +784,12 @@ mod tests {
         assert!(!decision.recorded);
         assert_eq!(decision.reason, "preview_truncated");
         assert!(safety.get_stamp(session_id, &path).is_none());
-        assert!(
-            safety
-                .assert_fresh_write(session_id, &path, &identity)
-                .expect_err("write after preview-truncated read must be rejected")
-                .to_string()
-                .contains("no edit baseline exists")
-        );
+        let error = safety
+            .assert_fresh_write(session_id, &path, &identity)
+            .expect_err("write after preview-truncated read must be rejected")
+            .to_string();
+        assert!(error.contains("no full-content write baseline exists"));
+        assert!(error.contains("use apply_patch for a targeted update"));
     }
 
     #[test]

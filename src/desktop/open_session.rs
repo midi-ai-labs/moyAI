@@ -45,6 +45,10 @@ impl OpenSessionView {
         self.read.active_turn_id
     }
 
+    pub fn pending_turn_inputs(&self) -> &[crate::session::PendingTurnInputProjection] {
+        &self.read.pending_turn_inputs
+    }
+
     pub fn merge_contiguous(&mut self, incoming: &CanonicalSessionRead) -> bool {
         if self.session_id() != incoming.session.id
             || incoming.session.id != incoming.turns.session.id
@@ -69,6 +73,11 @@ impl OpenSessionView {
         read.turns = turns;
         read.turns.session = read.session.clone();
         read.turn_elapsed_ms = turn_elapsed_ms;
+        // The queue projection and canonical transcript are read from one
+        // repository snapshot. Never merge pending input by visible text or
+        // retain it from an older page: the incoming snapshot is authoritative
+        // for the pending -> delivered transition.
+        read.pending_turn_inputs = incoming.pending_turn_inputs.clone();
         self.stored_detail = build_session_detail(&read, None);
         self.read = read;
         true
@@ -85,6 +94,7 @@ impl OpenSessionView {
         }
         self.read.session = incoming.session.clone();
         self.read.history = incoming.history.clone();
+        self.read.pending_turn_inputs = incoming.pending_turn_inputs.clone();
         self.read.latest_turn_id = incoming.latest_turn_id;
         self.read.active_turn_id = incoming.active_turn_id;
         self.read.active_turn_sequence_no = incoming.active_turn_sequence_no;
@@ -244,6 +254,7 @@ fn canonical_suffix_boundary(
         .enumerate()
         .filter(|(_, row)| matches!(row.row_kind, User | Assistant | Error))
         .collect::<Vec<_>>();
+    let mut best_partial: Option<(usize, usize)> = None;
     for expected_start in 0..expected.len() {
         let mut expected_index = expected_start;
         let mut boundary = None;
@@ -266,8 +277,22 @@ fn canonical_suffix_boundary(
         if !invalid && expected_index == expected.len() {
             return boundary;
         }
+        // A canonical refresh can move a queued steer into history before the
+        // live renderer has any corresponding local row. In that case the
+        // live conversation is a prefix of the now-newer canonical sequence.
+        // Keep only the live suffix after the matched boundary; otherwise the
+        // already canonical user rows would be appended a second time.
+        if !invalid
+            && expected_index > expected_start
+            && let Some(boundary) = boundary
+        {
+            let matched = expected_index - expected_start;
+            if best_partial.is_none_or(|(best, _)| matched > best) {
+                best_partial = Some((matched, boundary));
+            }
+        }
     }
-    None
+    best_partial.map(|(_, boundary)| boundary)
 }
 
 fn primary_conversation_rows_from_rows(
@@ -352,7 +377,25 @@ fn stored_transcript_covers_live_conversation(
 ) -> bool {
     let stored_rows = primary_conversation_rows(stored);
     let live_rows = primary_conversation_rows(live);
-    stored_rows.ends_with(&live_rows)
+    if stored_rows.ends_with(&live_rows) {
+        return true;
+    }
+    if live_rows.is_empty() || live_rows.len() > stored_rows.len() {
+        return false;
+    }
+
+    let stored_suffix = &stored_rows[stored_rows.len() - live_rows.len()..];
+    let Some((stored_last, stored_prefix)) = stored_suffix.split_last() else {
+        return false;
+    };
+    let Some((live_last, live_prefix)) = live_rows.split_last() else {
+        return false;
+    };
+    stored_prefix == live_prefix
+        && stored_last.0 == super::models::DesktopTranscriptRowKind::Assistant
+        && live_last.0 == super::models::DesktopTranscriptRowKind::Assistant
+        && !live_last.1.is_empty()
+        && stored_last.1.starts_with(&live_last.1)
 }
 
 fn stored_lifecycle_matches_live(stored: crate::session::SessionStatus, live: RunStatus) -> bool {
@@ -481,9 +524,12 @@ mod tests {
     use crate::desktop::models::{
         DesktopArtifactRow, DesktopTranscriptRow, DesktopTranscriptRowKind,
     };
-    use crate::protocol::{TurnId, TurnItem, TurnItemId, TurnItemPayload, TurnTerminalOutcome};
+    use crate::protocol::{
+        HistoryItemId, TurnId, TurnItem, TurnItemId, TurnItemPayload, TurnTerminalOutcome,
+    };
     use crate::session::{
-        CanonicalHistoryPage, CanonicalTurnPage, ProjectId, SessionId, SessionStatus,
+        CanonicalHistoryPage, CanonicalTurnPage, PendingTurnInputProjection, ProjectId, SessionId,
+        SessionStatus,
     };
     use crate::tui::state::{TranscriptEntry, TranscriptKind};
 
@@ -529,6 +575,7 @@ mod tests {
                 has_more: offset.saturating_add(items.len()) < total,
                 items,
             },
+            pending_turn_inputs: Vec::new(),
             turn_elapsed_ms: Default::default(),
             latest_turn_id: None,
             active_turn_id: None,
@@ -550,6 +597,97 @@ mod tests {
             sequence_no,
             payload,
         }
+    }
+
+    fn pending_input(id: HistoryItemId, turn_id: TurnId, text: &str) -> PendingTurnInputProjection {
+        PendingTurnInputProjection {
+            id,
+            turn_id,
+            text: text.to_string(),
+            image_count: 0,
+            accepted_at_ms: 10,
+            client_user_message_id: None,
+        }
+    }
+
+    #[test]
+    fn restart_snapshot_projects_pending_input_without_adding_it_to_transcript() {
+        let mut session = session();
+        session.status = SessionStatus::Running;
+        session.completed_at_ms = None;
+        let turn_id = TurnId::new();
+        let first_id = HistoryItemId::new();
+        let second_id = HistoryItemId::new();
+        let mut read = canonical_read(&session, 0, 50, 0, Vec::new());
+        read.active_turn_id = Some(turn_id);
+        read.pending_turn_inputs = vec![
+            pending_input(first_id, turn_id, "identical"),
+            pending_input(second_id, turn_id, "identical"),
+        ];
+
+        let view = OpenSessionView::from_loaded(&read);
+
+        assert_eq!(
+            view.pending_turn_inputs()
+                .iter()
+                .map(|input| input.id)
+                .collect::<Vec<_>>(),
+            vec![first_id, second_id]
+        );
+        assert!(
+            !view.stored_detail().transcript_text.contains("identical"),
+            "pending queue input is not canonical transcript/export content"
+        );
+        assert!(
+            !crate::session::canonical_session_read_to_markdown(&read).contains("identical"),
+            "Markdown export is derived from canonical history, not the pending queue"
+        );
+    }
+
+    #[test]
+    fn delivered_pending_input_moves_once_to_transcript_with_the_same_history_identity() {
+        let mut session = session();
+        session.status = SessionStatus::Running;
+        session.completed_at_ms = None;
+        let turn_id = TurnId::new();
+        let input_id = HistoryItemId::new();
+        let mut queued = canonical_read(&session, 0, 50, 0, Vec::new());
+        queued.active_turn_id = Some(turn_id);
+        queued.pending_turn_inputs = vec![pending_input(input_id, turn_id, "deliver me")];
+        let mut view = OpenSessionView::from_loaded(&queued);
+
+        let mut delivered = canonical_read(
+            &session,
+            0,
+            50,
+            1,
+            vec![TurnItem {
+                id: TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: Some(input_id),
+                sequence_no: 1,
+                payload: TurnItemPayload::SteerMessage {
+                    text: "deliver me".to_string(),
+                },
+            }],
+        );
+        delivered.active_turn_id = Some(turn_id);
+
+        assert!(view.merge_contiguous(&delivered));
+        assert!(view.pending_turn_inputs().is_empty());
+        let rows = &view.stored_detail().transcript_rows;
+        assert_eq!(
+            rows.iter().filter(|row| row.body == "deliver me").count(),
+            1
+        );
+        let expected_identity = input_id.to_string();
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.body == "deliver me")
+                .and_then(|row| row.stable_history_identity.as_deref()),
+            Some(expected_identity.as_str())
+        );
     }
 
     fn transcript_row(
@@ -782,7 +920,7 @@ mod tests {
         );
         assert!(view.merge_contiguous(&completed_read));
         live.load_turn_items_with_active_turn(&completed_session, &items, None);
-        live.set_summary(crate::session::RunSummary::from_terminal(
+        live.apply_run_summary(crate::session::RunSummary::from_terminal(
             completed_session.id,
             turn_id,
             terminal,
@@ -1143,6 +1281,44 @@ mod tests {
     }
 
     #[test]
+    fn canonical_delivery_ahead_of_live_state_does_not_duplicate_the_prior_user_row() {
+        let prefix = vec![
+            transcript_row(
+                DesktopTranscriptRowKind::User,
+                "ユーザー依頼",
+                "root request",
+            ),
+            transcript_row(
+                DesktopTranscriptRowKind::User,
+                "ユーザー依頼",
+                "delivered steer",
+            ),
+        ];
+        let live = vec![
+            transcript_row(
+                DesktopTranscriptRowKind::User,
+                "ユーザー依頼",
+                "root request",
+            ),
+            transcript_row(
+                DesktopTranscriptRowKind::Assistant,
+                "応答",
+                "streaming response",
+            ),
+        ];
+
+        let merged = merge_canonical_prefix_with_live_suffix(prefix, live);
+
+        for body in ["root request", "delivered steer", "streaming response"] {
+            assert_eq!(
+                merged.iter().filter(|row| row.body == body).count(),
+                1,
+                "{body} appears once across canonical delivery and the live suffix"
+            );
+        }
+    }
+
+    #[test]
     fn terminal_live_detail_uses_canonical_turn_boundaries_when_the_read_is_fresh() {
         let session = session();
         let first_turn = TurnId::new();
@@ -1242,6 +1418,79 @@ mod tests {
         assert!(row_index("first final answer") < row_index("second request"));
         assert!(row_index("second request") < work_summary_indices[1]);
         assert!(work_summary_indices[1] < row_index("second final answer"));
+    }
+
+    #[test]
+    fn terminal_live_detail_reconciles_a_partial_streamed_final_from_canonical_history() {
+        let session = session();
+        let turn_id = TurnId::new();
+        let items = vec![
+            turn_item(
+                session.id,
+                turn_id,
+                1,
+                TurnItemPayload::UserMessage {
+                    text: "spawn a detached child".to_string(),
+                },
+            ),
+            turn_item(
+                session.id,
+                turn_id,
+                2,
+                TurnItemPayload::AgentMessage {
+                    text: "ROOT_SMOKE_COMPLETED".to_string(),
+                },
+            ),
+            turn_item(
+                session.id,
+                turn_id,
+                3,
+                TurnItemPayload::Terminal {
+                    outcome: TurnTerminalOutcome::Completed,
+                },
+            ),
+        ];
+        let view = OpenSessionView::from_loaded(&canonical_read(
+            &session,
+            0,
+            items.len(),
+            items.len(),
+            items,
+        ));
+        let mut live = AppState::default();
+        live.current_session_id = Some(session.id);
+        live.run_status = RunStatus::Completed;
+        live.transcript_entries = vec![
+            TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User".to_string(),
+                body: "spawn a detached child".to_string(),
+                response_id: None,
+                tool_call_id: None,
+            },
+            TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "ROOT_SMO".to_string(),
+                response_id: None,
+                tool_call_id: None,
+            },
+        ];
+
+        let detail = view.live_detail(&live, None);
+
+        assert!(
+            detail
+                .transcript_rows
+                .iter()
+                .any(|row| row.body == "ROOT_SMOKE_COMPLETED")
+        );
+        assert!(
+            !detail
+                .transcript_rows
+                .iter()
+                .any(|row| row.body == "ROOT_SMO")
+        );
     }
 
     #[test]

@@ -2028,6 +2028,12 @@ mod tests {
             ModelMessage::Agent {
                 content: "Message Type: NEW_TASK\nPayload:\nInspect the calculator.".to_string(),
             },
+            ModelMessage::Agent {
+                content: "Message Type: MESSAGE\nPayload:\nUse the current branch.".to_string(),
+            },
+            ModelMessage::Agent {
+                content: "Message Type: FINAL_ANSWER\nPayload:\nInspection complete.".to_string(),
+            },
             ModelMessage::User {
                 content: user_task.to_string(),
             },
@@ -2058,6 +2064,14 @@ mod tests {
                 "type": "message",
                 "role": "user",
                 "content": [{ "type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\nInspect the calculator." }]
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Message Type: MESSAGE\nPayload:\nUse the current branch." }]
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "Message Type: FINAL_ANSWER\nPayload:\nInspection complete." }]
             }, {
                 "type": "message",
                 "role": "user",

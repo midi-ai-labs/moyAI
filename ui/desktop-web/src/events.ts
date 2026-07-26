@@ -140,8 +140,6 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
         enhance.disabled = !capabilities.canEnhance;
         const title = projection.navigation_loading
           ? "画面の切り替え完了後にEnhanceできます"
-          : projection.agent_tree_active
-            ? "Sub Agentの完了または停止後にEnhanceできます"
           : projection.busy
             ? "実行中はEnhanceできません"
           : text.trim().length === 0

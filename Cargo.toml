@@ -47,7 +47,7 @@ ratatui = "0.29.0"
 regex = "1.11.1"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
 rfd = { version = "0.15.4", optional = true }
-rusqlite = { version = "0.32.1", features = ["bundled"] }
+rusqlite = { version = "0.32.1", features = ["bundled", "hooks"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
@@ -57,7 +57,7 @@ tauri-plugin-single-instance = { version = "2", optional = true }
 tempfile = "3.23.0"
 thiserror = "2.0.17"
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "process", "fs", "signal", "time", "sync", "io-util"] }
-tokio-util = "0.7.16"
+tokio-util = { version = "0.7.16", features = ["rt"] }
 toml = "0.8.23"
 tui-textarea = "0.7.0"
 ulid = { version = "1.2.1", features = ["serde"] }

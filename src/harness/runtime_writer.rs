@@ -138,6 +138,8 @@ impl NativeHarnessRecorder {
         if let Err(error) = self.run_store.upsert_run(&HarnessRunRecord {
             id: self.run_id,
             session_id: self.session_id,
+            protocol_turn_id: self.session_id.map(|_| self.protocol_turn_id),
+            canonical_terminal_runtime_event_id: None,
             workspace_root: self.workspace_root.clone(),
             artifact_root: self.artifact_root.clone(),
             mode: "native_runtime".to_string(),
@@ -270,6 +272,25 @@ impl NativeHarnessRecorder {
 
     fn record_event_immediate(&mut self, event: &RunEvent) -> Result<(), RuntimeError> {
         let terminal_status = terminal_status_for_run_event(event);
+        if terminal_status.is_some()
+            && let Some(session_id) = self.session_id
+        {
+            self.run_store
+                .project_canonical_terminal_for_turn(session_id, self.protocol_turn_id)
+                .map_err(runtime_error)?;
+            let run = self
+                .run_store
+                .get_run(self.run_id)
+                .map_err(runtime_error)?
+                .ok_or_else(|| runtime_error("native harness run disappeared before terminal"))?;
+            if run.status != HarnessRunStatus::Started {
+                return Ok(());
+            }
+            return Err(runtime_error(format!(
+                "mapped harness run {} cannot terminalize before canonical terminal for session {session_id} turn {} is durable",
+                self.run_id, self.protocol_turn_id
+            )));
+        }
         let event_capacity = if terminal_status.is_some() {
             MAX_RECORDED_EVENTS_PER_RUN
         } else {
@@ -295,6 +316,8 @@ impl NativeHarnessRecorder {
                 .upsert_run(&HarnessRunRecord {
                     id: self.run_id,
                     session_id: self.session_id,
+                    protocol_turn_id: self.session_id.map(|_| self.protocol_turn_id),
+                    canonical_terminal_runtime_event_id: None,
                     workspace_root: self.workspace_root.clone(),
                     artifact_root: self.artifact_root.clone(),
                     mode: "native_runtime".to_string(),
@@ -479,15 +502,13 @@ impl<S: RunEventSink + ?Sized> RunEventSink for HarnessRecordingSink<'_, S> {
     }
 
     fn emit(&mut self, event: RunEvent) -> Result<(), RuntimeError> {
-        self.inner.emit(event.clone())?;
         self.recorder.record_run_event_best_effort(&event);
-        Ok(())
+        self.inner.emit(event)
     }
 
     fn emit_runtime_only(&mut self, event: RunEvent) -> Result<(), RuntimeError> {
-        self.inner.emit_runtime_only(event.clone())?;
         self.recorder.record_run_event_best_effort(&event);
-        Ok(())
+        self.inner.emit_runtime_only(event)
     }
 }
 
@@ -590,11 +611,9 @@ fn event_kind_file_label(kind: HarnessEventKind) -> &'static str {
 
 fn terminal_status_for_run_event(event: &RunEvent) -> Option<HarnessRunStatus> {
     match event {
-        RunEvent::TurnTerminal { terminal, .. } => Some(match &terminal.outcome {
-            crate::protocol::TurnTerminalOutcome::Completed => HarnessRunStatus::Pass,
-            crate::protocol::TurnTerminalOutcome::Interrupted { .. } => HarnessRunStatus::Blocked,
-            crate::protocol::TurnTerminalOutcome::Failed { .. } => HarnessRunStatus::Fail,
-        }),
+        RunEvent::TurnTerminal { terminal, .. } => {
+            Some(HarnessRunStatus::from_terminal_outcome(&terminal.outcome))
+        }
         _ => None,
     }
 }
@@ -606,9 +625,13 @@ fn runtime_error(error: impl std::fmt::Display) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AccessMode;
     use crate::harness::HarnessEventStore;
-    use crate::protocol::ModelResponseId;
-    use crate::session::{RequestDiagnosticsPart, RunMetrics, SessionId, ToolCallId};
+    use crate::protocol::{ModelResponseId, RuntimeEvent, RuntimeEventId, RuntimeEventMsg};
+    use crate::session::{
+        NewSession, ProjectId, ProjectRepository, RequestDiagnosticsPart, RunMetrics, SessionId,
+        SessionRepository, ToolCallId,
+    };
     use crate::storage::{SqliteStore, StoragePaths};
     use crate::tool::ToolName;
 
@@ -741,6 +764,141 @@ mod tests {
             );
             assert_eq!(terminal_status_for_run_event(&event), Some(expected));
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn canonical_terminal_flushes_pending_delta_then_terminalizes_atomically() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 path");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir: data_dir.clone(),
+        };
+        let store = SqliteStore::open(&paths).expect("open store");
+        store.migrate().expect("migrate store");
+        let bundle = StoreBundle::new(store);
+        let project_id = ProjectId::new();
+        bundle
+            .project_repo()
+            .upsert_project(project_id, &data_dir, "project", "none")
+            .await
+            .expect("project");
+        let session = bundle
+            .session_repo()
+            .create_session(NewSession {
+                project_id,
+                title: "session".to_string(),
+                cwd: data_dir,
+                model: "model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+                access_mode: AccessMode::Default,
+            })
+            .await
+            .expect("session");
+        let missing_turn_id = TurnId::new();
+        let mut missing_terminal_recorder = NativeHarnessRecorder::start_harness_only_for_turn(
+            &bundle,
+            Some(session.id),
+            Utf8PathBuf::from("C:/workspace"),
+            missing_turn_id,
+        )
+        .expect("mapped recorder");
+        let missing_run_id = missing_terminal_recorder.run_id();
+        missing_terminal_recorder
+            .record_run_event(&RunEvent::TurnTerminal {
+                session_id: session.id,
+                terminal: Box::new(crate::session::DurableTurnTerminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                    final_response_id: None,
+                    tool_call_count: 0,
+                    failed_tool_count: 0,
+                    change_count: 0,
+                    metrics: RunMetrics::default(),
+                }),
+            })
+            .expect_err("mapped terminal requires canonical truth");
+        assert_eq!(
+            bundle
+                .harness_run_store()
+                .get_run(missing_run_id)
+                .expect("get unterminalized run")
+                .expect("unterminalized run")
+                .status,
+            HarnessRunStatus::Started
+        );
+        assert!(
+            bundle
+                .harness_event_store()
+                .list_events(missing_run_id)
+                .expect("unterminalized events")
+                .is_empty()
+        );
+
+        let turn_id = TurnId::new();
+        let mut recorder = NativeHarnessRecorder::start_harness_only_for_turn(
+            &bundle,
+            Some(session.id),
+            Utf8PathBuf::from("C:/workspace"),
+            turn_id,
+        )
+        .expect("recorder");
+        let run_id = recorder.run_id();
+        recorder
+            .record_run_event(&RunEvent::TextDelta {
+                response_id: ModelResponseId::new(),
+                delta: "last pending delta".to_string(),
+            })
+            .expect("pending delta");
+        let terminal = Box::new(crate::session::DurableTurnTerminal {
+            outcome: crate::protocol::TurnTerminalOutcome::Completed,
+            final_response_id: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: RunMetrics::default(),
+        });
+        let runtime_terminal = RuntimeEvent {
+            id: RuntimeEventId::new(),
+            session_id: session.id,
+            turn_id,
+            sequence_no: 0,
+            created_at_ms: 42,
+            msg: RuntimeEventMsg::TurnTerminal {
+                terminal: terminal.clone(),
+            },
+        };
+        bundle
+            .protocol_event_store()
+            .seed_runtime_event_for_test(&runtime_terminal)
+            .expect("canonical terminal");
+
+        recorder
+            .record_run_event(&RunEvent::TurnTerminal {
+                session_id: session.id,
+                terminal,
+            })
+            .expect("semantic terminal");
+
+        let events = bundle
+            .harness_event_store()
+            .list_events(run_id)
+            .expect("events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, HarnessEventKind::ModelResponseReceived);
+        assert_eq!(events[1].kind, HarnessEventKind::RunTerminalized);
+        let run = bundle
+            .harness_run_store()
+            .get_run(run_id)
+            .expect("get run")
+            .expect("run");
+        assert_eq!(run.protocol_turn_id, Some(turn_id));
+        assert_eq!(
+            run.canonical_terminal_runtime_event_id,
+            Some(runtime_terminal.id)
+        );
+        assert_eq!(run.completed_at_ms, Some(runtime_terminal.created_at_ms));
+        assert_eq!(run.status, HarnessRunStatus::Pass);
     }
 
     #[test]
@@ -935,24 +1093,16 @@ mod tests {
     }
 
     #[test]
-    fn failed_inner_delivery_does_not_become_semantic_harness_evidence() {
+    fn failed_renderer_delivery_keeps_terminal_harness_evidence_and_status() {
         #[derive(Default)]
         struct FailingSink {
             emit_calls: usize,
-            runtime_only_calls: usize,
         }
 
         impl RunEventSink for FailingSink {
             fn emit(&mut self, _event: RunEvent) -> Result<(), RuntimeError> {
                 self.emit_calls += 1;
                 Err(RuntimeError::Message("inner emit failed".to_string()))
-            }
-
-            fn emit_runtime_only(&mut self, _event: RunEvent) -> Result<(), RuntimeError> {
-                self.runtime_only_calls += 1;
-                Err(RuntimeError::Message(
-                    "inner runtime-only emit failed".to_string(),
-                ))
             }
         }
 
@@ -973,32 +1123,41 @@ mod tests {
         )
         .expect("recorder");
         let run_id = recorder.run_id();
-        let response_id = ModelResponseId::new();
+        let session_id = SessionId::new();
         let mut inner = FailingSink::default();
 
         {
             let mut sink = HarnessRecordingSink::new(recorder, &mut inner);
-            sink.emit(RunEvent::TextDelta {
-                response_id,
-                delta: "not delivered".to_string(),
+            sink.emit(RunEvent::TurnTerminal {
+                session_id,
+                terminal: Box::new(crate::session::DurableTurnTerminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                    final_response_id: None,
+                    tool_call_count: 0,
+                    failed_tool_count: 0,
+                    change_count: 0,
+                    metrics: RunMetrics::default(),
+                }),
             })
             .expect_err("failed delivery must remain failed");
-            sink.emit_runtime_only(RunEvent::ReasoningSummaryDelta {
-                response_id,
-                delta: "also not delivered".to_string(),
-            })
-            .expect_err("failed runtime-only delivery must remain failed");
             assert!(!sink.recording_status().disabled);
             assert_eq!(sink.recording_status().failure_count, 0);
         }
 
         assert_eq!(inner.emit_calls, 1);
-        assert_eq!(inner.runtime_only_calls, 1);
         let events = bundle
             .harness_event_store()
             .list_events(run_id)
             .expect("list events");
-        assert!(events.is_empty());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, HarnessEventKind::RunTerminalized);
+        let run = bundle
+            .harness_run_store()
+            .get_run(run_id)
+            .expect("read harness run")
+            .expect("harness run");
+        assert_eq!(run.status, HarnessRunStatus::Pass);
+        assert!(run.completed_at_ms.is_some());
     }
 
     #[test]

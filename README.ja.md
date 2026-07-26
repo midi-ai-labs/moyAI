@@ -64,12 +64,12 @@ moyAI は、そうした環境でも使いやすい開発用の相棒を目指�
 - Desktop の Stop は表示時のworkspace / root session / run generation / Agent Tree epochを検証し、古い画面操作を別runへ適用しない。Settingsの入力値、baseline、dirty状態、monotonic revisionはfrontend local draftだけが所有し、Rustにmirrorを置かない。Rustはtyped clean/dirty capability variantを投影し、Apply / Save / Reset / 別config owner mutationの前にcomplete draftとdecimal-string config generation targetをstatelessに検証する。commit時は一時的な完全`ResolvedConfig`を一度だけ作り、optionalの空欄を古いglobal/base値から再継承しない。active steerもdurable受理後だけ入力をclearする
 - terminal から利用できる CLI / TUI
 - OpenAI 互換 local LLM への接続と明示model availability diagnostic
-- canonical `update_plan`をclient-visibleな進捗投影として使い、fresh proactive multi-agent作業だけにadmitted turn単位のroot ownership checkpointを置くevidence-firstのtask planning
+- canonical `update_plan`をexecution gateやtool access gateではなくclient-visibleな進捗投影として使うevidence-firstのtask planning。proactive modeでは、最小限のgrounding後かつ広い調査前に早期planを作るstatic model instructionを使う
 - turn admissionで固定するimmutable `ResolvedTurnConfig` / turn / step context、canonical protocol history、`ModelResponseId`単位のatomic assistant/raw-tool-call commit
 - canonical HTTP input全体の再送とtyped reasoning summaryを持つLM Studio Responses API対応
 - response/call-output semantic unit、provider報告total usageとCodex型UTF-8 bytes/4 local suffix推定、full-request local fallback、full native summary requestとtyped overflow reduction、durable replacement lineageを備えたautomatic LLM semantic compaction
 - `/v1/models` と LM Studio `/api/v1/models` からの model metadata discovery
-- continuation cursorを持つbounded workspace search / directory inspection、guarded file read、diff-based edit、shell execution
+- model-visibleなcontinuation cursorを持つbounded workspace search / directory inspection、正確な次offsetを示してread用spool pathを作らないline-awareなguarded file-read page、diff-based edit、shell execution
 - fileのcreate / update / delete / rollbackは、一つのstable-handle・no-clobber条件付きcommitを使う。並行する外部replacementを上書きせず、target名を復元できない場合は保持したbackup pathを明示する。親directoryは暗黙作成しないため、先に作成する
 - Unixでは、update/delete前に開かれた書込可能descriptorが切り離した旧inodeを参照していないことを証明できない。createは従来どおりだが、既存fileのupdateは新しいtargetを設置し、deleteはtargetを切り離したうえで旧inodeをprivate backup pathに保持し、安全なcleanup成功とはせずtyped partial-commit errorを返す。先に開かれたwriterはそのbackupを後から変更できるため、errorに示されたpathを確認して調整する
 - **承認を求める**（`default`）、**代理で承認**（`auto_review`）、**フルアクセス**（`full_access`）の3種類のpermission mode。承認を求める/代理で承認は同じdeterministic admission policyとWindows `workspace-write` restricted-token / ACL profileを使い、明示した`sandbox_permissions: "require_escalated"` + `justification`または検出したdestructive/network/external/authority effectを、前者はhuman、後者はtask agentと分離したtool-less AI Guardianへ送る。Windows backendはadmitしたrootとselected existing authority carveoutをidentity-pinし、protected regular fileをcontent-pinし、起動する各process/threadへexplicit system-only descriptorを与え、stdio限定継承、resume前のJob process-tree/UI restrictions、unsandboxed retryなしのfail-closedを実装する。ただしこのunelevated profileはfinite existing-object defenseであり、Windows namespace全体やCodex enforcement互換ではない。未作成authority name、別subtreeのnested instruction、先行explicit / inheritance-disabled DACLを持つprotected descendant、未監査outside path、direct socket、同一userのhost process memory、same-desktop synthetic inputは残余であり、ACL preflightの既存tree伝播は同期処理でchild timeoutの対象外である。フルアクセスと承認済みprocess elevationはcurrent userの`Unrestricted`で動くため、そのchild filesystem mutationはtyped file guardを通らない。一方、typed `write` / `apply_patch`、MCP / Docling、process lifecycleは各guardを維持する。commit済みmode切替は次のdecisionへ反映し、pending requestとadmit済みeffectは元の判断/profileを保持する。native process sandboxは現在Windowsのみで、他platformのworkspace-mode effectはfail closedになる。hard boundaryには将来のelevated dedicated-identity / firewall / private-desktop backendが必要である。
@@ -77,7 +77,7 @@ moyAI は、そうした環境でも使いやすい開発用の相棒を目指�
 - Docling Serve / HTTP MCP と連携した document workflow
 - `AGENTS.md`、`CLAUDE.md`、`.moyai/rules*`、`.moyai/commands/*.md`、local `SKILL.md` の読み込み
 - canonical protocol session history、typed turn terminal、Markdown export、軽量な live-smoke artifact
-- child ごとの独立 session と Desktop activity 表示を持ち、明示的な委譲依頼で既定利用できる multi-agent collaboration
+- 全agentが通常toolとcollaboration toolを保持し、descendantごとの独立sessionとDesktop activity表示を持つ再帰的なmulti-agent collaboration
 
 ## 現在のリリース
 
@@ -194,7 +194,9 @@ enabled = false
 
 `request_timeout_ms`はconnect attempt、connect retry待機、request body送信、response header待ちを共有する一つの
 response-start operation budget、`stream_idle_timeout_ms`はstream開始後にSSE eventが届かない期間の
-rolling timeoutです。どちらも既定値は600,000msで、生成全体の所要時間上限ではありません。
+rolling timeoutです。どちらも既定値は600,000msです。この2設定は変更可能なno-progress deadlineで、
+aggregate stream capではありません。別にresponse header受信後は、製品固定で変更できない
+1,800,000ms（30分）のaggregate stream-duration limitが適用され、どちらの設定を増やしてもこの上限は延長されません。
 `max_output_tokens`は通常文だけでなくreasoningとtool-call引数のserialized output全体を制限します。
 文書全体を`write`するようなtool-heavy runではproviderごとに検証済みのbudgetを使い、製品既定値は
 `16384`です。provider側の`response.failed`、例えば
@@ -304,11 +306,23 @@ logical model message数と、exact HTTP wireのinput item数・serialized body 
 load開始を推測するものではありません。`request_in_flight`が長い場合に分かるのは、generation operationがまだ
 response headerへ到達していないことまでです。requestはmessage/tool/schema/extra body/stop/image/serialized wire byteを
 POST前にbounded validationし、stream開始後もraw byte、event、tool call、argument、absolute durationを制限します。
+明示的なtask-local監査では、`MOYAI_HTTP_REQUEST_CAPTURE_DIR`へabsolute directoryを設定できます。
+HTTP transportは各requestのprepared outbound DTOであるexact serialized JSONと、API mode / endpoint /
+byte count / capture stage / provider request ID metadataを保存します。同じrequest IDでruntimeのattempt /
+terminal phaseと対応付けられますが、capture file単独ではnetwork attemptの開始やprovider受領を証明しません。
+通常sessionはredacted diagnosticsだけを保持します。Unixではcapture directory / fileをowner-onlyの
+`0700` / `0600`へ強制します。WindowsではWindows ACLを継承するため、意図したaccountだけがaccessできる
+directoryを選んでください。captureを明示した場合の書込み失敗は証跡を黙って欠損させずrequest preparationを
+失敗させます。
 
 reasoning controlは任意です。reasoning対応modelでは、例えば`reasoning_effort = "medium"`と
 `reasoning_summary = "concise"`を設定できます。Responsesはtyped standard contractを使います。
 Chat Completionsはprovider差があるため、`chat_completions_reasoning_parameters = "effort_only"`または
 `"effort_and_summary"`を明示しない限り、reasoning parameterの送信をfail-closedにします。
+
+canonical contextではSystem / Developer sectionを論理的に区別したまま保持します。OpenAI-compatible wire境界では
+その順序を保って、Responsesはtop-level `instructions`へ、Chat Completionsは先頭の単一`system` messageへfoldし、
+`developer` wire roleを送りません。
 
 ## Runtimeと履歴の継続性
 
@@ -325,6 +339,10 @@ external tool availabilityを`StepContext`へcaptureし、同じStepからmodel-
 effect classとともに作ります。toolの広告可否、実行可否、安全分類を別contractにはしません。MCP effectは
 serverごとの明示`tool_routes`だけから解決し、未設定routeは拒否します。
 
+`WorldState`自体はtool名やtool inventoryを列挙せず、environment、instructions、時刻だけを保持します。
+tool availabilityの唯一のownerは`ToolSpecPlan`です。Guardianにも同じtool-inventory-freeなsnapshotと空のtool surfaceを渡し、
+exact action evidenceは別のtyped inputとして渡します。
+
 AutoReview Guardianにはboundedなhuman向けpermission previewとは別にcomplete typed action evidenceを渡します。MCPは
 normalized full arguments、configured target、exact tool name、credential presence、Doclingはexact endpoint、local pathまたは
 source URL、effective format/OCR/image/page options、credential presenceを保持し、secret値は渡しません。redactionやinvalid configにより
@@ -337,10 +355,14 @@ Desktopでroot turn完了後にchildだけがactiveな場合、mode更新はcurr
 最新値をdurable sessionへCASしてから`SessionStarted`とagent loopへ進みます。human promptがすでにpendingならmode切替は
 そのpromptを変更・清算せず、次のpermission decisionだけへ適用します。
 
-conversationの正本はcanonical protocol historyです。user / steer turnを直接受け、assistant message、raw tool call/output、
+配信済みconversationの正本はcanonical protocol historyです。新規user turnは直接受けます。active-turn steerは
+durable turn-input queueへ先に受理し、安全な次model-request境界で同じstable IDのhistory rowへ移します。次requestがない場合も、
+非Interrupted terminalは終了前に受理済みsteerをhistoryへdrainし、Interrupted terminalは中断を記録して未配信steerをdiscardします。
+assistant message、raw tool call/output、
 collaboration-mode instruction、compaction lineageをtyped itemとして保存します。Rust history envelopeのscope ownerは
 `HistoryScope::Turn { turn_id } | Session`だけです。user / steer、assistant / tool、compaction、active turnへ届くmailは
-Turn scope、collaboration modeとactive turnがないidle recipientへのmailはSession scopeとし、SQLではCHECK付きの
+Turn scope、collaboration modeと移行済みsession stateはSession scopeとします。新たに受理したidle mailはdurable mailboxで
+pendingのまま保持し、admitted turnが配信するまでcanonical historyとexportには現れません。SQLではCHECK付きの
 `scope_kind`とnullable `turn_id`からenumへ一度だけ組み立てます。session stateのためにTurnIdを発行しません。canonical ToolCallはproviderが返した
 `tool_name`と`arguments_json`の原文を保持し、typed name、JSON parse、schema validationは実行時だけのtransient stateです。
 同じprovider responseのassistant本文と全raw tool callは`ModelResponseId`を共有し、tool実行前に単一DB transactionへ
@@ -354,7 +376,8 @@ fieldを再所有せずそのvalueをhandoffします。turnではないcontrol 
 protocol writeはatomicなsession/runtime ownerへ限定します。query/fork用のgeneric protocol surfaceから任意event bundleを
 appendできず、runtime recording sinkもmodel/tool/file/terminal ownerと競合しない明示allow-listだけを受理します。
 TUIはsubmit時にuser/steer rowを先行挿入したりcomposerを先行clearしたりしません。root run / steerのsubmission identityを
-追跡し、durable `UserTurnStored` / 成功した`SteerStored`を受理してからrowを投影します。draftはsubmission時と同じ
+追跡し、durable `UserTurnStored`で新規user rowを投影します。active-turn steerの受理後はtranscript rowではなく
+pending入力として別表示し、delivery後に同じstable IDのcanonical user rowへ置き換えます。draftはsubmission時と同じ
 revisionかつtextのままの場合だけclearし、pre-admission / storage failureやsubmit後の編集では保持してphantom rowを作りません。
 新規root sessionのpre-admission中にF8でmodeを変えた場合はその値をdurable sessionへ確定してから`SessionStarted`とagent loopを
 開始します。human permissionがpending中のF8は既存promptを変えず、commit後の次decisionだけに反映します。
@@ -374,15 +397,18 @@ gateは最初のblockerを保持しつつ候補runtime rowを最後までtyped d
 lease renewal後も有効ですが、replacement run/turnには作用しません。renewalがterminalを観測した場合は同じtransactionから
 requested turnのexact typed terminalを返し、追跡queryで別turnへ接続しません。
 user-turn bundleと`RunSummary` terminalもadmitted session/turn identityとの一致を必須とします。session rollback、filtered fork、
-expired-run recovery、active mailとterminalの競合は、それぞれ単一のstorage/admission境界でatomicに確定します。mailが先に
-commitされた場合は同じturnでdrainし、terminalが先ならactive recipientへの後発appendを拒否します。idle recipientへのmailは
-history-onlyのSession scopeとして保存し、runtime event、turn item、terminalを合成しません。次turn contextとMarkdown exportには
-残り、real turnのrollbackでは削除しません。
+expired-run recovery、mailとterminalの競合は、それぞれ単一のstorage/admission境界でatomicに確定します。mail受理時はboundedな
+durable mailboxだけへappendし、canonical historyや本文を持つprocess-local copyは作りません。安全なdeliveryはpending rowを
+deliveredへ変え、同じstable IDのTurn scope history、turn item、runtime eventをatomicに作ります。必須のdirect-child resultは
+deliveryまでowner terminalをblockします。visible final後の通常mailは次turn向けpendingとして残せますが、stop fenceは存続させない
+mailをsettleします。capacity rejectionではmailbox row、history、local wakeのいずれも作りません。
 
 Desktop/TUIはlimit付きcanonical snapshotと同一transaction fenceを使い、whole historyを先に読みません。
 明示Markdown exportだけがbounded pageを順に読み、append fenceを検証します。workspace traversalとruntime deliveryは
-boundedです。active steer本文は最大200件のappend-position cursor pageでcanonical historyからだけ読み、process-local wake-upは
-本文もitem identityも持たないcoalesced generation signalです。harness recording failureはrecordingだけをdisableし、
+boundedです。受理済みで未sampleのactive steer本文はdurable turn-input queueだけが所有してconversation historyへ
+exportせず、atomic delivery後は通常のuser inputとしてcanonical historyから読みます。process-local wake-upは
+本文もitem identityも持たないcoalesced generation signalで、`wait_agent`は別processの入力を取りこぼさないよう
+durable queueも確認します。harness recording failureはrecordingだけをdisableし、
 user-visible run/eventの結果を上書きしません。
 
 v0.8.0に含まれるV33 migrationはlegacy message graphをdrop前にcanonical protocolへlossless・順序安定でbackfillします。
@@ -416,12 +442,27 @@ V46は保存済みv1 compaction行について、canonical append orderからbou
 `user_anchored_checkpoint` layoutへ移行します。実user textを復元できない行だけはeffective orderを変えず明示的な
 `legacy_prefix` checkpointとして残します。migrationはJSON、hash、同一session内のreplacement lineage、anchor上限を
 検証し、compaction行だけをbounded pageで書き換え、検証に失敗すればmarkerを残さず全transactionをrollbackします。
+V47がcurrentのspawn-edge schemaです。historicalなV40を通過して残ったflat edgeを保持し、各canonical
+`/root/...` pathとimmediate parentの整合を検証しながら再帰的なSub Agent lineageを許可します。descendantを
+orphanにする削除を拒否し、retained tree全体をroot込み256 agentに制限します。V40が破棄したnested edgeは復元しません。
+V48はdurable OwnerResume requestと、早期成功または回復可能なcrash failureのdeferred completion receiptを
+追加しました。既存の早期成功rowはcompatibilityとしてreadできますが、current runtimeが新規作成するdeferred receiptは
+crash recoveryだけです。V49は明示的に停止したsubtree、cause、root境界をrestart後に復活させないdurableな
+tree-stop fenceを追加します。V50は`NEW_TASK` / `MESSAGE` / `FINAL_ANSWER`をbounded durable mailboxへ移します。
+current child completionはexact direct parentへのqueue-onlyでOwnerResumeを作らず、delivery時に同じmailbox identityをTurn scopeの
+canonical historyへ移します。V51はactive-steer FIFO、pending projection、terminal drain / discard規則、および別processの
+`wait_agent`が使うdurable checkとtimeout直前のfinal recheckを追加します。root、別session source、曖昧なstate、
+exactな後続resolverを欠くterminal deferred stateはfail closedにします。
+V52は各native harness runをexactなcanonical session / turnへ結びます。曖昧、欠損、重複、cross-sessionのbackfillは
+markerや部分mutationを残さずatomicに失敗します。V53は各explicit mailbox wakeからrecipient session、admission、turnへの
+immutable claimを追加し、既存OwnerResumeもexactなclaimed turnへ結びます。Completed / Failed settlementは選択済みwakeだけを
+claimed turnへdeliveryし、Interrupted settlementはそのwakeだけをdiscardし、後続triggerは次のadmission用にpendingのまま
+残します。current openはV53 schemaとこれらのidentityを検証します。
 
 通常のtool surfaceでは、非自明な作業向けに`update_plan`を公開します。そのstructured resultはclientへ
 表示するplan projectionであり、moyAIがplan本文を解釈して次tool、turn終了、compactionを決めることはありません。
-fresh proactive root turnに限り、正常完了した`update_plan`はrootが直近blockerを所有するという判断を記録します。
-これはownership decisionであり、hostが作るtask planではありません。durableなPlan modeは内部に存在し
-`update_plan`を保持してmutation toolだけを隠しますが、現時点でCLI/TUI/Desktopにmode selectorはありません。
+tool surfaceの解除にも使いません。durableなPlan modeは内部に存在し、`update_plan`を保持してmutation toolだけを
+隠しますが、現時点でCLI/TUI/Desktopにmode selectorはありません。
 
 model policyの90% working targetへ達すると、固定item件数ではなくmodel-visibleなsemantic unitを選びます。
 provider報告total usageがある場合はdurable turn terminalから復元し、そのmodel response後に追加されたlocal itemだけをCodexと同じ粗いUTF-8 bytes/4で加算します。usageがないかresponse境界を照合できない場合だけfull prepared requestのlocal推定へfallbackし、request diagnosticsは使用したsourceを区別します。
@@ -430,12 +471,20 @@ provider報告total usageがある場合はdurable turn terminalから復元し�
 最後のUser inputへ追加し、toolsとprovider cursorを送りません。最初にfull native requestを一回送り、typed
 `context_length_exceeded`の場合だけ最古のprovider-native itemと必要なcall/output対応相手を除いて再試行します。
 semantic map/reduce経路は持ちません。
+`assets/prompts/compaction.md`のexact checkpoint textはsource-levelのCodex prompt-asset contractです。
+このtext一致だけでCodex runtime全体とのparityを主張しません。
 
 生成したcheckpointは、real User / Steer text inputのうち新しいものからoriginal orderのまま保守的な20,000 token
 以内に保持します。境界の一件は丸ごと捨てず中央を切り詰め、prefix付きsummaryを最後のUser inputにします。古いsummaryを
 anchorへ昇格させません。委譲turnを開始したcanonical `NEW_TASK`はanchorとして保持し、通常のagent messageと
 final handoffはsummaryへ残します。正確なreplacement lineageを
 commitし、元historyは保持します。cancel、空summary、tool call混入、provider failureではhistoryを変更しません。
+非空summaryでも、置換後の推定contextが置換前以上、またはcomplete requestが90% working target未満へ
+戻らない場合はcommitしません。同一turnのautomatic compactionは一度だけ試し、hard limit未満なら元の
+canonical historyで続行し、hard limit到達時は明示的に失敗します。working targetはadvertised context
+windowの90%、Codex型effective full input limitは95%です。追加のconfigured overflow marginはhard limitを
+working targetより後に保てる場合だけ適用します。`max_output_tokens`は生成上限だけを表し、input tokenを
+予約したりどちらのcontext limitも縮めたりしません。
 
 Activeなsession goalは、任意回数のidle continuation後に成功扱いにはしません。goal state、token/elapsed budget、
 cancellation、typed terminalのいずれかがsemanticな終了条件になるまで継続します。
@@ -448,50 +497,106 @@ multi-agent collaboration は既定で利用可能で、通常はmodelに `spawn
 
 - `mode = "explicit_request_only"` では、ユーザーが agent、Sub Agent、委譲、並列 agent 作業を
   明示的に依頼した場合だけ委譲します。`mode = "proactive"` では、品質または待ち時間の改善に有効な
-  boundedな並列作業またはcontextを分離した逐次handoffをmodelが判断して委譲できます。
-- fresh proactive root turnでは、最初に`spawn_agent`と`update_plan`だけを公開します。
-  `spawn_agent`の正常完了でdelegated ownershipへ入り、rootは`spawn_agent`、`send_message`、`followup_task`、
-  `wait_agent`、`interrupt_agent`、`list_agents`、`update_plan`だけを使い、workspace toolはchild側へ残します。
-  明確に分離した非重複blockerをrootが持つ場合だけ、`update_plan`の正常完了でroot-local ownershipを選び、
-  次model requestから通常surfaceへ戻します。失敗または拒否ではownershipを変えません。`spawn_agent`を含む
-  model responseへworkspace toolを混在させた場合、委譲前に広告済みでもそのsiblingは実行しません。
-  child、`explicit_request_only`、Plan mode、tool非対応model、空promptのcontinuationには適用しません。
-  この選択はadmitされたroot turn単位でcompactionをまたいで保持しますが、永続planner、task DAG、
-  package-size classifierは作りません。
-- rootは全体目的、制約、短い進捗、統合、最終回答を保持し、具体的なtask境界は現在のevidenceから
-  modelが選びます。固定のscout/stage routerは置きません。childは明確なscopeと一つの検証可能な結果を
-  所有し、書き込む場合だけmutation ownerを1体に限定します。依存するhandoffは同時実行を必要としません。
-  proactive modeでは`fork_turns`を明示し、自己完結したtask packetには`"none"`、親contextが必要な場合だけ
-  `"all"`を使います。並列mutationはtargetを分離し、重なるtargetはwriterを1体に限定します。materialな
-  変更には後段で独立したread-only verificationを割り当てられます。
-- 初版はflatな`/root/<task>` namespaceの1段固定です。`spawn_agent`を呼べるのはrootだけで、全childは
-  rootへ直接linkし、Sub Agentから別のSub Agentを再spawnできません。
-- `max_concurrent_agents` は root を含む同時 active agent 数の上限です。既定値 `4` では root と
-  child 最大 3 件が同時に実行できます。完了agentは一覧とfollow-up用に保持しますがactive枠を
-  消費しません。retained registryはrootを含む256件（direct child最大255件）でboundedにし、満杯時は
-  historyのevictionやspawn order再利用をせず新しいspawnを拒否します。
+  boundedな作業をmodelが判断して委譲できます。
+- `assets/prompts/multi_agent_root.md`と`sub_agent.md`は、Codex source-alignedなrole /
+  message-lifecycle fragmentと、明示的にlabelしたmoyAI local-model coordinationを分離します。後者は
+  direct-tool invocationをmoyAIのflatなtool名へ適応し、委譲、evidence handoff、instruction authorityの
+  safeguardを追加するため、asset全体がCodex promptとbyte-identicalという意味ではありません。proactive assetも
+  Codex activation textをそのまま保ち、その後にCodex delegation guidanceのlocal adaptationをlabelします。
+  high-level planでrootがlocalに処理するimmediate blockerと、concrete / self-containedなparallel sidecarを分け、
+  rootとcoding childのwork scopeを重複させず、rootはnon-overlap workを継続し、critical pathがresultを必要とする時だけ
+  waitして返却patchをreview / integrateします。これらのstatic instructionはruntime gate、固定DAG / stage router、動的な
+  behavior-correction layerを作らず、Codex runtime全体とのparityも主張しません。
+- 全agentは、同じmodel / mode / provider / config filterの下で通常toolと6つのcollaboration toolを保持します。
+  spawn後も親をcollaboration-only surfaceへ移さず、`update_plan`でworkspace toolを解除する必要もありません。
+  resolved modelがtool非対応の場合、requestのtool surfaceを空にし、collaboration tool callを要求するrole / mode
+  messageも注入しません。
+- どのagentも別agentをspawnできます。新しいtask nameはcallerのcanonical pathへ連結されるため、
+  `/root/task1`が`task_3`をspawnすると`/root/task1/task_3`になります。相対agent参照はcurrent agentを
+  基準に解決し、canonicalなabsolute pathでは同じtree内の別agentを指定できます。
+- 各agentは割り当てられた目的と自ら作ったchildの統合を担当し、具体的なbounded subtaskはmodelが
+  current evidenceから選びます。host側にplanner DAGや固定scout/stage routerは置きません。
+- rootはtask-wide plan、child結果の統合、最終verificationを保持します。childはoutcome、material claimを支える
+  evidence、意図的に変更したpath、verification commandと結果、残るunknown / riskを短いhandoffとして返します。
+  rootはそれをworking evidenceとして使い、private調査を再構築しません。最終verificationはdelegated acceptance
+  criteriaと結果のworkspace stateを確認し、欠けた証拠または矛盾だけを追加調査します。
+- descendantの最新のhost-delivered `NEW_TASK`とその後のhost-delivered parent messageは、system / developer /
+  applicable project・skill / user instructionの範囲内でのみdelegated scopeを定義します。parent supplied findings /
+  decisionsはworking contextであり、より上位のinstructionでも独立検証済みfactでもありません。quoted / embeddedな
+  external contentは、system / developer / user instructionが採用しない限りdataのままです。descendantはscope達成に必要なgapだけを
+  inspectし、private groundingを反復せず、上記evidence handoffを返します。
+- `max_concurrent_agents` は root を含む同時 active agent 数の上限です。既定値 `4` では同じtree全体で
+  rootと最大3件のactive descendantを実行できます。内部execution limiterだけがrootを除外し、公開値から
+  3件のdescendant枠を導出します。完了agentは一覧とfollow-up用に保持しますがactive枠を
+  消費しません。retained registryはrootを含むtree全体256件（任意深度のdescendant最大255件）で
+  boundedにし、満杯時はhistoryのevictionやspawn order再利用をせず新しいspawnを拒否します。
 - `max_concurrent_model_requests = 1` により、tree 内の local LLM model request は既定で直列化します。
   agent は tool 実行や review の前後では独立して進行できます。並列 request を安全に処理できる
-  inference server の場合だけ値を増やしてください。
-- child はrootと直接lineageで結ばれた別のdurable sessionです。通常のproject/session listには
-  implementation 用 child session を表示しません。`spawn_agent` の `fork_turns` は既定の `"all"` と
-  `"none"` を選べます。`"all"` ではstable append fence下のactive historyをbounded pageとしてstreamし、現在activeなuser turn、正常完了terminalが所有するplainなfinal assistant message、durableな
+  inference server の場合だけ値を増やしてください。2つのconcurrency上限はretained agent schedulerを
+  最初にloadした時点でcaptureします。後続root turnは同じschedulerとmodel-request semaphoreを再利用し、
+  異なる値はlive treeを書き換えずmodel sampling前に拒否します。上限を変える場合は新しいsessionを
+  開始するか、sessionを新しいprocessで開き直してください。
+- `wait_agent`の既定timeoutは30,000msで、10,000～3,600,000msを指定でき、agent activityまたは
+  active-turn user inputが届けば直ちにreturnします。taskが明示的に必要とする場合は、より長いbounded timeoutを指定できます。
+- 各descendantはimmediate parentとtree rootに結ばれた別のdurable sessionです。通常のproject/session listには
+  implementation 用sessionを表示しません。`spawn_agent` の `fork_turns` は既定の `"all"`、`"none"`、
+  または直近turn数を表す正の整数文字列を選べます。`"all"` ではstable append fence下の親のactive historyを
+  bounded pageとしてstreamし、現在activeなuser turn、正常完了terminalが所有するplainなfinal assistant message、durableな
   collaboration-mode instruction、active compaction summaryを複製します。そのsummaryが置換したraw historyは
   復活させず、reasoning、tool traffic、retired control state、permission evidenceは含みません。target sessionの存在を同じtransactionで検証し、fence mismatchまたは途中失敗ではcopy全体をrollbackします。Sub Agent
   activityはownerとなるroot sessionにfreshなactive turnがある間だけ記録します。
-- spawn、follow-up、通常message、child完了は新しいuser requestではなく、Codex型の`NEW_TASK`、
-  `MESSAGE`、`FINAL_ANSWER` envelopeとして渡します。親が受け取るのはchildの短い最終handoffだけで、
-  privateな調査transcriptは引き継ぎません。反証がない完了scopeを親が頭から再調査せず統合します。
-- continuationを含む各turnは新しい実行controlを持ち、Stop targetは同じroot Agent Treeとして保持します。
-  完了turnのterminal stateを次turnへ再利用せず、Stop-firstならcontinuationを始めず、continuation-firstなら
-  新turnを含む同じtreeを停止します。
+- live agentは、そのagent executionがcaptureしたconfig、workspace、permission brokerを保持します。
+  spawnはcallerのresourceを継承し、follow-upはexact targetが保持するresourceを使うため、新しいroot turnが
+  実行中の旧childを書き換えることはありません。project / session / workspace navigationで置換するのは
+  viewのworkspace-specific run serviceだけです。process scheduler、session event hub、active Agent Treeは
+  同じownerを保ち、admit済みexecutionは自分のexact run serviceを保持します。process restart後のlineage rehydrateはCodexのresume境界に
+  合わせ、child session columnから部分的なconfigを再構築せず、current root resumeのconfig、workspace、
+  permission brokerを全restored descendantへ渡します。
+- spawn、follow-up、通常message、child完了はcanonical history境界ではtyped Agent itemとCodex型の
+  `NEW_TASK`、`MESSAGE`、`FINAL_ANSWER` envelopeとして保持します。Codex固有の`agent_message`を受けない
+  OpenAI-compatible providerへの最終adapterだけは、envelopeを保ったstandard `user` roleへ変換します。
+  同時に渡すlogical Developer instructionが、このcompatibility表現をsystem / developer / project・skill /
+  original user constraints内のdelegated working contextとして扱わせます。childの`FINAL_ANSWER`は
+  immediate parentへ渡り、親が受け取るのはprivateな調査transcriptではなく短いevidence handoffです。child session、recursive edge、
+  指定したhistory fork、initial `NEW_TASK`は一つのtransactionで作ります。admission前のlaunch failureは
+  exact triggerを`Failed`としてsettleし、immediate parentへのterminal handoffを一度だけatomicに作ります。
+  cancellationは`Interrupted`としてsettleし、成功に見えるhandoffを作りません。follow-upは指定したexact targetだけを
+  起動し、inactiveなancestorを先に起こしません。durableな`trigger_turn` intentとstorageが許可する即時実行可否は
+  別の状態です。readyなinactive targetはpending durable mailboxのappend前にdescendant枠を一件予約し、capacity不足なら
+  mailbox row、canonical history、process-local wakeのいずれも追加しません。active targetへのmailは追加枠を
+  消費しません。
+- Codexのthreadと同様に、rootと各descendantはdescendantのlivenessと独立して自分のterminalを所有します。
+  `Completed`、`Failed`、target-onlyの`AgentInterrupted`はdescendantを待たず、停止もしません。回答がchild結果へ
+  依存する場合、modelがfinal responseの前に`wait_agent`を呼びます。permission Abortは要求元executionだけを
+  停止し、通常のUser Stopはexact current root executionだけを停止します。どちらもsibling / descendantへ
+  cascadeしません。retained tree全体を停止できるのは、別名の明示的なtree-stop操作だけです。
+- child terminalはexact immediate parentに`trigger_turn = false`のdurable `FINAL_ANSWER`を一件だけ作り、
+  rootへbubbleせず、terminal parentを自動再開しません。active parentはsafe mailbox boundaryで受け取れます。
+  current-turn deliveryがeligibleな非Interrupted terminalと競合したmailは、terminal writerが同じtransactionで
+  canonical IAC historyへ記録し、modelを再sampleしません。NextTurn phaseのmailはpendingのまま次のexplicit turnへ
+  渡ります。遅いchild resultが既存parent terminalを書き換えることはありません。
+- historical V48の`completed_early` rowはstorage compatibilityのためread / Stop可能なままですが、currentの通常完了は
+  新規作成しません。current deferred completionは`crash_failed` recoveryだけです。
+- OwnerResume turnのcrashはfailureを上流へ漏らさず同じrequestをrependingします。retryの成功／失敗はcrash receiptを
+  supersedeし、interruptionはdiscardし、連続crashはpending receipt一件をroll forwardします。crashしたownerへのexplicit
+  follow-upはschedule-readyなExplicitTaskとなってOwnerResumeより優先し、OwnerResume sourceを持たないorphan crashにも
+  同じ回復を適用します。そのretryのCompleted / Failedは旧crash receiptをsupersedeし、Interruptedはdiscardします。
+  liveなcurrent OwnerResumeの読取とadmission後projectionは同じmail-delivery fenceを共有し、古いlocal R1をdurableな
+  `None`またはR2へauthoritativeに置換します。OwnerResume claimが参照するturnはrollbackできません。共通startup
+  bootstrapはexactなreadinessを復元し、Agent Tree rehydrate前にcrash recoveryを実行します。
+- continuationを含む各turnは新しい実行controlを持ちます。通常のStopはそのexact active continuationだけを
+  対象とし、過去turnのterminalを開き直さず、detached childも停止しません。別の明示的なtree-stop操作だけが
+  retained treeを閉じ、dormant follow-upをsettleし、deferred owner stateをdiscardするため、後のrestartで
+  明示停止済みworkを復活させません。
 - Desktop は active な activity を本文内のクリック可能なAgentチップとして表示し、terminal後は履歴を
   1件の集約表示へ畳みます。本文またはOutputの集約表示をクリックすると、current root taskに紐づく
-  read-onlyのSub Agent専用paneが開き、状態別の一覧、task、current work、result、child session IDを確認できます。
+  Sub Agent専用paneが開き、状態別の一覧、task、current work、result、child session IDとread-only transcriptを確認できます。
+  exact active turn IDを持つRunning childだけに停止操作を表示し、workspace/root/path/child/turnのstaleまたはforged targetは拒否します。
   child sessionへ画面遷移はせず、狭いwindowでは右側drawerとして表示します。permission promptは要求元agentを
-  表示し、順番に処理します。current treeのいずれかのagentがactiveな間は、新規chat、session、project、
-  workspaceへのnavigationを禁止します。これによりcurrent root taskの選択とpermission / Stopのroutingを
-  維持します。Stopはtree全体を停止します。
+  表示し、順番に処理します。detached childがactiveであることだけを理由に、新規chat、session、project、
+  workspaceへのnavigationを禁止しません。先のroot terminal後もchildを独立して継続したまま、新しいroot
+  requestを開始できます。DesktopのStopはexact selected root executionを対象とし、tree全体の停止は別名の
+  明示的な破壊操作として扱います。
 - Desktopのsession status、transcript row kind、cancel可否はRustのtyped projectionが所有します。frontendは
   labelから再推論せず、durable terminalのないturnを完了ではなくincompleteとして表示します。
 - Stop commandはprojectionが渡すworkspace、root session、root run generation、Agent Tree epochをRustへ返します。

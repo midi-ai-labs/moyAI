@@ -63,12 +63,12 @@ moyAI is designed around those constraints:
 - Desktop Stop validates the projected workspace, root session, run generation, and Agent Tree epoch, so stale UI actions cannot cancel a later run. Settings values, baseline, dirty state, and monotonic revision exist only in one frontend-local draft owner. Rust projects typed clean/dirty capability variants and statelessly validates a complete draft plus a decimal-string config-generation target before Apply, Save, Reset, or another config-owner mutation. Commit builds one complete temporary `ResolvedConfig`, preserving cleared optional values instead of re-layering them. Active-turn steer clears input only after durable acceptance.
 - CLI and TUI for terminal-centered workflows.
 - OpenAI-compatible local LLM connection with explicit model availability diagnostics. moyAI connects to the configured external HTTP endpoint; it does not launch or supervise the provider process.
-- Evidence-first task planning with canonical `update_plan` as a client-visible progress projection, plus an admitted-turn-scoped root-ownership checkpoint for fresh proactive multi-agent work.
+- Evidence-first task planning with canonical `update_plan` as a client-visible progress projection rather than an execution or tool-access gate. In proactive mode, static model instructions require minimum grounding followed by an early plan before broad investigation.
 - One immutable `ResolvedTurnConfig`/turn/step context captured at admission, canonical protocol history, and atomic response-scoped assistant/raw-tool-call commits keyed by `ModelResponseId`.
 - LM Studio Responses API support with full canonical HTTP input replay and typed reasoning summaries.
 - Automatic LLM semantic compaction near the context threshold, using provider-reported total usage plus a Codex-style UTF-8-bytes/4 local suffix estimate, a full-request local fallback, full native summary requests with typed overflow reduction, and durable replacement lineage.
 - LM Studio metadata discovery through `/v1/models` and `/api/v1/models`.
-- Bounded workspace traversal/search/directory inspection with continuation cursors, guarded file reads, diff-based edits, and shell execution.
+- Bounded workspace traversal/search/directory inspection with model-visible continuation cursors, guarded line-aware file-read pages with exact next offsets and no read spool path, diff-based edits, and shell execution.
 - File writes and patches use one stable-handle, no-clobber conditional commit for create, update, delete, and rollback. A concurrent external replacement wins without being overwritten; if restoration cannot reclaim the target name, moyAI reports the preserved backup path. Parent directories are not created implicitly, so create the parent first.
 - On Unix, moyAI cannot prove that a writable descriptor opened before an update or delete no longer references the detached inode. Creation remains unchanged, but an existing-file update installs the new target and a delete detaches the target while retaining the old inode at a private backup path; both report a typed partial-commit error instead of claiming safe cleanup. Inspect and reconcile the reported backup because a pre-opened writer can still modify it.
 - Permission modes: **Ask for approval** (`default` / 承認を求める), **Approve for me** (`auto_review` / 代理で承認), and **Full access** (`full_access` / フルアクセス). Ask and Auto share one deterministic admission policy and the same Windows `workspace-write` restricted-token/ACL profile; explicit `sandbox_permissions: "require_escalated"` plus `justification`, or a detected destructive/network/external/authority effect, goes to a human in Ask or a separate tool-less AI Guardian in Auto. The Windows backend identity-pins admitted roots and selected existing authority carveouts, content-pins protected regular files, gives each launched process/thread an explicit system-only descriptor, inherits only stdio, applies Job process-tree/UI restrictions before resume, and fails closed without an unrestricted retry. This unelevated profile is a finite existing-object defense, not a complete Windows namespace or Codex-enforcement equivalent: absent authority names, unrelated nested instruction files, protected descendants with overriding explicit/inheritance-disabled DACLs, uninspected outside paths, direct sockets, same-user host-process memory, and same-desktop synthetic input remain residuals. Its ACL preflight can propagate through existing trees synchronously and is not covered by the child timeout. Full Access and an approved process elevation run `Unrestricted` as the current user, so their child filesystem mutations do not pass through typed file guards; typed `write`/`apply_patch`, MCP/Docling, and process lifecycle checks keep their own guards. A committed mode change affects the next permission decision, while a pending request and an admitted effect retain their original decision/profile. Native process sandboxing is currently Windows-only; workspace-mode process effects fail closed elsewhere. A future elevated dedicated-identity/firewall/private-desktop backend is required for the hard boundary.
@@ -76,7 +76,7 @@ moyAI is designed around those constraints:
 - Optional Docling Serve and HTTP MCP integration for document-heavy workflows.
 - Local instructions from `AGENTS.md`, `CLAUDE.md`, `.moyai/rules*`, `.moyai/commands/*.md`, and local `SKILL.md` files.
 - Canonical protocol session history, typed turn terminals, Markdown export, and lightweight live-smoke artifacts.
-- Root-scoped multi-agent collaboration, available by default for explicit delegation requests, with separate child sessions and visible Desktop activity.
+- Recursive multi-agent collaboration, available by default for explicit delegation requests, with the normal and collaboration tools available to every agent, separate descendant sessions, and visible Desktop activity.
 
 ## Current Release
 
@@ -193,8 +193,11 @@ enabled = false
 
 `request_timeout_ms` is one response-start operation budget shared by connection attempts, connection
 retry delays, request-body upload, and waiting for response headers. `stream_idle_timeout_ms` limits a period with no SSE
-event after streaming starts. Both default to 600,000 ms. They are no-progress deadlines, not a cap on
-total generation time; explicit config or environment overrides remain supported.
+event after streaming starts. Both default to 600,000 ms. These two settings are configurable
+no-progress deadlines, not the aggregate stream cap. Separately, after response headers, the product
+applies a non-configurable aggregate stream-duration limit of 1,800,000 ms (30 minutes); increasing
+either setting does not extend that bound. Explicit config or environment overrides for the two
+no-progress deadlines remain supported.
 `max_output_tokens` bounds the complete model output, including reasoning and serialized tool-call
 arguments. Tool-heavy runs that write a whole document need the provider's verified profile budget;
 the product default uses `16384`. A provider-side
@@ -324,11 +327,23 @@ model-instance loading. A long `request_in_flight` phase establishes only that t
 reached response headers. Before POST, moyAI bounds messages, tools, schemas, extra body, stop data,
 images, and the exact serialized wire bytes. After headers, it also bounds raw stream bytes, events,
 tool calls, arguments, idle time, and absolute stream duration.
+For an explicit task-local audit, set `MOYAI_HTTP_REQUEST_CAPTURE_DIR` to an absolute directory.
+The HTTP transport then writes the exact prepared outbound request JSON plus
+API-mode/endpoint/byte-count, capture-stage, and provider-request-ID metadata. The shared request ID
+joins this prepared DTO to runtime attempt and terminal phases; the file alone does not prove that a
+network attempt started or that the provider received it. Normal sessions retain only redacted
+diagnostics. On Unix, the capture directory and files are forced to owner-only `0700` / `0600`
+permissions. On Windows, the directory and files inherit Windows ACLs, so choose a location whose
+ACL grants access only to the intended account. When capture is explicitly enabled, a capture-write
+failure fails request preparation instead of silently losing the evidence.
 
 Reasoning controls are optional. A reasoning-capable model can use, for example,
 `reasoning_effort = "medium"` and `reasoning_summary = "concise"`. Responses has a standard typed
 contract. Chat Completions varies by provider, so reasoning parameters remain fail-closed unless
 `chat_completions_reasoning_parameters = "effort_only"` or `"effort_and_summary"` is configured.
+Canonical System and Developer sections remain distinct in the logical model context. At the
+OpenAI-compatible wire boundary, moyAI folds them in order into top-level `instructions` for
+Responses or one leading `system` message for Chat Completions; it never emits a `developer` role.
 
 ## Runtime and History Continuity
 
@@ -349,6 +364,10 @@ for the current world state, skills, and optional external-tool availability. Th
 the advertised tool schema, execution router, and effect classification, so visibility and safety are
 not separate execution contracts. MCP effects come only from explicit per-server tool routes; an
 unlisted route is rejected.
+`WorldState` itself contains only environment, instructions, and time and does not enumerate tool
+names: the request's `ToolSpecPlan` schema is the sole model-visible owner of tool availability. The
+AutoReview Guardian receives the same tool-inventory-free world-state snapshot and an empty tool
+surface; exact action evidence is carried separately.
 
 The AutoReview Guardian receives a complete typed action-evidence object separately from the bounded
 human-facing permission preview. MCP calls retain their normalized full arguments, configured target,
@@ -366,11 +385,16 @@ TUI root session, `RunSessionAccessModeAdoption` commits the latest pre-admissio
 durable session before `SessionStarted` or the agent loop. Switching with a human prompt already pending
 does not alter or settle that prompt; it affects only the next permission decision.
 
-Canonical protocol history is the conversation source of truth. User and steer turns enter it directly;
+Canonical protocol history is the delivered conversation source of truth. A new user turn enters it
+directly. An active-turn steer is first accepted into the durable turn-input queue and enters history
+at the next safe model-request boundary with the same stable identity. If no further request is made,
+a non-interrupted terminal drains the accepted steer into history before finishing; an interrupted
+terminal records the interruption and discards the still-pending steer instead.
 assistant messages, raw tool calls/outputs, collaboration-mode instructions, and compaction lineage are
 stored as typed items. Each Rust history envelope has one `HistoryScope`: `Turn { turn_id }` for
-user/steer, assistant/tool, compaction, and mail delivered to an active turn, or `Session` for
-collaboration mode and mail delivered while no turn is active. SQL stores that enum as a checked
+user/steer, assistant/tool, compaction, and delivered mail, or `Session` for collaboration mode and
+retained migrated session state. Newly accepted idle mail remains in the durable mailbox and is absent
+from canonical history and export until an admitted turn delivers it. SQL stores that enum as a checked
 `scope_kind` plus nullable `turn_id`; it never invents a turn ID for session state. A canonical tool call preserves the provider's `tool_name` and
 `arguments_json` strings; typed-name parsing, JSON parsing, and schema validation are transient
 execution steps. Assistant text and every raw tool call from one provider response share a
@@ -389,8 +413,10 @@ Protocol writes are limited to their atomic session/runtime owners. The generic 
 surface cannot append arbitrary event bundles, and the runtime recording sink accepts only its explicit
 projection allow-list rather than duplicating model/tool/file/terminal ownership.
 TUI does not insert a submitted user/steer row or clear the composer optimistically. It tracks root-run
-and steer submission identities, projects the row after durable `UserTurnStored` / successful
-`SteerStored` acceptance, and clears only a draft whose revision and text are still unchanged. A
+and steer submission identities, projects a new-user row after durable `UserTurnStored`, and shows an
+accepted active-turn steer as a separate pending input rather than a transcript row. Delivery replaces
+that pending projection with one canonical user row carrying the same stable identity. It clears only a
+draft whose revision and text are still unchanged. A
 pre-admission/storage failure or a post-submit edit keeps the draft and creates no phantom user row.
 For a new root session, a pre-admission F8 access-mode change is adopted into that durable session before
 `SessionStarted` and before the agent loop; F8 during an existing human permission prompt leaves the
@@ -418,20 +444,24 @@ requested turn's exact typed terminal from the same transaction instead of issui
 User-turn bundles and `RunSummary` terminals
 must also match the admitted session/turn identity. Session rollback, filtered fork, expired-run
 recovery, and active mail-versus-terminal settlement each have one atomic storage/admission boundary.
-In particular, mail committed first is drained in the same turn, while a terminal committed first
-prevents a later active-recipient append. Mail for an idle recipient is history-only session state: it
-creates no runtime event, turn item, or terminal, remains visible to the next turn and Markdown export,
-and is not consumed by rollback of a real turn.
+In particular, mail acceptance appends only the bounded durable mailbox; it does not append canonical
+history or rely on a process-local body copy. Safe delivery atomically changes one pending mailbox row
+to delivered and creates the Turn-scoped history, turn item, and runtime event with the same stable ID.
+Required direct-child results block an owner terminal until delivered. Ordinary mail arriving after a
+visible final can remain pending for the next turn, while stop fences settle mail that must not survive.
+Capacity rejection creates no mailbox row, history row, or local wake.
 
 Desktop and TUI use bounded latest/offset canonical snapshots with a fence instead of eagerly loading
 the whole history. Desktop can prepend adjacent older turn chunks into one continuous in-memory range,
 reprojects turn boundaries after each merge, and keeps latest live/current refreshes under one
 latest-wins owner so delayed snapshots cannot roll the transcript or terminal status backward.
 Explicit Markdown export reads bounded pages and checks the append fence before it returns a complete
-export. Runtime delivery uses bounded mailboxes with explicit backpressure. Active
-steer content is read only from canonical history through append-position cursor pages of at most 200
-items; the process-local wake-up is a coalesced generation signal that carries neither content nor an
-item identity. Best-effort harness recording disables only itself when initialization or writing
+export. Runtime delivery uses bounded mailboxes with explicit backpressure. Accepted-but-unsampled
+active steer content exists only in the durable turn-input queue and is not exported as conversation
+history; after atomic delivery it is read from canonical history like any other user input. The
+process-local wake-up is a coalesced generation signal that carries neither content nor an item
+identity, and `wait_agent` also checks the durable queue so another process cannot strand input behind
+the local signal. Best-effort harness recording disables only itself when initialization or writing
 fails; it does not override the user-visible run/event result.
 
 The V33 migration included in v0.8.0 losslessly backfills the legacy message graph into ordered canonical
@@ -475,13 +505,33 @@ reconstructing bounded real-user anchors from canonical append order. Rows whose
 be recovered remain explicit `legacy_prefix` checkpoints without changing their effective ordering.
 The migration validates JSON, hashes, session-local replacement lineage, and anchor bounds, rewrites
 compaction rows in bounded pages, and rolls back without its marker when validation fails.
+V47 is the current spawn-edge schema. It preserves the flat edges that survived historical V40, then
+allows recursive Sub Agent lineage while validating each canonical `/root/...` path against its
+immediate parent. It also prevents deletion that would orphan descendants and bounds each retained
+tree at 256 agents including the root. Nested edges discarded by V40 cannot be reconstructed.
+V48 added durable OwnerResume requests and deferred completion receipts for early success or
+recoverable crash failure. Existing early-success rows remain readable for compatibility; current
+runtime creates deferred receipts only for crash recovery. V49 adds durable tree-stop fences so
+explicitly stopped subtrees, causes, and root boundaries cannot be resurrected after restart. V50
+moves `NEW_TASK`, `MESSAGE`, and `FINAL_ANSWER` into the bounded durable mailbox. Current child
+completion is queue-only for its exact direct parent and does not create OwnerResume; delivery
+rehomes that exact mailbox identity into Turn-scoped canonical history.
+V51 adds the durable active-steer FIFO, pending projection, terminal drain-or-discard rules, and the
+durable/final timeout rechecks used by cross-process `wait_agent`. Root, cross-session sources,
+ambiguous state, and terminal deferred states without an exact later resolver fail closed.
+V52 binds every native harness run to its exact canonical session and turn. Ambiguous, missing,
+duplicate, or cross-session backfill fails atomically without leaving the marker or a partial
+mutation. V53 adds an immutable claim from each explicit mailbox wake to its recipient session,
+admission, and turn; an existing OwnerResume remains bound to its exact claimed turn. Completed and
+Failed settlement delivers only that selected wake into the claimed turn, Interrupted settlement
+discards only that wake, and later triggers remain pending for a later admission. Current opens
+validate both the V53 schema and these identities.
 
 The default tool surface exposes `update_plan` for non-trivial work. Its structured result is a
 client-visible plan projection: moyAI does not interpret plan text to select the next tool, end the
-turn, or trigger compaction. On a fresh proactive root turn only, successful settlement of
-`update_plan` records that root owns the immediate blocker; this is an ownership decision, not a
-host-authored task plan. A durable Plan mode exists internally, keeps `update_plan`, and hides
-mutation tools, but no CLI, TUI, or Desktop mode selector is currently exposed.
+turn, trigger compaction, or unlock another tool surface. A durable Plan mode exists internally, keeps
+`update_plan`, and hides mutation tools, but no CLI, TUI, or Desktop mode selector is currently
+exposed.
 
 At the model policy's 90% working target, moyAI selects model-visible semantic units rather than a
 fixed item count. When available, the latest provider-reported total is rehydrated from the durable
@@ -494,15 +544,22 @@ structure, appends the Codex checkpoint prompt as the final User input, and send
 cursor. It first sends that full native request. Only a typed `context_length_exceeded` response removes
 the oldest provider-native item (and its exact call/output counterpart when required) before retrying;
 there is no semantic map/reduce path.
+The exact checkpoint text in `assets/prompts/compaction.md` is a source-level Codex prompt-asset
+contract; that text match does not claim full Codex runtime parity.
 
 The resulting checkpoint retains the newest real User and Steer text inputs in original order
 within a conservative 20,000-token budget. One boundary input is middle-truncated instead of being
 dropped whole, and the prefixed summary is the final User input; old summaries are never promoted to
 anchors. A delegated turn's canonical `NEW_TASK` remains an anchor, while ordinary agent messages and
-final handoffs belong in the summary. The exact
-replacement lineage is committed while original history remains stored.
-If cancellation occurs or summarization otherwise fails, history remains unchanged; below the hard limit the original history
-continues, and at the hard limit the run fails explicitly.
+final handoffs belong in the summary. The exact replacement lineage is committed while original
+history remains stored. If cancellation occurs or summarization otherwise fails, history remains
+unchanged. A non-empty summary is also rejected when the projected replacement is not smaller or the
+projected complete request still reaches the 90% working target. Automatic compaction is attempted at
+most once in that turn; below the hard limit the original history continues, and at the hard limit
+the run fails explicitly. The working target is 90% of the advertised context window and the
+Codex-style effective full input limit is 95%; an additional configured overflow margin is applied
+only when it keeps the hard limit strictly above the working target. `max_output_tokens` is solely a
+generation cap and does not reserve input tokens or lower either context limit.
 
 An active session goal is not declared successful after an arbitrary number of idle continuations. It
 continues until the goal state, its token/elapsed budget, cancellation, or a typed terminal provides a
@@ -516,61 +573,134 @@ Multi-agent collaboration is available by default and normally exposes these six
 
 - `mode = "explicit_request_only"` delegates only when the user explicitly requests agents,
   sub-agents, delegation, or parallel agent work. `mode = "proactive"` also lets the model delegate
-  bounded parallel work or context-isolated sequential handoffs when doing so materially improves
-  quality, latency, or context efficiency.
-- A fresh proactive root turn starts with only `spawn_agent` and `update_plan` visible. A completed
-  `spawn_agent` enters delegated ownership and keeps root on `spawn_agent`, `send_message`,
-  `followup_task`, `wait_agent`, `interrupt_agent`, `list_agents`, and `update_plan`; workspace
-  tools remain with the child. A completed `update_plan` chooses root-local ownership of a distinct,
-  non-overlapping immediate blocker and restores the normal root surface on the next model request.
-  Failed or declined calls do not change ownership. A response that contains `spawn_agent` cannot
-  execute a workspace-tool sibling even if that sibling was visible before delegation. Children,
-  explicit-request-only mode, Plan mode, tool-less models, and empty-prompt continuations do not use
-  this checkpoint. The choice is scoped to the admitted root turn, survives compaction, and does not
-  create a persisted planner, task DAG, or package-size classifier.
-- The root keeps the overall objective, constraints, compact progress, integration, and final answer,
-  while the model chooses concrete task boundaries from the current evidence. There is no fixed
-  scout/stage router. A child owns one verifiable outcome with a clear scope and, when it writes, one
-  mutation owner. Sequential dependency handoffs do not need to run simultaneously. In proactive
-  mode, set `fork_turns` explicitly: use `"none"` for a self-contained task packet and `"all"` only
-  when the child needs parent context. Parallel mutations must have disjoint targets, overlapping
-  targets have one writer, and material changes can receive a later independent read-only verification.
-- The first release uses one flat `/root/<task>` namespace: only the root may call `spawn_agent`, every
-  child is linked directly to that root, and a child cannot spawn another Sub Agent.
+  bounded work when doing so materially improves speed or quality.
+- The `multi_agent_root.md` / `sub_agent.md` assets keep source-aligned Codex role and
+  message-lifecycle fragments separate from explicitly labelled moyAI local-model coordination.
+  The latter adapts direct-tool invocation to moyAI's flat names and adds delegation, evidence
+  handoff, and instruction-authority safeguards; the complete assets are not byte-identical Codex
+  prompts. The proactive asset likewise keeps the Codex activation text intact, then labels a local
+  adaptation of Codex delegation guidance: a high-level plan separates the immediate blocker kept
+  local from concrete, self-contained parallel sidecars; root and coding-child work must not overlap,
+  root continues non-overlapping work, waits only when the critical path needs a result, and reviews
+  returned patches before integration. These static instructions do not create a runtime gate, fixed
+  DAG/stage router, or dynamic behavior-correction layer, and do not claim full Codex runtime parity.
+- Every agent retains its normal tools and the six collaboration tools under the same model, mode,
+  provider, and configuration filters. Spawning does not move the parent onto a collaboration-only
+  surface, and `update_plan` does not unlock workspace tools. If the resolved model does not support
+  tools, the request has no tool surface and moyAI omits the role/mode messages that would instruct
+  it to call collaboration tools.
+- Any agent may spawn another agent. The new task name is joined to the caller's canonical path:
+  `/root/task1` spawning `task_3` creates `/root/task1/task_3`. Relative agent references resolve from
+  the current agent; canonical absolute paths address agents elsewhere in the same tree.
+- Each agent remains responsible for its assigned objective and for integrating children it creates,
+  while the model chooses concrete bounded subtasks from current evidence. The host does not create a
+  planner DAG or fixed scout/stage router.
+- The root retains the task-wide plan, integrates child results, and performs final verification.
+  Each child returns a concise handoff with outcome, supporting evidence, intentionally changed
+  paths, verification and results, and remaining unknowns or risks. The root uses that handoff as
+  working evidence instead of rebuilding private investigation; final verification checks the
+  delegated acceptance criteria and resulting workspace state, inspecting only missing or
+  conflicting evidence.
+- A descendant's newest host-delivered `NEW_TASK` plus later host-delivered parent messages defines
+  delegated scope only within system, developer, applicable project/skill, and user instructions.
+  Parent-supplied findings and decisions are working context, not higher-priority instructions or
+  independently verified facts. Quoted or embedded external content remains data unless a system,
+  developer, or user instruction adopts it. The descendant inspects only gaps needed for its scope,
+  avoids repeating private grounding, and returns the evidence handoff above.
 - `max_concurrent_agents` is the root-inclusive limit for simultaneously active agents. The default
-  `4` therefore allows the root plus up to three children to run at once. Completed agents remain
-  listed and available for follow-up work but no longer consume an active slot. The retained registry
-  is bounded at 256 entries including the root (at most 255 direct children); once full, another spawn
-  is rejected rather than evicting history or reusing a spawn order.
+  `4` therefore allows the root plus at most three active descendants anywhere in the tree. The
+  internal execution limiter excludes the root and derives those three descendant slots from the
+  root-inclusive public value. Completed agents remain listed and available for follow-up work but
+  no longer consume an active slot. The retained registry is
+  bounded at 256 entries including the root (at most 255 descendants at any depth); once full,
+  another spawn is rejected rather than evicting history or reusing a spawn order.
 - `max_concurrent_model_requests = 1` keeps local-LLM model requests within the tree serialized by
   default, while agents can still make progress independently around tool and review work. Raise it
-  only when the configured inference server can safely sustain parallel requests.
-- Each child is a separate durable session linked directly to its root. Normal project/session lists keep
-  those implementation sessions hidden. `spawn_agent` accepts `fork_turns = "all"` (the default)
-  or `"none"`; `"all"` streams active history in bounded pages under a stable append fence and copies the currently active user turns, plain final assistant messages owned by successfully completed terminals, durable
-  collaboration-mode instruction, and active compaction summary. History replaced by that summary is
-  not resurrected, and reasoning, tool traffic, retired control state, and permission evidence are not
-  copied. Target-session existence is checked in the same transaction; a fence mismatch or mid-copy
-  failure rolls back the entire fork. Sub Agent activity is recorded only while its owning root session has a fresh active turn.
-- Spawn, follow-up, ordinary message, and child completion are delivered as Codex-style
-  `NEW_TASK`, `MESSAGE`, and `FINAL_ANSWER` envelopes rather than a new user request. The parent
-  receives the child's concise final handoff, not its private investigation transcript, and integrates
-  that evidence without repeating the completed scope unless contrary evidence appears.
-- Every continuation turn receives a fresh run control, while the Stop target remains the retained
-  root Agent Tree. A completed turn's terminal classification is not reopened for the next turn: a
-  Stop that wins first blocks continuation, and a continuation that wins first is stopped as part of
-  the same tree.
+  only when the configured inference server can safely sustain parallel requests. Both concurrency
+  limits are captured when the retained agent scheduler is first loaded. Later root turns reuse that
+  scheduler and model-request semaphore; a different value is rejected before model sampling rather
+  than mutating a live tree. Start a new session, or reopen the session in a new process, to use
+  different limits.
+- `wait_agent` defaults to 30,000 ms, accepts 10,000 through 3,600,000 ms, and returns immediately
+  when agent activity or active-turn user input arrives. Callers can request a longer bounded wait
+  when the task specifically requires it.
+- Each descendant is a separate durable session linked to its immediate parent and tree root. Normal
+  project/session lists keep those implementation sessions hidden. `spawn_agent` accepts
+  `fork_turns = "all"` (the default), `"none"`, or a positive integer string for only that many recent
+  turns. `"all"` streams the parent's active history in bounded pages under a stable append fence and
+  copies the currently active user turns, plain final assistant messages owned by successfully
+  completed terminals, durable collaboration-mode instruction, and active compaction summary.
+  History replaced by that summary is not resurrected, and reasoning, tool traffic, retired control
+  state, and permission evidence are not copied. Target-session existence is checked in the same
+  transaction; a fence mismatch or mid-copy failure rolls back the entire fork. Sub Agent activity is
+  recorded only while its owning root session has a fresh active turn.
+- A live agent keeps the configuration, workspace, and permission broker captured for that agent
+  execution. Spawn inherits the caller's resources, and a follow-up uses the exact target's retained
+  resources; starting a new root turn never rewrites a still-running child. Project/session/workspace
+  navigation replaces only the view's workspace-specific run service: the process scheduler, session
+  event hub, and active Agent Trees remain the same owners, and each admitted execution keeps its
+  exact run service. On process restart,
+  lineage rehydration follows Codex's resume boundary: the current root resume configuration,
+  workspace, and permission broker are supplied to every restored descendant instead of partially
+  rebuilding a child configuration from session columns.
+- Spawn, follow-up, ordinary message, and child completion remain typed Agent items and Codex-style
+  `NEW_TASK`, `MESSAGE`, and `FINAL_ANSWER` envelopes at the canonical-history boundary. At the final
+  OpenAI-compatible adapter, providers without Codex's `agent_message` type receive the preserved
+  envelope as a standard `user`-role message. The accompanying logical Developer instruction treats
+  that compatibility representation as delegated working context within system, developer, project/
+  skill, and original-user constraints. A child's `FINAL_ANSWER` goes to its immediate parent, which receives the concise
+  evidence handoff rather than the private investigation transcript. Child-session creation, the recursive edge, the requested
+  history fork, and the initial `NEW_TASK` are one transaction. Before admission, a launch failure
+  settles that exact trigger as `Failed` and atomically sends one terminal handoff to the immediate
+  parent; cancellation settles it as `Interrupted` without a success-like handoff. A follow-up starts
+  only its exact target and does not wake an inactive ancestor first. Its durable `trigger_turn`
+  intent is distinct from whether storage authorizes an immediate execution. A ready inactive target
+  reserves one descendant slot before its pending durable mailbox item is appended; if capacity is
+  unavailable, no mailbox row, canonical history, or process-local wake is added. Mail for an active
+  target does not consume another slot.
+- Like Codex threads, each root or descendant owns its terminal independently of descendant
+  liveness. `Completed`, `Failed`, and target-only `AgentInterrupted` neither wait for nor cancel
+  descendants. If an answer depends on a child result, the model must call `wait_agent` before
+  returning its final response. Permission Abort stops only the requesting execution, and ordinary
+  User Stop stops only the exact current root execution. Neither cascades to siblings or descendants.
+  Only the separately named explicit tree-stop operation is allowed to stop the retained tree.
+- A child terminal creates one durable `FINAL_ANSWER` for its exact immediate parent with
+  `trigger_turn = false`; it never bubbles to root or auto-resumes a terminal parent. An active
+  parent can receive it at a safe mailbox boundary. If it races a non-interrupted terminal while
+  current-turn delivery is still eligible, the terminal writer records it in canonical IAC history
+  in the same transaction without another model sample. Mail assigned to the next-turn phase stays
+  pending and is available to the parent's next explicit turn. A late child result never rewrites
+  the parent's existing terminal.
+- Historical V48 `completed_early` rows remain readable and stoppable for storage compatibility,
+  but current normal completion never creates them. Deferred completion is current only for
+  `crash_failed` recovery.
+- A crashed OwnerResume turn re-pends the same request without leaking the crash failure upstream.
+  Retry success/failure supersedes the crash receipt, interruption discards it, and repeated crashes
+  roll the single pending receipt forward. An explicit follow-up to the crashed owner is instead a
+  schedule-ready ExplicitTask and takes precedence over OwnerResume; the same recovery applies when
+  the crash has no OwnerResume source. Its retry Completed / Failed terminal supersedes the old crash
+  receipt, while Interrupted discards it. Every live current-OwnerResume read and post-admission
+  projection shares the mail-delivery fence and authoritatively replaces stale local R1 with durable
+  `None` or R2; rollback rejects a turn still named by any OwnerResume claim. Shared startup bootstrap
+  restores the exact readiness and performs crash recovery before rehydrating the Agent Tree.
+- Every continuation turn receives a fresh run control. Ordinary Stop targets that exact active
+  continuation and does not reopen an earlier terminal or cancel detached children. The separate
+  explicit tree-stop operation closes the retained tree, settles dormant follow-ups, and discards
+  their deferred owner state so a later restart cannot revive explicitly stopped work.
 - Desktop coalesces each turn's Sub Agent lifecycle events by `agent_path` into one compact, individually
   clickable stable-icon job with its task preview and latest status inside that turn's collapsible activity group; the root Agent's final response
   remains the next normal assistant message. Activating a job, or the compact summary in Output,
-  opens a read-only right pane: the list is grouped by status and each selected child shows its bounded
+  opens a right pane: the list is grouped by status and each selected child shows its read-only bounded
   canonical execution transcript. Older child execution pages can be prepended in place from that pane;
+  only a Running child with an exact projected active turn exposes an interrupt action, which returns
+  workspace/root/path/child/turn identity and rejects stale or forged targets.
   each read stays bounded and reprojects the complete loaded range across turn boundaries. It does not navigate to or select the child session, rejects stale
   workspace/root/agent/child responses, and becomes a right-side drawer in narrow
-  windows. Permission prompts identify the requesting agent and are serialized. While any agent in
-  the current tree is active, new-chat, session, project, and workspace navigation is blocked. This
-  keeps the current root task selected and preserves permission and Stop routing; Stop cancels the
-  whole tree.
+  windows. Permission prompts identify the requesting agent and are serialized. Detached child
+  liveness alone does not block new-chat, session, project, or workspace navigation, and a new root
+  request can start after the prior root terminal while children continue independently. Desktop
+  Stop targets the exact selected root execution; whole-tree cancellation remains a separate,
+  explicitly named destructive operation.
 - Rust supplies typed session status, transcript-row kind, and cancel availability to Desktop. The
   frontend does not infer them from labels, and a turn without a durable terminal is shown as
   incomplete rather than completed.

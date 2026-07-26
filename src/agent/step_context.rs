@@ -25,12 +25,11 @@ impl StepContext {
         turn: Arc<TurnContext>,
         workspace: &Workspace,
         skills: SkillsSnapshot,
-        tool_names: &[String],
     ) -> Result<Self, WorkspaceError> {
         let (world_state, external_tools) = {
             let config = turn.resolved_config().runtime_config();
             (
-                WorldState::build_at(workspace, config, tool_names, turn.current_time.clone())?,
+                WorldState::build_at(workspace, config, turn.current_time.clone())?,
                 ExternalToolSnapshot {
                     docling_enabled: config.docling.enabled,
                     mcp: config.mcp.enabled.then(|| config.mcp.clone()),
@@ -45,18 +44,9 @@ impl StepContext {
         })
     }
 
-    pub fn refresh_world_state(
-        &mut self,
-        workspace: &Workspace,
-        tool_names: &[String],
-    ) -> Result<(), WorkspaceError> {
+    pub fn refresh_world_state(&mut self, workspace: &Workspace) -> Result<(), WorkspaceError> {
         let config = self.turn.resolved_config().runtime_config();
-        self.world_state = WorldState::build_at(
-            workspace,
-            config,
-            tool_names,
-            self.turn.current_time.clone(),
-        )?;
+        self.world_state = WorldState::build_at(workspace, config, self.turn.current_time.clone())?;
         Ok(())
     }
 }
@@ -121,7 +111,6 @@ mod tests {
                 roots: Vec::new(),
                 skills: Vec::new(),
             },
-            &["read".to_string()],
         )
         .expect("step context");
         assert!(!step.external_tools.docling_enabled);
@@ -132,7 +121,12 @@ mod tests {
             Some(&expected_time)
         );
 
-        step.refresh_world_state(&workspace, &["read".to_string(), "write".to_string()])
+        std::fs::write(
+            workspace.root.join("AGENTS.md"),
+            "REFRESHED_WORLD_STATE_INSTRUCTION",
+        )
+        .expect("write refreshed instruction");
+        step.refresh_world_state(&workspace)
             .expect("refresh world state");
 
         assert_eq!(
@@ -140,10 +134,17 @@ mod tests {
             Some(&expected_time),
             "clock ticks must not change the same turn's request fingerprint"
         );
-        assert_eq!(
-            step.world_state.snapshot.sections["environment"]["tools"],
-            serde_json::json!(["read", "write"]),
-            "meaningful step state remains refreshable"
+        assert!(
+            step.world_state
+                .rendered
+                .contains("REFRESHED_WORLD_STATE_INSTRUCTION"),
+            "meaningful instruction state remains refreshable"
+        );
+        assert!(
+            step.world_state.snapshot.sections["environment"]
+                .get("tools")
+                .is_none(),
+            "tool schemas are the sole owner of model-visible tool availability"
         );
         assert!(
             !step.world_state.rendered.contains("<tools>"),

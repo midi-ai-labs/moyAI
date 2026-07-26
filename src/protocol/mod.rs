@@ -18,18 +18,21 @@ mod recording;
 mod store;
 
 pub use projection::{
-    ProtocolRunEventProjection, project_inter_agent_communication, project_protocol_run_event,
+    ProtocolRunEventProjection, project_inter_agent_communication,
+    project_inter_agent_communication_with_history_item_id, project_protocol_run_event,
     project_sub_agent_activity, project_turn_item_for_run_event,
 };
-pub use recording::ProtocolRecordingSink;
+pub use recording::{
+    CanonicalRuntimeEventProjector, CanonicalRuntimeProjectionReport, ProtocolRecordingSink,
+};
 pub use store::{
     ActiveHistoryPage, ActiveHistorySnapshot, CanonicalProtocolFence, CanonicalProtocolSnapshot,
     MAX_PROTOCOL_PAGE_LIMIT, ProtocolEventStore, ProtocolPage, ProtocolPageRequest,
     SqliteProtocolEventStore,
 };
 pub(crate) use store::{
-    canonical_protocol_snapshot_from_connection, fork_canonical_items_in_transaction,
-    insert_idle_inter_agent_history_in_transaction,
+    canonical_protocol_snapshot_from_connection, fork_agent_context_in_transaction_for_spawn,
+    fork_canonical_items_in_transaction, insert_mailbox_append_order_in_transaction,
     insert_session_owned_event_bundle_in_transaction, latest_protocol_turn_ids_in_transaction,
 };
 
@@ -395,15 +398,21 @@ pub(crate) fn render_inter_agent_message(
 }
 
 pub(crate) fn is_rendered_inter_agent_message(communication: &InterAgentCommunication) -> bool {
+    rendered_inter_agent_message_type(communication).is_some()
+}
+
+pub(crate) fn rendered_inter_agent_message_type(
+    communication: &InterAgentCommunication,
+) -> Option<InterAgentMessageType> {
     let Some((header, _payload)) = communication.content.split_once("\nPayload:\n") else {
-        return false;
+        return None;
     };
     let mut lines = header.lines();
     let Some(message_type) = lines
         .next()
         .and_then(|line| line.strip_prefix("Message Type: "))
     else {
-        return false;
+        return None;
     };
     let task_name_matches = lines
         .next()
@@ -413,12 +422,15 @@ pub(crate) fn is_rendered_inter_agent_message(communication: &InterAgentCommunic
         .next()
         .and_then(|line| line.strip_prefix("Sender: "))
         .is_some_and(|sender| sender == communication.author);
-    let type_matches = match (communication.trigger_turn, message_type) {
-        (true, "NEW_TASK") => true,
-        (false, "MESSAGE" | "FINAL_ANSWER") => true,
-        _ => false,
+    let message_type = match (communication.trigger_turn, message_type) {
+        (true, "NEW_TASK") => Some(InterAgentMessageType::NewTask),
+        (false, "MESSAGE") => Some(InterAgentMessageType::Message),
+        (false, "FINAL_ANSWER") => Some(InterAgentMessageType::FinalAnswer),
+        _ => None,
     };
-    task_name_matches && sender_matches && type_matches && lines.next().is_none()
+    (task_name_matches && sender_matches && lines.next().is_none())
+        .then_some(message_type)
+        .flatten()
 }
 
 impl RuntimeEvent {

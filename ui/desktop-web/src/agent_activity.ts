@@ -23,7 +23,11 @@ const AGENT_VISUALS: AgentVisual[] = [
   { tone: "cyan", glyph: "✧" },
 ];
 
-const ACTIVE_STATUSES = new Set<AgentStatus>(["pending_init", "running"]);
+const ACTIVE_STATUSES = new Set<AgentStatus>([
+  "pending_init",
+  "running",
+  "awaiting_descendants",
+]);
 const ATTENTION_STATUSES = new Set<AgentStatus>(["interrupted", "errored"]);
 
 export function orderedAgentActivityRows(rows: readonly AgentActivityRow[]): AgentActivityRow[] {
@@ -71,6 +75,8 @@ export function agentStatusLabel(status: AgentStatus): string {
       return "準備中";
     case "running":
       return "作業中";
+    case "awaiting_descendants":
+      return "待機中";
     case "interrupted":
       return "中断";
     case "completed":
@@ -150,5 +156,7 @@ export function agentActivityRowIdentity(row: AgentActivityRow): string {
     row.result_preview,
     String(row.started_order),
     String(row.updated),
+    row.active_turn_id ?? "",
+    String(row.can_interrupt),
   ].join("\u0000");
 }

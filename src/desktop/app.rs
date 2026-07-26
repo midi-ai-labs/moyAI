@@ -26,9 +26,13 @@ use crate::llm::{
     ProviderModelInfo, apply_provider_model_info_to_config, extra_body_with_num_ctx,
     fetch_provider_model_infos, normalize_provider_base_url,
 };
-use crate::protocol::{ToolApprovalDecision, TurnInterruptionCause};
+use crate::protocol::{
+    ProtocolEventStore as _, RuntimeEvent, RuntimeEventMsg, ToolApprovalDecision, TurnId,
+    TurnInterruptionCause,
+};
 use crate::runtime::{
-    AgentStatus, RunCancelOutcome, RunCancellationCause, RunControl, SystemClock,
+    AgentStatus, LocalTaskExecutor, OwnedTaskHandle, RunCancelOutcome, RunCancellationCause,
+    RunControl, SystemClock,
 };
 use crate::session::markdown::{
     MarkdownExportEvent, MarkdownMetadataLine, MarkdownTerminalStatus,
@@ -69,11 +73,21 @@ use super::web_model::{
 
 const DESKTOP_RUNTIME_DRAIN_BUDGET: usize = 256;
 const DESKTOP_RUNTIME_MAILBOX_CAPACITY: usize = 512;
+const DESKTOP_CONTROL_MAILBOX_CAPACITY: usize = 64;
+const DESKTOP_SESSION_RUNTIME_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(100);
+const DESKTOP_SESSION_RUNTIME_CURSOR_PAGE_LIMIT: usize = 1;
+const DESKTOP_SESSION_RUNTIME_CURSOR_DRAIN_BUDGET: usize = 64;
 
 enum RuntimeMessage {
     RunEvent {
         run_generation: u64,
         event: RunEvent,
+    },
+    CanonicalSessionEvent {
+        listener_generation: u64,
+        target: SessionRuntimeListenerTarget,
+        event: RuntimeEvent,
     },
     Finished {
         run_generation: u64,
@@ -95,7 +109,6 @@ enum RuntimeMessage {
     },
     SteerFinished {
         target: SteerSubmissionTarget,
-        prompt_dispatch: crate::session::PromptDispatchPart,
         image_paths: Vec<Utf8PathBuf>,
         cancel_prompt_review_on_commit: bool,
         result: Result<(), String>,
@@ -182,6 +195,49 @@ enum RuntimeMessage {
         worker: Arc<AccessModePersistenceWorker>,
         result: Result<Utf8PathBuf, String>,
     },
+}
+
+#[derive(Clone)]
+struct DesktopControlPlaneSender {
+    tx: mpsc::SyncSender<RuntimeMessage>,
+    terminal_fallback: Arc<Mutex<Option<RuntimeMessage>>>,
+}
+
+impl DesktopControlPlaneSender {
+    fn try_send(&self, message: RuntimeMessage) -> Result<(), String> {
+        self.tx.try_send(message).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => {
+                "desktop control mailbox is full; the request was rejected".to_string()
+            }
+            mpsc::TrySendError::Disconnected(_) => {
+                "desktop control mailbox is unavailable".to_string()
+            }
+        })
+    }
+
+    fn publish_terminal(&self, message: RuntimeMessage) {
+        match self.tx.try_send(message) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(message)) => {
+                if let Ok(mut fallback) = self.terminal_fallback.lock() {
+                    *fallback = Some(message);
+                }
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_desktop_control_plane() -> (DesktopControlPlaneSender, mpsc::Receiver<RuntimeMessage>) {
+    let (tx, rx) = mpsc::sync_channel(DESKTOP_CONTROL_MAILBOX_CAPACITY);
+    (
+        DesktopControlPlaneSender {
+            tx,
+            terminal_fallback: Arc::new(Mutex::new(None)),
+        },
+        rx,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -345,6 +401,13 @@ struct SessionRefreshRequestTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionRuntimeListenerTarget {
+    workspace_root: Utf8PathBuf,
+    session_id: SessionId,
+    turn_id: TurnId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionSearchRequestTarget {
     query: String,
     include_archived: bool,
@@ -411,7 +474,9 @@ fn unique_background_request_admission_open(
 impl RuntimeMessage {
     fn async_contract(&self) -> RuntimeMessageAsyncContract {
         match self {
-            RuntimeMessage::RunEvent { .. } => RuntimeMessageAsyncContract::RunStream,
+            RuntimeMessage::RunEvent { .. } | RuntimeMessage::CanonicalSessionEvent { .. } => {
+                RuntimeMessageAsyncContract::RunStream
+            }
             RuntimeMessage::Finished { .. } => RuntimeMessageAsyncContract::TerminalRun,
             RuntimeMessage::Permission { .. } | RuntimeMessage::PermissionCancelled { .. } => {
                 RuntimeMessageAsyncContract::ModalDecision
@@ -479,17 +544,7 @@ enum SessionLoadReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CurrentSessionRefreshPurpose {
     Refresh,
-    StopSettlement { root_admission_fence: u64 },
-}
-
-fn stop_settlement_status_message(status: SessionStatus) -> &'static str {
-    match status {
-        SessionStatus::Completed => "root run completed; any remaining agent work was stopped",
-        SessionStatus::Failed => "root run failed; any remaining agent work was stopped",
-        SessionStatus::Idle | SessionStatus::Running | SessionStatus::Cancelled => {
-            "stopped the active agent tree"
-        }
-    }
+    StopRequestRefresh { root_admission_fence: u64 },
 }
 
 struct LoadedSession {
@@ -517,7 +572,7 @@ fn agent_activity_records_are_active(records: &[AgentActivityRecord]) -> bool {
     records.iter().any(|record| {
         matches!(
             &record.status,
-            AgentStatus::PendingInit | AgentStatus::Running
+            AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::AwaitingDescendants
         )
     })
 }
@@ -597,22 +652,17 @@ fn access_mode_display_label(access_mode: crate::config::AccessMode) -> &'static
     }
 }
 
-fn session_search_result_can_apply(
-    is_latest: bool,
-    root_run_active: bool,
-    agent_tree_active: bool,
-) -> bool {
-    is_latest && !root_run_active && !agent_tree_active
+fn session_search_result_can_apply(is_latest: bool, root_run_active: bool) -> bool {
+    is_latest && !root_run_active
 }
 
 fn apply_session_search_result(
     state: &mut DesktopState,
     is_latest: bool,
     root_run_active: bool,
-    agent_tree_active: bool,
     result: Result<DesktopSnapshot, String>,
 ) -> bool {
-    if !session_search_result_can_apply(is_latest, root_run_active, agent_tree_active) {
+    if !session_search_result_can_apply(is_latest, root_run_active) {
         return false;
     }
     match result {
@@ -624,18 +674,16 @@ fn apply_session_search_result(
 
 fn finish_steer_submission(
     state: &mut DesktopState,
-    prompt_dispatch: &crate::session::PromptDispatchPart,
     image_paths: &[Utf8PathBuf],
     result: Result<(), String>,
 ) -> bool {
     match result {
         Ok(()) => {
-            state.apply_durable_prompt_dispatch(prompt_dispatch);
             state
                 .composer
                 .image_attachment_paths
                 .retain(|path| !image_paths.contains(path));
-            state.set_status_message("追加入力を実行中の turn に保存しました。");
+            state.set_status_message("追加入力を送信待ちキューに保存しました。");
             true
         }
         Err(error) => {
@@ -704,6 +752,7 @@ struct DesktopRootRun {
     generation: u64,
     run_control: RunControl,
     phase: DesktopRootRunPhase,
+    worker: Option<OwnedTaskHandle>,
 }
 
 struct PendingRootSubmission {
@@ -713,6 +762,18 @@ struct PendingRootSubmission {
     prompt_dispatch: crate::session::PromptDispatchPart,
     image_paths: Vec<Utf8PathBuf>,
     cancel_prompt_review_on_commit: bool,
+}
+
+struct DesktopSessionRuntimeListener {
+    generation: u64,
+    target: SessionRuntimeListenerTarget,
+    cancel: CancellationToken,
+}
+
+impl Drop for DesktopSessionRuntimeListener {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 
 #[derive(Default)]
@@ -726,7 +787,27 @@ impl DesktopRunLifecycle {
             generation,
             run_control,
             phase: DesktopRootRunPhase::Running,
+            worker: None,
         });
+    }
+
+    fn attach_worker(
+        &mut self,
+        generation: u64,
+        worker: OwnedTaskHandle,
+    ) -> Result<(), OwnedTaskHandle> {
+        if worker.generation() != generation {
+            return Err(worker);
+        }
+        let Some(run) = self
+            .root
+            .as_mut()
+            .filter(|run| run.generation == generation && run.worker.is_none())
+        else {
+            return Err(worker);
+        };
+        run.worker = Some(worker);
+        Ok(())
     }
 
     fn root_is_active(&self) -> bool {
@@ -786,7 +867,11 @@ impl DesktopRunLifecycle {
     }
 
     fn finish_root(&mut self) {
-        self.root = None;
+        if let Some(mut root) = self.root.take()
+            && let Some(worker) = root.worker.take()
+        {
+            worker.detach();
+        }
     }
 }
 
@@ -920,7 +1005,6 @@ fn finish_navigation_failure(
 impl DesktopController {
     pub(crate) fn config_draft_mutation_admission_open(&self) -> bool {
         !self.run_lifecycle.root_is_active()
-            && !self.current_agent_tree_active()
             && !self.state.is_busy()
             && !self.state.navigation_loading()
             && !self.state.background_mutation_pending()
@@ -1040,26 +1124,14 @@ mod command_projection_owner_tests {
         assert!(lifecycle.root_is_finalizing());
         assert!(!lifecycle.can_steer_root());
         assert_eq!(
-            navigation_admission_blocker(
-                false,
-                false,
-                false,
-                false,
-                lifecycle.root_is_finalizing(),
-            ),
+            navigation_admission_blocker(false, false, false, lifecycle.root_is_finalizing(),),
             Some("the current run is finalizing")
         );
         lifecycle.finish_root();
         assert!(!lifecycle.root_is_active());
         assert_eq!(lifecycle.root_generation(), None);
         assert_eq!(
-            navigation_admission_blocker(
-                false,
-                false,
-                false,
-                false,
-                lifecycle.root_is_finalizing(),
-            ),
+            navigation_admission_blocker(false, false, false, lifecycle.root_is_finalizing(),),
             None
         );
     }
@@ -1605,6 +1677,64 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
+    async fn desktop_child_only_tree_does_not_block_new_root_prompt_admission() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (_temp, workspace_root, mut controller) = empty_access_test_controller().await;
+        let root_session = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "independent root terminal".to_string(),
+                cwd: workspace_root,
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: controller.app.config.permissions.access_mode,
+            })
+            .await
+            .expect("root session");
+        controller.state.app_state.current_session_id = Some(root_session.id);
+        controller.state.app_state.current_session_title = root_session.title;
+        controller.state.app_state.run_status = crate::tui::state::RunStatus::Completed;
+        controller.loaded_agent_activity_records = Some((
+            root_session.id,
+            vec![agent_record(
+                SessionId::new(),
+                "/root/detached_child",
+                AgentStatus::Running,
+                "",
+            )],
+        ));
+
+        assert!(controller.current_agent_tree_active());
+        assert!(!controller.run_lifecycle.root_is_active());
+        let admitted_generation = controller.next_root_run_generation;
+
+        assert!(
+            controller.start_run("continue with a new root turn".to_string()),
+            "a descendant worker is not the root prompt admission owner"
+        );
+        assert_eq!(
+            controller.run_lifecycle.root_generation(),
+            Some(admitted_generation)
+        );
+        assert_eq!(
+            controller
+                .pending_root_submission
+                .as_ref()
+                .map(|pending| pending.run_generation),
+            Some(admitted_generation)
+        );
+        assert_eq!(controller.next_root_run_generation, admitted_generation + 1);
+
+        // This test owns no provider response. Dropping the exact worker owner aborts the
+        // pre-admitted task before the controller's local executor is shut down.
+        drop(controller.run_lifecycle.root.take());
+    }
+
+    #[tokio::test]
     async fn pre_admission_access_change_persists_the_same_root_session_adopted_before_completion()
     {
         use crate::session::{NewSession, SessionRepository as _};
@@ -1941,6 +2071,286 @@ mod command_projection_owner_tests {
         (temp, root, controller)
     }
 
+    #[tokio::test]
+    async fn finished_interruption_projects_cancelled_even_if_the_live_view_is_still_running() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let session_id = SessionId::new();
+        controller.state.app_state.current_session_id = Some(session_id);
+        controller.state.app_state.run_status = crate::tui::state::RunStatus::Running;
+        controller.state.begin_agent_run();
+        controller.run_lifecycle.begin(17, RunControl::new());
+        let summary = RunSummary::from_terminal(
+            session_id,
+            crate::protocol::TurnId::new(),
+            crate::session::DurableTurnTerminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Interrupted {
+                    cause: crate::protocol::TurnInterruptionCause::UserStop,
+                },
+                final_response_id: None,
+                tool_call_count: 4,
+                failed_tool_count: 1,
+                change_count: 0,
+                metrics: crate::session::RunMetrics {
+                    model_request_count: 3,
+                    ..Default::default()
+                },
+            },
+        );
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::Finished {
+                run_generation: 17,
+                result: Ok(summary),
+            })
+            .expect("durable interrupted finish");
+        controller.drain_runtime_messages();
+
+        assert!(!controller.run_lifecycle.root_is_active());
+        assert_eq!(
+            controller.state.app_state.run_status,
+            crate::tui::state::RunStatus::Cancelled
+        );
+        assert_eq!(
+            controller.state.app_state.interruption_cause,
+            Some(crate::protocol::TurnInterruptionCause::UserStop)
+        );
+        assert_eq!(
+            controller.state.status_code,
+            super::super::state::DesktopStatusCode::UserStopped
+        );
+        assert_eq!(controller.state.app_state.progress.model_requests, 3);
+        assert_eq!(controller.state.app_state.progress.tool_calls_started, 4);
+        assert_eq!(controller.state.app_state.progress.tool_calls_failed, 1);
+    }
+
+    #[tokio::test]
+    async fn rejoined_running_session_observes_an_exact_terminal_committed_by_another_store() {
+        use crate::protocol::ProtocolEventStore as _;
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 root");
+        std::fs::create_dir_all(&root).expect("workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = build_test_app(&root, store).await;
+        let session = app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: app.workspace.project_id,
+                title: "cross-process owner".to_string(),
+                cwd: root.clone(),
+                model: app.config.model.model.clone(),
+                base_url: app.config.model.base_url.clone(),
+                access_mode: app.config.permissions.access_mode,
+            })
+            .await
+            .expect("session");
+        let turn_id = TurnId::new();
+        let admission = app
+            .store
+            .session_repo()
+            .admit_session_turn(session.id, turn_id)
+            .await
+            .expect("admission")
+            .expect("turn admitted");
+        let args = DesktopArgs {
+            directory: Some(root),
+            session_id: Some(session.id),
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+
+        assert_eq!(
+            controller.state.app_state.run_status,
+            crate::tui::state::RunStatus::Running
+        );
+        assert!(
+            controller
+                .session_runtime_listener
+                .as_ref()
+                .is_some_and(|listener| {
+                    listener.target.session_id == session.id && listener.target.turn_id == turn_id
+                })
+        );
+        let listener = controller
+            .session_runtime_listener
+            .as_ref()
+            .expect("listener")
+            .generation;
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::CanonicalSessionEvent {
+                listener_generation: listener.saturating_add(1),
+                target: SessionRuntimeListenerTarget {
+                    workspace_root: controller.app.workspace.root.clone(),
+                    session_id: session.id,
+                    turn_id,
+                },
+                event: RuntimeEvent {
+                    id: crate::protocol::RuntimeEventId::new(),
+                    session_id: session.id,
+                    turn_id,
+                    sequence_no: 99,
+                    created_at_ms: 1,
+                    msg: RuntimeEventMsg::TurnTerminal {
+                        terminal: Box::new(crate::session::DurableTurnTerminal {
+                            outcome: crate::protocol::TurnTerminalOutcome::Failed {
+                                error: "stale listener must not win".to_string(),
+                            },
+                            final_response_id: None,
+                            tool_call_count: 0,
+                            failed_tool_count: 0,
+                            change_count: 0,
+                            metrics: Default::default(),
+                        }),
+                    },
+                },
+            })
+            .expect("stale listener message");
+        controller.drain_runtime_messages();
+        assert_eq!(
+            controller.state.app_state.run_status,
+            crate::tui::state::RunStatus::Running,
+            "a stale listener generation cannot terminate the selected run"
+        );
+        let stale_turn_id = TurnId::new();
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::CanonicalSessionEvent {
+                listener_generation: listener,
+                target: SessionRuntimeListenerTarget {
+                    workspace_root: controller.app.workspace.root.clone(),
+                    session_id: session.id,
+                    turn_id: stale_turn_id,
+                },
+                event: RuntimeEvent {
+                    id: crate::protocol::RuntimeEventId::new(),
+                    session_id: session.id,
+                    turn_id: stale_turn_id,
+                    sequence_no: 1,
+                    created_at_ms: 1,
+                    msg: RuntimeEventMsg::TurnTerminal {
+                        terminal: Box::new(crate::session::DurableTurnTerminal {
+                            outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                            final_response_id: None,
+                            tool_call_count: 0,
+                            failed_tool_count: 0,
+                            change_count: 0,
+                            metrics: Default::default(),
+                        }),
+                    },
+                },
+            })
+            .expect("stale turn message");
+        controller.drain_runtime_messages();
+        assert_eq!(
+            controller.state.app_state.run_status,
+            crate::tui::state::RunStatus::Running,
+            "a stale listener turn cannot terminate the selected run"
+        );
+
+        let external_sqlite =
+            crate::storage::SqliteStore::open(&paths).expect("external sqlite connection");
+        let external_store = crate::storage::StoreBundle::new(external_sqlite);
+        let terminal = crate::session::DurableTurnTerminal {
+            outcome: crate::protocol::TurnTerminalOutcome::Interrupted {
+                cause: crate::protocol::TurnInterruptionCause::UserStop,
+            },
+            final_response_id: None,
+            tool_call_count: 7,
+            failed_tool_count: 2,
+            change_count: 3,
+            metrics: crate::session::RunMetrics {
+                model_request_count: 5,
+                ..Default::default()
+            },
+        };
+        external_store
+            .session_repo()
+            .terminalize_admitted_turn_with_protocol_event(
+                session.id,
+                admission.admission_id,
+                &RunEvent::TurnTerminal {
+                    session_id: session.id,
+                    terminal: Box::new(terminal.clone()),
+                },
+                turn_id,
+                None,
+                None,
+            )
+            .await
+            .expect("external terminal commit");
+        let canonical_terminal = external_store
+            .protocol_event_store()
+            .list_runtime_events(session.id, turn_id)
+            .expect("canonical runtime events")
+            .into_iter()
+            .find(RuntimeEvent::is_terminal)
+            .expect("canonical terminal");
+        controller
+            .app
+            .session_event_hub
+            .publisher()
+            .publish(canonical_terminal.clone())
+            .expect("live terminal wake");
+        controller
+            .app
+            .session_event_hub
+            .publisher()
+            .publish(canonical_terminal)
+            .expect("duplicate live wake is harmless");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while controller.state.app_state.run_status == crate::tui::state::RunStatus::Running
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            controller.drain_runtime_messages();
+        }
+
+        assert_eq!(
+            controller.state.app_state.run_status,
+            crate::tui::state::RunStatus::Cancelled
+        );
+        assert_eq!(
+            controller.state.app_state.interruption_cause,
+            Some(crate::protocol::TurnInterruptionCause::UserStop)
+        );
+        assert_eq!(controller.state.app_state.progress.model_requests, 5);
+        assert_eq!(controller.state.app_state.progress.tool_calls_started, 7);
+        assert_eq!(controller.state.app_state.progress.tool_calls_failed, 2);
+        assert!(controller.session_runtime_listener.is_none());
+        assert_eq!(
+            controller
+                .state
+                .app_state
+                .transcript_entries
+                .iter()
+                .filter(|entry| entry.title == "Run interrupted")
+                .count(),
+            0,
+            "the canonical refresh owns transcript rows; the lifecycle listener only projects state"
+        );
+    }
+
     fn loaded_test_session(
         controller: &DesktopController,
         root: &Utf8Path,
@@ -1999,6 +2409,7 @@ mod command_projection_owner_tests {
                     has_more: false,
                     items: turn_items,
                 },
+                pending_turn_inputs: Vec::new(),
                 turn_elapsed_ms: Default::default(),
                 latest_turn_id,
                 active_turn_id: None,
@@ -2009,7 +2420,7 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
-    async fn current_stop_settlement_applies_once_without_a_new_root_admission() {
+    async fn current_stop_request_refresh_applies_once_without_a_new_root_admission() {
         let (_temp, root, mut controller) = empty_access_test_controller().await;
         let session_id = SessionId::new();
         controller.state.app_state.current_session_id = Some(session_id);
@@ -2029,7 +2440,7 @@ mod command_projection_owner_tests {
             .send(RuntimeMessage::CurrentSessionRefreshed {
                 request_id,
                 target: target.clone(),
-                purpose: CurrentSessionRefreshPurpose::StopSettlement {
+                purpose: CurrentSessionRefreshPurpose::StopRequestRefresh {
                     root_admission_fence,
                 },
                 result: Ok(loaded_test_session(
@@ -2056,7 +2467,7 @@ mod command_projection_owner_tests {
             .send(RuntimeMessage::CurrentSessionRefreshed {
                 request_id,
                 target,
-                purpose: CurrentSessionRefreshPurpose::StopSettlement {
+                purpose: CurrentSessionRefreshPurpose::StopRequestRefresh {
                     root_admission_fence,
                 },
                 result: Err("duplicate Stop settlement".to_string()),
@@ -2069,7 +2480,98 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
-    async fn stop_settlement_from_before_the_next_root_admission_cannot_mutate_that_root() {
+    async fn running_stop_refresh_waits_for_the_matching_interrupted_summary() {
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let session_id = SessionId::new();
+        let run_generation = controller.next_root_run_generation;
+        controller.state.app_state.current_session_id = Some(session_id);
+        controller.state.app_state.run_status = crate::tui::state::RunStatus::Running;
+        controller.state.begin_agent_run();
+        controller
+            .run_lifecycle
+            .begin(run_generation, RunControl::new());
+        controller.state.mark_run_stop_requested(
+            "run cancellation requested",
+            "停止を要求しました。現在の処理を中断しています。",
+        );
+        controller.state.mark_post_run_refresh_pending();
+        let target = SessionRefreshRequestTarget {
+            workspace_root: root.clone(),
+            session_id,
+        };
+        let request_id = controller
+            .session_projection_refresh_requests
+            .begin(target.clone());
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::CurrentSessionRefreshed {
+                request_id,
+                target,
+                purpose: CurrentSessionRefreshPurpose::StopRequestRefresh {
+                    root_admission_fence: controller.next_root_run_generation,
+                },
+                result: Ok(loaded_test_session(
+                    &controller,
+                    &root,
+                    session_id,
+                    SessionStatus::Running,
+                    None,
+                )),
+            })
+            .expect("Stop acknowledgement");
+        controller.drain_runtime_messages();
+
+        assert!(controller.run_lifecycle.root_is_active());
+        assert_eq!(
+            controller.state.app_state.run_status,
+            crate::tui::state::RunStatus::Running
+        );
+        assert_eq!(controller.state.app_state.progress.status, "Stopping");
+        assert_eq!(
+            controller.state.app_state.status_message.as_deref(),
+            Some("Stop request accepted; waiting for the matching terminal event")
+        );
+
+        let summary = RunSummary::from_terminal(
+            session_id,
+            crate::protocol::TurnId::new(),
+            crate::session::DurableTurnTerminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Interrupted {
+                    cause: crate::protocol::TurnInterruptionCause::UserStop,
+                },
+                final_response_id: None,
+                tool_call_count: 1,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: crate::session::RunMetrics {
+                    model_request_count: 2,
+                    ..Default::default()
+                },
+            },
+        );
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::Finished {
+                run_generation,
+                result: Ok(summary),
+            })
+            .expect("matching interrupted summary");
+        controller.drain_runtime_messages();
+
+        assert!(!controller.run_lifecycle.root_is_active());
+        assert_eq!(
+            controller.state.app_state.run_status,
+            crate::tui::state::RunStatus::Cancelled
+        );
+        assert_eq!(
+            controller.state.status_code,
+            super::super::state::DesktopStatusCode::UserStopped
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_request_refresh_from_before_the_next_root_admission_cannot_mutate_that_root() {
         let (_temp, root, mut controller) = empty_access_test_controller().await;
         let session_id = SessionId::new();
         controller.state.app_state.current_session_id = Some(session_id);
@@ -2109,7 +2611,7 @@ mod command_projection_owner_tests {
             .send(RuntimeMessage::CurrentSessionRefreshed {
                 request_id,
                 target,
-                purpose: CurrentSessionRefreshPurpose::StopSettlement {
+                purpose: CurrentSessionRefreshPurpose::StopRequestRefresh {
                     root_admission_fence: old_root_admission_fence,
                 },
                 result: Ok(loaded_test_session(
@@ -2522,7 +3024,30 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
-    async fn durable_only_agent_tree_stop_dispatches_session_owner_and_preserves_root_result() {
+    async fn stop_without_a_root_resolves_only_the_displayed_approval_ticket() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let request = test_permission("detached child approval");
+        let (response, receiver) = mpsc::channel();
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request,
+            responder: response,
+            run_control: RunControl::new(),
+        });
+
+        controller.cancel_active_run();
+
+        assert_eq!(receiver.try_recv(), Ok(ReviewDecision::Abort));
+        assert!(controller.pending_permission.is_none());
+        let expected_status = crate::tui::state::permission_decision_pending_status_message();
+        assert_eq!(
+            controller.state.app_state.status_message.as_deref(),
+            Some(expected_status.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_stop_does_not_target_a_detached_child_after_root_completion() {
         use crate::session::{NewSession, SessionRepository as _};
 
         let (_temp, workspace_root, mut controller) = empty_access_test_controller().await;
@@ -2609,6 +3134,7 @@ mod command_projection_owner_tests {
             .expect("child admission")
             .expect("child admitted");
         controller.state.app_state.current_session_id = Some(root.id);
+        controller.state.app_state.run_status = crate::tui::state::RunStatus::Completed;
         controller.loaded_agent_activity_records = Some((
             root.id,
             vec![agent_record(
@@ -2622,13 +3148,6 @@ mod command_projection_owner_tests {
         assert!(!controller.run_lifecycle.root_is_active());
 
         controller.cancel_active_run();
-        for _ in 0..200 {
-            controller.drain_runtime_messages();
-            if !controller.session_projection_refresh_requests.is_pending() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
 
         assert!(!controller.session_projection_refresh_requests.is_pending());
         assert_eq!(
@@ -2643,15 +3162,15 @@ mod command_projection_owner_tests {
             repository
                 .get_session(child.id)
                 .await
-                .expect("stopped child")
+                .expect("detached child")
                 .status,
-            SessionStatus::Cancelled
+            SessionStatus::Running
         );
         assert_eq!(
             controller.state.app_state.status_message.as_deref(),
-            Some("root run completed; any remaining agent work was stopped")
+            Some("停止できる実行中タスクはありません。"),
+            "ordinary Stop has no implicit subtree target"
         );
-
         controller.loaded_agent_activity_records = Some((
             root.id,
             vec![agent_record(
@@ -2662,25 +3181,14 @@ mod command_projection_owner_tests {
             )],
         ));
         controller.cancel_active_run();
-        for _ in 0..200 {
-            controller.drain_runtime_messages();
-            if !controller.session_projection_refresh_requests.is_pending() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
         assert_eq!(
             controller.state.app_state.run_status,
             crate::tui::state::RunStatus::Completed,
-            "a rejected durable Stop must not reclassify the preserved root"
+            "a child-only Stop must not reclassify the preserved root"
         );
-        assert!(
-            controller
-                .state
-                .app_state
-                .status_message
-                .as_deref()
-                .is_some_and(|message| message.contains("failed to stop active agent tree"))
+        assert_eq!(
+            controller.state.app_state.status_message.as_deref(),
+            Some("停止できる実行中タスクはありません。")
         );
     }
 
@@ -3263,7 +3771,6 @@ mod command_projection_owner_tests {
 
         assert!(!finish_steer_submission(
             &mut state,
-            &crate::session::PromptDispatchPart::raw("follow-up"),
             std::slice::from_ref(&image),
             Err("terminal session".to_string()),
         ));
@@ -3275,6 +3782,42 @@ mod command_projection_owner_tests {
                 .status_message
                 .as_deref()
                 .is_some_and(|message| message.contains("terminal session"))
+        );
+    }
+
+    #[test]
+    fn accepted_steer_does_not_append_a_phantom_transcript_row() {
+        let mut state = DesktopState::new(
+            super::super::models::DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            ResolvedConfig::default(),
+        );
+        let image = Utf8PathBuf::from("C:/workspace/reference.png");
+        state.composer.image_attachment_paths.push(image.clone());
+
+        assert!(finish_steer_submission(
+            &mut state,
+            std::slice::from_ref(&image),
+            Ok(()),
+        ));
+        assert!(state.app_state.transcript_entries.is_empty());
+        assert!(state.composer.image_attachment_paths.is_empty());
+        assert!(
+            state
+                .app_state
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("送信待ちキュー"))
         );
     }
 
@@ -3299,6 +3842,8 @@ mod command_projection_owner_tests {
             started_order: 1,
             updated: false,
             is_current_turn: false,
+            active_turn_id: None,
+            can_interrupt: false,
         }
     }
 
@@ -3331,23 +3876,70 @@ mod command_projection_owner_tests {
     }
 
     #[test]
-    fn child_only_agent_activity_blocks_desktop_navigation() {
+    fn child_only_agent_activity_does_not_block_desktop_navigation() {
         assert_eq!(
-            navigation_admission_blocker(false, false, false, false, false),
+            navigation_admission_blocker(false, false, false, false),
             None
         );
         assert_eq!(
-            navigation_admission_blocker(false, false, false, true, false),
-            Some("the current agent tree is active")
-        );
-        assert_eq!(
-            navigation_admission_blocker(false, false, false, false, true),
+            navigation_admission_blocker(false, false, false, true),
             Some("the current run is finalizing")
         );
     }
 
+    #[tokio::test]
+    async fn child_only_agent_activity_keeps_in_flight_session_search_owned() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let root_session_id = SessionId::new();
+        controller.state.app_state.current_session_id = Some(root_session_id);
+        controller.loaded_agent_activity_records = Some((
+            root_session_id,
+            vec![agent_record(
+                SessionId::new(),
+                "/root/detached_search_worker",
+                AgentStatus::Running,
+                "",
+            )],
+        ));
+        let operation_id = controller.state.begin_session_search();
+        let request_id = controller
+            .session_search_requests
+            .begin(
+                operation_id,
+                SessionSearchRequestTarget {
+                    query: "retained query".to_string(),
+                    include_archived: false,
+                    selected_session_id: Some(root_session_id),
+                },
+            )
+            .dispatch
+            .expect("initial search dispatch")
+            .request_id;
+
+        let projection = controller.next_web_state().expect("child-only projection");
+
+        assert!(projection.agent_tree_active);
+        assert!(projection.navigation_admission_open);
+        assert!(projection.can_submit);
+        assert!(
+            controller
+                .state
+                .pending_async_operation_keys()
+                .iter()
+                .any(|key| key == "session_search"),
+            "descendant liveness must not cancel the root-owned search"
+        );
+        assert!(
+            controller
+                .session_search_requests
+                .finish(request_id)
+                .is_some(),
+            "the accepted search request must retain its completion owner"
+        );
+    }
+
     #[test]
-    fn session_search_started_while_idle_cannot_replace_root_after_run_or_tree_admission() {
+    fn session_search_started_while_idle_cannot_replace_root_after_root_admission() {
         fn snapshot(session_id: SessionId, title: &str) -> DesktopSnapshot {
             DesktopSnapshot {
                 workspace_path: "C:/workspace".to_string(),
@@ -3378,20 +3970,18 @@ mod command_projection_owner_tests {
             &mut state,
             true,
             true,
-            false,
             Ok(snapshot(stale_search_root, "stale search result")),
         ));
         assert_eq!(state.selected_session_id(), Some(selected_root));
 
-        assert!(!apply_session_search_result(
+        assert!(apply_session_search_result(
             &mut state,
             true,
             false,
-            true,
-            Ok(snapshot(stale_search_root, "stale tree result")),
+            Ok(snapshot(stale_search_root, "child-safe search result")),
         ));
-        assert_eq!(state.selected_session_id(), Some(selected_root));
-        assert!(!session_search_result_can_apply(false, false, false));
+        assert_eq!(state.selected_session_id(), Some(stale_search_root));
+        assert!(!session_search_result_can_apply(false, false));
     }
 
     fn navigation_owner_state() -> (DesktopState, SessionId, SessionId) {
@@ -4173,9 +4763,9 @@ mod command_projection_owner_tests {
 
     #[test]
     fn cancelled_active_permission_clears_by_id_and_advances_broker() {
-        let (runtime_tx, runtime_rx) = mpsc::sync_channel(DESKTOP_RUNTIME_MAILBOX_CAPACITY);
+        let (control, runtime_rx) = test_desktop_control_plane();
         let broker = SharedConfirmationPrompt::new(DesktopConfirmationPrompt {
-            tx: runtime_tx,
+            control,
             next_permission_request_id: Arc::new(AtomicU64::new(41)),
         });
 
@@ -4255,9 +4845,9 @@ mod command_projection_owner_tests {
 
     #[test]
     fn desktop_permission_abort_is_ticket_local_and_loses_to_existing_cause() {
-        let (runtime_tx, runtime_rx) = mpsc::sync_channel(DESKTOP_RUNTIME_MAILBOX_CAPACITY);
+        let (control, runtime_rx) = test_desktop_control_plane();
         let mut prompt = DesktopConfirmationPrompt {
-            tx: runtime_tx,
+            control,
             next_permission_request_id: Arc::new(AtomicU64::new(61)),
         };
         let control = RunControl::new();
@@ -4283,9 +4873,9 @@ mod command_projection_owner_tests {
         );
         assert_eq!(observer.cause(), None);
 
-        let (runtime_tx, runtime_rx) = mpsc::sync_channel(DESKTOP_RUNTIME_MAILBOX_CAPACITY);
+        let (control, runtime_rx) = test_desktop_control_plane();
         let mut prompt = DesktopConfirmationPrompt {
-            tx: runtime_tx,
+            control,
             next_permission_request_id: Arc::new(AtomicU64::new(71)),
         };
         let control = RunControl::new();
@@ -4486,6 +5076,10 @@ pub(crate) struct DesktopController {
     persist_preferences_to_disk: bool,
     runtime_tx: mpsc::SyncSender<RuntimeMessage>,
     runtime_rx: mpsc::Receiver<RuntimeMessage>,
+    control_tx: DesktopControlPlaneSender,
+    control_rx: mpsc::Receiver<RuntimeMessage>,
+    control_terminal_fallback: Arc<Mutex<Option<RuntimeMessage>>>,
+    root_task_runtime: LocalTaskExecutor,
     pending_permission: Option<PendingPermission>,
     next_permission_request_id: Arc<AtomicU64>,
     run_lifecycle: DesktopRunLifecycle,
@@ -4493,6 +5087,8 @@ pub(crate) struct DesktopController {
     composer_commit_generation: u64,
     next_root_run_generation: u64,
     next_enhance_request_id: u64,
+    next_session_runtime_listener_generation: u64,
+    session_runtime_listener: Option<DesktopSessionRuntimeListener>,
     session_search_requests: SessionSearchRequestTracker<SessionSearchRequestTarget>,
     snapshot_requests: LatestRequestTracker<SnapshotRequestTarget>,
     turn_page_requests: LatestRequestTracker<SessionPageRequestTarget>,
@@ -4527,6 +5123,14 @@ impl DesktopController {
         persist_preferences_to_disk: bool,
     ) -> Result<Self, AppRunError> {
         let (runtime_tx, runtime_rx) = mpsc::sync_channel(DESKTOP_RUNTIME_MAILBOX_CAPACITY);
+        let (control_channel_tx, control_rx) = mpsc::sync_channel(DESKTOP_CONTROL_MAILBOX_CAPACITY);
+        let control_terminal_fallback = Arc::new(Mutex::new(None));
+        let control_tx = DesktopControlPlaneSender {
+            tx: control_channel_tx,
+            terminal_fallback: Arc::clone(&control_terminal_fallback),
+        };
+        let root_task_runtime =
+            LocalTaskExecutor::new("moyai-desktop-root-runtime").map_err(AppRunError::Message)?;
         if args.directory.is_some() {
             preferences.unmark_project_deleted(&app.workspace.root);
         } else {
@@ -4534,7 +5138,7 @@ impl DesktopController {
                 .await
                 .map_err(AppRunError::Message)?;
             if preferences.is_project_deleted(&app.workspace.root) {
-                let store = app.session_service.store.clone();
+                let process_runtime = app.process_runtime.clone();
                 let mut hidden_roots = preferences.deleted_project_roots.clone();
                 hidden_roots.extend(internal_desktop_project_roots(
                     app.session_service.store.paths().data_dir.as_path(),
@@ -4562,7 +5166,10 @@ impl DesktopController {
                         next_root
                     ))
                 })?;
-                app = AppBootstrap::rebuild_for_directory(&next_root, store)
+                app = AppBootstrap::rebuild_for_directory_with_process_runtime(
+                    &next_root,
+                    process_runtime,
+                )
                     .await
                     .map_err(|error| {
                         AppRunError::Message(format!(
@@ -4575,23 +5182,20 @@ impl DesktopController {
         if let Some(session_id) = args.session_id {
             let session = app.session_service.get_session(session_id).await?;
             if session.cwd != app.workspace.cwd {
-                let store = app.session_service.store.clone();
-                app = AppBootstrap::rebuild_for_directory(&session.cwd, store)
-                    .await
-                    .map_err(|error| {
-                        AppRunError::Message(format!(
-                            "failed to open session workspace {}: {error}",
-                            session.cwd
-                        ))
-                    })?;
+                let process_runtime = app.process_runtime.clone();
+                app = AppBootstrap::rebuild_for_directory_with_process_runtime(
+                    &session.cwd,
+                    process_runtime,
+                )
+                .await
+                .map_err(|error| {
+                    AppRunError::Message(format!(
+                        "failed to open session workspace {}: {error}",
+                        session.cwd
+                    ))
+                })?;
             }
         }
-        app.session_service
-            .mark_stale_running_sessions(
-                "Desktop started without an active worker for this run; marking the prior run interrupted.",
-            )
-            .await?;
-
         let snapshot = if args.continue_last {
             load_snapshot_continue_last(&app).await?
         } else {
@@ -4624,6 +5228,10 @@ impl DesktopController {
             persist_preferences_to_disk,
             runtime_tx,
             runtime_rx,
+            control_tx,
+            control_rx,
+            control_terminal_fallback,
+            root_task_runtime,
             pending_permission: None,
             next_permission_request_id: Arc::new(AtomicU64::new(1)),
             run_lifecycle: DesktopRunLifecycle::default(),
@@ -4631,6 +5239,8 @@ impl DesktopController {
             composer_commit_generation: 0,
             next_root_run_generation: 1,
             next_enhance_request_id: 1,
+            next_session_runtime_listener_generation: 1,
+            session_runtime_listener: None,
             session_search_requests: SessionSearchRequestTracker::default(),
             snapshot_requests: LatestRequestTracker::default(),
             turn_page_requests: LatestRequestTracker::default(),
@@ -4646,6 +5256,7 @@ impl DesktopController {
             attachment_asset_app: None,
             authorized_attachment_assets: BTreeSet::new(),
         };
+        controller.attach_runtime_listener_for_open_running_session();
         controller.persist_preferences();
         Ok(controller)
     }
@@ -4686,9 +5297,6 @@ impl DesktopController {
             runtime_projection.agent_activity_rows = rows;
             runtime_projection.current_turn_agent_activity_rows = current_turn_rows;
             runtime_projection.agent_tree_active = tree_active;
-            if tree_active {
-                self.invalidate_session_search_requests();
-            }
             if refresh_durable_activity {
                 self.spawn_durable_agent_activity_refresh(root_session_id);
             }
@@ -4898,12 +5506,10 @@ impl DesktopController {
     }
 
     fn ensure_navigation_admission(&mut self, target: &str) -> bool {
-        let agent_tree_active = self.current_agent_tree_active();
         let Some(reason) = navigation_admission_blocker(
             self.state.is_busy(),
             self.state.background_mutation_pending(),
             self.state.navigation_loading(),
-            agent_tree_active,
             self.run_lifecycle.root_is_finalizing(),
         ) else {
             return true;
@@ -4929,6 +5535,7 @@ impl DesktopController {
     }
 
     fn invalidate_session_target_requests(&mut self) {
+        self.stop_session_runtime_listener();
         self.invalidate_session_search_requests();
         self.snapshot_requests.clear();
         self.turn_page_requests.clear();
@@ -4938,6 +5545,57 @@ impl DesktopController {
         self.state.finish_snapshot_refresh();
         self.state.finish_turn_page_load();
         self.state.finish_history_export();
+    }
+
+    fn attach_runtime_listener_for_open_running_session(&mut self) {
+        let target = self.state.open_session.as_ref().and_then(|open_session| {
+            if open_session.session().status != SessionStatus::Running {
+                return None;
+            }
+            Some(SessionRuntimeListenerTarget {
+                workspace_root: self.app.workspace.root.clone(),
+                session_id: open_session.session_id(),
+                turn_id: open_session.active_turn_id()?,
+            })
+        });
+        let Some(target) = target else {
+            self.stop_session_runtime_listener();
+            return;
+        };
+        if self
+            .session_runtime_listener
+            .as_ref()
+            .is_some_and(|listener| listener.target == target)
+        {
+            return;
+        }
+
+        self.stop_session_runtime_listener();
+        let generation = self.next_session_runtime_listener_generation;
+        let Some(next_generation) = generation.checked_add(1) else {
+            self.state.set_status_message(
+                "desktop session listener generation is exhausted; restart moyAI",
+            );
+            return;
+        };
+        self.next_session_runtime_listener_generation = next_generation;
+        let cancel = CancellationToken::new();
+        spawn_desktop_session_runtime_listener(
+            self.app.clone(),
+            self.runtime_tx.clone(),
+            generation,
+            target.clone(),
+            cancel.clone(),
+        );
+        self.session_runtime_listener = Some(DesktopSessionRuntimeListener {
+            generation,
+            target,
+            cancel,
+        });
+    }
+
+    fn stop_session_runtime_listener(&mut self) {
+        self.session_runtime_listener = None;
     }
 
     fn invalidate_session_search_requests(&mut self) {
@@ -5591,11 +6249,11 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop session rejoin runtime");
             let result = runtime.block_on(async move {
-                app.session_service
+                let rejoin = app
+                    .session_service
                     .rejoin_running_session(session_id, 0, 200, 0, DESKTOP_TURN_PAGE_LIMIT)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let read = app
+                    .await;
+                let snapshot = app
                     .session_service
                     .canonical_latest_session_snapshot(
                         session_id,
@@ -5603,15 +6261,19 @@ impl DesktopController {
                         DESKTOP_TURN_PAGE_LIMIT,
                     )
                     .await
-                    .map(|snapshot| snapshot.read)
                     .map_err(|error| error.to_string())?;
+                if let Err(error) = rejoin
+                    && snapshot.read.session.status == SessionStatus::Running
+                {
+                    return Err(error.to_string());
+                }
                 let agent_activity_records = app
                     .run_service
                     .durable_agent_activity_records(session_id)
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok(LoadedSession {
-                    read,
+                    read: snapshot.read,
                     agent_activity_records: Some(agent_activity_records),
                 })
             });
@@ -5638,7 +6300,7 @@ impl DesktopController {
         let request_id = self
             .session_projection_refresh_requests
             .begin(target.clone());
-        let runtime_tx = self.runtime_tx.clone();
+        let control_tx = self.control_tx.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -5651,17 +6313,17 @@ impl DesktopController {
                     .await
                     .map_err(|error| error.to_string())?;
                 if !in_memory_stop_accepted && !durable_stop_accepted {
-                    return Err("active agent tree no longer accepted the Stop request".to_string());
+                    return Err("current task no longer accepted the Stop request".to_string());
                 }
                 let detail = load_session_detail(&app, session_id)
                     .await
                     .map_err(|error| error.to_string())?;
                 loaded_session_from_detail_with_activity(&app, detail).await
             });
-            let _ = runtime_tx.send(RuntimeMessage::CurrentSessionRefreshed {
+            control_tx.publish_terminal(RuntimeMessage::CurrentSessionRefreshed {
                 request_id,
                 target,
-                purpose: CurrentSessionRefreshPurpose::StopSettlement {
+                purpose: CurrentSessionRefreshPurpose::StopRequestRefresh {
                     root_admission_fence,
                 },
                 result,
@@ -5901,10 +6563,13 @@ impl DesktopController {
                     }
                     std::fs::create_dir_all(next_root.as_std_path())
                         .map_err(|error| error.to_string())?;
-                    let store = app.session_service.store.clone();
-                    app = AppBootstrap::rebuild_for_directory(&next_root, store)
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    let process_runtime = app.process_runtime.clone();
+                    app = AppBootstrap::rebuild_for_directory_with_process_runtime(
+                        &next_root,
+                        process_runtime,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
                 }
                 let snapshot = load_snapshot_for_selection(&app, None)
                     .await
@@ -6106,7 +6771,6 @@ impl DesktopController {
         if raw_prompt.is_empty()
             || self.state.is_busy()
             || self.state.navigation_loading()
-            || self.current_agent_tree_active()
             || self.run_lifecycle.root_is_active()
         {
             self.state
@@ -6369,6 +7033,12 @@ impl DesktopController {
             ),
             !self.state.navigation_loading() && !self.state.background_mutation_pending(),
         )
+    }
+
+    pub(crate) fn pending_permission_confirmation_id(&self) -> Option<u64> {
+        self.pending_permission
+            .as_ref()
+            .map(|pending| pending.confirmation_id)
     }
 
     pub(crate) fn access_mode_mutation_admission_open(&self) -> bool {
@@ -6842,7 +7512,7 @@ impl DesktopController {
         requested: Utf8PathBuf,
         request_id: NavigationRequestId,
     ) {
-        let store = self.app.session_service.store.clone();
+        let process_runtime = self.app.process_runtime.clone();
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -6850,9 +7520,12 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop workspace runtime");
             let result = runtime.block_on(async move {
-                let app = AppBootstrap::rebuild_for_directory(&requested, store)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                let app = AppBootstrap::rebuild_for_directory_with_process_runtime(
+                    &requested,
+                    process_runtime,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
                 let snapshot = load_snapshot_for_selection(&app, None)
                     .await
                     .map_err(|error| error.to_string())?;
@@ -6870,7 +7543,7 @@ impl DesktopController {
         request_id: NavigationRequestId,
         root_mode: WorkspaceRootMode,
     ) {
-        let store = self.app.session_service.store.clone();
+        let process_runtime = self.app.process_runtime.clone();
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -6880,11 +7553,18 @@ impl DesktopController {
             let result = runtime.block_on(async move {
                 let app = match root_mode {
                     WorkspaceRootMode::Discover => {
-                        AppBootstrap::rebuild_for_directory(&requested, store).await
+                        AppBootstrap::rebuild_for_directory_with_process_runtime(
+                            &requested,
+                            process_runtime,
+                        )
+                        .await
                     }
                     WorkspaceRootMode::Fixed => {
-                        AppBootstrap::rebuild_for_directory_as_workspace_root(&requested, store)
-                            .await
+                        AppBootstrap::rebuild_for_directory_as_workspace_root_with_process_runtime(
+                            &requested,
+                            process_runtime,
+                        )
+                        .await
                     }
                 }
                 .map_err(|error| error.to_string())?;
@@ -7280,21 +7960,26 @@ impl DesktopController {
     pub(crate) fn cancel_active_run(&mut self) {
         let mut requested = false;
         let session_id = self.state.app_state.current_session_id;
-        let root_run_active = self.run_lifecycle.root_is_active();
-        let sub_agent_active = self.current_agent_tree_active();
-        let semantic_tree_target = root_run_active || sub_agent_active;
+        let exact_root_target = self.run_lifecycle.root_is_active() || self.state.is_busy();
         if self.run_lifecycle.request_cancel() {
             requested = true;
         }
-        if semantic_tree_target {
-            if let Some(session_id) = session_id {
-                requested |= self
-                    .app
-                    .run_service
-                    .cancel_agent_tree(session_id, TurnInterruptionCause::UserStop);
+        if !exact_root_target
+            && let Some(confirmation_id) = self
+                .pending_permission
+                .as_ref()
+                .map(|permission| permission.confirmation_id)
+        {
+            let resolution = self.answer_permission(confirmation_id, ReviewDecision::Abort);
+            if matches!(
+                resolution,
+                PendingPermissionResolution::Resolved
+                    | PendingPermissionResolution::AlreadyTerminal(_)
+            ) {
+                return;
             }
         }
-        let durable_stop_dispatched = if semantic_tree_target {
+        let durable_stop_dispatched = if exact_root_target {
             if let Some(session_id) = session_id {
                 self.state.mark_post_run_refresh_pending();
                 self.spawn_session_cancel_persist(session_id, requested);
@@ -7313,7 +7998,7 @@ impl DesktopController {
             );
         } else if durable_stop_dispatched {
             self.state
-                .set_status_message("stopping the active agent tree...");
+                .set_status_message("stopping the current task...");
         } else {
             self.state
                 .set_status_message("停止できる実行中タスクはありません。");
@@ -7387,22 +8072,12 @@ impl DesktopController {
                 && review_request.is_none()
                 && !prompt.trim().is_empty()
             {
-                return self.launch_active_turn_steer(
-                    prompt,
-                    prompt_dispatch,
-                    cancel_prompt_review_on_commit,
-                );
+                return self.launch_active_turn_steer(prompt, cancel_prompt_review_on_commit);
             } else {
                 self.state.set_status_message(
                     "前回の停止処理を片付けています。状態が更新されてから再度実行してください。",
                 );
             }
-            return false;
-        }
-        if self.current_agent_tree_active() {
-            self.state.set_status_message(
-                "Sub Agentの完了または停止後に、新しい依頼を送信できます。".to_string(),
-            );
             return false;
         }
         if review_request.is_none()
@@ -7413,11 +8088,7 @@ impl DesktopController {
                 crate::tui::state::RunStatus::Running
             )
         {
-            return self.launch_active_turn_steer(
-                prompt,
-                prompt_dispatch,
-                cancel_prompt_review_on_commit,
-            );
+            return self.launch_active_turn_steer(prompt, cancel_prompt_review_on_commit);
         }
         if prompt.trim().is_empty() && review_request.is_none() {
             return false;
@@ -7468,34 +8139,32 @@ impl DesktopController {
         });
         let run_service = self.app.run_service.clone();
         let runtime_tx = self.runtime_tx.clone();
+        let control_tx = self.control_tx.clone();
         let next_permission_request_id = self.next_permission_request_id.clone();
         let notification_title = request
             .title
             .clone()
             .unwrap_or_else(|| self.state.current_session_label());
-        std::thread::spawn(move || {
-            let mut request = request;
-            let worker_run_control = request.run_control.clone();
-            let root_run_control = request.run_control.clone();
-            let mut renderer = DesktopRenderer {
-                tx: runtime_tx.clone(),
-                run_generation,
-                notification_title: notification_title.clone(),
-                notified_terminal: false,
-            };
-            let mut prompt = SharedConfirmationPrompt::new_with_root_control(
-                DesktopConfirmationPrompt {
+        let worker = self
+            .root_task_runtime
+            .spawn(run_generation, move || async move {
+                let mut request = request;
+                let worker_run_control = request.run_control.clone();
+                let root_run_control = request.run_control.clone();
+                let mut renderer = DesktopRenderer {
                     tx: runtime_tx.clone(),
-                    next_permission_request_id,
-                },
-                root_run_control,
-            );
-            request.agent_confirmation = Some(prompt.clone());
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build desktop worker runtime");
-            runtime.block_on(async move {
+                    run_generation,
+                    notification_title: notification_title.clone(),
+                    notified_terminal: false,
+                };
+                let mut prompt = SharedConfirmationPrompt::new_with_root_control(
+                    DesktopConfirmationPrompt {
+                        control: control_tx.clone(),
+                        next_permission_request_id,
+                    },
+                    root_run_control,
+                );
+                request.agent_confirmation = Some(prompt.clone());
                 let result = run_service
                     .execute(AppCommand::Run(request), &mut renderer, &mut prompt)
                     .await
@@ -7527,16 +8196,36 @@ impl DesktopController {
                     }
                     _ => {}
                 }
-                publish_desktop_run_finished(&runtime_tx, run_generation, result);
+                publish_desktop_run_finished(&control_tx, run_generation, result);
             });
-        });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.discard_pending_root_submission(run_generation);
+                self.run_lifecycle.finish_root();
+                self.state.finish_agent_run();
+                self.state.app_state.run_status = crate::tui::state::RunStatus::Failed;
+                self.state
+                    .set_status_message(format!("failed to start desktop run worker: {error}"));
+                return false;
+            }
+        };
+        if let Err(worker) = self.run_lifecycle.attach_worker(run_generation, worker) {
+            worker.abort();
+            self.discard_pending_root_submission(run_generation);
+            self.run_lifecycle.finish_root();
+            self.state.finish_agent_run();
+            self.state.app_state.run_status = crate::tui::state::RunStatus::Failed;
+            self.state
+                .set_status_message("desktop run owner changed before worker attachment");
+            return false;
+        }
         true
     }
 
     fn launch_active_turn_steer(
         &mut self,
         prompt: String,
-        prompt_dispatch: crate::session::PromptDispatchPart,
         cancel_prompt_review_on_commit: bool,
     ) -> bool {
         let Some(session_id) = self.state.app_state.current_session_id else {
@@ -7559,6 +8248,7 @@ impl DesktopController {
             .set_status_message("実行中の turn に追加入力を保存しています。");
         let run_service = self.app.run_service.clone();
         let runtime_tx = self.runtime_tx.clone();
+        let control_tx = self.control_tx.clone();
         let next_permission_request_id = self.next_permission_request_id.clone();
         let cwd = self.app.workspace.cwd.clone();
         let worker_target = target.clone();
@@ -7568,7 +8258,7 @@ impl DesktopController {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut renderer = DesktopSteerRenderer;
                 let mut prompt_ui = DesktopConfirmationPrompt {
-                    tx: runtime_tx.clone(),
+                    control: control_tx,
                     next_permission_request_id,
                 };
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -7600,9 +8290,8 @@ impl DesktopController {
                     })
             }))
             .unwrap_or_else(|_| Err("desktop steer worker panicked".to_string()));
-            let _ = runtime_tx.send(RuntimeMessage::SteerFinished {
+            let _ = runtime_tx.try_send(RuntimeMessage::SteerFinished {
                 target: worker_target,
-                prompt_dispatch,
                 image_paths,
                 cancel_prompt_review_on_commit,
                 result,
@@ -7654,12 +8343,16 @@ impl DesktopController {
                     return;
                 }
                 self.state.finish_navigation(request_id);
+                let loaded_status = loaded.read.session.status;
                 self.state.load_open_session(&loaded.read);
                 if let Some(records) = loaded.agent_activity_records {
                     self.loaded_agent_activity_records = Some((loaded.read.session.id, records));
                     self.durable_agent_activity_refresh_failures = 0;
                 }
-                if !self.state.status_code.is_terminal_interruption() {
+                if !self.state.status_code.is_terminal_interruption()
+                    && !(reason == SessionLoadReason::RunningRejoin
+                        && loaded_status != SessionStatus::Running)
+                {
                     self.state.set_status_message(match reason {
                         SessionLoadReason::RunningRejoin => {
                             format!("rejoined running session {}", session_id)
@@ -7669,6 +8362,7 @@ impl DesktopController {
                         }
                     });
                 }
+                self.attach_runtime_listener_for_open_running_session();
             }
             Err(error) => {
                 finish_navigation_failure(&mut self.state, request_id, error);
@@ -7717,19 +8411,37 @@ impl DesktopController {
                     }
                 }
                 self.state.clear_post_run_refresh_pending();
-                if matches!(purpose, CurrentSessionRefreshPurpose::StopSettlement { .. }) {
-                    self.state.finish_agent_run();
-                    if !self.state.status_code.is_terminal_interruption() {
-                        self.state
-                            .set_status_message(stop_settlement_status_message(loaded_status));
+                if matches!(
+                    purpose,
+                    CurrentSessionRefreshPurpose::StopRequestRefresh { .. }
+                ) {
+                    if loaded_status == SessionStatus::Running
+                        && matches!(
+                            self.state.app_state.run_status,
+                            crate::tui::state::RunStatus::Running
+                        )
+                    {
+                        self.state.mark_run_stop_requested(
+                            "run cancellation requested",
+                            "Stop request accepted; waiting for the matching terminal event",
+                        );
+                    } else if matches!(
+                        loaded_status,
+                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                    ) {
+                        self.run_lifecycle.observe_terminal_event();
                     }
                 }
             }
             Err(error) => {
                 self.state.clear_post_run_refresh_pending();
-                if matches!(purpose, CurrentSessionRefreshPurpose::StopSettlement { .. }) {
-                    self.state
-                        .set_status_message(format!("failed to stop active agent tree: {error}"));
+                if matches!(
+                    purpose,
+                    CurrentSessionRefreshPurpose::StopRequestRefresh { .. }
+                ) {
+                    self.state.set_status_message(format!(
+                        "failed to confirm durable Stop request: {error}"
+                    ));
                 } else {
                     self.state.set_status_message(error);
                 }
@@ -7859,12 +8571,55 @@ impl DesktopController {
     pub(crate) fn drain_runtime_messages(&mut self) -> bool {
         let mut changed = false;
         for _ in 0..DESKTOP_RUNTIME_DRAIN_BUDGET {
-            let Ok(message) = self.runtime_rx.try_recv() else {
+            let fallback = self
+                .control_terminal_fallback
+                .lock()
+                .ok()
+                .and_then(|mut fallback| fallback.take());
+            let message = fallback
+                .or_else(|| self.control_rx.try_recv().ok())
+                .or_else(|| self.runtime_rx.try_recv().ok());
+            let Some(message) = message else {
                 break;
             };
             changed = true;
             let _contract = message.async_contract();
             match message {
+                RuntimeMessage::CanonicalSessionEvent {
+                    listener_generation,
+                    target,
+                    event,
+                } => {
+                    let listener_is_current =
+                        self.session_runtime_listener
+                            .as_ref()
+                            .is_some_and(|listener| {
+                                listener.generation == listener_generation
+                                    && listener.target == target
+                            });
+                    if !listener_is_current
+                        || target.workspace_root != self.app.workspace.root
+                        || self.state.app_state.current_session_id != Some(target.session_id)
+                        || event.session_id != target.session_id
+                        || event.turn_id != target.turn_id
+                    {
+                        continue;
+                    }
+                    if let RuntimeEventMsg::TurnTerminal { terminal } = event.msg {
+                        self.run_lifecycle.observe_terminal_event();
+                        self.state.apply_run_summary(RunSummary::from_terminal(
+                            target.session_id,
+                            target.turn_id,
+                            *terminal,
+                        ));
+                        self.state.finish_agent_run();
+                        self.state.mark_post_run_refresh_pending();
+                        self.stop_session_runtime_listener();
+                        self.refresh_current_session_after_terminal_run();
+                    } else if !self.session_projection_refresh_requests.is_pending() {
+                        self.spawn_latest_live_session_refresh(target.session_id);
+                    }
+                }
                 RuntimeMessage::RunEvent {
                     run_generation,
                     event,
@@ -7936,7 +8691,7 @@ impl DesktopController {
                             self.settle_pending_permission_after_root_finish();
                             self.state.finish_agent_run();
                             self.state.mark_post_run_refresh_pending();
-                            self.state.app_state.set_summary(summary);
+                            self.state.apply_run_summary(summary);
                             self.refresh_current_session_after_terminal_run();
                         }
                         Err(error) => {
@@ -8014,7 +8769,6 @@ impl DesktopController {
                 }
                 RuntimeMessage::SteerFinished {
                     target,
-                    prompt_dispatch,
                     image_paths,
                     cancel_prompt_review_on_commit,
                     result,
@@ -8026,17 +8780,17 @@ impl DesktopController {
                     ) {
                         continue;
                     }
-                    let accepted = finish_steer_submission(
-                        &mut self.state,
-                        &prompt_dispatch,
-                        &image_paths,
-                        result,
-                    );
+                    let accepted = finish_steer_submission(&mut self.state, &image_paths, result);
                     if accepted {
                         if cancel_prompt_review_on_commit {
                             self.state.cancel_prompt_review();
                         }
                         self.advance_composer_commit_generation();
+                        // The acknowledgement says only that the queue owner
+                        // accepted the input. Re-read the canonical snapshot:
+                        // the runner may already have delivered it before this
+                        // callback is processed.
+                        self.spawn_latest_live_session_refresh(target.session_id);
                     }
                 }
                 RuntimeMessage::SnapshotLoaded {
@@ -8082,7 +8836,7 @@ impl DesktopController {
                     }
                     let root_admission_is_current = match purpose {
                         CurrentSessionRefreshPurpose::Refresh => true,
-                        CurrentSessionRefreshPurpose::StopSettlement {
+                        CurrentSessionRefreshPurpose::StopRequestRefresh {
                             root_admission_fence,
                         } => root_admission_fence == self.next_root_run_generation,
                     };
@@ -8281,12 +9035,10 @@ impl DesktopController {
                     }
                     let root_run_active =
                         self.run_lifecycle.root_is_active() || self.state.is_busy();
-                    let agent_tree_active = self.current_agent_tree_active();
                     if !apply_session_search_result(
                         &mut self.state,
                         completion.is_latest,
                         root_run_active,
-                        agent_tree_active,
                         result,
                     ) {
                         continue;
@@ -8677,11 +9429,11 @@ fn desktop_run_failure_notification_allowed(cause: Option<&RunCancellationCause>
 }
 
 fn publish_desktop_run_finished(
-    tx: &mpsc::SyncSender<RuntimeMessage>,
+    control: &DesktopControlPlaneSender,
     run_generation: u64,
     result: Result<RunSummary, String>,
 ) {
-    let _ = tx.send(RuntimeMessage::Finished {
+    control.publish_terminal(RuntimeMessage::Finished {
         run_generation,
         result,
     });
@@ -8819,6 +9571,7 @@ fn live_event_requires_canonical_refresh(event: &RunEvent) -> bool {
             | RunEvent::PermissionRequested { .. }
             | RunEvent::PermissionResolved { .. }
             | RunEvent::RecoverableRuntimeFeedback { .. }
+            | RunEvent::TurnTerminal { .. }
     )
 }
 
@@ -9455,16 +10208,17 @@ fn provider_catalog_probe_config(
 #[cfg(test)]
 mod tests {
     use super::{
-        DESKTOP_RUNTIME_MAILBOX_CAPACITY, DesktopRenderer, HistoryExportRequestTarget,
-        PendingPermission, PendingPermissionResolution, ProviderCatalogRequestTarget,
-        RuntimeMessage, RuntimeMessageAsyncContract, SessionRefreshRequestTarget,
-        SteerSubmissionTarget, desktop_terminal_status_message,
+        DESKTOP_RUNTIME_MAILBOX_CAPACITY, DesktopRenderer, DesktopSessionEventDelivery,
+        HistoryExportRequestTarget, PendingPermission, PendingPermissionResolution,
+        ProviderCatalogRequestTarget, RuntimeMessage, RuntimeMessageAsyncContract,
+        SessionRefreshRequestTarget, SessionRuntimeListenerTarget, SteerSubmissionTarget,
+        deliver_desktop_session_runtime_events, desktop_terminal_status_message,
         fallback_workspace_after_project_delete, finish_steer_operation_if_current,
         first_restorable_project_root, normalize_image_attachment_path, notification_session_title,
         open_transcript_rows_to_markdown, provider_catalog_probe_config,
         publish_desktop_run_finished, resolve_pending_permission, run_completion_notification_body,
-        run_terminal_event_notification_body, transcript_markdown_file_name,
-        unique_background_request_admission_open,
+        run_terminal_event_notification_body, test_desktop_control_plane,
+        transcript_markdown_file_name, unique_background_request_admission_open,
     };
     use crate::cli::{EventRenderer as _, ReviewDecision};
     use crate::config::{ProviderMetadataMode, ResolvedConfig};
@@ -9472,6 +10226,7 @@ mod tests {
     use crate::desktop::models::DesktopTranscriptRowKind;
     use crate::desktop::models::{DesktopFileChangeRow, DesktopSnapshot, DesktopTranscriptRow};
     use crate::desktop::state::DesktopState;
+    use crate::protocol::{RuntimeEvent, RuntimeEventMsg, TurnId};
     use crate::session::{ProjectId, ProjectRecord, RunEvent, RunSummary, SessionId};
     use camino::{Utf8Path, Utf8PathBuf};
     use std::sync::mpsc;
@@ -9684,6 +10439,75 @@ mod tests {
             .async_contract(),
             RuntimeMessageAsyncContract::TerminalRun
         );
+    }
+
+    #[test]
+    fn full_desktop_mailbox_keeps_the_canonical_terminal_retryable() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let target = SessionRuntimeListenerTarget {
+            workspace_root: Utf8PathBuf::from("C:/workspace"),
+            session_id,
+            turn_id,
+        };
+        let terminal_event = RuntimeEvent {
+            id: crate::protocol::RuntimeEventId::new(),
+            session_id,
+            turn_id,
+            sequence_no: 9,
+            created_at_ms: 1,
+            msg: RuntimeEventMsg::TurnTerminal {
+                terminal: Box::new(crate::session::DurableTurnTerminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                    final_response_id: None,
+                    tool_call_count: 1,
+                    failed_tool_count: 0,
+                    change_count: 0,
+                    metrics: Default::default(),
+                }),
+            },
+        };
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.try_send(RuntimeMessage::CanonicalSessionEvent {
+            listener_generation: 1,
+            target: target.clone(),
+            event: RuntimeEvent {
+                id: crate::protocol::RuntimeEventId::new(),
+                session_id,
+                turn_id,
+                sequence_no: 8,
+                created_at_ms: 1,
+                msg: RuntimeEventMsg::Warning {
+                    message: "occupy mailbox".to_string(),
+                },
+            },
+        })
+        .expect("fill mailbox");
+
+        assert_eq!(
+            deliver_desktop_session_runtime_events(
+                &tx,
+                1,
+                &target,
+                std::slice::from_ref(&terminal_event),
+            ),
+            DesktopSessionEventDelivery::MailboxFull
+        );
+        let _ = rx.recv().expect("release mailbox slot");
+        assert_eq!(
+            deliver_desktop_session_runtime_events(
+                &tx,
+                1,
+                &target,
+                std::slice::from_ref(&terminal_event),
+            ),
+            DesktopSessionEventDelivery::Terminal
+        );
+        assert!(matches!(
+            rx.recv().expect("retried terminal"),
+            RuntimeMessage::CanonicalSessionEvent { event, .. }
+                if event.id == terminal_event.id
+        ));
     }
 
     #[test]
@@ -10027,6 +10851,7 @@ mod tests {
     #[test]
     fn desktop_renderer_defers_state_completion_until_worker_settlement() {
         let (tx, rx) = mpsc::sync_channel(DESKTOP_RUNTIME_MAILBOX_CAPACITY);
+        let (control, control_rx) = test_desktop_control_plane();
         let mut renderer = DesktopRenderer {
             tx: tx.clone(),
             run_generation: 12,
@@ -10038,9 +10863,9 @@ mod tests {
         renderer.finish(&summary).expect("renderer finish");
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
 
-        publish_desktop_run_finished(&tx, 12, Ok(summary.clone()));
+        publish_desktop_run_finished(&control, 12, Ok(summary.clone()));
         assert!(matches!(
-            rx.try_recv().expect("worker settlement"),
+            control_rx.try_recv().expect("worker settlement"),
             RuntimeMessage::Finished {
                 run_generation: 12,
                 result: Ok(received),
@@ -10073,6 +10898,174 @@ mod tests {
     }
 }
 
+fn spawn_desktop_session_runtime_listener(
+    app: App,
+    runtime_tx: mpsc::SyncSender<RuntimeMessage>,
+    listener_generation: u64,
+    target: SessionRuntimeListenerTarget,
+    cancel: CancellationToken,
+) {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build desktop session-listener runtime");
+        runtime.block_on(run_desktop_session_runtime_listener(
+            app,
+            runtime_tx,
+            listener_generation,
+            target,
+            cancel,
+        ));
+    });
+}
+
+async fn run_desktop_session_runtime_listener(
+    app: App,
+    runtime_tx: mpsc::SyncSender<RuntimeMessage>,
+    listener_generation: u64,
+    target: SessionRuntimeListenerTarget,
+    cancel: CancellationToken,
+) {
+    let event_store = app.store.protocol_event_store();
+    let mut subscription = app.subscribe_session_runtime_events(target.session_id);
+    let mut cursor = loop {
+        match event_store.latest_runtime_event_page_for_session(
+            target.session_id,
+            crate::protocol::MAX_PROTOCOL_PAGE_LIMIT,
+        ) {
+            Ok(page) => {
+                let latest_target_event = page
+                    .items
+                    .iter()
+                    .rev()
+                    .find(|event| event.turn_id == target.turn_id)
+                    .cloned()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                loop {
+                    match deliver_desktop_session_runtime_events(
+                        &runtime_tx,
+                        listener_generation,
+                        &target,
+                        &latest_target_event,
+                    ) {
+                        DesktopSessionEventDelivery::Complete => break,
+                        DesktopSessionEventDelivery::Terminal
+                        | DesktopSessionEventDelivery::Disconnected => return,
+                        DesktopSessionEventDelivery::MailboxFull => {
+                            tokio::select! {
+                                _ = cancel.cancelled() => return,
+                                _ = tokio::time::sleep(DESKTOP_SESSION_RUNTIME_POLL_INTERVAL) => {}
+                            }
+                        }
+                    }
+                }
+                break page.next_cursor;
+            }
+            Err(_) => {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(DESKTOP_SESSION_RUNTIME_POLL_INTERVAL) => {}
+                }
+            }
+        }
+    };
+
+    loop {
+        let wake = tokio::select! {
+            _ = cancel.cancelled() => return,
+            wake = tokio::time::timeout(
+                DESKTOP_SESSION_RUNTIME_POLL_INTERVAL,
+                subscription.recv(),
+            ) => wake,
+        };
+        if matches!(wake, Ok(Err(_))) {
+            // A bounded broadcast is only a wake-up path. If it lags or closes,
+            // replace it and replay the canonical append stream from the last
+            // durable cursor instead of making the listener permanently fail.
+            subscription.resubscribe();
+        }
+
+        for _ in 0..DESKTOP_SESSION_RUNTIME_CURSOR_DRAIN_BUDGET {
+            let page = match event_store.runtime_event_cursor_page_for_session(
+                target.session_id,
+                cursor,
+                DESKTOP_SESSION_RUNTIME_CURSOR_PAGE_LIMIT,
+            ) {
+                Ok(page) => page,
+                Err(_) => break,
+            };
+            let page_len = page.items.len();
+            let next_cursor = page.next_cursor;
+            match deliver_desktop_session_runtime_events(
+                &runtime_tx,
+                listener_generation,
+                &target,
+                &page.items,
+            ) {
+                DesktopSessionEventDelivery::Complete => {}
+                DesktopSessionEventDelivery::Terminal
+                | DesktopSessionEventDelivery::Disconnected => return,
+                DesktopSessionEventDelivery::MailboxFull => {
+                    // Keep the durable cursor unchanged. The next bounded read
+                    // replays the same canonical page, including any terminal
+                    // that did not fit in the Desktop mailbox.
+                    break;
+                }
+            }
+            if let Some(next_cursor) = next_cursor {
+                if cursor.is_some_and(|cursor| next_cursor <= cursor) {
+                    break;
+                }
+                cursor = Some(next_cursor);
+            }
+            if page_len < DESKTOP_SESSION_RUNTIME_CURSOR_PAGE_LIMIT {
+                break;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopSessionEventDelivery {
+    Complete,
+    Terminal,
+    MailboxFull,
+    Disconnected,
+}
+
+fn deliver_desktop_session_runtime_events(
+    runtime_tx: &mpsc::SyncSender<RuntimeMessage>,
+    listener_generation: u64,
+    target: &SessionRuntimeListenerTarget,
+    events: &[RuntimeEvent],
+) -> DesktopSessionEventDelivery {
+    for event in events {
+        if event.session_id != target.session_id || event.turn_id != target.turn_id {
+            continue;
+        }
+        let terminal = event.is_terminal();
+        match runtime_tx.try_send(RuntimeMessage::CanonicalSessionEvent {
+            listener_generation,
+            target: target.clone(),
+            event: event.clone(),
+        }) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                return DesktopSessionEventDelivery::MailboxFull;
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return DesktopSessionEventDelivery::Disconnected;
+            }
+        }
+        if terminal {
+            return DesktopSessionEventDelivery::Terminal;
+        }
+    }
+    DesktopSessionEventDelivery::Complete
+}
+
 struct DesktopRenderer {
     tx: mpsc::SyncSender<RuntimeMessage>,
     run_generation: u64,
@@ -10093,12 +11086,15 @@ impl EventRenderer for DesktopRenderer {
                 self.notified_terminal = true;
             }
         }
-        self.tx
-            .send(RuntimeMessage::RunEvent {
-                run_generation: self.run_generation,
-                event: event.clone(),
-            })
-            .map_err(|error| CliRenderError::Message(error.to_string()))
+        match self.tx.try_send(RuntimeMessage::RunEvent {
+            run_generation: self.run_generation,
+            event: event.clone(),
+        }) {
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(CliRenderError::Message(
+                "desktop runtime stream is unavailable".to_string(),
+            )),
+        }
     }
 
     fn finish(&mut self, _summary: &RunSummary) -> Result<(), CliRenderError> {
@@ -10227,7 +11223,7 @@ impl EventRenderer for DesktopSteerRenderer {
 }
 
 struct DesktopConfirmationPrompt {
-    tx: mpsc::SyncSender<RuntimeMessage>,
+    control: DesktopControlPlaneSender,
     next_permission_request_id: Arc<AtomicU64>,
 }
 
@@ -10250,14 +11246,17 @@ impl ConfirmationPrompt for DesktopConfirmationPrompt {
         let confirmation_id = self
             .next_permission_request_id
             .fetch_add(1, Ordering::Relaxed);
-        self.tx
-            .send(RuntimeMessage::Permission {
+        self.control
+            .try_send(RuntimeMessage::Permission {
                 confirmation_id,
                 request: request.clone(),
                 response: response_tx,
                 run_control: control.clone(),
             })
-            .map_err(|error| CliPromptError::Message(error.to_string()))?;
+            .map_err(|error| {
+                control.fail(error.clone());
+                CliPromptError::Message(error)
+            })?;
         loop {
             match response_rx.recv_timeout(std::time::Duration::from_millis(25)) {
                 Ok(_) if control.is_cancelled() => {
@@ -10278,16 +11277,16 @@ impl ConfirmationPrompt for DesktopConfirmationPrompt {
                 Ok(ReviewDecision::Abort) => return Ok(ConfirmationOutcome::AbortRequested),
                 Err(mpsc::RecvTimeoutError::Timeout) if control.is_cancelled() => {
                     let _ = self
-                        .tx
-                        .send(RuntimeMessage::PermissionCancelled { confirmation_id });
+                        .control
+                        .try_send(RuntimeMessage::PermissionCancelled { confirmation_id });
                     return Ok(ConfirmationOutcome::Interrupted);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     if control.is_cancelled() {
                         let _ = self
-                            .tx
-                            .send(RuntimeMessage::PermissionCancelled { confirmation_id });
+                            .control
+                            .try_send(RuntimeMessage::PermissionCancelled { confirmation_id });
                         return Ok(ConfirmationOutcome::Interrupted);
                     }
                     let message = "desktop permission response channel disconnected".to_string();

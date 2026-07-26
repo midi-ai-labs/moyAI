@@ -3,7 +3,7 @@ use std::fs;
 use std::future::Future;
 use std::io::Read;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -36,10 +36,13 @@ use crate::harness::{HarnessRecordingSink, NativeHarnessRecorder};
 use crate::llm::model_policy::{ModelPolicy, ProviderCapabilities, ResolvedTurnPolicy};
 use crate::llm::validate_image_bytes;
 use crate::protocol::{
-    AdditionalContextEntry, AdditionalContextKind, ProtocolEventStore, ProtocolRecordingSink,
-    SteerTurn, UserInputItem, UserTurn,
+    AdditionalContextEntry, AdditionalContextKind, CanonicalRuntimeEventProjector,
+    ProtocolEventStore, ProtocolRecordingSink, SteerTurn, UserInputItem, UserTurn,
 };
-use crate::runtime::{RunCancellationCause, RunControl, RunEventSink, SessionRuntimeEventHub};
+use crate::runtime::{
+    GRACEFUL_TASK_ABORT_TIMEOUT, LocalTaskExecutor, OwnedTaskHandle, RunCancellationCause,
+    RunControl, RunEventSink, SessionRuntimeEventHub,
+};
 use crate::session::{
     AdmissionId, DispatchTransformKind, ImagePart, PromptDispatchPart, RunSummary,
     SessionModelParameters, SessionRecord, SessionRepository, SessionSelector,
@@ -49,7 +52,7 @@ use crate::session::{
 use crate::storage::{
     StoreBundle,
     session_repo::{
-        ActiveGoalTurnAdmission, DirectChildRunAdmissionState, RUN_ADMISSION_HEARTBEAT_INTERVAL_MS,
+        ActiveGoalTurnAdmission, RUN_ADMISSION_HEARTBEAT_INTERVAL_MS,
         RunAdmissionLeaseRenewalOutcome,
     },
 };
@@ -72,16 +75,82 @@ pub enum AppCommandOutcome {
     ControlCompleted,
 }
 
-fn blocking_direct_child<'a>(
-    states: &'a [DirectChildRunAdmissionState],
-    active_runs: &crate::runtime::ActiveRunRegistry,
-) -> Option<&'a crate::session::SessionSpawnEdge> {
-    states
-        .iter()
-        .find(|state| {
-            state.blocks_new_root_turn || active_runs.is_active(state.edge.child_session_id)
-        })
-        .map(|state| &state.edge)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedSessionAccess {
+    RootVisibleRead,
+    AgentOwnerRequired(&'static str),
+}
+
+fn external_session_command_access(
+    command: &AppCommand,
+) -> Option<(crate::session::SessionId, RetainedSessionAccess)> {
+    let access = match command {
+        AppCommand::Run(_)
+        | AppCommand::SessionList(_)
+        | AppCommand::SessionLoaded(_)
+        | AppCommand::SessionSearch(_) => return None,
+        AppCommand::SessionShow(request) => {
+            (request.session_id, RetainedSessionAccess::RootVisibleRead)
+        }
+        AppCommand::SessionGoalGet(request) => {
+            (request.session_id, RetainedSessionAccess::RootVisibleRead)
+        }
+        AppCommand::SessionIdleAdmission(request) => {
+            (request.session_id, RetainedSessionAccess::RootVisibleRead)
+        }
+        AppCommand::SessionHistory(request) => {
+            (request.session_id, RetainedSessionAccess::RootVisibleRead)
+        }
+        AppCommand::SessionRead(request) => {
+            (request.session_id, RetainedSessionAccess::RootVisibleRead)
+        }
+        AppCommand::SessionRejoin(request) => {
+            (request.session_id, RetainedSessionAccess::RootVisibleRead)
+        }
+        AppCommand::SessionTurns(request) => {
+            (request.session_id, RetainedSessionAccess::RootVisibleRead)
+        }
+        AppCommand::SessionEvents(request) => {
+            (request.session_id, RetainedSessionAccess::RootVisibleRead)
+        }
+        AppCommand::SessionArchive(request) => (
+            request.session_id,
+            RetainedSessionAccess::AgentOwnerRequired("archived"),
+        ),
+        AppCommand::SessionSettingsUpdate(request) => (
+            request.session_id,
+            RetainedSessionAccess::AgentOwnerRequired("have its settings changed"),
+        ),
+        AppCommand::SessionTitleUpdate(request) => (
+            request.session_id,
+            RetainedSessionAccess::AgentOwnerRequired("have its title changed"),
+        ),
+        AppCommand::SessionInterrupt(request) => (
+            request.session_id,
+            RetainedSessionAccess::AgentOwnerRequired("be interrupted directly"),
+        ),
+        AppCommand::SessionGoalSet(request) => (
+            request.session_id,
+            RetainedSessionAccess::AgentOwnerRequired("have its goal changed"),
+        ),
+        AppCommand::SessionGoalClear(request) => (
+            request.session_id,
+            RetainedSessionAccess::AgentOwnerRequired("have its goal cleared"),
+        ),
+        AppCommand::SessionRollback(request) => (
+            request.session_id,
+            RetainedSessionAccess::AgentOwnerRequired("be rolled back"),
+        ),
+        AppCommand::SessionFork(request) => (
+            request.source_session_id,
+            RetainedSessionAccess::AgentOwnerRequired("be used as a fork source"),
+        ),
+        AppCommand::SessionSteer(request) => (
+            request.session_id,
+            RetainedSessionAccess::AgentOwnerRequired("be steered directly"),
+        ),
+    };
+    Some(access)
 }
 
 #[derive(Clone)]
@@ -92,7 +161,7 @@ pub struct RunService {
     session_service: crate::session::SessionService,
     agent_loop: AgentLoop,
     session_event_hub: SessionRuntimeEventHub,
-    agent_runtime: Arc<crate::app::AgentRuntime>,
+    agent_runtime: Weak<crate::app::AgentRuntime>,
 }
 
 impl RunService {
@@ -112,22 +181,33 @@ impl RunService {
             session_service,
             agent_loop,
             session_event_hub,
-            agent_runtime,
+            agent_runtime: Arc::downgrade(&agent_runtime),
         }
+    }
+
+    fn agent_runtime(&self) -> Result<Arc<crate::app::AgentRuntime>, AppRunError> {
+        self.agent_runtime.upgrade().ok_or_else(|| {
+            AppRunError::Message(
+                "process runtime was shut down while this run service was still in use".to_string(),
+            )
+        })
     }
 
     pub fn agent_activity_records(
         &self,
         root_session_id: crate::session::SessionId,
     ) -> Vec<crate::app::AgentActivityRecord> {
-        self.agent_runtime.activity_records(root_session_id)
+        self.agent_runtime
+            .upgrade()
+            .map(|runtime| runtime.activity_records(root_session_id))
+            .unwrap_or_default()
     }
 
     pub async fn durable_agent_activity_records(
         &self,
         root_session_id: crate::session::SessionId,
     ) -> Result<Vec<crate::app::AgentActivityRecord>, AppRunError> {
-        self.agent_runtime
+        self.agent_runtime()?
             .durable_activity_records(root_session_id)
             .await
             .map_err(AppRunError::Message)
@@ -139,25 +219,83 @@ impl RunService {
         root_cause: crate::protocol::TurnInterruptionCause,
     ) -> bool {
         self.agent_runtime
-            .cancel_tree_for_session(session_id, root_cause)
+            .upgrade()
+            .is_some_and(|runtime| runtime.cancel_tree_for_session(session_id, root_cause))
+    }
+
+    /// Interrupts one exact retained child turn, mirroring Codex's `(thread_id, turn_id)`
+    /// boundary while retaining moyAI's durable lineage identity.
+    pub async fn interrupt_agent_turn_exact(
+        &self,
+        root_session_id: crate::session::SessionId,
+        agent_path: &str,
+        child_session_id: crate::session::SessionId,
+        expected_turn_id: crate::protocol::TurnId,
+    ) -> Result<bool, AppRunError> {
+        let path = crate::runtime::AgentPath::try_from(agent_path)
+            .map_err(|error| AppRunError::Message(format!("invalid Sub Agent path: {error}")))?;
+        if path.is_root() {
+            return Err(AppRunError::Message(
+                "the root task cannot be interrupted through the Sub Agent surface".to_string(),
+            ));
+        }
+        let edge = self
+            .store
+            .session_repo()
+            .session_spawn_edge_for_child(child_session_id)
+            .await?
+            .ok_or_else(|| {
+                AppRunError::Message(format!(
+                    "session {child_session_id} is not a retained Sub Agent"
+                ))
+            })?;
+        if edge.root_session_id != root_session_id
+            || edge.child_session_id != child_session_id
+            || edge.agent_path != path.as_str()
+        {
+            return Err(AppRunError::Message(
+                "the exact Sub Agent lineage changed before interrupt was applied".to_string(),
+            ));
+        }
+        let accepted = self
+            .session_service
+            .cancel_running_session_turn(
+                child_session_id,
+                expected_turn_id,
+                crate::protocol::TurnInterruptionCause::AgentInterrupted,
+            )
+            .await?;
+        if accepted && let Ok(runtime) = self.agent_runtime() {
+            runtime.schedule_cancelled_agent_worker_abort(
+                root_session_id,
+                path.as_str(),
+                child_session_id,
+                expected_turn_id,
+            );
+        }
+        Ok(accepted)
     }
 
     pub async fn wait_for_agent_tree_quiescence(
         &self,
         root_session_id: crate::session::SessionId,
     ) -> Result<(), AppRunError> {
-        self.agent_runtime
+        self.agent_runtime()?
             .wait_for_tree_quiescence(root_session_id)
             .await
             .map_err(AppRunError::Message)
     }
 
     pub async fn execute(
-        &self,
+        self: &Arc<Self>,
         command: AppCommand,
         renderer: &mut dyn EventRenderer,
         prompt: &mut dyn ConfirmationPrompt,
     ) -> Result<AppCommandOutcome, AppRunError> {
+        if let Some((session_id, access)) = external_session_command_access(&command) {
+            self.ensure_retained_session_access(session_id, access, None)
+                .await?;
+        }
         match command {
             AppCommand::Run(request) => self.execute_run(request, renderer, prompt).await,
             AppCommand::SessionArchive(request) => self
@@ -243,9 +381,65 @@ impl RunService {
         }
     }
 
+    async fn ensure_retained_session_access(
+        &self,
+        session_id: crate::session::SessionId,
+        access: RetainedSessionAccess,
+        agent_context: Option<&crate::app::AgentRunContext>,
+    ) -> Result<(), AppRunError> {
+        if access == RetainedSessionAccess::RootVisibleRead && agent_context.is_none() {
+            return Ok(());
+        }
+        if let Some(context) = agent_context
+            && context.session_id() != session_id
+        {
+            return Err(AppRunError::Message(format!(
+                "agent context session {} does not match requested session {}",
+                context.session_id(),
+                session_id
+            )));
+        }
+        let retained_agent_edge = self
+            .store
+            .session_repo()
+            .session_spawn_edge_for_child(session_id)
+            .await?;
+        match (retained_agent_edge.as_ref(), agent_context) {
+            (Some(edge), Some(context))
+                if context.root_session_id() == edge.root_session_id
+                    && context.path().as_str() == edge.agent_path =>
+            {
+                Ok(())
+            }
+            (Some(edge), Some(context)) => Err(AppRunError::Message(format!(
+                "agent context {} in root tree {} does not own retained session {} at {}",
+                context.path(),
+                context.root_session_id(),
+                edge.child_session_id,
+                edge.agent_path
+            ))),
+            (Some(_), None) if access == RetainedSessionAccess::RootVisibleRead => Ok(()),
+            (Some(_), None) => {
+                let RetainedSessionAccess::AgentOwnerRequired(operation) = access else {
+                    unreachable!("root-visible reads were handled above");
+                };
+                Err(AppRunError::Message(format!(
+                    "session {session_id} is a retained sub-agent and cannot {operation} through a root-visible command; resume its root task or use the owning agent's collaboration tools"
+                )))
+            }
+            (None, Some(context)) if context.is_sub_agent() => Err(AppRunError::Message(format!(
+                "agent context {} has no durable spawn edge for session {}",
+                context.path(),
+                context.session_id()
+            ))),
+            (None, _) => Ok(()),
+        }
+    }
+
     async fn context_manager(
         &self,
         session_id: crate::session::SessionId,
+        allow_empty_agent_mailbox_context: bool,
     ) -> Result<ContextManager, AppRunError> {
         let mut context_builder = ContextManager::active_history_builder();
         let snapshot = self
@@ -259,13 +453,8 @@ impl RunService {
                     Ok(())
                 },
             )?;
-        let context = context_builder.finish(
-            snapshot.append_fence,
-            snapshot.canonical_count,
-            snapshot.steer_count,
-            snapshot.agent_communication_count,
-        );
-        if !context.has_model_context() {
+        let context = context_builder.finish(snapshot.append_fence, snapshot.canonical_count);
+        if !allow_empty_agent_mailbox_context && !context.has_model_context() {
             return Err(AppRunError::Message(
                 "cannot build runtime input without active canonical model context".to_string(),
             ));
@@ -274,7 +463,7 @@ impl RunService {
     }
 
     async fn execute_run(
-        &self,
+        self: &Arc<Self>,
         request: RunRequest,
         renderer: &mut dyn EventRenderer,
         prompt: &mut dyn ConfirmationPrompt,
@@ -293,34 +482,31 @@ impl RunService {
                 unreachable!("an explicit run does not require an active goal")
             }
         };
-        if !allow_idle_goal_continuation {
+        if !allow_idle_goal_continuation || summary.status() != SessionStatus::Completed {
             return Ok(AppCommandOutcome::Turn(summary));
         }
 
         'continuations: loop {
-            let preclaimed_root_execution = loop {
-                self.wait_for_agent_tree_quiescence(summary.session_id())
-                    .await?;
-                match self
-                    .agent_runtime
-                    .begin_root_continuation(
-                        summary.session_id(),
-                        request.run_control.clone(),
-                        request.agent_confirmation.clone(),
-                    )
-                    .map_err(AppRunError::Message)?
-                {
-                    AgentRuntimeContinuationOutcome::Admitted(execution) => {
-                        break Some(execution);
-                    }
-                    AgentRuntimeContinuationOutcome::Blocked => break 'continuations,
-                    AgentRuntimeContinuationOutcome::NotReady => continue,
-                    AgentRuntimeContinuationOutcome::Invalid => {
-                        return Err(AppRunError::Message(format!(
-                            "session {} could not admit an idle goal continuation from its retained root task scope",
-                            summary.session_id()
-                        )));
-                    }
+            let preclaimed_root_execution = match self
+                .agent_runtime()?
+                .begin_root_continuation_with_run_service(
+                    summary.session_id(),
+                    request.run_control.clone(),
+                    request.agent_confirmation.clone(),
+                    Arc::clone(self),
+                )
+                .map_err(AppRunError::Message)?
+            {
+                AgentRuntimeContinuationOutcome::Admitted(execution) => Some(execution),
+                AgentRuntimeContinuationOutcome::Blocked => break 'continuations,
+                // A root turn owns continuation admission independently of descendants. If
+                // another exact root owner won the race, do not spin or wait for the tree.
+                AgentRuntimeContinuationOutcome::NotReady => break 'continuations,
+                AgentRuntimeContinuationOutcome::Invalid => {
+                    return Err(AppRunError::Message(format!(
+                        "session {} could not admit an idle goal continuation from its retained root task scope",
+                        summary.session_id()
+                    )));
                 }
             };
             let continuation_request = RunRequest {
@@ -360,7 +546,7 @@ impl RunService {
     }
 
     async fn execute_single_run(
-        &self,
+        self: &Arc<Self>,
         request: RunRequest,
         renderer: &mut dyn EventRenderer,
         prompt: &mut dyn ConfirmationPrompt,
@@ -388,7 +574,7 @@ impl RunService {
                             .to_string(),
                     )
                 })?;
-                self.agent_runtime
+                self.agent_runtime()?
                     .release_unadmitted_root_continuation(execution)
                     .map_err(AppRunError::Message)?;
                 Ok(SingleRunOutcome::IdleGoalInactive)
@@ -396,7 +582,7 @@ impl RunService {
             Ok(SingleRunOutcome::Turn(summary)) => {
                 let completed = Ok(summary);
                 if let Some(execution) = root_agent_execution.take() {
-                    self.agent_runtime.complete_root(
+                    self.agent_runtime()?.complete_root(
                         execution,
                         &completed,
                         terminal_control.cause(),
@@ -408,7 +594,7 @@ impl RunService {
             }
             Ok(SingleRunOutcome::ControlCompleted) => {
                 if let Some(execution) = root_agent_execution.take() {
-                    self.agent_runtime
+                    self.agent_runtime()?
                         .release_unadmitted_root_continuation(execution)
                         .map_err(AppRunError::Message)?;
                 }
@@ -418,8 +604,11 @@ impl RunService {
                 classify_run_error(terminal_control, &error);
                 let failed = Err(error);
                 if let Some(execution) = root_agent_execution.take() {
-                    self.agent_runtime
-                        .complete_root(execution, &failed, terminal_control.cause());
+                    self.agent_runtime()?.complete_root(
+                        execution,
+                        &failed,
+                        terminal_control.cause(),
+                    );
                 }
                 Err(failed.expect_err("failed run result"))
             }
@@ -427,14 +616,21 @@ impl RunService {
     }
 
     async fn execute_single_run_inner(
-        &self,
+        self: &Arc<Self>,
         mut request: RunRequest,
         renderer: &mut dyn EventRenderer,
         prompt: &mut dyn ConfirmationPrompt,
         root_agent_execution: &mut Option<AgentRuntimeExecution>,
         turn_run_control: &mut Option<RunControl>,
     ) -> Result<SingleRunOutcome, AppRunError> {
-        let requires_active_goal = root_agent_execution.is_some();
+        let continuation_has_agent_updates = root_agent_execution
+            .as_ref()
+            .map(|execution| execution.context.has_pending_mailbox_input())
+            .transpose()
+            .map_err(AppRunError::Message)?
+            .unwrap_or(false);
+        let requires_active_goal =
+            root_agent_execution.is_some() && !continuation_has_agent_updates;
         let slash_goal_command = parse_goal_slash_command(&request.prompt)?;
         let selector = match (request.session_id, request.continue_last) {
             (Some(id), false) => SessionSelector::ById(id),
@@ -446,6 +642,26 @@ impl RunService {
                 ));
             }
         };
+        let session_settings = self.session_settings_for_selector(&selector).await?;
+        if let Some(session) = session_settings.as_ref() {
+            let access = match slash_goal_command.as_ref() {
+                Some(GoalSlashCommand::Get) => RetainedSessionAccess::RootVisibleRead,
+                Some(
+                    GoalSlashCommand::Clear
+                    | GoalSlashCommand::SetStatus(_)
+                    | GoalSlashCommand::SetObjective(_),
+                ) => RetainedSessionAccess::AgentOwnerRequired("have its goal changed"),
+                None => RetainedSessionAccess::AgentOwnerRequired("run as a root task"),
+            };
+            self.ensure_retained_session_access(session.id, access, request.agent_context.as_ref())
+                .await?;
+        } else if let Some(context) = request.agent_context.as_ref() {
+            return Err(AppRunError::Message(format!(
+                "agent context {} cannot start or select a different session from {}",
+                context.path(),
+                context.session_id()
+            )));
+        }
         if let Some(command) = slash_goal_command.clone() {
             match command {
                 GoalSlashCommand::SetObjective(objective) => {
@@ -471,7 +687,6 @@ impl RunService {
                 }
             }
         }
-        let session_settings = self.session_settings_for_selector(&selector).await?;
         let effective_config = materialize_run_config(
             self.config.clone(),
             session_settings.as_ref(),
@@ -551,19 +766,6 @@ impl RunService {
                 .with_model_override(&turn_policy.model.id)
                 .map_err(|error| AppRunError::Message(error.to_string()))?,
         );
-        if request.agent_context.is_none() {
-            let child_states = self
-                .store
-                .session_repo()
-                .list_direct_child_run_admission_states(session_context.session.id)
-                .await?;
-            if let Some(edge) = blocking_direct_child(&child_states, self.store.active_runs()) {
-                return Err(AppRunError::Message(format!(
-                    "session {} still has active sub-agent {}; wait for it to finish or cancel the agent tree before starting another root turn",
-                    session_context.session.id, edge.agent_path
-                )));
-            }
-        }
         let supplied_agent_context = request.agent_context.clone();
         let preclaimed_agent_context = root_agent_execution
             .as_ref()
@@ -594,43 +796,116 @@ impl RunService {
             None
         };
         let protocol_turn_id = crate::protocol::TurnId::new();
+        let initial_user_turn = build_initial_user_turn(
+            protocol_turn_id,
+            &prepared,
+            &image_parts,
+            request.editor_context.clone(),
+        );
+        let agent_trigger_history_item_id = provided_agent_context
+            .as_ref()
+            .filter(|context| context.is_sub_agent())
+            .and_then(|context| context.trigger_history_item_id());
+        let agent_owner_resume_request_id = provided_agent_context
+            .as_ref()
+            .filter(|context| context.is_sub_agent())
+            .and_then(|context| context.owner_resume_request_id());
+        if provided_agent_context
+            .as_ref()
+            .is_some_and(|context| context.is_sub_agent())
+            && agent_trigger_history_item_id.is_none()
+            && agent_owner_resume_request_id.is_none()
+        {
+            return Err(AppRunError::Message(
+                provided_agent_context
+                    .as_ref()
+                    .map(|context| {
+                        format!(
+                            "sub-agent `{}` has no canonical execution wake identity",
+                            context.path()
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "sub-agent has no canonical execution wake identity".to_string()
+                    }),
+            ));
+        }
+        if agent_trigger_history_item_id.is_some() && agent_owner_resume_request_id.is_some() {
+            return Err(AppRunError::Message(
+                "a sub-agent execution cannot combine an explicit task with OwnerResume"
+                    .to_string(),
+            ));
+        }
+        if (agent_trigger_history_item_id.is_some() || agent_owner_resume_request_id.is_some())
+            && initial_user_turn.is_some()
+        {
+            return Err(AppRunError::Message(
+                "an agent-triggered turn cannot also carry an initial user turn".to_string(),
+            ));
+        }
         let process_run_lease = self
             .store
             .try_acquire_run_process_lease(session_context.session.id)?;
-        let admission = match slash_goal_command.as_ref() {
-            Some(GoalSlashCommand::SetObjective(objective)) => {
-                self.store
-                    .session_repo()
-                    .admit_session_turn_with_goal_objective(
-                        session_context.session.id,
-                        protocol_turn_id,
-                        objective,
-                    )
-                    .await?
-            }
-            None if requires_active_goal => {
-                match self
-                    .store
-                    .session_repo()
-                    .admit_active_goal_continuation_turn(
-                        session_context.session.id,
-                        protocol_turn_id,
-                    )
-                    .await?
-                {
-                    ActiveGoalTurnAdmission::Admitted(snapshot) => Some(snapshot),
-                    ActiveGoalTurnAdmission::GoalInactive => {
-                        drop(process_run_lease);
-                        return Ok(SingleRunOutcome::IdleGoalInactive);
-                    }
-                    ActiveGoalTurnAdmission::Unavailable => None,
+        let admission = if let Some(expected_history_item_id) = agent_trigger_history_item_id {
+            self.store
+                .session_repo()
+                .admit_agent_triggered_turn(
+                    session_context.session.id,
+                    protocol_turn_id,
+                    expected_history_item_id,
+                )
+                .await?
+        } else if let Some(expected_owner_resume_request_id) = agent_owner_resume_request_id {
+            self.store
+                .session_repo()
+                .admit_owner_resume_turn(
+                    session_context.session.id,
+                    protocol_turn_id,
+                    expected_owner_resume_request_id,
+                )
+                .await?
+        } else {
+            match slash_goal_command.as_ref() {
+                Some(GoalSlashCommand::SetObjective(objective)) => {
+                    self.store
+                        .session_repo()
+                        .admit_session_turn_with_goal_objective_and_initial_user_turn(
+                            session_context.session.id,
+                            protocol_turn_id,
+                            objective,
+                            initial_user_turn.as_ref(),
+                        )
+                        .await?
                 }
-            }
-            _ => {
-                self.store
-                    .session_repo()
-                    .admit_session_turn(session_context.session.id, protocol_turn_id)
-                    .await?
+                None if requires_active_goal => {
+                    match self
+                        .store
+                        .session_repo()
+                        .admit_active_goal_continuation_turn_with_initial_user_turn(
+                            session_context.session.id,
+                            protocol_turn_id,
+                            initial_user_turn.as_ref(),
+                        )
+                        .await?
+                    {
+                        ActiveGoalTurnAdmission::Admitted(snapshot) => Some(snapshot),
+                        ActiveGoalTurnAdmission::GoalInactive => {
+                            drop(process_run_lease);
+                            return Ok(SingleRunOutcome::IdleGoalInactive);
+                        }
+                        ActiveGoalTurnAdmission::Unavailable => None,
+                    }
+                }
+                _ => {
+                    self.store
+                        .session_repo()
+                        .admit_session_turn_with_initial_user_turn(
+                            session_context.session.id,
+                            protocol_turn_id,
+                            initial_user_turn.as_ref(),
+                        )
+                        .await?
+                }
             }
         };
         let Some(admission) = admission else {
@@ -661,12 +936,61 @@ impl RunService {
                             )
                         })
                 })
-                .transpose()?;
+                .transpose();
         let admitted_goal = admission.goal.as_ref().map(|goal| {
             crate::agent::goal_steering::GoalSnapshot::capture(goal.goal_id.clone(), &goal.goal)
         });
+        let initial_user_history_item_id = admission.initial_user_history_item_id;
         let admission_id = admission.admission_id;
         let session_id = session_context.session.id;
+        let slash_goal_result = slash_goal_result.and_then(|result| {
+            if let Some(result) = result.as_ref() {
+                renderer.render_thread_goal_set(result)?;
+            }
+            Ok(result)
+        });
+        let mut renderer_sink = RendererSink {
+            renderer,
+            show_reasoning_summary: request.show_reasoning_summary,
+        };
+        let recorder = NativeHarnessRecorder::start_best_effort_for_turn(
+            &self.store,
+            Some(session_id),
+            self.workspace.root.clone(),
+            protocol_turn_id,
+        );
+        let mut harness_sink = HarnessRecordingSink::new(recorder, &mut renderer_sink);
+        let mut sink = ProtocolRecordingSink::new(
+            self.store.protocol_event_store(),
+            Some(session_id),
+            protocol_turn_id,
+            &mut harness_sink,
+        )
+        .with_admission_id(admission_id.clone())
+        .with_runtime_event_publisher(self.session_event_hub.publisher())
+        .with_canonical_runtime_projector(CanonicalRuntimeEventProjector::new(
+            self.store.protocol_event_store(),
+            self.store.harness_run_store(),
+            self.session_event_hub.publisher(),
+        ));
+        if let Err(error) = slash_goal_result {
+            let result = finish_admitted_run_with_terminal_fanout(
+                &self.store,
+                session_id,
+                admission_id,
+                protocol_turn_id,
+                &request.run_control,
+                Err(error),
+                Ok(()),
+                &mut sink,
+            )
+            .await;
+            drop(sink);
+            drop(harness_sink);
+            drop(renderer_sink);
+            drop(process_run_lease);
+            return result.map(SingleRunOutcome::Turn);
+        }
         let agent_context = if let Some(context) = provided_agent_context {
             if turn_run_control.is_none() {
                 *turn_run_control = Some(request.run_control.clone());
@@ -674,18 +998,19 @@ impl RunService {
             Some(context)
         } else if let Some(confirmation) = root_confirmation {
             let execution = match self
-                .agent_runtime
-                .begin_root(
+                .agent_runtime()?
+                .begin_root_with_run_service(
                     &session_context,
                     Arc::clone(&turn_config),
                     confirmation,
                     request.run_control.clone(),
+                    Arc::clone(self),
                 )
                 .await
             {
                 Ok(execution) => execution,
                 Err(error) => {
-                    let result = finish_admitted_run(
+                    let result = finish_admitted_run_with_terminal_fanout(
                         &self.store,
                         session_id,
                         admission_id,
@@ -693,8 +1018,12 @@ impl RunService {
                         &request.run_control,
                         Err(AppRunError::Message(error)),
                         Ok(()),
+                        &mut sink,
                     )
                     .await;
+                    drop(sink);
+                    drop(harness_sink);
+                    drop(renderer_sink);
                     drop(process_run_lease);
                     return result.map(SingleRunOutcome::Turn);
                 }
@@ -707,9 +1036,27 @@ impl RunService {
         } else {
             None
         };
-        request.run_control = turn_run_control.clone().ok_or_else(|| {
-            AppRunError::Message("admitted turn did not retain a run control".to_string())
-        })?;
+        let Some(admitted_run_control) = turn_run_control.clone() else {
+            let result = finish_admitted_run_with_terminal_fanout(
+                &self.store,
+                session_id,
+                admission_id,
+                protocol_turn_id,
+                &request.run_control,
+                Err(AppRunError::Message(
+                    "admitted turn did not retain a run control".to_string(),
+                )),
+                Ok(()),
+                &mut sink,
+            )
+            .await;
+            drop(sink);
+            drop(harness_sink);
+            drop(renderer_sink);
+            drop(process_run_lease);
+            return result.map(SingleRunOutcome::Turn);
+        };
+        request.run_control = admitted_run_control;
         let heartbeat_stop = CancellationToken::new();
         let heartbeat_repo = self.store.session_repo();
         let heartbeat_admission_id = admission_id.clone();
@@ -748,143 +1095,94 @@ impl RunService {
             goal: admitted_goal,
             current_time: crate::context::current_time::CurrentTimeSnapshot::now(),
         });
-        let admitted_result: Result<RunSummary, AppRunError> = async {
-            if let Some(context) = agent_context
-                .as_ref()
-                .filter(|context| context.is_sub_agent())
-            {
-                // Publish Running only after the durable session admission
-                // exists. PendingInit mail can therefore be committed without
-                // racing a not-yet-created active turn.
-                context
-                    .mark_durable_turn_admitted()
-                    .map_err(AppRunError::Message)?;
-            }
-            if let Some(adoption) = request.session_access_mode_adoption.as_ref() {
-                adoption
-                    .adopt(session_id, session_context.session.access_mode)
-                    .await
-                    .map_err(AppRunError::Message)?;
-            }
-            if let Some(context) = agent_context
-                .as_ref()
-                .filter(|context| !context.is_sub_agent())
-            {
-                context
-                    .bind_root_turn_owner(admission_id, protocol_turn_id)
-                    .map_err(AppRunError::Message)?;
-            }
-            let active_run = self
-                .store
-                .active_runs()
-                .try_start(session_id, request.run_control.clone())?;
-            if let Some(result) = slash_goal_result.as_ref() {
-                renderer.render_thread_goal_set(result)?;
-            }
-            let mut renderer_sink = RendererSink {
-                renderer,
-                show_reasoning_summary: request.show_reasoning_summary,
-            };
-            let recorder = NativeHarnessRecorder::start_best_effort_for_turn(
-                &self.store,
-                Some(session_id),
-                self.workspace.root.clone(),
-                protocol_turn_id,
-            );
-            active_run.set_turn_id(protocol_turn_id)?;
-            let mut harness_sink = HarnessRecordingSink::new(recorder, &mut renderer_sink);
-            let mut sink = ProtocolRecordingSink::new(
-                self.store.protocol_event_store(),
-                Some(session_id),
-                protocol_turn_id,
-                &mut harness_sink,
-            )
-            .with_admission_id(admission_id.clone())
-            .with_runtime_event_publisher(self.session_event_hub.publisher());
-            sink.emit(crate::session::RunEvent::SessionStarted {
-                session_id,
-                title: session_context.session.title.clone(),
-            })?;
+        let admitted_result: Result<RunSummary, AppRunError> =
+            run_admitted_inner_with_cancel_grace(&request.run_control, async {
+                if let Some(context) = agent_context.as_ref() {
+                    context
+                        .bind_durable_turn_owner(admission_id, protocol_turn_id)
+                        .map_err(AppRunError::Message)?;
+                }
+                if let Some(context) = agent_context
+                    .as_ref()
+                    .filter(|context| context.is_sub_agent())
+                {
+                    // Publish Running only after the durable session admission
+                    // exists. PendingInit mail can therefore be committed without
+                    // racing a not-yet-created active turn.
+                    context
+                        .mark_durable_turn_admitted()
+                        .map_err(AppRunError::Message)?;
+                }
+                if let Some(adoption) = request.session_access_mode_adoption.as_ref() {
+                    adoption
+                        .adopt(session_id, session_context.session.access_mode)
+                        .await
+                        .map_err(AppRunError::Message)?;
+                }
+                let active_run = self
+                    .store
+                    .active_runs()
+                    .try_start(session_id, request.run_control.clone())?;
+                active_run.set_turn_id(protocol_turn_id)?;
+                sink.emit_committed(crate::session::RunEvent::SessionStarted {
+                    session_id,
+                    title: session_context.session.title.clone(),
+                })?;
 
-            if prepared.prompt.trim().is_empty() {
-                let context = self.context_manager(session_id).await?;
-                if !context.has_model_context() {
-                    return Err(AppRunError::Message(
+                if let Some(user_turn) = initial_user_turn.as_ref() {
+                    sink.emit_committed(crate::session::RunEvent::UserTurnStored {
+                        session_id,
+                        turn: Box::new(user_turn.clone()),
+                    })?;
+                } else if agent_context.is_none() {
+                    let context = self.context_manager(session_id, false).await?;
+                    if !context.has_model_context() {
+                        return Err(AppRunError::Message(
                         "cannot resume a session without a prompt or active canonical model context"
                             .to_string(),
                     ));
+                    }
                 }
-            } else {
-                let user_turn = build_user_turn(
-                    protocol_turn_id,
-                    &prepared,
-                    &image_parts,
-                    request.editor_context.clone(),
-                );
-                self.session_service
-                    .store_user_turn_with_protocol_bundle(
-                        &session_context,
-                        admission_id,
-                        &user_turn,
-                        protocol_turn_id,
-                        sink.reserve_sequence_no(),
+
+                let context = self
+                    .context_manager(
+                        session_id,
+                        agent_context.is_some() && initial_user_turn.is_none(),
                     )
                     .await?;
-                sink.emit_committed(crate::session::RunEvent::UserTurnStored {
-                    session_id,
-                    turn: Box::new(user_turn),
-                })?;
-            }
-
-            let context = self.context_manager(session_id).await?;
-            let mut tree_confirmation = agent_context
-                .as_ref()
-                .map(crate::app::AgentRunContext::confirmation_prompt);
-            let active_prompt: &mut dyn ConfirmationPrompt = match tree_confirmation.as_mut() {
-                Some(confirmation) => confirmation,
-                None => prompt,
-            };
-            let summary = self
-                .agent_loop
-                .run(
-                    AgentRunRequest {
-                        session: session_context,
-                        turn: turn_context,
-                        context,
-                        run_control: request.run_control.clone(),
-                        agent_context: agent_context.clone(),
-                    },
-                    active_prompt,
-                    &mut sink,
-                )
-                .await?;
-            drop(sink);
-            renderer.finish(&summary)?;
-            drop(active_run);
-            if should_generate_session_title
-                && let Some(title) = derive_session_title(&prepared.prompt)
-            {
-                let _ = self
-                    .session_service
-                    .update_session_title(session_id, title)
-                    .await;
-            }
-            Ok(summary)
-        }
-        .await;
+                let mut tree_confirmation = agent_context
+                    .as_ref()
+                    .map(crate::app::AgentRunContext::confirmation_prompt);
+                let active_prompt: &mut dyn ConfirmationPrompt = match tree_confirmation.as_mut() {
+                    Some(confirmation) => confirmation,
+                    None => prompt,
+                };
+                let summary = self
+                    .agent_loop
+                    .run(
+                        AgentRunRequest {
+                            session: session_context,
+                            turn: turn_context,
+                            context,
+                            run_control: request.run_control.clone(),
+                            agent_context: agent_context.clone(),
+                            initial_user_history_item_id,
+                        },
+                        active_prompt,
+                        &mut sink,
+                    )
+                    .await?;
+                drop(active_run);
+                Ok(summary)
+            })
+            .await;
+        let renderer_finish_required = admitted_result.is_ok();
         heartbeat_stop.cancel();
-        let heartbeat_result = match heartbeat_task.await {
-            Ok(result) => result,
-            Err(error) => {
-                request
-                    .run_control
-                    .fail(format!("run admission heartbeat task failed: {error}"));
-                Err(crate::error::StorageError::Message(format!(
-                    "run admission heartbeat task failed: {error}"
-                )))
-            }
+        let heartbeat_result = match heartbeat_task {
+            Ok(task) => task.stop_and_wait().await,
+            Err(error) => Err(error),
         };
-        let result = finish_admitted_run(
+        let result = finish_admitted_run_with_terminal_fanout(
             &self.store,
             session_id,
             admission_id,
@@ -892,8 +1190,30 @@ impl RunService {
             &request.run_control,
             admitted_result,
             heartbeat_result,
+            &mut sink,
         )
         .await;
+        drop(sink);
+        drop(harness_sink);
+        drop(renderer_sink);
+        if renderer_finish_required
+            && let Ok(summary) = result.as_ref()
+            && let Err(error) = renderer.finish(summary)
+        {
+            eprintln!(
+                "warning: durable run {session_id} settled but its renderer could not finish: {error}"
+            );
+        }
+        if renderer_finish_required
+            && result.is_ok()
+            && should_generate_session_title
+            && let Some(title) = derive_session_title(&prepared.prompt)
+        {
+            let _ = self
+                .session_service
+                .update_session_title(session_id, title)
+                .await;
+        }
         drop(process_run_lease);
         result.map(SingleRunOutcome::Turn)
     }
@@ -1433,6 +1753,12 @@ async fn renew_admitted_run_lease_with_terminal_cancel(
         .await?;
     match &outcome {
         RunAdmissionLeaseRenewalOutcome::Renewed => {}
+        RunAdmissionLeaseRenewalOutcome::StopFenced(outcome) => {
+            classify_run_control_for_terminal_outcome(&run_control, outcome);
+            if let Some(agent_context) = agent_context {
+                let _ = agent_context.cancel_for_durable_terminal();
+            }
+        }
         RunAdmissionLeaseRenewalOutcome::Terminal(terminal)
             if terminal.session_status() == SessionStatus::Completed => {}
         RunAdmissionLeaseRenewalOutcome::Terminal(_) => {
@@ -1448,6 +1774,59 @@ async fn renew_admitted_run_lease_with_terminal_cancel(
     Ok(outcome)
 }
 
+fn classify_run_control_for_terminal_outcome(
+    run_control: &RunControl,
+    outcome: &crate::protocol::TurnTerminalOutcome,
+) {
+    match outcome {
+        crate::protocol::TurnTerminalOutcome::Completed => {
+            run_control.supersede();
+        }
+        crate::protocol::TurnTerminalOutcome::Interrupted { cause } => {
+            run_control.request_cancel(RunCancellationCause::Interruption(*cause));
+        }
+        crate::protocol::TurnTerminalOutcome::Failed { error } => {
+            run_control.request_cancel(RunCancellationCause::Failure(error.clone()));
+        }
+    }
+}
+
+struct RunAdmissionHeartbeatTask {
+    executor: LocalTaskExecutor,
+    task: Option<OwnedTaskHandle>,
+    result: tokio::sync::oneshot::Receiver<Result<(), crate::error::StorageError>>,
+    session_id: crate::session::SessionId,
+    admission_id: AdmissionId,
+}
+
+impl RunAdmissionHeartbeatTask {
+    async fn stop_and_wait(mut self) -> Result<(), crate::error::StorageError> {
+        let result = match tokio::time::timeout(GRACEFUL_TASK_ABORT_TIMEOUT, &mut self.result).await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(crate::error::StorageError::Message(format!(
+                "run admission heartbeat worker stopped without a result for session {} admission {}",
+                self.session_id, self.admission_id
+            ))),
+            Err(_) => Err(crate::error::StorageError::Message(format!(
+                "run admission heartbeat worker exceeded the {} ms cancellation grace period for session {} admission {}",
+                GRACEFUL_TASK_ABORT_TIMEOUT.as_millis(),
+                self.session_id,
+                self.admission_id
+            ))),
+        };
+
+        // The heartbeat owns a durable lease mutation path. Do not let the outer run settle until
+        // that whole worker has been dropped, even when it already sent its result or ignored the
+        // cooperative stop token.
+        if let Some(task) = self.task.take() {
+            task.abort_and_wait().await;
+        }
+        drop(self.executor);
+        result
+    }
+}
+
 fn spawn_run_admission_heartbeat<Renew, RenewFuture>(
     session_id: crate::session::SessionId,
     admission_id: AdmissionId,
@@ -1455,75 +1834,65 @@ fn spawn_run_admission_heartbeat<Renew, RenewFuture>(
     heartbeat_stop: CancellationToken,
     heartbeat_interval: Duration,
     renew: Renew,
-) -> tokio::task::JoinHandle<Result<(), crate::error::StorageError>>
+) -> Result<RunAdmissionHeartbeatTask, crate::error::StorageError>
 where
     Renew: FnMut() -> RenewFuture + Send + 'static,
-    RenewFuture:
-        Future<Output = Result<RunAdmissionLeaseRenewalOutcome, crate::error::StorageError>>,
+    RenewFuture: Future<Output = Result<RunAdmissionLeaseRenewalOutcome, crate::error::StorageError>>
+        + 'static,
 {
     // Permission surfaces intentionally wait for a human through a synchronous confirmation
     // boundary. Keep lease renewal off the foreground executor so a current-thread runtime can
     // remain blocked for an arbitrary confirmation interval without forfeiting run ownership.
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    let thread_admission_id = admission_id.clone();
-    let control_on_thread_failure = run_control.clone();
-    let thread_spawn = std::thread::Builder::new()
-        .name("moyai-run-admission-heartbeat".to_string())
-        .spawn(move || {
-            let result = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime.block_on(async move {
-                    let heartbeat = maintain_run_admission_lease(
-                        session_id,
-                        thread_admission_id.clone(),
-                        heartbeat_stop,
-                        heartbeat_interval,
-                        renew,
-                    );
-                    match AssertUnwindSafe(heartbeat).catch_unwind().await {
-                        Ok(result) => result,
-                        Err(payload) => {
-                            let message = payload
-                                .downcast_ref::<&str>()
-                                .map(|message| (*message).to_string())
-                                .or_else(|| payload.downcast_ref::<String>().cloned())
-                                .unwrap_or_else(|| "non-string panic payload".to_string());
-                            Err(crate::error::StorageError::Message(format!(
-                                "run admission heartbeat panicked for session {session_id} admission {thread_admission_id}: {message}"
-                            )))
-                        }
-                    }
-                }),
-                Err(error) => Err(crate::error::StorageError::Message(format!(
-                    "failed to build run admission heartbeat runtime for session {session_id} admission {thread_admission_id}: {error}"
-                ))),
-            };
-            if let Err(error) = &result {
-                record_heartbeat_failure(&control_on_thread_failure, error.to_string());
-            }
-            let _ = result_tx.send(result);
-        });
-
-    let thread_spawn_error = thread_spawn.err().map(|error| {
+    let worker_admission_id = admission_id.clone();
+    let control_on_failure = run_control.clone();
+    let executor = LocalTaskExecutor::new("moyai-run-admission-heartbeat").map_err(|error| {
         let error = crate::error::StorageError::Message(format!(
-            "failed to start run admission heartbeat thread for session {session_id} admission {admission_id}: {error}"
+            "failed to start run admission heartbeat executor for session {session_id} admission {admission_id}: {error}"
         ));
         record_heartbeat_failure(&run_control, error.to_string());
         error
-    });
-    tokio::spawn(async move {
-        if let Some(error) = thread_spawn_error {
-            return Err(error);
-        }
-        result_rx.await.map_err(|_| {
+    })?;
+    let task = executor
+        .spawn(0, move || async move {
+            let heartbeat = maintain_run_admission_lease(
+                session_id,
+                worker_admission_id.clone(),
+                heartbeat_stop,
+                heartbeat_interval,
+                renew,
+            );
+            let result = match AssertUnwindSafe(heartbeat).catch_unwind().await {
+                Ok(result) => result,
+                Err(payload) => {
+                    let message = payload
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    Err(crate::error::StorageError::Message(format!(
+                        "run admission heartbeat panicked for session {session_id} admission {worker_admission_id}: {message}"
+                    )))
+                }
+            };
+            if let Err(error) = &result {
+                record_heartbeat_failure(&control_on_failure, error.to_string());
+            }
+            let _ = result_tx.send(result);
+        })
+        .map_err(|error| {
             let error = crate::error::StorageError::Message(format!(
-                "run admission heartbeat thread stopped without a result for session {session_id} admission {admission_id}"
+                "failed to spawn run admission heartbeat worker for session {session_id} admission {admission_id}: {error}"
             ));
             record_heartbeat_failure(&run_control, error.to_string());
             error
-        })?
+        })?;
+    Ok(RunAdmissionHeartbeatTask {
+        executor,
+        task: Some(task),
+        result: result_rx,
+        session_id,
+        admission_id,
     })
 }
 
@@ -1552,6 +1921,7 @@ where
             _ = tokio::time::sleep(heartbeat_interval) => {
                 match renew().await? {
                     RunAdmissionLeaseRenewalOutcome::Renewed => {}
+                    RunAdmissionLeaseRenewalOutcome::StopFenced(_) => return Ok(()),
                     RunAdmissionLeaseRenewalOutcome::Terminal(_) => return Ok(()),
                     RunAdmissionLeaseRenewalOutcome::SupersededOrExpired => {
                         return Err(crate::error::StorageError::Message(format!(
@@ -1586,12 +1956,13 @@ async fn finish_admitted_run(
     let admitted_result = match heartbeat_result {
         Ok(()) => admitted_result,
         Err(heartbeat_error) => match admitted_result {
-            Ok(summary) => {
+            Ok(_summary) => {
                 match durable_run_summary_for_turn(store, session_id, protocol_turn_id).await {
-                    Ok(Some(durable)) if durable.status() == SessionStatus::Completed => {
-                        // The exact turn's durable session/protocol commit is authoritative. The
-                        // heartbeat failure remains diagnostic and must not reverse completed work.
-                        Ok(summary)
+                    Ok(Some(durable)) => {
+                        // The exact turn's durable terminal is authoritative for every typed
+                        // outcome. Heartbeat cleanup cannot turn Interrupted or Failed back into
+                        // an operational transport error any more than it can reverse Completed.
+                        Ok(durable)
                     }
                     Ok(_) => Err(AppRunError::Storage(heartbeat_error)),
                     Err(authority_error) => Err(AppRunError::Message(format!(
@@ -1629,6 +2000,106 @@ async fn finish_admitted_run(
     reconcile_admitted_run_release(settled, released, admission_id)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn finish_admitted_run_with_terminal_fanout<S: RunEventSink + ?Sized>(
+    store: &StoreBundle,
+    session_id: crate::session::SessionId,
+    admission_id: AdmissionId,
+    protocol_turn_id: crate::protocol::TurnId,
+    run_control: &RunControl,
+    admitted_result: Result<RunSummary, AppRunError>,
+    heartbeat_result: Result<(), crate::error::StorageError>,
+    sink: &mut ProtocolRecordingSink<'_, S>,
+) -> Result<RunSummary, AppRunError> {
+    let result = finish_admitted_run(
+        store,
+        session_id,
+        admission_id,
+        protocol_turn_id,
+        run_control,
+        admitted_result,
+        heartbeat_result,
+    )
+    .await;
+    if sink.committed_terminal_fanout_attempted() {
+        return result;
+    }
+
+    let durable_summary = match result.as_ref() {
+        Ok(summary) => Some(summary.clone()),
+        Err(_) => match durable_run_summary_for_turn(store, session_id, protocol_turn_id).await {
+            Ok(summary) => summary,
+            Err(error) => {
+                eprintln!(
+                    "warning: admitted turn {protocol_turn_id} settled but its terminal fanout could not reload durable truth: {error}"
+                );
+                None
+            }
+        },
+    };
+    if let Some(summary) = durable_summary {
+        let event = crate::session::RunEvent::TurnTerminal {
+            session_id,
+            terminal: Box::new(summary.into_terminal()),
+        };
+        if let Err(error) = sink.emit_committed(event) {
+            // Durable state already won. The runtime-event publisher and harness recorder run
+            // before the fallible renderer, and clients also receive the typed RunSummary.
+            eprintln!(
+                "warning: durable terminal for admitted turn {protocol_turn_id} could not reach every live renderer: {error}"
+            );
+        }
+    }
+    result
+}
+
+/// Owns the potentially non-cooperative agent loop inside the durable admitted-run boundary.
+///
+/// The outer `RunService` future retains the exact session/admission/turn identities and therefore
+/// remains responsible for `finish_admitted_run_with_terminal_fanout`. Cancellation first gives
+/// the inner loop the same short cooperative grace used by Codex tasks. If it does not return, the
+/// pinned inner future is dropped here; the outer owner then commits the already-classified typed
+/// terminal instead of relying on the cancelled future's cleanup tail.
+async fn run_admitted_inner_with_cancel_grace<F, T, E>(
+    run_control: &RunControl,
+    inner: F,
+) -> Result<T, AppRunError>
+where
+    F: Future<Output = Result<T, E>>,
+    AppRunError: From<E>,
+{
+    let cancel = run_control.token();
+    tokio::pin!(inner);
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            let stopped_cooperatively =
+                tokio::time::timeout(GRACEFUL_TASK_ABORT_TIMEOUT, &mut inner)
+                    .await
+                    .is_ok();
+            let disposition = if stopped_cooperatively {
+                "stopped during"
+            } else {
+                "exceeded"
+            };
+            Err(AppRunError::Message(format!(
+                "admitted run {disposition} the {} ms cancellation grace period",
+                GRACEFUL_TASK_ABORT_TIMEOUT.as_millis()
+            )))
+        },
+        result = &mut inner => {
+            if run_control.cause().is_some() {
+                Err(AppRunError::Message(
+                    "admitted run completed after cancellation had already won terminal ownership"
+                        .to_string(),
+                ))
+            } else {
+                result.map_err(AppRunError::from)
+            }
+        },
+    }
+}
+
 pub(crate) fn classify_run_error(run_control: &RunControl, error: &AppRunError) {
     let cause = if matches!(error, AppRunError::Agent(AgentError::RunSuperseded { .. })) {
         RunCancellationCause::Superseded
@@ -1645,14 +2116,14 @@ fn reconcile_admitted_run_release(
 ) -> Result<RunSummary, AppRunError> {
     match (settled, released) {
         (result, Ok(_)) => result,
-        (Ok(summary), Err(release_error)) if summary.status() == SessionStatus::Completed => {
+        (Ok(summary), Err(release_error)) => {
             eprintln!(
-                "warning: durable run {} completed, but admission {admission_id} could not be released: {release_error}",
-                summary.session_id()
+                "warning: durable run {} settled as {}, but admission {admission_id} could not be released: {release_error}",
+                summary.session_id(),
+                summary.status().key(),
             );
             Ok(summary)
         }
-        (Ok(_), Err(release_error)) => Err(AppRunError::Storage(release_error)),
         (Err(run_error), Err(release_error)) => Err(AppRunError::Message(format!(
             "{run_error}; additionally failed to release run admission {admission_id}: {release_error}"
         ))),
@@ -1715,6 +2186,8 @@ async fn settle_admitted_run_result(
             metrics: Default::default(),
         },
     };
+    let fallback_summary =
+        RunSummary::from_terminal(session_id, protocol_turn_id, terminal.clone());
     let event = crate::session::RunEvent::TurnTerminal {
         session_id,
         terminal: Box::new(terminal),
@@ -1726,8 +2199,6 @@ async fn settle_admitted_run_result(
             admission_id,
             &event,
             protocol_turn_id,
-            None,
-            None,
             None,
             None,
         )
@@ -1747,6 +2218,12 @@ async fn settle_admitted_run_result(
             })?
     {
         return Ok(summary);
+    }
+    if terminalized == crate::storage::session_repo::AdmittedTerminalCommit::Applied {
+        // Post-admission execution has a typed durable terminal, including setup failures and
+        // explicit interruptions. Surface that exact owner to clients; operational Err is now
+        // reserved for cases where terminal truth could not be committed or recovered.
+        return Ok(fallback_summary);
     }
     Err(error)
 }
@@ -2003,6 +2480,16 @@ fn build_user_turn(
         prompt_dispatch: prepared.prompt_dispatch.clone(),
         editor_context,
     }
+}
+
+fn build_initial_user_turn(
+    turn_id: crate::protocol::TurnId,
+    prepared: &PreparedRunTurn,
+    images: &[ImagePart],
+    editor_context: Option<crate::session::EditorContext>,
+) -> Option<UserTurn> {
+    (!prepared.prompt.trim().is_empty() || !images.is_empty())
+        .then(|| build_user_turn(turn_id, prepared, images, editor_context))
 }
 
 fn load_image_attachments(
@@ -2489,6 +2976,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn image_only_turn_is_retained_as_initial_user_input() {
+        let turn_id = crate::protocol::TurnId::new();
+        let prepared = super::PreparedRunTurn {
+            prompt: String::new(),
+            prompt_dispatch: Some(crate::session::PromptDispatchPart::raw("")),
+        };
+        let image = crate::session::ImagePart {
+            source_path: None,
+            mime_type: "image/png".to_string(),
+            data_base64: "iVBORw0KGgo=".to_string(),
+            byte_len: 8,
+        };
+
+        let turn = super::build_initial_user_turn(turn_id, &prepared, &[image], None)
+            .expect("image-only input");
+
+        assert_eq!(turn.turn_id, turn_id);
+        assert!(matches!(
+            turn.items.as_slice(),
+            [crate::protocol::UserInputItem::Image { .. }]
+        ));
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn workflow_command_link_cannot_ingest_an_external_file() {
@@ -2694,44 +3205,6 @@ mod tests {
     }
 
     #[test]
-    fn direct_child_blocker_combines_one_sql_snapshot_with_process_local_runs() {
-        let root_session_id = crate::session::SessionId::new();
-        let child_session_id = crate::session::SessionId::new();
-        let mut states = vec![crate::storage::session_repo::DirectChildRunAdmissionState {
-            edge: crate::session::SessionSpawnEdge {
-                root_session_id,
-                parent_session_id: root_session_id,
-                child_session_id,
-                agent_path: "/root/worker".to_string(),
-                task_name: "worker".to_string(),
-                created_at_ms: 1,
-            },
-            blocks_new_root_turn: false,
-        }];
-        let active_runs = crate::runtime::ActiveRunRegistry::default();
-        assert!(super::blocking_direct_child(&states, &active_runs).is_none());
-
-        let local_lease = active_runs
-            .try_start(child_session_id, crate::runtime::RunControl::new())
-            .expect("local child run");
-        assert_eq!(
-            super::blocking_direct_child(&states, &active_runs)
-                .expect("local blocker")
-                .child_session_id,
-            child_session_id
-        );
-        drop(local_lease);
-
-        states[0].blocks_new_root_turn = true;
-        assert_eq!(
-            super::blocking_direct_child(&states, &active_runs)
-                .expect("durable blocker")
-                .child_session_id,
-            child_session_id
-        );
-    }
-
-    #[test]
     fn review_prompt_bounds_file_inventory_and_requires_authoritative_enumeration() {
         let scope = crate::workspace::ReviewScope {
             mode: crate::workspace::ReviewScopeMode::Uncommitted,
@@ -2783,6 +3256,7 @@ mod tests {
         Arc<super::RunService>,
         StoreBundle,
         crate::workspace::Workspace,
+        Arc<crate::app::AgentRuntime>,
     ) {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = Utf8PathBuf::from_path_buf(temp.keep().join("data")).expect("utf8 data dir");
@@ -2837,7 +3311,71 @@ mod tests {
         agent_runtime
             .bind_run_service(Arc::downgrade(&run_service))
             .expect("bind run service");
-        (run_service, store, workspace)
+        (run_service, store, workspace, agent_runtime)
+    }
+
+    async fn retained_child_fixture(
+        run_service: &super::RunService,
+        store: &StoreBundle,
+        workspace: &crate::workspace::Workspace,
+        config: &ResolvedConfig,
+    ) -> (crate::session::SessionRecord, crate::session::SessionRecord) {
+        let start = |title: &str| crate::session::SessionStartRequest {
+            selector: crate::session::SessionSelector::New,
+            title: Some(title.to_string()),
+            cwd: workspace.cwd.clone(),
+            model: config.model.model.clone(),
+            base_url: config.model.base_url.clone(),
+            access_mode: config.permissions.access_mode,
+        };
+        let root = run_service
+            .session_service
+            .start_or_resume(start("root"), workspace.clone())
+            .await
+            .expect("root session");
+        let child = run_service
+            .session_service
+            .start_or_resume(start("child"), workspace.clone())
+            .await
+            .expect("child session");
+        store
+            .session_repo()
+            .insert_session_spawn_edge(
+                root.session.id,
+                root.session.id,
+                child.session.id,
+                "/root/worker",
+                "worker",
+            )
+            .await
+            .expect("retained child edge");
+        (root.session, child.session)
+    }
+
+    fn control_run_request(
+        config: ResolvedConfig,
+        workspace: &crate::workspace::Workspace,
+        session_id: crate::session::SessionId,
+        prompt: &str,
+    ) -> crate::app::RunRequest {
+        crate::app::RunRequest {
+            prompt: prompt.to_string(),
+            session_id: Some(session_id),
+            continue_last: false,
+            title: None,
+            cwd: workspace.cwd.clone(),
+            config: crate::app::RunConfigInput::Resolved(config),
+            output_mode: crate::cli::OutputMode::Human,
+            show_reasoning_summary: false,
+            prompt_dispatch: None,
+            editor_context: None,
+            review_request: None,
+            image_paths: Vec::new(),
+            run_control: crate::runtime::RunControl::new(),
+            session_access_mode_adoption: None,
+            agent_confirmation: None,
+            agent_context: None,
+        }
     }
 
     async fn heartbeat_active_turn_fixture(
@@ -2995,7 +3533,8 @@ mod tests {
         config.model.supports_reasoning = true;
         config.multi_agent.enabled = false;
 
-        let (run_service, store, workspace) = run_service_fixture(config.clone()).await;
+        let (run_service, store, workspace, _process_agent_runtime) =
+            run_service_fixture(config.clone()).await;
         let run_control = crate::runtime::RunControl::new();
         let mut renderer = crate::cli::HumanRenderer::new();
         let mut prompt = NoPrompt;
@@ -3060,9 +3599,309 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn top_level_run_rejects_a_retained_sub_agent_session() {
+        let config = ResolvedConfig::default();
+        let (run_service, store, workspace, _process_agent_runtime) =
+            run_service_fixture(config.clone()).await;
+        let root = run_service
+            .session_service
+            .start_or_resume(
+                crate::session::SessionStartRequest {
+                    selector: crate::session::SessionSelector::New,
+                    title: Some("root".to_string()),
+                    cwd: workspace.cwd.clone(),
+                    model: config.model.model.clone(),
+                    base_url: config.model.base_url.clone(),
+                    access_mode: config.permissions.access_mode,
+                },
+                workspace.clone(),
+            )
+            .await
+            .expect("root session");
+        let child = run_service
+            .session_service
+            .start_or_resume(
+                crate::session::SessionStartRequest {
+                    selector: crate::session::SessionSelector::New,
+                    title: Some("child".to_string()),
+                    cwd: workspace.cwd.clone(),
+                    model: config.model.model.clone(),
+                    base_url: config.model.base_url.clone(),
+                    access_mode: config.permissions.access_mode,
+                },
+                workspace.clone(),
+            )
+            .await
+            .expect("child session");
+        store
+            .session_repo()
+            .insert_session_spawn_edge(
+                root.session.id,
+                root.session.id,
+                child.session.id,
+                "/root/worker",
+                "worker",
+            )
+            .await
+            .expect("retained child edge");
+        let run_control = crate::runtime::RunControl::new();
+        let mut renderer = crate::cli::HumanRenderer::new();
+        let mut prompt = NoPrompt;
+
+        let error = run_service
+            .execute(
+                crate::app::AppCommand::Run(crate::app::RunRequest {
+                    prompt: "incorrect top-level resume".to_string(),
+                    session_id: Some(child.session.id),
+                    continue_last: false,
+                    title: None,
+                    cwd: workspace.cwd.clone(),
+                    config: crate::app::RunConfigInput::Resolved(config),
+                    output_mode: crate::cli::OutputMode::Human,
+                    show_reasoning_summary: false,
+                    prompt_dispatch: None,
+                    editor_context: None,
+                    review_request: None,
+                    image_paths: Vec::new(),
+                    run_control,
+                    session_access_mode_adoption: None,
+                    agent_confirmation: None,
+                    agent_context: None,
+                }),
+                &mut renderer,
+                &mut prompt,
+            )
+            .await
+            .expect_err("retained child cannot become a root run");
+
+        assert!(error.to_string().contains("retained sub-agent"));
+        assert!(error.to_string().contains("resume its root task"));
+        assert!(
+            !store
+                .session_repo()
+                .has_fresh_run_admission(child.session.id)
+                .await
+                .expect("child admission state")
+        );
+    }
+
+    #[tokio::test]
+    async fn external_steer_and_interrupt_cannot_bypass_an_active_child_owner() {
+        let config = ResolvedConfig::default();
+        let (run_service, store, workspace, _process_agent_runtime) =
+            run_service_fixture(config.clone()).await;
+        let (root, child) = retained_child_fixture(&run_service, &store, &workspace, &config).await;
+        let child_turn_id = crate::protocol::TurnId::new();
+        store
+            .session_repo()
+            .admit_session_turn(child.id, child_turn_id)
+            .await
+            .expect("child admission")
+            .expect("active child turn");
+        let mut renderer = crate::cli::HumanRenderer::new();
+        let mut prompt = NoPrompt;
+
+        let steer_error = run_service
+            .execute(
+                crate::app::AppCommand::SessionSteer(crate::app::SessionSteerRequest {
+                    session_id: child.id,
+                    prompt: "external steer".to_string(),
+                    cwd: workspace.cwd.clone(),
+                    image_paths: Vec::new(),
+                    client_user_message_id: None,
+                }),
+                &mut renderer,
+                &mut prompt,
+            )
+            .await
+            .expect_err("retained child steer requires its agent owner");
+        assert!(steer_error.to_string().contains("retained sub-agent"));
+        assert!(steer_error.to_string().contains("steered directly"));
+        assert!(
+            store
+                .protocol_event_store()
+                .list_history_items_for_session(child.id)
+                .expect("child history")
+                .iter()
+                .all(|item| !matches!(
+                    item.payload,
+                    crate::protocol::HistoryItemPayload::SteerTurn { .. }
+                ))
+        );
+
+        let interrupt_error = run_service
+            .execute(
+                crate::app::AppCommand::SessionInterrupt(crate::app::SessionInterruptRequest {
+                    session_id: child.id,
+                }),
+                &mut renderer,
+                &mut prompt,
+            )
+            .await
+            .expect_err("retained child interrupt requires its agent owner");
+        assert!(interrupt_error.to_string().contains("interrupted directly"));
+        assert_eq!(
+            store
+                .session_repo()
+                .get_session(child.id)
+                .await
+                .expect("active child")
+                .status,
+            crate::session::SessionStatus::Running
+        );
+
+        for (forged_root, forged_path, forged_child) in [
+            (crate::session::SessionId::new(), "/root/worker", child.id),
+            (root.id, "/root/forged", child.id),
+            (root.id, "/root/worker", crate::session::SessionId::new()),
+        ] {
+            assert!(
+                run_service
+                    .interrupt_agent_turn_exact(
+                        forged_root,
+                        forged_path,
+                        forged_child,
+                        child_turn_id,
+                    )
+                    .await
+                    .is_err(),
+                "forged Sub Agent lineage must fail closed"
+            );
+            assert_eq!(
+                store
+                    .session_repo()
+                    .fresh_running_turn_for_session(child.id)
+                    .await
+                    .expect("unchanged child owner"),
+                Some(child_turn_id)
+            );
+        }
+
+        assert!(
+            run_service
+                .interrupt_agent_turn_exact(root.id, "/root/worker", child.id, child_turn_id,)
+                .await
+                .expect("exact child interrupt")
+        );
+        assert_eq!(
+            store
+                .session_repo()
+                .durable_terminal_for_turn(child.id, child_turn_id)
+                .await
+                .expect("exact child terminal")
+                .expect("interrupted child terminal")
+                .outcome,
+            crate::protocol::TurnTerminalOutcome::Interrupted {
+                cause: crate::protocol::TurnInterruptionCause::AgentInterrupted,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_child_goal_reads_are_visible_but_direct_and_slash_mutations_are_rejected() {
+        let config = ResolvedConfig::default();
+        let (run_service, store, workspace, _process_agent_runtime) =
+            run_service_fixture(config.clone()).await;
+        let (_root, child) =
+            retained_child_fixture(&run_service, &store, &workspace, &config).await;
+        store
+            .session_repo()
+            .replace_thread_goal(
+                child.id,
+                "owner-controlled goal",
+                ThreadGoalStatus::Active,
+                None,
+            )
+            .await
+            .expect("child goal");
+        let mut renderer = crate::cli::HumanRenderer::new();
+        let mut prompt = NoPrompt;
+
+        let direct_get = run_service
+            .execute(
+                crate::app::AppCommand::SessionGoalGet(crate::app::SessionGoalGetRequest {
+                    session_id: child.id,
+                }),
+                &mut renderer,
+                &mut prompt,
+            )
+            .await
+            .expect("root-visible goal read");
+        assert!(matches!(
+            direct_get,
+            crate::app::AppCommandOutcome::ControlCompleted
+        ));
+        let slash_get = run_service
+            .execute(
+                crate::app::AppCommand::Run(control_run_request(
+                    config.clone(),
+                    &workspace,
+                    child.id,
+                    "/goal",
+                )),
+                &mut renderer,
+                &mut prompt,
+            )
+            .await
+            .expect("root-visible slash goal read");
+        assert!(matches!(
+            slash_get,
+            crate::app::AppCommandOutcome::ControlCompleted
+        ));
+
+        let direct_set_error = run_service
+            .execute(
+                crate::app::AppCommand::SessionGoalSet(crate::app::SessionGoalSetRequest {
+                    session_id: child.id,
+                    objective: Some("external replacement".to_string()),
+                    status: None,
+                    token_budget: None,
+                }),
+                &mut renderer,
+                &mut prompt,
+            )
+            .await
+            .expect_err("direct child goal mutation requires its agent owner");
+        assert!(
+            direct_set_error
+                .to_string()
+                .contains("have its goal changed")
+        );
+        let slash_clear_error = run_service
+            .execute(
+                crate::app::AppCommand::Run(control_run_request(
+                    config,
+                    &workspace,
+                    child.id,
+                    "/goal clear",
+                )),
+                &mut renderer,
+                &mut prompt,
+            )
+            .await
+            .expect_err("slash child goal mutation requires its agent owner");
+        assert!(
+            slash_clear_error
+                .to_string()
+                .contains("have its goal changed")
+        );
+        assert_eq!(
+            store
+                .session_repo()
+                .get_thread_goal(child.id)
+                .await
+                .expect("retained child goal")
+                .expect("goal remains")
+                .objective,
+            "owner-controlled goal"
+        );
+    }
+
+    #[tokio::test]
     async fn inactive_goal_ends_preclaimed_continuation_without_admission_or_failure() {
         let config = ResolvedConfig::default();
-        let (run_service, store, workspace) = run_service_fixture(config.clone()).await;
+        let (run_service, store, workspace, _process_agent_runtime) =
+            run_service_fixture(config.clone()).await;
         let session = run_service
             .session_service
             .start_or_resume(
@@ -3080,8 +3919,8 @@ mod tests {
             .expect("session");
         let root_scope = crate::runtime::RunControl::new();
         let confirmation = crate::cli::SharedConfirmationPrompt::new(NoPrompt);
-        let first_execution = run_service
-            .agent_runtime
+        let agent_runtime = run_service.agent_runtime().expect("process agent runtime");
+        let first_execution = agent_runtime
             .begin_root(
                 &session,
                 Arc::new(
@@ -3102,20 +3941,19 @@ mod tests {
             .admission_id;
         first_execution
             .context
-            .bind_root_turn_owner(admission_id, turn_id)
+            .bind_durable_turn_owner(admission_id, turn_id)
             .expect("bind durable first-turn owner");
         assert_eq!(
             commit_completed_turn(&store, session.session.id, admission_id, turn_id).await,
             crate::storage::session_repo::AdmittedTerminalCommit::Applied
         );
         assert!(first_execution.run_control().seal_success());
-        run_service.agent_runtime.complete_root(
+        agent_runtime.complete_root(
             first_execution,
             &Ok(successful_run_summary(session.session.id, turn_id)),
             None,
         );
-        let continuation = match run_service
-            .agent_runtime
+        let continuation = match agent_runtime
             .begin_root_continuation(
                 session.session.id,
                 root_scope.clone(),
@@ -3185,9 +4023,7 @@ mod tests {
         assert_eq!(root_scope.cause(), None);
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            run_service
-                .agent_runtime
-                .wait_for_tree_quiescence(session.session.id),
+            agent_runtime.wait_for_tree_quiescence(session.session.id),
         )
         .await
         .expect("bounded tree quiescence wait")
@@ -3239,7 +4075,7 @@ mod tests {
         let wrong_turn_id = crate::protocol::TurnId::new();
         assert_ne!(wrong_turn_id, admitted_turn_id);
         let run_control = crate::runtime::RunControl::new();
-        let error = super::finish_admitted_run(
+        let failure = super::finish_admitted_run(
             &store,
             session_id,
             admission_id,
@@ -3249,8 +4085,12 @@ mod tests {
             Ok(()),
         )
         .await
-        .expect_err("wrong-turn summary must settle the admitted turn as failure");
-        assert!(error.to_string().contains("summary identity mismatch"));
+        .expect("wrong-turn summary must return the admitted turn's durable failure");
+        assert!(matches!(
+            &failure.terminal().outcome,
+            crate::protocol::TurnTerminalOutcome::Failed { error }
+                if error.contains("summary identity mismatch")
+        ));
         assert_eq!(
             store
                 .session_repo()
@@ -3292,8 +4132,6 @@ mod tests {
                 admission_id,
                 &event,
                 turn_id,
-                None,
-                None,
                 None,
                 None,
             )
@@ -3459,7 +4297,7 @@ mod tests {
                 .expect("admission")
                 .expect("admitted")
                 .admission_id;
-            let failure = super::settle_admitted_run_result(
+            let summary = super::settle_admitted_run_result(
                 &store,
                 session.id,
                 admission_id,
@@ -3470,9 +4308,14 @@ mod tests {
                 ))),
             )
             .await
-            .expect_err("setup failure returned");
+            .expect("post-admission setup failure has a typed durable terminal");
 
-            assert!(failure.to_string().contains(setup_stage));
+            assert_eq!(summary.status(), crate::session::SessionStatus::Failed);
+            assert!(matches!(
+                &summary.terminal().outcome,
+                crate::protocol::TurnTerminalOutcome::Failed { error }
+                    if error.contains(setup_stage)
+            ));
             assert_eq!(
                 store
                     .session_repo()
@@ -3492,6 +4335,134 @@ mod tests {
                 "{setup_stage} must release durable admission ownership"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn user_stop_returns_the_durable_interrupted_summary_instead_of_the_unwind_error() {
+        let (store, session_id, admission_id, turn_id) =
+            heartbeat_active_turn_fixture("visible user stop").await;
+        let summary = super::settle_admitted_run_result(
+            &store,
+            session_id,
+            admission_id,
+            turn_id,
+            Some(crate::runtime::RunCancellationCause::Interruption(
+                crate::protocol::TurnInterruptionCause::UserStop,
+            )),
+            Err(crate::error::AppRunError::Message(
+                "run admission no longer owns session after stop".to_string(),
+            )),
+        )
+        .await
+        .expect("the durable interruption is the client-visible result");
+
+        assert_eq!(summary.status(), crate::session::SessionStatus::Cancelled);
+        assert!(matches!(
+            summary.terminal().outcome,
+            crate::protocol::TurnTerminalOutcome::Interrupted {
+                cause: crate::protocol::TurnInterruptionCause::UserStop
+            }
+        ));
+        assert_eq!(
+            store
+                .session_repo()
+                .get_session(session_id)
+                .await
+                .expect("cancelled session")
+                .status,
+            crate::session::SessionStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn preclassified_cancellation_wins_when_the_inner_result_is_already_ready() {
+        let run_control = crate::runtime::RunControl::new();
+        assert!(
+            run_control.interrupt(crate::protocol::TurnInterruptionCause::UserStop),
+            "precondition: cancellation owns the terminal"
+        );
+
+        let result = super::run_admitted_inner_with_cancel_grace(
+            &run_control,
+            std::future::ready(Ok::<_, crate::error::AppRunError>(7_u8)),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an immediately-ready success must not overtake an existing cancellation cause"
+        );
+        assert_eq!(
+            run_control.cause(),
+            Some(crate::runtime::RunCancellationCause::Interruption(
+                crate::protocol::TurnInterruptionCause::UserStop
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn sealed_success_is_not_rewritten_by_a_late_cancellation_request() {
+        let run_control = crate::runtime::RunControl::new();
+        let reservation = run_control
+            .begin_success_commit()
+            .expect("success reservation");
+        assert!(reservation.seal());
+        assert!(!run_control.interrupt(crate::protocol::TurnInterruptionCause::UserStop));
+
+        assert_eq!(
+            super::run_admitted_inner_with_cancel_grace(
+                &run_control,
+                std::future::ready(Ok::<_, crate::error::AppRunError>(11_u8)),
+            )
+            .await
+            .expect("sealed success"),
+            11
+        );
+        assert!(run_control.success_is_sealed());
+    }
+
+    #[tokio::test]
+    async fn noncooperative_inner_is_dropped_before_outer_terminal_settlement_can_begin() {
+        use std::sync::Mutex;
+
+        struct DropOrder(Arc<Mutex<Vec<&'static str>>>);
+        impl Drop for DropOrder {
+            fn drop(&mut self) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push("worker_dropped");
+            }
+        }
+
+        let run_control = crate::runtime::RunControl::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let worker_order = Arc::clone(&order);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let worker_started = Arc::clone(&started);
+        let helper_control = run_control.clone();
+        let helper = tokio::spawn(async move {
+            super::run_admitted_inner_with_cancel_grace(&helper_control, async move {
+                let _drop_order = DropOrder(worker_order);
+                worker_started.notify_one();
+                std::future::pending::<Result<(), crate::error::AppRunError>>().await
+            })
+            .await
+        });
+        started.notified().await;
+        assert!(run_control.interrupt(crate::protocol::TurnInterruptionCause::UserStop));
+        assert!(helper.await.expect("helper task").is_err());
+
+        order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push("durable_terminal");
+        assert_eq!(
+            *order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec!["worker_dropped", "durable_terminal"],
+            "the dropped worker cannot land a later file/tool/storage mutation after terminal truth"
+        );
     }
 
     #[test]
@@ -3534,7 +4505,7 @@ mod tests {
     }
 
     #[test]
-    fn root_operational_error_closes_sibling_admission_before_durable_terminal_settlement() {
+    fn root_operational_error_classifies_only_the_exact_root_turn() {
         let root_scope_control = crate::runtime::RunControl::new();
         let (tree, root_execution) = crate::runtime::AgentControl::with_root_control(
             crate::session::SessionId::new(),
@@ -3557,7 +4528,8 @@ mod tests {
         );
 
         // `finish_admitted_run` invokes this synchronous classifier immediately before its
-        // awaited durable terminal settlement. The whole tree must already be closed on return.
+        // awaited durable terminal settlement. A normal root failure owns only that exact turn;
+        // detached sibling work remains independently live.
         super::classify_run_error(
             &root_turn_control,
             &crate::error::AppRunError::Message(
@@ -3566,14 +4538,14 @@ mod tests {
         );
 
         assert_eq!(root_turn_control.cause(), Some(failure.clone()));
-        assert_eq!(root_scope_control.cause(), Some(failure.clone()));
-        assert_eq!(sibling_control.cause(), Some(failure));
-        assert!(tree.tree_is_cancelled());
-        assert!(sibling_control.begin_tool_effect_admission().is_none());
+        assert_eq!(root_scope_control.cause(), None);
+        assert_eq!(sibling_control.cause(), None);
+        assert!(!tree.tree_is_cancelled());
+        assert!(sibling_control.begin_tool_effect_admission().is_some());
     }
 
     #[test]
-    fn heartbeat_failure_closes_sibling_admission_while_root_effect_is_reserved() {
+    fn heartbeat_failure_waits_for_the_exact_root_effect_without_closing_a_sibling() {
         let root_scope_control = crate::runtime::RunControl::new();
         let (tree, root_execution) = crate::runtime::AgentControl::with_root_control(
             crate::session::SessionId::new(),
@@ -3604,10 +4576,10 @@ mod tests {
         );
 
         assert_eq!(root_turn_control.cause(), None);
-        assert_eq!(root_scope_control.cause(), Some(failure.clone()));
-        assert_eq!(sibling_control.cause(), Some(failure.clone()));
-        assert!(tree.tree_is_cancelled());
-        assert!(sibling_control.begin_tool_effect_admission().is_none());
+        assert_eq!(root_scope_control.cause(), None);
+        assert_eq!(sibling_control.cause(), None);
+        assert!(!tree.tree_is_cancelled());
+        assert!(sibling_control.begin_tool_effect_admission().is_some());
 
         assert_eq!(root_effect.admit(), Err(failure.clone()));
         assert_eq!(root_turn_control.cause(), Some(failure));
@@ -3691,8 +4663,9 @@ mod tests {
         assert!(!run_control.is_cancelled());
         heartbeat_stop.cancel();
         heartbeat_task
+            .expect("heartbeat spawn")
+            .stop_and_wait()
             .await
-            .expect("heartbeat task")
             .expect("heartbeat result");
     }
 
@@ -3726,8 +4699,9 @@ mod tests {
         assert!(!run_control.is_cancelled());
         heartbeat_stop.cancel();
         heartbeat_task
+            .expect("heartbeat spawn")
+            .stop_and_wait()
             .await
-            .expect("heartbeat task")
             .expect("heartbeat result");
     }
 
@@ -3749,8 +4723,6 @@ mod tests {
                     admission_id,
                     &interrupted,
                     turn_id,
-                    None,
-                    None,
                     None,
                     None,
                 )
@@ -3778,6 +4750,47 @@ mod tests {
         assert_eq!(
             run_control.cause(),
             Some(crate::runtime::RunCancellationCause::Superseded)
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_fenced_heartbeat_preserves_the_typed_interruption_without_a_lease_error() {
+        let (store, session_id, admission_id, turn_id) =
+            heartbeat_active_turn_fixture("typed Stop fence heartbeat").await;
+        store
+            .session_repo()
+            .record_agent_tree_stop_fence_for_observed_turn(
+                session_id,
+                crate::protocol::TurnInterruptionCause::UserStop,
+                turn_id,
+            )
+            .await
+            .expect("record Stop fence")
+            .expect("Stop fence");
+        let run_control = crate::runtime::RunControl::new();
+
+        assert!(matches!(
+            super::renew_admitted_run_lease_with_terminal_cancel(
+                store.session_repo(),
+                session_id,
+                admission_id,
+                turn_id,
+                run_control.clone(),
+                None,
+            )
+            .await
+            .expect("typed fenced renewal"),
+            crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::StopFenced(
+                crate::protocol::TurnTerminalOutcome::Interrupted {
+                    cause: crate::protocol::TurnInterruptionCause::UserStop
+                }
+            )
+        ));
+        assert_eq!(
+            run_control.cause(),
+            Some(crate::runtime::RunCancellationCause::Interruption(
+                crate::protocol::TurnInterruptionCause::UserStop
+            ))
         );
     }
 
@@ -3857,15 +4870,16 @@ mod tests {
                     turn_id,
                     None,
                     None,
-                    None,
-                    None,
                 )
                 .await
                 .expect("terminal commit"),
             crate::storage::session_repo::AdmittedTerminalCommit::Applied
         );
         allow_renewal.notify_one();
-        let heartbeat_result = heartbeat_task.await.expect("heartbeat task");
+        let heartbeat_result = heartbeat_task
+            .expect("heartbeat spawn")
+            .stop_and_wait()
+            .await;
         assert!(!run_control.is_cancelled());
         let completed = super::finish_admitted_run(
             &store,
@@ -3924,7 +4938,10 @@ mod tests {
         )
         .await
         .expect("heartbeat error did not cancel the run");
-        let heartbeat_result = heartbeat_task.await.expect("heartbeat task");
+        let heartbeat_result = heartbeat_task
+            .expect("heartbeat spawn")
+            .stop_and_wait()
+            .await;
 
         assert_eq!(
             commit_completed_turn(&store, session_id, admission_id, turn_id).await,
@@ -3992,7 +5009,10 @@ mod tests {
         )
         .await
         .expect("heartbeat panic did not cancel the run");
-        let heartbeat_result = heartbeat_task.await.expect("heartbeat task");
+        let heartbeat_result = heartbeat_task
+            .expect("heartbeat spawn")
+            .stop_and_wait()
+            .await;
 
         let completed = super::finish_admitted_run(
             &store,
@@ -4031,7 +5051,10 @@ mod tests {
         )
         .await
         .expect("storage failure did not cancel the run");
-        let heartbeat_result = heartbeat_task.await.expect("heartbeat task");
+        let heartbeat_result = heartbeat_task
+            .expect("heartbeat spawn")
+            .stop_and_wait()
+            .await;
         let failure = super::finish_admitted_run(
             &store,
             session_id,
@@ -4042,13 +5065,13 @@ mod tests {
             heartbeat_result,
         )
         .await
-        .expect_err("heartbeat storage failure must fail the run");
+        .expect("heartbeat storage failure must return its durable failed terminal");
 
-        assert!(
-            failure
-                .to_string()
-                .contains("injected heartbeat storage error")
-        );
+        assert!(matches!(
+            &failure.terminal().outcome,
+            crate::protocol::TurnTerminalOutcome::Failed { error }
+                if error.contains("injected heartbeat storage error")
+        ));
         assert!(matches!(
             run_control.cause(),
             Some(crate::runtime::RunCancellationCause::Failure(message))
@@ -4105,7 +5128,10 @@ mod tests {
         )
         .await
         .expect("heartbeat panic did not cancel the run");
-        let heartbeat_result = heartbeat_task.await.expect("heartbeat task");
+        let heartbeat_result = heartbeat_task
+            .expect("heartbeat spawn")
+            .stop_and_wait()
+            .await;
         let failure = super::finish_admitted_run(
             &store,
             session_id,
@@ -4116,9 +5142,13 @@ mod tests {
             heartbeat_result,
         )
         .await
-        .expect_err("heartbeat panic must fail the run");
+        .expect("heartbeat panic must return its durable failed terminal");
 
-        assert!(failure.to_string().contains("injected heartbeat panic"));
+        assert!(matches!(
+            &failure.terminal().outcome,
+            crate::protocol::TurnTerminalOutcome::Failed { error }
+                if error.contains("injected heartbeat panic")
+        ));
         assert!(matches!(
             run_control.cause(),
             Some(crate::runtime::RunCancellationCause::Failure(message))

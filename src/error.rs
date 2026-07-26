@@ -68,6 +68,17 @@ pub enum StorageError {
         expected_active_count: usize,
         actual_active_count: usize,
     },
+    #[error("agent concurrency limit reached before scheduling recipient session {session_id}")]
+    AgentCapacityUnavailable {
+        session_id: crate::session::SessionId,
+    },
+    #[error(
+        "durable agent mailbox for recipient session {session_id} reached its {capacity}-message capacity"
+    )]
+    AgentMailboxFull {
+        session_id: crate::session::SessionId,
+        capacity: usize,
+    },
     #[error("{0}")]
     Message(String),
 }

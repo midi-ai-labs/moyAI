@@ -58,9 +58,30 @@ pub fn project_inter_agent_communication(
     sequence_no: i64,
     communication: InterAgentCommunication,
 ) -> ProtocolRunEventProjection {
+    project_inter_agent_communication_with_history_item_id(
+        session_id,
+        turn_id,
+        sequence_no,
+        HistoryItemId::new(),
+        communication,
+    )
+}
+
+/// Projects a mailbox item at its safe delivery boundary while preserving the
+/// stable identity allocated by the durable mailbox owner at enqueue time.
+///
+/// The mailbox item is deliberately not canonical protocol history until this
+/// projection is committed for an exact admitted turn.
+pub fn project_inter_agent_communication_with_history_item_id(
+    session_id: SessionId,
+    turn_id: TurnId,
+    sequence_no: i64,
+    history_item_id: HistoryItemId,
+    communication: InterAgentCommunication,
+) -> ProtocolRunEventProjection {
     let created_at_ms = SystemClock::now_ms();
     let history_item = HistoryItem {
-        id: HistoryItemId::new(),
+        id: history_item_id,
         session_id,
         scope: HistoryScope::Turn { turn_id },
         sequence_no,
@@ -805,5 +826,38 @@ mod tests {
             projection.turn_item.map(|item| item.payload),
             Some(TurnItemPayload::UserMessage { text }) if text == "inspect"
         ));
+    }
+
+    #[test]
+    fn mailbox_delivery_preserves_preallocated_history_identity() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let history_item_id = HistoryItemId::new();
+        let communication = InterAgentCommunication {
+            author: "/root".to_string(),
+            recipient: "/root/worker".to_string(),
+            content: "continue".to_string(),
+            trigger_turn: true,
+        };
+
+        let projection = project_inter_agent_communication_with_history_item_id(
+            session_id,
+            turn_id,
+            0,
+            history_item_id,
+            communication,
+        );
+
+        assert_eq!(
+            projection.history_item.as_ref().map(|item| item.id),
+            Some(history_item_id)
+        );
+        assert_eq!(
+            projection
+                .turn_item
+                .as_ref()
+                .and_then(|item| item.source_item_id),
+            Some(history_item_id)
+        );
     }
 }

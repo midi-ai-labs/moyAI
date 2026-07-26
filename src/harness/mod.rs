@@ -29,5 +29,8 @@ pub use ids::{ArtifactId, ContractId, GateId, HarnessEventId, HarnessRunId};
 pub use replay::{ReplayExecution, ReplayMode, ReplayProfile, ReplayRunInput, ReplayService};
 pub use report::{ReplayReport, ReplayStatus, StateTimeline};
 pub use report_store::{ReplayReportStore, SqliteReplayReportStore};
-pub use run_store::{HarnessRunRecord, HarnessRunStatus, HarnessRunStore, SqliteHarnessRunStore};
+pub use run_store::{
+    HarnessRunRecord, HarnessRunStatus, HarnessRunStore, HarnessTerminalReconciliationPage,
+    MAX_HARNESS_TERMINAL_RECONCILIATION_PAGE_SIZE, SqliteHarnessRunStore,
+};
 pub use runtime_writer::{HarnessRecordingSink, HarnessRecordingStatus, NativeHarnessRecorder};

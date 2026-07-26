@@ -137,6 +137,7 @@ pub struct SessionSpawnEdge {
     pub child_session_id: SessionId,
     pub agent_path: String,
     pub task_name: String,
+    pub spawn_order: u64,
     pub created_at_ms: i64,
 }
 
@@ -642,11 +643,24 @@ pub struct CanonicalRuntimeEventPage {
     pub items: Vec<crate::protocol::RuntimeEvent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingTurnInputProjection {
+    pub id: crate::protocol::HistoryItemId,
+    pub turn_id: TurnId,
+    pub text: String,
+    pub image_count: usize,
+    pub accepted_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_user_message_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalSessionRead {
     pub session: SessionRecord,
     pub history: CanonicalHistoryPage,
     pub turns: CanonicalTurnPage,
+    #[serde(default)]
+    pub pending_turn_inputs: Vec<PendingTurnInputProjection>,
     #[serde(skip)]
     pub turn_elapsed_ms: HashMap<TurnId, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

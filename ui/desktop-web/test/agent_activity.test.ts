@@ -42,6 +42,7 @@ test("agent rows retain spawn order and derive all counts from status", () => {
     agentRow("/root/second", 2, "completed"),
     agentRow("/root/first", 1, "running", true),
     agentRow("/root/pending", 3, "pending_init"),
+    agentRow("/root/waiting", 6, "awaiting_descendants"),
     agentRow("/root/error", 4, "errored"),
     agentRow("/root/interrupted", 5, "interrupted"),
     agentRow("/root/stopped", 7, "shutdown"),
@@ -56,19 +57,20 @@ test("agent rows retain spawn order and derive all counts from status", () => {
       "/root/pending",
       "/root/error",
       "/root/interrupted",
+      "/root/waiting",
       "/root/stopped",
     ],
   );
   assert.deepEqual(rows.map((row) => row.agent_path), originalOrder, "projection rows are not mutated");
   assert.deepEqual(agentActivityCounts(rows), {
-    total: 6,
-    active: 2,
+    total: 7,
+    active: 3,
     completed: 1,
     attention: 2,
     stopped: 1,
     updated: 1,
   });
-  assert.equal(agentActivitySummary(rows, true), "2件作業中 · 1件完了 · 2件要確認 · 1件停止");
+  assert.equal(agentActivitySummary(rows, true), "3件作業中 · 1件完了 · 2件要確認 · 1件停止");
   assert.equal(agentActivitySummary([], true), "Sub Agentを準備中");
 });
 
@@ -108,6 +110,8 @@ test("inline and output renderers show projected activity in spawn order without
   assert.match(inline, /data-focus-key="agent-job:\/root\/first"/);
   assert.match(inline, /class="agent-job-group"[^>]*open/);
   assert.match(inline, /data-details-key="sub-agent-inline-group:active"/);
+  assert.equal(inline.match(/data-action="interrupt-agent"/g)?.length, 1);
+  assert.match(inline, /data-action="interrupt-agent" data-agent-path="\/root\/first"/);
   assert.match(inline, /class="agent-job-card[^>]+agent-status-completed/);
   assert.match(inline, /aria-controls="sub-agent-inspector" aria-expanded="false"/);
   assert.match(inline, /実装を完了 詳細/);
@@ -129,6 +133,7 @@ test("inline and output renderers show projected activity in spawn order without
   const output = renderAgentInspector(state, null);
   assert.ok(output.indexOf("sub-agent-card:/root/first") < output.indexOf("sub-agent-card:/root/later"));
   assert.match(output, /data-focus-key="sub-agent-card:\/root\/first"/);
+  assert.equal(output.match(/data-action="interrupt-agent"/g)?.length, 1);
   assert.match(output, /実装を完了/);
   assert.doesNotMatch(output, /INTERNAL_CHAIN_OF_THOUGHT/);
   assert.equal(renderInlineAgentActivity({ agent_tree_active: false, agent_activity_rows: [] } as DesktopWebState), "");
@@ -144,7 +149,7 @@ test("terminal inline activity keeps individual stable-icon jobs inside a collap
   assert.match(inline, /class="agent-job-group"/);
   assert.match(inline, /data-details-key="sub-agent-inline-group:terminal"/);
   assert.doesNotMatch(inline, /class="agent-job-group"[^>]*open/);
-  assert.equal(inline.match(/class="agent-job-card/g)?.length, 2);
+  assert.equal(inline.match(/<button type="button" class="agent-job-card\b/g)?.length, 2);
   assert.match(inline, /data-agent-path="\/root\/first"/);
   assert.match(inline, /data-agent-path="\/root\/second"/);
   assert.match(inline, /完了しました/);
@@ -220,6 +225,11 @@ test("agent inspector separates ordered list and selected execution detail", () 
   assert.ok(list.indexOf('id="sub-agent-group-attention"') < list.indexOf('id="sub-agent-group-completed"'));
   assert.ok(list.indexOf("/root/completed-first") < list.indexOf("/root/completed-later"));
   assert.match(list, /data-action="show-agent-pane" data-agent-path="\/root\/completed-later"/);
+  assert.equal(list.match(/data-action="interrupt-agent"/g)?.length, 1);
+  assert.match(list, /data-action="interrupt-agent" data-agent-path="\/root\/active"/);
+
+  const activeDetail = renderAgentInspector(state, "/root/active");
+  assert.match(activeDetail, /data-action="interrupt-agent" data-agent-path="\/root\/active"/);
 
   const projection = executionProjection(completedLater, [{
     row_kind: "assistant",
@@ -670,31 +680,55 @@ test("permission actions send typed approve and abort decisions", async () => {
   assert.deepEqual(decisions, ["approved", "abort"]);
 });
 
-test("run cancellation remains available while only the child agent tree is active and carries its owner", async () => {
+test("ordinary Stop remains root-only while exact child interrupt carries lineage and turn", async () => {
   assert.equal(runCanBeCancelled({ can_cancel_run: false }), false);
   assert.equal(runCanBeCancelled({ can_cancel_run: true }), true);
   assert.equal(runSurfaceActive({ busy: false, agent_tree_active: true }), true);
   assert.equal(runSurfaceActive({ busy: false, agent_tree_active: false }), false);
 
-  const expectedTarget = {
-    workspacePath: "C:/workspace",
-    sessionId: "root-session",
-    runtimeOwnerToken: "tree:17",
-  };
+  const row = agentRow("/root/review", 1, "running");
   let dispatched: { name: string; args?: Record<string, unknown> } | null = null;
-  await actionById("cancel-run")?.run(
-    { can_cancel_run: true, run_target: expectedTarget } as DesktopWebState,
+  await actionById("interrupt-agent")?.run(
+    {
+      workspace_path: "C:/workspace",
+      draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: 1 },
+      agent_activity_rows: [row],
+    } as DesktopWebState,
     {
       mutate: async (name: string, args?: Record<string, unknown>) => {
         dispatched = { name, args };
       },
     } as unknown as ActionContext,
-    { index: -1, value: "" },
+    { index: -1, value: row.agent_path },
   );
   assert.deepEqual(dispatched, {
-    name: "cancel_run",
-    args: { expectedTarget },
+    name: "interrupt_agent",
+    args: {
+      expectedTarget: {
+        workspacePath: "C:/workspace",
+        rootSessionId: "root-session",
+        agentPath: "/root/review",
+        childSessionId: "session-1",
+        expectedTurnId: "turn-1",
+      },
+    },
   });
+
+  dispatched = null;
+  await actionById("interrupt-agent")?.run(
+    {
+      workspace_path: "C:/workspace",
+      draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: 1 },
+      agent_activity_rows: [{ ...row, active_turn_id: null, can_interrupt: false }],
+    } as DesktopWebState,
+    {
+      mutate: async (name: string, args?: Record<string, unknown>) => {
+        dispatched = { name, args };
+      },
+    } as unknown as ActionContext,
+    { index: -1, value: row.agent_path },
+  );
+  assert.equal(dispatched, null, "a row without an exact active turn must not dispatch interrupt");
 });
 
 function agentRow(
@@ -713,6 +747,8 @@ function agentRow(
     result_preview: "",
     started_order: startedOrder,
     updated,
+    active_turn_id: status === "running" ? `turn-${startedOrder}` : null,
+    can_interrupt: status === "running",
   };
 }
 

@@ -26,6 +26,10 @@ pub struct ApplyPatchInput {
     pub patch_text: String,
 }
 
+const APPLY_PATCH_DESCRIPTION: &str = "Apply a structured patch to one or more files using the exact `*** Begin Patch` / `*** End Patch` grammar. For an existing file, use `*** Update File: path`, then `@@`, and prefix every hunk body line with one space for unchanged context, `-` for deletion, or `+` for insertion. Update hunks are matched against the current UTF-8 file contents; if context does not match, read the relevant range and regenerate the hunk. A bare `@@` hunk containing only `+` lines is a context-free full-file replacement and still requires a current full-content write baseline. For a new file, use `*** Add File: path` and prefix every content line with `+`; delete with `*** Delete File: path`. Use only one content-changing section per path in a call and group multiple edits as `@@` hunks in that section. After a successful write/apply_patch, the resulting file contents become the current edit baseline unless another tool changes the file.";
+
+const APPLY_PATCH_TEXT_DESCRIPTION: &str = "Entire patch text. It must start with `*** Begin Patch` and end with `*** End Patch`. Update example: `*** Begin Patch\n*** Update File: a.txt\n@@\n unchanged\n-before\n+after\n*** End Patch`; the leading space before `unchanged` is required. For updates, every hunk body line starts with space (context), `-` (delete), or `+` (insert). Use one `*** Update File` section per path and put multiple edits in multiple `@@` hunks. An optional `*** Move to: new-path` goes immediately after the Update header. For new files, use `*** Add File: path` and prefix every added line with `+`, including blank lines and top-level code or declaration lines. Delete with `*** Delete File: path`. Do not include unified diff file markers such as `---` or `+++`.";
+
 #[derive(Debug, Default)]
 pub struct ApplyPatchTool;
 
@@ -35,14 +39,14 @@ impl Tool for ApplyPatchTool {
         ToolSpec {
             name: ToolName::ApplyPatch,
             effect: crate::tool::ToolEffectPolicy::mutation(),
-            description: "Apply a structured patch to one or more files using the exact `*** Begin Patch` / `*** End Patch` grammar. Read an existing file before the first `*** Update File` or `*** Delete File` operation in this session. After a successful write/apply_patch, the resulting file contents become the current edit baseline unless another tool changes the file.",
+            description: APPLY_PATCH_DESCRIPTION,
             input_schema: json!({
                 "type": "object",
                 "required": ["patch_text"],
                 "properties": {
                     "patch_text": {
                         "type": "string",
-                        "description": "Entire patch text. Must start with `*** Begin Patch` and end with `*** End Patch`. For new files, use `*** Add File: path` and prefix every added line with `+`, including blank lines and top-level code or declaration lines. Do not use unified diff markers like `---` or `+++`."
+                        "description": APPLY_PATCH_TEXT_DESCRIPTION
                     }
                 }
             }),
@@ -945,11 +949,13 @@ async fn classify_patch_operations_before_side_effects(
                     &guarded,
                     ctx.config.file_guard.max_inline_read_bytes,
                 )?;
-                ctx.services.edit_safety.assert_fresh_write(
-                    ctx.session.session.id,
-                    &source_path,
-                    &source_identity,
-                )?;
+                if PatchParser::has_context_free_replacement(hunks) {
+                    ctx.services.edit_safety.assert_fresh_write(
+                        ctx.session.session.id,
+                        &source_path,
+                        &source_identity,
+                    )?;
+                }
                 let patched = PatchParser::apply_to_text(&original, hunks)
                     .map_err(|error| crate::error::EditError::Message(error.to_string()))?;
                 let normalized = ctx.services.formatter.normalize_text(
@@ -994,11 +1000,6 @@ async fn classify_patch_operations_before_side_effects(
                 let (original, identity) = read_text_file_with_identity(
                     &guarded,
                     ctx.config.file_guard.max_inline_read_bytes,
-                )?;
-                ctx.services.edit_safety.assert_fresh_write(
-                    ctx.session.session.id,
-                    &guarded.absolute,
-                    &identity,
                 )?;
                 planned_operations.push(AdmittedPatchOperation::Delete {
                     path: guarded.absolute,
@@ -1360,7 +1361,7 @@ fn claim_apply_patch_participant(
 ) -> Result<(), ToolError> {
     if owned_participants.iter().any(|owned| owned == path) {
         return Err(ToolError::from(crate::error::EditError::Message(format!(
-            "path `{path}` has multiple content-changing owners in one apply_patch invocation ({operation_name})"
+            "path `{path}` has multiple content-changing sections in one apply_patch invocation ({operation_name}); use one Add/Update/Delete section for that path and group multiple updates as `@@` hunks"
         ))));
     }
     if owned_participants.len() >= MAX_APPLY_PATCH_PARTICIPANTS {
@@ -1468,24 +1469,45 @@ mod tests {
     use camino::Utf8PathBuf;
     use std::sync::{Arc, Barrier};
 
+    use crate::cli::ConfirmationPrompt;
     use crate::config::{AccessMode, FormatConfig, FormatterRule, NewlineStyle};
     use crate::edit::{
         CommittedFileMutation, EditSafety, Formatter, FormatterExecutionOptions, PatchOperation,
-        read_file_with_identity,
+        PatchParser, read_file_with_identity,
     };
-    use crate::protocol::TurnInterruptionCause;
+    use crate::protocol::{ModelResponseId, ReviewDecision, TurnId, TurnInterruptionCause};
     use crate::runtime::{RunCancelOutcome, RunCancellationCause, RunControl};
-    use crate::session::SessionId;
-    use crate::tool::context::{
-        ToolEffectAdmission, ToolFormatterPlan, access_mode_allows_permission,
+    use crate::session::{
+        NewSession, ProjectId, ProjectRepository, SessionContext, SessionId, SessionRepository,
+        ToolCallId,
     };
+    use crate::storage::session_repo::{ModelResponseWrite, PendingToolCallWrite};
+    use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
+    use crate::tool::context::{
+        RunMutationFence, ToolContext, ToolEffectAdmission, ToolFormatterPlan, ToolServices,
+        access_mode_allows_permission,
+    };
+    use crate::tool::registry::Tool;
+    use crate::tool::truncate::ToolTruncator;
     use crate::workspace::{AccessKind, PathGuard, Workspace, WorkspaceDiscovery};
 
     use super::{
-        CommittedFileState, FileRollbackState, PatchMutation, apply_patch_mutations,
-        build_patch_permission_admission, committed_file_mutations, restore_file_state,
-        validate_patch_formatter_plan_target,
+        APPLY_PATCH_TEXT_DESCRIPTION, ApplyPatchTool, CommittedFileState, FileRollbackState,
+        PatchMutation, apply_patch_mutations, build_patch_permission_admission,
+        committed_file_mutations, restore_file_state, validate_patch_formatter_plan_target,
     };
+
+    #[derive(Default)]
+    struct AllowPrompt;
+
+    impl ConfirmationPrompt for AllowPrompt {
+        fn confirm(
+            &mut self,
+            _request: &crate::tool::PermissionRequest,
+        ) -> Result<ReviewDecision, crate::error::CliPromptError> {
+            Ok(ReviewDecision::Approved)
+        }
+    }
 
     fn test_workspace(root: &camino::Utf8Path) -> Workspace {
         WorkspaceDiscovery::discover_fixed_root(root, &crate::config::ResolvedConfig::default())
@@ -1521,6 +1543,241 @@ mod tests {
             max_output_bytes: 1_024,
             cancel: control.token(),
         }
+    }
+
+    #[test]
+    fn tool_spec_teaches_a_parseable_update_hunk() {
+        let spec = ApplyPatchTool.spec();
+        let description = spec
+            .input_schema
+            .pointer("/properties/patch_text/description")
+            .and_then(serde_json::Value::as_str)
+            .expect("patch text description");
+        assert_eq!(description, APPLY_PATCH_TEXT_DESCRIPTION);
+        for required in [
+            "*** Update File: a.txt",
+            "@@",
+            "space (context)",
+            "`-` (delete)",
+            "`+` (insert)",
+            "one `*** Update File` section per path",
+            "*** Move to: new-path",
+            "*** Delete File: path",
+        ] {
+            assert!(
+                description.contains(required),
+                "apply_patch schema omitted `{required}`"
+            );
+        }
+        let tool_description = spec.description;
+        assert!(tool_description.contains("current UTF-8 file contents"));
+        assert!(tool_description.contains("read the relevant range"));
+        assert!(tool_description.contains("context-free full-file replacement"));
+        assert!(!tool_description.contains("Read an existing file before"));
+
+        let advertised = "*** Begin Patch\n*** Update File: a.txt\n@@\n unchanged\n-before\n+after\n*** End Patch";
+        PatchParser::parse(advertised).expect("advertised update example must remain parseable");
+    }
+
+    #[tokio::test]
+    async fn large_targeted_update_and_delete_do_not_require_a_full_content_write_baseline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root =
+            Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data dir");
+        std::fs::create_dir_all(&root).expect("workspace directory");
+        std::fs::create_dir_all(&data_dir).expect("data directory");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir: data_dir.clone(),
+        };
+        let sqlite = SqliteStore::open(&paths).expect("store");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &root, "large targeted patch", "none")
+            .await
+            .expect("project");
+        let session = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id,
+                title: "large targeted patch".to_string(),
+                cwd: root.clone(),
+                model: "model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+                access_mode: AccessMode::Default,
+            })
+            .await
+            .expect("session");
+        let config = crate::config::ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let session = SessionContext { session, workspace };
+        let services = ToolServices {
+            edit_safety: EditSafety::default(),
+            formatter: Formatter::new(config.format.clone()),
+            change_tracker: crate::edit::ChangeTracker,
+            store: store.clone(),
+            storage_paths: paths,
+            truncator: ToolTruncator,
+            mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
+            skills: crate::skill::SkillsService::new(),
+        };
+        let large_path = root.join("large.txt");
+        let deleted_path = root.join("obsolete.txt");
+        let mut large_contents = (0..3_000)
+            .map(|index| format!("line-{index:04}-{}", "x".repeat(24)))
+            .collect::<Vec<_>>();
+        large_contents[1_500] = "target-marker".to_string();
+        std::fs::write(&large_path, format!("{}\n", large_contents.join("\n")))
+            .expect("large source");
+        std::fs::write(&deleted_path, "obsolete\n").expect("deleted source");
+        assert!(
+            std::fs::metadata(&large_path)
+                .expect("large metadata")
+                .len()
+                > config.tool_output.max_bytes as u64
+        );
+        assert!(
+            services
+                .edit_safety
+                .get_stamp(session.session.id, &large_path)
+                .is_none()
+        );
+        assert!(
+            services
+                .edit_safety
+                .get_stamp(session.session.id, &deleted_path)
+                .is_none()
+        );
+
+        let control = RunControl::new();
+        let turn_id = TurnId::new();
+        let admission_id = store
+            .session_repo()
+            .admit_session_turn(session.session.id, turn_id)
+            .await
+            .expect("run admission")
+            .expect("fresh session must admit")
+            .admission_id;
+        let mutation_fence = RunMutationFence::new(
+            store.session_repo(),
+            session.session.id,
+            admission_id,
+            turn_id,
+            control.clone(),
+        );
+        let mut prompt = AllowPrompt;
+        let error = ApplyPatchTool
+            .execute(
+                serde_json::json!({
+                    "patch_text": "*** Begin Patch\n*** Update File: large.txt\n@@\n+replacement-only\n*** End Patch"
+                }),
+                ToolContext {
+                    session: &session,
+                    workspace: &session.workspace,
+                    config: &config,
+                    tool_call_id: ToolCallId::new(),
+                    cancel: control.token(),
+                    run_control: control.clone(),
+                    run_mutation_fence: mutation_fence.clone(),
+                    prompt: &mut prompt,
+                    services: &services,
+                    agent: None,
+                    permission_guardian: None,
+                },
+            )
+            .await
+            .expect_err("context-free full replacement still requires a current baseline");
+        assert!(
+            error
+                .to_string()
+                .contains("no full-content write baseline exists")
+        );
+
+        let targeted_patch = "*** Begin Patch\n*** Update File: large.txt\n@@\n-target-marker\n+replacement-marker\n*** Delete File: obsolete.txt\n*** End Patch";
+        let tool_call_id = ToolCallId::new();
+        store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session.session.id,
+                admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id: ModelResponseId::new(),
+                    assistant_text: None,
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: vec![PendingToolCallWrite {
+                        id: tool_call_id,
+                        model_call_id: "large-targeted-patch".to_string(),
+                        tool_name: "apply_patch".to_string(),
+                        arguments_json: serde_json::json!({
+                            "patch_text": targeted_patch
+                        })
+                        .to_string(),
+                        protocol_sequence_no: None,
+                    }],
+                },
+            )
+            .await
+            .expect("persist pending tool call");
+        let result = ApplyPatchTool
+            .execute(
+                serde_json::json!({
+                    "patch_text": targeted_patch
+                }),
+                ToolContext {
+                    session: &session,
+                    workspace: &session.workspace,
+                    config: &config,
+                    tool_call_id,
+                    cancel: control.token(),
+                    run_control: control.clone(),
+                    run_mutation_fence: mutation_fence,
+                    prompt: &mut prompt,
+                    services: &services,
+                    agent: None,
+                    permission_guardian: None,
+                },
+            )
+            .await
+            .expect("targeted update/delete through the public tool path");
+
+        assert_eq!(result.recorded_changes.len(), 2);
+        assert_eq!(result.change_summaries.len(), 2);
+        assert_eq!(
+            result.change_summaries[0].kind,
+            crate::session::ChangeKind::Update
+        );
+        assert_eq!(
+            result.change_summaries[1].kind,
+            crate::session::ChangeKind::Delete
+        );
+        let current = std::fs::read_to_string(&large_path).expect("patched source");
+        large_contents[1_500] = "replacement-marker".to_string();
+        assert_eq!(
+            current.lines().map(str::to_owned).collect::<Vec<_>>(),
+            large_contents
+        );
+        assert_eq!(current.lines().count(), 3_000);
+        assert!(current.starts_with("line-0000-"));
+        assert!(
+            current
+                .lines()
+                .last()
+                .is_some_and(|line| line.starts_with("line-2999-"))
+        );
+        assert!(!deleted_path.exists());
+        assert!(
+            services
+                .edit_safety
+                .get_stamp(session.session.id, &large_path)
+                .is_some(),
+            "successful public apply_patch must synchronize the typed mutation baseline"
+        );
     }
 
     #[cfg(windows)]
@@ -2096,6 +2353,19 @@ mod tests {
                 .to_string()
                 .contains("split the patch before any mutation")
         );
+    }
+
+    #[test]
+    fn duplicate_patch_participant_feedback_explains_hunk_grouping() {
+        let path = camino::Utf8Path::new("target.txt");
+        let mut participants = Vec::new();
+        super::claim_apply_patch_participant(&mut participants, path, "update")
+            .expect("first section owns the path");
+        let error = super::claim_apply_patch_participant(&mut participants, path, "update")
+            .expect_err("second content-changing section must fail");
+        let message = error.to_string();
+        assert!(message.contains("use one Add/Update/Delete section"));
+        assert!(message.contains("group multiple updates as `@@` hunks"));
     }
 
     #[test]

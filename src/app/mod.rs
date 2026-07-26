@@ -8,6 +8,7 @@ pub use agent_runtime::{
     AgentActivityRecord, AgentForkTurns, AgentRunContext, AgentRuntime, AgentWaitResult,
 };
 pub use bootstrap::AppBootstrap;
+pub(crate) use command::AppProcessRuntime;
 pub use command::{
     App, AppCommand, ReviewRequest, RunConfigInput, RunRequest, RunSessionAccessModeAdoption,
     SessionArchiveRequest, SessionEventsRequest, SessionForkRequest, SessionGoalClearRequest,

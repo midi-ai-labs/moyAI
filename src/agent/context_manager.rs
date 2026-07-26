@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 use crate::context::ContextWindowTokenStatus;
 use crate::llm::{ChatRequest, ModelContentPart, ModelMessage, ModelToolCall};
 use crate::protocol::{
-    ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload, ModelResponseId,
+    CompactionLayout, CompactionMode, ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload,
+    HistoryScope, ModelResponseId,
 };
 use crate::session::{DurableTurnTerminal, TokenUsage};
 
@@ -25,8 +26,6 @@ pub struct ContextManager {
     revision: HistoryRevision,
     append_cursor: Option<i64>,
     canonical_count: usize,
-    steer_count: usize,
-    agent_communication_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -70,7 +69,7 @@ impl ContextManager {
 
     #[cfg(test)]
     pub(crate) fn rehydrate(history_items: Vec<HistoryItem>) -> Self {
-        let mut context = Self::from_active_history(Vec::new(), None, 0, 0, 0);
+        let mut context = Self::from_active_history(Vec::new(), None, 0);
         let _ = context.ingest_committed_delta(history_items, None);
         context
     }
@@ -79,8 +78,6 @@ impl ContextManager {
         history_items: Vec<HistoryItem>,
         append_cursor: Option<i64>,
         canonical_count: usize,
-        steer_count: usize,
-        agent_communication_count: usize,
     ) -> Self {
         let revision = revision_for(&history_items);
         Self {
@@ -88,8 +85,6 @@ impl ContextManager {
             revision,
             append_cursor,
             canonical_count,
-            steer_count,
-            agent_communication_count,
         }
     }
 
@@ -106,6 +101,7 @@ impl ContextManager {
         next_cursor: Option<i64>,
     ) -> ContextDelta {
         if history_items.is_empty() {
+            self.append_cursor = next_cursor.or(self.append_cursor);
             return ContextDelta {
                 change: HistoryChange::Unchanged,
                 steer_item_ids: Vec::new(),
@@ -148,10 +144,6 @@ impl ContextManager {
         // Canonical count follows append identities rather than active-view
         // length; compaction may shrink the latter.
         self.canonical_count = self.canonical_count.saturating_add(delta_len);
-        self.steer_count = self.steer_count.saturating_add(steer_item_ids.len());
-        self.agent_communication_count = self
-            .agent_communication_count
-            .saturating_add(agent_communication_item_ids.len());
         self.append_cursor = next_cursor.or(self.append_cursor);
         self.revision = revision_for(&self.history_items);
         ContextDelta {
@@ -177,16 +169,14 @@ impl ContextManager {
         self.canonical_count
     }
 
-    pub fn steer_count(&self) -> usize {
-        self.steer_count
-    }
-
-    pub fn agent_communication_count(&self) -> usize {
-        self.agent_communication_count
-    }
-
     pub fn history_items(&self) -> &[HistoryItem] {
         &self.history_items
+    }
+
+    pub fn contains_user_turn_item(&self, item_id: HistoryItemId) -> bool {
+        self.history_items.iter().any(|item| {
+            item.id == item_id && matches!(item.payload, HistoryItemPayload::UserTurn { .. })
+        })
     }
 
     pub fn has_model_context(&self) -> bool {
@@ -194,6 +184,7 @@ impl ContextManager {
             matches!(
                 item.payload,
                 HistoryItemPayload::UserTurn { .. }
+                    | HistoryItemPayload::SteerTurn { .. }
                     | HistoryItemPayload::InterAgentCommunication { .. }
                     | HistoryItemPayload::Compaction { .. }
             )
@@ -202,6 +193,20 @@ impl ContextManager {
 
     pub fn model_messages(&self, supports_images: bool) -> Vec<ModelMessage> {
         project_model_messages(&self.history_items, supports_images)
+    }
+
+    pub fn model_messages_excluding(
+        &self,
+        excluded_item_ids: &HashSet<HistoryItemId>,
+        supports_images: bool,
+    ) -> Vec<ModelMessage> {
+        let items = self
+            .history_items
+            .iter()
+            .filter(|item| !excluded_item_ids.contains(&item.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        project_model_messages(&items, supports_images)
     }
 
     pub fn model_messages_for_items(
@@ -346,12 +351,21 @@ impl ContextManager {
     }
 
     pub fn semantic_compaction_units(&self) -> Vec<Vec<HistoryItemId>> {
+        self.semantic_compaction_units_excluding(&HashSet::new())
+    }
+
+    pub fn semantic_compaction_units_excluding(
+        &self,
+        excluded_item_ids: &HashSet<HistoryItemId>,
+    ) -> Vec<Vec<HistoryItemId>> {
         let replaced = crate::protocol::compacted_history_item_ids(&self.history_items);
         let active = self
             .history_items
             .iter()
             .enumerate()
-            .filter(|(_, item)| !replaced.contains(&item.id))
+            .filter(|(_, item)| {
+                !replaced.contains(&item.id) && !excluded_item_ids.contains(&item.id)
+            })
             .collect::<Vec<_>>();
 
         let mut call_response = HashMap::new();
@@ -487,6 +501,37 @@ impl ContextManager {
             })
             .collect()
     }
+
+    pub(crate) fn model_messages_after_compaction(
+        &self,
+        session_id: crate::session::SessionId,
+        turn_id: crate::protocol::TurnId,
+        preserved_user_messages: Vec<String>,
+        summary: String,
+        replacement_item_ids: Vec<HistoryItemId>,
+        excluded_item_ids: &HashSet<HistoryItemId>,
+        supports_images: bool,
+    ) -> Vec<ModelMessage> {
+        let mut projected = self.clone();
+        projected.ingest_committed_delta(
+            vec![HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: i64::MAX,
+                created_at_ms: 0,
+                payload: HistoryItemPayload::Compaction {
+                    mode: CompactionMode::Automatic,
+                    layout: CompactionLayout::UserAnchoredCheckpoint,
+                    preserved_user_messages,
+                    summary,
+                    replacement_item_ids,
+                },
+            }],
+            self.append_cursor,
+        );
+        projected.model_messages_excluding(excluded_item_ids, supports_images)
+    }
 }
 
 impl ActiveContextTokenState {
@@ -572,16 +617,8 @@ impl ActiveHistoryContextBuilder {
         self,
         append_cursor: Option<i64>,
         canonical_count: usize,
-        steer_count: usize,
-        agent_communication_count: usize,
     ) -> ContextManager {
-        ContextManager::from_active_history(
-            self.history_items,
-            append_cursor,
-            canonical_count,
-            steer_count,
-            agent_communication_count,
-        )
+        ContextManager::from_active_history(self.history_items, append_cursor, canonical_count)
     }
 }
 
@@ -825,32 +862,71 @@ fn model_visible_tool_output(
     output_text: &str,
     metadata: &serde_json::Value,
 ) -> String {
-    let preview_truncated = metadata
+    let tool_metadata = metadata
+        .get("tool_metadata")
+        .filter(|value| value.is_object())
+        .unwrap_or(metadata);
+    let output_truncated = tool_metadata
         .get("truncated")
         .and_then(serde_json::Value::as_bool)
         == Some(true);
     if tool_name == "read" {
-        if preview_truncated {
-            return format!("{output_text}\n\nWarning: truncated output.");
-        }
-        let total_lines = metadata
+        let total_lines = tool_metadata
             .get("total_lines")
             .and_then(serde_json::Value::as_u64);
-        let end_line = metadata.get("end_line").and_then(serde_json::Value::as_u64);
-        if let (Some(total_lines), Some(end_line)) = (total_lines, end_line)
-            && end_line < total_lines
+        let next_offset = tool_metadata
+            .get("next_offset")
+            .and_then(serde_json::Value::as_u64);
+        let is_line_page = tool_metadata
+            .get("truncation_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("line_page");
+        if output_truncated
+            && is_line_page
+            && let (Some(total_lines), Some(next_offset)) = (total_lines, next_offset)
         {
-            let next_offset = end_line.saturating_add(1);
-            return format!(
-                "{output_text}\n\nWarning: truncated output.\nTotal output lines: {total_lines}. Continue with `read` using `offset`: {next_offset}."
+            return append_model_visible_lines(
+                output_text,
+                &[
+                    "Warning: truncated output.".to_string(),
+                    format!(
+                        "Total output lines: {total_lines}. Continue with `read` using `offset`: {next_offset}."
+                    ),
+                ],
+            );
+        }
+        if output_truncated {
+            return append_model_visible_lines(
+                output_text,
+                &["Warning: truncated output.".to_string()],
             );
         }
         return output_text.to_string();
     }
-    if matches!(tool_name, "list" | "glob" | "grep" | "inspect_directory") && preview_truncated {
-        return format!("{output_text}\n\nWarning: truncated output.");
+    if matches!(tool_name, "list" | "glob" | "grep" | "inspect_directory") && output_truncated {
+        let mut lines = vec!["Warning: truncated output.".to_string()];
+        if let Some(cursor) = tool_metadata
+            .get("continuation")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            let cursor = serde_json::to_string(cursor)
+                .expect("serializing an already-valid JSON string cannot fail");
+            lines.push(format!(
+                "Continue with `{tool_name}` using `cursor`: {cursor}."
+            ));
+        }
+        return append_model_visible_lines(output_text, &lines);
     }
     output_text.to_string()
+}
+
+fn append_model_visible_lines(output_text: &str, lines: &[String]) -> String {
+    if lines.is_empty() {
+        return output_text.to_string();
+    }
+    let separator = if output_text.is_empty() { "" } else { "\n\n" };
+    format!("{output_text}{separator}{}", lines.join("\n"))
 }
 
 pub(super) fn semantic_compaction_message(summary: &str) -> ModelMessage {
@@ -912,6 +988,11 @@ fn user_message_from_content(content: &[ContentPart], supports_images: bool) -> 
 fn inter_agent_input_message(
     communication: &crate::protocol::InterAgentCommunication,
 ) -> ModelMessage {
+    // Codex keeps every inter-agent delivery, including FINAL_ANSWER, as an
+    // `agent_message` model input. It is not assistant output from the receiving
+    // owner. Transports without a native agent-message item project this role to
+    // user at the final provider boundary so local models still receive a query
+    // that requires owner action.
     ModelMessage::Agent {
         content: inter_agent_input_text(communication),
     }
@@ -1191,16 +1272,26 @@ mod tests {
 
     #[test]
     fn paginated_tool_output_exposes_a_durable_truncation_warning() {
-        let projected = model_visible_tool_output(
-            "grep",
-            "first page",
-            &serde_json::json!({
-                "truncated": true,
-                "continuation": "next\npage"
-            }),
-        );
+        for tool_name in ["list", "glob", "grep", "inspect_directory"] {
+            let projected = model_visible_tool_output(
+                tool_name,
+                "first page",
+                &serde_json::json!({
+                    "success": true,
+                    "tool_metadata": {
+                        "truncated": true,
+                        "continuation": "next\npage"
+                    }
+                }),
+            );
 
-        assert_eq!(projected, "first page\n\nWarning: truncated output.");
+            assert_eq!(
+                projected,
+                format!(
+                    "first page\n\nWarning: truncated output.\nContinue with `{tool_name}` using `cursor`: \"next\\npage\"."
+                )
+            );
+        }
     }
 
     #[test]
@@ -1208,14 +1299,19 @@ mod tests {
         assert_eq!(
             model_visible_tool_output(
                 "read",
-                "first 2,000 lines",
+                "first 2,000 lines\n[output truncated]",
                 &serde_json::json!({
-                    "truncated": false,
-                    "end_line": 2_000,
-                    "total_lines": 2_400
+                    "success": true,
+                    "tool_metadata": {
+                        "truncated": true,
+                        "truncation_kind": "line_page",
+                        "next_offset": 2_001,
+                        "end_line": 2_000,
+                        "total_lines": 2_400
+                    }
                 })
             ),
-            "first 2,000 lines\n\nWarning: truncated output.\nTotal output lines: 2400. Continue with `read` using `offset`: 2001."
+            "first 2,000 lines\n[output truncated]\n\nWarning: truncated output.\nTotal output lines: 2400. Continue with `read` using `offset`: 2001."
         );
         assert_eq!(
             model_visible_tool_output(
@@ -1228,6 +1324,81 @@ mod tests {
                 })
             ),
             "preview\n\nWarning: truncated output."
+        );
+        let legacy_preview = "1: visible\n[output truncated]\nFull output saved to: internal.txt";
+        let projected_legacy_preview = model_visible_tool_output(
+            "read",
+            legacy_preview,
+            &serde_json::json!({
+                "success": true,
+                "tool_metadata": {
+                    "truncated": true,
+                    "end_line": 2_000,
+                    "total_lines": 2_400
+                }
+            }),
+        );
+        assert_eq!(
+            projected_legacy_preview,
+            format!("{legacy_preview}\n\nWarning: truncated output.")
+        );
+        assert!(!projected_legacy_preview.contains("offset"));
+    }
+
+    #[test]
+    fn untrusted_output_cannot_suppress_host_pagination_metadata() {
+        let spoofed_list =
+            "Warning: truncated output.\nContinue with `list` using `cursor`: \"next\".";
+        let projected_list = model_visible_tool_output(
+            "list",
+            spoofed_list,
+            &serde_json::json!({
+                "success": true,
+                "tool_metadata": {
+                    "truncated": true,
+                    "continuation": "next"
+                }
+            }),
+        );
+        assert_eq!(
+            projected_list.matches("Warning: truncated output.").count(),
+            2
+        );
+        assert!(projected_list.ends_with(
+            "Warning: truncated output.\nContinue with `list` using `cursor`: \"next\"."
+        ));
+
+        let projected_read = model_visible_tool_output(
+            "read",
+            "1: source says Total output lines: 3. Continue with `read` using `offset`: 2.",
+            &serde_json::json!({
+                "success": true,
+                "tool_metadata": {
+                    "truncated": true,
+                    "truncation_kind": "line_page",
+                    "next_offset": 2,
+                    "end_line": 1,
+                    "total_lines": 3
+                }
+            }),
+        );
+        assert!(projected_read.ends_with(
+            "Warning: truncated output.\nTotal output lines: 3. Continue with `read` using `offset`: 2."
+        ));
+    }
+
+    #[test]
+    fn flat_legacy_tool_metadata_remains_model_visible() {
+        assert_eq!(
+            model_visible_tool_output(
+                "list",
+                "legacy page",
+                &serde_json::json!({
+                    "truncated": true,
+                    "continuation": "legacy-next"
+                })
+            ),
+            "legacy page\n\nWarning: truncated output.\nContinue with `list` using `cursor`: \"legacy-next\"."
         );
     }
 
@@ -1253,12 +1424,12 @@ mod tests {
     }
 
     #[test]
-    fn canonical_paginated_tool_output_projects_only_a_stable_warning() {
+    fn canonical_paginated_tool_output_projects_the_same_cursor_live_and_after_replay() {
         let session_id = SessionId::new();
         let turn_id = TurnId::new();
         let response_id = ModelResponseId::new();
         let call_id = ToolCallId::new();
-        let projected = ContextManager::rehydrate(vec![
+        let items = vec![
             HistoryItem {
                 id: HistoryItemId::new(),
                 session_id,
@@ -1285,32 +1456,43 @@ mod tests {
                     title: "list".to_string(),
                     output_text: "first page".to_string(),
                     metadata: serde_json::json!({
-                        "truncated": true,
-                        "continuation": "list-next-page"
+                        "success": true,
+                        "tool_metadata": {
+                            "truncated": true,
+                            "continuation": "list-next-page"
+                        }
                     }),
                     success: Some(true),
                 },
             },
-        ])
-        .model_messages(false);
+        ];
+        let replayed = ContextManager::rehydrate(items.clone()).model_messages(false);
+        let mut live = ContextManager::from_active_history(vec![items[0].clone()], Some(0), 1);
+        live.ingest_committed_delta(vec![items[1].clone()], Some(1));
+        let projected_live = live.model_messages(false);
 
+        assert_eq!(
+            serde_json::to_value(&projected_live).expect("serialize live projection"),
+            serde_json::to_value(&replayed).expect("serialize replay projection")
+        );
         assert!(matches!(
-            projected.as_slice(),
+            replayed.as_slice(),
             [
                 ModelMessage::AssistantToolCalls { tool_calls, .. },
                 ModelMessage::Tool { result, .. },
             ] if matches!(tool_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "list")
                 && result.contains("first page")
                 && result.contains("Warning: truncated output")
-                && !result.contains("list-next-page")
-                && !result.contains("cursor")
+                && result.contains("list-next-page")
+                && result.contains("cursor")
+                && result.matches("Warning: truncated output.").count() == 1
         ));
     }
 
     #[test]
     fn revision_changes_only_with_canonical_history() {
         let first = user_item("one");
-        let mut context = ContextManager::from_active_history(vec![first], Some(1), 1, 0, 0);
+        let mut context = ContextManager::from_active_history(vec![first], Some(1), 1);
         let revision = context.revision().clone();
         assert_eq!(
             context.ingest_committed_delta(Vec::new(), None).change,
@@ -1339,13 +1521,11 @@ mod tests {
 
         builder.ingest_page(vec![first.clone()]);
         builder.ingest_page(vec![second.clone()]);
-        let context = builder.finish(Some(9), 7, 2, 1);
+        let context = builder.finish(Some(9), 7);
 
         assert_eq!(context.revision(), &expected_revision);
         assert_eq!(context.append_cursor(), Some(9));
         assert_eq!(context.canonical_count(), 7);
-        assert_eq!(context.steer_count(), 2);
-        assert_eq!(context.agent_communication_count(), 1);
         assert_eq!(
             context
                 .history_items()
@@ -1371,8 +1551,6 @@ mod tests {
             vec![first.clone(), second.clone(), tail.clone()],
             Some(3),
             3,
-            0,
-            0,
         );
         let summary = HistoryItem {
             id: HistoryItemId::new(),
@@ -1417,19 +1595,85 @@ mod tests {
     }
 
     #[test]
+    fn pre_turn_compaction_excludes_the_exact_new_user_until_the_following_sample() {
+        let old = user_item("old context");
+        let mut current = user_item("new explicit request");
+        current.session_id = old.session_id;
+        current.scope = old.scope;
+        current.sequence_no = 2;
+        let context =
+            ContextManager::from_active_history(vec![old.clone(), current.clone()], Some(2), 2);
+        let excluded = HashSet::from([current.id]);
+
+        let selected = context.semantic_compaction_units_excluding(&excluded);
+        assert!(selected.iter().flatten().any(|item_id| *item_id == old.id));
+        assert!(
+            selected
+                .iter()
+                .flatten()
+                .all(|item_id| *item_id != current.id)
+        );
+        let compaction_source = context.model_messages_excluding(&excluded, true);
+        assert!(compaction_source.iter().any(
+            |message| matches!(message, ModelMessage::User { content } if content == "old context")
+        ));
+        assert!(compaction_source.iter().all(
+            |message| !matches!(message, ModelMessage::User { content } if content == "new explicit request")
+        ));
+        let projected_for_compaction = context.model_messages_after_compaction(
+            old.session_id,
+            old.turn_id().expect("turn-scoped fixture"),
+            vec!["old context".to_string()],
+            "old work is summarized".to_string(),
+            vec![old.id],
+            &excluded,
+            true,
+        );
+        assert!(projected_for_compaction.iter().all(
+            |message| !matches!(message, ModelMessage::User { content } if content == "new explicit request")
+        ));
+
+        let mut committed = context;
+        committed.ingest_committed_delta(
+            vec![HistoryItem {
+                id: HistoryItemId::new(),
+                session_id: old.session_id,
+                scope: old.scope,
+                sequence_no: 3,
+                created_at_ms: 3,
+                payload: HistoryItemPayload::Compaction {
+                    mode: crate::protocol::CompactionMode::Automatic,
+                    layout: crate::protocol::CompactionLayout::UserAnchoredCheckpoint,
+                    preserved_user_messages: vec!["old context".to_string()],
+                    summary: "old work is summarized".to_string(),
+                    replacement_item_ids: vec![old.id],
+                },
+            }],
+            Some(3),
+        );
+        assert_eq!(
+            committed
+                .model_messages(true)
+                .iter()
+                .filter(|message| matches!(
+                    message,
+                    ModelMessage::User { content } if content == "new explicit request"
+                ))
+                .count(),
+            1,
+            "the following normal sample must see the exact new UserTurn once"
+        );
+    }
+
+    #[test]
     fn legacy_compaction_keeps_summary_at_the_replaced_prefix_position() {
         let first = user_item("first");
         let mut tail = user_item("tail");
         tail.session_id = first.session_id;
         tail.scope = first.scope;
         tail.sequence_no = 2;
-        let mut context = ContextManager::from_active_history(
-            vec![first.clone(), tail.clone()],
-            Some(2),
-            2,
-            0,
-            0,
-        );
+        let mut context =
+            ContextManager::from_active_history(vec![first.clone(), tail.clone()], Some(2), 2);
         let summary = HistoryItem {
             id: HistoryItemId::new(),
             session_id: first.session_id,
@@ -1513,7 +1757,7 @@ mod tests {
         ];
         let mut active = vec![old.clone()];
         active.extend(retained.clone());
-        let mut context = ContextManager::from_active_history(active, Some(4), 4, 0, 0);
+        let mut context = ContextManager::from_active_history(active, Some(4), 4);
         let compaction = HistoryItem {
             id: HistoryItemId::new(),
             session_id: old.session_id,
@@ -1560,8 +1804,6 @@ mod tests {
             vec![first_user.clone(), first_assistant.clone()],
             Some(2),
             2,
-            0,
-            0,
         );
         let first_summary = HistoryItem {
             id: HistoryItemId::new(),
@@ -1841,8 +2083,6 @@ mod tests {
             ],
             Some(5),
             5,
-            0,
-            2,
         );
 
         let anchors = context.compaction_user_messages_for_items(&selected);

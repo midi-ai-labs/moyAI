@@ -73,10 +73,12 @@ impl ContextWindowTokenStatus {
         let full_context_window_limit = request.model.context_window;
         let configured_max_output_tokens = request.model.max_output_tokens;
         let overflow_margin_tokens = overflow_margin_tokens.min(u32::MAX as usize) as u32;
-        let reserved = configured_max_output_tokens.saturating_add(overflow_margin_tokens);
-        let tokens_until_limit = i64::from(full_context_window_limit)
-            - i64::from(active_context_tokens)
-            - i64::from(reserved);
+        // ModelPolicy has already projected the advertised context window into
+        // the immutable Codex-style effective full input limit, including any
+        // non-inverting overflow-margin cap. Keep the configured margin only
+        // for diagnostics; subtracting it again would double-reserve it.
+        let tokens_until_limit =
+            i64::from(full_context_window_limit) - i64::from(active_context_tokens);
         Self {
             source,
             active_context_tokens,
@@ -442,9 +444,7 @@ mod tests {
         assert!(estimated > super::estimate_request_tokens(&empty_request));
 
         let margin = 37u32;
-        request.model.context_window = estimated
-            .saturating_add(request.model.max_output_tokens)
-            .saturating_add(margin);
+        request.model.context_window = estimated;
         let at_boundary = super::ContextWindowTokenStatus::for_request(&request, margin as usize);
         assert_eq!(at_boundary.tokens_until_limit, 0);
         assert!(at_boundary.token_limit_reached);
@@ -454,6 +454,51 @@ mod tests {
             super::ContextWindowTokenStatus::for_request(&request, margin as usize);
         assert_eq!(below_boundary.tokens_until_limit, 1);
         assert!(!below_boundary.token_limit_reached);
+    }
+
+    #[test]
+    fn max_output_does_not_reduce_the_active_context_limit() {
+        let mut request = request_with(ProviderApiMode::Responses, Vec::new(), Vec::new());
+        request.model.context_window = 131_072;
+        request.model.max_output_tokens = 65_536;
+        let large_output = super::ContextWindowTokenStatus::for_request(&request, 1_024);
+        request.model.max_output_tokens = 8_192;
+        let small_output = super::ContextWindowTokenStatus::for_request(&request, 1_024);
+
+        assert_eq!(
+            large_output.tokens_until_limit,
+            small_output.tokens_until_limit
+        );
+        assert_eq!(large_output.configured_max_output_tokens, 65_536);
+        assert_eq!(small_output.configured_max_output_tokens, 8_192);
+    }
+
+    #[test]
+    fn eight_k_profile_reaches_compaction_before_the_effective_full_limit() {
+        let mut config = crate::config::ResolvedConfig::default();
+        config.model.context_window = 8_192;
+        config.session.overflow_margin_tokens = 1_024;
+        let policy = crate::llm::model_policy::ModelPolicy::from_config(&config);
+        let mut request = request_with(ProviderApiMode::Responses, Vec::new(), Vec::new());
+        request.model = policy.transport_profile(config.model.provider_metadata_mode);
+
+        let below_working = super::ContextWindowTokenStatus::from_active_context_tokens(
+            &request,
+            config.session.overflow_margin_tokens,
+            policy.working_context_token_limit.saturating_sub(1),
+            super::ActiveContextTokenSource::FullPreparedRequestEstimate,
+        );
+        let at_working = super::ContextWindowTokenStatus::from_active_context_tokens(
+            &request,
+            config.session.overflow_margin_tokens,
+            policy.working_context_token_limit,
+            super::ActiveContextTokenSource::FullPreparedRequestEstimate,
+        );
+
+        assert!(!below_working.token_limit_reached);
+        assert!(!at_working.token_limit_reached);
+        assert_eq!(at_working.full_context_window_limit, 7_782);
+        assert!(policy.working_context_token_limit < at_working.full_context_window_limit);
     }
 
     #[test]

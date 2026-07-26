@@ -236,6 +236,22 @@ impl RunMutationFence {
         };
         match outcome {
             RunAdmissionLeaseRenewalOutcome::Renewed => {}
+            RunAdmissionLeaseRenewalOutcome::StopFenced(outcome) => {
+                match outcome {
+                    crate::protocol::TurnTerminalOutcome::Interrupted { cause } => {
+                        self.control
+                            .request_cancel(RunCancellationCause::Interruption(cause));
+                    }
+                    crate::protocol::TurnTerminalOutcome::Failed { error } => {
+                        self.control
+                            .request_cancel(RunCancellationCause::Failure(error));
+                    }
+                    crate::protocol::TurnTerminalOutcome::Completed => {
+                        self.control.supersede();
+                    }
+                }
+                return Err(self.rejected_error("the admitted turn is fenced for terminalization"));
+            }
             RunAdmissionLeaseRenewalOutcome::Terminal(_) => {
                 self.control.supersede();
                 return Err(self.rejected_error("the admitted turn is already terminal"));
@@ -1277,7 +1293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_mutation_fence_rejects_cancelled_and_expired_owners_before_mutation() {
+    async fn run_mutation_fence_rejects_cancelled_expired_and_tree_stopped_owners() {
         let (store, session_id) = fence_test_session().await;
         let repo = store.session_repo();
         let turn_id = TurnId::new();
@@ -1320,5 +1336,40 @@ mod tests {
         }
         assert!(!expired_mutation_ran);
         assert!(expired_control.is_cancelled());
+
+        let (stopped_store, stopped_session_id) = fence_test_session().await;
+        let stopped_repo = stopped_store.session_repo();
+        let stopped_turn_id = TurnId::new();
+        let stopped_admission_id = stopped_repo
+            .admit_session_turn(stopped_session_id, stopped_turn_id)
+            .await
+            .expect("tree-stop admission")
+            .expect("tree-stop admitted")
+            .admission_id;
+        let stopped_control = RunControl::new();
+        let stopped_fence = RunMutationFence::new(
+            stopped_repo.clone(),
+            stopped_session_id,
+            stopped_admission_id,
+            stopped_turn_id,
+            stopped_control.clone(),
+        );
+        stopped_fence
+            .assert_owned()
+            .await
+            .expect("owner before durable tree Stop");
+        stopped_repo
+            .record_agent_tree_stop_fence(
+                stopped_session_id,
+                crate::protocol::TurnInterruptionCause::UserStop,
+            )
+            .await
+            .expect("durable tree Stop")
+            .expect("tree Stop fence");
+        assert!(
+            stopped_fence.assert_owned().await.is_err(),
+            "a durable tree Stop must revoke workspace mutation ownership before fanout"
+        );
+        assert!(stopped_control.is_cancelled());
     }
 }
