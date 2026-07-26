@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use encoding_rs::SHIFT_JIS;
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
@@ -44,6 +44,12 @@ pub enum ShellSandboxPermissions {
     RequireEscalated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ShellSandboxFailureHint {
+    WorkspaceWriteEffectTempAccessDenied,
+}
+
 #[derive(Debug, Default)]
 pub struct ShellTool;
 
@@ -51,9 +57,9 @@ pub struct ShellTool;
 impl Tool for ShellTool {
     fn spec(&self) -> ToolSpec {
         let description = if cfg!(windows) {
-            "Run a PowerShell command. Workspace modes use the native workspace-write OS sandbox; set sandbox_permissions=require_escalated with a concise justification only when this exact command must run outside it. Approved elevation and Full Access run without the sandbox. Shell side effects have no typed file-change owner, so every edit baseline for the current session is invalidated before execution."
+            "Run a PowerShell command. Workspace modes use the native workspace-write OS sandbox. Keep sandbox_permissions=use_default unless this exact command is known to require unrestricted execution or a prior default run shows a sandbox-caused OS access denial, including a Windows child-created protected-DACL temp path; a nonzero exit alone is not sufficient. require_escalated starts a new reviewed execution, requires concise justification, and never replays the failed command automatically. Approved elevation and Full Access run without the sandbox. Shell side effects have no typed file-change owner, so every edit baseline for the current session is invalidated before execution."
         } else {
-            "Run a bash command. Workspace modes require a supported native workspace-write OS sandbox; set sandbox_permissions=require_escalated with a concise justification only when this exact command must run outside it. Approved elevation and Full Access run without the sandbox. Shell side effects have no typed file-change owner, so every edit baseline for the current session is invalidated before execution."
+            "Run a bash command. Workspace modes require a supported native workspace-write OS sandbox. Keep sandbox_permissions=use_default unless this exact command is known to require unrestricted execution or a prior default run shows a sandbox-caused OS access denial; a nonzero exit alone is not sufficient. require_escalated starts a new reviewed execution, requires concise justification, and never replays the failed command automatically. Approved elevation and Full Access run without the sandbox. Shell side effects have no typed file-change owner, so every edit baseline for the current session is invalidated before execution."
         };
         ToolSpec {
             name: ToolName::Shell,
@@ -69,7 +75,8 @@ impl Tool for ShellTool {
                     "description": { "type": "string" },
                     "sandbox_permissions": {
                         "type": "string",
-                        "enum": ["use_default", "require_escalated"]
+                        "enum": ["use_default", "require_escalated"],
+                        "description": "Keep use_default unless this exact command is known to require unrestricted execution or a prior default run shows a sandbox-caused OS access denial. A nonzero exit alone is not sufficient. require_escalated starts a new reviewed execution, requires justification, and never automatically replays the failed command."
                     },
                     "justification": { "type": "string" }
                 }
@@ -142,6 +149,8 @@ impl Tool for ShellTool {
         } else {
             "not_started"
         };
+        let sandbox_failure_hint =
+            classify_shell_sandbox_failure_hint(effect_admission.sandbox_plan(), &output);
 
         Ok(ToolResult {
             title: description,
@@ -156,6 +165,7 @@ impl Tool for ShellTool {
                 "truncated": preview.truncated,
                 "success": output.exit_code == Some(0) && !output.timed_out && !output.cancelled && !output.cleanup_failed,
                 "cleanup_failed": output.cleanup_failed,
+                "sandbox_failure_hint": sandbox_failure_hint,
                 "change_evidence": {
                     "status": change_evidence_status,
                     "effects_unknown": output.effect_started,
@@ -312,6 +322,31 @@ struct CommandOutput {
     stderr_truncated: bool,
 }
 
+fn classify_shell_sandbox_failure_hint(
+    sandbox_plan: &ProcessSandboxPlan,
+    output: &CommandOutput,
+) -> Option<ShellSandboxFailureHint> {
+    if !matches!(sandbox_plan, ProcessSandboxPlan::WorkspaceWrite(_))
+        || !output.effect_started
+        || !output.exit_code.is_some_and(|code| code != 0)
+        || output.timed_out
+        || output.cancelled
+        || output.cleanup_failed
+    {
+        return None;
+    }
+
+    output
+        .stdout
+        .lines()
+        .chain(output.stderr.lines())
+        .any(|line| {
+            let line = line.to_ascii_lowercase();
+            line.contains("permissionerror: [winerror 5]") && line.contains("moyai-sandbox-effect-")
+        })
+        .then_some(ShellSandboxFailureHint::WorkspaceWriteEffectTempAccessDenied)
+}
+
 enum ShellWaitOutcome {
     Exited(Result<std::process::ExitStatus, std::io::Error>),
     TimedOut,
@@ -345,17 +380,36 @@ async fn execute_shell_command(
     } else {
         ShellFamily::Bash
     });
-    let program = shell
-        .program
-        .as_ref()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| {
-            if matches!(family, ShellFamily::PowerShell) {
-                "powershell".to_string()
-            } else {
-                "bash".to_string()
-            }
-        });
+    let environment = captured_process_environment(shell);
+    let programs = resolve_shell_programs(shell, family, &environment);
+    execute_shell_command_with_programs(
+        shell,
+        workdir,
+        command_text,
+        timeout_ms,
+        max_output_bytes,
+        cancel,
+        sandbox_plan,
+        family,
+        environment,
+        programs,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_shell_command_with_programs(
+    shell: &crate::config::ShellConfig,
+    workdir: &Utf8Path,
+    command_text: &str,
+    timeout_ms: u64,
+    max_output_bytes: usize,
+    cancel: CancellationToken,
+    sandbox_plan: &ProcessSandboxPlan,
+    family: ShellFamily,
+    environment: std::collections::HashMap<String, String>,
+    programs: Vec<String>,
+) -> Result<CommandOutput, ToolError> {
     let arguments = match family {
         ShellFamily::PowerShell => vec![
             "-NoProfile".to_string(),
@@ -364,7 +418,6 @@ async fn execute_shell_command(
         ],
         ShellFamily::Bash => vec!["-lc".to_string(), command_text.to_string()],
     };
-    let environment = captured_process_environment(shell);
 
     if let ProcessSandboxPlan::NoProcess = sandbox_plan {
         return Err(ToolError::SandboxExecution(
@@ -374,23 +427,42 @@ async fn execute_shell_command(
         ));
     }
     if let ProcessSandboxPlan::WorkspaceWrite(profile) = sandbox_plan {
-        let mut argv = Vec::with_capacity(arguments.len() + 1);
-        argv.push(program);
-        argv.extend(arguments);
-        let completed = execute_workspace_write(
-            profile.clone(),
-            SandboxedProcessRequest {
-                argv,
-                cwd: workdir.to_path_buf(),
-                environment,
-                stdin: Vec::new(),
-                timeout_ms,
-                max_output_bytes,
-                hide_window: shell.hide_windows,
-                cancel,
-            },
-        )
-        .await?;
+        let mut completed = None;
+        let program_count = programs.len();
+        for (index, program) in programs.iter().enumerate() {
+            let mut argv = Vec::with_capacity(arguments.len() + 1);
+            argv.push(program.clone());
+            argv.extend(arguments.iter().cloned());
+            match execute_workspace_write(
+                profile.clone(),
+                SandboxedProcessRequest {
+                    argv,
+                    cwd: workdir.to_path_buf(),
+                    environment: environment.clone(),
+                    stdin: Vec::new(),
+                    timeout_ms,
+                    max_output_bytes,
+                    hide_window: shell.hide_windows,
+                    cancel: cancel.clone(),
+                },
+            )
+            .await
+            {
+                Ok(output) => {
+                    completed = Some(output);
+                    break;
+                }
+                Err(crate::tool::sandbox_process::SandboxExecutionError::Spawn(_))
+                    if index + 1 < program_count =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let completed = completed.ok_or_else(|| {
+            ToolError::Message("no shell program candidate could be launched".to_string())
+        })?;
         let stdout = captured_shell_text(&completed.stdout.bytes, completed.stdout.truncated);
         let mut stderr = captured_shell_text(&completed.stderr.bytes, completed.stderr.truncated);
         let cleanup_error = completed.cleanup_error();
@@ -413,11 +485,28 @@ async fn execute_shell_command(
         });
     }
 
-    let mut command = Command::new(program);
-    command.args(arguments);
-    command.current_dir(workdir.as_std_path());
-    apply_shell_environment(&mut command, shell);
-    let mut process = ManagedProcess::spawn(command, shell.hide_windows, max_output_bytes).await?;
+    let mut process = None;
+    let program_count = programs.len();
+    for (index, program) in programs.iter().enumerate() {
+        let mut command = Command::new(program);
+        command.args(&arguments);
+        command.current_dir(workdir.as_std_path());
+        apply_captured_shell_environment(&mut command, &environment);
+        match ManagedProcess::spawn(command, shell.hide_windows, max_output_bytes).await {
+            Ok(spawned) => {
+                process = Some(spawned);
+                break;
+            }
+            Err(error)
+                if index + 1 < program_count && retryable_windows_shell_spawn_error(&error) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut process = process
+        .ok_or_else(|| ToolError::Message("no shell program candidate could be launched".into()))?;
     let wait_outcome = tokio::select! {
         _ = cancel.cancelled() => ShellWaitOutcome::Cancelled,
         result = timeout(Duration::from_millis(timeout_ms), process.wait()) => match result {
@@ -471,9 +560,57 @@ async fn execute_shell_command(
     })
 }
 
+fn resolve_shell_programs(
+    shell: &crate::config::ShellConfig,
+    family: ShellFamily,
+    environment: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    if let Some(program) = &shell.program {
+        return vec![program.to_string()];
+    }
+    match family {
+        ShellFamily::PowerShell => default_powershell_programs(environment),
+        ShellFamily::Bash => vec!["bash".to_string()],
+    }
+}
+
+#[cfg(windows)]
+fn default_powershell_programs(
+    environment: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    if environment
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("PATH"))
+    {
+        vec!["pwsh".to_string(), "powershell".to_string()]
+    } else {
+        vec!["powershell".to_string()]
+    }
+}
+
+#[cfg(not(windows))]
+fn default_powershell_programs(
+    _environment: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    vec!["powershell".to_string()]
+}
+
+fn retryable_windows_shell_spawn_error(error: &std::io::Error) -> bool {
+    cfg!(windows) && error.raw_os_error().is_some()
+}
+
+#[cfg(all(test, windows))]
 fn apply_shell_environment(command: &mut Command, shell: &crate::config::ShellConfig) {
+    let environment = captured_process_environment(shell);
+    apply_captured_shell_environment(command, &environment);
+}
+
+fn apply_captured_shell_environment(
+    command: &mut Command,
+    environment: &std::collections::HashMap<String, String>,
+) {
     command.env_clear();
-    command.envs(captured_process_environment(shell));
+    command.envs(environment);
 }
 
 fn captured_shell_text(bytes: &[u8], truncated: bool) -> String {
@@ -1041,6 +1178,135 @@ mod tests {
     }
 
     #[test]
+    fn protected_effect_temp_access_denial_is_classified_narrowly() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let workspace_write = crate::tool::os_sandbox::ProcessSandboxPlan::for_access_mode(
+            crate::config::AccessMode::Default,
+            &workspace,
+        )
+        .expect("workspace-write plan");
+        let make_output = |stdout: &str, stderr: &str| super::CommandOutput {
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            exit_code: Some(1),
+            timed_out: false,
+            cancelled: false,
+            effect_started: true,
+            cleanup_failed: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let signature = "PermissionError: [WinError 5] Access is denied: 'C:\\Temp\\moyai-sandbox-effect-ABC\\pytest'";
+
+        let classified = super::classify_shell_sandbox_failure_hint(
+            &workspace_write,
+            &make_output("", signature),
+        );
+        assert_eq!(
+            classified,
+            Some(super::ShellSandboxFailureHint::WorkspaceWriteEffectTempAccessDenied)
+        );
+        assert_eq!(
+            serde_json::to_value(classified).expect("serialize hint"),
+            serde_json::json!("workspace_write_effect_temp_access_denied")
+        );
+        assert_eq!(
+            super::classify_shell_sandbox_failure_hint(
+                &workspace_write,
+                &make_output(
+                    "permissionERROR: [WINerror 5] C:\\Temp\\MOYAI-SANDBOX-EFFECT-mixed",
+                    "",
+                ),
+            ),
+            Some(super::ShellSandboxFailureHint::WorkspaceWriteEffectTempAccessDenied)
+        );
+
+        for output in [
+            make_output("", "ordinary command failure"),
+            make_output("", "PermissionError: [WinError 5] Access is denied"),
+            make_output("", "C:\\Temp\\moyai-sandbox-effect-ABC\\pytest"),
+            make_output(
+                "PermissionError: [WinError 5] Access is denied",
+                "C:\\Temp\\moyai-sandbox-effect-ABC\\pytest",
+            ),
+            make_output(
+                "",
+                "PermissionError: [WinError 5] Access is denied\nC:\\Temp\\moyai-sandbox-effect-ABC\\pytest",
+            ),
+        ] {
+            assert_eq!(
+                super::classify_shell_sandbox_failure_hint(&workspace_write, &output),
+                None
+            );
+        }
+
+        let mut exit_zero = make_output("", signature);
+        exit_zero.exit_code = Some(0);
+        let mut no_exit_code = make_output("", signature);
+        no_exit_code.exit_code = None;
+        let mut not_started = make_output("", signature);
+        not_started.effect_started = false;
+        let mut timed_out = make_output("", signature);
+        timed_out.timed_out = true;
+        let mut cancelled = make_output("", signature);
+        cancelled.cancelled = true;
+        let mut cleanup_failed = make_output("", signature);
+        cleanup_failed.cleanup_failed = true;
+        for output in [
+            exit_zero,
+            no_exit_code,
+            not_started,
+            timed_out,
+            cancelled,
+            cleanup_failed,
+        ] {
+            assert_eq!(
+                super::classify_shell_sandbox_failure_hint(&workspace_write, &output),
+                None
+            );
+        }
+        assert_eq!(
+            super::classify_shell_sandbox_failure_hint(
+                &crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted,
+                &make_output("", signature),
+            ),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_windows_powershell_uses_lazy_path_resolution_and_preserves_override() {
+        let environment = std::collections::HashMap::from([(
+            "Path".to_string(),
+            r"C:\first;\\unreachable\unused".to_string(),
+        )]);
+        let mut shell = ResolvedConfig::default().shell;
+
+        assert_eq!(
+            super::resolve_shell_programs(
+                &shell,
+                crate::config::ShellFamily::PowerShell,
+                &environment,
+            ),
+            vec!["pwsh".to_string(), "powershell".to_string()]
+        );
+
+        shell.program = Some(Utf8PathBuf::from("explicit-shell.exe"));
+        assert_eq!(
+            super::resolve_shell_programs(
+                &shell,
+                crate::config::ShellFamily::PowerShell,
+                &environment,
+            ),
+            vec!["explicit-shell.exe".to_string()]
+        );
+    }
+
+    #[test]
     fn network_urls_are_not_classified_as_outside_workspace_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
@@ -1415,6 +1681,181 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn installed_default_pwsh_supports_conjunction_in_both_process_profiles() {
+        let pwsh_probe = std::process::Command::new("pwsh")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "exit 0",
+            ])
+            .status();
+        if !matches!(pwsh_probe, Ok(status) if status.success()) {
+            return;
+        }
+        std::fs::create_dir_all("target").expect("target directory");
+        let temp = tempfile::Builder::new()
+            .prefix("moyai-shell-pwsh-")
+            .tempdir_in("target")
+            .expect("tempdir");
+        let workspace_root =
+            Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&workspace_root, &config)
+            .expect("workspace discovery");
+        let workspace_plan = crate::tool::os_sandbox::ProcessSandboxPlan::for_access_mode(
+            crate::config::AccessMode::Default,
+            &workspace,
+        )
+        .expect("workspace plan");
+
+        for (label, plan) in [
+            ("workspace-write", workspace_plan),
+            (
+                "unrestricted",
+                crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted,
+            ),
+        ] {
+            let output = super::execute_shell_command(
+                &config.shell,
+                &workspace_root,
+                &format!("cmd.exe /d /c exit 0 && Write-Output {label}-pwsh-ok"),
+                30_000,
+                8_192,
+                CancellationToken::new(),
+                &plan,
+            )
+            .await
+            .expect("pwsh shell execution");
+
+            assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
+            assert!(
+                output.stdout.contains(&format!("{label}-pwsh-ok")),
+                "stdout={}",
+                output.stdout
+            );
+            assert!(!output.cleanup_failed);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn unusable_pwsh_candidate_falls_back_before_effect_in_both_process_profiles() {
+        std::fs::create_dir_all("target").expect("target directory");
+        let temp = tempfile::Builder::new()
+            .prefix("moyai-shell-pwsh-fallback-")
+            .tempdir_in("target")
+            .expect("tempdir");
+        let workspace_root =
+            Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let unusable = workspace_root.join("pwsh.exe");
+        std::fs::write(&unusable, b"not a Windows executable").expect("invalid pwsh fixture");
+        let config = ResolvedConfig::default();
+        let environment = crate::tool::sandbox_process::captured_process_environment(&config.shell);
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&workspace_root, &config)
+            .expect("workspace discovery");
+        let workspace_plan = crate::tool::os_sandbox::ProcessSandboxPlan::for_access_mode(
+            crate::config::AccessMode::Default,
+            &workspace,
+        )
+        .expect("workspace plan");
+
+        for (label, plan) in [
+            ("workspace-write", workspace_plan),
+            (
+                "unrestricted",
+                crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted,
+            ),
+        ] {
+            let output = super::execute_shell_command_with_programs(
+                &config.shell,
+                &workspace_root,
+                &format!("Write-Output {label}-fallback-ok"),
+                30_000,
+                8_192,
+                CancellationToken::new(),
+                &plan,
+                crate::config::ShellFamily::PowerShell,
+                environment.clone(),
+                vec![unusable.to_string(), "powershell".to_string()],
+            )
+            .await
+            .expect("pre-effect launch failure should use the next candidate");
+
+            assert_eq!(output.exit_code, Some(0), "stderr={}", output.stderr);
+            assert!(
+                output.stdout.contains(&format!("{label}-fallback-ok")),
+                "stdout={}",
+                output.stdout
+            );
+            assert!(!output.cleanup_failed);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn launched_candidate_is_never_replayed_after_a_nonzero_exit() {
+        std::fs::create_dir_all("target").expect("target directory");
+        let temp = tempfile::Builder::new()
+            .prefix("moyai-shell-no-replay-")
+            .tempdir_in("target")
+            .expect("tempdir");
+        let workspace_root =
+            Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let environment = crate::tool::sandbox_process::captured_process_environment(&config.shell);
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&workspace_root, &config)
+            .expect("workspace discovery");
+        let workspace_plan = crate::tool::os_sandbox::ProcessSandboxPlan::for_access_mode(
+            crate::config::AccessMode::Default,
+            &workspace,
+        )
+        .expect("workspace plan");
+
+        for (label, plan) in [
+            ("workspace-write", workspace_plan),
+            (
+                "unrestricted",
+                crate::tool::os_sandbox::ProcessSandboxPlan::Unrestricted,
+            ),
+        ] {
+            let first_marker = workspace_root.join(format!("{label}-first.txt"));
+            let replay_marker = workspace_root.join(format!("{label}-replayed.txt"));
+            let quote = |path: &camino::Utf8Path| path.as_str().replace('\'', "''");
+            let command = format!(
+                "if ($PSVersionTable.PSEdition -eq 'Desktop') {{ Set-Content -LiteralPath '{}' -Value first; exit 23 }} else {{ Set-Content -LiteralPath '{}' -Value replayed; exit 0 }}",
+                quote(&first_marker),
+                quote(&replay_marker)
+            );
+
+            let output = super::execute_shell_command_with_programs(
+                &config.shell,
+                &workspace_root,
+                &command,
+                30_000,
+                8_192,
+                CancellationToken::new(),
+                &plan,
+                crate::config::ShellFamily::PowerShell,
+                environment.clone(),
+                vec!["powershell".to_string(), "pwsh".to_string()],
+            )
+            .await
+            .expect("a launched candidate's nonzero exit is a completed execution");
+
+            assert_eq!(output.exit_code, Some(23), "stderr={}", output.stderr);
+            assert!(first_marker.exists(), "first candidate did not run");
+            assert!(
+                !replay_marker.exists(),
+                "second candidate replayed an already-started effect"
+            );
+            assert!(!output.cleanup_failed);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn unrestricted_shell_dispatch_can_write_outside_workspace() {
         let temp = tempfile::tempdir().expect("tempdir");
         let fixture = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
@@ -1424,8 +1865,16 @@ mod tests {
         std::fs::create_dir_all(&outside_root).expect("outside");
         let config = ResolvedConfig::default();
         let outside = outside_root.join("outside.txt");
+        let host_environment =
+            crate::tool::sandbox_process::captured_process_environment(&config.shell);
+        let host_temp = host_environment
+            .get("TEMP")
+            .expect("default Windows shell environment includes TEMP");
+        let host_tmp = host_environment
+            .get("TMP")
+            .expect("default Windows shell environment includes TMP");
         let command = format!(
-            "Set-Content -LiteralPath '{}' -Value outside",
+            "Set-Content -LiteralPath '{}' -Value outside; Write-Output \"TEMP=$env:TEMP\"; Write-Output \"TMP=$env:TMP\"",
             outside.as_str().replace('\'', "''")
         );
         let output = super::execute_shell_command(
@@ -1442,6 +1891,23 @@ mod tests {
 
         assert_eq!(output.exit_code, Some(0));
         assert!(outside.exists());
+        assert!(
+            output
+                .stdout
+                .lines()
+                .any(|line| line == format!("TEMP={host_temp}")),
+            "Full Access changed the host TEMP: {}",
+            output.stdout
+        );
+        assert!(
+            output
+                .stdout
+                .lines()
+                .any(|line| line == format!("TMP={host_tmp}")),
+            "Full Access changed the host TMP: {}",
+            output.stdout
+        );
+        assert!(!output.stdout.contains("moyai-sandbox-effect-"));
         assert!(!output.cleanup_failed);
     }
 

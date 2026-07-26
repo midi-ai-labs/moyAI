@@ -200,6 +200,13 @@ function renderProjectRow(row: ProjectRow, selected: boolean, index: number, act
   `;
 }
 
+function selectedProjectDisplayLabel(
+  state: Pick<DesktopViewState, "project_rows" | "selected_project_index" | "workspace_path">,
+): string {
+  const selected = state.project_rows[state.selected_project_index];
+  return selected?.label.trim() || shortenPath(state.workspace_path);
+}
+
 function renderProjectSessionRows(state: DesktopWebState): string {
   if (state.selected_project_index < 0) {
     return "";
@@ -348,7 +355,8 @@ export function renderSidebar(state: DesktopWebState): string {
 }
 
 export function renderTopbar(state: DesktopViewState): string {
-  const workspaceLabel = state.selected_project_index >= 0 ? shortenPath(state.workspace_path) : "プロジェクトなし";
+  const workspaceLabel =
+    state.selected_project_index >= 0 ? selectedProjectDisplayLabel(state) : "プロジェクトなし";
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
   const exportDisabled = !state.history_export_enabled || !navigationIsIdle(state);
   const exportTitle = exportDisabled ? "保存できる表示中の履歴がありません" : "表示中の履歴をMarkdown保存";
@@ -503,7 +511,7 @@ function renderEmptyThread(state: DesktopWebState): string {
     <div class="empty-thread">
       <h2>${state.selected_project_index >= 0 ? "このプロジェクトで何を作りますか？" : "何に取り組みますか？"}</h2>
       <div class="empty-status">
-        ${state.selected_project_index >= 0 ? `<span>${escapeHtml(shortenPath(state.workspace_path))}</span>` : ""}
+        ${state.selected_project_index >= 0 ? `<span>${escapeHtml(selectedProjectDisplayLabel(state))}</span>` : ""}
         <span>${escapeHtml(projectText)}</span>
         <span>${escapeHtml(llmText)}</span>
         <span>${escapeHtml(displayAccessLabel(state.access_label))}</span>

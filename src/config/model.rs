@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_MODEL_BASE_URL: &str = "http://127.0.0.1:1234";
 pub const DEFAULT_MODEL_NAME: &str = "qwen/qwen3.6-35b-a3b";
 pub const DEFAULT_MODEL_CONTEXT_WINDOW: u32 = 131_072;
-pub const DEFAULT_MODEL_MAX_OUTPUT_TOKENS: u32 = 16_384;
-pub const DEFAULT_MODEL_REQUEST_TIMEOUT_MS: u64 = 600_000;
-pub const DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS: u64 = 600_000;
+pub const DEFAULT_MODEL_MAX_OUTPUT_TOKENS: u32 = 32_768;
+pub const DEFAULT_MODEL_REQUEST_TIMEOUT_MS: u64 = 1_800_000;
+pub const DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS: u64 = 1_800_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -15,7 +15,7 @@
 - versionごとにfresh workspace、config/data、preferences、logs、screenshots directoryを作り、同じseedをcopyする。workspaceをresetして再利用しない。
 - このdirectoryの `task.md` をworkspace rootへ配置する。stage promptは `stage2-design.txt`、`stage3-implement.txt`、`stage4-regression.txt` をbyte-identicalに使用する。
 - 同一provider/model、temperature、output budget、tool設定を全versionで使い、versionが所有するwire behaviorはbackportしない。
-- Quality profileはcurrent製品既定値 `context_window = 131072`、provider側 `num_ctx = 131072`、`max_output_tokens = 16384`、`request_timeout_ms = 600000`、`stream_idle_timeout_ms = 600000` とする。historical版とのpaired比較では各runの実値を記録し、32kへの意図的な縮小は行わない。artifact完成度とhidden contractを主に採点し、compactionは観測項目であって発生しなくてもfailまたはinconclusiveにしない。
+- Quality profileはcurrent製品既定値 `context_window = 131072`、provider側 `num_ctx = 131072`、`max_output_tokens = 32768`、`request_timeout_ms = 1800000`、`stream_idle_timeout_ms = 1800000` とする。historical版とのpaired比較では各runの実値を記録し、output budgetの意図的な縮小は行わない。artifact完成度とhidden contractを主に採点し、compactionは観測項目であって発生しなくてもfailまたはinconclusiveにしない。
 - Stress profileは `context_window = 32768`、provider側 `num_ctx = 32768`、`max_output_tokens = 8192` とする。これはcompaction/recoveryを確実に観測する意図的overrideであり、Quality profileやrelease smokeの代用にしない。
 - access modeは `auto_review`（現UI: 代理で承認、旧UI: 自動レビュー）を要求する。versionがそのmodeを実装しない場合は暗黙に同等扱いせず、requested/effective modeとhuman approval回数を記録する。
 - multi-agent、MCP、Doclingは無効にする。dependency installとexternal fixture mutationは禁止する。
@@ -46,7 +46,7 @@ current directory の `task.md` に従って作業してください。
 
 ### Reopen boundary
 
-Stage 3 terminal completion後にDesktop appを通常終了する。同じworkspace、config/data、preferencesを使ってDesktopを再起動し、同じProject Chat sessionとtranscriptを再開する。新しいsessionを作らず、履歴を手動要約または再投入しない。
+Stage 3 terminal completion後に `cdp-action.mjs <port> exit-app` またはtrayの終了操作でDesktop appを通常終了し、記録済みPIDの終了を確認する。タイトルバーの「閉じる」はtrayへ隠す操作なので再起動gateには使わない。同じworkspace、config/data、preferencesを使ってDesktopを再起動し、同じProject Chat sessionとtranscriptを再開する。新しいsessionを作らず、履歴を手動要約または再投入しない。
 
 ### Stage 4: regression repair
 

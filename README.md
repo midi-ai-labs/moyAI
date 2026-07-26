@@ -164,12 +164,12 @@ model = "qwen/qwen3.6-35b-a3b"
 provider_metadata_mode = "lm_studio_native_required"
 provider_api_mode = "responses"
 reasoning_summary = "none"
-request_timeout_ms = 600000
-stream_idle_timeout_ms = 600000
+request_timeout_ms = 1800000
+stream_idle_timeout_ms = 1800000
 context_window = 131072
 supports_tools = true
 supports_images = true
-max_output_tokens = 16384
+max_output_tokens = 32768
 
 [model.extra_body_json]
 num_ctx = 131072
@@ -193,14 +193,14 @@ enabled = false
 
 `request_timeout_ms` is one response-start operation budget shared by connection attempts, connection
 retry delays, request-body upload, and waiting for response headers. `stream_idle_timeout_ms` limits a period with no SSE
-event after streaming starts. Both default to 600,000 ms. These two settings are configurable
+event after streaming starts. Both default to 1,800,000 ms (30 minutes). These two settings are configurable
 no-progress deadlines, not the aggregate stream cap. Separately, after response headers, the product
 applies a non-configurable aggregate stream-duration limit of 1,800,000 ms (30 minutes); increasing
 either setting does not extend that bound. Explicit config or environment overrides for the two
 no-progress deadlines remain supported.
 `max_output_tokens` bounds the complete model output, including reasoning and serialized tool-call
 arguments. Tool-heavy runs that write a whole document need the provider's verified profile budget;
-the product default uses `16384`. A provider-side
+the product default uses `32768`. A provider-side
 `response.failed` such as `Failed to parse tool call: Unexpected end of content` is reported as a
 generation failure with the configured budget and is not treated as a locally parsed or executed
 tool call.

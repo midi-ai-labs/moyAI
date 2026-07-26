@@ -5,11 +5,11 @@ provider_metadata_mode = "lm_studio_native_required"
 provider_api_mode = "responses"
 reasoning_summary = "none"
 connect_timeout_ms = 10000
-request_timeout_ms = 600000
-stream_idle_timeout_ms = 600000
+request_timeout_ms = 1800000
+stream_idle_timeout_ms = 1800000
 max_retries = 2
 context_window = 131072
-max_output_tokens = 16384
+max_output_tokens = 32768
 supports_tools = true
 supports_images = true
 

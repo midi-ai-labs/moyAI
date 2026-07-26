@@ -1484,6 +1484,35 @@ test("topbar omits page replacement controls even when bounded history has more 
   assert.doesNotMatch(html, /data-action="load-next-turn-page"/);
 });
 
+test("drive-root projects use the selected Rust display label without changing path authority", () => {
+  const state = projection({
+    workspace_path: "R:/",
+    selected_project_index: 0,
+    selected_session_index: -1,
+    project_rows: [{
+      project_id: "project-r",
+      label: "MappedProjectFolder",
+      path: "R:/",
+    }],
+    session_rows: [],
+    transcript_rows: [],
+  });
+
+  const sidebar = renderSidebar(state);
+  assert.match(sidebar, /<span class="nav-title">MappedProjectFolder<\/span>/);
+  assert.match(sidebar, /<small>R:\/<\/small>/);
+
+  const topbar = renderTopbar(state);
+  assert.match(
+    topbar,
+    /data-action="open-workspace-folder" title="R:\/">MappedProjectFolder<\/button>/,
+  );
+
+  const thread = renderThreadContent(state);
+  assert.match(thread, /<div class="empty-status">[\s\S]*?<span>MappedProjectFolder<\/span>/);
+  assert.doesNotMatch(thread, /<div class="empty-status">[\s\S]*?<span>R:<\/span>/);
+});
+
 test("config commit capability never gates unrelated workspace or window actions", () => {
   const clean = projection();
   for (const id of ["browse-workspace", "toggle-maximize-window"]) {

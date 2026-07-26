@@ -26,9 +26,9 @@ pub struct ApplyPatchInput {
     pub patch_text: String,
 }
 
-const APPLY_PATCH_DESCRIPTION: &str = "Apply a structured patch to one or more files using the exact `*** Begin Patch` / `*** End Patch` grammar. For an existing file, use `*** Update File: path`, then `@@`, and prefix every hunk body line with one space for unchanged context, `-` for deletion, or `+` for insertion. Update hunks are matched against the current UTF-8 file contents; if context does not match, read the relevant range and regenerate the hunk. A bare `@@` hunk containing only `+` lines is a context-free full-file replacement and still requires a current full-content write baseline. For a new file, use `*** Add File: path` and prefix every content line with `+`; delete with `*** Delete File: path`. Use only one content-changing section per path in a call and group multiple edits as `@@` hunks in that section. After a successful write/apply_patch, the resulting file contents become the current edit baseline unless another tool changes the file.";
+const APPLY_PATCH_DESCRIPTION: &str = "Apply a structured patch to one or more files using the exact `*** Begin Patch` / `*** End Patch` grammar. For an existing file, use `*** Update File: path`, then `@@` (or `@@ context` to continue after that named source line), and canonically prefix every hunk body line with one space for unchanged context, `-` for deletion, or `+` for insertion; a physically empty body line is also accepted as empty context for Codex compatibility. Put optional `*** End of File` after a non-empty hunk to require its old lines at the file ending. Update hunks are matched against the current UTF-8 file contents; if context does not match, read the relevant range and regenerate the hunk. A bare `@@` hunk containing only `+` lines appends those lines at end of file; it does not replace existing content. For a new file, use `*** Add File: path` and prefix every content line with `+`; delete with `*** Delete File: path`. Use only one content-changing section per path in a call and group multiple edits as `@@` hunks in that section. After a successful write/apply_patch, the resulting file contents become the current edit baseline unless another tool changes the file.";
 
-const APPLY_PATCH_TEXT_DESCRIPTION: &str = "Entire patch text. It must start with `*** Begin Patch` and end with `*** End Patch`. Update example: `*** Begin Patch\n*** Update File: a.txt\n@@\n unchanged\n-before\n+after\n*** End Patch`; the leading space before `unchanged` is required. For updates, every hunk body line starts with space (context), `-` (delete), or `+` (insert). Use one `*** Update File` section per path and put multiple edits in multiple `@@` hunks. An optional `*** Move to: new-path` goes immediately after the Update header. For new files, use `*** Add File: path` and prefix every added line with `+`, including blank lines and top-level code or declaration lines. Delete with `*** Delete File: path`. Do not include unified diff file markers such as `---` or `+++`.";
+const APPLY_PATCH_TEXT_DESCRIPTION: &str = "Entire patch text. It must start with `*** Begin Patch` and end with `*** End Patch`. Update example: `*** Begin Patch\n*** Update File: a.txt\n@@\n unchanged\n-before\n+after\n*** End Patch`; the leading space before `unchanged` is required. Canonically, each update hunk body line starts with space (context), `-` (delete), or `+` (insert); a physically empty body line is accepted as empty context. Use `@@ context` only when the named source line must anchor the following hunk. Put optional `*** End of File` after the hunk body to require the old lines at EOF. A bare `@@` hunk with only `+` lines appends them at EOF without replacing existing content. Use one `*** Update File` section per path and put multiple edits in multiple `@@` hunks. An optional `*** Move to: new-path` goes immediately after the Update header. For new files, use `*** Add File: path` and prefix every added line with `+`, including blank lines and top-level code or declaration lines. Delete with `*** Delete File: path`. Do not include unified diff file markers such as `---` or `+++`.";
 
 #[derive(Debug, Default)]
 pub struct ApplyPatchTool;
@@ -949,13 +949,6 @@ async fn classify_patch_operations_before_side_effects(
                     &guarded,
                     ctx.config.file_guard.max_inline_read_bytes,
                 )?;
-                if PatchParser::has_context_free_replacement(hunks) {
-                    ctx.services.edit_safety.assert_fresh_write(
-                        ctx.session.session.id,
-                        &source_path,
-                        &source_identity,
-                    )?;
-                }
                 let patched = PatchParser::apply_to_text(&original, hunks)
                     .map_err(|error| crate::error::EditError::Message(error.to_string()))?;
                 let normalized = ctx.services.formatter.normalize_text(
@@ -1560,6 +1553,11 @@ mod tests {
             "space (context)",
             "`-` (delete)",
             "`+` (insert)",
+            "`@@ context`",
+            "`*** End of File`",
+            "require the old lines at EOF",
+            "physically empty",
+            "appends them at EOF",
             "one `*** Update File` section per path",
             "*** Move to: new-path",
             "*** Delete File: path",
@@ -1572,7 +1570,11 @@ mod tests {
         let tool_description = spec.description;
         assert!(tool_description.contains("current UTF-8 file contents"));
         assert!(tool_description.contains("read the relevant range"));
-        assert!(tool_description.contains("context-free full-file replacement"));
+        assert!(tool_description.contains("appends those lines at end of file"));
+        assert!(tool_description.contains("does not replace existing content"));
+        assert!(tool_description.contains("require its old lines at the file ending"));
+        assert!(tool_description.contains("physically empty body line"));
+        assert!(!tool_description.contains("prefer the file ending"));
         assert!(!tool_description.contains("Read an existing file before"));
 
         let advertised = "*** Begin Patch\n*** Update File: a.txt\n@@\n unchanged\n-before\n+after\n*** End Patch";
@@ -1580,7 +1582,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_targeted_update_and_delete_do_not_require_a_full_content_write_baseline() {
+    async fn large_targeted_update_delete_and_eof_append_do_not_require_a_full_content_write_baseline()
+     {
         let temp = tempfile::tempdir().expect("tempdir");
         let root =
             Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 workspace");
@@ -1631,6 +1634,7 @@ mod tests {
         let mut large_contents = (0..3_000)
             .map(|index| format!("line-{index:04}-{}", "x".repeat(24)))
             .collect::<Vec<_>>();
+        large_contents[1_499] = String::new();
         large_contents[1_500] = "target-marker".to_string();
         std::fs::write(&large_path, format!("{}\n", large_contents.join("\n")))
             .expect("large source");
@@ -1671,34 +1675,7 @@ mod tests {
             control.clone(),
         );
         let mut prompt = AllowPrompt;
-        let error = ApplyPatchTool
-            .execute(
-                serde_json::json!({
-                    "patch_text": "*** Begin Patch\n*** Update File: large.txt\n@@\n+replacement-only\n*** End Patch"
-                }),
-                ToolContext {
-                    session: &session,
-                    workspace: &session.workspace,
-                    config: &config,
-                    tool_call_id: ToolCallId::new(),
-                    cancel: control.token(),
-                    run_control: control.clone(),
-                    run_mutation_fence: mutation_fence.clone(),
-                    prompt: &mut prompt,
-                    services: &services,
-                    agent: None,
-                    permission_guardian: None,
-                },
-            )
-            .await
-            .expect_err("context-free full replacement still requires a current baseline");
-        assert!(
-            error
-                .to_string()
-                .contains("no full-content write baseline exists")
-        );
-
-        let targeted_patch = "*** Begin Patch\n*** Update File: large.txt\n@@\n-target-marker\n+replacement-marker\n*** Delete File: obsolete.txt\n*** End Patch";
+        let targeted_patch = "*** Begin Patch\n*** Update File: large.txt\n@@\n\n-target-marker\n+replacement-marker\n@@\n+appended-without-baseline\n*** Delete File: obsolete.txt\n*** End Patch";
         let tool_call_id = ToolCallId::new();
         store
             .session_repo()
@@ -1758,18 +1735,20 @@ mod tests {
         );
         let current = std::fs::read_to_string(&large_path).expect("patched source");
         large_contents[1_500] = "replacement-marker".to_string();
+        large_contents.push("appended-without-baseline".to_string());
         assert_eq!(
             current.lines().map(str::to_owned).collect::<Vec<_>>(),
             large_contents
         );
-        assert_eq!(current.lines().count(), 3_000);
+        assert_eq!(current.lines().count(), 3_001);
         assert!(current.starts_with("line-0000-"));
         assert!(
             current
                 .lines()
-                .last()
+                .nth_back(1)
                 .is_some_and(|line| line.starts_with("line-2999-"))
         );
+        assert_eq!(current.lines().last(), Some("appended-without-baseline"));
         assert!(!deleted_path.exists());
         assert!(
             services
@@ -2082,6 +2061,74 @@ mod tests {
         assert_eq!(applied.len(), 0);
         assert_eq!(
             std::fs::read_to_string(&path).expect("read file"),
+            "external"
+        );
+    }
+
+    #[test]
+    fn full_access_permission_does_not_bypass_typed_patch_authority_or_no_clobber() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root =
+            Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 workspace");
+        let outside =
+            Utf8PathBuf::from_path_buf(temp.path().join("outside.txt")).expect("utf8 outside path");
+        std::fs::create_dir(&root).expect("workspace");
+        let mut config = crate::config::ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::FullAccess;
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let external_request = crate::tool::PermissionRequest {
+            access: AccessKind::Edit,
+            summary: "external patch".to_string(),
+            details: Vec::new(),
+            targets: vec![outside.clone()],
+            outside_workspace: true,
+            risks: vec![crate::tool::PermissionRisk::ExternalMutation],
+            agent_path: None,
+            agent_task_name: None,
+        };
+        assert!(access_mode_allows_permission(
+            AccessMode::FullAccess,
+            &external_request
+        ));
+        let outside_patch = vec![PatchOperation::Add {
+            path: outside,
+            contents: "agent".to_string(),
+        }];
+        build_patch_permission_admission(&config, &workspace, &outside_patch)
+            .expect_err("Full Access cannot widen a typed patch's configured roots");
+
+        let existing = root.join("existing.txt");
+        std::fs::write(&existing, "alpha").expect("seed existing file");
+        let (_, expected_identity) =
+            read_file_with_identity(&existing, 1_024).expect("capture stable identity");
+        let stale_write = vec![PatchMutation::Write {
+            path: existing.clone(),
+            text: "agent".to_string(),
+            expected_identity: Some(expected_identity),
+            rollback: FileRollbackState::Present("alpha".to_string()),
+        }];
+        std::fs::write(&existing, "bravo").expect("external same-size rewrite");
+        let (_, applied) = apply_patch_mutations(&EditSafety::default(), &stale_write, &workspace)
+            .expect_err("Full Access cannot bypass typed stable-identity revalidation");
+        assert!(applied.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&existing).expect("read preserved rewrite"),
+            "bravo"
+        );
+
+        let created = root.join("created.txt");
+        let no_clobber = vec![PatchMutation::Write {
+            path: created.clone(),
+            text: "agent".to_string(),
+            expected_identity: None,
+            rollback: FileRollbackState::Absent,
+        }];
+        std::fs::write(&created, "external").expect("external create");
+        let (_, applied) = apply_patch_mutations(&EditSafety::default(), &no_clobber, &workspace)
+            .expect_err("Full Access cannot bypass typed create no-clobber");
+        assert!(applied.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&created).expect("read preserved create"),
             "external"
         );
     }

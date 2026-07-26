@@ -12,6 +12,7 @@ use crate::session::{
     SessionStatus, ToolCallStatus,
 };
 use crate::tui::state::{AppState, RunProgressPhase, RunStatus, TranscriptKind};
+use crate::workspace::project::project_display_name;
 
 use super::artifact_projection::{
     artifact_rows_from_file_changes, file_change_rows_from_turn_items_with_root,
@@ -240,7 +241,7 @@ fn build_project_rows(
             0,
             DesktopProjectRow {
                 project_id: current_project_id,
-                label: project_folder_label(current_path),
+                label: truncate_text(&project_display_name(current_path), 34),
                 path: current_path.to_string(),
             },
         );
@@ -265,13 +266,12 @@ fn internal_desktop_project_roots(data_dir: &camino::Utf8Path) -> Vec<camino::Ut
 }
 
 fn format_project_row(project: &ProjectRecord) -> String {
-    truncate_text(&project_folder_label(&project.root_path), 34)
-}
-
-fn project_folder_label(path: &camino::Utf8Path) -> String {
-    path.file_name()
-        .map(str::to_string)
-        .unwrap_or_else(|| path.to_string())
+    let display_name = if project.display_name.trim().is_empty() {
+        project_display_name(&project.root_path)
+    } else {
+        project.display_name.clone()
+    };
+    truncate_text(&display_name, 34)
 }
 
 pub fn select_session_index(
@@ -2107,7 +2107,7 @@ mod tests {
         let projects = vec![ProjectRecord {
             id: other_project,
             root_path: Utf8PathBuf::from("C:/workspace/other"),
-            display_name: "Workspace".to_string(),
+            display_name: " Workspace ".to_string(),
             vcs_kind: "none".to_string(),
             created_at_ms: 1,
             updated_at_ms: 1,
@@ -2126,9 +2126,30 @@ mod tests {
             rows.iter()
                 .find(|row| row.project_id == other_project)
                 .map(|row| row.label.as_str()),
-            Some("other")
+            Some(" Workspace ")
         );
         assert!(rows.iter().any(|row| row.project_id == other_project));
+    }
+
+    #[test]
+    fn project_rows_keep_drive_root_authority_while_using_persisted_display_name() {
+        let project_id = ProjectId::new();
+        let root = Utf8PathBuf::from("R:/");
+        let projects = vec![ProjectRecord {
+            id: project_id,
+            root_path: root.clone(),
+            display_name: "MappedProjectFolder".to_string(),
+            vcs_kind: "none".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }];
+
+        let (rows, selected) = build_project_rows(&projects, project_id, &root, &[]);
+
+        assert_eq!(selected, 0);
+        assert_eq!(rows[0].project_id, project_id);
+        assert_eq!(rows[0].label, "MappedProjectFolder");
+        assert_eq!(rows[0].path, "R:/");
     }
 
     #[test]

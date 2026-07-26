@@ -38,6 +38,7 @@ pub(crate) struct SandboxedProcessOutput {
     pub timed_out: bool,
     pub cancelled: bool,
     pub effect_started: bool,
+    pub process_tree_reaped: bool,
     pub cleanup_errors: Vec<String>,
 }
 
@@ -56,8 +57,12 @@ pub enum SandboxExecutionError {
     InvalidProfile(String),
     #[error("OS sandbox initialization failed before process start: {0}")]
     Initialization(String),
+    #[error("OS sandbox initialization failed before process start: {0}")]
+    InitializationCleanup(String),
     #[error("OS sandbox process launch failed: {0}")]
     Spawn(String),
+    #[error("OS sandbox process launch failed: {0}")]
+    SpawnCleanup(String),
     #[error("OS sandbox worker failed: {0}")]
     Worker(String),
 }
@@ -104,11 +109,11 @@ mod windows {
         AclSizeInformation, AdjustTokenPrivileges, CopySid, CreateRestrictedToken,
         CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
         GetLengthSid, GetTokenInformation, InitializeSecurityDescriptor, IsTokenRestricted,
-        LookupPrivilegeValueW, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES,
-        SetSecurityDescriptorDacl, SetTokenInformation, TOKEN_ADJUST_DEFAULT,
-        TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-        TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenDefaultDacl, TokenGroups,
-        TokenRestrictedSids, TokenUser,
+        IsValidSid, LookupPrivilegeValueW, PROTECTED_DACL_SECURITY_INFORMATION,
+        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES, SetSecurityDescriptorDacl,
+        SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID,
+        TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
+        TokenDefaultDacl, TokenGroups, TokenRestrictedSids, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, DELETE, FILE_APPEND_DATA,
@@ -125,9 +130,11 @@ mod windows {
         JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS,
         JOB_OBJECT_UILIMIT_EXITWINDOWS, JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
         JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS,
-        JOB_OBJECT_UILIMIT_WRITECLIPBOARD, JOBOBJECT_BASIC_UI_RESTRICTIONS,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
-        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
+        JOB_OBJECT_UILIMIT_WRITECLIPBOARD, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicAccountingInformation, JobObjectBasicUIRestrictions,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        TerminateJobObject,
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
@@ -170,6 +177,7 @@ mod windows {
     const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(3);
     const WORKER_DRAIN_GRACE: Duration = Duration::from_millis(250);
     const WORKER_CANCEL_TIMEOUT: Duration = Duration::from_secs(1);
+    const EFFECT_TEMP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 
     #[repr(C)]
     struct TokenDefaultDaclInfo {
@@ -373,7 +381,7 @@ mod windows {
     }
 
     pub(super) fn execute(
-        profile: WorkspaceWriteSandboxProfile,
+        mut profile: WorkspaceWriteSandboxProfile,
         mut request: SandboxedProcessRequest,
     ) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
         if request.argv.is_empty() || request.argv[0].trim().is_empty() {
@@ -389,11 +397,34 @@ mod windows {
                 timed_out: false,
                 cancelled: true,
                 effect_started: false,
+                process_tree_reaped: true,
                 cleanup_errors: Vec::new(),
             });
         }
 
         apply_advisory_offline_environment(&mut request.environment);
+        let effect_temp = create_effect_local_temp(&mut profile, &mut request.environment)?;
+        let (effect_temp, output) = run_with_effect_temp_panic_boundary(effect_temp, move |_| {
+            execute_after_effect_temp(profile, request)
+        })?;
+        let finalization = effect_temp_finalization_for_result(&output);
+        let cleanup_errors = finalize_effect_local_temp(effect_temp, finalization);
+        match output {
+            Ok(mut output) => {
+                output.cleanup_errors.extend(cleanup_errors);
+                Ok(output)
+            }
+            Err(error) => Err(with_cleanup_errors(error, cleanup_errors)),
+        }
+    }
+
+    fn execute_after_effect_temp(
+        profile: WorkspaceWriteSandboxProfile,
+        request: SandboxedProcessRequest,
+    ) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
+        if request.cancel.is_cancelled() {
+            return Ok(cancelled_before_effect(Vec::new(), true));
+        }
         let prepared = prepare_capabilities_and_acls(
             &profile,
             &request.cwd,
@@ -401,20 +432,233 @@ mod windows {
             &request.cancel,
         )?;
         if request.cancel.is_cancelled() {
-            return Ok(cancelled_before_effect(Vec::new()));
+            return Ok(cancelled_before_effect(Vec::new(), true));
         }
         let token = create_workspace_write_token(&prepared.roots)?;
         if request.cancel.is_cancelled() {
-            return Ok(cancelled_before_effect(Vec::new()));
+            return Ok(cancelled_before_effect(Vec::new(), true));
         }
         let output = spawn_and_capture(token, request);
         drop(prepared);
         output
     }
 
+    #[derive(Debug)]
+    struct EffectLocalTempDirectory {
+        path: std::path::PathBuf,
+    }
+
+    impl EffectLocalTempDirectory {
+        fn take_explicit_ownership(directory: tempfile::TempDir) -> Self {
+            Self {
+                path: directory.keep(),
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+
+        fn remove(self) -> std::io::Result<()> {
+            std::fs::remove_dir_all(self.path)
+        }
+    }
+
+    // Effect-local TEMP deliberately has no Drop cleanup. A panic can unwind
+    // while the sandbox Job still has active descendants, so deletion is only
+    // allowed through the explicit finalizer after process-tree exit is known.
+    fn run_with_effect_temp_panic_boundary<T>(
+        directory: EffectLocalTempDirectory,
+        worker: impl FnOnce(&EffectLocalTempDirectory) -> Result<T, SandboxExecutionError>,
+    ) -> Result<(EffectLocalTempDirectory, Result<T, SandboxExecutionError>), SandboxExecutionError>
+    {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(&directory))) {
+            Ok(result) => Ok((directory, result)),
+            Err(_) => {
+                let path = directory.path().to_path_buf();
+                drop(directory);
+                Err(SandboxExecutionError::Worker(format!(
+                    "workspace-write worker panicked; effect-local temp directory `{}` was preserved because sandbox Job process-tree exit was not established",
+                    path.display()
+                )))
+            }
+        }
+    }
+
+    fn create_effect_local_temp(
+        profile: &mut WorkspaceWriteSandboxProfile,
+        environment: &mut std::collections::HashMap<String, String>,
+    ) -> Result<EffectLocalTempDirectory, SandboxExecutionError> {
+        let base = profile.effect_temp_base.clone().ok_or_else(|| {
+            SandboxExecutionError::InvalidProfile(
+                "workspace-write profile has no admitted effect temp base".to_string(),
+            )
+        })?;
+        // Pin and revalidate the admitted base while the parent creates and
+        // snapshots the execution-local directory. The base itself is never
+        // placed in the restricted child's capability set.
+        let base_handle = open_verified_identity_path(&base)?;
+        validate_effect_temp_base_acl(base_handle.raw(), &base.requested)?;
+        let directory = tempfile::Builder::new()
+            .prefix("moyai-sandbox-effect-")
+            .tempdir_in(base.requested.as_std_path())
+            .map_err(|error| {
+                SandboxExecutionError::Initialization(format!(
+                    "failed to create effect-local temp directory under `{}`: {error}",
+                    base.requested
+                ))
+            })?;
+        // Stop TempDir's unwind-time deletion immediately. From this point,
+        // every removal is an explicit lifecycle decision.
+        let directory = EffectLocalTempDirectory::take_explicit_ownership(directory);
+        let (directory, initialization) =
+            run_with_effect_temp_panic_boundary(directory, |directory| {
+                let path =
+                    Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).map_err(|path| {
+                        SandboxExecutionError::Initialization(format!(
+                            "effect-local temp directory is not valid UTF-8: {}",
+                            path.display()
+                        ))
+                    })?;
+                if let Err(error) = profile.admit_effect_temp_directory(&path) {
+                    return Err(SandboxExecutionError::Initialization(format!(
+                        "failed to admit effect-local temp directory `{path}`: {error}"
+                    )));
+                }
+                environment.retain(|key, _| {
+                    !["TEMP", "TMP", "TMPDIR"]
+                        .iter()
+                        .any(|candidate| key.eq_ignore_ascii_case(candidate))
+                });
+                for key in ["TEMP", "TMP", "TMPDIR"] {
+                    environment.insert(key.to_string(), path.to_string());
+                }
+                Ok(())
+            })?;
+        drop(base_handle);
+        match initialization {
+            Ok(()) => Ok(directory),
+            Err(error) => Err(with_cleanup_errors(
+                error,
+                close_effect_local_temp(directory),
+            )),
+        }
+    }
+
+    fn close_effect_local_temp(directory: EffectLocalTempDirectory) -> Vec<String> {
+        let path = directory.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        if let Err(error) = std::thread::Builder::new()
+            .name("moyai-effect-temp-cleanup".to_string())
+            .spawn(move || {
+                let _ = sender.send(directory.remove());
+            })
+        {
+            return vec![format!(
+                "failed to start effect-local temp cleanup worker for `{}`; directory was preserved: {error}",
+                path.display()
+            )];
+        }
+        match receiver.recv_timeout(EFFECT_TEMP_CLEANUP_TIMEOUT) {
+            Ok(Ok(())) => Vec::new(),
+            Ok(Err(error)) => {
+                vec![format!(
+                    "failed to remove effect-local temp directory `{}`: {error}",
+                    path.display()
+                )]
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                vec![format!(
+                    "effect-local temp cleanup for `{}` exceeded {} ms and continues in the background",
+                    path.display(),
+                    EFFECT_TEMP_CLEANUP_TIMEOUT.as_millis()
+                )]
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                vec![format!(
+                    "effect-local temp cleanup worker for `{}` disconnected",
+                    path.display()
+                )]
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum EffectTempFinalization {
+        Remove,
+        PreserveProcessTreeUnknown,
+    }
+
+    fn effect_temp_finalization_for_result(
+        result: &Result<SandboxedProcessOutput, SandboxExecutionError>,
+    ) -> EffectTempFinalization {
+        match result {
+            Ok(output) if !output.process_tree_reaped => {
+                EffectTempFinalization::PreserveProcessTreeUnknown
+            }
+            Err(
+                SandboxExecutionError::InitializationCleanup(_)
+                | SandboxExecutionError::SpawnCleanup(_),
+            ) => EffectTempFinalization::PreserveProcessTreeUnknown,
+            Ok(_) | Err(_) => EffectTempFinalization::Remove,
+        }
+    }
+
+    fn finalize_effect_local_temp(
+        directory: EffectLocalTempDirectory,
+        finalization: EffectTempFinalization,
+    ) -> Vec<String> {
+        if finalization == EffectTempFinalization::Remove {
+            return close_effect_local_temp(directory);
+        }
+        let path = directory.path().to_path_buf();
+        drop(directory);
+        vec![format!(
+            "effect-local temp directory `{}` was preserved because sandbox Job process-tree exit was not established",
+            path.display()
+        )]
+    }
+
+    fn with_cleanup_errors(
+        error: SandboxExecutionError,
+        cleanup_errors: Vec<String>,
+    ) -> SandboxExecutionError {
+        if cleanup_errors.is_empty() {
+            return error;
+        }
+        let cleanup = cleanup_errors.join("; ");
+        match error {
+            SandboxExecutionError::InvalidProfile(message) => {
+                SandboxExecutionError::InvalidProfile(format!(
+                    "{message}; cleanup failed: {cleanup}"
+                ))
+            }
+            SandboxExecutionError::Initialization(message) => {
+                SandboxExecutionError::Initialization(format!(
+                    "{message}; cleanup failed: {cleanup}"
+                ))
+            }
+            SandboxExecutionError::InitializationCleanup(message) => {
+                SandboxExecutionError::InitializationCleanup(format!(
+                    "{message}; cleanup failed: {cleanup}"
+                ))
+            }
+            SandboxExecutionError::Spawn(message) => {
+                SandboxExecutionError::SpawnCleanup(format!("{message}; cleanup failed: {cleanup}"))
+            }
+            SandboxExecutionError::SpawnCleanup(message) => {
+                SandboxExecutionError::SpawnCleanup(format!("{message}; cleanup failed: {cleanup}"))
+            }
+            SandboxExecutionError::Worker(message) => {
+                SandboxExecutionError::Worker(format!("{message}; cleanup failed: {cleanup}"))
+            }
+        }
+    }
+
     struct RootCapability {
         root: SandboxPathSnapshot,
         sid: LocalSid,
+        deny_outside_root: bool,
         _handle: OwnedHandle,
     }
 
@@ -439,22 +683,28 @@ mod windows {
         for root in &profile.writable_roots {
             let handle = open_verified_acl_path(root)?;
             let sid = LocalSid::from_string(&capability_sid_for_root(root))?;
-            update_opened_path_acl(
-                handle.raw(),
-                &root.requested,
-                sid.raw(),
-                AclChange::AllowWrite,
-            )?;
+            let is_effect_temp = profile.effect_temp_directory.as_ref() == Some(root);
+            if is_effect_temp {
+                replace_effect_temp_acl(handle.raw(), &root.requested, sid.raw())?;
+            } else {
+                update_opened_path_acl(
+                    handle.raw(),
+                    &root.requested,
+                    sid.raw(),
+                    AclChange::AllowWrite,
+                )?;
+            }
             roots.push(RootCapability {
                 root: root.clone(),
                 sid,
+                deny_outside_root: !is_effect_temp,
                 _handle: handle,
             });
         }
         let mut protected_handles = Vec::with_capacity(profile.read_only_roots.len());
         for protected in &profile.read_only_roots {
             let handle = open_verified_acl_path(protected)?;
-            for root in &roots {
+            for root in roots.iter().filter(|root| root.deny_outside_root) {
                 // A protected object may live outside every writable root (for
                 // example a worktree gitdir). Deny every active capability SID
                 // unconditionally so ambient Everyone/logon grants cannot make
@@ -540,7 +790,7 @@ mod windows {
                 )));
             }
             let mut deny_applied = true;
-            for root in roots {
+            for root in roots.iter().filter(|root| root.deny_outside_root) {
                 if update_opened_path_acl(
                     write_handle.raw(),
                     &candidate,
@@ -743,6 +993,116 @@ mod windows {
         Ok(acl_has_any_write_allow(dacl, world_sid))
     }
 
+    fn validate_effect_temp_base_acl(
+        handle: HANDLE,
+        path: &camino::Utf8Path,
+    ) -> Result<(), SandboxExecutionError> {
+        let token = open_current_process_token()?;
+        let mut logon = token_logon_sid(token.raw())?;
+        let mut world = world_sid()?;
+        let shared_restricting_sids = [
+            ("World SID", world.as_mut_ptr().cast()),
+            ("current logon SID", logon.as_mut_ptr().cast()),
+        ];
+        let mut descriptor = null_mut();
+        let mut dacl = null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "GetSecurityInfo failed for effect temp base `{path}` with {status}"
+            )));
+        }
+        let _descriptor = LocalAllocation(descriptor);
+        if dacl.is_null() {
+            return Err(SandboxExecutionError::InvalidProfile(format!(
+                "effect temp base `{path}` has a NULL DACL"
+            )));
+        }
+
+        let mut info: ACL_SIZE_INFORMATION = unsafe { zeroed() };
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "GetAclInformation failed for effect temp base `{path}`: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        let unsafe_mask = GENERIC_ALL
+            | GENERIC_WRITE_MASK
+            | FILE_GENERIC_WRITE
+            | FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_WRITE_EA
+            | FILE_WRITE_ATTRIBUTES
+            | WRITE_DAC
+            | WRITE_OWNER
+            | DELETE
+            | 0x0000_0040; // FILE_DELETE_CHILD
+        for index in 0..info.AceCount {
+            let mut raw_ace = null_mut();
+            if unsafe { GetAce(dacl, index, &mut raw_ace) } == 0 {
+                return Err(SandboxExecutionError::Initialization(format!(
+                    "GetAce failed for effect temp base `{path}` at index {index}: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            let header = unsafe { &*(raw_ace as *const ACE_HEADER) };
+            match header.AceType {
+                ACCESS_DENIED_ACE_TYPE => continue,
+                ACCESS_ALLOWED_ACE_TYPE => {}
+                unsupported => {
+                    return Err(SandboxExecutionError::InvalidProfile(format!(
+                        "effect temp base `{path}` contains unsupported ACE type {unsupported}; shared write authority cannot be proven absent"
+                    )));
+                }
+            }
+            if usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>() {
+                return Err(SandboxExecutionError::InvalidProfile(format!(
+                    "effect temp base `{path}` contains a malformed allow ACE at index {index}"
+                )));
+            }
+            let sid_ptr =
+                (raw_ace as usize + size_of::<ACE_HEADER>() + size_of::<u32>()) as *mut c_void;
+            if unsafe { IsValidSid(sid_ptr) } == 0 {
+                return Err(SandboxExecutionError::InvalidProfile(format!(
+                    "effect temp base `{path}` contains an invalid SID at ACE index {index}"
+                )));
+            }
+            let mask = unsafe { (*(raw_ace as *const ACCESS_ALLOWED_ACE)).Mask };
+            if mask & unsafe_mask == 0 {
+                continue;
+            }
+            if let Some((label, _)) = shared_restricting_sids
+                .iter()
+                .find(|(_, sid)| unsafe { EqualSid(sid_ptr, *sid) } != 0)
+            {
+                return Err(SandboxExecutionError::InvalidProfile(format!(
+                    "effect temp base `{path}` grants {label} write or ACL-control authority"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn acl_has_any_write_allow(dacl: *mut ACL, sid: *mut c_void) -> bool {
         let mut info: ACL_SIZE_INFORMATION = unsafe { zeroed() };
         if unsafe {
@@ -803,6 +1163,65 @@ mod windows {
         )
     }
 
+    fn replace_effect_temp_acl(
+        handle: HANDLE,
+        path: &camino::Utf8Path,
+        capability_sid: *mut c_void,
+    ) -> Result<(), SandboxExecutionError> {
+        let token = open_current_process_token()?;
+        let mut user_sid = token_user_sid(token.raw())?;
+        let mut system_sid = system_sid()?;
+        let trustees = [
+            (user_sid.as_mut_ptr().cast(), GENERIC_ALL),
+            (system_sid.as_mut_ptr().cast(), GENERIC_ALL),
+            (capability_sid, AclChange::AllowWrite.mask()),
+        ];
+        let entries = trustees.map(|(sid, mask)| EXPLICIT_ACCESS_W {
+            grfAccessPermissions: mask,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: CONTAINER_AND_OBJECT_INHERIT,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: null_mut(),
+                MultipleTrusteeOperation: 0,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_UNKNOWN,
+                ptstrName: sid.cast(),
+            },
+        });
+        let mut dacl = null_mut();
+        let status = unsafe {
+            SetEntriesInAclW(
+                entries.len() as u32,
+                entries.as_ptr(),
+                null_mut(),
+                &mut dacl,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "SetEntriesInAclW failed for private effect TEMP `{path}` with {status}"
+            )));
+        }
+        let dacl = LocalAcl(dacl);
+        let status = unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl.0,
+                null_mut(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "SetSecurityInfo failed for private effect TEMP `{path}` with {status}"
+            )));
+        }
+        Ok(())
+    }
+
     fn path_is_within(path: &camino::Utf8Path, root: &camino::Utf8Path) -> bool {
         let path = path.as_str().replace('/', "\\").to_lowercase();
         let root = root
@@ -829,13 +1248,11 @@ mod windows {
                     FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE
                 }
                 Self::DenyWrite | Self::DenyWriteNonInheriting => {
-                    GENERIC_ALL
-                        | FILE_GENERIC_WRITE
+                    FILE_GENERIC_WRITE
                         | FILE_WRITE_DATA
                         | FILE_APPEND_DATA
                         | FILE_WRITE_EA
                         | FILE_WRITE_ATTRIBUTES
-                        | GENERIC_WRITE_MASK
                         | WRITE_DAC
                         | WRITE_OWNER
                         | DELETE
@@ -928,6 +1345,55 @@ mod windows {
                     "protected sandbox file `{path}` changed contents after permission admission"
                 )));
             }
+        }
+        Ok(handle)
+    }
+
+    fn open_verified_identity_path(
+        snapshot: &SandboxPathSnapshot,
+    ) -> Result<OwnedHandle, SandboxExecutionError> {
+        let path = &snapshot.requested;
+        let wide = to_wide(path.as_str());
+        let handle = OwnedHandle::new(
+            unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    null_mut(),
+                )
+            },
+            &format!("open sandbox identity path `{path}`"),
+        )?;
+        verify_opened_path(handle.raw(), &snapshot.canonical)?;
+        let mut attributes: FILE_ATTRIBUTE_TAG_INFO = unsafe { zeroed() };
+        if unsafe {
+            GetFileInformationByHandleEx(
+                handle.raw(),
+                FileAttributeTagInfo,
+                (&mut attributes as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+                u32::try_from(size_of::<FILE_ATTRIBUTE_TAG_INFO>())
+                    .expect("file attribute tag info size fits u32"),
+            )
+        } == 0
+        {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "failed to classify opened sandbox identity path `{path}`: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "opened sandbox identity path `{path}` is a reparse point"
+            )));
+        }
+        if opened_object_identity(handle.raw())? != snapshot.identity {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "sandbox identity path `{path}` changed object identity after permission admission"
+            )));
         }
         Ok(handle)
     }
@@ -1623,7 +2089,7 @@ mod windows {
             creation_flags |= CREATE_NO_WINDOW;
         }
         if request.cancel.is_cancelled() {
-            return Ok(cancelled_before_effect(Vec::new()));
+            return Ok(cancelled_before_effect(Vec::new(), true));
         }
         let spawned = unsafe {
             CreateProcessAsUserW(
@@ -1650,20 +2116,30 @@ mod windows {
         }
         if !valid_handle(process_info.hProcess) || !valid_handle(process_info.hThread) {
             let error = std::io::Error::last_os_error();
+            let mut cleanup_errors = Vec::new();
             if valid_handle(process_info.hProcess) {
-                unsafe {
-                    TerminateProcess(process_info.hProcess, 1);
-                    WaitForSingleObject(process_info.hProcess, 3_000);
-                    CloseHandle(process_info.hProcess);
-                }
+                let process = OwnedHandle(process_info.hProcess);
+                cleanup_errors.extend(terminate_suspended_process(&process));
+            } else {
+                cleanup_errors.push(
+                    "CreateProcessAsUserW succeeded without a process handle; process exit cannot be established"
+                        .to_string(),
+                );
             }
             if valid_handle(process_info.hThread) {
                 unsafe {
                     CloseHandle(process_info.hThread);
                 }
             }
-            return Err(SandboxExecutionError::Spawn(format!(
+            let message = format!(
                 "CreateProcessAsUserW returned an invalid process or thread handle: {error}"
+            );
+            if cleanup_errors.is_empty() {
+                return Err(SandboxExecutionError::Spawn(message));
+            }
+            return Err(SandboxExecutionError::SpawnCleanup(format!(
+                "{message}; cleanup failed: {}",
+                cleanup_errors.join("; ")
             )));
         }
         let process = OwnedHandle(process_info.hProcess);
@@ -1676,26 +2152,40 @@ mod windows {
         let job = match create_kill_on_close_job(process.raw()) {
             Ok(job) => job,
             Err(error) => {
-                unsafe {
-                    TerminateProcess(process.raw(), 1);
-                    WaitForSingleObject(process.raw(), 3_000);
+                let cleanup_errors = terminate_suspended_process(&process);
+                if cleanup_errors.is_empty() {
+                    return Err(error);
                 }
-                return Err(error);
+                let message = match error {
+                    SandboxExecutionError::Initialization(message)
+                    | SandboxExecutionError::InitializationCleanup(message) => message,
+                    other => return Err(other),
+                };
+                return Err(SandboxExecutionError::InitializationCleanup(format!(
+                    "{message}; cleanup failed: {}",
+                    cleanup_errors.join("; ")
+                )));
             }
         };
         if request.cancel.is_cancelled() {
-            let cleanup_errors = terminate_and_reap_job(&job, &process);
-            return Ok(cancelled_before_effect(cleanup_errors));
+            drop(thread);
+            let (cleanup_errors, process_tree_reaped) = terminate_and_reap_job(&job, process);
+            return Ok(cancelled_before_effect(cleanup_errors, process_tree_reaped));
         }
         if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
             let error = std::io::Error::last_os_error();
-            let cleanup_errors = terminate_and_reap_job(&job, &process);
+            drop(thread);
+            let (cleanup_errors, process_tree_reaped) = terminate_and_reap_job(&job, process);
             let cleanup = (!cleanup_errors.is_empty())
                 .then(|| format!("; cleanup: {}", cleanup_errors.join("; ")))
                 .unwrap_or_default();
-            return Err(SandboxExecutionError::Spawn(format!(
-                "failed to resume sandbox process after Job assignment: {error}{cleanup}"
-            )));
+            let message =
+                format!("failed to resume sandbox process after Job assignment: {error}{cleanup}");
+            return Err(if process_tree_reaped && cleanup_errors.is_empty() {
+                SandboxExecutionError::Spawn(message)
+            } else {
+                SandboxExecutionError::SpawnCleanup(message)
+            });
         }
         drop(thread);
 
@@ -1747,35 +2237,9 @@ mod windows {
             let error = std::io::Error::last_os_error();
             cleanup_errors.push(format!("failed to terminate sandbox Job: {error}"));
         }
-        let reap_deadline = Instant::now() + PROCESS_REAP_TIMEOUT;
-        loop {
-            match unsafe { WaitForSingleObject(process.raw(), 50) } {
-                WAIT_OBJECT_0 => break,
-                WAIT_TIMEOUT if Instant::now() < reap_deadline => continue,
-                WAIT_TIMEOUT => {
-                    cleanup_errors.push(format!(
-                        "sandbox process did not exit within {} ms after Job termination",
-                        PROCESS_REAP_TIMEOUT.as_millis()
-                    ));
-                    break;
-                }
-                WAIT_FAILED => {
-                    cleanup_errors.push(format!(
-                        "failed to reap sandbox process: {}",
-                        std::io::Error::last_os_error()
-                    ));
-                    break;
-                }
-                value => {
-                    cleanup_errors.push(format!(
-                        "sandbox process reap returned unexpected status {value}"
-                    ));
-                    break;
-                }
-            }
-        }
-        drop(job);
         drop(process);
+        let process_tree_reaped = wait_for_job_process_tree_exit(&job, &mut cleanup_errors);
+        drop(job);
         drop(token);
 
         match join_worker_bounded(stdin_writer, "stdin writer", &mut cleanup_errors) {
@@ -1804,6 +2268,7 @@ mod windows {
             timed_out,
             cancelled,
             effect_started: true,
+            process_tree_reaped,
             cleanup_errors,
         })
     }
@@ -1859,7 +2324,10 @@ mod windows {
         !handle.is_null() && handle != INVALID_HANDLE_VALUE
     }
 
-    fn cancelled_before_effect(cleanup_errors: Vec<String>) -> SandboxedProcessOutput {
+    fn cancelled_before_effect(
+        cleanup_errors: Vec<String>,
+        process_tree_reaped: bool,
+    ) -> SandboxedProcessOutput {
         SandboxedProcessOutput {
             exit_code: None,
             stdout: empty_output(),
@@ -1867,11 +2335,37 @@ mod windows {
             timed_out: false,
             cancelled: true,
             effect_started: false,
+            process_tree_reaped,
             cleanup_errors,
         }
     }
 
-    fn terminate_and_reap_job(job: &OwnedHandle, process: &OwnedHandle) -> Vec<String> {
+    fn terminate_suspended_process(process: &OwnedHandle) -> Vec<String> {
+        let mut cleanup_errors = Vec::new();
+        if unsafe { TerminateProcess(process.raw(), 1) } == 0 {
+            cleanup_errors.push(format!(
+                "failed to terminate suspended sandbox process: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        match unsafe { WaitForSingleObject(process.raw(), 3_000) } {
+            WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => cleanup_errors.push(
+                "suspended sandbox process did not exit within 3000 ms after termination"
+                    .to_string(),
+            ),
+            WAIT_FAILED => cleanup_errors.push(format!(
+                "failed to wait for suspended sandbox process exit: {}",
+                std::io::Error::last_os_error()
+            )),
+            value => cleanup_errors.push(format!(
+                "waiting for suspended sandbox process returned unexpected status {value}"
+            )),
+        }
+        cleanup_errors
+    }
+
+    fn terminate_and_reap_job(job: &OwnedHandle, process: OwnedHandle) -> (Vec<String>, bool) {
         let mut cleanup_errors = Vec::new();
         if unsafe { TerminateJobObject(job.raw(), 1) } == 0 {
             cleanup_errors.push(format!(
@@ -1879,26 +2373,44 @@ mod windows {
                 std::io::Error::last_os_error()
             ));
         }
-        match unsafe {
-            WaitForSingleObject(
-                process.raw(),
-                u32::try_from(PROCESS_REAP_TIMEOUT.as_millis()).unwrap_or(u32::MAX),
-            )
-        } {
-            WAIT_OBJECT_0 => {}
-            WAIT_TIMEOUT => cleanup_errors.push(format!(
-                "sandbox process did not exit within {} ms after Job termination",
-                PROCESS_REAP_TIMEOUT.as_millis()
-            )),
-            WAIT_FAILED => cleanup_errors.push(format!(
-                "failed to reap sandbox process: {}",
-                std::io::Error::last_os_error()
-            )),
-            value => cleanup_errors.push(format!(
-                "sandbox process reap returned unexpected status {value}"
-            )),
+        drop(process);
+        let process_tree_reaped = wait_for_job_process_tree_exit(job, &mut cleanup_errors);
+        (cleanup_errors, process_tree_reaped)
+    }
+
+    fn wait_for_job_process_tree_exit(job: &OwnedHandle, cleanup_errors: &mut Vec<String>) -> bool {
+        let deadline = Instant::now() + PROCESS_REAP_TIMEOUT;
+        loop {
+            let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { zeroed() };
+            if unsafe {
+                QueryInformationJobObject(
+                    job.raw(),
+                    JobObjectBasicAccountingInformation,
+                    (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    null_mut(),
+                )
+            } == 0
+            {
+                cleanup_errors.push(format!(
+                    "failed to query sandbox Job process accounting: {}",
+                    std::io::Error::last_os_error()
+                ));
+                return false;
+            }
+            if accounting.ActiveProcesses == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                cleanup_errors.push(format!(
+                    "sandbox Job retained {} active process(es) {} ms after termination",
+                    accounting.ActiveProcesses,
+                    PROCESS_REAP_TIMEOUT.as_millis()
+                ));
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
-        cleanup_errors
     }
 
     fn create_pipe_pair(label: &str) -> Result<(OwnedHandle, OwnedHandle), SandboxExecutionError> {
@@ -2155,16 +2667,79 @@ mod windows {
     }
 
     #[cfg(test)]
+    pub(super) fn test_acl_ace_count(
+        path: &camino::Utf8Path,
+    ) -> Result<u32, SandboxExecutionError> {
+        let handle = open_audit_candidate(path, READ_CONTROL)?;
+        let mut descriptor = null_mut();
+        let mut dacl = null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                handle.raw(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "GetSecurityInfo failed for test ACL count `{path}` with {status}"
+            )));
+        }
+        let _descriptor = LocalAllocation(descriptor);
+        if dacl.is_null() {
+            return Ok(0);
+        }
+        let mut info: ACL_SIZE_INFORMATION = unsafe { zeroed() };
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(SandboxExecutionError::Initialization(format!(
+                "GetAclInformation failed for test ACL count `{path}`: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(info.AceCount)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_grant_current_logon_write(
+        path: &camino::Utf8Path,
+    ) -> Result<(), SandboxExecutionError> {
+        let handle = open_audit_candidate(path, READ_CONTROL | WRITE_DAC)?;
+        let token = open_current_process_token()?;
+        let mut logon = token_logon_sid(token.raw())?;
+        update_opened_path_acl(
+            handle.raw(),
+            path,
+            logon.as_mut_ptr().cast(),
+            AclChange::AllowWrite,
+        )
+    }
+
+    #[cfg(test)]
     mod tests {
         use std::collections::HashMap;
 
         use super::{
-            ACCESS_ALLOWED_ACE_TYPE, CONTAINER_AND_OBJECT_INHERIT, GENERIC_ALL, INHERIT_ONLY_ACE,
-            NO_PROPAGATE_INHERIT_ACE, TokenDefaultDaclInfo, ace_inheritance_is_sufficient,
+            ACCESS_ALLOWED_ACE_TYPE, CONTAINER_AND_OBJECT_INHERIT, EffectLocalTempDirectory,
+            EffectTempFinalization, GENERIC_ALL, INHERIT_ONLY_ACE, NO_PROPAGATE_INHERIT_ACE,
+            SandboxExecutionError, TokenDefaultDaclInfo, ace_inheritance_is_sufficient,
             acl_has_entry, apply_advisory_offline_environment, argv_to_command_line,
-            canonical_windows_path_is_local, capability_sid_for_root, create_workspace_write_token,
-            environment_block, normalize_windows_identity, open_current_process_token,
-            token_logon_sid, token_user_sid, world_sid,
+            cancelled_before_effect, canonical_windows_path_is_local, capability_sid_for_root,
+            create_workspace_write_token, effect_temp_finalization_for_result, environment_block,
+            finalize_effect_local_temp, normalize_windows_identity, open_current_process_token,
+            run_with_effect_temp_panic_boundary, token_logon_sid, token_user_sid, world_sid,
         };
         use crate::tool::os_sandbox::{SandboxPathSnapshot, WindowsSandboxObjectIdentity};
         use camino::Utf8PathBuf;
@@ -2179,6 +2754,120 @@ mod windows {
                     file_id: [file_id; 16],
                 },
             }
+        }
+
+        #[test]
+        fn spawn_cleanup_preserves_effect_temp_when_process_tree_exit_is_unconfirmed() {
+            let parent = tempfile::tempdir().expect("parent tempdir");
+            let effect = tempfile::Builder::new()
+                .prefix("moyai-unreaped-effect-")
+                .tempdir_in(parent.path())
+                .expect("effect tempdir");
+            let path = effect.path().to_path_buf();
+            let effect = EffectLocalTempDirectory::take_explicit_ownership(effect);
+            let result = Err(SandboxExecutionError::SpawnCleanup(
+                "fault-injected process-tree uncertainty".to_string(),
+            ));
+
+            let errors =
+                finalize_effect_local_temp(effect, effect_temp_finalization_for_result(&result));
+
+            assert!(path.exists(), "unconfirmed process tree must retain TEMP");
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("process-tree exit was not established")),
+                "{errors:?}"
+            );
+            std::fs::remove_dir_all(path).expect("remove retained test directory");
+        }
+
+        #[test]
+        fn effect_temp_finalization_maps_cleanup_uncertainty() {
+            let reaped = Ok(cancelled_before_effect(Vec::new(), true));
+            let unreaped = Ok(cancelled_before_effect(Vec::new(), false));
+            assert_eq!(
+                effect_temp_finalization_for_result(&reaped),
+                EffectTempFinalization::Remove
+            );
+            assert_eq!(
+                effect_temp_finalization_for_result(&unreaped),
+                EffectTempFinalization::PreserveProcessTreeUnknown
+            );
+
+            for error in [
+                SandboxExecutionError::InvalidProfile("invalid".to_string()),
+                SandboxExecutionError::Initialization("initialization".to_string()),
+                SandboxExecutionError::Spawn("spawn".to_string()),
+                SandboxExecutionError::Worker("worker".to_string()),
+            ] {
+                assert_eq!(
+                    effect_temp_finalization_for_result(&Err(error)),
+                    EffectTempFinalization::Remove
+                );
+            }
+            for error in [
+                SandboxExecutionError::InitializationCleanup("initialization cleanup".to_string()),
+                SandboxExecutionError::SpawnCleanup("spawn cleanup".to_string()),
+            ] {
+                assert_eq!(
+                    effect_temp_finalization_for_result(&Err(error)),
+                    EffectTempFinalization::PreserveProcessTreeUnknown
+                );
+            }
+        }
+
+        #[test]
+        fn pre_effect_initialization_failure_explicitly_removes_effect_temp() {
+            let parent = tempfile::tempdir().expect("parent tempdir");
+            let effect = tempfile::Builder::new()
+                .prefix("moyai-initialization-failure-effect-")
+                .tempdir_in(parent.path())
+                .expect("effect tempdir");
+            let path = effect.path().to_path_buf();
+            let effect = EffectLocalTempDirectory::take_explicit_ownership(effect);
+            let result = Err(SandboxExecutionError::Initialization(
+                "fault-injected initialization failure".to_string(),
+            ));
+
+            let errors =
+                finalize_effect_local_temp(effect, effect_temp_finalization_for_result(&result));
+
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(!path.exists(), "pre-effect failure must clean up TEMP");
+        }
+
+        #[test]
+        fn worker_panic_preserves_explicitly_owned_effect_temp() {
+            let parent = tempfile::tempdir().expect("parent tempdir");
+            let effect = tempfile::Builder::new()
+                .prefix("moyai-worker-panic-effect-")
+                .tempdir_in(parent.path())
+                .expect("effect tempdir");
+            let path = effect.path().to_path_buf();
+            let effect = EffectLocalTempDirectory::take_explicit_ownership(effect);
+
+            let error = run_with_effect_temp_panic_boundary(
+                effect,
+                |_| -> Result<(), SandboxExecutionError> {
+                    panic!("fault-injected sandbox worker panic");
+                },
+            )
+            .expect_err("panic must become a typed worker failure");
+
+            let SandboxExecutionError::Worker(message) = error else {
+                panic!("unexpected panic mapping: {error:?}");
+            };
+            assert!(path.exists(), "worker panic must preserve TEMP");
+            assert!(
+                message.contains(path.to_string_lossy().as_ref()),
+                "{message}"
+            );
+            assert!(
+                message.contains("process-tree exit was not established"),
+                "{message}"
+            );
+            std::fs::remove_dir_all(path).expect("remove retained test directory");
         }
 
         #[test]
@@ -2401,14 +3090,10 @@ mod integration_tests {
             git_meta.join("config"),
         ];
         let protected_instruction_files = [&agents_file, &claude_file, &configured_instruction];
-        let temp_target = Utf8PathBuf::from_path_buf(std::env::temp_dir())
-            .expect("utf8 temp")
-            .join(format!("moyai-sandbox-{}.txt", ulid::Ulid::new()));
         let mut script = format!(
-            "$ErrorActionPreference='Stop'; Set-Content -LiteralPath '{}' -Value inside; Set-Content -LiteralPath '{}' -Value additional; Set-Content -LiteralPath '{}' -Value temporary; Get-Content -LiteralPath '{}' | Out-Null; Write-Output protected-read-ok; try {{ Set-Content -LiteralPath '{}' -Value outside; Write-Output outside-allowed }} catch {{ Write-Output outside-denied }}; ",
+            "$ErrorActionPreference='Stop'; Set-Content -LiteralPath '{}' -Value inside; Set-Content -LiteralPath '{}' -Value additional; Get-Content -LiteralPath '{}' | Out-Null; Write-Output protected-read-ok; try {{ Set-Content -LiteralPath '{}' -Value outside; Write-Output outside-allowed }} catch {{ Write-Output outside-denied }}; ",
             ps_literal(&inside),
             ps_literal(&additional),
-            ps_literal(&temp_target),
             ps_literal(&git_file),
             ps_literal(&outside),
         );
@@ -2464,7 +3149,6 @@ mod integration_tests {
         );
         assert!(inside.exists());
         assert!(additional.exists());
-        assert!(temp_target.exists());
         assert!(!outside.exists(), "outside write escaped sandbox");
         assert_eq!(
             std::fs::read_to_string(&git_file).expect("gitdir content"),
@@ -2503,7 +3187,530 @@ mod integration_tests {
                 "stdout={stdout}"
             );
         }
-        std::fs::remove_file(&temp_target).expect("remove sandbox temp output");
+    }
+
+    #[tokio::test]
+    async fn restricted_children_receive_fresh_effect_local_temp_directories() {
+        std::fs::create_dir_all("target").expect("target directory");
+        let fixture = tempfile::Builder::new()
+            .prefix("moyai-sandbox-effect-temp-")
+            .tempdir_in("target")
+            .expect("sandbox fixture");
+        let fixture =
+            Utf8PathBuf::from_path_buf(fixture.path().to_path_buf()).expect("utf8 fixture");
+        let workspace_root = fixture.join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("workspace");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&workspace_root, &config)
+            .expect("workspace discovery");
+        let ProcessSandboxPlan::WorkspaceWrite(profile) =
+            ProcessSandboxPlan::for_access_mode(AccessMode::Default, &workspace)
+                .expect("sandbox profile")
+        else {
+            panic!("default must resolve workspace-write");
+        };
+        let script = "$ErrorActionPreference='Stop'; \
+            if ($env:TEMP -ne $env:TMP -or $env:TEMP -ne $env:TMPDIR) { throw 'temp env mismatch' }; \
+            $nested = Join-Path $env:TEMP 'repeatable-nested\\run-0'; \
+            New-Item -ItemType Directory -Path $nested -Force | Out-Null; \
+            Set-Content -LiteralPath (Join-Path $nested 'probe.txt') -Value ok; \
+            Write-Output \"EFFECT_TEMP=$env:TEMP\"";
+        let mut effect_temp_paths = Vec::new();
+
+        for _ in 0..2 {
+            let output = execute_workspace_write(
+                profile.clone(),
+                SandboxedProcessRequest {
+                    argv: vec![
+                        "powershell.exe".to_string(),
+                        "-NoProfile".to_string(),
+                        "-NonInteractive".to_string(),
+                        "-Command".to_string(),
+                        script.to_string(),
+                    ],
+                    cwd: workspace_root.clone(),
+                    environment: captured_process_environment(&config.shell),
+                    stdin: Vec::new(),
+                    timeout_ms: 30_000,
+                    max_output_bytes: 8 * 1024,
+                    hide_window: true,
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await
+            .expect("sandboxed child");
+            assert_eq!(
+                output.exit_code,
+                Some(0),
+                "stderr={}",
+                String::from_utf8_lossy(&output.stderr.bytes)
+            );
+            assert!(
+                output.cleanup_errors.is_empty(),
+                "cleanup errors: {:?}",
+                output.cleanup_errors
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout.bytes);
+            let path = stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("EFFECT_TEMP="))
+                .map(Utf8PathBuf::from)
+                .expect("effect temp path");
+            let host_temp =
+                Utf8PathBuf::from_path_buf(std::env::temp_dir()).expect("utf8 host temp");
+            assert_ne!(path, host_temp, "child inherited the shared host TEMP");
+            assert!(
+                path.starts_with(&host_temp),
+                "effect temp `{path}` escaped admitted host temp `{host_temp}`"
+            );
+            assert!(
+                !path.exists(),
+                "effect temp `{path}` remained after process-tree cleanup"
+            );
+            effect_temp_paths.push(path);
+        }
+
+        assert_ne!(
+            effect_temp_paths[0], effect_temp_paths[1],
+            "separate effects reused one temp directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn everyone_writable_effect_temp_base_fails_before_process_spawn() {
+        std::fs::create_dir_all("target").expect("target directory");
+        let fixture = tempfile::Builder::new()
+            .prefix("moyai-sandbox-world-temp-")
+            .tempdir_in("target")
+            .expect("sandbox fixture");
+        let fixture =
+            Utf8PathBuf::from_path_buf(fixture.path().to_path_buf()).expect("utf8 fixture");
+        let workspace_root = fixture.join("workspace");
+        let temp_base = fixture.join("world-temp");
+        std::fs::create_dir_all(&workspace_root).expect("workspace");
+        std::fs::create_dir_all(&temp_base).expect("temp base");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&workspace_root, &config)
+            .expect("workspace discovery");
+        let profile = crate::tool::os_sandbox::WorkspaceWriteSandboxProfile::compile(
+            &workspace,
+            [temp_base.clone()],
+        )
+        .expect("sandbox profile");
+        let acl_update = std::process::Command::new("icacls.exe")
+            .arg(temp_base.as_str())
+            .arg("/grant")
+            .arg("*S-1-1-0:(OI)(CI)F")
+            .output()
+            .expect("grant controlled Everyone ACE");
+        assert!(
+            acl_update.status.success(),
+            "icacls failed: {}",
+            String::from_utf8_lossy(&acl_update.stderr)
+        );
+        let marker = workspace_root.join("must-not-spawn.txt");
+
+        let error = execute_workspace_write(
+            profile,
+            SandboxedProcessRequest {
+                argv: vec![
+                    "powershell.exe".to_string(),
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                    format!(
+                        "Set-Content -LiteralPath '{}' -Value spawned",
+                        ps_literal(&marker)
+                    ),
+                ],
+                cwd: workspace_root,
+                environment: captured_process_environment(&config.shell),
+                stdin: Vec::new(),
+                timeout_ms: 30_000,
+                max_output_bytes: 8 * 1024,
+                hide_window: true,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .expect_err("World-writable temp base must fail closed");
+
+        assert!(
+            matches!(error, SandboxExecutionError::InvalidProfile(ref message) if message.contains("World SID") && message.contains("write or ACL-control")),
+            "{error}"
+        );
+        assert!(
+            !marker.exists(),
+            "sandbox process spawned after temp rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn logon_writable_effect_temp_base_fails_before_process_spawn() {
+        std::fs::create_dir_all("target").expect("target directory");
+        let fixture = tempfile::Builder::new()
+            .prefix("moyai-sandbox-logon-temp-")
+            .tempdir_in("target")
+            .expect("sandbox fixture");
+        let fixture =
+            Utf8PathBuf::from_path_buf(fixture.path().to_path_buf()).expect("utf8 fixture");
+        let workspace_root = fixture.join("workspace");
+        let temp_base = fixture.join("logon-temp");
+        std::fs::create_dir_all(&workspace_root).expect("workspace");
+        std::fs::create_dir_all(&temp_base).expect("temp base");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&workspace_root, &config)
+            .expect("workspace discovery");
+        let profile = crate::tool::os_sandbox::WorkspaceWriteSandboxProfile::compile(
+            &workspace,
+            [temp_base.clone()],
+        )
+        .expect("sandbox profile");
+        super::windows::test_grant_current_logon_write(&temp_base)
+            .expect("grant controlled current-logon ACE");
+        let marker = workspace_root.join("must-not-spawn.txt");
+
+        let error = execute_workspace_write(
+            profile,
+            SandboxedProcessRequest {
+                argv: vec![
+                    "powershell.exe".to_string(),
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                    format!(
+                        "Set-Content -LiteralPath '{}' -Value spawned",
+                        ps_literal(&marker)
+                    ),
+                ],
+                cwd: workspace_root,
+                environment: captured_process_environment(&config.shell),
+                stdin: Vec::new(),
+                timeout_ms: 30_000,
+                max_output_bytes: 8 * 1024,
+                hide_window: true,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .expect_err("logon-writable temp base must fail closed");
+
+        assert!(
+            matches!(error, SandboxExecutionError::InvalidProfile(ref message) if message.contains("current logon SID") && message.contains("write or ACL-control")),
+            "{error}"
+        );
+        assert!(
+            !marker.exists(),
+            "sandbox process spawned after temp rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_effect_temp_base_replacement_fails_before_process_spawn() {
+        std::fs::create_dir_all("target").expect("target directory");
+        let fixture = tempfile::Builder::new()
+            .prefix("moyai-sandbox-replaced-temp-base-")
+            .tempdir_in("target")
+            .expect("sandbox fixture");
+        let fixture =
+            Utf8PathBuf::from_path_buf(fixture.path().to_path_buf()).expect("utf8 fixture");
+        let workspace_root = fixture.join("workspace");
+        let selected_temp_base = fixture.join("selected-temp-base");
+        let later_temp_candidate = fixture.join("later-temp-candidate");
+        std::fs::create_dir_all(&workspace_root).expect("workspace");
+        std::fs::create_dir_all(&selected_temp_base).expect("selected temp base");
+        std::fs::create_dir_all(&later_temp_candidate).expect("later temp candidate");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&workspace_root, &config)
+            .expect("workspace discovery");
+        let profile = crate::tool::os_sandbox::WorkspaceWriteSandboxProfile::compile(
+            &workspace,
+            [selected_temp_base.clone(), later_temp_candidate.clone()],
+        )
+        .expect("sandbox profile");
+        assert_eq!(
+            profile
+                .effect_temp_base
+                .as_ref()
+                .map(|snapshot| &snapshot.requested),
+            Some(&selected_temp_base)
+        );
+
+        let admitted_temp_base = fixture.join("admitted-temp-base");
+        std::fs::rename(&selected_temp_base, &admitted_temp_base).expect("move admitted temp base");
+        std::fs::create_dir(&selected_temp_base).expect("replacement temp base");
+        let marker = workspace_root.join("must-not-spawn.txt");
+        let error = execute_workspace_write(
+            profile,
+            SandboxedProcessRequest {
+                argv: vec![
+                    "powershell.exe".to_string(),
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                    format!(
+                        "Set-Content -LiteralPath '{}' -Value spawned",
+                        ps_literal(&marker)
+                    ),
+                ],
+                cwd: workspace_root,
+                environment: captured_process_environment(&config.shell),
+                stdin: Vec::new(),
+                timeout_ms: 30_000,
+                max_output_bytes: 8 * 1024,
+                hide_window: true,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await
+        .expect_err("replacement temp base must fail its admitted identity snapshot");
+
+        assert!(
+            matches!(
+                error,
+                SandboxExecutionError::Initialization(ref message)
+                    if message.contains(selected_temp_base.as_str())
+                        && message.contains("changed object identity")
+            ),
+            "{error}"
+        );
+        assert!(
+            !marker.exists(),
+            "sandbox process spawned after replacement"
+        );
+        for (label, path) in [
+            ("replacement", &selected_temp_base),
+            ("admitted original", &admitted_temp_base),
+            ("later candidate", &later_temp_candidate),
+        ] {
+            assert_eq!(
+                std::fs::read_dir(path)
+                    .unwrap_or_else(|error| panic!("read {label} temp base `{path}`: {error}"))
+                    .count(),
+                0,
+                "an effect-local TEMP was created under the {label} base `{path}`"
+            );
+        }
+
+        std::fs::remove_dir(&selected_temp_base).expect("remove replacement temp base");
+        std::fs::rename(&admitted_temp_base, &selected_temp_base)
+            .expect("restore admitted temp base");
+    }
+
+    #[tokio::test]
+    async fn concurrent_restricted_children_cannot_write_each_others_effect_temp() {
+        std::fs::create_dir_all("target").expect("target directory");
+        let fixture = tempfile::Builder::new()
+            .prefix("moyai-sandbox-effect-temp-isolation-")
+            .tempdir_in("target")
+            .expect("sandbox fixture");
+        let fixture =
+            Utf8PathBuf::from_path_buf(fixture.path().to_path_buf()).expect("utf8 fixture");
+        let workspace_root = fixture.join("workspace");
+        std::fs::create_dir_all(&workspace_root).expect("workspace");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&workspace_root, &config)
+            .expect("workspace discovery");
+        let ProcessSandboxPlan::WorkspaceWrite(profile) =
+            ProcessSandboxPlan::for_access_mode(AccessMode::Default, &workspace)
+                .expect("sandbox profile")
+        else {
+            panic!("default must resolve workspace-write");
+        };
+        let first_temp_marker = workspace_root.join("first-effect-temp.txt");
+        let release_marker = workspace_root.join("release-first-effect.txt");
+        let first_script = format!(
+            "$ErrorActionPreference='Stop'; \
+             Set-Content -LiteralPath '{}' -Value $env:TEMP -NoNewline; \
+             Set-Content -LiteralPath (Join-Path $env:TEMP 'owner.txt') -Value first; \
+             while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 25 }}",
+            ps_literal(&first_temp_marker),
+            ps_literal(&release_marker),
+        );
+        let first_profile = profile.clone();
+        let first_workspace = workspace_root.clone();
+        let first_environment = captured_process_environment(&config.shell);
+        let first = tokio::spawn(async move {
+            execute_workspace_write(
+                first_profile,
+                SandboxedProcessRequest {
+                    argv: vec![
+                        "powershell.exe".to_string(),
+                        "-NoProfile".to_string(),
+                        "-NonInteractive".to_string(),
+                        "-Command".to_string(),
+                        first_script,
+                    ],
+                    cwd: first_workspace,
+                    environment: first_environment,
+                    stdin: Vec::new(),
+                    timeout_ms: 30_000,
+                    max_output_bytes: 8 * 1024,
+                    hide_window: true,
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await
+        });
+
+        let first_temp_text = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(value) = std::fs::read_to_string(&first_temp_marker) {
+                    if !value.is_empty() {
+                        break value;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        let Ok(first_temp_text) = first_temp_text else {
+            std::fs::write(&release_marker, "release").expect("release timed-out first effect");
+            let _ = first.await;
+            panic!("first effect did not publish its TEMP path");
+        };
+        let first_temp = Utf8PathBuf::from(first_temp_text);
+        assert!(first_temp.exists(), "first effect TEMP closed too early");
+        let second_script = format!(
+            "$ErrorActionPreference='Stop'; \
+             try {{ Set-Content -LiteralPath '{}' -Value intruder; Write-Output first-temp-allowed }} \
+             catch {{ Write-Output first-temp-denied }}; \
+             Write-Output \"SECOND_TEMP=$env:TEMP\"",
+            ps_literal(&first_temp.join("intrusion.txt")),
+        );
+        let second_result = execute_workspace_write(
+            profile,
+            SandboxedProcessRequest {
+                argv: vec![
+                    "powershell.exe".to_string(),
+                    "-NoProfile".to_string(),
+                    "-NonInteractive".to_string(),
+                    "-Command".to_string(),
+                    second_script,
+                ],
+                cwd: workspace_root.clone(),
+                environment: captured_process_environment(&config.shell),
+                stdin: Vec::new(),
+                timeout_ms: 30_000,
+                max_output_bytes: 8 * 1024,
+                hide_window: true,
+                cancel: CancellationToken::new(),
+            },
+        )
+        .await;
+        let intrusion_existed_while_first_effect_was_live =
+            first_temp.join("intrusion.txt").exists();
+        std::fs::write(&release_marker, "release").expect("release first effect");
+        let first_result = tokio::time::timeout(Duration::from_secs(10), first)
+            .await
+            .expect("first effect cleanup remained bounded")
+            .expect("join first effect")
+            .expect("first sandboxed child");
+        let second = second_result.expect("second sandboxed child");
+
+        assert_eq!(first_result.exit_code, Some(0));
+        assert!(
+            first_result.cleanup_errors.is_empty(),
+            "first cleanup errors: {:?}",
+            first_result.cleanup_errors
+        );
+        assert_eq!(
+            second.exit_code,
+            Some(0),
+            "stderr={}",
+            String::from_utf8_lossy(&second.stderr.bytes)
+        );
+        assert!(
+            second.cleanup_errors.is_empty(),
+            "second cleanup errors: {:?}",
+            second.cleanup_errors
+        );
+        let second_stdout = String::from_utf8_lossy(&second.stdout.bytes);
+        assert!(
+            second_stdout.contains("first-temp-denied"),
+            "stdout={second_stdout}"
+        );
+        assert!(
+            !intrusion_existed_while_first_effect_was_live,
+            "the second child wrote into the first child's live effect TEMP"
+        );
+        assert!(
+            !first_temp.exists(),
+            "first effect TEMP remained after exit"
+        );
+        let second_temp = second_stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("SECOND_TEMP="))
+            .map(Utf8PathBuf::from)
+            .expect("second effect TEMP path");
+        assert_ne!(first_temp, second_temp);
+        assert!(
+            !second_temp.exists(),
+            "second effect TEMP remained after exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn effect_temp_capabilities_do_not_accumulate_on_protected_authority_acls() {
+        std::fs::create_dir_all("target").expect("target directory");
+        let fixture = tempfile::Builder::new()
+            .prefix("moyai-sandbox-effect-temp-acl-")
+            .tempdir_in("target")
+            .expect("sandbox fixture");
+        let workspace_root =
+            Utf8PathBuf::from_path_buf(fixture.path().join("workspace")).expect("utf8 workspace");
+        let protected = workspace_root.join(".moyai");
+        std::fs::create_dir_all(&protected).expect("protected authority");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&workspace_root, &config)
+            .expect("workspace discovery");
+        let ProcessSandboxPlan::WorkspaceWrite(profile) =
+            ProcessSandboxPlan::for_access_mode(AccessMode::Default, &workspace)
+                .expect("sandbox profile")
+        else {
+            panic!("default must resolve workspace-write");
+        };
+        let mut stable_ace_count = None;
+
+        for _ in 0..4 {
+            let output = execute_workspace_write(
+                profile.clone(),
+                SandboxedProcessRequest {
+                    argv: vec![
+                        "powershell.exe".to_string(),
+                        "-NoProfile".to_string(),
+                        "-NonInteractive".to_string(),
+                        "-Command".to_string(),
+                        "Write-Output ok".to_string(),
+                    ],
+                    cwd: workspace_root.clone(),
+                    environment: captured_process_environment(&config.shell),
+                    stdin: Vec::new(),
+                    timeout_ms: 30_000,
+                    max_output_bytes: 8 * 1024,
+                    hide_window: true,
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await
+            .expect("sandboxed child");
+            assert_eq!(output.exit_code, Some(0));
+            assert!(
+                output.cleanup_errors.is_empty(),
+                "{:?}",
+                output.cleanup_errors
+            );
+            let current = super::windows::test_acl_ace_count(&protected)
+                .expect("protected authority ACL count");
+            if let Some(expected) = stable_ace_count {
+                assert_eq!(
+                    current, expected,
+                    "a per-effect TEMP capability accumulated on protected authority"
+                );
+            } else {
+                stable_ace_count = Some(current);
+            }
+        }
     }
 
     #[tokio::test]
@@ -3206,6 +4413,7 @@ mod integration_tests {
         let workspace_root = fixture.join("workspace");
         std::fs::create_dir_all(&workspace_root).expect("workspace");
         let child_started = workspace_root.join("child-started.txt");
+        let effect_temp_marker = workspace_root.join("effect-temp.txt");
         let late = workspace_root.join("late.txt");
         let descendant = workspace_root.join("descendant.ps1");
         let config = ResolvedConfig::default();
@@ -3218,7 +4426,8 @@ mod integration_tests {
             panic!("default must resolve workspace-write");
         };
         let descendant_script = format!(
-            "Set-Content -LiteralPath '{}' -Value started; Start-Sleep -Seconds 3; Set-Content -LiteralPath '{}' -Value late",
+            "Set-Content -LiteralPath '{}' -Value $env:TEMP -NoNewline; $held = [IO.File]::Open((Join-Path $env:TEMP 'held-by-descendant.txt'), 'OpenOrCreate', 'ReadWrite', 'None'); Set-Content -LiteralPath '{}' -Value started; Start-Sleep -Seconds 3; Set-Content -LiteralPath '{}' -Value late",
+            ps_literal(&effect_temp_marker),
             ps_literal(&child_started),
             ps_literal(&late)
         );
@@ -3279,6 +4488,13 @@ mod integration_tests {
             !late.exists(),
             "sandboxed descendant survived Job termination"
         );
+        let effect_temp = Utf8PathBuf::from(
+            std::fs::read_to_string(&effect_temp_marker).expect("effect TEMP marker"),
+        );
+        assert!(
+            !effect_temp.exists(),
+            "cancelled process tree retained its effect TEMP"
+        );
     }
 
     #[tokio::test]
@@ -3293,12 +4509,14 @@ mod integration_tests {
         let workspace_root = fixture.join("workspace");
         std::fs::create_dir_all(&workspace_root).expect("workspace");
         let child_started = workspace_root.join("child-started.txt");
+        let effect_temp_marker = workspace_root.join("effect-temp.txt");
         let late = workspace_root.join("late.txt");
         let descendant = workspace_root.join("descendant.ps1");
         std::fs::write(
             &descendant,
             format!(
-                "Set-Content -LiteralPath '{}' -Value started; Start-Sleep -Seconds 3; Set-Content -LiteralPath '{}' -Value late",
+                "Set-Content -LiteralPath '{}' -Value $env:TEMP -NoNewline; $held = [IO.File]::Open((Join-Path $env:TEMP 'held-by-descendant.txt'), 'OpenOrCreate', 'ReadWrite', 'None'); Set-Content -LiteralPath '{}' -Value started; Start-Sleep -Seconds 3; Set-Content -LiteralPath '{}' -Value late",
+                ps_literal(&effect_temp_marker),
                 ps_literal(&child_started),
                 ps_literal(&late)
             ),
@@ -3353,6 +4571,13 @@ mod integration_tests {
         );
         tokio::time::sleep(Duration::from_secs(4)).await;
         assert!(!late.exists(), "descendant survived normal parent exit");
+        let effect_temp = Utf8PathBuf::from(
+            std::fs::read_to_string(&effect_temp_marker).expect("effect TEMP marker"),
+        );
+        assert!(
+            !effect_temp.exists(),
+            "normal parent exit retained its effect TEMP"
+        );
     }
 
     #[tokio::test]
@@ -3367,6 +4592,7 @@ mod integration_tests {
         let workspace_root = fixture.join("workspace");
         std::fs::create_dir_all(&workspace_root).expect("workspace");
         let child_started = workspace_root.join("child-started.txt");
+        let effect_temp_marker = workspace_root.join("effect-temp.txt");
         let late = workspace_root.join("late.txt");
         let descendant = workspace_root.join("descendant.ps1");
         let config = ResolvedConfig::default();
@@ -3379,7 +4605,8 @@ mod integration_tests {
             panic!("default must resolve workspace-write");
         };
         let descendant_script = format!(
-            "Set-Content -LiteralPath '{}' -Value started; Start-Sleep -Seconds 8; Set-Content -LiteralPath '{}' -Value late",
+            "Set-Content -LiteralPath '{}' -Value $env:TEMP -NoNewline; $held = [IO.File]::Open((Join-Path $env:TEMP 'held-by-descendant.txt'), 'OpenOrCreate', 'ReadWrite', 'None'); Set-Content -LiteralPath '{}' -Value started; Start-Sleep -Seconds 8; Set-Content -LiteralPath '{}' -Value late",
+            ps_literal(&effect_temp_marker),
             ps_literal(&child_started),
             ps_literal(&late)
         );
@@ -3436,6 +4663,13 @@ mod integration_tests {
         assert!(
             !late.exists(),
             "timed-out descendant survived Job termination"
+        );
+        let effect_temp = Utf8PathBuf::from(
+            std::fs::read_to_string(&effect_temp_marker).expect("effect TEMP marker"),
+        );
+        assert!(
+            !effect_temp.exists(),
+            "timed-out process tree retained its effect TEMP"
         );
     }
 }

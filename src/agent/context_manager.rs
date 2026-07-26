@@ -857,6 +857,8 @@ fn project_model_messages(
         .collect()
 }
 
+const WORKSPACE_WRITE_EFFECT_TEMP_ACCESS_DENIED_NOTE: &str = "Sandbox note: this workspace-write run matched the known protected effect-TEMP access-denied signature. No retry occurred. If this exact command is required and the workspace is trusted, issue a new shell call with sandbox_permissions=require_escalated and concise justification; do not change project files solely to bypass this sandbox restriction.";
+
 fn model_visible_tool_output(
     tool_name: &str,
     output_text: &str,
@@ -918,7 +920,32 @@ fn model_visible_tool_output(
         }
         return append_model_visible_lines(output_text, &lines);
     }
+    let sandbox_failure_hint =
+        tool_metadata
+            .get("sandbox_failure_hint")
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<crate::tool::shell::ShellSandboxFailureHint>(value).ok()
+            });
+    if tool_name == "shell"
+        && sandbox_failure_hint
+            == Some(
+                crate::tool::shell::ShellSandboxFailureHint::WorkspaceWriteEffectTempAccessDenied,
+            )
+    {
+        return append_model_visible_paragraph_once(
+            output_text,
+            WORKSPACE_WRITE_EFFECT_TEMP_ACCESS_DENIED_NOTE,
+        );
+    }
     output_text.to_string()
+}
+
+fn append_model_visible_paragraph_once(output_text: &str, paragraph: &str) -> String {
+    if output_text.contains(paragraph) {
+        return output_text.to_string();
+    }
+    append_model_visible_lines(output_text, &[paragraph.to_string()])
 }
 
 fn append_model_visible_lines(output_text: &str, lines: &[String]) -> String {
@@ -1403,6 +1430,49 @@ mod tests {
     }
 
     #[test]
+    fn shell_sandbox_failure_hint_is_projected_once_from_nested_and_flat_metadata() {
+        let nested = serde_json::json!({
+            "success": false,
+            "tool_metadata": {
+                "sandbox_failure_hint": "workspace_write_effect_temp_access_denied"
+            }
+        });
+        let flat = serde_json::json!({
+            "sandbox_failure_hint": "workspace_write_effect_temp_access_denied"
+        });
+        for metadata in [&nested, &flat] {
+            let projected = model_visible_tool_output("shell", "factual shell output", metadata);
+            assert!(projected.starts_with("factual shell output\n\nSandbox note:"));
+            assert_eq!(projected.matches("Sandbox note:").count(), 1);
+            assert!(projected.contains("No retry occurred."));
+            assert!(projected.contains("sandbox_permissions=require_escalated"));
+            assert!(projected.contains("do not change project files solely to bypass"));
+            assert_eq!(
+                model_visible_tool_output("shell", &projected, metadata),
+                projected
+            );
+        }
+        for (tool_name, metadata) in [
+            (
+                "shell",
+                serde_json::json!({"sandbox_failure_hint": "some_other_failure"}),
+            ),
+            ("shell", serde_json::json!({"sandbox_failure_hint": 1})),
+            (
+                "read",
+                serde_json::json!({
+                    "sandbox_failure_hint": "workspace_write_effect_temp_access_denied"
+                }),
+            ),
+        ] {
+            assert_eq!(
+                model_visible_tool_output(tool_name, "generic failure", &metadata),
+                "generic failure"
+            );
+        }
+    }
+
+    #[test]
     fn complete_and_unrelated_tool_outputs_are_unchanged() {
         let metadata = serde_json::json!({
             "truncated": true,
@@ -1486,6 +1556,66 @@ mod tests {
                 && result.contains("list-next-page")
                 && result.contains("cursor")
                 && result.matches("Warning: truncated output.").count() == 1
+        ));
+    }
+
+    #[test]
+    fn flat_shell_sandbox_hint_projects_the_same_note_live_and_after_replay() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let response_id = ModelResponseId::new();
+        let call_id = ToolCallId::new();
+        let items = vec![
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: 0,
+                created_at_ms: 1,
+                payload: HistoryItemPayload::ToolCall {
+                    call_id,
+                    response_id,
+                    model_call_id: "provider-shell-call".to_string(),
+                    tool_name: "shell".to_string(),
+                    arguments_json: serde_json::json!({"command": "python -m pytest"}).to_string(),
+                },
+            },
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: 1,
+                created_at_ms: 2,
+                payload: HistoryItemPayload::ToolOutput {
+                    call_id,
+                    status: ToolLifecycleStatus::Completed,
+                    title: "shell".to_string(),
+                    output_text: "Command failed with WinError 5".to_string(),
+                    metadata: serde_json::json!({
+                        "sandbox_failure_hint": "workspace_write_effect_temp_access_denied"
+                    }),
+                    success: Some(false),
+                },
+            },
+        ];
+        let replayed = ContextManager::rehydrate(items.clone()).model_messages(false);
+        let mut live = ContextManager::from_active_history(vec![items[0].clone()], Some(0), 1);
+        live.ingest_committed_delta(vec![items[1].clone()], Some(1));
+        let projected_live = live.model_messages(false);
+
+        assert_eq!(
+            serde_json::to_value(&projected_live).expect("serialize live projection"),
+            serde_json::to_value(&replayed).expect("serialize replay projection")
+        );
+        assert!(matches!(
+            replayed.as_slice(),
+            [
+                ModelMessage::AssistantToolCalls { tool_calls, .. },
+                ModelMessage::Tool { result, .. },
+            ] if matches!(tool_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "shell")
+                && result.contains("Command failed with WinError 5")
+                && result.contains("Sandbox note:")
+                && result.matches("Sandbox note:").count() == 1
         ));
     }
 

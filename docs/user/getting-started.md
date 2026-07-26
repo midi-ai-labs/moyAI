@@ -51,19 +51,19 @@ model transportの既定値は次の通り。
 [model]
 provider_api_mode = "responses"
 reasoning_summary = "none"
-request_timeout_ms = 600000
-stream_idle_timeout_ms = 600000
+request_timeout_ms = 1800000
+stream_idle_timeout_ms = 1800000
 ```
 
 `request_timeout_ms`はconnect attempt、connect retry待機、request body送信、response header待ちを共有する一つの
 response-start operation budget、`stream_idle_timeout_ms`はstream開始後のSSE event未着に対する
-rolling timeoutで、どちらも既定値は600,000ms。この2設定はconfigまたは対応するenvironment variableで
+rolling timeoutで、どちらも既定値は1,800,000ms（30分）。この2設定はconfigまたは対応するenvironment variableで
 明示overrideできるno-progress deadlineであり、aggregate stream capではない。別にresponse header受信後は、
 製品固定で変更できない1,800,000ms（30分）のaggregate stream-duration limitが適用され、どちらの設定を
 増やしてもこの上限は延長されない。
 `max_output_tokens`は通常文だけでなくreasoningとtool-call引数のserialized output全体を制限する。
 文書全体を`write`するようなtool-heavy runではproviderごとに検証済みのbudgetを使い、製品既定値は
-`16384`とする。LM Studioが
+`32768`とする。LM Studioが
 `Failed to parse tool call: Unexpected end of content`等を`response.failed`で返した場合、moyAIは
 設定中のbudgetを含むgeneration failureとして表示し、不完全なtool callをlocal commit・実行しない。
 `max_retries`はHTTP responseを受ける前のretry可能な接続/transport失敗だけに適用し、retry待機は1回最大30,000ms。
@@ -139,7 +139,7 @@ moyai.exe tui --dir C:\path\to\workspace
 
 TUI では実行中も `Ctrl+Enter` で現在 turn へ追加指示を送り、`Ctrl+X` でexact current root executionを停止できる。`F10`のSub Agent pickerではRunning childを選び、`x`で表示時のexact child turnだけを停止する。composerで`F6`を押すとPrompt Enhanceを開始し、通信中の`Esc`はprovider requestをcancelしてraw promptを保持したままTUIへ戻る。通信中の`Ctrl+Q`は同じrequestをcancelし、pending reviewを清算してからTUIを終了する。cancel後の遅延responseをreviewとして再表示しない。新規user rowはdurable history保存後に追加する。active-turn steerはdurable queueへの受理後にcomposerをclearしてpending入力として別表示し、安全な次request境界で同じstable IDのcanonical user rowへ置き換える。次requestがない場合も非Interrupted terminalは終了前にhistoryへdrainし、Interrupted terminalは中断を記録して未配信steerをdiscardする。送信時と同じdraft revision・textの場合だけclearし、保存前の失敗や送信後の再編集ではdraftを保持してphantom rowを作らない。CLI の `session steer` / `session interrupt` を別 process から実行した場合も、SQLite の durable control state を実行 process が取り込む。
 
-`write`と`apply_patch`のcreate / update / delete / rollbackは、同じstable-handle・no-clobber条件付きcommitを使う。既存file全体を`write`で置換する場合は、同じsessionでUTF-8全文をtruncationなしに読んだか、直前のtyped mutation成功で同期されたcurrent baselineが必要になる。contextを持つtargetedな`apply_patch` Updateはこの全文履歴を要求せず、current UTF-8 contentへhunk contextを照合する。ただしbare `@@`に`+`行だけを置くcontext-free Updateは全文置換として同じbaselineを要求する。`apply_patch` Deleteも全文履歴は要求しないが、destructive permissionとcurrent file identityを確認して条件付き削除する。準備中に別processがtargetを更新・置換した場合は外部側を上書きせず、復元不能時は保持したbackup pathをerrorへ含める。親directoryは暗黙作成しないため、存在しない場合は先に明示作成する。
+`write`と`apply_patch`のcreate / update / delete / rollbackは、同じstable-handle・no-clobber条件付きcommitを使う。既存file全体を`write`で置換する場合は、同じsessionでUTF-8全文をtruncationなしに読んだか、直前のtyped mutation成功で同期されたcurrent baselineが必要になる。`apply_patch` Updateはこの全文履歴を要求せず、contextを持つhunkをcurrent UTF-8 contentへ照合する。bare `@@`に`+`行だけを置くhunkは既存内容を置換せずEOFへ追記し、その後に記述されたcontext hunkの探索位置も進めない。`apply_patch` Deleteも全文履歴は要求しないが、destructive permissionとcurrent file identityを確認して条件付き削除する。準備中に別processがtargetを更新・置換した場合は外部側を上書きせず、復元不能時は保持したbackup pathをerrorへ含める。親directoryは暗黙作成しないため、存在しない場合は先に明示作成する。
 
 Unixでは、update/delete前に開かれた書込可能descriptorが切り離した旧inodeを参照していないことを証明できない。createは従来どおりだが、既存fileのupdateは新しいtargetを設置し、deleteはtargetを切り離したうえで旧inodeをprivate backup pathに保持し、安全なcleanup成功とはせずtyped partial-commit errorを返す。先に開かれたwriterはそのbackupを後から変更できるため、errorに示されたpathを確認して調整する。
 
@@ -151,7 +151,9 @@ Unixでは、update/delete前に開かれた書込可能descriptorが切り離�
 - **代理で承認**（`auto_review`）: 承認を求めると同じdeterministic workspace boundaryと同じOS sandboxを使う。残るelevation targetは、task agentとは別のtool-less AI Guardian requestが判定する。Guardianはbounded human previewとは別のcomplete typed action evidenceを使い、requested sandbox elevationも受け取る。MCPはnormalized full arguments / configured target / credential presence、Doclingはexact endpoint / source / effective format・OCR・image・page options / credential presenceをsecret値なしで受け取る。redaction等でevidenceがincompleteならGuardianもhumanも呼ばずdenyする。inputにはcurrent `WorldState`、top-level root sessionのappend-only historyからmodel compactionやchild `fork_turns`と独立して抽出したchronological canonical text UserTurn / SteerTurn、current exact committed response/call、同じresponse内で先に確定したbounded tool resultsを含む。childのNEW_TASKやassistant/tool outputはuser authorityではない。source history 4,096件・source payload 16,000,000文字・authority 64件・各item 8,000文字・authority合計16,000文字のいずれかを超える場合、canonical user authorityの欠落、non-text、またはstorage failureでexactに表現できない場合はGuardian request前にdenyする。このsnapshotはGuardian審査時だけ90秒total deadline内のworkerで読み、risk-free toolや他modeでは読まない。storageがbusyなら待たずにdenyし、timeout / cancelは進行中scanをinterruptしてconnection再利用前にhookを外す。`WorldState`はenvironment / instructions / timeだけを持ち、tool名やinventoryを列挙しない。tool availabilityは`ToolSpecPlan`だけが所有し、Guardianには同じtool-free snapshotと空のtool surfaceを渡して、exact action evidenceを別入力にする。requestはtools / reasoning / continuationを持たず、task generationのsampling / stop / arbitrary extra bodyを継承せず、90秒total deadlineを使う。Guardianの`allow` / `deny`は最終判断で、deny、invalid response、unavailable、timeout、request/storage failureはhuman confirmationへfallbackせずfail closedにする。
 - **フルアクセス**（`full_access`）: permission promptを出さず、process effectをcurrent user authorityの`Unrestricted` profileで実行する。unrestricted childのfilesystem mutationはtyped file guardを通らないため、信頼できるworkspaceでのみ使う。`write` / `apply_patch`等のtyped file toolとMCP / Docling等のin-process effectは、各stable-handle / path-integrity / authority / no-clobber guardを維持する。
 
-shellとその子processは、承認を求める/代理で承認ではWindows native `workspace-write` profile、フルアクセスまたは承認済みelevationではcurrent userの`Unrestricted` profileで動く。modelがsandbox外実行を必要とするexact commandは`sandbox_permissions: "require_escalated"`と空でない`justification`を明示できる。`workspace-write`はadmit時に存在する有限objectのrestricted-token / ACL defenseであり、変数やscript内部で動的に組み立てたpath、未作成authority namespace、別subtree instruction、protected descendantのexplicit / inheritance-disabled DACL、direct network accessを完全には閉じない。Codex OS enforcement互換、firewall級network isolation、全outside writeの構造的証明として扱わない。
+shellとその子processは、承認を求める/代理で承認ではWindows native `workspace-write` profile、フルアクセスまたは承認済みelevationではcurrent userの`Unrestricted` profileで動く。WindowsでPowerShell familyの`program`を省略した場合は、OSのcommand resolutionによりPowerShell 7 (`pwsh`)を一度起動し、effect開始前のlaunch failureだけWindows PowerShell (`powershell`)へfallbackする。process開始後の失敗は副作用を重複させないため別shellで自動再実行しない。明示した`program`は常にそのまま使う。modelがsandbox外実行を必要とするexact commandは`sandbox_permissions: "require_escalated"`と空でない`justification`を明示できる。`workspace-write`はadmit時に存在する有限objectのrestricted-token / ACL defenseであり、変数やscript内部で動的に組み立てたpath、未作成authority namespace、別subtree instruction、protected descendantのexplicit / inheritance-disabled DACL、direct network accessを完全には閉じない。特にCPython 3.13以降がWindowsで`os.mkdir(mode=0o700)`へ指定するprotected owner-only DACLは親のsandbox capabilityを継承しないため、pytestの`tmp_path`等はrestricted profileで再openに失敗し得る。
+
+この既知制約については、WorkspaceWriteでeffectが開始され、timeout / cancel / cleanup failureではない非zero終了となり、stdoutまたはstderrの同一行に`PermissionError: [WinError 5]`と`moyai-sandbox-effect-`がともに現れた場合だけ、shellがtyped failure hintを記録する。canonicalなnested metadataとlegacy flat metadataのどちらから再生しても、model-visible outputへ同じsandbox noteを一度だけ追加する。通常の非zero終了や片方だけの一致では追加しない。noteは再実行を行わず、信頼できるworkspaceでexact commandが必要な場合に限り、新しいshell callで`require_escalated`と理由を明示するよう案内する。project fileをsandbox回避のためだけに変更しない。この場合も自動昇格せず、信頼できるworkspaceでexact commandを明示elevationするかフルアクセスを選ぶ。Codex OS enforcement互換、firewall級network isolation、全outside writeの構造的証明として扱わない。
 
 `read`と`grep`はUTF-8を優先し、UTF-8でないtextを厳密にShift_JIS decodeできる場合は自動的に読み取る。Shift_JISで読んだfileはUTF-8専用編集baselineの対象にしない。長いtool/Docling出力がmoyAIのRoaming data directoryへ退避された場合、現在sessionが生成した正確な出力fileだけを`read`または`grep`で再利用できる。
 model-visibleなtool continuation guidanceはcanonical `ToolOutput`から作る一つのoutput projectionだけが所有する。

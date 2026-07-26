@@ -921,6 +921,56 @@ mod tests {
     }
 
     #[test]
+    fn full_access_permission_does_not_bypass_typed_write_authority_or_no_clobber() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root =
+            Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 workspace");
+        let outside =
+            Utf8PathBuf::from_path_buf(temp.path().join("outside.txt")).expect("utf8 outside path");
+        std::fs::create_dir(&root).expect("workspace");
+        let mut config = crate::config::ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::FullAccess;
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let external_request = crate::tool::PermissionRequest {
+            access: AccessKind::Edit,
+            summary: "external write".to_string(),
+            details: Vec::new(),
+            targets: vec![outside.clone()],
+            outside_workspace: true,
+            risks: vec![crate::tool::PermissionRisk::ExternalMutation],
+            agent_path: None,
+            agent_task_name: None,
+        };
+        assert!(access_mode_allows_permission(
+            AccessMode::FullAccess,
+            &external_request
+        ));
+        PathGuard::require_path(&workspace, &outside, AccessKind::Edit)
+            .expect_err("Full Access cannot widen a typed write's configured roots");
+
+        let existing = root.join("existing.txt");
+        std::fs::write(&existing, "alpha").expect("seed existing file");
+        let (_, expected) =
+            read_file_with_identity(&existing, 1_024).expect("capture stable identity");
+        std::fs::write(&existing, "bravo").expect("external same-size rewrite");
+        validate_write_commit_precondition(&EditSafety::default(), &existing, Some(&expected))
+            .expect_err("Full Access cannot bypass typed stable-identity revalidation");
+        assert_eq!(
+            std::fs::read_to_string(&existing).expect("read preserved rewrite"),
+            "bravo"
+        );
+
+        let created = root.join("created.txt");
+        std::fs::write(&created, "external").expect("external create");
+        validate_write_commit_precondition(&EditSafety::default(), &created, None)
+            .expect_err("Full Access cannot bypass typed create no-clobber");
+        assert_eq!(
+            std::fs::read_to_string(&created).expect("read preserved create"),
+            "external"
+        );
+    }
+
+    #[test]
     fn final_formatted_write_over_turn_limit_is_rejected_before_file_mutation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = Utf8PathBuf::from_path_buf(temp.path().join("new.txt")).expect("utf8 path");

@@ -168,6 +168,15 @@ try {
     const buffer = Buffer.from(capture.data, "base64");
     await writeFile(argument, buffer);
     console.log(JSON.stringify({ path: argument, bytes: buffer.length }));
+  } else if (action === "exit-app") {
+    const requested = await evaluate(`(() => {
+      const invoke = window.__TAURI_INTERNALS__?.invoke;
+      if (typeof invoke !== "function") return { error: "Tauri invoke is unavailable" };
+      setTimeout(() => invoke("exit_app"), 0);
+      return { requested: true };
+    })()`);
+    if (!requested?.requested) throw new Error(JSON.stringify(requested));
+    console.log(JSON.stringify(requested));
   } else {
     throw new Error(`unknown action: ${action}`);
   }

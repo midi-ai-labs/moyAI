@@ -15,7 +15,7 @@ use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
 use crate::tool::context::ToolServices;
 use crate::tool::registry::ToolRegistry;
 use crate::tool::truncate::ToolTruncator;
-use crate::workspace::WorkspaceDiscovery;
+use crate::workspace::{WorkspaceDiscovery, project::project_display_name};
 
 pub struct AppBootstrap;
 
@@ -104,11 +104,7 @@ impl AppBootstrap {
         } else {
             WorkspaceDiscovery::discover(start_dir, &config)?
         };
-        let project_name = workspace
-            .root
-            .file_name()
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| workspace.root.to_string());
+        let project_name = project_display_name(&workspace.root);
         store
             .project_repo()
             .upsert_project(

@@ -165,12 +165,12 @@ model = "qwen/qwen3.6-35b-a3b"
 provider_metadata_mode = "lm_studio_native_required"
 provider_api_mode = "responses"
 reasoning_summary = "none"
-request_timeout_ms = 600000
-stream_idle_timeout_ms = 600000
+request_timeout_ms = 1800000
+stream_idle_timeout_ms = 1800000
 context_window = 131072
 supports_tools = true
 supports_images = true
-max_output_tokens = 16384
+max_output_tokens = 32768
 
 [model.extra_body_json]
 num_ctx = 131072
@@ -194,12 +194,12 @@ enabled = false
 
 `request_timeout_ms`はconnect attempt、connect retry待機、request body送信、response header待ちを共有する一つの
 response-start operation budget、`stream_idle_timeout_ms`はstream開始後にSSE eventが届かない期間の
-rolling timeoutです。どちらも既定値は600,000msです。この2設定は変更可能なno-progress deadlineで、
+rolling timeoutです。どちらも既定値は1,800,000ms（30分）です。この2設定は変更可能なno-progress deadlineで、
 aggregate stream capではありません。別にresponse header受信後は、製品固定で変更できない
 1,800,000ms（30分）のaggregate stream-duration limitが適用され、どちらの設定を増やしてもこの上限は延長されません。
 `max_output_tokens`は通常文だけでなくreasoningとtool-call引数のserialized output全体を制限します。
 文書全体を`write`するようなtool-heavy runではproviderごとに検証済みのbudgetを使い、製品既定値は
-`16384`です。provider側の`response.failed`、例えば
+`32768`です。provider側の`response.failed`、例えば
 `Failed to parse tool call: Unexpected end of content`は設定中のbudgetを含むgeneration failureとして表示し、
 不完全なtool callをmoyAIがlocal parse・commit・実行したものとして扱いません。
 `max_retries`が適用されるのはHTTP response前のretry可能な接続/transport失敗だけで、retry待機は1回最大30,000msです。

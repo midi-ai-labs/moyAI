@@ -354,9 +354,9 @@ mod tests {
     #[test]
     fn provider_no_progress_timeouts_share_a_default_and_remain_overridable() {
         let defaults = ResolvedConfig::default();
-        assert_eq!(defaults.model.request_timeout_ms, 600_000);
-        assert_eq!(defaults.model.stream_idle_timeout_ms, 600_000);
-        assert_eq!(defaults.model.max_output_tokens, 16_384);
+        assert_eq!(defaults.model.request_timeout_ms, 1_800_000);
+        assert_eq!(defaults.model.stream_idle_timeout_ms, 1_800_000);
+        assert_eq!(defaults.model.max_output_tokens, 32_768);
 
         let resolved = apply_patch(
             defaults,

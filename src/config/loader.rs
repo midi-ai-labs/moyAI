@@ -761,9 +761,9 @@ mod tests {
         assert!(text.contains("reasoning_summary = \"none\""));
         assert!(!text.contains("chat_completions_reasoning_parameters"));
         assert!(!text.contains("reasoning_effort"));
-        assert!(text.contains("request_timeout_ms = 600000"));
-        assert!(text.contains("stream_idle_timeout_ms = 600000"));
-        assert!(text.contains("max_output_tokens = 16384"));
+        assert!(text.contains("request_timeout_ms = 1800000"));
+        assert!(text.contains("stream_idle_timeout_ms = 1800000"));
+        assert!(text.contains("max_output_tokens = 32768"));
         assert!(!text.contains("prompt_profile"));
         assert!(!text.contains("max_steps_per_turn"));
         assert!(text.contains("[docling]"));
