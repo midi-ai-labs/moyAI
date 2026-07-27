@@ -2473,6 +2473,148 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
+    async fn provider_limit_only_apply_does_not_require_a_catalog_reload() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let baseline = controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .clone();
+        let next_context_window = baseline.context_window.saturating_add(1);
+        let next_max_output_tokens = baseline.max_output_tokens.saturating_add(1);
+
+        controller.accept_provider_action_input(
+            baseline.base_url.clone(),
+            baseline.provider_metadata_mode,
+            next_context_window.to_string(),
+            next_max_output_tokens.to_string(),
+            baseline.model.clone(),
+        );
+
+        assert_eq!(
+            controller.state.provider_config.provider_loaded_base_url,
+            None
+        );
+        assert!(controller.state.can_apply_provider_selection());
+        assert!(controller.apply_provider_session());
+        let applied = &controller.state.provider_config.effective_config.model;
+        assert_eq!(applied.context_window, next_context_window);
+        assert_eq!(applied.max_output_tokens, next_max_output_tokens);
+        assert_eq!(
+            applied
+                .extra_body_json
+                .as_ref()
+                .and_then(|value| value.get("num_ctx"))
+                .and_then(serde_json::Value::as_u64),
+            Some(u64::from(next_context_window))
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_limit_only_apply_does_not_consume_stale_catalog_metadata() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let baseline = controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .clone();
+        let stale_url = "http://127.0.0.1:4321".to_string();
+        controller.accept_provider_action_input(
+            stale_url.clone(),
+            baseline.provider_metadata_mode,
+            baseline.context_window.to_string(),
+            baseline.max_output_tokens.to_string(),
+            baseline.model.clone(),
+        );
+        controller
+            .state
+            .begin_provider_model_load(stale_url.clone());
+        controller
+            .state
+            .finish_provider_model_load(vec![ProviderModelInfo {
+                id: baseline.model.clone(),
+                display_name: Some("stale catalog model".to_string()),
+                context_window: Some(baseline.context_window.saturating_add(10)),
+                max_output_tokens: Some(baseline.max_output_tokens.saturating_add(10)),
+                supports_images: Some(!baseline.supports_images),
+                supports_tools: Some(!baseline.supports_tools),
+                supports_reasoning: Some(!baseline.supports_reasoning),
+                max_parallel_predictions: Some(baseline.max_parallel_predictions.saturating_add(1)),
+                load_state: crate::llm::ProviderModelLoadState::Unknown,
+                source: "provider_catalog".to_string(),
+            }]);
+        assert!(controller.state.provider_catalog_owns_current_target());
+
+        controller.state.show_provider_editor();
+        assert!(!controller.state.provider_catalog_owns_current_target());
+        controller.accept_provider_action_input(
+            baseline.base_url.clone(),
+            baseline.provider_metadata_mode,
+            baseline.context_window.saturating_add(1).to_string(),
+            baseline.max_output_tokens.saturating_add(1).to_string(),
+            baseline.model.clone(),
+        );
+
+        assert!(controller.apply_provider_session());
+        let applied = &controller.state.provider_config.effective_config.model;
+        assert_eq!(applied.supports_images, baseline.supports_images);
+        assert_eq!(applied.supports_tools, baseline.supports_tools);
+        assert_eq!(applied.supports_reasoning, baseline.supports_reasoning);
+        assert_eq!(
+            applied.max_parallel_predictions,
+            baseline.max_parallel_predictions
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_limit_only_apply_preserves_metadata_from_the_effective_config() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let baseline = controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .clone();
+        controller
+            .state
+            .begin_provider_model_load(baseline.base_url.clone());
+        controller
+            .state
+            .finish_provider_model_load(vec![ProviderModelInfo {
+                id: baseline.model.clone(),
+                display_name: Some("current catalog model".to_string()),
+                context_window: Some(baseline.context_window),
+                max_output_tokens: Some(baseline.max_output_tokens),
+                supports_images: Some(!baseline.supports_images),
+                supports_tools: Some(!baseline.supports_tools),
+                supports_reasoning: Some(!baseline.supports_reasoning),
+                max_parallel_predictions: Some(baseline.max_parallel_predictions.saturating_add(1)),
+                load_state: crate::llm::ProviderModelLoadState::Unknown,
+                source: "provider_catalog".to_string(),
+            }]);
+        assert!(controller.state.provider_catalog_owns_current_target());
+        controller.accept_provider_action_input(
+            baseline.base_url.clone(),
+            baseline.provider_metadata_mode,
+            baseline.context_window.saturating_add(1).to_string(),
+            baseline.max_output_tokens.saturating_add(1).to_string(),
+            baseline.model.clone(),
+        );
+
+        assert!(controller.apply_provider_session());
+        let applied = &controller.state.provider_config.effective_config.model;
+        assert_eq!(applied.supports_images, baseline.supports_images);
+        assert_eq!(applied.supports_tools, baseline.supports_tools);
+        assert_eq!(applied.supports_reasoning, baseline.supports_reasoning);
+        assert_eq!(
+            applied.max_parallel_predictions,
+            baseline.max_parallel_predictions
+        );
+    }
+
+    #[tokio::test]
     async fn finished_interruption_projects_cancelled_even_if_the_live_view_is_still_running() {
         let (_temp, _root, mut controller) = empty_access_test_controller().await;
         let session_id = SessionId::new();
@@ -7360,7 +7502,7 @@ impl DesktopController {
     pub(crate) fn apply_provider_session(&mut self) -> bool {
         if !self.state.can_apply_provider_selection() {
             self.state.set_status_message(
-                "load the current provider model list and select a model before applying",
+                "keep the current provider URL, mode, and model, or load the target model list before applying",
             );
             return false;
         }
@@ -7381,7 +7523,7 @@ impl DesktopController {
     pub(crate) fn save_provider_global(&mut self) -> bool {
         if !self.state.can_apply_provider_selection() {
             self.state.set_status_message(
-                "load the current provider model list and select a model before saving",
+                "keep the current provider URL, mode, and model, or load the target model list before saving",
             );
             return false;
         }
@@ -8129,6 +8271,18 @@ impl DesktopController {
         self.open_path_in_file_manager(&folder);
     }
 
+    pub(crate) fn open_user_data_folder(&mut self) {
+        let folder = self.app.store.paths().data_dir.clone();
+        if let Err(error) = std::fs::create_dir_all(folder.as_std_path()) {
+            self.state.set_status_message(format!(
+                "failed to create user data folder {}: {error}",
+                folder
+            ));
+            return;
+        }
+        self.open_path_in_file_manager(&folder);
+    }
+
     pub(crate) fn open_typed_path_in_file_manager(&mut self) -> bool {
         if let Some(path) = self.resolve_workspace_input() {
             self.open_path_in_file_manager(&path)
@@ -8195,14 +8349,6 @@ impl DesktopController {
             return None;
         };
         let model = model.to_string();
-        let mut hydrated_model_config = self.state.provider_config.effective_config.model.clone();
-        hydrated_model_config.base_url = base_url.clone();
-        hydrated_model_config.model = model.clone();
-        hydrated_model_config.provider_metadata_mode =
-            self.state.provider_config.provider_metadata_mode_input;
-        if let Some(info) = self.state.selected_provider_model_info() {
-            apply_provider_model_info_to_config(&mut hydrated_model_config, info);
-        }
         let context_window = match parse_provider_limit_input(
             "context_window",
             &self.state.provider_config.provider_context_window_input,
@@ -8223,6 +8369,21 @@ impl DesktopController {
                 return None;
             }
         };
+        let effective_model = &self.state.provider_config.effective_config.model;
+        let limit_only_update = self.state.provider_input_matches_effective_target()
+            && (context_window != effective_model.context_window
+                || max_output_tokens != effective_model.max_output_tokens);
+        let mut hydrated_model_config = effective_model.clone();
+        hydrated_model_config.base_url = base_url.clone();
+        hydrated_model_config.model = model.clone();
+        hydrated_model_config.provider_metadata_mode =
+            self.state.provider_config.provider_metadata_mode_input;
+        if self.state.provider_catalog_owns_current_target()
+            && !limit_only_update
+            && let Some(info) = self.state.selected_provider_model_info()
+        {
+            apply_provider_model_info_to_config(&mut hydrated_model_config, info);
+        }
         hydrated_model_config.context_window = context_window;
         hydrated_model_config.max_output_tokens = max_output_tokens;
         hydrated_model_config.extra_body_json = Some(extra_body_with_num_ctx(

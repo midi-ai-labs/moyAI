@@ -903,6 +903,7 @@ function renderConfigOverlay(state: DesktopWebState): string {
             <a href="#settings-files">Files</a>
             <a href="#settings-advanced">Advanced</a>
             <button data-action="open-global-config-folder">設定フォルダーを開く</button>
+            <button data-action="open-user-data-folder">データフォルダーを開く</button>
           </nav>
           <div class="settings-content">
             <section id="settings-provider" class="settings-section">

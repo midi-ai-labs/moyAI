@@ -132,6 +132,9 @@ export function providerCapabilities(
     | "provider_apply_enabled"
     | "config_draft"
   >,
+  options: {
+    currentProviderLimitDraftDirty?: boolean;
+  } = {},
 ): Pick<UiCapabilities, "canLoadProviderModels" | "canApplyProvider"> {
   const urlValid = /^https?:\/\/\S+$/i.test(state.provider_base_url.trim());
   const limitsValid = positiveInteger(state.provider_context_window)
@@ -141,13 +144,15 @@ export function providerCapabilities(
     && state.provider_metadata_mode === state.provider_catalog_metadata_mode;
   return {
     canLoadProviderModels: !state.provider_loading && urlValid && limitsValid,
-    canApplyProvider: state.provider_apply_enabled
-      && state.config_draft.external_owner_mutation_open
+    canApplyProvider: state.config_draft.external_owner_mutation_open
       && !state.provider_loading
       && urlValid
       && limitsValid
       && state.provider_selected_index >= 0
-      && catalogOwnerMatches,
+      && (
+        (state.provider_apply_enabled && catalogOwnerMatches)
+        || options.currentProviderLimitDraftDirty === true
+      ),
   };
 }
 
@@ -419,6 +424,10 @@ export function deriveUiCapabilities(state: DesktopWebState, uiState: UiLocalSta
   const provider = uiState.drafts.provider;
   const configDraft = activeConfigDraftProjection(state, uiState);
   const selectedModelIndex = state.provider_model_ids.indexOf(provider.selectedModelId);
+  const currentProviderLimitDraftDirty = providerLimitDraftTargetsEffectiveProvider(
+    state,
+    provider,
+  );
   const providerActions = providerCapabilities({
     provider_loading: state.provider_loading,
     provider_base_url: provider.baseUrl,
@@ -430,6 +439,8 @@ export function deriveUiCapabilities(state: DesktopWebState, uiState: UiLocalSta
     provider_selected_index: selectedModelIndex,
     provider_apply_enabled: state.provider_apply_enabled,
     config_draft: configDraft,
+  }, {
+    currentProviderLimitDraftDirty,
   });
   return {
     ...composer,
@@ -515,6 +526,19 @@ function hydrateProviderDraft(draft: ProviderDraft, state: DesktopWebState): voi
   draft.contextWindow = state.provider_context_window;
   draft.maxOutputTokens = state.provider_max_output_tokens;
   draft.selectedModelId = selectedProviderModelId(state);
+}
+
+function providerLimitDraftTargetsEffectiveProvider(
+  state: DesktopWebState,
+  draft: ProviderDraft,
+): boolean {
+  const targetMatches = normalizeProviderBaseUrl(draft.baseUrl)
+      === normalizeProviderBaseUrl(state.provider_effective_base_url)
+    && draft.metadataMode === state.provider_effective_metadata_mode
+    && draft.selectedModelId === state.provider_effective_model_id;
+  if (!targetMatches) return false;
+  return draft.contextWindow.trim() !== state.provider_effective_context_window.trim()
+    || draft.maxOutputTokens.trim() !== state.provider_effective_max_output_tokens.trim();
 }
 
 function selectedProviderModelId(state: DesktopWebState): string {

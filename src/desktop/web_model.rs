@@ -349,6 +349,11 @@ pub struct DesktopWebState {
     pub command_rows: Vec<DesktopCommandRow>,
     pub provider_base_url: String,
     pub provider_metadata_mode: String,
+    pub provider_effective_base_url: String,
+    pub provider_effective_metadata_mode: String,
+    pub provider_effective_context_window: String,
+    pub provider_effective_max_output_tokens: String,
+    pub provider_effective_model_id: String,
     pub provider_catalog_base_url: Option<String>,
     pub provider_catalog_metadata_mode: Option<String>,
     pub provider_context_window: String,
@@ -693,15 +698,39 @@ pub(crate) fn desktop_web_state_with_permission(
             state.provider_config.provider_metadata_mode_input,
         )
         .to_string(),
+        provider_effective_base_url: state
+            .provider_config
+            .effective_config
+            .model
+            .base_url
+            .clone(),
+        provider_effective_metadata_mode: provider_metadata_mode_key(
+            state
+                .provider_config
+                .effective_config
+                .model
+                .provider_metadata_mode,
+        )
+        .to_string(),
+        provider_effective_context_window: state
+            .provider_config
+            .effective_config
+            .model
+            .context_window
+            .to_string(),
+        provider_effective_max_output_tokens: state
+            .provider_config
+            .effective_config
+            .model
+            .max_output_tokens
+            .to_string(),
+        provider_effective_model_id: state.provider_config.effective_config.model.model.clone(),
         provider_catalog_base_url: state.provider_config.provider_loaded_base_url.clone(),
         provider_catalog_metadata_mode: state
             .provider_config
-            .provider_loaded_base_url
-            .as_ref()
-            .map(|_| {
-                provider_metadata_mode_key(state.provider_config.provider_metadata_mode_input)
-                    .to_string()
-            }),
+            .provider_loaded_metadata_mode
+            .map(provider_metadata_mode_key)
+            .map(str::to_string),
         provider_context_window: state.provider_config.provider_context_window_input.clone(),
         provider_max_output_tokens: state
             .provider_config

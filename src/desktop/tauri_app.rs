@@ -235,6 +235,7 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             browse_workspace,
             open_workspace_folder,
             open_global_config_folder,
+            open_user_data_folder,
             import_global_config_toml,
             open_typed_path,
             open_artifact_folder,
@@ -2076,6 +2077,13 @@ async fn open_global_config_folder(
     controller: State<'_, SharedController>,
 ) -> Result<DesktopWebState, String> {
     mutate_controller(controller, DesktopController::open_global_config_folder).await
+}
+
+#[tauri::command]
+async fn open_user_data_folder(
+    controller: State<'_, SharedController>,
+) -> Result<DesktopWebState, String> {
+    mutate_controller(controller, DesktopController::open_user_data_folder).await
 }
 
 #[tauri::command]

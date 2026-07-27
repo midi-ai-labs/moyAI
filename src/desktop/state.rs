@@ -836,6 +836,7 @@ impl DesktopState {
         if target_changed {
             self.provider_config.provider_loading = false;
             self.provider_config.provider_loaded_base_url = None;
+            self.provider_config.provider_loaded_metadata_mode = None;
             self.view
                 .async_operations
                 .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
@@ -1359,6 +1360,7 @@ impl DesktopState {
             .async_operations
             .begin_unique(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
         self.provider_config.provider_loaded_base_url = None;
+        self.provider_config.provider_loaded_metadata_mode = None;
         self.provider_config.set_status(
             DesktopProviderStatusKind::Loading,
             "Provider 状態",
@@ -1393,6 +1395,8 @@ impl DesktopState {
             .map(|index| index as i32)
             .unwrap_or(-1);
         self.provider_config.provider_loaded_base_url = Some(normalized_base_url);
+        self.provider_config.provider_loaded_metadata_mode =
+            Some(self.provider_config.provider_metadata_mode_input);
         self.provider_config.provider_loading = false;
         self.view
             .async_operations
@@ -1421,6 +1425,7 @@ impl DesktopState {
             .async_operations
             .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
         self.provider_config.provider_loaded_base_url = None;
+        self.provider_config.provider_loaded_metadata_mode = None;
         let message = message.into();
         self.provider_config.set_status(
             DesktopProviderStatusKind::Error,
@@ -1441,6 +1446,8 @@ impl DesktopState {
 
     pub fn cancel_provider_model_load(&mut self) {
         self.provider_config.provider_loading = false;
+        self.provider_config.provider_loaded_base_url = None;
+        self.provider_config.provider_loaded_metadata_mode = None;
         self.view
             .async_operations
             .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
@@ -1595,15 +1602,33 @@ impl DesktopState {
 
     pub fn can_apply_provider_selection(&self) -> bool {
         let normalized = normalize_provider_base_url(&self.provider_config.provider_base_url_input);
+        let selected_model = self.selected_provider_model();
         !self.provider_config.provider_loading
             && !self
                 .provider_config
                 .provider_base_url_input
                 .trim()
                 .is_empty()
-            && self.selected_provider_model().is_some()
+            && selected_model.is_some()
             && !normalized.is_empty()
-            && self.provider_config.provider_loaded_base_url.as_deref() == Some(normalized.as_str())
+            && (self.provider_catalog_owns_current_target()
+                || self.provider_input_matches_effective_target())
+    }
+
+    pub fn provider_catalog_owns_current_target(&self) -> bool {
+        let normalized = normalize_provider_base_url(&self.provider_config.provider_base_url_input);
+        self.provider_config.provider_loaded_base_url.as_deref() == Some(normalized.as_str())
+            && self.provider_config.provider_loaded_metadata_mode
+                == Some(self.provider_config.provider_metadata_mode_input)
+    }
+
+    pub(crate) fn provider_input_matches_effective_target(&self) -> bool {
+        let current_model = &self.provider_config.effective_config.model;
+        normalize_provider_base_url(&current_model.base_url)
+            == normalize_provider_base_url(&self.provider_config.provider_base_url_input)
+            && self.provider_config.provider_metadata_mode_input
+                == current_model.provider_metadata_mode
+            && self.selected_provider_model() == Some(current_model.model.as_str())
     }
 
     fn with_provider_fields(mut self) -> Self {
@@ -1627,6 +1652,7 @@ impl DesktopState {
             .max_output_tokens
             .to_string();
         self.provider_config.provider_loaded_base_url = None;
+        self.provider_config.provider_loaded_metadata_mode = None;
         self
     }
 
@@ -2616,19 +2642,66 @@ mod tests {
     }
 
     #[test]
-    fn provider_apply_requires_catalog_evidence_and_preserves_selected_metadata() {
+    fn provider_apply_accepts_the_current_target_without_reloading_catalog() {
         let mut config = ResolvedConfig::default();
         config.model.base_url = "http://127.0.0.1:1234".to_string();
         config.model.model = "catalog-model".to_string();
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
+        assert!(state.can_apply_provider_selection());
+
+        state.provider_config.provider_context_window_input = "65536".to_string();
+        state.provider_config.provider_max_output_tokens_input = "8192".to_string();
+        assert!(
+            state.can_apply_provider_selection(),
+            "limit-only edits keep the current provider target eligible"
+        );
+
+        state.provider_config.provider_base_url_input = "http://127.0.0.1:5678".to_string();
+        assert!(!state.can_apply_provider_selection());
+        state.provider_config.provider_base_url_input = config.model.base_url.clone();
+        state.provider_config.provider_metadata_mode_input =
+            match config.model.provider_metadata_mode {
+                ProviderMetadataMode::LmStudioNativeRequired => {
+                    ProviderMetadataMode::OpenAiCompatibleOnly
+                }
+                ProviderMetadataMode::OpenAiCompatibleOnly => {
+                    ProviderMetadataMode::LmStudioNativeRequired
+                }
+            };
+        assert!(!state.can_apply_provider_selection());
+        state.provider_config.provider_metadata_mode_input = config.model.provider_metadata_mode;
+        state.provider_config.provider_selected_model_id_input = "other-model".to_string();
+        state
+            .provider_config
+            .provider_models
+            .push("other-model".to_string());
+        state.provider_config.provider_selected_index =
+            (state.provider_config.provider_models.len() - 1) as i32;
         assert!(!state.can_apply_provider_selection());
 
         let mut catalog_info = provider_info_from_config(&config);
         catalog_info.context_window = Some(262_144);
         catalog_info.source = "provider_catalog".to_string();
+        state.provider_config.provider_selected_model_id_input = config.model.model.clone();
         state.begin_provider_model_load(config.model.base_url.clone());
         state.finish_provider_model_load(vec![catalog_info]);
         assert!(state.can_apply_provider_selection());
+        assert!(state.provider_catalog_owns_current_target());
+        assert_eq!(
+            state.provider_config.provider_loaded_metadata_mode,
+            Some(config.model.provider_metadata_mode)
+        );
+        state.provider_config.provider_metadata_mode_input =
+            match config.model.provider_metadata_mode {
+                ProviderMetadataMode::LmStudioNativeRequired => {
+                    ProviderMetadataMode::OpenAiCompatibleOnly
+                }
+                ProviderMetadataMode::OpenAiCompatibleOnly => {
+                    ProviderMetadataMode::LmStudioNativeRequired
+                }
+            };
+        assert!(!state.provider_catalog_owns_current_target());
+        state.provider_config.provider_metadata_mode_input = config.model.provider_metadata_mode;
 
         let mut same_target = config.clone();
         same_target.model.context_window = 65_536;
@@ -2643,8 +2716,11 @@ mod tests {
         let mut changed_target = config;
         changed_target.model.base_url = "http://127.0.0.1:5678".to_string();
         state.reset_effective_config(changed_target);
-        assert!(!state.can_apply_provider_selection());
         assert_eq!(state.provider_config.provider_loaded_base_url, None);
+        assert!(
+            state.can_apply_provider_selection(),
+            "the newly effective target is eligible without stale catalog evidence"
+        );
     }
 
     #[test]

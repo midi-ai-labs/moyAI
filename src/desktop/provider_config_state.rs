@@ -59,6 +59,7 @@ pub struct DesktopProviderConfigState {
     pub provider_max_output_tokens_input: String,
     pub provider_selected_model_id_input: String,
     pub provider_loaded_base_url: Option<String>,
+    pub provider_loaded_metadata_mode: Option<ProviderMetadataMode>,
     pub provider_status: DesktopProviderStatus,
     pub provider_loading: bool,
 }
@@ -92,6 +93,7 @@ impl DesktopProviderConfigState {
             provider_max_output_tokens_input,
             provider_selected_model_id_input,
             provider_loaded_base_url: None,
+            provider_loaded_metadata_mode: None,
             provider_status,
             provider_loading: false,
         }
@@ -101,7 +103,7 @@ impl DesktopProviderConfigState {
         let normalized_base_url = normalize_provider_base_url(&config.model.base_url);
         let preserve_loaded_catalog = !self.provider_loading
             && self.provider_loaded_base_url.as_deref() == Some(normalized_base_url.as_str())
-            && self.provider_metadata_mode_input == config.model.provider_metadata_mode;
+            && self.provider_loaded_metadata_mode == Some(config.model.provider_metadata_mode);
         let retained_models = preserve_loaded_catalog.then(|| self.provider_models.clone());
         let retained_model_infos =
             preserve_loaded_catalog.then(|| self.provider_model_infos.clone());
@@ -126,6 +128,8 @@ impl DesktopProviderConfigState {
         self.provider_max_output_tokens_input = config.model.max_output_tokens.to_string();
         self.provider_selected_model_id_input = config.model.model.clone();
         self.provider_loaded_base_url = preserve_loaded_catalog.then_some(normalized_base_url);
+        self.provider_loaded_metadata_mode =
+            preserve_loaded_catalog.then_some(config.model.provider_metadata_mode);
         self.provider_loading = false;
         self.provider_status = retained_status.unwrap_or_else(|| {
             DesktopProviderStatus::idle(
@@ -168,6 +172,8 @@ mod tests {
         state.provider_base_url_input = state.effective_config.model.base_url.clone();
         state.provider_loaded_base_url =
             Some(normalize_provider_base_url(&state.provider_base_url_input));
+        state.provider_loaded_metadata_mode =
+            Some(state.effective_config.model.provider_metadata_mode);
         state.set_status(
             DesktopProviderStatusKind::Success,
             "catalog loaded",
@@ -176,6 +182,7 @@ mod tests {
         );
         let generation = state.config_generation;
         let loaded_base_url = state.provider_loaded_base_url.clone();
+        let loaded_metadata_mode = state.provider_loaded_metadata_mode;
         let provider_status = state.provider_status.clone();
         let model_ids = state
             .provider_model_infos
@@ -186,6 +193,7 @@ mod tests {
 
         assert_eq!(state.config_generation, generation);
         assert_eq!(state.provider_loaded_base_url, loaded_base_url);
+        assert_eq!(state.provider_loaded_metadata_mode, loaded_metadata_mode);
         assert_eq!(state.provider_status, provider_status);
         assert_eq!(
             state

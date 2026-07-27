@@ -677,6 +677,7 @@ export const ACTIONS: ActionDefinition[] = [
   },
   { id: "open-typed-path", label: "入力パスを開く", palette: true, enabled: always, run: (state, context) => context.mutate("open_typed_path", { text: state.workspace_input, expectedTarget: draftMutationTarget(state) }) },
   { id: "open-global-config-folder", label: "設定フォルダーを開く", palette: true, enabled: always, run: (_state, context) => runWithoutRender("open_global_config_folder", context) },
+  { id: "open-user-data-folder", label: "データフォルダーを開く", palette: true, enabled: always, run: (_state, context) => runWithoutRender("open_user_data_folder", context) },
   { id: "set-image", label: "画像を添付", palette: true, enabled: (state) => state.image_input_enabled, run: (state, context) => context.mutate("attach_image", { text: state.image_input, expectedTarget: draftMutationTarget(state) }) },
   { id: "browse-image", label: "画像を参照", palette: true, enabled: (state) => state.image_input_enabled, run: (state, context) => context.mutate("browse_image", { expectedTarget: draftMutationTarget(state) }) },
   { id: "clear-images", label: "添付を解除", palette: true, enabled: (state) => state.attached_images.length > 0, run: (state, context) => context.mutate("clear_images", { expectedTarget: draftMutationTarget(state) }) },

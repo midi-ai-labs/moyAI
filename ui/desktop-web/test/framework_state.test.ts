@@ -140,6 +140,11 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
     send_raw_enabled: true,
     provider_base_url: "http://127.0.0.1:1234",
     provider_metadata_mode: "openai_compatible_only",
+    provider_effective_base_url: "http://127.0.0.1:1234",
+    provider_effective_metadata_mode: "openai_compatible_only",
+    provider_effective_context_window: "131072",
+    provider_effective_max_output_tokens: "8192",
+    provider_effective_model_id: "model-a",
     provider_catalog_base_url: "http://127.0.0.1:1234",
     provider_catalog_metadata_mode: "openai_compatible_only",
     provider_context_window: "131072",
@@ -1840,22 +1845,99 @@ test("provider overlay consumes typed status and exposes control selection seman
   assert.match(invalid, /data-action="load-provider-models" disabled>モデル読込<\/button>/);
 });
 
-test("provider apply requires Rust catalog evidence owned by the local URL and mode", () => {
-  const withoutCatalog = projection({
-    provider_apply_enabled: false,
+test("provider limit-only edits can be committed without reloading the current catalog", () => {
+  const currentWithoutCatalog = projection({
+    provider_apply_enabled: true,
     provider_catalog_base_url: null,
     provider_catalog_metadata_mode: null,
   });
   const ui = createUiLocalState();
-  reconcileUiDrafts(ui, null, withoutCatalog, null);
-  assert.equal(projectViewState(withoutCatalog, ui).provider_apply_enabled, false);
+  reconcileUiDrafts(ui, null, currentWithoutCatalog, null);
+  assert.equal(
+    projectViewState(currentWithoutCatalog, ui).provider_apply_enabled,
+    false,
+    "an unchanged current provider is not a commit action",
+  );
 
+  ui.drafts.provider.contextWindow = "65536";
+  assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, true);
+  ui.drafts.provider.contextWindow = currentWithoutCatalog.provider_context_window;
+  assert.equal(
+    projectViewState(currentWithoutCatalog, ui).provider_apply_enabled,
+    false,
+    "reverting the local limit disables the no-op commit",
+  );
+
+  ui.drafts.provider.maxOutputTokens = "4096";
+  assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, true);
+  ui.drafts.provider.maxOutputTokens = "0";
+  assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, false);
+  ui.drafts.provider.maxOutputTokens = "4096";
+  ui.drafts.provider.baseUrl = "http://127.0.0.1:4321";
+  assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, false);
+  ui.drafts.provider.baseUrl = currentWithoutCatalog.provider_base_url;
+  ui.drafts.provider.metadataMode = "lm_studio_native_required";
+  assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, false);
+  ui.drafts.provider.metadataMode = currentWithoutCatalog.provider_metadata_mode;
+  ui.drafts.provider.selectedModelId = "model-b";
+  assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, false);
+
+  const failedSave = projection({
+    provider_context_window: "65536",
+    provider_max_output_tokens: "4096",
+    provider_apply_enabled: true,
+    provider_catalog_base_url: null,
+    provider_catalog_metadata_mode: null,
+  });
+  const failedSaveUi = createUiLocalState();
+  reconcileUiDrafts(failedSaveUi, null, failedSave, null);
+  assert.equal(
+    projectViewState(failedSave, failedSaveUi).provider_apply_enabled,
+    true,
+    "a failed command keeps limits dirty against the effective provider baseline",
+  );
+
+  const failedCatalogSwitch = projection({
+    provider_base_url: "http://127.0.0.1:4321",
+    provider_context_window: "65536",
+    provider_apply_enabled: false,
+    provider_catalog_base_url: null,
+    provider_catalog_metadata_mode: null,
+  });
+  const failedCatalogSwitchUi = createUiLocalState();
+  reconcileUiDrafts(failedCatalogSwitchUi, null, failedCatalogSwitch, null);
+  failedCatalogSwitchUi.drafts.provider.baseUrl =
+    failedCatalogSwitch.provider_effective_base_url;
+  assert.equal(
+    projectViewState(failedCatalogSwitch, failedCatalogSwitchUi).provider_apply_enabled,
+    true,
+    "returning from a failed catalog target can commit limits against the effective provider",
+  );
+
+  const rustRejected = projection({
+    provider_apply_enabled: false,
+    provider_catalog_base_url: null,
+    provider_catalog_metadata_mode: null,
+  });
+  const rustRejectedUi = createUiLocalState();
+  reconcileUiDrafts(rustRejectedUi, null, rustRejected, null);
+  rustRejectedUi.drafts.provider.contextWindow = "65536";
+  rustRejectedUi.drafts.provider.baseUrl = "http://127.0.0.1:4321";
+  assert.equal(
+    projectViewState(rustRejected, rustRejectedUi).provider_apply_enabled,
+    false,
+    "frontend dirty state cannot replace catalog evidence for a new provider target",
+  );
+});
+
+test("provider catalog evidence remains bound to the local URL and mode", () => {
   const loaded = projection({
     provider_apply_enabled: true,
     provider_catalog_base_url: "http://127.0.0.1:1234",
     provider_catalog_metadata_mode: "openai_compatible_only",
   });
-  reconcileUiDrafts(ui, withoutCatalog, loaded, null);
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, loaded, null);
   assert.equal(projectViewState(loaded, ui).provider_apply_enabled, true);
 
   ui.drafts.provider.baseUrl = "http://127.0.0.1:1234/v1/";
@@ -1870,18 +1952,24 @@ test("provider apply requires Rust catalog evidence owned by the local URL and m
   ui.drafts.provider.baseUrl = "http://127.0.0.1:1234";
   ui.drafts.provider.metadataMode = "lm_studio_native_required";
   assert.equal(projectViewState(loaded, ui).provider_apply_enabled, false);
+});
 
-  const unownedEvidence = projection({
-    provider_apply_enabled: true,
-    provider_catalog_base_url: null,
-    provider_catalog_metadata_mode: null,
-  });
-  const unownedUi = createUiLocalState();
-  reconcileUiDrafts(unownedUi, null, unownedEvidence, null);
+test("settings exposes separate config and user data folder actions", () => {
+  const state = projection({ overlay: "config" });
+  const html = renderOverlay(state);
+
+  assert.match(
+    html,
+    /data-action="open-global-config-folder">設定フォルダーを開く<\/button>/,
+  );
+  assert.match(
+    html,
+    /data-action="open-user-data-folder">データフォルダーを開く<\/button>/,
+  );
+  assert.equal(actionById("open-user-data-folder")?.label, "データフォルダーを開く");
   assert.equal(
-    projectViewState(unownedEvidence, unownedUi).provider_apply_enabled,
-    false,
-    "frontend validity cannot replace Rust catalog ownership evidence",
+    actionById("open-user-data-folder")?.enabled?.(state, { index: -1, value: "" }),
+    true,
   );
 });
 

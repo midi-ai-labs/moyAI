@@ -313,6 +313,11 @@ export interface DesktopWebState {
   command_rows: Array<{ name: string; label: string; path: string }>;
   provider_base_url: string;
   provider_metadata_mode: "lm_studio_native_required" | "openai_compatible_only";
+  provider_effective_base_url: string;
+  provider_effective_metadata_mode: "lm_studio_native_required" | "openai_compatible_only";
+  provider_effective_context_window: string;
+  provider_effective_max_output_tokens: string;
+  provider_effective_model_id: string;
   provider_catalog_base_url: string | null;
   provider_catalog_metadata_mode: "lm_studio_native_required" | "openai_compatible_only" | null;
   provider_context_window: string;
