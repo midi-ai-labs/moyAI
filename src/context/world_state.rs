@@ -9,7 +9,7 @@ use crate::config::PermissionProfileCatalog;
 use crate::config::{AccessMode, ResolvedConfig};
 use crate::context::current_time::CurrentTimeSnapshot;
 use crate::error::WorkspaceError;
-use crate::workspace::{AccessKind, PathGuard, Workspace, instruction_file_names, is_rule_file};
+use crate::workspace::{PathGuard, Workspace, instruction_file_names, is_rule_file};
 
 const MAX_CONTEXT_SOURCE_BYTES: usize = 16 * 1024;
 const MAX_CONTEXT_TOTAL_BYTES: usize = 48 * 1024;
@@ -92,7 +92,7 @@ pub struct EnvironmentSection {
 impl EnvironmentSection {
     fn new(workspace: &Workspace, config: &ResolvedConfig) -> Self {
         Self {
-            workspace_root: workspace.root.clone(),
+            workspace_root: workspace.authority_root().to_path_buf(),
             cwd: workspace.cwd.clone(),
             access_mode: config.permissions.access_mode,
             model: config.model.model.clone(),
@@ -188,7 +188,7 @@ impl InstructionsSection {
             total_bytes += content.len();
             truncated |= source_truncated;
             sources.push(InstructionSource {
-                relative_path: relative_display_path(&workspace.root, &path),
+                relative_path: relative_display_path(workspace.authority_root(), &path),
                 path,
                 kind,
                 content,
@@ -383,7 +383,7 @@ fn read_bounded_utf8_prefix(
 ) -> Result<Option<(String, bool)>, WorkspaceError> {
     let guarded = match authority {
         InstructionPathAuthority::Workspace => {
-            PathGuard::require_path(workspace, path, AccessKind::Read)?
+            PathGuard::trusted_internal_path(path, &workspace.root)?
         }
         InstructionPathAuthority::ExplicitFile => PathGuard::trusted_exact_path(path)?,
     };
@@ -443,7 +443,7 @@ mod tests {
     use super::WorldStateSection;
     use crate::config::ResolvedConfig;
     use crate::session::ProjectId;
-    use crate::workspace::{IgnorePlan, PathPolicy, VcsKind, Workspace};
+    use crate::workspace::{IgnorePlan, PathPolicy, VcsKind, Workspace, WorkspaceDiscovery};
 
     fn workspace(root: Utf8PathBuf) -> Workspace {
         Workspace {
@@ -460,6 +460,60 @@ mod tests {
             protected_paths: Vec::new(),
             traversal_registry: crate::workspace::traversal::TraversalRegistry::default(),
         }
+    }
+
+    #[test]
+    fn world_state_projects_the_selected_directory_as_workspace_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 project root");
+        let selected = project_root.join("bbb");
+        std::fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        std::fs::create_dir_all(&selected).expect("selected directory");
+        let workspace = WorkspaceDiscovery::discover(&selected, &ResolvedConfig::default())
+            .expect("nested workspace");
+
+        let environment = super::EnvironmentSection::new(&workspace, &ResolvedConfig::default());
+
+        assert_eq!(environment.workspace_root, selected);
+        assert_eq!(environment.cwd, selected);
+        assert_eq!(workspace.root, project_root);
+    }
+
+    #[test]
+    fn nested_git_instruction_labels_use_authority_relative_or_absolute_coordinates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 project root");
+        let selected = project_root.join("bbb");
+        std::fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        std::fs::create_dir_all(&selected).expect("selected directory");
+        let project_instruction = project_root.join("AGENTS.md");
+        let selected_instruction = selected.join("AGENTS.md");
+        std::fs::write(&project_instruction, "project instruction").expect("project instruction");
+        std::fs::write(&selected_instruction, "selected instruction")
+            .expect("selected instruction");
+        let workspace = WorkspaceDiscovery::discover(&selected, &ResolvedConfig::default())
+            .expect("nested workspace");
+
+        let instructions = super::InstructionsSection::load(&workspace, &ResolvedConfig::default())
+            .expect("instructions");
+        let project_source = instructions
+            .sources
+            .iter()
+            .find(|source| source.path == project_instruction)
+            .expect("project source");
+        let selected_source = instructions
+            .sources
+            .iter()
+            .find(|source| source.path == selected_instruction)
+            .expect("selected source");
+
+        assert_eq!(
+            project_source.relative_path,
+            project_instruction.as_str().replace('\\', "/")
+        );
+        assert_eq!(selected_source.relative_path, "AGENTS.md");
     }
 
     #[cfg(unix)]
@@ -580,7 +634,7 @@ mod tests {
             .expect_err("external instruction link must fail closed");
 
         assert!(
-            error.to_string().contains("outside the allowed roots"),
+            error.to_string().contains("outside"),
             "unexpected boundary error: {error}"
         );
         assert!(!error.to_string().contains("EXTERNAL_INSTRUCTION_SECRET"));
@@ -657,7 +711,7 @@ mod tests {
         escaped_config.instructions.additional_files = vec![Utf8PathBuf::from("../explicit.md")];
         let error = super::InstructionsSection::load(&workspace(root), &escaped_config)
             .expect_err("relative configured instruction must remain workspace-bound");
-        assert!(error.to_string().contains("outside the allowed roots"));
+        assert!(error.to_string().contains("outside"));
     }
 
     #[test]

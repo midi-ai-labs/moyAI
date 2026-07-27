@@ -50,7 +50,7 @@ impl DesktopPreferences {
         if self
             .last_workspace
             .as_ref()
-            .is_some_and(|workspace| workspace == root)
+            .is_some_and(|workspace| workspace.starts_with(root))
         {
             self.last_workspace = None;
         }
@@ -97,10 +97,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn project_delete_tombstone_clears_restore_state() {
+    fn project_delete_tombstone_clears_nested_restore_state() {
         let root = Utf8Path::new("C:/workspace/deleted");
+        let nested_workspace = root.join("bbb");
         let mut preferences = DesktopPreferences {
-            last_workspace: Some(root.to_path_buf()),
+            last_workspace: Some(nested_workspace),
             window_opacity_percent: Some(95),
             deleted_project_roots: Vec::new(),
         };
@@ -115,5 +116,20 @@ mod tests {
         preferences.unmark_project_deleted(root);
 
         assert!(!preferences.is_project_deleted(root));
+    }
+
+    #[test]
+    fn project_delete_tombstone_preserves_sibling_restore_state() {
+        let root = Utf8Path::new("C:/workspace/deleted");
+        let sibling = Utf8PathBuf::from("C:/workspace/deleted-sibling");
+        let mut preferences = DesktopPreferences {
+            last_workspace: Some(sibling.clone()),
+            window_opacity_percent: Some(95),
+            deleted_project_roots: Vec::new(),
+        };
+
+        preferences.mark_project_deleted(root);
+
+        assert_eq!(preferences.last_workspace, Some(sibling));
     }
 }

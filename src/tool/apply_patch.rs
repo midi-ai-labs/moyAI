@@ -105,8 +105,11 @@ async fn execute_admitted_patch_operations(
     if commit.changes.is_empty() {
         let path = all_update_operations_no_content_path
             .or(first_no_content_update_path)
-            .unwrap_or_else(|| ctx.workspace.root.clone());
-        return Ok(no_content_patch_result(&path, &ctx.workspace.root));
+            .unwrap_or_else(|| ctx.workspace.authority_root().to_path_buf());
+        return Ok(no_content_patch_result(
+            &path,
+            ctx.workspace.authority_root(),
+        ));
     }
 
     Ok(ToolResult {
@@ -114,7 +117,10 @@ async fn execute_admitted_patch_operations(
         output_text: commit
             .summaries
             .iter()
-            .map(|summary| summary.summary_line(Some(&ctx.workspace.root)))
+            .map(|summary| {
+                summary
+                    .summary_line_relative_to(&ctx.workspace.root, ctx.workspace.authority_root())
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         metadata: json!({

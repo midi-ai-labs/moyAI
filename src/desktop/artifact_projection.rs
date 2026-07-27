@@ -6,12 +6,21 @@ use crate::protocol::{
 };
 use crate::session::{ChangeKind, ToolCallId};
 pub fn file_change_rows_from_turn_items(turn_items: &[TurnItem]) -> Vec<DesktopFileChangeRow> {
-    file_change_rows_from_turn_items_with_root(turn_items, None)
+    file_change_rows_from_turn_items_with_roots(turn_items, None, None)
 }
 
+#[cfg(test)]
 pub(crate) fn file_change_rows_from_turn_items_with_root(
     turn_items: &[TurnItem],
     workspace_root: Option<&Utf8Path>,
+) -> Vec<DesktopFileChangeRow> {
+    file_change_rows_from_turn_items_with_roots(turn_items, workspace_root, workspace_root)
+}
+
+pub(crate) fn file_change_rows_from_turn_items_with_roots(
+    turn_items: &[TurnItem],
+    storage_root: Option<&Utf8Path>,
+    display_root: Option<&Utf8Path>,
 ) -> Vec<DesktopFileChangeRow> {
     let mut rows = Vec::new();
     for item in turn_items_in_projection_order(turn_items) {
@@ -22,11 +31,15 @@ pub(crate) fn file_change_rows_from_turn_items_with_root(
             ..
         } = &item.payload
         {
-            rows.extend(
-                changes.iter().map(|change| {
-                    file_change_row(*call_id, change, summary.as_str(), workspace_root)
-                }),
-            );
+            rows.extend(changes.iter().map(|change| {
+                file_change_row(
+                    *call_id,
+                    change,
+                    summary.as_str(),
+                    storage_root,
+                    display_root,
+                )
+            }));
         }
     }
     dedupe_file_change_rows(rows)
@@ -36,7 +49,8 @@ fn file_change_row(
     call_id: ToolCallId,
     change: &FileChangeEvidence,
     fallback_summary: &str,
-    workspace_root: Option<&Utf8Path>,
+    storage_root: Option<&Utf8Path>,
+    display_root: Option<&Utf8Path>,
 ) -> DesktopFileChangeRow {
     let raw_path = change
         .path_after
@@ -45,7 +59,7 @@ fn file_change_row(
         .map(|value| value.to_string());
     let path = raw_path
         .as_deref()
-        .map(|value| display_file_change_path(Utf8Path::new(value), workspace_root))
+        .map(|value| display_file_change_path(Utf8Path::new(value), storage_root, display_root))
         .unwrap_or_else(|| "(不明なパス)".to_string());
     let label = path
         .rsplit(['/', '\\'])
@@ -58,7 +72,18 @@ fn file_change_row(
     } else {
         change.summary.trim().to_string()
     };
-    let summary = normalize_file_change_summary(&raw_summary, raw_path.as_deref(), &path);
+    let summary = match (storage_root, display_root) {
+        (Some(storage_root), Some(display_root)) => {
+            crate::edit::change_tracker::summary_line_from_stored_paths(
+                change.kind,
+                change.path_before.as_ref(),
+                change.path_after.as_ref(),
+                storage_root,
+                display_root,
+            )
+        }
+        _ => normalize_file_change_summary(&raw_summary, raw_path.as_deref(), &path),
+    };
     DesktopFileChangeRow {
         label,
         path,
@@ -69,11 +94,22 @@ fn file_change_row(
     }
 }
 
-fn display_file_change_path(path: &Utf8Path, workspace_root: Option<&Utf8Path>) -> String {
-    let display_path = workspace_root
-        .and_then(|root| path.strip_prefix(root).ok())
+fn display_file_change_path(
+    path: &Utf8Path,
+    storage_root: Option<&Utf8Path>,
+    display_root: Option<&Utf8Path>,
+) -> String {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(storage_root) = storage_root {
+        storage_root.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    let display_path = display_root
+        .and_then(|root| crate::workspace::PathGuard::relative_path_from_root(&absolute, root))
         .filter(|relative| !relative.as_str().trim().is_empty())
-        .unwrap_or(path);
+        .unwrap_or(absolute);
     display_path.as_str().replace('\\', "/")
 }
 
@@ -239,6 +275,8 @@ fn change_kind_label(kind: ChangeKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use camino::Utf8PathBuf;
+
     use super::*;
 
     fn row(kind: ChangeKind, summary: &str) -> DesktopFileChangeRow {
@@ -274,5 +312,44 @@ mod tests {
 
         assert_eq!(rows[0].kind, ChangeKind::Update);
         assert_eq!(artifact_rows_from_file_changes(&rows).len(), 1);
+    }
+
+    #[test]
+    fn project_relative_change_path_projects_from_nested_workspace_authority() {
+        let storage_root = Utf8PathBuf::from("C:/workspace/aaa");
+        let display_root = storage_root.join("bbb");
+
+        assert_eq!(
+            display_file_change_path(
+                Utf8Path::new("bbb/ccc/result.txt"),
+                Some(&storage_root),
+                Some(&display_root),
+            ),
+            "ccc/result.txt"
+        );
+        assert_eq!(
+            display_file_change_path(
+                Utf8Path::new("sibling/outside.txt"),
+                Some(&storage_root),
+                Some(&display_root),
+            ),
+            "C:/workspace/aaa/sibling/outside.txt"
+        );
+
+        let change_id = crate::session::ChangeId::new();
+        let row = file_change_row(
+            ToolCallId::new(),
+            &FileChangeEvidence {
+                change_id,
+                kind: ChangeKind::Move,
+                path_before: Some(camino::Utf8PathBuf::from("bbb/old.txt")),
+                path_after: Some(camino::Utf8PathBuf::from("bbb/ccc/new.txt")),
+                summary: "Moved bbb/old.txt -> bbb/ccc/new.txt".to_string(),
+            },
+            "Moved bbb/old.txt -> bbb/ccc/new.txt",
+            Some(&storage_root),
+            Some(&display_root),
+        );
+        assert_eq!(row.summary, "Moved old.txt -> ccc/new.txt");
     }
 }

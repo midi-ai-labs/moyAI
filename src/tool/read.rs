@@ -393,7 +393,7 @@ fn find_instruction_sources(
     let mut sources = Vec::new();
     let mut current = relative_to_root.parent();
     while let Some(relative_dir) = current {
-        let dir = workspace.root.join(relative_dir);
+        let dir = workspace.authority_root().join(relative_dir);
         for file_name in instruction_file_names() {
             let candidate = dir.join(file_name);
             let candidate_guard = PathGuard::require_path(workspace, &candidate, AccessKind::Read)
@@ -504,6 +504,45 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(!sources.contains(&outside_instruction.as_str().replace('\\', "/")));
+    }
+
+    #[test]
+    fn nested_git_read_instruction_sources_stop_at_selected_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 project root");
+        let selected = project_root.join("bbb");
+        let nested = selected.join("ccc");
+        std::fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        std::fs::create_dir_all(&nested).expect("nested directory");
+        let project_instruction = project_root.join("AGENTS.md");
+        let selected_instruction = selected.join("AGENTS.md");
+        let nested_instruction = nested.join("AGENTS.md");
+        std::fs::write(&project_instruction, "project").expect("project instruction");
+        std::fs::write(&selected_instruction, "selected").expect("selected instruction");
+        std::fs::write(&nested_instruction, "nested").expect("nested instruction");
+        let target = nested.join("target.txt");
+        std::fs::write(&target, "target").expect("target");
+        let workspace = WorkspaceDiscovery::discover(&selected, &ResolvedConfig::default())
+            .expect("nested workspace");
+        let guarded = PathGuard::require_path(&workspace, &target, AccessKind::Read)
+            .expect("guarded nested target");
+
+        let sources = find_instruction_sources(
+            guarded.inside_workspace,
+            &guarded.relative_to_root,
+            &workspace,
+        )
+        .expect("instruction sources");
+
+        assert_eq!(
+            sources,
+            [&nested_instruction, &selected_instruction]
+                .into_iter()
+                .map(|path| path.as_str().replace('\\', "/"))
+                .collect::<Vec<_>>()
+        );
+        assert!(!sources.contains(&project_instruction.as_str().replace('\\', "/")));
     }
 
     #[test]

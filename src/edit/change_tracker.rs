@@ -59,6 +59,20 @@ impl ChangeSummary {
             ),
         }
     }
+
+    pub fn summary_line_relative_to(
+        &self,
+        storage_root: &Utf8Path,
+        display_root: &Utf8Path,
+    ) -> String {
+        summary_line_from_stored_paths(
+            self.kind,
+            self.path_before.as_ref(),
+            self.path_after.as_ref(),
+            storage_root,
+            display_root,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -177,4 +191,85 @@ fn render_display_path(path: Option<&Utf8PathBuf>, workspace_root: Option<&Utf8P
         }
     }
     path.as_str().to_string()
+}
+
+pub(crate) fn summary_line_from_stored_paths(
+    kind: ChangeKind,
+    path_before: Option<&Utf8PathBuf>,
+    path_after: Option<&Utf8PathBuf>,
+    storage_root: &Utf8Path,
+    display_root: &Utf8Path,
+) -> String {
+    match kind {
+        ChangeKind::Add => format!(
+            "Added {}",
+            render_stored_display_path(path_after, storage_root, display_root)
+        ),
+        ChangeKind::Update => format!(
+            "Updated {}",
+            render_stored_display_path(path_after.or(path_before), storage_root, display_root,)
+        ),
+        ChangeKind::Delete => format!(
+            "Deleted {}",
+            render_stored_display_path(path_before, storage_root, display_root)
+        ),
+        ChangeKind::Move => format!(
+            "Moved {} -> {}",
+            render_stored_display_path(path_before, storage_root, display_root),
+            render_stored_display_path(path_after, storage_root, display_root)
+        ),
+    }
+}
+
+fn render_stored_display_path(
+    path: Option<&Utf8PathBuf>,
+    storage_root: &Utf8Path,
+    display_root: &Utf8Path,
+) -> String {
+    let Some(path) = path else {
+        return String::new();
+    };
+    let absolute = if path.is_absolute() {
+        path.clone()
+    } else {
+        storage_root.join(path)
+    };
+    crate::workspace::PathGuard::relative_path_from_root(&absolute, display_root)
+        .filter(|relative| !relative.as_str().is_empty())
+        .unwrap_or(absolute)
+        .as_str()
+        .replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use camino::Utf8PathBuf;
+
+    use crate::session::{ChangeId, ChangeKind};
+
+    use super::ChangeSummary;
+
+    #[test]
+    fn project_relative_storage_renders_from_nested_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 storage root");
+        let display_root = storage_root.join("bbb");
+        let summary = ChangeSummary {
+            change_id: ChangeId::new(),
+            kind: ChangeKind::Update,
+            path_before: Some(Utf8PathBuf::from("bbb/ccc/file.txt")),
+            path_after: Some(Utf8PathBuf::from("bbb/ccc/file.txt")),
+        };
+
+        assert_eq!(
+            summary.summary_line_relative_to(&storage_root, &display_root),
+            "Updated ccc/file.txt"
+        );
+        assert_eq!(
+            summary.path_after,
+            Some(Utf8PathBuf::from("bbb/ccc/file.txt")),
+            "persisted project-relative coordinates stay unchanged"
+        );
+    }
 }

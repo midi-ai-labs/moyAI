@@ -4,7 +4,7 @@ use crate::config::ResolvedConfig;
 use crate::error::WorkspaceError;
 use crate::session::ProjectId;
 use crate::workspace::ignore::IgnorePlan;
-use crate::workspace::path_guard::PathPolicy;
+use crate::workspace::path_guard::{PathGuard, PathPolicy};
 use crate::workspace::project::{VcsKind, find_workspace_root};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -18,6 +18,12 @@ pub struct Workspace {
     pub path_policy: PathPolicy,
     #[serde(skip, default)]
     pub traversal_registry: crate::workspace::traversal::TraversalRegistry,
+}
+
+impl Workspace {
+    pub fn authority_root(&self) -> &Utf8Path {
+        &self.path_policy.workspace_root
+    }
 }
 
 pub struct WorkspaceDiscovery;
@@ -38,6 +44,21 @@ impl WorkspaceDiscovery {
     ) -> Result<Workspace, WorkspaceError> {
         let cwd = absolute_start_dir(start_dir)?;
         workspace_from_cwd_and_root(cwd.clone(), cwd, config)
+    }
+
+    pub(crate) fn discover_with_stored_root(
+        start_dir: &Utf8Path,
+        stored_root: &Utf8Path,
+        config: &ResolvedConfig,
+    ) -> Result<Workspace, WorkspaceError> {
+        let cwd = absolute_start_dir(start_dir)?;
+        let root = absolute_start_dir(stored_root)?;
+        if PathGuard::relative_path_from_root(&cwd, &root).is_none() {
+            return Err(WorkspaceError::Message(format!(
+                "workspace directory `{cwd}` is outside stored project root `{root}`"
+            )));
+        }
+        workspace_from_cwd_and_root(cwd, root, config)
     }
 }
 
@@ -74,7 +95,7 @@ fn workspace_from_cwd_and_root(
     protected_paths.dedup();
 
     let path_policy = PathPolicy {
-        workspace_root: root.clone(),
+        workspace_root: cwd.clone(),
         additional_read_roots: config.permissions.additional_read_roots.clone(),
         additional_write_roots: config.permissions.additional_write_roots.clone(),
     };

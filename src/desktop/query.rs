@@ -14,8 +14,10 @@ use crate::session::{
 use crate::tui::state::{AppState, RunProgressPhase, RunStatus, TranscriptKind};
 use crate::workspace::project::project_display_name;
 
+#[cfg(test)]
+use super::artifact_projection::file_change_rows_from_turn_items_with_root;
 use super::artifact_projection::{
-    artifact_rows_from_file_changes, file_change_rows_from_turn_items_with_root,
+    artifact_rows_from_file_changes, file_change_rows_from_turn_items_with_roots,
     format_file_change_summary,
 };
 pub use super::artifact_projection::{file_change_rows_from_turn_items, format_artifact_preview};
@@ -156,7 +158,7 @@ async fn build_snapshot(
         session_rows.push(DesktopSessionRow::from_loaded_summary(summary));
     }
     Ok(DesktopSnapshot {
-        workspace_path: app.workspace.root.to_string(),
+        workspace_path: app.workspace.authority_root().to_string(),
         provider_label: app.config.model.base_url.clone(),
         model_label: app.config.model.model.clone(),
         command_rows: load_command_rows(&app.workspace.root),
@@ -311,12 +313,24 @@ pub fn build_session_detail(
     read: &CanonicalSessionRead,
     replay_report: Option<ReplayReport>,
 ) -> DesktopSessionDetail {
+    build_session_detail_with_roots(read, replay_report, None, None)
+}
+
+pub(crate) fn build_session_detail_with_roots(
+    read: &CanonicalSessionRead,
+    replay_report: Option<ReplayReport>,
+    storage_root: Option<&camino::Utf8Path>,
+    display_root: Option<&camino::Utf8Path>,
+) -> DesktopSessionDetail {
     let session = &read.session;
     let turn_items = &read.turns.items;
     let mut ui_state = AppState::default();
+    if let (Some(storage_root), Some(display_root)) = (storage_root, display_root) {
+        ui_state.set_file_change_display_roots(storage_root, display_root);
+    }
     ui_state.load_turn_items_with_active_turn(session, turn_items, read.active_turn_id);
     let file_changes =
-        file_change_rows_from_turn_items_with_root(turn_items, Some(session.cwd.as_path()));
+        file_change_rows_from_turn_items_with_roots(turn_items, storage_root, display_root);
     let mut detail = build_session_detail_from_app_state(&ui_state);
     detail.turn_page_offset = read.turns.offset;
     detail.turn_page_limit = if read.turns.limit == 0 {
@@ -331,10 +345,12 @@ pub fn build_session_detail(
     };
     detail.turn_page_has_more = read.turns.has_more;
     detail.session_id = session.id;
-    detail.transcript_rows = transcript_rows_from_turn_items_with_context_and_elapsed(
+    detail.transcript_rows = transcript_rows_from_turn_items_with_context_and_elapsed_and_roots(
         session,
         turn_items,
         &read.turn_elapsed_ms,
+        storage_root,
+        display_root,
     );
     detail.thread_empty = transcript_rows_are_empty_placeholder(&detail.transcript_rows);
     detail.artifacts = artifact_rows_from_file_changes(&file_changes);
@@ -374,6 +390,7 @@ impl TurnTranscriptGroup {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 pub(super) fn transcript_rows_from_turn_items_with_context(
     session: &SessionRecord,
     turn_items: &[crate::protocol::TurnItem],
@@ -385,10 +402,27 @@ pub(super) fn transcript_rows_from_turn_items_with_context(
     )
 }
 
+#[cfg(test)]
 pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed(
     session: &SessionRecord,
     turn_items: &[crate::protocol::TurnItem],
     turn_elapsed_ms: &std::collections::HashMap<crate::protocol::TurnId, u64>,
+) -> Vec<DesktopTranscriptRow> {
+    transcript_rows_from_turn_items_with_context_and_elapsed_and_roots(
+        session,
+        turn_items,
+        turn_elapsed_ms,
+        None,
+        None,
+    )
+}
+
+pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed_and_roots(
+    session: &SessionRecord,
+    turn_items: &[crate::protocol::TurnItem],
+    turn_elapsed_ms: &std::collections::HashMap<crate::protocol::TurnId, u64>,
+    storage_root: Option<&camino::Utf8Path>,
+    display_root: Option<&camino::Utf8Path>,
 ) -> Vec<DesktopTranscriptRow> {
     let mut rows = Vec::new();
     let mut current = TurnTranscriptGroup::default();
@@ -403,7 +437,15 @@ pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed(
             let elapsed_ms = current
                 .turn_id
                 .and_then(|turn_id| turn_elapsed_ms.get(&turn_id).copied());
-            flush_turn_transcript_group(&mut rows, session, &mut current, elapsed_ms, None, None);
+            flush_turn_transcript_group(
+                &mut rows,
+                &mut current,
+                elapsed_ms,
+                None,
+                None,
+                storage_root,
+                display_root,
+            );
         }
         current.turn_id.get_or_insert(item.turn_id);
         let preceding_agent_communication = immediately_preceding_agent_communication.take();
@@ -414,11 +456,12 @@ pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed(
                     .and_then(|turn_id| turn_elapsed_ms.get(&turn_id).copied());
                 flush_turn_transcript_group(
                     &mut rows,
-                    session,
                     &mut current,
                     elapsed_ms,
                     None,
                     Some(item.id),
+                    storage_root,
+                    display_root,
                 );
                 current.turn_id = Some(item.turn_id);
                 current.user_body = text.clone();
@@ -430,11 +473,12 @@ pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed(
                     .and_then(|turn_id| turn_elapsed_ms.get(&turn_id).copied());
                 flush_turn_transcript_group(
                     &mut rows,
-                    session,
                     &mut current,
                     elapsed_ms,
                     None,
                     Some(item.id),
+                    storage_root,
+                    display_root,
                 );
                 current.turn_id = Some(item.turn_id);
                 current.user_body = text.clone();
@@ -572,11 +616,12 @@ pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed(
         .and_then(|turn_id| turn_elapsed_ms.get(&turn_id).copied());
     flush_turn_transcript_group(
         &mut rows,
-        session,
         &mut current,
         elapsed_ms,
         Some(session.status),
         None,
+        storage_root,
+        display_root,
     );
     if rows.is_empty() {
         rows.push(desktop_transcript_row(
@@ -616,11 +661,12 @@ fn ordered_turn_items_for_projection(
 
 fn flush_turn_transcript_group(
     rows: &mut Vec<DesktopTranscriptRow>,
-    session: &SessionRecord,
     group: &mut TurnTranscriptGroup,
     elapsed_ms: Option<u64>,
     lifecycle_status: Option<SessionStatus>,
     next_user_boundary_id: Option<crate::protocol::TurnItemId>,
+    storage_root: Option<&camino::Utf8Path>,
+    display_root: Option<&camino::Utf8Path>,
 ) {
     if !group.has_content() {
         group.turn_id = None;
@@ -644,9 +690,10 @@ fn flush_turn_transcript_group(
     rows.extend(group.system_rows.drain(..));
     rows.extend(group.agent_rows.drain(..));
 
-    let file_changes = file_change_rows_from_turn_items_with_root(
+    let file_changes = file_change_rows_from_turn_items_with_roots(
         &group.file_change_items,
-        Some(session.cwd.as_path()),
+        storage_root,
+        display_root,
     );
     if has_work_summary {
         let row_kind = turn_work_summary_kind(group, lifecycle_status);
@@ -2507,6 +2554,88 @@ mod tests {
         assert_eq!(rows[1].path, "tests/workflow.contract");
         assert_eq!(rows[1].action, "追加");
         assert_eq!(rows[1].summary, "Updated tests/workflow.contract");
+    }
+
+    #[test]
+    fn file_change_rows_project_stored_paths_from_nested_authority() {
+        let session_id = SessionId::new();
+        let storage_root = Utf8PathBuf::from("C:/workspace/aaa");
+        let display_root = storage_root.join("bbb");
+        let turn_items = vec![TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id: crate::protocol::TurnId::new(),
+            source_item_id: None,
+            sequence_no: 1,
+            payload: TurnItemPayload::FileChange {
+                call_id: crate::session::ToolCallId::new(),
+                change_ids: vec![crate::session::ChangeId::new()],
+                changes: vec![FileChangeEvidence {
+                    change_id: crate::session::ChangeId::new(),
+                    kind: ChangeKind::Update,
+                    path_before: Some(Utf8PathBuf::from("bbb/ccc/result.txt")),
+                    path_after: Some(Utf8PathBuf::from("bbb/ccc/result.txt")),
+                    summary: "Updated bbb/ccc/result.txt".to_string(),
+                }],
+                summary: "Updated bbb/ccc/result.txt".to_string(),
+            },
+        }];
+
+        let rows = file_change_rows_from_turn_items_with_roots(
+            &turn_items,
+            Some(&storage_root),
+            Some(&display_root),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "ccc/result.txt");
+        assert_eq!(rows[0].summary, "Updated ccc/result.txt");
+    }
+
+    #[test]
+    fn nested_authority_session_detail_uses_one_public_change_coordinate_system() {
+        let storage_root = Utf8PathBuf::from("C:/workspace/aaa");
+        let display_root = storage_root.join("bbb");
+        let mut session = session_record(ProjectId::new(), "nested detail");
+        session.cwd = display_root.clone();
+        let turn_id = crate::protocol::TurnId::new();
+        let change_id = crate::session::ChangeId::new();
+        let read = canonical_read_with_elapsed(
+            &session,
+            vec![TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 1,
+                payload: TurnItemPayload::FileChange {
+                    call_id: crate::session::ToolCallId::new(),
+                    change_ids: vec![change_id],
+                    changes: vec![FileChangeEvidence {
+                        change_id,
+                        kind: ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from("bbb/ccc/result.txt")),
+                        path_after: Some(Utf8PathBuf::from("bbb/ccc/result.txt")),
+                        summary: "Updated bbb/ccc/result.txt".to_string(),
+                    }],
+                    summary: "Updated bbb/ccc/result.txt".to_string(),
+                },
+            }],
+            Default::default(),
+        );
+
+        let detail =
+            build_session_detail_with_roots(&read, None, Some(&storage_root), Some(&display_root));
+
+        assert_eq!(detail.file_changes[0].path, "ccc/result.txt");
+        assert_eq!(detail.artifacts[0].path, "ccc/result.txt");
+        let change_row = detail
+            .transcript_rows
+            .iter()
+            .find(|row| row.row_kind == DesktopTranscriptRowKind::FileChanges)
+            .expect("file-change transcript row");
+        assert!(change_row.body.contains("ccc/result.txt"));
+        assert!(!change_row.body.contains("bbb/ccc/result.txt"));
     }
 
     #[test]

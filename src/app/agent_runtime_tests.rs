@@ -3433,21 +3433,23 @@ async fn rehydrated_child_followup_uses_current_root_config_and_workspace() {
         direct_runtime_fixture("followup-admitted-access", 3).await;
     let child_path = AgentPath::root().join("research").expect("child path");
     let persisted_child_cwd = root_session.workspace.cwd.join("persisted-child-only-cwd");
-    let child = runtime
-        .session_service
-        .start_or_resume(
-            SessionStartRequest {
-                selector: SessionSelector::New,
-                title: Some("research".to_string()),
-                cwd: persisted_child_cwd.clone(),
-                model: "persisted-old-child-model".to_string(),
-                base_url: config.model.base_url.clone(),
-                access_mode: AccessMode::Default,
-            },
-            root_session.workspace.clone(),
-        )
+    let child_session = runtime
+        .store
+        .session_repo()
+        .create_session(NewSession {
+            project_id: root_session.workspace.project_id,
+            title: "research".to_string(),
+            cwd: persisted_child_cwd.clone(),
+            model: "persisted-old-child-model".to_string(),
+            base_url: config.model.base_url.clone(),
+            access_mode: AccessMode::Default,
+        })
         .await
         .expect("child session");
+    let child = SessionContext {
+        session: child_session,
+        workspace: root_session.workspace.clone(),
+    };
     runtime
         .store
         .session_repo()

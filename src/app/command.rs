@@ -77,10 +77,15 @@ pub struct App {
     pub session_service: crate::session::SessionService,
     pub run_service: std::sync::Arc<crate::app::RunService>,
     pub session_event_hub: SessionRuntimeEventHub,
+    pub(crate) resolved_run_session_id: Option<SessionId>,
     pub(crate) process_runtime: AppProcessRuntime,
 }
 
 impl App {
+    pub fn resolved_run_session_id(&self) -> Option<SessionId> {
+        self.resolved_run_session_id
+    }
+
     pub fn subscribe_session_runtime_events(
         &self,
         session_id: SessionId,

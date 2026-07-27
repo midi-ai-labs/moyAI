@@ -10,7 +10,7 @@ use crate::edit::{ChangeTracker, EditSafety, Formatter};
 use crate::error::AppBootstrapError;
 use crate::llm::{OpenAiCompatClient, resolve_api_key_from_env};
 use crate::runtime::SessionRuntimeEventHub;
-use crate::session::ProjectRepository;
+use crate::session::{ProjectRepository, SessionId, SessionRecord, SessionRepository};
 use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
 use crate::tool::context::ToolServices;
 use crate::tool::registry::ToolRegistry;
@@ -18,6 +18,12 @@ use crate::tool::truncate::ToolTruncator;
 use crate::workspace::{WorkspaceDiscovery, project::project_display_name};
 
 pub struct AppBootstrap;
+
+enum WorkspaceRootMode {
+    Discover,
+    FixedToStart,
+    Stored(Utf8PathBuf),
+}
 
 impl AppBootstrap {
     pub async fn build(command: &CliCommand) -> Result<App, AppBootstrapError> {
@@ -31,7 +37,17 @@ impl AppBootstrap {
         sqlite.migrate()?;
         let store = StoreBundle::new(sqlite);
         ConfigLoader::ensure_default_global_config()?;
-        Self::build_with_store(&start_dir, run_args, store).await
+        let restored = restore_run_session_directory(start_dir, run_args, &store).await?;
+        let root_mode = restored
+            .project_root
+            .clone()
+            .map(WorkspaceRootMode::Stored)
+            .unwrap_or(WorkspaceRootMode::Discover);
+        let mut app =
+            Self::build_with_store_with_root_mode(&restored.directory, run_args, store, root_mode)
+                .await?;
+        app.resolved_run_session_id = restored.session_id;
+        Ok(app)
     }
 
     pub(crate) async fn rebuild_for_directory_with_process_runtime(
@@ -40,8 +56,38 @@ impl AppBootstrap {
     ) -> Result<App, AppBootstrapError> {
         let config = ConfigLoader::load(start_dir, None)?;
         let store = process_runtime.store();
-        Self::build_with_resolved_config(start_dir, store, false, config, Some(process_runtime))
-            .await
+        Self::build_with_resolved_config(
+            start_dir,
+            store,
+            WorkspaceRootMode::Discover,
+            config,
+            Some(process_runtime),
+        )
+        .await
+    }
+
+    pub(crate) async fn rebuild_for_session_with_process_runtime(
+        session: &SessionRecord,
+        process_runtime: AppProcessRuntime,
+    ) -> Result<App, AppBootstrapError> {
+        let store = process_runtime.store();
+        let project = store.project_repo().get_project(session.project_id).await?;
+        let directory = crate::session::service::normalize_session_cwd_for_project(
+            &project.root_path,
+            session.project_id,
+            &project.vcs_kind,
+            &session.cwd,
+        )
+        .map_err(|error| AppBootstrapError::Message(error.to_string()))?;
+        let config = ConfigLoader::load(&directory, None)?;
+        Self::build_with_resolved_config(
+            &directory,
+            store,
+            WorkspaceRootMode::Stored(project.root_path),
+            config,
+            Some(process_runtime),
+        )
+        .await
     }
 
     pub(crate) async fn rebuild_for_directory_as_workspace_root_with_process_runtime(
@@ -50,26 +96,39 @@ impl AppBootstrap {
     ) -> Result<App, AppBootstrapError> {
         let config = ConfigLoader::load(start_dir, None)?;
         let store = process_runtime.store();
-        Self::build_with_resolved_config(start_dir, store, true, config, Some(process_runtime))
-            .await
+        Self::build_with_resolved_config(
+            start_dir,
+            store,
+            WorkspaceRootMode::FixedToStart,
+            config,
+            Some(process_runtime),
+        )
+        .await
     }
 
+    #[cfg(test)]
     async fn build_with_store(
         start_dir: &Utf8Path,
         run_args: Option<&RunArgs>,
         store: StoreBundle,
     ) -> Result<App, AppBootstrapError> {
-        Self::build_with_store_with_root_mode(start_dir, run_args, store, false).await
+        Self::build_with_store_with_root_mode(
+            start_dir,
+            run_args,
+            store,
+            WorkspaceRootMode::Discover,
+        )
+        .await
     }
 
     async fn build_with_store_with_root_mode(
         start_dir: &Utf8Path,
         run_args: Option<&RunArgs>,
         store: StoreBundle,
-        fixed_workspace_root: bool,
+        root_mode: WorkspaceRootMode,
     ) -> Result<App, AppBootstrapError> {
         let config = ConfigLoader::load(start_dir, run_args)?;
-        Self::build_with_resolved_config(start_dir, store, fixed_workspace_root, config, None).await
+        Self::build_with_resolved_config(start_dir, store, root_mode, config, None).await
     }
 
     #[cfg(test)]
@@ -78,7 +137,14 @@ impl AppBootstrap {
         store: StoreBundle,
         config: ResolvedConfig,
     ) -> Result<App, AppBootstrapError> {
-        Self::build_with_resolved_config(start_dir, store, true, config, None).await
+        Self::build_with_resolved_config(
+            start_dir,
+            store,
+            WorkspaceRootMode::FixedToStart,
+            config,
+            None,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -88,21 +154,31 @@ impl AppBootstrap {
         config: ResolvedConfig,
     ) -> Result<App, AppBootstrapError> {
         let store = process_runtime.store();
-        Self::build_with_resolved_config(start_dir, store, true, config, Some(process_runtime))
-            .await
+        Self::build_with_resolved_config(
+            start_dir,
+            store,
+            WorkspaceRootMode::FixedToStart,
+            config,
+            Some(process_runtime),
+        )
+        .await
     }
 
     async fn build_with_resolved_config(
         start_dir: &Utf8Path,
         store: StoreBundle,
-        fixed_workspace_root: bool,
+        root_mode: WorkspaceRootMode,
         config: ResolvedConfig,
         process_runtime: Option<AppProcessRuntime>,
     ) -> Result<App, AppBootstrapError> {
-        let workspace = if fixed_workspace_root {
-            WorkspaceDiscovery::discover_fixed_root(start_dir, &config)?
-        } else {
-            WorkspaceDiscovery::discover(start_dir, &config)?
+        let workspace = match root_mode {
+            WorkspaceRootMode::Discover => WorkspaceDiscovery::discover(start_dir, &config)?,
+            WorkspaceRootMode::FixedToStart => {
+                WorkspaceDiscovery::discover_fixed_root(start_dir, &config)?
+            }
+            WorkspaceRootMode::Stored(root) => {
+                WorkspaceDiscovery::discover_with_stored_root(start_dir, &root, &config)?
+            }
         };
         let project_name = project_display_name(&workspace.root);
         store
@@ -189,9 +265,68 @@ impl AppBootstrap {
             session_service,
             run_service,
             session_event_hub,
+            resolved_run_session_id: None,
             process_runtime,
         })
     }
+}
+
+#[derive(Debug)]
+struct RestoredRunSessionDirectory {
+    directory: Utf8PathBuf,
+    session_id: Option<SessionId>,
+    project_root: Option<Utf8PathBuf>,
+}
+
+async fn restore_run_session_directory(
+    start_dir: Utf8PathBuf,
+    run_args: Option<&RunArgs>,
+    store: &StoreBundle,
+) -> Result<RestoredRunSessionDirectory, AppBootstrapError> {
+    let Some(run_args) = run_args else {
+        return Ok(RestoredRunSessionDirectory {
+            directory: start_dir,
+            session_id: None,
+            project_root: None,
+        });
+    };
+    let session = if let Some(session_id) = run_args.session_id {
+        Some(
+            store
+                .session_repo()
+                .get_session(session_id)
+                .await
+                .map_err(AppBootstrapError::from)?,
+        )
+    } else if run_args.continue_last {
+        let workspace = WorkspaceDiscovery::discover(&start_dir, &ResolvedConfig::default())?;
+        store
+            .session_repo()
+            .latest_session(workspace.project_id)
+            .await?
+    } else {
+        None
+    };
+    let Some(session) = session else {
+        return Ok(RestoredRunSessionDirectory {
+            directory: start_dir,
+            session_id: None,
+            project_root: None,
+        });
+    };
+    let project = store.project_repo().get_project(session.project_id).await?;
+    let directory = crate::session::service::normalize_session_cwd_for_project(
+        &project.root_path,
+        session.project_id,
+        &project.vcs_kind,
+        &session.cwd,
+    )
+    .map_err(|error| AppBootstrapError::Message(error.to_string()))?;
+    Ok(RestoredRunSessionDirectory {
+        directory,
+        session_id: Some(session.id),
+        project_root: Some(project.root_path),
+    })
 }
 
 fn command_directory(command: &CliCommand) -> Result<camino::Utf8PathBuf, AppBootstrapError> {
@@ -260,8 +395,302 @@ mod tests {
         TurnTerminalOutcome,
     };
     use crate::session::{
-        DurableTurnTerminal, RunEvent, SessionSelector, SessionStartRequest, SessionStatus,
+        DurableTurnTerminal, NewSession, RunEvent, SessionSelector, SessionStartRequest,
+        SessionStatus,
     };
+
+    #[tokio::test]
+    async fn cli_run_session_restores_its_nested_workspace_directory_before_bootstrap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 project root");
+        let selected = project_root.join("bbb");
+        std::fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        std::fs::create_dir_all(&selected).expect("selected directory");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let workspace = WorkspaceDiscovery::discover(&selected, &ResolvedConfig::default())
+            .expect("nested workspace");
+        store
+            .project_repo()
+            .upsert_project(workspace.project_id, &workspace.root, "aaa", "git")
+            .await
+            .expect("project");
+        let session = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: workspace.project_id,
+                title: "nested CLI session".to_string(),
+                cwd: selected.clone(),
+                model: "test-model".to_string(),
+                base_url: "http://127.0.0.1:1234/v1".to_string(),
+                access_mode: crate::config::AccessMode::Default,
+            })
+            .await
+            .expect("session");
+        let args = RunArgs {
+            prompt: Some("continue".to_string()),
+            session_id: Some(session.id),
+            continue_last: false,
+            title: None,
+            directory: Some(project_root.clone()),
+            model_override: None,
+            base_url_override: None,
+            output_mode: crate::cli::OutputMode::Human,
+            show_reasoning_summary: false,
+            review_uncommitted: false,
+            review_branch: None,
+            active_file: None,
+            open_tabs: Vec::new(),
+            visible_files: Vec::new(),
+            image_paths: Vec::new(),
+        };
+
+        let restored = restore_run_session_directory(project_root.clone(), Some(&args), &store)
+            .await
+            .expect("restored directory");
+        let app = AppBootstrap::build_with_store(&restored.directory, Some(&args), store)
+            .await
+            .expect("restored app");
+
+        assert_eq!(restored.directory, selected);
+        assert_eq!(restored.session_id, Some(session.id));
+        assert_eq!(app.workspace.root, project_root);
+        assert_eq!(app.workspace.cwd, selected);
+        assert_eq!(app.workspace.authority_root(), selected);
+    }
+
+    #[tokio::test]
+    async fn cli_continue_last_pins_the_exact_nested_session_selected_before_bootstrap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 project root");
+        let first_cwd = project_root.join("bbb");
+        let latest_cwd = project_root.join("ccc");
+        std::fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        std::fs::create_dir_all(&first_cwd).expect("first cwd");
+        std::fs::create_dir_all(&latest_cwd).expect("latest cwd");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let workspace = WorkspaceDiscovery::discover(&first_cwd, &ResolvedConfig::default())
+            .expect("workspace");
+        store
+            .project_repo()
+            .upsert_project(workspace.project_id, &workspace.root, "aaa", "git")
+            .await
+            .expect("project");
+        let first = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: workspace.project_id,
+                title: "first".to_string(),
+                cwd: first_cwd,
+                model: "test-model".to_string(),
+                base_url: "http://127.0.0.1:1234/v1".to_string(),
+                access_mode: crate::config::AccessMode::Default,
+            })
+            .await
+            .expect("first session");
+        let latest = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: workspace.project_id,
+                title: "latest".to_string(),
+                cwd: latest_cwd.clone(),
+                model: "test-model".to_string(),
+                base_url: "http://127.0.0.1:1234/v1".to_string(),
+                access_mode: crate::config::AccessMode::Default,
+            })
+            .await
+            .expect("latest session");
+        store
+            .session_repo()
+            .update_session_settings(
+                latest.id,
+                &crate::session::SessionSettingsPatch {
+                    model: Some("latest-model".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("make latest deterministic");
+        let args = RunArgs {
+            prompt: Some("continue".to_string()),
+            session_id: None,
+            continue_last: true,
+            title: None,
+            directory: Some(project_root.clone()),
+            model_override: None,
+            base_url_override: None,
+            output_mode: crate::cli::OutputMode::Human,
+            show_reasoning_summary: false,
+            review_uncommitted: false,
+            review_branch: None,
+            active_file: None,
+            open_tabs: Vec::new(),
+            visible_files: Vec::new(),
+            image_paths: Vec::new(),
+        };
+
+        let restored = restore_run_session_directory(project_root, Some(&args), &store)
+            .await
+            .expect("restored latest session");
+
+        assert_ne!(restored.session_id, Some(first.id));
+        assert_eq!(restored.session_id, Some(latest.id));
+        assert_eq!(restored.directory, latest_cwd);
+    }
+
+    #[tokio::test]
+    async fn cli_continue_last_rejects_a_session_cwd_from_another_project() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("first")).expect("utf8 first root");
+        let second_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("second")).expect("utf8 second root");
+        std::fs::create_dir_all(first_root.join(".git")).expect("first git marker");
+        std::fs::create_dir_all(second_root.join(".git")).expect("second git marker");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let first = WorkspaceDiscovery::discover(&first_root, &ResolvedConfig::default())
+            .expect("first workspace");
+        let second = WorkspaceDiscovery::discover(&second_root, &ResolvedConfig::default())
+            .expect("second workspace");
+        for (workspace, name) in [(&first, "first"), (&second, "second")] {
+            store
+                .project_repo()
+                .upsert_project(workspace.project_id, &workspace.root, name, "git")
+                .await
+                .expect("project");
+        }
+        store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: first.project_id,
+                title: "invalid first-project cwd".to_string(),
+                cwd: second_root.clone(),
+                model: "test-model".to_string(),
+                base_url: "http://127.0.0.1:1234/v1".to_string(),
+                access_mode: crate::config::AccessMode::Default,
+            })
+            .await
+            .expect("legacy invalid session");
+        store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: second.project_id,
+                title: "second project latest".to_string(),
+                cwd: second_root,
+                model: "test-model".to_string(),
+                base_url: "http://127.0.0.1:1234/v1".to_string(),
+                access_mode: crate::config::AccessMode::Default,
+            })
+            .await
+            .expect("second project session");
+        let args = RunArgs {
+            prompt: Some("continue".to_string()),
+            session_id: None,
+            continue_last: true,
+            title: None,
+            directory: Some(first_root.clone()),
+            model_override: None,
+            base_url_override: None,
+            output_mode: crate::cli::OutputMode::Human,
+            show_reasoning_summary: false,
+            review_uncommitted: false,
+            review_branch: None,
+            active_file: None,
+            open_tabs: Vec::new(),
+            visible_files: Vec::new(),
+            image_paths: Vec::new(),
+        };
+
+        let error = restore_run_session_directory(first_root, Some(&args), &store)
+            .await
+            .err()
+            .expect("cross-project cwd must fail before bootstrap");
+
+        assert!(error.to_string().contains("outside stored project root"));
+    }
+
+    #[tokio::test]
+    async fn fixed_non_git_session_under_parent_git_restores_its_stored_project_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let outer = Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 outer");
+        let data_dir = outer.join("data");
+        let quick_chat = data_dir.join("quick-chat-workspace");
+        std::fs::create_dir_all(outer.join(".git")).expect("parent git marker");
+        std::fs::create_dir_all(&quick_chat).expect("quick chat workspace");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root_with_config(
+            &quick_chat,
+            store,
+            ResolvedConfig::default(),
+        )
+        .await
+        .expect("fixed quick-chat app");
+        let project_id = app.workspace.project_id;
+        let process_runtime = app.process_runtime.clone();
+        let session = app
+            .session_service
+            .start_or_resume(
+                SessionStartRequest {
+                    selector: SessionSelector::New,
+                    title: Some("quick chat".to_string()),
+                    cwd: quick_chat.clone(),
+                    model: app.config.model.model.clone(),
+                    base_url: app.config.model.base_url.clone(),
+                    access_mode: crate::config::AccessMode::Default,
+                },
+                app.workspace.clone(),
+            )
+            .await
+            .expect("quick-chat session");
+        let projected = app
+            .session_service
+            .get_session(session.session.id)
+            .await
+            .expect("quick-chat session projection");
+
+        let restored =
+            AppBootstrap::rebuild_for_session_with_process_runtime(&projected, process_runtime)
+                .await
+                .expect("restored quick-chat session");
+
+        assert_eq!(restored.workspace.root, quick_chat);
+        assert_eq!(restored.workspace.cwd, quick_chat);
+        assert_eq!(restored.workspace.authority_root(), quick_chat.as_path());
+        assert_eq!(restored.workspace.project_id, project_id);
+        assert_eq!(restored.workspace.vcs, crate::workspace::VcsKind::None);
+    }
 
     #[tokio::test]
     async fn workspace_rebuild_reuses_the_process_host_without_replaying_startup_recovery() {

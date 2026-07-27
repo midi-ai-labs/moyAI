@@ -1,5 +1,8 @@
+use camino::{Utf8Path, Utf8PathBuf};
+
 use crate::context::ContextWindowTokenStatus;
 use crate::edit::ChangeSummary;
+use crate::edit::change_tracker::summary_line_from_stored_paths;
 use crate::protocol::{
     ModelResponseId, PlanStep, ToolLifecycleStatus, TurnId, TurnInterruptionCause, TurnItem,
     TurnItemPayload, TurnTerminalOutcome, turn_items_in_projection_order,
@@ -212,6 +215,8 @@ pub struct AppState {
     pub latest_context_window: Option<ContextWindowTokenStatus>,
     pub prompt_review: Option<PromptReviewState>,
     pub last_summary: Option<RunSummary>,
+    file_change_storage_root: Option<Utf8PathBuf>,
+    file_change_display_root: Option<Utf8PathBuf>,
 }
 
 impl Default for AppState {
@@ -238,11 +243,29 @@ impl Default for AppState {
             latest_context_window: None,
             prompt_review: None,
             last_summary: None,
+            file_change_storage_root: None,
+            file_change_display_root: None,
         }
     }
 }
 
 impl AppState {
+    pub(crate) fn set_file_change_display_roots(
+        &mut self,
+        storage_root: &Utf8Path,
+        display_root: &Utf8Path,
+    ) {
+        self.file_change_storage_root = Some(storage_root.to_path_buf());
+        self.file_change_display_root = Some(display_root.to_path_buf());
+    }
+
+    fn file_change_display_roots(&self) -> Option<(&Utf8Path, &Utf8Path)> {
+        Some((
+            self.file_change_storage_root.as_deref()?,
+            self.file_change_display_root.as_deref()?,
+        ))
+    }
+
     pub fn load_turn_items(&mut self, session: &SessionRecord, turn_items: &[TurnItem]) {
         let active_turn_id = (session.status == SessionStatus::Running)
             .then(|| {
@@ -265,7 +288,9 @@ impl AppState {
         self.route = Route::Session;
         self.current_session_id = Some(session.id);
         self.current_session_title = session.title.clone();
-        self.transcript_entries = transcript_entries_from_turn_items(turn_items);
+        let roots = self.file_change_display_roots();
+        let transcript_entries = transcript_entries_from_turn_items_with_roots(turn_items, roots);
+        self.transcript_entries = transcript_entries;
         if previous_session_id != Some(session.id) {
             self.pending_turn_inputs.clear();
         }
@@ -322,7 +347,10 @@ impl AppState {
         if self.current_session_id != Some(read.session.id) {
             return false;
         }
-        self.transcript_entries = transcript_entries_from_turn_items(&read.turns.items);
+        let roots = self.file_change_display_roots();
+        let transcript_entries =
+            transcript_entries_from_turn_items_with_roots(&read.turns.items, roots);
+        self.transcript_entries = transcript_entries;
         self.pending_turn_inputs = read.pending_turn_inputs.clone();
         self.refresh_plan_from_turn_items(&read.turns.items);
         true
@@ -611,10 +639,12 @@ impl AppState {
                 });
             }
             RunEvent::FileChangesRecorded { changes, .. } => {
+                let roots = self.file_change_display_roots();
+                let body = summarize_changes(changes, roots);
                 self.transcript_entries.push(TranscriptEntry {
                     kind: TranscriptKind::Diff,
                     title: format!("{}個のファイルが変更されました", changes.len()),
-                    body: summarize_changes(changes),
+                    body,
                     response_id: None,
                     tool_call_id: None,
                 });
@@ -1005,10 +1035,15 @@ fn run_status_label_for_progress(status: RunStatus) -> &'static str {
     }
 }
 
-fn summarize_changes(changes: &[ChangeSummary]) -> String {
+fn summarize_changes(changes: &[ChangeSummary], roots: Option<(&Utf8Path, &Utf8Path)>) -> String {
     changes
         .iter()
-        .map(|value| value.summary_line(None))
+        .map(|value| match roots {
+            Some((storage_root, display_root)) => {
+                value.summary_line_relative_to(storage_root, display_root)
+            }
+            None => value.summary_line(None),
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1054,6 +1089,21 @@ fn prompt_dispatch_summary(prompt_dispatch: &PromptDispatchPart) -> String {
 }
 
 pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<TranscriptEntry> {
+    transcript_entries_from_turn_items_with_roots(turn_items, None)
+}
+
+pub(crate) fn transcript_entries_from_turn_items_relative_to(
+    turn_items: &[TurnItem],
+    storage_root: &Utf8Path,
+    display_root: &Utf8Path,
+) -> Vec<TranscriptEntry> {
+    transcript_entries_from_turn_items_with_roots(turn_items, Some((storage_root, display_root)))
+}
+
+fn transcript_entries_from_turn_items_with_roots(
+    turn_items: &[TurnItem],
+    roots: Option<(&Utf8Path, &Utf8Path)>,
+) -> Vec<TranscriptEntry> {
     turn_items_in_projection_order(turn_items)
         .into_iter()
         .filter(|item| !item.payload.is_internal_projection_only())
@@ -1138,7 +1188,25 @@ pub fn transcript_entries_from_turn_items(turn_items: &[TurnItem]) -> Vec<Transc
             } => Some(TranscriptEntry {
                 kind: TranscriptKind::Diff,
                 title: format!("{}個のファイルが変更されました", changes.len()),
-                body: summary.clone(),
+                body: if changes.is_empty() {
+                    summary.clone()
+                } else if let Some((storage_root, display_root)) = roots {
+                    changes
+                        .iter()
+                        .map(|change| {
+                            summary_line_from_stored_paths(
+                                change.kind,
+                                change.path_before.as_ref(),
+                                change.path_after.as_ref(),
+                                storage_root,
+                                display_root,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                } else {
+                    summary.clone()
+                },
                 response_id: None,
                 tool_call_id: Some(*call_id),
             }),
@@ -1365,6 +1433,67 @@ mod tests {
             active_turn_id,
             active_turn_sequence_no: active_turn_id.map(|_| 1),
         }
+    }
+
+    #[test]
+    fn nested_authority_projects_canonical_and_live_change_paths_without_mutating_storage() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let tool_call_id = ToolCallId::new();
+        let change_id = crate::session::ChangeId::new();
+        let storage_root = Utf8PathBuf::from("C:/repo/aaa");
+        let display_root = storage_root.join("bbb");
+        let stored_path = Utf8PathBuf::from("bbb/ccc/file.rs");
+        let turn_item = TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 1,
+            payload: TurnItemPayload::FileChange {
+                call_id: tool_call_id,
+                change_ids: vec![change_id],
+                changes: vec![crate::protocol::FileChangeEvidence {
+                    change_id,
+                    kind: crate::session::ChangeKind::Update,
+                    path_before: Some(stored_path.clone()),
+                    path_after: Some(stored_path.clone()),
+                    summary: "Updated bbb/ccc/file.rs".to_string(),
+                }],
+                summary: "Updated bbb/ccc/file.rs".to_string(),
+            },
+        };
+
+        assert_eq!(
+            transcript_entries_from_turn_items(std::slice::from_ref(&turn_item))[0].body,
+            "Updated bbb/ccc/file.rs",
+            "unit contexts without roots keep the canonical stored summary"
+        );
+
+        let mut state = AppState::default();
+        state.set_file_change_display_roots(&storage_root, &display_root);
+        state.load_turn_items(&test_session(session_id), std::slice::from_ref(&turn_item));
+        assert_eq!(state.transcript_entries[0].body, "Updated ccc/file.rs");
+
+        let live_change = ChangeSummary {
+            change_id,
+            kind: crate::session::ChangeKind::Update,
+            path_before: Some(stored_path.clone()),
+            path_after: Some(stored_path.clone()),
+        };
+        state.apply_run_event(&RunEvent::FileChangesRecorded {
+            tool_call_id,
+            changes: vec![live_change],
+        });
+        assert_eq!(
+            state.transcript_entries.last().expect("live change").body,
+            "Updated ccc/file.rs"
+        );
+        assert_eq!(
+            stored_path,
+            Utf8PathBuf::from("bbb/ccc/file.rs"),
+            "project-root-relative stored coordinates remain unchanged"
+        );
     }
 
     #[test]

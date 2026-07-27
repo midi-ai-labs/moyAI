@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.0"><img alt="Release" src="https://img.shields.io/badge/release-v1.1.0-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.1"><img alt="Release" src="https://img.shields.io/badge/release-v1.1.1-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.md">English README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.0">release をダウンロード</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.1">release をダウンロード</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -70,6 +70,7 @@ moyAI は、そうした環境でも使いやすい開発用の相棒を目指�
 - response/call-output semantic unit、provider報告total usageとCodex型UTF-8 bytes/4 local suffix推定、full-request local fallback、full native summary requestとtyped overflow reduction、durable replacement lineageを備えたautomatic LLM semantic compaction
 - `/v1/models` と LM Studio `/api/v1/models` からの model metadata discovery
 - model-visibleなcontinuation cursorを持つbounded workspace search / directory inspection、正確な次offsetを示してread用spool pathを作らないline-awareなguarded file-read page、diff-based edit、shell execution
+- Git project rootの配下にあるdirectoryを選んだ場合も、そのdirectoryをtoolとsandboxのauthority境界として維持し、sessionを開き直したときも同じdirectoryを復元
 - fileのcreate / update / delete / rollbackは、一つのstable-handle・no-clobber条件付きcommitを使う。並行する外部replacementを上書きせず、target名を復元できない場合は保持したbackup pathを明示する。親directoryは暗黙作成しないため、先に作成する
 - Unixでは、update/delete前に開かれた書込可能descriptorが切り離した旧inodeを参照していないことを証明できない。createは従来どおりだが、既存fileのupdateは新しいtargetを設置し、deleteはtargetを切り離したうえで旧inodeをprivate backup pathに保持し、安全なcleanup成功とはせずtyped partial-commit errorを返す。先に開かれたwriterはそのbackupを後から変更できるため、errorに示されたpathを確認して調整する
 - **承認を求める**（`default`）、**代理で承認**（`auto_review`）、**フルアクセス**（`full_access`）の3種類のpermission mode。承認を求める/代理で承認は同じdeterministic admission policyとWindows `workspace-write` restricted-token / ACL profileを使い、明示した`sandbox_permissions: "require_escalated"` + `justification`または検出したdestructive/network/external/authority effectを、前者はhuman、後者はtask agentと分離したtool-less AI Guardianへ送る。Windows backendはadmitしたrootとselected existing authority carveoutをidentity-pinし、protected regular fileをcontent-pinし、起動する各process/threadへexplicit system-only descriptorを与え、stdio限定継承、resume前のJob process-tree/UI restrictions、unsandboxed retryなしのfail-closedを実装する。ただしこのunelevated profileはfinite existing-object defenseであり、Windows namespace全体やCodex enforcement互換ではない。未作成authority name、別subtreeのnested instruction、先行explicit / inheritance-disabled DACLを持つprotected descendant、未監査outside path、direct socket、同一userのhost process memory、same-desktop synthetic inputは残余であり、ACL preflightの既存tree伝播は同期処理でchild timeoutの対象外である。フルアクセスと承認済みprocess elevationはcurrent userの`Unrestricted`で動くため、そのchild filesystem mutationはtyped file guardを通らない。一方、typed `write` / `apply_patch`、MCP / Docling、process lifecycleは各guardを維持する。commit済みmode切替は次のdecisionへ反映し、pending requestとadmit済みeffectは元の判断/profileを保持する。native process sandboxは現在Windowsのみで、他platformのworkspace-mode effectはfail closedになる。hard boundaryには将来のelevated dedicated-identity / firewall / private-desktop backendが必要である。
@@ -83,11 +84,12 @@ moyAI は、そうした環境でも使いやすい開発用の相棒を目指�
 
 現在の release を公開しています。
 
-[**moyAI v1.1.0 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.0)
+[**moyAI v1.1.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.1)
 
-v1.1.0では、再帰的なAgent Treeのnested owner、再起動、follow-up mail、exact Stop境界をdurableにしました。
-加えてcontext compaction、patch、Windows shell/process、長時間local model向け既定値をCodexへ近づけ、
-SUBST driveからprojectを開いた場合も論理workspace authorityを保ったまま実体folder名を表示します。
+v1.1.1では、ancestorがGit project rootであっても、選択したnested directoryをtoolとsandboxの
+正確なauthority境界として維持します。Glob、typed file tool、shell effect review、Windows sandbox、
+session reopen、built-in Git reviewが同じ選択directoryを使い、project単位のGit identityとancestor
+instructionは引き続き利用できます。
 
 Windows 向け release zip には、次のものが含まれています。
 
@@ -135,7 +137,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 1.1.0 -ManualGuiStResultsPath path\to\RESULTS.md
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 1.1.1 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
 
 packageはそのrelease用のclean source commitから作成します。`v<version>` tagが既に存在する場合、

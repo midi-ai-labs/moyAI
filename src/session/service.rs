@@ -1,6 +1,8 @@
 use std::fs;
 
-use crate::config::ProviderEndpoint;
+use camino::{Utf8Path, Utf8PathBuf};
+
+use crate::config::{ProviderEndpoint, ResolvedConfig};
 use crate::error::SessionError;
 use crate::protocol::{
     CanonicalProtocolSnapshot, CanonicalRuntimeEventProjector, HistoryItem, ModeKind,
@@ -26,7 +28,7 @@ use crate::storage::session_repo::{
     AgentExecutionWakeTerminalOwner, AgentExecutionWakeTerminalSettlement, AgentTreeStopFence,
     DurableSessionStopState, PendingAgentTriggerSettlement, RunningSessionTerminalTarget,
 };
-use crate::workspace::Workspace;
+use crate::workspace::{PathGuard, Workspace, WorkspaceDiscovery};
 
 const RUNNING_SESSION_RECOVERY_PAGE_SIZE: usize = 64;
 
@@ -61,6 +63,29 @@ impl SessionService {
             .map_err(|error| SessionError::Message(error.to_string()))?
             .as_str()
             .to_string();
+        let project_vcs_kind = match workspace.vcs {
+            crate::workspace::VcsKind::Git => "git",
+            crate::workspace::VcsKind::None => "none",
+        };
+        let workspace_cwd = normalize_session_cwd_for_project(
+            &workspace.root,
+            workspace.project_id,
+            project_vcs_kind,
+            workspace.authority_root(),
+        )?;
+        let requested_cwd = normalize_session_cwd_for_project(
+            &workspace.root,
+            workspace.project_id,
+            project_vcs_kind,
+            &request.cwd,
+        )?;
+        if !PathGuard::same_path_identity(&requested_cwd, &workspace_cwd) {
+            return Err(SessionError::Message(format!(
+                "session request workspace directory {} does not match the current workspace authority {}",
+                request.cwd,
+                workspace.authority_root()
+            )));
+        }
         let repository = self.store.session_repo();
         let session = match &request.selector {
             SessionSelector::New => {
@@ -69,7 +94,7 @@ impl SessionService {
                     .create_session(NewSession {
                         project_id: workspace.project_id,
                         title,
-                        cwd: request.cwd.clone(),
+                        cwd: workspace_cwd,
                         model: request.model.clone(),
                         base_url: request.base_url.clone(),
                         access_mode: request.access_mode,
@@ -112,6 +137,20 @@ impl SessionService {
                 "session {} belongs to project {}, not the current workspace project {}; reopen its workspace before resuming it",
                 session.id, session.project_id, workspace.project_id
             )));
+        }
+        let session = match session {
+            Some(session) => Some(self.normalize_session_record_cwd(session).await?),
+            None => None,
+        };
+        if let Some(session) = &session {
+            if !PathGuard::same_path_identity(&session.cwd, workspace.authority_root()) {
+                return Err(SessionError::Message(format!(
+                    "session {} uses workspace directory {}, not the current workspace authority {}; reopen the session workspace before resuming it",
+                    session.id,
+                    session.cwd,
+                    workspace.authority_root()
+                )));
+            }
         }
         Ok(session)
     }
@@ -778,15 +817,37 @@ impl SessionService {
         }
     }
 
+    async fn normalize_session_record_cwd(
+        &self,
+        mut session: SessionRecord,
+    ) -> Result<SessionRecord, SessionError> {
+        let project = self
+            .store
+            .project_repo()
+            .get_project(session.project_id)
+            .await?;
+        session.cwd = normalize_session_cwd_for_project(
+            &project.root_path,
+            session.project_id,
+            &project.vcs_kind,
+            &session.cwd,
+        )?;
+        Ok(session)
+    }
+
     pub async fn get_session(&self, session_id: SessionId) -> Result<SessionRecord, SessionError> {
-        Ok(self.store.session_repo().get_session(session_id).await?)
+        let session = self.store.session_repo().get_session(session_id).await?;
+        self.normalize_session_record_cwd(session).await
     }
 
     pub async fn latest_session(
         &self,
         project_id: ProjectId,
     ) -> Result<Option<SessionRecord>, SessionError> {
-        Ok(self.store.session_repo().latest_session(project_id).await?)
+        match self.store.session_repo().latest_session(project_id).await? {
+            Some(session) => Ok(Some(self.normalize_session_record_cwd(session).await?)),
+            None => Ok(None),
+        }
     }
 
     pub async fn list_sessions(
@@ -872,7 +933,17 @@ impl SessionService {
                 session.status.key()
             )));
         }
-        let normalized = normalize_session_settings_patch(patch)?;
+        let project = self
+            .store
+            .project_repo()
+            .get_project(session.project_id)
+            .await?;
+        let normalized = normalize_session_settings_patch(
+            patch,
+            &project.root_path,
+            session.project_id,
+            &project.vcs_kind,
+        )?;
         Ok(self
             .store
             .session_repo()
@@ -1331,11 +1402,12 @@ impl SessionService {
         };
         validate_canonical_page_limit(history_limit)?;
         validate_canonical_page_limit(turn_limit)?;
-        let snapshot = self
+        let mut snapshot = self
             .store
             .session_repo()
             .canonical_session_protocol_snapshot(session_id, history_request, turn_request)
             .await?;
+        snapshot.session = self.normalize_session_record_cwd(snapshot.session).await?;
         Ok(canonical_session_snapshot_from_storage(snapshot))
     }
 }
@@ -1431,10 +1503,54 @@ fn loaded_status_from_session_status(status: SessionStatus) -> LoadedSessionStat
     }
 }
 
+pub(crate) fn normalize_session_cwd_for_project(
+    project_root: &Utf8Path,
+    project_id: ProjectId,
+    project_vcs_kind: &str,
+    cwd: &Utf8Path,
+) -> Result<Utf8PathBuf, SessionError> {
+    let normalized = crate::workspace::project::normalize_path(project_root, cwd)
+        .map_err(|error| SessionError::Message(error.to_string()))?;
+    let relative = PathGuard::relative_path_from_root(&normalized, project_root).ok_or_else(|| {
+        SessionError::Message(format!(
+            "session workspace directory `{cwd}` is outside stored project root `{project_root}`"
+        ))
+    })?;
+    let normalized = project_root.join(relative);
+    match project_vcs_kind {
+        "git" => {
+            let discovered = WorkspaceDiscovery::discover(&normalized, &ResolvedConfig::default())
+                .map_err(|error| SessionError::Message(error.to_string()))?;
+            if discovered.project_id != project_id {
+                return Err(SessionError::Message(format!(
+                    "session workspace directory `{cwd}` resolves to project {}, not stored project {project_id}",
+                    discovered.project_id
+                )));
+            }
+        }
+        "none" => {}
+        other => {
+            return Err(SessionError::Message(format!(
+                "stored project {project_id} has unsupported vcs kind `{other}`"
+            )));
+        }
+    }
+    Ok(normalized)
+}
+
 fn normalize_session_settings_patch(
     patch: SessionSettingsPatch,
+    project_root: &Utf8Path,
+    project_id: ProjectId,
+    project_vcs_kind: &str,
 ) -> Result<SessionSettingsPatch, SessionError> {
-    if let Some(cwd) = patch.cwd.as_ref() {
+    let cwd = patch
+        .cwd
+        .map(|cwd| {
+            normalize_session_cwd_for_project(project_root, project_id, project_vcs_kind, &cwd)
+        })
+        .transpose()?;
+    if let Some(cwd) = cwd.as_ref() {
         let metadata = fs::metadata(cwd).map_err(|error| {
             SessionError::Message(format!(
                 "session settings cwd `{cwd}` is not readable: {error}"
@@ -1479,7 +1595,7 @@ fn normalize_session_settings_patch(
         ));
     }
     Ok(SessionSettingsPatch {
-        cwd: patch.cwd,
+        cwd,
         model,
         base_url,
         access_mode: patch.access_mode,
@@ -1988,6 +2104,167 @@ mod tests {
 
         assert!(error.to_string().contains("belongs to project"));
         assert!(error.to_string().contains("reopen its workspace"));
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_a_different_authority_within_the_same_project() {
+        let (service, workspace, _) = service_fixture().await;
+        let session = create_session(&service, &workspace).await;
+        let nested = workspace.root.join("nested");
+        std::fs::create_dir_all(&nested).expect("nested authority");
+        let mut mismatched = workspace.clone();
+        mismatched.cwd = nested.clone();
+        mismatched.path_policy.workspace_root = nested;
+
+        let error = service
+            .resolve_session_for_workspace(&SessionSelector::ById(session.session.id), &mismatched)
+            .await
+            .expect_err("same-project authority mismatch must fail closed");
+
+        assert!(error.to_string().contains("workspace directory"));
+        assert!(error.to_string().contains("reopen the session workspace"));
+    }
+
+    #[tokio::test]
+    async fn new_session_rejects_a_request_cwd_outside_the_workspace_authority() {
+        let (service, workspace, other) = service_fixture().await;
+
+        let error = service
+            .start_or_resume(
+                SessionStartRequest {
+                    selector: SessionSelector::New,
+                    title: Some("mismatched cwd".to_string()),
+                    cwd: other.cwd,
+                    model: "model".to_string(),
+                    base_url: "http://localhost:1234".to_string(),
+                    access_mode: AccessMode::Default,
+                },
+                workspace.clone(),
+            )
+            .await
+            .expect_err("mismatched cwd must fail before session creation");
+
+        assert!(error.to_string().contains("outside stored project root"));
+        assert!(
+            service
+                .list_sessions(workspace.project_id, 10)
+                .await
+                .expect("sessions")
+                .is_empty(),
+            "rejected request must not leave a session row"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_normalize_equivalent_cwd_and_reject_cross_project_cwd() {
+        let (service, workspace, other) = service_fixture().await;
+        let session = create_session(&service, &workspace).await;
+        let child = workspace.root.join("child");
+        fs::create_dir_all(&child).expect("child");
+        let equivalent = child.join("..");
+
+        let updated = service
+            .update_session_settings(
+                session.session.id,
+                SessionSettingsPatch {
+                    cwd: Some(equivalent),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("normalize equivalent cwd");
+        assert_eq!(updated.session.cwd, workspace.root);
+
+        let error = service
+            .update_session_settings(
+                session.session.id,
+                SessionSettingsPatch {
+                    cwd: Some(other.root),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("cross-project cwd must fail");
+        assert!(error.to_string().contains("outside stored project root"));
+        assert_eq!(
+            service
+                .get_session(session.session.id)
+                .await
+                .expect("preserved session")
+                .cwd,
+            workspace.root
+        );
+    }
+
+    #[tokio::test]
+    async fn session_projection_normalizes_a_legacy_equivalent_cwd() {
+        let (service, workspace, _) = service_fixture().await;
+        let session = create_session(&service, &workspace).await;
+        let child = workspace.root.join("legacy-child");
+        fs::create_dir_all(&child).expect("legacy child");
+        let legacy_equivalent = child.join("..");
+        service
+            .store
+            .session_repo()
+            .update_session_settings(
+                session.session.id,
+                &SessionSettingsPatch {
+                    cwd: Some(legacy_equivalent.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("inject legacy cwd");
+        assert_eq!(
+            service
+                .store
+                .session_repo()
+                .get_session(session.session.id)
+                .await
+                .expect("raw legacy session")
+                .cwd,
+            legacy_equivalent
+        );
+
+        let projected = service
+            .get_session(session.session.id)
+            .await
+            .expect("normalized projection");
+        assert_eq!(projected.cwd, workspace.root);
+        let canonical = service
+            .canonical_latest_session_snapshot(session.session.id, 10, 10)
+            .await
+            .expect("normalized canonical projection");
+        assert_eq!(canonical.read.session.cwd, workspace.root);
+        let resumed = service
+            .resolve_session_for_workspace(&SessionSelector::ById(session.session.id), &workspace)
+            .await
+            .expect("legacy resume")
+            .expect("session");
+        assert_eq!(resumed.cwd, workspace.root);
+    }
+
+    #[test]
+    fn git_session_cwd_rejects_a_nested_repository_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 project root");
+        let nested = project_root.join("nested");
+        fs::create_dir_all(project_root.join(".git")).expect("project git marker");
+        fs::create_dir_all(nested.join(".git")).expect("nested git marker");
+        let workspace = WorkspaceDiscovery::discover(&project_root, &ResolvedConfig::default())
+            .expect("outer workspace");
+
+        let error =
+            normalize_session_cwd_for_project(&project_root, workspace.project_id, "git", &nested)
+                .expect_err("nested repository must not inherit the outer project identity");
+
+        assert!(error.to_string().contains("resolves to project"));
+        assert!(
+            error
+                .to_string()
+                .contains(&workspace.project_id.to_string())
+        );
     }
 
     #[tokio::test]

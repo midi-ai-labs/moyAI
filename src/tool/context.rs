@@ -63,8 +63,11 @@ impl ToolFormatterPlan {
         workspace: &Workspace,
         target_guard: &GuardedPath,
     ) -> Result<Option<Self>, ToolError> {
-        let Some(invocation) =
-            Formatter::resolve_invocation(&config.format, &target_guard.absolute, &workspace.root)?
+        let Some(invocation) = Formatter::resolve_invocation(
+            &config.format,
+            &target_guard.absolute,
+            workspace.authority_root(),
+        )?
         else {
             return Ok(None);
         };

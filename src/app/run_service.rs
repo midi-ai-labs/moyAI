@@ -56,7 +56,7 @@ use crate::storage::{
         RunAdmissionLeaseRenewalOutcome,
     },
 };
-use crate::workspace::{AccessKind, PathGuard, branch_review_scope, uncommitted_review_scope};
+use crate::workspace::{PathGuard, branch_review_scope, uncommitted_review_scope};
 
 const DEFAULT_SESSION_SHOW_LIMIT: usize = 100;
 const MAX_WORKFLOW_COMMAND_BYTES: usize = 16 * 1024;
@@ -956,7 +956,7 @@ impl RunService {
         let recorder = NativeHarnessRecorder::start_best_effort_for_turn(
             &self.store,
             Some(session_id),
-            self.workspace.root.clone(),
+            self.workspace.authority_root().to_path_buf(),
             protocol_turn_id,
         );
         let mut harness_sink = HarnessRecordingSink::new(recorder, &mut renderer_sink);
@@ -2702,7 +2702,7 @@ fn maybe_expand_workflow_command(
         .root
         .join(".moyai/commands")
         .join(format!("{name}.md"));
-    let guarded = PathGuard::require_path(workspace, &path, AccessKind::Read).map_err(|error| {
+    let guarded = PathGuard::trusted_internal_path(&path, &workspace.root).map_err(|error| {
         AppRunError::Message(format!("failed to resolve workflow `{path}`: {error}"))
     })?;
     let file = match PathGuard::open_validated_read_file(&guarded) {
@@ -2819,6 +2819,30 @@ fn parse_workflow_invocation(prompt: &str) -> Option<(&str, Option<&str>)> {
 
 const REVIEW_PROMPT_FILE_LIST_LIMIT: usize = 200;
 
+fn review_git_inspection_commands(scope: &crate::workspace::ReviewScope) -> String {
+    match scope.mode {
+        crate::workspace::ReviewScopeMode::Uncommitted => [
+            "- Inventory: `git --literal-pathspecs --no-optional-locks -c core.fsmonitor=false -c submodule.recurse=false status --short --untracked-files=all --ignore-submodules=all -- .`",
+            "- Unstaged diff: `git --literal-pathspecs --no-optional-locks -c core.fsmonitor=false -c submodule.recurse=false diff --no-ext-diff --no-textconv --ignore-submodules=all -- .`",
+            "- Staged diff: `git --literal-pathspecs --no-optional-locks -c core.fsmonitor=false -c submodule.recurse=false diff --cached --no-ext-diff --no-textconv --ignore-submodules=all -- .`",
+        ]
+        .join("\n"),
+        crate::workspace::ReviewScopeMode::Branch => scope
+            .git
+            .resolved_diff_range
+            .as_deref()
+            .map(|range| {
+                format!(
+                    "- Branch diff: `git --literal-pathspecs --no-optional-locks -c core.fsmonitor=false -c submodule.recurse=false diff --no-ext-diff --no-textconv --ignore-submodules=all {range} -- .`"
+                )
+            })
+            .unwrap_or_else(|| {
+                "- The immutable branch range is unavailable; do not replace it with an unscoped Git command."
+                    .to_string()
+            }),
+    }
+}
+
 fn build_review_prompt(raw_prompt: &str, scope: &crate::workspace::ReviewScope) -> String {
     let mode_line = match scope.mode {
         crate::workspace::ReviewScopeMode::Uncommitted => {
@@ -2850,17 +2874,18 @@ fn build_review_prompt(raw_prompt: &str, scope: &crate::workspace::ReviewScope) 
             listed
         } else {
             format!(
-                "{listed}\n- … {omitted} additional changed file(s) are not embedded here; enumerate the authoritative scope with git before planning the review"
+                "{listed}\n- … {omitted} additional changed file(s) are not embedded here; enumerate them only with the authority-scoped Git commands below"
             )
         }
     };
+    let git_commands = review_git_inspection_commands(scope);
     let extra_focus = if raw_prompt.is_empty() {
         String::new()
     } else {
         format!("\nAdditional review request:\n{raw_prompt}\n")
     };
     format!(
-        "{mode_line}\nBase ref: {}\nHead ref: {}\nGit summary: {}\nChanged files:\n{scope_files}{extra_focus}\nInspect only this scope, gather evidence, and report findings first with severity, path, rationale, and impact. If no material issue is found, say so explicitly.",
+        "{mode_line}\nBase ref: {}\nHead ref: {}\nGit summary: {}\nChanged files:\n{scope_files}\n\nAuthority-scoped Git inspection:\n- Keep the shell workdir at the selected workspace directory.\n- The trailing `-- .` is the mandatory literal pathspec; do not omit it or replace it with a repository-wide Git command.\n{git_commands}{extra_focus}\nInspect only this scope, gather evidence, and report findings first with severity, path, rationale, and impact. If no material issue is found, say so explicitly.",
         scope.base_ref.as_deref().unwrap_or("HEAD"),
         scope.head_ref.as_deref().unwrap_or("HEAD"),
         scope.summary,
@@ -3000,6 +3025,55 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn nested_workspace_expands_a_project_root_workflow_without_widening_tool_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 project root");
+        let selected = project_root.join("bbb");
+        std::fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        std::fs::create_dir_all(project_root.join(".moyai/commands"))
+            .expect("project commands directory");
+        std::fs::create_dir_all(&selected).expect("selected directory");
+        std::fs::write(
+            project_root.join(".moyai/commands/inspect.md"),
+            "Inspect {{args}} inside the selected workspace.",
+        )
+        .expect("workflow fixture");
+        let ordinary_project_file = project_root.join("outside-selected.txt");
+        std::fs::write(&ordinary_project_file, "not workflow authority")
+            .expect("ordinary project fixture");
+        let workspace =
+            crate::workspace::WorkspaceDiscovery::discover(&selected, &ResolvedConfig::default())
+                .expect("nested workspace");
+
+        let expanded = super::maybe_expand_workflow_command(&workspace, "/inspect carefully")
+            .expect("workflow expansion")
+            .expect("project workflow");
+
+        assert_eq!(workspace.root, project_root);
+        assert_eq!(workspace.authority_root(), selected);
+        assert!(
+            expanded
+                .prompt
+                .contains("Source: .moyai/commands/inspect.md")
+        );
+        assert!(
+            expanded
+                .prompt
+                .contains("Inspect carefully inside the selected workspace.")
+        );
+        assert!(
+            crate::workspace::PathGuard::require_path(
+                &workspace,
+                &ordinary_project_file,
+                crate::workspace::AccessKind::Read,
+            )
+            .is_err(),
+            "loading one project workflow must not widen ordinary typed reads to the project root"
+        );
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn workflow_command_link_cannot_ingest_an_external_file() {
@@ -3023,7 +3097,7 @@ mod tests {
         let error = super::maybe_expand_workflow_command(&workspace, "/escape")
             .expect_err("external workflow link must fail closed");
 
-        assert!(error.to_string().contains("outside the allowed roots"));
+        assert!(error.to_string().contains("outside"));
         assert!(!error.to_string().contains("EXTERNAL_WORKFLOW_SECRET"));
     }
 
@@ -3055,7 +3129,7 @@ mod tests {
         let error = super::maybe_expand_workflow_command(&workspace, "/escape")
             .expect_err("external workflow directory link must fail closed");
 
-        assert!(error.to_string().contains("outside the allowed roots"));
+        assert!(error.to_string().contains("outside"));
         assert!(
             !error
                 .to_string()
@@ -3205,7 +3279,7 @@ mod tests {
     }
 
     #[test]
-    fn review_prompt_bounds_file_inventory_and_requires_authoritative_enumeration() {
+    fn review_prompt_bounds_file_inventory_and_requires_scoped_git_commands() {
         let scope = crate::workspace::ReviewScope {
             mode: crate::workspace::ReviewScopeMode::Uncommitted,
             base_ref: Some("HEAD".to_string()),
@@ -3214,6 +3288,10 @@ mod tests {
                 .map(|index| Utf8PathBuf::from(format!("src/file-{index:03}.rs")))
                 .collect(),
             summary: "201 files changed".to_string(),
+            git: crate::workspace::ReviewGitScope {
+                literal_pathspec: Some("nested/workspace".to_string()),
+                resolved_diff_range: None,
+            },
         };
 
         let prompt = super::build_review_prompt("", &scope);
@@ -3222,7 +3300,36 @@ mod tests {
         assert!(prompt.contains("src/file-199.rs"));
         assert!(!prompt.contains("src/file-200.rs"));
         assert!(prompt.contains("1 additional changed file(s) are not embedded"));
-        assert!(prompt.contains("enumerate the authoritative scope with git"));
+        assert!(prompt.contains("--no-optional-locks"));
+        assert!(prompt.contains("-c core.fsmonitor=false"));
+        assert!(prompt.contains("status --short"));
+        assert!(prompt.contains("diff --no-ext-diff"));
+        assert!(prompt.contains("mandatory literal pathspec"));
+        assert!(prompt.contains("-- ."));
+        assert!(!prompt.contains("enumerate the authoritative scope with git"));
+    }
+
+    #[test]
+    fn branch_review_prompt_uses_the_resolved_range_and_mandatory_scope_pathspec() {
+        let resolved_range =
+            "0123456789abcdef0123456789abcdef01234567...89abcdef0123456789abcdef0123456789abcdef";
+        let scope = crate::workspace::ReviewScope {
+            mode: crate::workspace::ReviewScopeMode::Branch,
+            base_ref: Some("feature/base".to_string()),
+            head_ref: Some("feature/review".to_string()),
+            changed_files: vec![Utf8PathBuf::from("src/lib.rs")],
+            summary: "1 file changed".to_string(),
+            git: crate::workspace::ReviewGitScope {
+                literal_pathspec: Some("nested/workspace".to_string()),
+                resolved_diff_range: Some(resolved_range.to_string()),
+            },
+        };
+
+        let prompt = super::build_review_prompt("", &scope);
+
+        assert!(prompt.contains(resolved_range));
+        assert!(prompt.contains("-- ."));
+        assert!(prompt.contains("do not omit it"));
     }
 
     struct UnreachableLlm;

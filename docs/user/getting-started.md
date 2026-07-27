@@ -1,6 +1,6 @@
 # moyAI Getting Started
 
-2026-07-27 時点のv1.1.0 release向け最小手順。durableな再帰Agent Tree、canonical runtime/storage、Codex型Desktop履歴、3種類のpermission mode、Windows workspace sandbox、Responses transportを含む。正確なversionと機能は利用するrelease packageと製品READMEを確認する。
+2026-07-27 時点のv1.1.1 release向け最小手順。durableな再帰Agent Tree、canonical runtime/storage、Codex型Desktop履歴、3種類のpermission mode、Windows workspace sandbox、Responses transportを含む。正確なversionと機能は利用するrelease packageと製品READMEを確認する。
 
 ## 初回起動
 
@@ -128,6 +128,8 @@ Desktop:
 - command palette: `Ctrl+K` または composer の検索/コマンドボタン。
 - Markdown export: transcript 表示中に export ボタンまたは `F9`。
 - 停止: 実行中に stop button を押すと、表示時のworkspace / root session / run generation / Agent Tree epochが一致するexact current root executionだけを停止する。実行中またはdetachedなchildへcascadeしない。画面更新後の古いStopは新しいrunへ適用されず、tree全体の停止は別名の明示的なtree-stop操作として扱う。
+
+Git repository内のsubdirectoryをworkspaceとして選んだ場合、選択したdirectoryがtoolとsandboxの境界になる。ancestorのGit rootはproject一覧、履歴、Git機能、ancestor instruction探索に使うが、選択directoryのsiblingをworkspace内にはしない。同じsessionを開き直した場合も、保存済みdirectoryからこの境界を復元する。built-in reviewがshell用に提示するGit commandも、末尾の`-- .`で選択directoryへscopeされる。
 
 CLI:
 

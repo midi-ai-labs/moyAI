@@ -146,7 +146,10 @@ impl WorkspaceWriteSandboxProfile {
         configured_instruction_files: &[Utf8PathBuf],
     ) -> Result<Self, SandboxProfileError> {
         let mut writable_roots = Vec::new();
-        writable_roots.push(validate_writable_root(&workspace.root, "workspace")?);
+        writable_roots.push(validate_writable_root(
+            workspace.authority_root(),
+            "workspace",
+        )?);
         for path in &workspace.path_policy.additional_write_roots {
             writable_roots.push(validate_writable_root(path, "additional write")?);
         }
@@ -969,6 +972,34 @@ mod tests {
             profile
                 .audit_description()
                 .contains("world_writable_audit=bounded_best_effort")
+        );
+    }
+
+    #[test]
+    fn nested_git_sandbox_writes_only_to_the_selected_authority_and_keeps_git_protected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root = utf8(temp.path().join("aaa"));
+        let selected = project_root.join("bbb");
+        let git = project_root.join(".git");
+        std::fs::create_dir_all(&git).expect("git marker");
+        std::fs::create_dir_all(&selected).expect("selected directory");
+        let workspace = WorkspaceDiscovery::discover(&selected, &ResolvedConfig::default())
+            .expect("nested workspace");
+
+        let profile =
+            WorkspaceWriteSandboxProfile::compile(&workspace, std::iter::empty::<Utf8PathBuf>())
+                .expect("nested workspace profile");
+
+        assert_eq!(workspace.root, project_root);
+        assert_eq!(workspace.authority_root(), selected);
+        assert_eq!(profile.writable_roots.len(), 1);
+        assert_eq!(profile.writable_roots[0].requested, selected);
+        assert!(
+            profile
+                .read_only_roots
+                .iter()
+                .any(|snapshot| snapshot.requested == git),
+            "the ancestor Git authority remains protected"
         );
     }
 

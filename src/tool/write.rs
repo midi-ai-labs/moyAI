@@ -103,7 +103,7 @@ impl Tool for WriteTool {
         let session_id = ctx.session.session.id;
         let tool_call_id = ctx.tool_call_id;
         let path = guarded.absolute.clone();
-        let workspace_root = ctx.workspace.root.clone();
+        let display_root = ctx.workspace.authority_root().to_path_buf();
         let stored_path = path_for_change_storage(&path, &ctx.workspace.root);
         let locked_path = path.clone();
         let path_in_task = path.clone();
@@ -171,9 +171,8 @@ impl Tool for WriteTool {
                         maximum_edit_read_bytes,
                     )?;
                     return Ok(WriteExecutionOutcome::NoContent {
-                        path: path_in_task
-                            .strip_prefix(&workspace_root)
-                            .unwrap_or(path_in_task.as_path())
+                        path: PathGuard::relative_path_from_root(&path_in_task, &display_root)
+                            .unwrap_or(path_in_task)
                             .as_str()
                             .replace('\\', "/"),
                     });
@@ -212,8 +211,13 @@ impl Tool for WriteTool {
         };
 
         Ok(ToolResult {
-            title: format!("Wrote {}", summary.summary_line(Some(&ctx.workspace.root))),
-            output_text: summary.summary_line(Some(&ctx.workspace.root)),
+            title: format!(
+                "Wrote {}",
+                summary
+                    .summary_line_relative_to(&ctx.workspace.root, ctx.workspace.authority_root(),)
+            ),
+            output_text: summary
+                .summary_line_relative_to(&ctx.workspace.root, ctx.workspace.authority_root()),
             metadata: json!({
                 "changes": [json!({
                     "change_id": summary.change_id,

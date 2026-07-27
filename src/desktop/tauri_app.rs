@@ -16,7 +16,7 @@ use crate::session::{SessionId, SessionSpawnEdge};
 use super::app::{DesktopController, PendingPermissionResolution};
 use super::args::DesktopArgs;
 use super::query::{
-    DESKTOP_HISTORY_PROJECTION_LIMIT, DESKTOP_TURN_PAGE_LIMIT, build_session_detail,
+    DESKTOP_HISTORY_PROJECTION_LIMIT, DESKTOP_TURN_PAGE_LIMIT, build_session_detail_with_roots,
     load_latest_session_detail,
 };
 use super::web_model::{DesktopAgentExecutionProjection, DesktopWebState};
@@ -566,7 +566,7 @@ fn ensure_session_search_target(
 ) -> Result<(), DesktopCommandConflict> {
     validate_session_search_target(
         expected,
-        controller.app.workspace.root.as_str(),
+        controller.app.workspace.authority_root().as_str(),
         controller
             .state
             .selected_project_id()
@@ -585,7 +585,7 @@ fn ensure_draft_action_target(
         .map(|session_id| session_id.to_string());
     validate_draft_action_target(
         expected,
-        controller.app.workspace.root.as_str(),
+        controller.app.workspace.authority_root().as_str(),
         session_id,
         controller.state.composer.owner_generation(),
     )
@@ -634,7 +634,7 @@ fn ensure_run_mutation_target(
     let (runtime_owner_token, _) = controller.access_mode_mutation_runtime_contract();
     validate_run_mutation_target(
         expected,
-        controller.app.workspace.root.as_str(),
+        controller.app.workspace.authority_root().as_str(),
         controller
             .state
             .app_state
@@ -721,14 +721,16 @@ fn ensure_row_mutation_target(
     expected: &DesktopRowMutationTarget,
     actual_row_id: Option<String>,
 ) -> Result<(), DesktopCommandConflict> {
-    if controller.state.snapshot.workspace_path != controller.app.workspace.root.as_str() {
+    if controller.state.snapshot.workspace_path
+        != controller.app.workspace.authority_root().as_str()
+    {
         return Err(DesktopCommandConflict::new(
             "the workspace projection changed before the operation was applied; refresh and try again",
         ));
     }
     validate_row_mutation_target(
         expected,
-        controller.app.workspace.root.as_str(),
+        controller.app.workspace.authority_root().as_str(),
         controller
             .state
             .selected_project_id()
@@ -1133,7 +1135,7 @@ async fn interrupt_agent(
         controller.drain_runtime_messages();
         let (root_session_id, child_session_id) = validate_agent_execution_owner(
             &execution_target,
-            controller.app.workspace.root.as_str(),
+            controller.app.workspace.authority_root().as_str(),
             controller.state.app_state.current_session_id,
         )
         .map_err(|conflict| command_conflict_error(&mut controller, conflict))?;
@@ -1154,7 +1156,7 @@ async fn interrupt_agent(
         controller.drain_runtime_messages();
         validate_agent_execution_owner(
             &execution_target,
-            controller.app.workspace.root.as_str(),
+            controller.app.workspace.authority_root().as_str(),
             controller.state.app_state.current_session_id,
         )
         .map_err(|conflict| command_conflict_error(&mut controller, conflict))?;
@@ -1200,7 +1202,7 @@ async fn load_agent_execution_projection(
         controller.drain_runtime_messages();
         let (root_session_id, child_session_id) = validate_agent_execution_owner(
             &expected_target,
-            controller.app.workspace.root.as_str(),
+            controller.app.workspace.authority_root().as_str(),
             controller.state.app_state.current_session_id,
         )
         .map_err(read_only_command_conflict_error)?;
@@ -1218,7 +1220,7 @@ async fn load_agent_execution_projection(
         controller.drain_runtime_messages();
         if let Err(owner_conflict) = validate_agent_execution_owner(
             &expected_target,
-            controller.app.workspace.root.as_str(),
+            controller.app.workspace.authority_root().as_str(),
             controller.state.app_state.current_session_id,
         ) {
             return Err(read_only_command_conflict_error(owner_conflict));
@@ -1363,7 +1365,12 @@ async fn load_agent_execution_projection(
         )
         .map_err(read_only_command_conflict_error)?;
     }
-    let detail = build_session_detail(&read, None);
+    let detail = build_session_detail_with_roots(
+        &read,
+        None,
+        Some(&app.workspace.root),
+        Some(app.workspace.authority_root()),
+    );
     let turn_page_end = read.turns.offset.saturating_add(read.turns.items.len());
 
     // The detail read runs outside the controller lock. Re-read the durable edge
@@ -1375,7 +1382,7 @@ async fn load_agent_execution_projection(
         controller.drain_runtime_messages();
         validate_agent_execution_owner(
             &expected_target,
-            controller.app.workspace.root.as_str(),
+            controller.app.workspace.authority_root().as_str(),
             controller.state.app_state.current_session_id,
         )
         .map_err(read_only_command_conflict_error)?;
@@ -1390,7 +1397,7 @@ async fn load_agent_execution_projection(
     let edge = edge.expect("validated Sub Agent edge must be present");
 
     Ok(DesktopAgentExecutionProjection {
-        workspace_path: app.workspace.root.to_string(),
+        workspace_path: app.workspace.authority_root().to_string(),
         root_session_id: root_session_id.to_string(),
         agent_path: edge.agent_path,
         session_id: child_session_id.to_string(),
@@ -2396,7 +2403,7 @@ fn ensure_config_mutation_target(
 ) -> Result<(), DesktopCommandConflict> {
     validate_config_mutation_target(
         expected,
-        controller.app.workspace.root.as_str(),
+        controller.app.workspace.authority_root().as_str(),
         controller
             .state
             .app_state
@@ -2446,7 +2453,7 @@ fn ensure_access_mode_mutation_target(
     let (runtime_owner_token, admission_open) = controller.access_mode_mutation_runtime_contract();
     validate_access_mode_mutation_target(
         expected,
-        controller.app.workspace.root.as_str(),
+        controller.app.workspace.authority_root().as_str(),
         controller
             .state
             .app_state

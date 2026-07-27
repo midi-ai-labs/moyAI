@@ -54,6 +54,7 @@ use super::state::{
     AppState, Modal, PlanView, PromptReviewPhase, Route, RunStatus, TranscriptEntry,
     TranscriptKind, interruption_status_message, latest_plan_from_turn_items,
     permission_decision_pending_status_message, run_cancellation_status_message,
+    transcript_entries_from_turn_items_relative_to,
 };
 
 type TerminalHandle = Terminal<CrosstermBackend<Stdout>>;
@@ -387,6 +388,7 @@ impl TuiController {
             should_quit: false,
             started_at: Instant::now(),
         };
+        controller.sync_file_change_display_roots();
         let summaries = controller.loaded_summaries_for(sessions).await?;
         controller.state.set_loaded_sessions(summaries);
         controller.refresh_preview().await?;
@@ -558,7 +560,7 @@ impl TuiController {
                 }
             }
             KeyCode::F(5) => {
-                let root = self.app.workspace.root.clone();
+                let root = self.app.workspace.authority_root().to_path_buf();
                 self.open_path_in_file_manager(&root);
             }
             KeyCode::Enter => {}
@@ -1061,6 +1063,7 @@ impl TuiController {
         self.root_run_lifecycle = TuiRootRunLifecycle::default();
         self.config_editor = ConfigEditorState::from_config(&self.effective_config);
         self.state = AppState::default();
+        self.sync_file_change_display_roots();
         self.composer = build_composer();
         self.composer_draft_revision = 0;
         self.pending_composer_submissions.clear();
@@ -1071,7 +1074,10 @@ impl TuiController {
         self.preview_entries.clear();
         self.preview_plan = None;
         self.refresh_sessions().await?;
-        self.state.status_message = Some(format!("workspace set to {}", self.app.workspace.root));
+        self.state.status_message = Some(format!(
+            "workspace set to {}",
+            self.app.workspace.authority_root()
+        ));
         self.state.modal = Modal::None;
         Ok(())
     }
@@ -1709,10 +1715,51 @@ impl TuiController {
     async fn open_session(&mut self, session_id: SessionId) -> Result<(), AppRunError> {
         let read = session_view(&self.app.session_service, session_id).await?;
         self.cancel_pending_prompt_enhance();
+        self.align_workspace_to_session(&read.session).await?;
         self.apply_access_mode_owner(read.session.access_mode);
         self.state.load_canonical_session_read(&read);
         self.state.modal = Modal::None;
         Ok(())
+    }
+
+    async fn align_workspace_to_session(
+        &mut self,
+        session: &SessionRecord,
+    ) -> Result<(), AppRunError> {
+        if session.project_id != self.app.workspace.project_id
+            || session.cwd != self.app.workspace.cwd
+            || self.app.workspace.authority_root() != session.cwd.as_path()
+        {
+            let process_runtime = self.app.process_runtime.clone();
+            let app =
+                AppBootstrap::rebuild_for_session_with_process_runtime(session, process_runtime)
+                    .await
+                    .map_err(|error| {
+                        AppRunError::Message(format!(
+                            "failed to restore session workspace {} for {}: {error}",
+                            session.cwd, session.id
+                        ))
+                    })?;
+            if app.workspace.project_id != session.project_id {
+                return Err(AppRunError::Message(format!(
+                    "session {} cwd {} resolves to project {}, not its stored project {}",
+                    session.id, session.cwd, app.workspace.project_id, session.project_id
+                )));
+            }
+            self.app = app;
+            self.base_config = self.app.config.clone();
+            self.effective_config = self.base_config.clone();
+            self.config_editor = ConfigEditorState::from_config(&self.effective_config);
+        }
+        self.sync_file_change_display_roots();
+        Ok(())
+    }
+
+    fn sync_file_change_display_roots(&mut self) {
+        self.state.set_file_change_display_roots(
+            &self.app.workspace.root,
+            self.app.workspace.authority_root(),
+        );
     }
 
     fn finish_pending_prompt_enhance(&mut self, request_id: u64) -> bool {
@@ -1780,12 +1827,14 @@ impl TuiController {
     async fn rejoin_session(&mut self, session_id: SessionId) -> Result<(), AppRunError> {
         // Rejoin first validates the durable active-turn owner with a minimal bounded read, then
         // hydrates the latest TUI page before live runtime events continue as deltas.
+        let session = self.app.session_service.get_session(session_id).await?;
+        self.cancel_pending_prompt_enhance();
+        self.align_workspace_to_session(&session).await?;
         self.app
             .session_service
             .rejoin_running_session(session_id, 0, 1, 0, 1)
             .await?;
         let read = session_view(&self.app.session_service, session_id).await?;
-        self.cancel_pending_prompt_enhance();
         self.apply_access_mode_owner(read.session.access_mode);
         self.state.load_canonical_session_read(&read);
         self.state.status_message = Some(format!("rejoined running session {session_id}"));
@@ -1810,10 +1859,9 @@ impl TuiController {
         }
 
         let file_name = history_markdown_file_name(&read.session.title, session_id);
-        let export_path = self
-            .app
-            .workspace
-            .root
+        let export_path = read
+            .session
+            .cwd
             .join(".moyai")
             .join("history-exports")
             .join(file_name);
@@ -1960,7 +2008,11 @@ impl TuiController {
                     self.preview_turn_limit,
                 )
                 .await?;
-            self.preview_entries = super::state::transcript_entries_from_turn_items(&page.items);
+            self.preview_entries = transcript_entries_from_turn_items_relative_to(
+                &page.items,
+                &self.app.workspace.root,
+                &session.cwd,
+            );
             self.preview_plan = latest_plan_from_turn_items(&page.items);
             self.preview_turn_offset = page.offset;
             self.preview_turn_limit = page.limit;
@@ -2058,7 +2110,7 @@ impl TuiController {
                 )),
                 Span::raw(format!(
                     "workspace={}",
-                    truncate_middle(self.app.workspace.root.as_str(), 42)
+                    truncate_middle(self.app.workspace.authority_root().as_str(), 42)
                 )),
             ]),
         ];
@@ -3642,6 +3694,72 @@ mod key_tests {
         panic!("timed out waiting for TUI runtime message")
     }
 
+    #[tokio::test]
+    async fn history_export_uses_the_selected_sessions_nested_workspace() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (_temp, mut controller, current_session_id) =
+            tui_controller_with_session("current workspace").await;
+        let project_root = controller.app.workspace.root.clone();
+        let selected_directory = project_root.join("nested");
+        std::fs::create_dir_all(&selected_directory).expect("nested workspace");
+        let selected = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "nested export".to_string(),
+                cwd: selected_directory.clone(),
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: crate::config::AccessMode::Default,
+            })
+            .await
+            .expect("nested session");
+        append_tui_user_history(&controller, selected.id, "export this nested session");
+        controller.state.route = Route::History;
+        controller
+            .refresh_sessions()
+            .await
+            .expect("session refresh");
+        controller.state.selected_session_index = controller
+            .state
+            .sessions
+            .iter()
+            .position(|session| session.id == selected.id)
+            .expect("nested session row");
+
+        controller
+            .export_history_markdown()
+            .await
+            .expect("history export");
+
+        let file_name = history_markdown_file_name("nested export", selected.id);
+        let expected_export = selected_directory
+            .join(".moyai")
+            .join("history-exports")
+            .join(&file_name);
+        let current_authority_export = controller
+            .app
+            .workspace
+            .authority_root()
+            .join(".moyai")
+            .join("history-exports")
+            .join(file_name);
+        let markdown = std::fs::read_to_string(&expected_export).expect("exported markdown");
+        assert_eq!(
+            controller.state.current_session_id,
+            Some(current_session_id)
+        );
+        assert!(expected_export.is_file());
+        assert!(
+            !current_authority_export.exists(),
+            "history export must follow the selected session, not the open session"
+        );
+        assert!(markdown.contains(selected_directory.as_str()));
+    }
+
     #[test]
     fn running_session_accepts_ctrl_enter_for_steer() {
         assert!(ctrl_enter_available(Route::Session, RunStatus::Running));
@@ -4939,6 +5057,289 @@ mod key_tests {
             crate::config::AccessMode::FullAccess,
             "reopen reads the persisted session access mode"
         );
+    }
+
+    #[tokio::test]
+    async fn reopening_nested_tui_session_restores_saved_cwd_authority_and_project_identity() {
+        use crate::session::{SessionSelector, SessionStartRequest};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 project root");
+        let session_cwd = project_root.join("bbb");
+        std::fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        std::fs::create_dir_all(&session_cwd).expect("session cwd");
+
+        let data_dir =
+            Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data root");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = AppBootstrap::rebuild_for_directory_as_workspace_root_with_config(
+            &project_root,
+            store,
+            ResolvedConfig::default(),
+        )
+        .await
+        .expect("initial app");
+        let project_id = app.workspace.project_id;
+        let process_runtime = app.process_runtime.clone();
+        let nested_app = AppBootstrap::rebuild_for_directory_with_process_runtime(
+            &session_cwd,
+            process_runtime.clone(),
+        )
+        .await
+        .expect("nested authority app");
+        let session = nested_app
+            .session_service
+            .start_or_resume(
+                SessionStartRequest {
+                    selector: SessionSelector::New,
+                    title: Some("nested session authority".to_string()),
+                    cwd: session_cwd.clone(),
+                    model: nested_app.config.model.model.clone(),
+                    base_url: nested_app.config.model.base_url.clone(),
+                    access_mode: AccessMode::Default,
+                },
+                nested_app.workspace.clone(),
+            )
+            .await
+            .expect("nested session");
+        let mut controller = TuiController::new(
+            app,
+            TuiArgs {
+                directory: Some(project_root.clone()),
+                session_id: None,
+                continue_last: false,
+            },
+        )
+        .await
+        .expect("controller");
+
+        controller
+            .open_session(session.session.id)
+            .await
+            .expect("reopen nested session");
+
+        assert_eq!(controller.app.workspace.root, project_root);
+        assert_eq!(controller.app.workspace.cwd, session_cwd);
+        assert_eq!(
+            controller.app.workspace.authority_root(),
+            session_cwd.as_path()
+        );
+        assert_eq!(controller.app.workspace.project_id, project_id);
+        assert!(
+            controller.app.process_runtime.ptr_eq(&process_runtime),
+            "session reopen must retain the process-lifetime runtime"
+        );
+        assert_eq!(
+            controller.state.current_session_id,
+            Some(session.session.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_session_from_another_project_restores_its_nested_workspace_authority() {
+        use crate::session::{SessionSelector, SessionStartRequest};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("first")).expect("utf8 first root");
+        let selected = first_root.join("selected");
+        let second_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("second")).expect("utf8 second root");
+        std::fs::create_dir_all(first_root.join(".git")).expect("first git marker");
+        std::fs::create_dir_all(&selected).expect("selected authority");
+        std::fs::create_dir_all(second_root.join(".git")).expect("second git marker");
+
+        let data_dir =
+            Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data root");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let second_app = AppBootstrap::rebuild_for_directory_as_workspace_root_with_config(
+            &second_root,
+            store,
+            ResolvedConfig::default(),
+        )
+        .await
+        .expect("second project app");
+        let process_runtime = second_app.process_runtime.clone();
+        let first_app = AppBootstrap::rebuild_for_directory_with_process_runtime(
+            &selected,
+            process_runtime.clone(),
+        )
+        .await
+        .expect("first nested app");
+        let first_project_id = first_app.workspace.project_id;
+        let session = first_app
+            .session_service
+            .start_or_resume(
+                SessionStartRequest {
+                    selector: SessionSelector::New,
+                    title: Some("first nested session".to_string()),
+                    cwd: selected.clone(),
+                    model: first_app.config.model.model.clone(),
+                    base_url: first_app.config.model.base_url.clone(),
+                    access_mode: AccessMode::Default,
+                },
+                first_app.workspace.clone(),
+            )
+            .await
+            .expect("first nested session");
+        let mut controller = TuiController::new(
+            second_app,
+            TuiArgs {
+                directory: Some(second_root),
+                session_id: None,
+                continue_last: false,
+            },
+        )
+        .await
+        .expect("second project controller");
+
+        controller
+            .open_session(session.session.id)
+            .await
+            .expect("open first-project session");
+
+        assert_eq!(controller.app.workspace.root, first_root);
+        assert_eq!(controller.app.workspace.cwd, selected);
+        assert_eq!(
+            controller.app.workspace.authority_root(),
+            selected.as_path()
+        );
+        assert_eq!(controller.app.workspace.project_id, first_project_id);
+        assert!(
+            controller.app.process_runtime.ptr_eq(&process_runtime),
+            "cross-project session reopen must retain the process runtime"
+        );
+        assert_eq!(
+            controller.state.current_session_id,
+            Some(session.session.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejoining_session_from_another_project_restores_its_nested_workspace_authority() {
+        use crate::session::{SessionSelector, SessionStartRequest};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("first")).expect("utf8 first root");
+        let selected = first_root.join("selected");
+        let second_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("second")).expect("utf8 second root");
+        std::fs::create_dir_all(first_root.join(".git")).expect("first git marker");
+        std::fs::create_dir_all(&selected).expect("selected authority");
+        std::fs::create_dir_all(second_root.join(".git")).expect("second git marker");
+
+        let data_dir =
+            Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data root");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let second_app = AppBootstrap::rebuild_for_directory_as_workspace_root_with_config(
+            &second_root,
+            store,
+            ResolvedConfig::default(),
+        )
+        .await
+        .expect("second project app");
+        let process_runtime = second_app.process_runtime.clone();
+        let first_app = AppBootstrap::rebuild_for_directory_with_process_runtime(
+            &selected,
+            process_runtime.clone(),
+        )
+        .await
+        .expect("first nested app");
+        let first_project_id = first_app.workspace.project_id;
+        let session = first_app
+            .session_service
+            .start_or_resume(
+                SessionStartRequest {
+                    selector: SessionSelector::New,
+                    title: Some("active nested authority".to_string()),
+                    cwd: selected.clone(),
+                    model: first_app.config.model.model.clone(),
+                    base_url: first_app.config.model.base_url.clone(),
+                    access_mode: AccessMode::Default,
+                },
+                first_app.workspace.clone(),
+            )
+            .await
+            .expect("nested session");
+        let turn_id = crate::protocol::TurnId::new();
+        let repository = first_app.store.session_repo();
+        let admission = repository
+            .admit_session_turn(session.session.id, turn_id)
+            .await
+            .expect("active admission")
+            .expect("session admitted");
+        repository
+            .append_user_turn_with_protocol_bundle(
+                session.session.id,
+                admission.admission_id,
+                &crate::protocol::UserTurn {
+                    turn_id,
+                    items: vec![crate::protocol::UserInputItem::Text {
+                        text: "continue nested work".to_string(),
+                    }],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                },
+                turn_id,
+                0,
+            )
+            .await
+            .expect("active turn history");
+        let mut controller = TuiController::new(
+            second_app,
+            TuiArgs {
+                directory: Some(second_root),
+                session_id: None,
+                continue_last: false,
+            },
+        )
+        .await
+        .expect("second project controller");
+
+        controller
+            .rejoin_session(session.session.id)
+            .await
+            .expect("rejoin first-project session");
+
+        assert_eq!(controller.app.workspace.root, first_root);
+        assert_eq!(controller.app.workspace.cwd, selected);
+        assert_eq!(
+            controller.app.workspace.authority_root(),
+            selected.as_path()
+        );
+        assert_eq!(controller.app.workspace.project_id, first_project_id);
+        assert!(
+            controller.app.process_runtime.ptr_eq(&process_runtime),
+            "cross-project rejoin must retain the process runtime"
+        );
+        assert_eq!(
+            controller.state.current_session_id,
+            Some(session.session.id)
+        );
+        assert_eq!(controller.state.run_status, RunStatus::Running);
     }
 
     #[tokio::test]

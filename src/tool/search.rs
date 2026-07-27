@@ -371,7 +371,7 @@ impl Tool for GlobTool {
                     &matcher,
                     &entry.path,
                     &entry.relative_path,
-                    &ctx.workspace.root,
+                    ctx.workspace.authority_root(),
                     projected_workspace_relative.as_deref(),
                 )
             })
@@ -388,7 +388,7 @@ impl Tool for GlobTool {
                     glob_workspace_relative_path(&guarded, &entry.relative_path);
                 glob_output_label(
                     &entry.path,
-                    &ctx.workspace.root,
+                    ctx.workspace.authority_root(),
                     projected_workspace_relative.as_deref(),
                 )
             },
@@ -405,6 +405,7 @@ impl Tool for GlobTool {
             title: format!("Glob {}", input.pattern),
             output_text: rendered.output_text,
             metadata: json!({
+                "root": guarded.absolute,
                 "match_count": rendered.rendered_count,
                 "candidate_count": page.entries.len(),
                 "visited_entries": page.visited_entries,
@@ -1179,6 +1180,58 @@ mod tests {
         assert_eq!(bounded_result_limit(Some(12), 64), 12);
         assert_eq!(bounded_result_limit(None, 64), 64);
         assert_eq!(bounded_result_limit(Some(0), 64), 1);
+    }
+
+    #[test]
+    fn nested_git_glob_projects_matches_from_the_selected_authority_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 project root");
+        let selected = project_root.join("bbb");
+        let nested = selected.join("ccc");
+        fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        fs::create_dir_all(&nested).expect("nested directory");
+        fs::write(nested.join("file.txt"), "fixture").expect("glob fixture");
+        let workspace = WorkspaceDiscovery::discover(&selected, &ResolvedConfig::default())
+            .expect("nested workspace");
+        let guarded = PathGuard::require_path(
+            &workspace,
+            Utf8PathBuf::from(".").as_path(),
+            AccessKind::Search,
+        )
+        .expect("selected search root");
+        let page = walk_page(
+            &guarded.absolute,
+            &workspace,
+            None,
+            TraversalOptions {
+                include_hidden: false,
+                max_depth: None,
+                include_files: true,
+                include_directories: false,
+                result_limit: 8,
+                visit_limit: 32,
+            },
+        )
+        .expect("glob page");
+        let entry = page.entries.first().expect("glob entry");
+        let projected = glob_workspace_relative_path(&guarded, &entry.relative_path)
+            .expect("authority-relative projection");
+        let matcher = compile_include_glob("ccc/*.txt").expect("glob matcher");
+
+        assert_eq!(workspace.root, project_root);
+        assert_eq!(workspace.authority_root(), selected);
+        assert!(glob_matches_path(
+            &matcher,
+            &entry.path,
+            &entry.relative_path,
+            workspace.authority_root(),
+            Some(&projected),
+        ));
+        assert_eq!(
+            glob_output_label(&entry.path, workspace.authority_root(), Some(&projected),),
+            "ccc/file.txt"
+        );
     }
 
     #[test]

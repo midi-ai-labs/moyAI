@@ -1,9 +1,13 @@
+use camino::{Utf8Path, Utf8PathBuf};
+
 use crate::session::{CanonicalSessionRead, CanonicalTurnPage, SessionRecord};
 use crate::tui::state::{AppState, RunStatus};
 
 use super::models::DesktopSessionDetail;
 use super::query::{
     build_session_detail, build_session_detail_from_app_state_with_session,
+    build_session_detail_with_roots,
+    transcript_rows_from_turn_items_with_context_and_elapsed_and_roots,
     turn_work_summary_stable_identity,
 };
 
@@ -11,6 +15,8 @@ use super::query::{
 pub struct OpenSessionView {
     read: CanonicalSessionRead,
     stored_detail: DesktopSessionDetail,
+    file_change_storage_root: Option<Utf8PathBuf>,
+    file_change_display_root: Option<Utf8PathBuf>,
 }
 
 impl OpenSessionView {
@@ -19,6 +25,23 @@ impl OpenSessionView {
         Self {
             read: read.clone(),
             stored_detail,
+            file_change_storage_root: None,
+            file_change_display_root: None,
+        }
+    }
+
+    pub fn from_loaded_with_roots(
+        read: &CanonicalSessionRead,
+        storage_root: &Utf8Path,
+        display_root: &Utf8Path,
+    ) -> Self {
+        let stored_detail =
+            build_session_detail_with_roots(read, None, Some(storage_root), Some(display_root));
+        Self {
+            read: read.clone(),
+            stored_detail,
+            file_change_storage_root: Some(storage_root.to_path_buf()),
+            file_change_display_root: Some(display_root.to_path_buf()),
         }
     }
 
@@ -78,7 +101,12 @@ impl OpenSessionView {
         // retain it from an older page: the incoming snapshot is authoritative
         // for the pending -> delivered transition.
         read.pending_turn_inputs = incoming.pending_turn_inputs.clone();
-        self.stored_detail = build_session_detail(&read, None);
+        self.stored_detail = build_session_detail_with_roots(
+            &read,
+            None,
+            self.file_change_storage_root.as_deref(),
+            self.file_change_display_root.as_deref(),
+        );
         self.read = read;
         true
     }
@@ -108,7 +136,12 @@ impl OpenSessionView {
         self.read.turns.limit = self.read.turns.limit.max(incoming.turns.limit);
         self.read.turns.total = self.read.turns.total.max(incoming.turns.total);
         self.read.turns.has_more = self.loaded_turn_end() < self.read.turns.total;
-        self.stored_detail = build_session_detail(&self.read, None);
+        self.stored_detail = build_session_detail_with_roots(
+            &self.read,
+            None,
+            self.file_change_storage_root.as_deref(),
+            self.file_change_display_root.as_deref(),
+        );
         true
     }
 
@@ -181,16 +214,20 @@ impl OpenSessionView {
             .iter()
             .cloned()
             .partition(|item| item.turn_id != active_turn_id);
-        let mut rows = super::query::transcript_rows_from_turn_items_with_context_and_elapsed(
+        let mut rows = transcript_rows_from_turn_items_with_context_and_elapsed_and_roots(
             &self.read.session,
             &prior_items,
             &self.read.turn_elapsed_ms,
+            self.file_change_storage_root.as_deref(),
+            self.file_change_display_root.as_deref(),
         );
         rows.extend(
-            super::query::transcript_rows_from_turn_items_with_context_and_elapsed(
+            transcript_rows_from_turn_items_with_context_and_elapsed_and_roots(
                 &self.read.session,
                 &active_items,
                 &self.read.turn_elapsed_ms,
+                self.file_change_storage_root.as_deref(),
+                self.file_change_display_root.as_deref(),
             )
             .into_iter()
             .filter(|row| {
@@ -728,6 +765,8 @@ mod tests {
         let view = OpenSessionView {
             read: canonical_read(&session, 0, 0, 0, Vec::new()),
             stored_detail,
+            file_change_storage_root: None,
+            file_change_display_root: None,
         };
         let mut live = AppState::default();
         live.transcript_entries = vec![TranscriptEntry {
@@ -778,6 +817,8 @@ mod tests {
         let view = OpenSessionView {
             read: canonical_read(&session, 0, 0, 0, Vec::new()),
             stored_detail,
+            file_change_storage_root: None,
+            file_change_display_root: None,
         };
         let mut live = AppState::default();
         live.current_session_id = Some(session.id);
@@ -958,6 +999,8 @@ mod tests {
         let view = OpenSessionView {
             read: canonical_read(&session, 0, 0, 0, Vec::new()),
             stored_detail,
+            file_change_storage_root: None,
+            file_change_display_root: None,
         };
         let mut live = AppState::default();
         live.current_session_id = Some(session.id);

@@ -84,6 +84,8 @@ pub struct DesktopState {
     pub view: DesktopViewState,
     pub startup: DesktopStartupState,
     pub status_code: DesktopStatusCode,
+    file_change_storage_root: Option<camino::Utf8PathBuf>,
+    file_change_display_root: Option<camino::Utf8PathBuf>,
     prompt_enhance_cancellation: Option<(u64, CancellationToken)>,
 }
 
@@ -101,9 +103,33 @@ impl DesktopState {
             view: DesktopViewState::default(),
             startup: DesktopStartupState::ready(),
             status_code: DesktopStatusCode::Plain,
+            file_change_storage_root: None,
+            file_change_display_root: None,
             prompt_enhance_cancellation: None,
         }
         .with_provider_fields()
+    }
+
+    pub fn set_file_change_display_roots(
+        &mut self,
+        storage_root: &camino::Utf8Path,
+        display_root: &camino::Utf8Path,
+    ) {
+        self.file_change_storage_root = Some(storage_root.to_path_buf());
+        self.file_change_display_root = Some(display_root.to_path_buf());
+        self.app_state
+            .set_file_change_display_roots(storage_root, display_root);
+    }
+
+    fn reset_app_state_preserving_file_change_display_roots(&mut self) {
+        let mut app_state = AppState::default();
+        if let (Some(storage_root), Some(display_root)) = (
+            self.file_change_storage_root.as_deref(),
+            self.file_change_display_root.as_deref(),
+        ) {
+            app_state.set_file_change_display_roots(storage_root, display_root);
+        }
+        self.app_state = app_state;
     }
 
     pub fn begin_startup(
@@ -184,7 +210,7 @@ impl DesktopState {
             if changed {
                 self.snapshot.session_rows.clear();
                 self.snapshot.session_details.clear();
-                self.app_state = AppState::default();
+                self.reset_app_state_preserving_file_change_display_roots();
                 self.open_session = None;
             }
         }
@@ -822,7 +848,15 @@ impl DesktopState {
         let turn_items = &read.turns.items;
         self.provider_config.update_access_mode(session.access_mode);
         self.bind_composer_to_loaded_session(session.id);
-        let open_session = OpenSessionView::from_loaded(read);
+        let open_session = match (
+            self.file_change_storage_root.as_deref(),
+            self.file_change_display_root.as_deref(),
+        ) {
+            (Some(storage_root), Some(display_root)) => {
+                OpenSessionView::from_loaded_with_roots(read, storage_root, display_root)
+            }
+            _ => OpenSessionView::from_loaded(read),
+        };
         self.app_state
             .load_turn_items_with_active_turn(session, turn_items, read.active_turn_id);
         self.status_code = self
@@ -1003,7 +1037,17 @@ impl DesktopState {
                 || open_session.refresh_metadata_preserving_loaded_history(read)
         });
         if !retained {
-            open_session = Some(OpenSessionView::from_loaded(read));
+            open_session = Some(
+                match (
+                    self.file_change_storage_root.as_deref(),
+                    self.file_change_display_root.as_deref(),
+                ) {
+                    (Some(storage_root), Some(display_root)) => {
+                        OpenSessionView::from_loaded_with_roots(read, storage_root, display_root)
+                    }
+                    _ => OpenSessionView::from_loaded(read),
+                },
+            );
         }
         let open_session = open_session.expect("open session projection is always available");
         let session = open_session.session().clone();
@@ -1186,7 +1230,7 @@ impl DesktopState {
         self.cancel_prompt_review();
         self.composer
             .reset_owner(&self.snapshot.workspace_path, None);
-        self.app_state = AppState::default();
+        self.reset_app_state_preserving_file_change_display_roots();
         self.open_session = None;
         self.view.artifact_selected_index = 0;
         self.view.overlay = DesktopOverlay::None;
@@ -1840,6 +1884,73 @@ mod tests {
         }
     }
 
+    fn assert_nested_file_change_projection(state: &mut DesktopState) {
+        let session_id = SessionId::new();
+        let turn_id = crate::protocol::TurnId::new();
+        let tool_call_id = crate::session::ToolCallId::new();
+        let change_id = crate::session::ChangeId::new();
+        let stored_path = Utf8PathBuf::from("bbb/ccc/file.rs");
+        let mut session = session_record(session_id);
+        session.cwd = Utf8PathBuf::from("C:/workspace/aaa/bbb");
+        let canonical_change = turn_item(
+            session_id,
+            turn_id,
+            1,
+            TurnItemPayload::FileChange {
+                call_id: tool_call_id,
+                change_ids: vec![change_id],
+                changes: vec![crate::protocol::FileChangeEvidence {
+                    change_id,
+                    kind: crate::session::ChangeKind::Update,
+                    path_before: Some(stored_path.clone()),
+                    path_after: Some(stored_path.clone()),
+                    summary: "Updated bbb/ccc/file.rs".to_string(),
+                }],
+                summary: "Updated bbb/ccc/file.rs".to_string(),
+            },
+        );
+        let read = canonical_read(&session, Vec::new(), vec![canonical_change]);
+
+        state.load_open_session(&read);
+
+        assert_eq!(
+            state
+                .app_state
+                .transcript_entries
+                .first()
+                .expect("canonical file change")
+                .body,
+            "Updated ccc/file.rs"
+        );
+
+        state
+            .app_state
+            .apply_run_event(&crate::session::RunEvent::FileChangesRecorded {
+                tool_call_id,
+                changes: vec![crate::edit::ChangeSummary {
+                    change_id,
+                    kind: crate::session::ChangeKind::Update,
+                    path_before: Some(stored_path.clone()),
+                    path_after: Some(stored_path.clone()),
+                }],
+            });
+
+        assert_eq!(
+            state
+                .app_state
+                .transcript_entries
+                .last()
+                .expect("live file change")
+                .body,
+            "Updated ccc/file.rs"
+        );
+        assert_eq!(
+            stored_path,
+            Utf8PathBuf::from("bbb/ccc/file.rs"),
+            "project-root-relative stored coordinates remain unchanged"
+        );
+    }
+
     fn terminal_event(
         session_id: SessionId,
         outcome: crate::protocol::TurnTerminalOutcome,
@@ -2429,6 +2540,39 @@ mod tests {
         assert_eq!(state.snapshot.selected_session_index, 1);
         assert_eq!(state.selected_index(), -1);
         assert_eq!(state.current_session_label(), "新規チャット");
+    }
+
+    #[test]
+    fn nested_file_change_roots_survive_start_new_chat_reset() {
+        let storage_root = Utf8PathBuf::from("C:/workspace/aaa");
+        let display_root = storage_root.join("bbb");
+        let mut initial_snapshot = snapshot(Vec::new(), 0);
+        initial_snapshot.workspace_path = display_root.to_string();
+        let mut state = DesktopState::new(initial_snapshot, ResolvedConfig::default());
+        state.set_file_change_display_roots(&storage_root, &display_root);
+
+        state.start_new_chat();
+
+        assert_nested_file_change_projection(&mut state);
+    }
+
+    #[test]
+    fn nested_file_change_roots_survive_project_selection_reset() {
+        let storage_root = Utf8PathBuf::from("C:/workspace/aaa");
+        let display_root = storage_root.join("bbb");
+        let mut initial_snapshot = snapshot(Vec::new(), 0);
+        initial_snapshot.workspace_path = display_root.to_string();
+        initial_snapshot.project_rows.push(DesktopProjectRow {
+            project_id: ProjectId::new(),
+            label: "other".to_string(),
+            path: "C:/workspace/other".to_string(),
+        });
+        let mut state = DesktopState::new(initial_snapshot, ResolvedConfig::default());
+        state.set_file_change_display_roots(&storage_root, &display_root);
+
+        state.select_project(1);
+
+        assert_nested_file_change_projection(&mut state);
     }
 
     #[test]

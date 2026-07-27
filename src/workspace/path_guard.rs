@@ -66,7 +66,8 @@ impl PathGuard {
     ) -> Result<GuardedPath, WorkspaceError> {
         let absolute = crate::workspace::project::normalize_path(&workspace.cwd, requested)?;
         let effective_absolute = effective_path_for_boundary(&absolute)?;
-        let effective_workspace_root = effective_path_for_boundary(&workspace.root)?;
+        let authority_root = workspace.authority_root();
+        let effective_workspace_root = effective_path_for_boundary(authority_root)?;
         if is_protected_path(workspace, &absolute, &effective_absolute)? {
             return Err(WorkspaceError::Message(format!(
                 "path `{absolute}` is protected"
@@ -75,7 +76,7 @@ impl PathGuard {
 
         let inside_workspace = boundary_path_is_within(
             &absolute,
-            &workspace.root,
+            authority_root,
             &effective_absolute,
             &effective_workspace_root,
         )?;
@@ -112,14 +113,14 @@ impl PathGuard {
         let relative_to_root = if inside_workspace {
             boundary_relative_path_from_root(
                 &absolute,
-                &workspace.root,
+                authority_root,
                 &effective_absolute,
                 &effective_workspace_root,
             )
             .ok_or_else(|| {
                 WorkspaceError::Message(format!(
                     "path `{absolute}` could not be projected relative to workspace root `{}`",
-                    workspace.root
+                    authority_root
                 ))
             })?
         } else {
@@ -150,7 +151,8 @@ impl PathGuard {
         Self::revalidate(guarded_root)?;
         let absolute = crate::workspace::project::normalize_path(&workspace.cwd, candidate)?;
         let effective_absolute = effective_path_for_boundary(&absolute)?;
-        let effective_workspace_root = effective_path_for_boundary(&workspace.root)?;
+        let authority_root = workspace.authority_root();
+        let effective_workspace_root = effective_path_for_boundary(authority_root)?;
         if !boundary_path_is_within(
             &absolute,
             &guarded_root.absolute,
@@ -166,14 +168,14 @@ impl PathGuard {
         let relative_to_root = if guarded_root.inside_workspace {
             boundary_relative_path_from_root(
                 &absolute,
-                &workspace.root,
+                authority_root,
                 &effective_absolute,
                 &effective_workspace_root,
             )
             .ok_or_else(|| {
                 WorkspaceError::Message(format!(
                     "path `{absolute}` could not be projected relative to workspace root `{}`",
-                    workspace.root
+                    authority_root
                 ))
             })?
         } else {
@@ -1214,6 +1216,42 @@ mod tests {
     #[cfg(unix)]
     use super::GuardedPath;
     use super::{AccessKind, PathGuard};
+
+    #[test]
+    fn nested_git_workspace_uses_selected_directory_as_every_tool_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 project root");
+        let authority_root = project_root.join("bbb");
+        let inside = authority_root.join("ccc");
+        let sibling = project_root.join("sibling");
+        std::fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        std::fs::create_dir_all(&inside).expect("inside directory");
+        std::fs::create_dir_all(&sibling).expect("sibling directory");
+
+        let workspace = WorkspaceDiscovery::discover(&authority_root, &ResolvedConfig::default())
+            .expect("nested workspace");
+
+        assert_eq!(workspace.root, project_root);
+        assert_eq!(workspace.cwd, authority_root);
+        assert_eq!(workspace.authority_root(), authority_root);
+        for access in [
+            AccessKind::List,
+            AccessKind::Search,
+            AccessKind::Read,
+            AccessKind::Edit,
+            AccessKind::Shell,
+        ] {
+            let guarded = PathGuard::require_path(&workspace, &inside, access)
+                .unwrap_or_else(|error| panic!("{access:?} inside authority failed: {error}"));
+            assert!(guarded.inside_workspace, "{access:?}");
+            assert_eq!(guarded.relative_to_root, Utf8PathBuf::from("ccc"));
+
+            let error = PathGuard::require_path(&workspace, &sibling, access)
+                .expect_err("project sibling must be outside selected authority");
+            assert!(error.to_string().contains("outside the allowed roots"));
+        }
+    }
 
     #[cfg(windows)]
     fn enable_case_sensitive_directory(path: &camino::Utf8Path) {

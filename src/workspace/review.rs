@@ -15,7 +15,7 @@ use crate::error::WorkspaceError;
 
 use super::PathGuard;
 use super::path_guard::ExistingObjectIdentity;
-use super::{VcsKind, Workspace};
+use super::{AccessKind, VcsKind, Workspace};
 
 const GIT_REVIEW_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_REVIEW_STDOUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
@@ -61,6 +61,17 @@ pub enum ReviewScopeMode {
     Branch,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewGitScope {
+    /// Repository-root-relative pathspec passed to Git in literal mode.
+    /// `None` means the selected authority is the repository root itself.
+    #[serde(default)]
+    pub literal_pathspec: Option<String>,
+    /// Immutable commit range used for branch review commands.
+    #[serde(default)]
+    pub resolved_diff_range: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewScope {
     pub mode: ReviewScopeMode,
@@ -69,6 +80,8 @@ pub struct ReviewScope {
     #[serde(default)]
     pub changed_files: Vec<Utf8PathBuf>,
     pub summary: String,
+    #[serde(default)]
+    pub git: ReviewGitScope,
 }
 
 impl ReviewScope {
@@ -109,7 +122,7 @@ fn uncommitted_review_scope_with_deadline_and_observer(
     let first = capture_uncommitted_snapshot(workspace, &deadline, || {})?;
     observer();
     let second = capture_uncommitted_snapshot(workspace, &deadline, || {})?;
-    finish_uncommitted_scope(first, second, &deadline)
+    finish_uncommitted_scope(workspace, first, second, &deadline)
 }
 
 #[cfg(test)]
@@ -121,10 +134,11 @@ fn uncommitted_review_scope_with_capture_observer(
     let deadline = ReviewDeadline::new(GIT_REVIEW_OPERATION_TIMEOUT);
     let first = capture_uncommitted_snapshot(workspace, &deadline, observer)?;
     let second = capture_uncommitted_snapshot(workspace, &deadline, || {})?;
-    finish_uncommitted_scope(first, second, &deadline)
+    finish_uncommitted_scope(workspace, first, second, &deadline)
 }
 
 fn finish_uncommitted_scope(
+    workspace: &Workspace,
     first: UncommittedReviewSnapshot,
     second: UncommittedReviewSnapshot,
     deadline: &ReviewDeadline,
@@ -139,8 +153,8 @@ fn finish_uncommitted_scope(
     let status_entries = parse_status_entries(&second.status)?;
     let changed_files = status_entries
         .iter()
-        .map(|(_, path)| path.clone())
-        .collect::<Vec<_>>();
+        .map(|(_, path)| project_path_to_authority_relative(workspace, path))
+        .collect::<Result<Vec<_>, _>>()?;
     let untracked = status_entries
         .iter()
         .filter(|(code, _)| code == "??")
@@ -165,6 +179,10 @@ fn finish_uncommitted_scope(
         head_ref: Some(second.head.label().to_string()),
         changed_files,
         summary: summary_lines.join("; "),
+        git: ReviewGitScope {
+            literal_pathspec: git_authority_pathspec(workspace)?,
+            resolved_diff_range: None,
+        },
     })
 }
 
@@ -310,34 +328,33 @@ fn branch_review_scope_with_observer(
     let head_commit = resolve_commit(workspace, "HEAD", &deadline)?;
     let head_label = current_head_label(workspace, &deadline)?;
     let diff_range = format!("{base_commit}...{head_commit}");
-    let names = run_git_bytes(
-        workspace,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--ignore-submodules=all",
-            "--name-only",
-            "-z",
-            "--end-of-options",
-            &diff_range,
-        ],
-        &deadline,
-    )?;
+    let authority_pathspec = git_authority_pathspec(workspace)?;
+    let mut names_args = vec![
+        "--literal-pathspecs",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=all",
+        "--name-only",
+        "-z",
+        "--end-of-options",
+        diff_range.as_str(),
+    ];
+    append_git_authority_pathspec(&mut names_args, authority_pathspec.as_deref());
+    let names = run_git_bytes(workspace, &names_args, &deadline)?;
     observer();
-    let summary = run_git(
-        workspace,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--ignore-submodules=all",
-            "--shortstat",
-            "--end-of-options",
-            &diff_range,
-        ],
-        &deadline,
-    )?;
+    let mut summary_args = vec![
+        "--literal-pathspecs",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=all",
+        "--shortstat",
+        "--end-of-options",
+        diff_range.as_str(),
+    ];
+    append_git_authority_pathspec(&mut summary_args, authority_pathspec.as_deref());
+    let summary = run_git(workspace, &summary_args, &deadline)?;
     if resolve_commit(workspace, base_ref, &deadline)? != base_commit
         || resolve_commit(workspace, "HEAD", &deadline)? != head_commit
         || current_head_label(workspace, &deadline)? != head_label
@@ -348,7 +365,10 @@ fn branch_review_scope_with_observer(
         ));
     }
     deadline.ensure_remaining("finalizing a branch review inventory")?;
-    let changed_files = parse_nul_paths(&names)?;
+    let changed_files = parse_nul_paths(&names)?
+        .iter()
+        .map(|path| project_path_to_authority_relative(workspace, path))
+        .collect::<Result<Vec<_>, _>>()?;
     deadline.ensure_remaining("returning a branch review inventory")?;
     Ok(ReviewScope {
         mode: ReviewScopeMode::Branch,
@@ -360,6 +380,10 @@ fn branch_review_scope_with_observer(
         } else {
             summary.trim().to_string()
         },
+        git: ReviewGitScope {
+            literal_pathspec: authority_pathspec,
+            resolved_diff_range: Some(diff_range),
+        },
     })
 }
 
@@ -369,7 +393,53 @@ fn ensure_git_workspace(workspace: &Workspace) -> Result<(), WorkspaceError> {
             "review entrypoint requires a git workspace".to_string(),
         ));
     }
+    git_authority_pathspec(workspace)?;
     Ok(())
+}
+
+fn git_authority_pathspec(workspace: &Workspace) -> Result<Option<String>, WorkspaceError> {
+    let relative = PathGuard::relative_path_from_root(workspace.authority_root(), &workspace.root)
+        .ok_or_else(|| {
+            WorkspaceError::Message(format!(
+                "workspace authority `{}` is outside git project root `{}`",
+                workspace.authority_root(),
+                workspace.root
+            ))
+        })?;
+    if relative.as_str().is_empty() {
+        return Ok(None);
+    }
+    validate_untracked_relative_path(&relative)?;
+    #[cfg(windows)]
+    {
+        Ok(Some(relative.as_str().replace('\\', "/")))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(Some(relative.into_string()))
+    }
+}
+
+fn append_git_authority_pathspec<'a>(args: &mut Vec<&'a str>, pathspec: Option<&'a str>) {
+    if let Some(pathspec) = pathspec {
+        args.extend(["--", pathspec]);
+    }
+}
+
+fn project_path_to_authority_relative(
+    workspace: &Workspace,
+    project_relative: &Utf8Path,
+) -> Result<Utf8PathBuf, WorkspaceError> {
+    validate_untracked_relative_path(project_relative)?;
+    let absolute = workspace.root.join(project_relative);
+    let guarded = PathGuard::require_path(workspace, &absolute, AccessKind::Read)?;
+    if !guarded.inside_workspace {
+        return Err(WorkspaceError::Message(format!(
+            "git review path `{project_relative}` is outside workspace authority `{}`",
+            workspace.authority_root()
+        )));
+    }
+    Ok(guarded.relative_to_root)
 }
 
 fn current_head_label(
@@ -462,22 +532,22 @@ fn capture_status(
     workspace: &Workspace,
     deadline: &ReviewDeadline,
 ) -> Result<Vec<u8>, WorkspaceError> {
-    run_git_bytes(
-        workspace,
-        &[
-            "--no-optional-locks",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "submodule.recurse=false",
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--ignore-submodules=all",
-        ],
-        deadline,
-    )
+    let authority_pathspec = git_authority_pathspec(workspace)?;
+    let mut args = vec![
+        "--literal-pathspecs",
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "submodule.recurse=false",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=all",
+    ];
+    append_git_authority_pathspec(&mut args, authority_pathspec.as_deref());
+    run_git_bytes(workspace, &args, deadline)
 }
 
 fn capture_diff_fingerprint(
@@ -487,6 +557,7 @@ fn capture_diff_fingerprint(
     deadline: &ReviewDeadline,
 ) -> Result<GitOutputFingerprint, WorkspaceError> {
     let mut args = vec![
+        "--literal-pathspecs",
         "--no-optional-locks",
         "-c",
         "core.fsmonitor=false",
@@ -507,6 +578,8 @@ fn capture_diff_fingerprint(
             args.extend(["--end-of-options", oid.as_str()]);
         }
     }
+    let authority_pathspec = git_authority_pathspec(workspace)?;
+    append_git_authority_pathspec(&mut args, authority_pathspec.as_deref());
     let bytes = run_git_bytes(workspace, &args, deadline)?;
     Ok(GitOutputFingerprint::from_bytes(&bytes))
 }
@@ -518,6 +591,7 @@ fn capture_diff_summary(
     deadline: &ReviewDeadline,
 ) -> Result<String, WorkspaceError> {
     let mut args = vec![
+        "--literal-pathspecs",
         "--no-optional-locks",
         "-c",
         "core.fsmonitor=false",
@@ -537,6 +611,8 @@ fn capture_diff_summary(
             args.extend(["--end-of-options", oid.as_str()]);
         }
     }
+    let authority_pathspec = git_authority_pathspec(workspace)?;
+    append_git_authority_pathspec(&mut args, authority_pathspec.as_deref());
     run_git(workspace, &args, deadline)
 }
 
@@ -583,7 +659,7 @@ fn open_untracked_parent(
     })?;
     let parent_relative = path.parent().unwrap_or(Utf8Path::new(""));
     let parent = workspace.root.join(parent_relative);
-    let guarded_parent = PathGuard::trusted_internal_path(&parent, &workspace.root)?;
+    let guarded_parent = PathGuard::trusted_internal_path(&parent, workspace.authority_root())?;
     let parent_handle = PathGuard::open_validated_metadata_handle(&guarded_parent)?;
     if !parent_handle.metadata()?.is_dir() {
         return Err(WorkspaceError::Message(format!(
@@ -1049,7 +1125,7 @@ fn capture_untracked_entry(
     deadline: &ReviewDeadline,
 ) -> Result<UntrackedEntryFingerprint, WorkspaceError> {
     let (_parent_handle, absolute, _) = open_untracked_parent(workspace, path)?;
-    let guarded = PathGuard::trusted_internal_path(&absolute, &workspace.root)?;
+    let guarded = PathGuard::trusted_internal_path(&absolute, workspace.authority_root())?;
     let mut file = PathGuard::open_validated_read_file(&guarded)?;
     let identity = UntrackedEntryIdentity::Opened(PathGuard::opened_object_identity(&file)?);
     let (byte_len, sha256) = hash_regular_untracked_file(&mut file, path, total_bytes, deadline)?;
@@ -1822,6 +1898,138 @@ mod tests {
         let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &ResolvedConfig::default())
             .expect("unborn git workspace");
         (temp, workspace)
+    }
+
+    fn nested_git_workspace() -> (tempfile::TempDir, Workspace) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 tempdir");
+        let selected = root.join("bbb");
+        let sibling = root.join("sibling");
+        std::fs::create_dir_all(&selected).expect("selected directory");
+        std::fs::create_dir_all(&sibling).expect("sibling directory");
+        run_fixture_git(&root, &["init", "--quiet"]);
+        run_fixture_git(&root, &["config", "user.email", "moyai@example.invalid"]);
+        run_fixture_git(&root, &["config", "user.name", "moyAI Test"]);
+        std::fs::write(selected.join("inside.txt"), "baseline\n").expect("inside baseline");
+        std::fs::write(sibling.join("outside.txt"), "baseline\n").expect("outside baseline");
+        run_fixture_git(&root, &["add", "."]);
+        run_fixture_git(&root, &["commit", "--quiet", "-m", "baseline"]);
+        let workspace = WorkspaceDiscovery::discover(&selected, &ResolvedConfig::default())
+            .expect("nested git workspace");
+        (temp, workspace)
+    }
+
+    #[test]
+    fn nested_git_review_is_limited_to_the_selected_authority() {
+        let (_temp, workspace) = nested_git_workspace();
+        std::fs::write(
+            workspace.authority_root().join("inside.txt"),
+            "inside change\n",
+        )
+        .expect("inside change");
+        std::fs::write(workspace.authority_root().join("new.txt"), "inside new\n")
+            .expect("inside untracked");
+        std::fs::write(
+            workspace.root.join("sibling/outside.txt"),
+            "outside change\n",
+        )
+        .expect("outside change");
+        std::fs::write(workspace.root.join("sibling/new.txt"), "outside new\n")
+            .expect("outside untracked");
+
+        let uncommitted =
+            uncommitted_review_scope(&workspace).expect("nested uncommitted review scope");
+
+        assert_eq!(
+            uncommitted.changed_files,
+            vec![
+                Utf8PathBuf::from("inside.txt"),
+                Utf8PathBuf::from("new.txt")
+            ]
+        );
+        assert!(uncommitted.summary.contains("untracked: 1 file(s)"));
+        assert_eq!(uncommitted.git.literal_pathspec.as_deref(), Some("bbb"));
+        assert_eq!(uncommitted.git.resolved_diff_range, None);
+
+        run_fixture_git(&workspace.root, &["add", "."]);
+        run_fixture_git(
+            &workspace.root,
+            &["commit", "--quiet", "-m", "inside and outside"],
+        );
+        let branch = branch_review_scope(&workspace, "HEAD~1").expect("nested branch review scope");
+
+        assert_eq!(
+            branch.changed_files,
+            vec![
+                Utf8PathBuf::from("inside.txt"),
+                Utf8PathBuf::from("new.txt")
+            ]
+        );
+        assert!(!branch.summary.contains("4 files changed"));
+        assert_eq!(branch.git.literal_pathspec.as_deref(), Some("bbb"));
+        assert!(
+            branch
+                .git
+                .resolved_diff_range
+                .as_deref()
+                .is_some_and(|range| range.contains("..."))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_git_review_treats_git_pathspec_magic_as_a_literal_directory_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 tempdir");
+        let selected = root.join(":(glob)scope*");
+        let pattern_sibling = root.join("scope-outside");
+        std::fs::create_dir_all(&selected).expect("selected magic directory");
+        std::fs::create_dir_all(&pattern_sibling).expect("pattern sibling");
+        run_fixture_git(&root, &["init", "--quiet"]);
+        run_fixture_git(&root, &["config", "user.email", "moyai@example.invalid"]);
+        run_fixture_git(&root, &["config", "user.name", "moyAI Test"]);
+        std::fs::write(selected.join("inside.txt"), "baseline\n").expect("inside baseline");
+        std::fs::write(pattern_sibling.join("outside.txt"), "baseline\n")
+            .expect("outside baseline");
+        run_fixture_git(&root, &["add", "."]);
+        run_fixture_git(&root, &["commit", "--quiet", "-m", "baseline"]);
+        let workspace = WorkspaceDiscovery::discover(&selected, &ResolvedConfig::default())
+            .expect("nested magic workspace");
+
+        std::fs::write(selected.join("inside.txt"), "inside change\n").expect("inside change");
+        let uncommitted = uncommitted_review_scope(&workspace).expect("literal uncommitted scope");
+        assert_eq!(
+            uncommitted.changed_files,
+            vec![Utf8PathBuf::from("inside.txt")]
+        );
+        assert_eq!(
+            uncommitted.git.literal_pathspec.as_deref(),
+            Some(":(glob)scope*")
+        );
+
+        run_fixture_git(&root, &["add", "."]);
+        run_fixture_git(&root, &["commit", "--quiet", "-m", "selected change"]);
+        let branch = branch_review_scope(&workspace, "HEAD~1").expect("literal branch scope");
+        assert_eq!(branch.changed_files, vec![Utf8PathBuf::from("inside.txt")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_git_authority_pathspec_preserves_literal_backslashes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 tempdir");
+        let selected = root.join(r"scope\literal");
+        std::fs::create_dir_all(&selected).expect("selected backslash directory");
+        run_fixture_git(&root, &["init", "--quiet"]);
+        let workspace = WorkspaceDiscovery::discover(&selected, &ResolvedConfig::default())
+            .expect("nested backslash workspace");
+
+        assert_eq!(
+            git_authority_pathspec(&workspace)
+                .expect("literal authority pathspec")
+                .as_deref(),
+            Some(r"scope\literal")
+        );
     }
 
     #[test]

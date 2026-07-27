@@ -1,3 +1,5 @@
+use camino::{Utf8Path, Utf8PathBuf};
+
 use crate::cli::terminal::{terminal_safe_inline, terminal_safe_multiline};
 use crate::error::CliRenderError;
 use crate::protocol::{HistoryItem, HistoryItemPayload};
@@ -57,11 +59,24 @@ pub trait EventRenderer {
     }
 }
 
-pub struct HumanRenderer;
+pub struct HumanRenderer {
+    file_change_storage_root: Option<Utf8PathBuf>,
+    file_change_display_root: Option<Utf8PathBuf>,
+}
 
 impl HumanRenderer {
     pub fn new() -> Self {
-        Self
+        Self {
+            file_change_storage_root: None,
+            file_change_display_root: None,
+        }
+    }
+
+    pub fn with_file_change_roots(storage_root: &Utf8Path, display_root: &Utf8Path) -> Self {
+        Self {
+            file_change_storage_root: Some(storage_root.to_path_buf()),
+            file_change_display_root: Some(display_root.to_path_buf()),
+        }
     }
 }
 
@@ -145,7 +160,18 @@ impl EventRenderer for HumanRenderer {
                     "[changes] {}",
                     changes
                         .iter()
-                        .map(|value| terminal_safe_inline(&value.summary_line(None)).into_owned())
+                        .map(|value| {
+                            let summary = match (
+                                self.file_change_storage_root.as_deref(),
+                                self.file_change_display_root.as_deref(),
+                            ) {
+                                (Some(storage_root), Some(display_root)) => {
+                                    value.summary_line_relative_to(storage_root, display_root)
+                                }
+                                _ => value.summary_line(None),
+                            };
+                            terminal_safe_inline(&summary).into_owned()
+                        })
                         .collect::<Vec<_>>()
                         .join(", ")
                 )?;

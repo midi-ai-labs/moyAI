@@ -252,7 +252,7 @@ fn walk_page_with_observers(
     builder.max_depth(options.max_depth);
     builder.sort_by_file_path(compare_traversal_path);
     let filter_root = traversal_root.clone();
-    let workspace_root = workspace.root.clone();
+    let workspace_root = workspace.authority_root().to_path_buf();
     let protected_paths = workspace.protected_paths.clone();
     let ignore_plan = workspace.ignore.clone();
     let resume_filter = resume_path.clone();

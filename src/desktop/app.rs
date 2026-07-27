@@ -120,9 +120,9 @@ enum RuntimeMessage {
     },
     SessionLoaded {
         request_id: NavigationRequestId,
-        session_id: SessionId,
+        target: SessionLoadRequestTarget,
         reason: SessionLoadReason,
-        result: Result<LoadedSession, String>,
+        result: Result<SessionNavigationLoadResult, String>,
     },
     CurrentSessionRefreshed {
         request_id: LatestRequestId,
@@ -244,6 +244,14 @@ fn test_desktop_control_plane() -> (DesktopControlPlaneSender, mpsc::Receiver<Ru
 struct SnapshotRequestTarget {
     workspace_root: Utf8PathBuf,
     selected_session_id: Option<SessionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionLoadRequestTarget {
+    workspace_root: Utf8PathBuf,
+    workspace_cwd: Utf8PathBuf,
+    project_id: ProjectId,
+    session_id: SessionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -441,7 +449,7 @@ struct ProjectDeleteRequestTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HistoryExportRequestTarget {
-    workspace_root: Utf8PathBuf,
+    workspace_authority_root: Utf8PathBuf,
     session_id: SessionId,
 }
 
@@ -550,6 +558,11 @@ enum CurrentSessionRefreshPurpose {
 struct LoadedSession {
     read: crate::session::CanonicalSessionRead,
     agent_activity_records: Option<Vec<AgentActivityRecord>>,
+}
+
+struct SessionNavigationLoadResult {
+    workspace: Option<WorkspaceLoadResult>,
+    loaded: LoadedSession,
 }
 
 type LoadedAgentActivityRecords = (SessionId, Vec<AgentActivityRecord>);
@@ -978,12 +991,12 @@ fn finish_history_export_request(
     tracker: &mut LatestRequestTracker<HistoryExportRequestTarget>,
     request_id: LatestRequestId,
     target: &HistoryExportRequestTarget,
-    workspace_root: &Utf8Path,
+    workspace_authority_root: &Utf8Path,
 ) -> Option<bool> {
     if !tracker.finish_if_current(request_id, target) {
         return None;
     }
-    Some(target.workspace_root == workspace_root)
+    Some(target.workspace_authority_root == workspace_authority_root)
 }
 
 fn finish_navigation_failure(
@@ -1027,6 +1040,394 @@ mod command_projection_owner_tests {
         AppBootstrap::rebuild_for_directory_as_workspace_root_with_config(root, store, config)
             .await
             .expect("app")
+    }
+
+    #[tokio::test]
+    async fn startup_restores_nested_workspace_and_exports_history_inside_its_authority() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 project root");
+        let selected_directory = project_root.join("bbb");
+        std::fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        std::fs::create_dir_all(selected_directory.join("ccc")).expect("selected directory");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = build_test_app(&project_root, store).await;
+        let session = app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: app.workspace.project_id,
+                title: "nested workspace".to_string(),
+                cwd: selected_directory.clone(),
+                model: app.config.model.model.clone(),
+                base_url: app.config.model.base_url.clone(),
+                access_mode: app.config.permissions.access_mode,
+            })
+            .await
+            .expect("session");
+        app.store
+            .protocol_event_store()
+            .seed_history_item_for_test(&crate::protocol::HistoryItem {
+                id: crate::protocol::HistoryItemId::new(),
+                session_id: session.id,
+                scope: crate::protocol::HistoryScope::Turn {
+                    turn_id: crate::protocol::TurnId::new(),
+                },
+                sequence_no: 1,
+                created_at_ms: 1,
+                payload: crate::protocol::HistoryItemPayload::UserTurn {
+                    content: vec![crate::protocol::ContentPart::Text {
+                        text: "export from the selected nested workspace".to_string(),
+                    }],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                },
+            })
+            .expect("history item");
+        let args = DesktopArgs {
+            directory: Some(project_root.clone()),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+
+        assert_eq!(controller.app.workspace.root, project_root);
+        assert_eq!(controller.app.workspace.cwd, selected_directory);
+        assert_eq!(
+            controller.state.app_state.current_session_id,
+            Some(session.id)
+        );
+
+        let export_title = controller
+            .state
+            .snapshot
+            .session_rows
+            .iter()
+            .find(|row| row.session_id == session.id)
+            .expect("session row")
+            .label
+            .clone();
+        let file_name = history_markdown_file_name(&export_title, session.id);
+        let expected_export = selected_directory
+            .join(".moyai")
+            .join("history-exports")
+            .join(&file_name);
+        let ancestor_export = project_root
+            .join(".moyai")
+            .join("history-exports")
+            .join(file_name);
+        controller.export_history_markdown_auto(session.id);
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if controller.state.can_export_history() && expected_export.is_file() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            expected_export.is_file(),
+            "expected {expected_export}; status: {:?}",
+            controller.state.app_state.status_message
+        );
+        assert!(
+            !ancestor_export.exists(),
+            "automatic export must not escape to the ancestor project root"
+        );
+        assert!(
+            controller
+                .state
+                .app_state
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.contains(expected_export.as_str()))
+        );
+
+        let transcript_file_name =
+            transcript_markdown_file_name(&controller.state.selected_session_title(), session.id);
+        let expected_transcript = selected_directory
+            .join(".moyai")
+            .join("transcript-exports")
+            .join(&transcript_file_name);
+        let ancestor_transcript = project_root
+            .join(".moyai")
+            .join("transcript-exports")
+            .join(transcript_file_name);
+        controller.export_open_transcript_markdown_auto();
+        let transcript =
+            std::fs::read_to_string(&expected_transcript).expect("exported transcript markdown");
+        assert!(
+            !ancestor_transcript.exists(),
+            "automatic transcript export must not escape to the ancestor project root"
+        );
+        assert!(transcript.contains(selected_directory.as_str()));
+    }
+
+    #[tokio::test]
+    async fn session_navigation_restores_the_sessions_nested_workspace_cwd() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 project root");
+        let selected_directory = project_root.join("bbb");
+        std::fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        std::fs::create_dir_all(selected_directory.join("ccc")).expect("selected directory");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = build_test_app(&project_root, store).await;
+        let args = DesktopArgs {
+            directory: Some(project_root.clone()),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        let session = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "nested workspace".to_string(),
+                cwd: selected_directory.clone(),
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: controller.app.config.permissions.access_mode,
+            })
+            .await
+            .expect("session");
+
+        let request_id = controller.state.begin_session_load(session.id);
+        controller.spawn_session_load(session.id, SessionLoadReason::UserSelection, request_id);
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if !controller.state.navigation_loading() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(!controller.state.navigation_loading());
+        assert_eq!(controller.app.workspace.root, project_root);
+        assert_eq!(controller.app.workspace.cwd, selected_directory);
+        assert_eq!(
+            controller.state.app_state.current_session_id,
+            Some(session.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_first_session_submission_adopts_the_authority_owned_composer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 project root");
+        let selected_directory = project_root.join("bbb");
+        std::fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        std::fs::create_dir_all(&selected_directory).expect("selected directory");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let root_app = build_test_app(&project_root, store).await;
+        let app = AppBootstrap::rebuild_for_directory_with_process_runtime(
+            &selected_directory,
+            root_app.process_runtime.clone(),
+        )
+        .await
+        .expect("nested app");
+        let args = DesktopArgs {
+            directory: Some(selected_directory.clone()),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+        let next_image = selected_directory.join("next-request.png");
+        let owner_generation = controller.state.composer.owner_generation();
+        let run_generation = 41;
+        controller
+            .state
+            .composer
+            .image_attachment_paths
+            .push(next_image.clone());
+        controller.pending_root_submission = Some(PendingRootSubmission {
+            run_generation,
+            owner_workspace_path: controller.root_submission_owner_workspace_path(),
+            owner_session_id: None,
+            prompt_dispatch: crate::session::PromptDispatchPart::raw("first nested run"),
+            image_paths: Vec::new(),
+            cancel_prompt_review_on_commit: false,
+        });
+        let created_session_id = SessionId::new();
+        controller.state.app_state.current_session_id = Some(created_session_id);
+
+        assert_eq!(
+            controller.root_submission_owner_workspace_path(),
+            selected_directory
+        );
+        assert!(controller.commit_pending_root_submission(run_generation));
+        assert_eq!(
+            controller.state.composer.image_attachment_paths,
+            vec![next_image]
+        );
+        assert_eq!(
+            controller.state.composer.owner_generation(),
+            owner_generation,
+            "adopting the first durable session must not reset the authority-owned draft"
+        );
+        assert!(controller.state.composer.is_owned_by(
+            controller.app.workspace.authority_root().as_str(),
+            Some(created_session_id)
+        ));
+    }
+
+    #[tokio::test]
+    async fn nested_workspace_preference_preserves_the_selected_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 project root");
+        let selected_directory = project_root.join("bbb");
+        std::fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        std::fs::create_dir_all(&selected_directory).expect("selected directory");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        let paths = crate::storage::StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("sqlite");
+        sqlite.migrate().expect("migrate");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let root_app = build_test_app(&project_root, store).await;
+        let app = AppBootstrap::rebuild_for_directory_with_process_runtime(
+            &selected_directory,
+            root_app.process_runtime.clone(),
+        )
+        .await
+        .expect("nested app");
+        let args = DesktopArgs {
+            directory: Some(selected_directory.clone()),
+            session_id: None,
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let controller = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("controller");
+
+        assert_eq!(controller.app.workspace.root, project_root);
+        assert_eq!(
+            controller.app.workspace.authority_root(),
+            selected_directory
+        );
+        assert_eq!(
+            controller.workspace_path_for_preferences(),
+            Some(selected_directory)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_session_navigation_cannot_replace_a_newer_workspace_with_reused_request_id() {
+        let (_temp, project_root, mut controller) = empty_access_test_controller().await;
+        let session_id = SessionId::new();
+        let stale_request_id = controller.state.begin_session_load(session_id);
+        let stale_target = SessionLoadRequestTarget {
+            workspace_root: controller.app.workspace.root.clone(),
+            workspace_cwd: controller.app.workspace.cwd.clone(),
+            project_id: controller.app.workspace.project_id,
+            session_id,
+        };
+        let stale_loaded = loaded_test_session(
+            &controller,
+            &project_root,
+            session_id,
+            SessionStatus::Idle,
+            None,
+        );
+
+        std::fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        let newer_cwd = project_root.join("nested");
+        std::fs::create_dir_all(&newer_cwd).expect("newer cwd");
+        let newer_app = AppBootstrap::rebuild_for_directory_with_process_runtime(
+            &newer_cwd,
+            controller.app.process_runtime.clone(),
+        )
+        .await
+        .expect("newer app");
+        let newer_snapshot = load_snapshot_for_selection(&newer_app, None)
+            .await
+            .expect("newer snapshot");
+        controller.replace_workspace_from_load(WorkspaceLoadResult {
+            app: newer_app,
+            snapshot: newer_snapshot,
+        });
+        let reused_request_id = controller.state.begin_session_load(session_id);
+        assert_eq!(reused_request_id, stale_request_id);
+
+        controller.apply_session_loaded_message(
+            stale_request_id,
+            stale_target,
+            SessionLoadReason::UserSelection,
+            Ok(SessionNavigationLoadResult {
+                workspace: None,
+                loaded: stale_loaded,
+            }),
+        );
+
+        assert_eq!(controller.app.workspace.cwd, newer_cwd);
+        assert!(controller.state.navigation_loading());
+        assert_eq!(controller.state.app_state.current_session_id, None);
     }
 
     #[tokio::test]
@@ -2740,12 +3141,21 @@ mod command_projection_owner_tests {
                 SessionStatus::Cancelled,
                 Some(cause),
             );
+            let target = SessionLoadRequestTarget {
+                workspace_root: controller.app.workspace.root.clone(),
+                workspace_cwd: controller.app.workspace.cwd.clone(),
+                project_id: controller.app.workspace.project_id,
+                session_id,
+            };
 
             controller.apply_session_loaded_message(
                 request_id,
-                session_id,
+                target,
                 SessionLoadReason::UserSelection,
-                Ok(loaded),
+                Ok(SessionNavigationLoadResult {
+                    workspace: None,
+                    loaded,
+                }),
             );
 
             let expected = crate::tui::state::interruption_status_message(cause);
@@ -5022,7 +5432,7 @@ mod command_projection_owner_tests {
     fn history_export_completion_rejects_stale_request_workspace_and_repeat() {
         let session_id = SessionId::new();
         let target = HistoryExportRequestTarget {
-            workspace_root: Utf8PathBuf::from("C:/workspace-a"),
+            workspace_authority_root: Utf8PathBuf::from("C:/repo/bbb"),
             session_id,
         };
         let mut tracker = LatestRequestTracker::default();
@@ -5034,7 +5444,7 @@ mod command_projection_owner_tests {
                 &mut tracker,
                 stale_request,
                 &target,
-                Utf8Path::new("C:/workspace-a"),
+                Utf8Path::new("C:/repo/bbb"),
             ),
             None,
             "an older completion cannot settle the latest export owner"
@@ -5044,17 +5454,17 @@ mod command_projection_owner_tests {
                 &mut tracker,
                 current_request,
                 &target,
-                Utf8Path::new("C:/workspace-b"),
+                Utf8Path::new("C:/repo/ccc"),
             ),
             Some(false),
-            "a current request from the replaced workspace cannot update status"
+            "a current request from a replaced sibling authority cannot update status"
         );
         assert_eq!(
             finish_history_export_request(
                 &mut tracker,
                 current_request,
                 &target,
-                Utf8Path::new("C:/workspace-a"),
+                Utf8Path::new("C:/repo/bbb"),
             ),
             None,
             "the same completion is consumed at most once"
@@ -5181,10 +5591,13 @@ impl DesktopController {
         }
         if let Some(session_id) = args.session_id {
             let session = app.session_service.get_session(session_id).await?;
-            if session.cwd != app.workspace.cwd {
+            if session.project_id != app.workspace.project_id
+                || session.cwd != app.workspace.cwd
+                || app.workspace.authority_root() != session.cwd.as_path()
+            {
                 let process_runtime = app.process_runtime.clone();
-                app = AppBootstrap::rebuild_for_directory_with_process_runtime(
-                    &session.cwd,
+                app = AppBootstrap::rebuild_for_session_with_process_runtime(
+                    &session,
                     process_runtime,
                 )
                 .await
@@ -5194,14 +5607,48 @@ impl DesktopController {
                         session.cwd
                     ))
                 })?;
+                if app.workspace.project_id != session.project_id {
+                    return Err(AppRunError::Message(format!(
+                        "session {} cwd {} resolves to project {}, not its stored project {}",
+                        session.id, session.cwd, app.workspace.project_id, session.project_id
+                    )));
+                }
             }
         }
-        let snapshot = if args.continue_last {
+        let mut snapshot = if args.continue_last {
             load_snapshot_continue_last(&app).await?
         } else {
             load_snapshot(&app, &args).await?
         };
+        if let Some(session_id) = args.session_id.or_else(|| snapshot.selected_session_id()) {
+            let session = app.session_service.get_session(session_id).await?;
+            if session.project_id != app.workspace.project_id
+                || session.cwd != app.workspace.cwd
+                || app.workspace.authority_root() != session.cwd.as_path()
+            {
+                let process_runtime = app.process_runtime.clone();
+                app = AppBootstrap::rebuild_for_session_with_process_runtime(
+                    &session,
+                    process_runtime,
+                )
+                .await
+                .map_err(|error| {
+                    AppRunError::Message(format!(
+                        "failed to restore selected session workspace {}: {error}",
+                        session.cwd
+                    ))
+                })?;
+                if app.workspace.project_id != session.project_id {
+                    return Err(AppRunError::Message(format!(
+                        "session {} cwd {} resolves to project {}, not its stored project {}",
+                        session.id, session.cwd, app.workspace.project_id, session.project_id
+                    )));
+                }
+                snapshot = load_snapshot_for_selection(&app, Some(session_id)).await?;
+            }
+        }
         let mut state = DesktopState::new(snapshot, app.config.clone());
+        state.set_file_change_display_roots(&app.workspace.root, app.workspace.authority_root());
         state.workspace_input = app.workspace.cwd.to_string();
         state.begin_startup(
             args.global_config_existed_at_launch,
@@ -5860,7 +6307,7 @@ impl DesktopController {
         let export_path = self
             .app
             .workspace
-            .root
+            .authority_root()
             .join(".moyai")
             .join("history-exports")
             .join(default_file_name);
@@ -5890,13 +6337,13 @@ impl DesktopController {
         let export_path = self
             .app
             .workspace
-            .root
+            .authority_root()
             .join(".moyai")
             .join("transcript-exports")
             .join(file_name);
         let markdown = open_transcript_rows_to_markdown(
             &self.state.selected_session_title(),
-            &self.app.workspace.root,
+            self.app.workspace.authority_root(),
             session_id,
             &self.state.provider_config.effective_config.model.base_url,
             &self.state.provider_config.effective_config.model.model,
@@ -5939,7 +6386,7 @@ impl DesktopController {
         self.state
             .set_status_message("exporting history markdown...");
         let target = HistoryExportRequestTarget {
-            workspace_root: self.app.workspace.root.clone(),
+            workspace_authority_root: self.app.workspace.authority_root().to_path_buf(),
             session_id,
         };
         let request_id = self.history_export_requests.begin(target.clone());
@@ -6041,21 +6488,22 @@ impl DesktopController {
         request_id: NavigationRequestId,
     ) {
         let app = self.app.clone();
+        let target = SessionLoadRequestTarget {
+            workspace_root: self.app.workspace.root.clone(),
+            workspace_cwd: self.app.workspace.cwd.clone(),
+            project_id: self.app.workspace.project_id,
+            session_id,
+        };
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build desktop session runtime");
-            let result = runtime.block_on(async move {
-                let detail = load_session_detail(&app, session_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                loaded_session_from_detail_with_activity(&app, detail).await
-            });
+            let result = runtime.block_on(load_session_navigation_result(app, session_id, reason));
             let _ = runtime_tx.send(RuntimeMessage::SessionLoaded {
                 request_id,
-                session_id,
+                target,
                 reason,
                 result,
             });
@@ -6242,44 +6690,26 @@ impl DesktopController {
 
     fn spawn_session_rejoin(&self, session_id: SessionId, request_id: NavigationRequestId) {
         let app = self.app.clone();
+        let target = SessionLoadRequestTarget {
+            workspace_root: self.app.workspace.root.clone(),
+            workspace_cwd: self.app.workspace.cwd.clone(),
+            project_id: self.app.workspace.project_id,
+            session_id,
+        };
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build desktop session rejoin runtime");
-            let result = runtime.block_on(async move {
-                let rejoin = app
-                    .session_service
-                    .rejoin_running_session(session_id, 0, 200, 0, DESKTOP_TURN_PAGE_LIMIT)
-                    .await;
-                let snapshot = app
-                    .session_service
-                    .canonical_latest_session_snapshot(
-                        session_id,
-                        DESKTOP_HISTORY_PROJECTION_LIMIT,
-                        DESKTOP_TURN_PAGE_LIMIT,
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if let Err(error) = rejoin
-                    && snapshot.read.session.status == SessionStatus::Running
-                {
-                    return Err(error.to_string());
-                }
-                let agent_activity_records = app
-                    .run_service
-                    .durable_agent_activity_records(session_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                Ok(LoadedSession {
-                    read: snapshot.read,
-                    agent_activity_records: Some(agent_activity_records),
-                })
-            });
+            let result = runtime.block_on(load_session_navigation_result(
+                app,
+                session_id,
+                SessionLoadReason::RunningRejoin,
+            ));
             let _ = runtime_tx.send(RuntimeMessage::SessionLoaded {
                 request_id,
-                session_id,
+                target,
                 reason: SessionLoadReason::RunningRejoin,
                 result,
             });
@@ -7485,7 +7915,7 @@ impl DesktopController {
         if !self.ensure_navigation_admission("workspace") {
             return;
         }
-        let path = self.app.workspace.root.to_string();
+        let path = self.app.workspace.cwd.to_string();
         self.state.show_workspace_picker(&path);
     }
 
@@ -7579,10 +8009,10 @@ impl DesktopController {
 
     pub(crate) fn browse_workspace_dialog(&mut self) -> Option<Utf8PathBuf> {
         let start_dir = if self.state.workspace_input.trim().is_empty() {
-            Some(self.app.workspace.root.clone())
+            Some(self.app.workspace.cwd.clone())
         } else {
             self.resolve_workspace_input()
-                .or_else(|| Some(self.app.workspace.root.clone()))
+                .or_else(|| Some(self.app.workspace.cwd.clone()))
         };
         match pick_workspace_directory(start_dir.as_ref()) {
             Ok(Some(path)) => {
@@ -7671,7 +8101,7 @@ impl DesktopController {
     }
 
     pub(crate) fn open_current_workspace_in_file_manager(&mut self) {
-        let root = self.app.workspace.root.clone();
+        let root = self.app.workspace.authority_root().to_path_buf();
         self.open_path_in_file_manager(&root);
     }
 
@@ -7716,14 +8146,14 @@ impl DesktopController {
         let absolute_path = if path.is_absolute() {
             path
         } else {
-            self.app.workspace.root.join(path)
+            self.app.workspace.authority_root().join(path)
         };
         let folder = if absolute_path.is_dir() {
             absolute_path
         } else if let Some(parent) = absolute_path.parent() {
             parent.to_path_buf()
         } else {
-            self.app.workspace.root.clone()
+            self.app.workspace.authority_root().to_path_buf()
         };
         self.open_path_in_file_manager(&folder);
     }
@@ -7895,15 +8325,15 @@ impl DesktopController {
             return;
         }
         self.preferences.window_opacity_percent = Some(self.state.view.window_opacity_percent);
-        if self.is_quick_chat_workspace() {
-            self.preferences.last_workspace = None;
-        } else {
-            self.preferences.last_workspace = Some(self.app.workspace.root.clone());
-        }
+        self.preferences.last_workspace = self.workspace_path_for_preferences();
         if let Err(error) = self.preferences.save() {
             self.state
                 .set_status_message(format!("failed to save desktop preferences: {error}"));
         }
+    }
+
+    fn workspace_path_for_preferences(&self) -> Option<Utf8PathBuf> {
+        (!self.is_quick_chat_workspace()).then(|| self.app.workspace.authority_root().to_path_buf())
     }
 
     fn is_quick_chat_workspace(&self) -> bool {
@@ -8012,6 +8442,10 @@ impl DesktopController {
 
     fn advance_composer_commit_generation(&mut self) {
         self.composer_commit_generation = self.composer_commit_generation.saturating_add(1);
+    }
+
+    fn root_submission_owner_workspace_path(&self) -> Utf8PathBuf {
+        self.app.workspace.authority_root().to_path_buf()
     }
 
     fn commit_pending_root_submission(&mut self, run_generation: u64) -> bool {
@@ -8131,7 +8565,7 @@ impl DesktopController {
         self.run_lifecycle.begin(run_generation, run_control);
         self.pending_root_submission = Some(PendingRootSubmission {
             run_generation,
-            owner_workspace_path: self.app.workspace.root.clone(),
+            owner_workspace_path: self.root_submission_owner_workspace_path(),
             owner_session_id: request.session_id,
             prompt_dispatch,
             image_paths: self.state.composer.image_attachment_paths.clone(),
@@ -8325,24 +8759,31 @@ impl DesktopController {
     fn apply_session_loaded_message(
         &mut self,
         request_id: NavigationRequestId,
-        session_id: SessionId,
+        target: SessionLoadRequestTarget,
         reason: SessionLoadReason,
-        result: Result<LoadedSession, String>,
+        result: Result<SessionNavigationLoadResult, String>,
     ) {
+        if target.workspace_root != self.app.workspace.root
+            || target.workspace_cwd != self.app.workspace.cwd
+            || target.project_id != self.app.workspace.project_id
+            || !self
+                .state
+                .is_current_session_navigation(request_id, target.session_id)
+        {
+            return;
+        }
+        let session_id = target.session_id;
         match result {
-            Ok(loaded) => {
+            Ok(result) => {
                 if self.session_load_is_blocked_by_active_run() {
                     self.state.finish_navigation(request_id);
                     return;
                 }
-                if !self
-                    .state
-                    .is_current_session_navigation(request_id, session_id)
-                {
-                    self.state.finish_navigation(request_id);
-                    return;
-                }
                 self.state.finish_navigation(request_id);
+                if let Some(workspace) = result.workspace {
+                    self.replace_workspace_from_load(workspace);
+                }
+                let loaded = result.loaded;
                 let loaded_status = loaded.read.session.status;
                 self.state.load_open_session(&loaded.read);
                 if let Some(records) = loaded.agent_activity_records {
@@ -8485,10 +8926,8 @@ impl DesktopController {
                         request_id,
                     );
                 } else {
-                    self.state.set_status_message(format!(
-                        "workspace set to {}",
-                        self.app.workspace.root
-                    ));
+                    self.state
+                        .set_status_message(format!("workspace set to {}", self.app.workspace.cwd));
                 }
             }
             Err(error) => {
@@ -8529,6 +8968,10 @@ impl DesktopController {
         }
         self.session_search_requests.clear();
         self.state = DesktopState::new(loaded.snapshot, self.app.config.clone());
+        self.state.set_file_change_display_roots(
+            &self.app.workspace.root,
+            self.app.workspace.authority_root(),
+        );
         self.state.provider_config.config_generation = next_config_generation;
         self.loaded_agent_activity_records = None;
         self.durable_agent_activity_refresh_failures = 0;
@@ -8817,10 +9260,10 @@ impl DesktopController {
                 }
                 RuntimeMessage::SessionLoaded {
                     request_id,
-                    session_id,
+                    target,
                     reason,
                     result,
-                } => self.apply_session_loaded_message(request_id, session_id, reason, result),
+                } => self.apply_session_loaded_message(request_id, target, reason, result),
                 RuntimeMessage::CurrentSessionRefreshed {
                     request_id,
                     target,
@@ -9197,6 +9640,10 @@ impl DesktopController {
                                 self.provider_catalog_requests.clear();
                                 self.state =
                                     DesktopState::new(loaded.snapshot, self.app.config.clone());
+                                self.state.set_file_change_display_roots(
+                                    &self.app.workspace.root,
+                                    self.app.workspace.authority_root(),
+                                );
                                 self.state.provider_config.config_generation =
                                     next_config_generation;
                                 self.loaded_agent_activity_records = None;
@@ -9269,7 +9716,7 @@ impl DesktopController {
                         &mut self.history_export_requests,
                         request_id,
                         &target,
-                        &self.app.workspace.root,
+                        self.app.workspace.authority_root(),
                     ) else {
                         continue;
                     };
@@ -9529,6 +9976,93 @@ async fn loaded_session_from_detail_with_activity(
         detail,
         Some(agent_activity_records),
     ))
+}
+
+async fn load_session_navigation_result(
+    app: App,
+    session_id: SessionId,
+    reason: SessionLoadReason,
+) -> Result<SessionNavigationLoadResult, String> {
+    let session = app
+        .session_service
+        .get_session(session_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let workspace_changed = session.project_id != app.workspace.project_id
+        || session.cwd != app.workspace.cwd
+        || app.workspace.authority_root() != session.cwd.as_path();
+    let aligned_app = if workspace_changed {
+        let process_runtime = app.process_runtime.clone();
+        let rebuilt =
+            AppBootstrap::rebuild_for_session_with_process_runtime(&session, process_runtime)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to restore session workspace {} for {}: {error}",
+                        session.cwd, session.id
+                    )
+                })?;
+        if rebuilt.workspace.project_id != session.project_id {
+            return Err(format!(
+                "session {} cwd {} resolves to project {}, not its stored project {}",
+                session.id, session.cwd, rebuilt.workspace.project_id, session.project_id
+            ));
+        }
+        rebuilt
+    } else {
+        app
+    };
+
+    let loaded = match reason {
+        SessionLoadReason::UserSelection => {
+            let detail = load_session_detail(&aligned_app, session_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            loaded_session_from_detail_with_activity(&aligned_app, detail).await?
+        }
+        SessionLoadReason::RunningRejoin => {
+            let rejoin = aligned_app
+                .session_service
+                .rejoin_running_session(session_id, 0, 200, 0, DESKTOP_TURN_PAGE_LIMIT)
+                .await;
+            let snapshot = aligned_app
+                .session_service
+                .canonical_latest_session_snapshot(
+                    session_id,
+                    DESKTOP_HISTORY_PROJECTION_LIMIT,
+                    DESKTOP_TURN_PAGE_LIMIT,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Err(error) = rejoin
+                && snapshot.read.session.status == SessionStatus::Running
+            {
+                return Err(error.to_string());
+            }
+            let agent_activity_records = aligned_app
+                .run_service
+                .durable_agent_activity_records(session_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            LoadedSession {
+                read: snapshot.read,
+                agent_activity_records: Some(agent_activity_records),
+            }
+        }
+    };
+
+    let workspace = if workspace_changed {
+        let snapshot = load_snapshot_for_selection(&aligned_app, Some(session_id))
+            .await
+            .map_err(|error| error.to_string())?;
+        Some(WorkspaceLoadResult {
+            app: aligned_app,
+            snapshot,
+        })
+    } else {
+        None
+    };
+    Ok(SessionNavigationLoadResult { workspace, loaded })
 }
 
 async fn load_session_operation_projection(
@@ -10393,7 +10927,7 @@ mod tests {
         };
         let provider_request_id = LatestRequestTracker::default().begin(provider_target.clone());
         let history_target = HistoryExportRequestTarget {
-            workspace_root: Utf8PathBuf::from("C:/workspace"),
+            workspace_authority_root: Utf8PathBuf::from("C:/workspace"),
             session_id: crate::session::SessionId::new(),
         };
         let history_request_id = LatestRequestTracker::default().begin(history_target.clone());

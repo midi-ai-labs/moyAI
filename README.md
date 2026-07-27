@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.0"><img alt="Release" src="https://img.shields.io/badge/release-v1.1.0-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.1"><img alt="Release" src="https://img.shields.io/badge/release-v1.1.1-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.ja.md">日本語 README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.0">Download release</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.1">Download release</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -69,6 +69,7 @@ moyAI is designed around those constraints:
 - Automatic LLM semantic compaction near the context threshold, using provider-reported total usage plus a Codex-style UTF-8-bytes/4 local suffix estimate, a full-request local fallback, full native summary requests with typed overflow reduction, and durable replacement lineage.
 - LM Studio metadata discovery through `/v1/models` and `/api/v1/models`.
 - Bounded workspace traversal/search/directory inspection with model-visible continuation cursors, guarded line-aware file-read pages with exact next offsets and no read spool path, diff-based edits, and shell execution.
+- A selected nested directory remains the tool and sandbox authority boundary even when an ancestor is the Git project root; reopening its session restores that exact directory.
 - File writes and patches use one stable-handle, no-clobber conditional commit for create, update, delete, and rollback. A concurrent external replacement wins without being overwritten; if restoration cannot reclaim the target name, moyAI reports the preserved backup path. Parent directories are not created implicitly, so create the parent first.
 - On Unix, moyAI cannot prove that a writable descriptor opened before an update or delete no longer references the detached inode. Creation remains unchanged, but an existing-file update installs the new target and a delete detaches the target while retaining the old inode at a private backup path; both report a typed partial-commit error instead of claiming safe cleanup. Inspect and reconcile the reported backup because a pre-opened writer can still modify it.
 - Permission modes: **Ask for approval** (`default` / 承認を求める), **Approve for me** (`auto_review` / 代理で承認), and **Full access** (`full_access` / フルアクセス). Ask and Auto share one deterministic admission policy and the same Windows `workspace-write` restricted-token/ACL profile; explicit `sandbox_permissions: "require_escalated"` plus `justification`, or a detected destructive/network/external/authority effect, goes to a human in Ask or a separate tool-less AI Guardian in Auto. The Windows backend identity-pins admitted roots and selected existing authority carveouts, content-pins protected regular files, gives each launched process/thread an explicit system-only descriptor, inherits only stdio, applies Job process-tree/UI restrictions before resume, and fails closed without an unrestricted retry. This unelevated profile is a finite existing-object defense, not a complete Windows namespace or Codex-enforcement equivalent: absent authority names, unrelated nested instruction files, protected descendants with overriding explicit/inheritance-disabled DACLs, uninspected outside paths, direct sockets, same-user host-process memory, and same-desktop synthetic input remain residuals. Its ACL preflight can propagate through existing trees synchronously and is not covered by the child timeout. Full Access and an approved process elevation run `Unrestricted` as the current user, so their child filesystem mutations do not pass through typed file guards; typed `write`/`apply_patch`, MCP/Docling, and process lifecycle checks keep their own guards. A committed mode change affects the next permission decision, while a pending request and an admitted effect retain their original decision/profile. Native process sandboxing is currently Windows-only; workspace-mode process effects fail closed elsewhere. A future elevated dedicated-identity/firewall/private-desktop backend is required for the hard boundary.
@@ -82,12 +83,12 @@ moyAI is designed around those constraints:
 
 The current release is available here:
 
-[**moyAI v1.1.0 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.0)
+[**moyAI v1.1.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.1)
 
-v1.1.0 makes recursive Agent Tree work durable across nested owners, restarts, follow-up mail, and
-exact Stop boundaries. It also aligns context compaction, patching, Windows shell/process behavior,
-and long-running local-model defaults more closely with Codex, while preserving logical workspace
-authority when a project is opened through a SUBST drive.
+v1.1.1 keeps a selected nested directory as the exact tool and sandbox authority boundary even when
+an ancestor is the Git project root. Glob, typed file tools, shell effect review, Windows sandboxing,
+session reopen, and built-in Git review now agree on that selected directory without losing
+project-level Git identity or ancestor instructions.
 
 The Windows release zip includes:
 
@@ -135,7 +136,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 1.1.0 -ManualGuiStResultsPath path\to\RESULTS.md
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 1.1.1 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
 
 Run packaging from the clean source commit for that release. If `v<version>` already exists, the

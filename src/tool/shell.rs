@@ -669,7 +669,7 @@ fn path_is_outside_writable_boundary(
     path: &Utf8Path,
 ) -> bool {
     let inside = |root: &Utf8Path| PathGuard::security_path_is_within(path, root).unwrap_or(false);
-    !inside(&workspace.root)
+    !inside(workspace.authority_root())
         && !workspace
             .path_policy
             .additional_write_roots
@@ -1361,6 +1361,33 @@ mod tests {
                 .risks
                 .contains(&crate::tool::PermissionRisk::DestructiveDelete)
         );
+    }
+
+    #[test]
+    fn nested_git_shell_treats_project_sibling_as_outside_selected_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("aaa")).expect("utf8 project root");
+        let selected = project_root.join("bbb");
+        let sibling = project_root.join("sibling");
+        std::fs::create_dir_all(project_root.join(".git")).expect("git marker");
+        std::fs::create_dir_all(&selected).expect("selected directory");
+        std::fs::create_dir_all(&sibling).expect("project sibling");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover(&selected, &config).expect("nested workspace");
+        let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+            "command": format!("Get-ChildItem -LiteralPath '{}'", sibling)
+        }))
+        .expect("shell input");
+
+        let intent =
+            super::shell_permission_intent(&workspace, &config, &input).expect("permission intent");
+
+        assert_eq!(workspace.root, project_root);
+        assert_eq!(workspace.authority_root(), selected);
+        assert_eq!(intent.guarded.absolute, selected);
+        assert!(intent.targets.contains(&sibling));
+        assert!(intent.outside_workspace);
     }
 
     #[cfg(windows)]

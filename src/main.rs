@@ -191,7 +191,7 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
     }
     install_cli_interrupt_handler(&app_command);
     let output_mode = command_output_mode(&command);
-    let mut renderer = build_renderer(output_mode);
+    let mut renderer = build_renderer(output_mode, &app);
     let outcome = app
         .run_service
         .execute(app_command, renderer.as_mut(), &mut prompt)
@@ -296,8 +296,8 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
     match command {
         CliCommand::Run(args) => AppCommand::Run(RunRequest {
             prompt: args.prompt.clone().unwrap_or_default(),
-            session_id: args.session_id,
-            continue_last: args.continue_last,
+            session_id: app.resolved_run_session_id().or(args.session_id),
+            continue_last: args.continue_last && app.resolved_run_session_id().is_none(),
             title: args.title.clone(),
             cwd: app.workspace.cwd.clone(),
             config: RunConfigInput::Layered {
@@ -494,9 +494,12 @@ fn command_output_mode(command: &CliCommand) -> OutputMode {
     }
 }
 
-fn build_renderer(mode: OutputMode) -> Box<dyn EventRenderer> {
+fn build_renderer(mode: OutputMode, app: &moyai::app::App) -> Box<dyn EventRenderer> {
     match mode {
-        OutputMode::Human => Box::new(HumanRenderer::new()),
+        OutputMode::Human => Box::new(HumanRenderer::with_file_change_roots(
+            &app.workspace.root,
+            app.workspace.authority_root(),
+        )),
         OutputMode::Json => Box::new(JsonRenderer::new()),
     }
 }
