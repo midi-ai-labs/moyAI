@@ -1,6 +1,6 @@
 # moyAI Getting Started
 
-2026-07-25 時点のv1.0.0 release向け最小手順。canonical runtime/storage、Codex型Desktop履歴、3種類のpermission mode、Windows workspace sandbox、Responses transportを含む。正確なversionと機能は利用するrelease packageと製品READMEを確認する。
+2026-07-27 時点のv1.1.0 release向け最小手順。durableな再帰Agent Tree、canonical runtime/storage、Codex型Desktop履歴、3種類のpermission mode、Windows workspace sandbox、Responses transportを含む。正確なversionと機能は利用するrelease packageと製品READMEを確認する。
 
 ## 初回起動
 

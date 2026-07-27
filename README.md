@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.0.0"><img alt="Release" src="https://img.shields.io/badge/release-v1.0.0-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.0"><img alt="Release" src="https://img.shields.io/badge/release-v1.1.0-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.ja.md">日本語 README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.0.0">Download release</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.0">Download release</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -82,11 +82,12 @@ moyAI is designed around those constraints:
 
 The current release is available here:
 
-[**moyAI v1.0.0 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v1.0.0)
+[**moyAI v1.1.0 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.0)
 
-v1.0.0 adds a Codex-inspired continuous Desktop conversation and Sub Agent history, three explicit
-permission modes with the Windows workspace sandbox, and hardened LM Studio/Qwen tool-call and
-post-compaction compatibility on top of the canonical runtime introduced in v0.8.0.
+v1.1.0 makes recursive Agent Tree work durable across nested owners, restarts, follow-up mail, and
+exact Stop boundaries. It also aligns context compaction, patching, Windows shell/process behavior,
+and long-running local-model defaults more closely with Codex, while preserving logical workspace
+authority when a project is opened through a SUBST drive.
 
 The Windows release zip includes:
 
@@ -134,7 +135,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 1.0.0 -ManualGuiStResultsPath path\to\RESULTS.md
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 1.1.0 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
 
 Run packaging from the clean source commit for that release. If `v<version>` already exists, the

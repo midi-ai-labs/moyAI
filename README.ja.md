@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.0.0"><img alt="Release" src="https://img.shields.io/badge/release-v1.0.0-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.0"><img alt="Release" src="https://img.shields.io/badge/release-v1.1.0-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.md">English README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.0.0">release をダウンロード</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.0">release をダウンロード</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -83,11 +83,11 @@ moyAI は、そうした環境でも使いやすい開発用の相棒を目指�
 
 現在の release を公開しています。
 
-[**moyAI v1.0.0 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v1.0.0)
+[**moyAI v1.1.0 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.0)
 
-v1.0.0では、v0.8.0で導入したcanonical runtimeを基盤として、Codexに近い連続したDesktop会話・
-Sub Agent履歴、3種類のpermission modeとWindows workspace sandbox、LM Studio/Qwenのtool-callおよび
-compaction後の互換性強化を追加しました。
+v1.1.0では、再帰的なAgent Treeのnested owner、再起動、follow-up mail、exact Stop境界をdurableにしました。
+加えてcontext compaction、patch、Windows shell/process、長時間local model向け既定値をCodexへ近づけ、
+SUBST driveからprojectを開いた場合も論理workspace authorityを保ったまま実体folder名を表示します。
 
 Windows 向け release zip には、次のものが含まれています。
 
@@ -135,7 +135,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 1.0.0 -ManualGuiStResultsPath path\to\RESULTS.md
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 1.1.0 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
 
 packageはそのrelease用のclean source commitから作成します。`v<version>` tagが既に存在する場合、
