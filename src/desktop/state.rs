@@ -1,6 +1,4 @@
-use crate::protocol::{
-    HistoryItem, HistoryItemPayload, TurnInterruptionCause, TurnItemPayload, TurnTerminalOutcome,
-};
+use crate::protocol::{HistoryItem, HistoryItemPayload, TurnInterruptionCause, TurnItemPayload};
 use crate::session::{
     CanonicalSessionRead, ProjectId, PromptDispatchPart, SessionId, SessionStatus,
 };
@@ -954,26 +952,7 @@ impl DesktopState {
             return false;
         }
 
-        let (run_status, progress_status, status_message) = match &outcome {
-            TurnTerminalOutcome::Completed => (
-                RunStatus::Completed,
-                "Completed",
-                "run completed".to_string(),
-            ),
-            TurnTerminalOutcome::Interrupted { cause } => (
-                RunStatus::Cancelled,
-                "Cancelled",
-                crate::tui::state::interruption_status_message(*cause),
-            ),
-            TurnTerminalOutcome::Failed { error } => (RunStatus::Failed, "Failed", error.clone()),
-        };
-        self.app_state.run_status = run_status;
-        self.app_state.status_message = Some(status_message);
-        self.app_state.interruption_cause = outcome.interruption_cause();
-        self.app_state.permission = None;
-        self.app_state.progress.status = progress_status.to_string();
-        self.app_state.progress.current_phase = RunProgressPhase::Terminal;
-        self.app_state.progress.active_step = outcome.summary().to_string();
+        self.app_state.apply_terminal_outcome_projection(&outcome);
         self.status_code = self
             .app_state
             .interruption_cause
@@ -981,6 +960,18 @@ impl DesktopState {
             .unwrap_or(DesktopStatusCode::Plain);
         self.update_session_row_status(read.session.id, outcome.session_status());
         true
+    }
+
+    pub fn apply_run_summary(&mut self, summary: crate::session::RunSummary) {
+        let session_id = summary.session_id();
+        let session_status = summary.status();
+        self.app_state.apply_run_summary(summary);
+        self.status_code = self
+            .app_state
+            .interruption_cause
+            .map(DesktopStatusCode::from_interruption)
+            .unwrap_or(DesktopStatusCode::Plain);
+        self.update_session_row_status(session_id, session_status);
     }
 
     pub fn next_turn_page_offset(&self) -> Option<usize> {
@@ -1787,6 +1778,7 @@ mod tests {
         active_context_tokens: u32,
     ) -> crate::context::ContextWindowTokenStatus {
         crate::context::ContextWindowTokenStatus {
+            source: crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
             active_context_tokens,
             full_context_window_limit: 131_072,
             configured_max_output_tokens: 8_192,
@@ -1824,6 +1816,7 @@ mod tests {
                 has_more: false,
                 items: turn_items,
             },
+            pending_turn_inputs: Vec::new(),
             turn_elapsed_ms: Default::default(),
             latest_turn_id,
             active_turn_id: None,
@@ -1898,6 +1891,7 @@ mod tests {
                     image_bytes: 0,
                     tool_names: Vec::new(),
                     tool_schemas: Vec::new(),
+                    wire: None,
                     context_window,
                     messages: Vec::new(),
                 },

@@ -154,8 +154,10 @@ function renderTranscriptRow(row: TranscriptRow, anchorId: string): string {
     return renderFileChanges(row, anchorId);
   }
   const routineConversation = row.row_kind === "user" || row.row_kind === "assistant";
+  const durableIdentity = row.stable_history_identity?.trim();
   return `
-    <article class="message ${escapeHtml(row.row_kind)}" data-history-anchor="${escapeHtml(anchorId)}">
+    <article class="message ${escapeHtml(row.row_kind)}" data-history-anchor="${escapeHtml(anchorId)}"
+      ${durableIdentity ? `data-history-identity="${escapeHtml(durableIdentity)}"` : ""}>
       <div class="message-body">
         ${routineConversation ? "" : `<h2>${escapeHtml(row.title)}</h2>`}
         <div class="markdown-body">${renderMarkdown(row.body)}</div>
@@ -538,7 +540,11 @@ function agentEventStatus(
           : null;
   if (event.rowKind === "sub_agent_started" && !terminalStatus) return "作業を開始しました";
   if (terminalStatus) return terminalStatus;
-  if (activity?.status === "running" || activity?.status === "pending_init") {
+  if (
+    activity?.status === "running"
+    || activity?.status === "pending_init"
+    || activity?.status === "awaiting_descendants"
+  ) {
     return agentStatusLabel(activity.status);
   }
   return "更新しました";

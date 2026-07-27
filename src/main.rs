@@ -174,7 +174,7 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
             .map_err(|error| (4, error.to_string()))?;
         return Ok(());
     }
-    let wait_for_agent_tree = matches!(&command, CliCommand::Run(_));
+    let expects_turn = matches!(&command, CliCommand::Run(_));
     let mut app_command = to_app_command(&command, &app);
     let root_run_control = match &app_command {
         AppCommand::Run(request) => Some(request.run_control.clone()),
@@ -199,11 +199,7 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
         .map_err(|error| (4, error.to_string()))?;
     match outcome {
         AppCommandOutcome::ControlCompleted => Ok(()),
-        AppCommandOutcome::Turn(summary) if wait_for_agent_tree => {
-            app.run_service
-                .wait_for_agent_tree_quiescence(summary.session_id())
-                .await
-                .map_err(|error| (4, error.to_string()))?;
+        AppCommandOutcome::Turn(summary) if expects_turn => {
             if let Some(exit) = terminal_run_exit(summary.status(), summary.interruption_cause()) {
                 return Err(exit);
             }
@@ -674,6 +670,8 @@ fn persist_replay_execution(
     let run = HarnessRunRecord {
         id: execution.report.run_id,
         session_id: None,
+        protocol_turn_id: None,
+        canonical_terminal_runtime_event_id: None,
         workspace_root: current_utf8_dir()?,
         artifact_root: artifact_root.clone(),
         mode: mode.to_string(),

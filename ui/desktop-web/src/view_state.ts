@@ -359,7 +359,6 @@ export function reconcileUiDrafts(
       && pending.baseCommitGeneration === state.composer_commit_generation
       && state.can_submit
       && !state.busy
-      && !state.agent_tree_active
     ) {
       drafts.pendingRunSubmission = null;
     }

@@ -6,16 +6,16 @@ pub mod model_policy;
 pub mod model_probe;
 pub mod openai_compat;
 pub mod provider;
+pub mod request_diagnostics;
 pub mod responses;
-pub mod turn_session;
 
 pub use catalog::{ConfigModelCatalog, ModelCatalog};
 pub use contract::{
     ChatRequest, LlmClient, LlmEvent, LlmEventSink, LlmResponseSummary, ModelCapabilities,
     ModelContentPart, ModelMessage, ModelProfile, ModelToolCall, ProviderToolChoice,
-    ReasoningRequest, ResponsesContinuation, ToolSchema,
-    control_plane_parallel_tool_calls_projection, effective_parallel_tool_calls,
-    tool_surface_scoped_parallel_tool_calls_projection, validate_toolless_text_response,
+    ReasoningRequest, ToolSchema, control_plane_parallel_tool_calls_projection,
+    effective_parallel_tool_calls, tool_surface_scoped_parallel_tool_calls_projection,
+    validate_toolless_text_response,
 };
 pub use image_validation::{
     ImageValidationError, ValidatedImageMetadata, validate_image_bytes, validate_image_payload,

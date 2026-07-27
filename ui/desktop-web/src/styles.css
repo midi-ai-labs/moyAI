@@ -985,6 +985,50 @@ select:focus-visible,
   background: #292925;
 }
 
+.pending-turn-inputs {
+  width: min(760px, 100%);
+  margin: 8px auto 20px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.pending-turn-inputs-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-bottom: 10px;
+  color: var(--muted);
+}
+
+.pending-turn-inputs-heading strong {
+  color: #d8d2b8;
+  font-size: 12px;
+}
+
+.pending-turn-inputs-heading small,
+.pending-turn-input-images {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.message.pending-turn-input {
+  width: 100%;
+  margin-bottom: 10px;
+  opacity: 0.82;
+}
+
+.message.pending-turn-input .message-body {
+  border-style: dashed;
+  border-color: rgba(216, 210, 184, 0.28);
+}
+
+.pending-turn-input-images {
+  display: block;
+  margin-top: 6px;
+  text-align: right;
+}
+
 .message.user .markdown-body > :first-child,
 .message.assistant .markdown-body > :first-child {
   margin-top: 0;
@@ -2267,7 +2311,8 @@ select:focus-visible,
 }
 
 .agent-status-running .agent-status-label,
-.agent-status-pending_init .agent-status-label {
+.agent-status-pending_init .agent-status-label,
+.agent-status-awaiting_descendants .agent-status-label {
   color: #8fbcff;
 }
 
@@ -3298,4 +3343,16 @@ pre {
   color: var(--muted);
   line-height: 1.5;
   font-size: 13px;
+}
+.agent-job-card-shell,
+.sub-agent-list-card-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.agent-interrupt {
+  align-self: center;
+  flex: 0 0 auto;
 }

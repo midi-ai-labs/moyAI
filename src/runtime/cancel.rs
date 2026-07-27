@@ -469,6 +469,32 @@ impl RunControl {
         }
     }
 
+    /// Commits durable evidence and the exact local cancellation as one classification boundary.
+    ///
+    /// The callback runs only while this owner is still open and while its classification mutex is
+    /// retained. A concurrent success commit, Stop, failure, or supersession therefore cannot win
+    /// between durable authorization and publishing the matching cancellation cause. On callback
+    /// failure the owner remains open.
+    pub(crate) fn commit_cancel_local<E>(
+        &self,
+        cause: RunCancellationCause,
+        durable_commit: impl FnOnce() -> Result<(), E>,
+    ) -> Result<RunCancelOutcome, E> {
+        let mut classification = self
+            .inner
+            .classification
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(*classification, RunClassification::Open) {
+            return Ok(RunCancelOutcome::Rejected);
+        }
+        durable_commit()?;
+        *classification = RunClassification::Cancelled(cause);
+        drop(classification);
+        self.inner.wake.cancel();
+        Ok(RunCancelOutcome::Applied)
+    }
+
     pub(crate) fn install_terminal_router(&self, router: &Arc<RunTerminalRoute>) -> Result<(), ()> {
         let mut installed = self
             .inner

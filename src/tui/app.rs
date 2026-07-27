@@ -20,8 +20,8 @@ use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::{
-    App, AppBootstrap, AppCommand, AppCommandOutcome, ReviewRequest, RunConfigInput, RunRequest,
-    RunSessionAccessModeAdoption, SessionSteerRequest,
+    AgentActivityRecord, App, AppBootstrap, AppCommand, AppCommandOutcome, ReviewRequest,
+    RunConfigInput, RunRequest, RunSessionAccessModeAdoption, SessionSteerRequest,
 };
 use crate::cli::{
     ConfirmationOutcome, ConfirmationPrompt, EventRenderer, OutputMode, ReviewDecision,
@@ -30,13 +30,18 @@ use crate::cli::{
 use crate::config::{AccessMode, ConfigLoader, ResolvedConfig, ShellFamily};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
 use crate::protocol::{PlanStepStatus, ToolApprovalDecision, TurnInterruptionCause};
-use crate::runtime::{RunCancelOutcome, RunCancellationCause, RunControl, SystemClock};
+use crate::runtime::{
+    LocalTaskExecutor, OwnedTaskHandle, RunCancelOutcome, RunCancellationCause, RunControl,
+    SystemClock,
+};
+#[cfg(test)]
+use crate::session::SessionStatus;
 use crate::session::markdown::{
     canonical_markdown_export_read, canonical_session_read_to_markdown, history_markdown_file_name,
 };
 use crate::session::{
     EditorContext, LoadedSessionStatus, LoadedSessionSummary, PromptDispatchPart, RunEvent,
-    RunSummary, SessionId, SessionRecord, SessionStatus,
+    RunSummary, SessionId, SessionRecord,
 };
 use crate::tool::PermissionRequest;
 use crate::workspace::project::normalize_path;
@@ -63,9 +68,22 @@ fn access_mode_display_label(access_mode: AccessMode) -> &'static str {
     }
 }
 
+fn tui_agent_status_label(status: &crate::runtime::AgentStatus) -> &'static str {
+    match status {
+        crate::runtime::AgentStatus::PendingInit => "pending",
+        crate::runtime::AgentStatus::Running => "running",
+        crate::runtime::AgentStatus::AwaitingDescendants => "waiting",
+        crate::runtime::AgentStatus::Interrupted => "interrupted",
+        crate::runtime::AgentStatus::Completed(_) => "completed",
+        crate::runtime::AgentStatus::Errored(_) => "errored",
+        crate::runtime::AgentStatus::Shutdown => "shutdown",
+    }
+}
+
 struct TuiRootRun {
     generation: u64,
     run_control: RunControl,
+    worker: Option<OwnedTaskHandle>,
 }
 
 #[derive(Default)]
@@ -81,8 +99,28 @@ impl TuiRootRunLifecycle {
         self.active = Some(TuiRootRun {
             generation,
             run_control,
+            worker: None,
         });
         true
+    }
+
+    fn attach_worker(
+        &mut self,
+        generation: u64,
+        worker: OwnedTaskHandle,
+    ) -> Result<(), OwnedTaskHandle> {
+        if worker.generation() != generation {
+            return Err(worker);
+        }
+        let Some(active) = self
+            .active
+            .as_mut()
+            .filter(|active| active.generation == generation && active.worker.is_none())
+        else {
+            return Err(worker);
+        };
+        active.worker = Some(worker);
+        Ok(())
     }
 
     fn is_active(&self) -> bool {
@@ -111,7 +149,12 @@ impl TuiRootRunLifecycle {
         {
             return None;
         }
-        self.active.take().map(|active| active.run_control.cause())
+        self.active.take().map(|mut active| {
+            if let Some(worker) = active.worker.take() {
+                worker.detach();
+            }
+            active.run_control.cause()
+        })
     }
 }
 
@@ -279,6 +322,7 @@ struct TuiController {
     base_config: ResolvedConfig,
     effective_config: ResolvedConfig,
     root_run_lifecycle: TuiRootRunLifecycle,
+    root_task_runtime: LocalTaskExecutor,
     next_root_run_generation: u64,
     next_steer_submission_id: u64,
     composer_draft_revision: u64,
@@ -296,6 +340,8 @@ struct TuiController {
     preview_turn_has_more: bool,
     next_enhance_request_id: u64,
     pending_prompt_enhance: Option<(u64, CancellationToken)>,
+    agent_picker_rows: Vec<AgentActivityRecord>,
+    agent_picker_selected: usize,
     should_quit: bool,
     started_at: Instant,
 }
@@ -306,6 +352,8 @@ impl TuiController {
         let sessions = recent_sessions(&app.session_service, app.workspace.project_id, 20).await?;
         let base_config = app.config.clone();
         let effective_config = base_config.clone();
+        let root_task_runtime =
+            LocalTaskExecutor::new("moyai-tui-root-runtime").map_err(AppRunError::Message)?;
         let mut controller = Self {
             app,
             state: AppState::default(),
@@ -316,6 +364,7 @@ impl TuiController {
             base_config,
             effective_config,
             root_run_lifecycle: TuiRootRunLifecycle::default(),
+            root_task_runtime,
             next_root_run_generation: 1,
             next_steer_submission_id: 1,
             composer_draft_revision: 0,
@@ -333,6 +382,8 @@ impl TuiController {
             preview_turn_has_more: false,
             next_enhance_request_id: 1,
             pending_prompt_enhance: None,
+            agent_picker_rows: Vec::new(),
+            agent_picker_selected: 0,
             should_quit: false,
             started_at: Instant::now(),
         };
@@ -365,7 +416,9 @@ impl TuiController {
             return Ok(());
         }
         if is_stop_key(key)
-            && (matches!(self.state.run_status, RunStatus::Running) || self.agent_tree_active())
+            && (matches!(self.state.run_status, RunStatus::Running)
+                || self.root_run_lifecycle.is_active()
+                || self.pending_permission.is_some())
         {
             return self.stop_current_run().await;
         }
@@ -380,13 +433,14 @@ impl TuiController {
             Modal::ConfigEditor => self.handle_config_editor_key(key).await,
             Modal::EnhanceReview => self.handle_enhance_review_key(key).await,
             Modal::WorkspacePicker => self.handle_workspace_picker_key(key).await,
+            Modal::AgentPicker => self.handle_agent_picker_key(key).await,
             Modal::None => self.handle_main_key(key).await,
         }
     }
 
     async fn handle_main_key(&mut self, key: KeyEvent) -> Result<(), AppRunError> {
         if key_leaves_current_task(key, self.state.route)
-            && self.reject_agent_tree_navigation("the current task")
+            && self.reject_active_root_navigation("the current task")
         {
             return Ok(());
         }
@@ -427,6 +481,9 @@ impl TuiController {
             }
             KeyCode::F(9) if self.state.run_status != RunStatus::Running => {
                 self.export_history_markdown().await?;
+            }
+            KeyCode::F(10) => {
+                self.open_agent_picker().await?;
             }
             KeyCode::Up => {
                 if self.state.route == Route::History && !self.state.sessions.is_empty() {
@@ -533,7 +590,7 @@ impl TuiController {
             self.launch_run(prompt.clone(), PromptDispatchPart::raw(&prompt))
                 .await?;
         } else if let Some(session_id) = self.state.selected_session().map(|session| session.id) {
-            if self.reject_agent_tree_navigation("session") {
+            if self.reject_active_root_navigation("session") {
                 return Ok(());
             }
             self.open_session(session_id).await?;
@@ -556,6 +613,97 @@ impl TuiController {
             _ => {
                 let _ = self.workspace_picker.input(key);
             }
+        }
+        Ok(())
+    }
+
+    async fn open_agent_picker(&mut self) -> Result<(), AppRunError> {
+        let Some(root_session_id) = self.state.current_session_id else {
+            self.state.status_message =
+                Some("open a task before inspecting Sub Agents".to_string());
+            return Ok(());
+        };
+        let mut rows = self.app.run_service.agent_activity_records(root_session_id);
+        if rows.is_empty() {
+            rows = self
+                .app
+                .run_service
+                .durable_agent_activity_records(root_session_id)
+                .await?;
+        }
+        rows.sort_by_key(|row| row.started_order);
+        self.agent_picker_rows = rows;
+        self.agent_picker_selected = self
+            .agent_picker_selected
+            .min(self.agent_picker_rows.len().saturating_sub(1));
+        self.state.modal = Modal::AgentPicker;
+        Ok(())
+    }
+
+    async fn handle_agent_picker_key(&mut self, key: KeyEvent) -> Result<(), AppRunError> {
+        match key.code {
+            KeyCode::Esc => self.state.modal = Modal::None,
+            KeyCode::Up => {
+                self.agent_picker_selected = self.agent_picker_selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if self.agent_picker_selected + 1 < self.agent_picker_rows.len() {
+                    self.agent_picker_selected += 1;
+                }
+            }
+            KeyCode::Char('x') if key.modifiers.is_empty() => {
+                self.interrupt_selected_agent().await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn interrupt_selected_agent(&mut self) -> Result<(), AppRunError> {
+        let Some(root_session_id) = self.state.current_session_id else {
+            self.state.status_message = Some("the Sub Agent owner is no longer open".to_string());
+            self.state.modal = Modal::None;
+            return Ok(());
+        };
+        let Some(row) = self
+            .agent_picker_rows
+            .get(self.agent_picker_selected)
+            .cloned()
+        else {
+            self.state.status_message = Some("select a Sub Agent first".to_string());
+            return Ok(());
+        };
+        let Some(expected_turn_id) = row.active_turn_id else {
+            self.state.status_message =
+                Some("the selected Sub Agent has no interruptible running turn".to_string());
+            return Ok(());
+        };
+        if !row.can_interrupt || !matches!(row.status, crate::runtime::AgentStatus::Running) {
+            self.state.status_message =
+                Some("the selected Sub Agent is not currently interruptible".to_string());
+            return Ok(());
+        }
+        let accepted = self
+            .app
+            .run_service
+            .interrupt_agent_turn_exact(
+                root_session_id,
+                &row.agent_path,
+                row.session_id,
+                expected_turn_id,
+            )
+            .await?;
+        if accepted {
+            self.state.status_message = Some(format!(
+                "interrupt requested for Sub Agent {} turn {}",
+                row.agent_path, expected_turn_id
+            ));
+            self.state.modal = Modal::None;
+        } else {
+            self.state.status_message = Some(
+                "the selected Sub Agent turn changed; reopen the Agent picker and retry"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -707,9 +855,15 @@ impl TuiController {
     }
 
     async fn stop_current_run(&mut self) -> Result<(), AppRunError> {
-        let root_stop_accepted = self.root_run_lifecycle.request_cancel();
+        let exact_root_target = self.root_run_lifecycle.is_active()
+            || matches!(self.state.run_status, RunStatus::Running);
+        let stop_accepted = self.root_run_lifecycle.request_cancel();
+        if !exact_root_target && self.pending_permission.is_some() {
+            self.answer_permission(ReviewDecision::Abort)?;
+            return Ok(());
+        }
         let Some(session_id) = self.state.current_session_id else {
-            if root_stop_accepted {
+            if stop_accepted {
                 self.state.status_message =
                     Some("stop requested before run admission completed".to_string());
                 return Ok(());
@@ -717,66 +871,33 @@ impl TuiController {
             self.state.status_message = Some("no active session to stop".to_string());
             return Ok(());
         };
-        let tree_cancelled = self
-            .app
-            .run_service
-            .cancel_agent_tree(session_id, TurnInterruptionCause::UserStop);
-        if root_stop_accepted {
-            // Stop dispatch is not a terminal transition. The admitted turn remains the owner
-            // until its matching TurnTerminal/worker settlement is projected back to the TUI.
-            self.state.status_message = Some("stop requested for active run".to_string());
-            return Ok(());
-        }
-        match self
+        let durable_stop_accepted = self
             .app
             .session_service
-            .interrupt_running_session(session_id)
-            .await
-        {
-            Ok(session) => {
-                self.state.run_status = tui_run_status_for_session_status(session.status);
-                self.state.status_message = Some(if session.status == SessionStatus::Cancelled {
-                    "stop requested for active run".to_string()
-                } else {
-                    "stopped the active agent tree; root result was preserved".to_string()
-                });
+            .cancel_running_session(session_id)
+            .await?;
+        if stop_accepted || durable_stop_accepted {
+            // Stop dispatch is not a terminal transition. The exact task worker remains the owner
+            // until its matching TurnTerminal/worker settlement is projected back to the TUI.
+            self.state.status_message = Some("stop requested for the current task".to_string());
+            if durable_stop_accepted && !self.root_run_lifecycle.is_active() {
                 self.refresh_sessions().await?;
             }
-            Err(error) => {
-                if tree_cancelled {
-                    self.state.run_status = RunStatus::Cancelled;
-                    self.state.status_message = Some("stopped the active agent tree".to_string());
-                } else {
-                    self.state.status_message = Some(format!("failed to stop active run: {error}"));
-                }
-            }
+        } else {
+            self.state.status_message =
+                Some("no current task accepted the Stop request".to_string());
         }
         Ok(())
     }
 
-    fn agent_tree_active(&self) -> bool {
-        self.root_run_lifecycle.is_active()
-            || self.state.current_session_id.is_some_and(|session_id| {
-                self.app
-                    .run_service
-                    .agent_activity_records(session_id)
-                    .iter()
-                    .any(|record| {
-                        matches!(
-                            record.status,
-                            crate::runtime::AgentStatus::PendingInit
-                                | crate::runtime::AgentStatus::Running
-                        )
-                    })
-            })
-    }
-
-    fn reject_agent_tree_navigation(&mut self, target: &str) -> bool {
-        if !self.agent_tree_active() {
+    fn reject_active_root_navigation(&mut self, target: &str) -> bool {
+        if !self.root_run_lifecycle.is_active()
+            && !matches!(self.state.run_status, RunStatus::Running)
+        {
             return false;
         }
         self.state.status_message = Some(format!(
-            "{target} cannot change while the agent tree is active; press Ctrl+X to stop it first"
+            "{target} cannot change while the root turn is active; press Ctrl+X to stop it first"
         ));
         true
     }
@@ -901,7 +1022,7 @@ impl TuiController {
     }
 
     fn open_workspace_picker(&mut self) {
-        if self.reject_agent_tree_navigation("workspace") {
+        if self.reject_active_root_navigation("workspace") {
             return;
         }
         self.workspace_picker = build_composer();
@@ -911,7 +1032,7 @@ impl TuiController {
     }
 
     async fn submit_workspace_picker(&mut self) -> Result<(), AppRunError> {
-        if self.reject_agent_tree_navigation("workspace") {
+        if self.reject_active_root_navigation("workspace") {
             self.state.modal = Modal::None;
             return Ok(());
         }
@@ -919,8 +1040,13 @@ impl TuiController {
             return Ok(());
         };
 
-        let store = self.app.session_service.store.clone();
-        let app = match AppBootstrap::rebuild_for_directory(&requested, store).await {
+        let process_runtime = self.app.process_runtime.clone();
+        let app = match AppBootstrap::rebuild_for_directory_with_process_runtime(
+            &requested,
+            process_runtime,
+        )
+        .await
+        {
             Ok(value) => value,
             Err(error) => {
                 self.state.status_message =
@@ -999,9 +1125,9 @@ impl TuiController {
         if raw_prompt.is_empty() {
             return Ok(());
         }
-        if self.agent_tree_active() {
+        if self.root_run_lifecycle.is_active() {
             self.state.status_message = Some(
-                "wait for the active agent tree to finish, or press Ctrl+X to stop it".to_string(),
+                "wait for the active root turn to finish, or press Ctrl+X to stop it".to_string(),
             );
             return Ok(());
         }
@@ -1071,9 +1197,9 @@ impl TuiController {
             self.launch_active_turn_steer(prompt).await?;
             return Ok(());
         }
-        if self.agent_tree_active() {
+        if self.root_run_lifecycle.is_active() {
             self.state.status_message = Some(
-                "wait for the active agent tree to finish, or press Ctrl+X to stop it".to_string(),
+                "wait for the active root turn to finish, or press Ctrl+X to stop it".to_string(),
             );
             return Ok(());
         }
@@ -1131,26 +1257,23 @@ impl TuiController {
         let run_service = self.app.run_service.clone();
         let runtime_tx = self.runtime_tx.clone();
         let next_permission_request_id = self.next_permission_request_id.clone();
-        std::thread::spawn(move || {
-            let mut request = request;
-            let root_run_control = request.run_control.clone();
-            let mut renderer = TuiRenderer {
-                tx: runtime_tx.clone(),
-                root_run_generation: Some(run_generation),
-            };
-            let mut prompt = SharedConfirmationPrompt::new_with_root_control(
-                TuiConfirmationPrompt {
+        let worker = self
+            .root_task_runtime
+            .spawn(run_generation, move || async move {
+                let mut request = request;
+                let root_run_control = request.run_control.clone();
+                let mut renderer = TuiRenderer {
                     tx: runtime_tx.clone(),
-                    next_permission_request_id,
-                },
-                root_run_control,
-            );
-            request.agent_confirmation = Some(prompt.clone());
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build tui worker runtime");
-            runtime.block_on(async move {
+                    root_run_generation: Some(run_generation),
+                };
+                let mut prompt = SharedConfirmationPrompt::new_with_root_control(
+                    TuiConfirmationPrompt {
+                        tx: runtime_tx.clone(),
+                        next_permission_request_id,
+                    },
+                    root_run_control,
+                );
+                request.agent_confirmation = Some(prompt.clone());
                 let result = run_service
                     .execute(AppCommand::Run(request), &mut renderer, &mut prompt)
                     .await
@@ -1163,7 +1286,34 @@ impl TuiController {
                     .map_err(|error| error.to_string());
                 publish_tui_run_finished(&runtime_tx, run_generation, result);
             });
-        });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                let _ = self.root_run_lifecycle.finish(run_generation);
+                self.pending_access_mode_adoption = None;
+                self.discard_pending_composer_submission(PendingComposerSubmissionId::RootRun(
+                    run_generation,
+                ));
+                self.state.run_status = RunStatus::Failed;
+                self.state.status_message =
+                    Some(format!("failed to start TUI run worker: {error}"));
+                return Ok(());
+            }
+        };
+        if let Err(worker) = self
+            .root_run_lifecycle
+            .attach_worker(run_generation, worker)
+        {
+            worker.abort();
+            let _ = self.root_run_lifecycle.finish(run_generation);
+            self.pending_access_mode_adoption = None;
+            self.discard_pending_composer_submission(PendingComposerSubmissionId::RootRun(
+                run_generation,
+            ));
+            self.state.run_status = RunStatus::Failed;
+            self.state.status_message =
+                Some("TUI run owner changed before worker attachment".to_string());
+        }
         Ok(())
     }
 
@@ -1194,7 +1344,6 @@ impl TuiController {
         let runtime_tx = self.runtime_tx.clone();
         let next_permission_request_id = self.next_permission_request_id.clone();
         let cwd = self.app.workspace.cwd.clone();
-        let accepted_prompt = prompt.clone();
         std::thread::spawn(move || {
             let mut renderer = TuiRenderer {
                 tx: runtime_tx.clone(),
@@ -1229,7 +1378,6 @@ impl TuiController {
             let _ = runtime_tx.send(RuntimeMessage::SteerStored {
                 submission_id,
                 session_id,
-                prompt: accepted_prompt,
                 result,
             });
         });
@@ -1390,8 +1538,8 @@ impl TuiController {
                     if live_event_requires_canonical_refresh(&event) {
                         if let Some(session_id) = live_refresh_session_id {
                             self.refresh_loaded_summary_for_session(session_id).await?;
-                            if event_requires_plan_refresh(&event)
-                                && self.state.current_session_id == Some(session_id)
+                            if self.state.current_session_id == Some(session_id)
+                                && event_requires_canonical_conversation_refresh(&event)
                             {
                                 let snapshot = self
                                     .app
@@ -1402,8 +1550,7 @@ impl TuiController {
                                         crate::protocol::MAX_PROTOCOL_PAGE_LIMIT,
                                     )
                                     .await?;
-                                self.state
-                                    .refresh_plan_from_turn_items(&snapshot.read.turns.items);
+                                self.state.refresh_canonical_conversation(&snapshot.read);
                             }
                             if self.state.route == Route::History
                                 && self
@@ -1437,7 +1584,7 @@ impl TuiController {
                     match result {
                         Ok(summary) => {
                             self.settle_pending_permission_after_root_success();
-                            self.state.set_summary(summary);
+                            self.state.apply_run_summary(summary);
                             self.refresh_sessions().await?;
                             if let Some(session_id) = self.state.current_session_id {
                                 self.open_session(session_id).await?;
@@ -1482,21 +1629,21 @@ impl TuiController {
                 RuntimeMessage::SteerStored {
                     submission_id,
                     session_id,
-                    prompt,
                     result,
                 } => match result {
                     Ok(()) => {
-                        if self.state.current_session_id == Some(session_id) {
-                            self.state.apply_durable_steer_prompt(&prompt);
-                        }
                         self.settle_pending_composer_submission(
                             PendingComposerSubmissionId::Steer(submission_id),
                             session_id,
                             true,
                         );
+                        if self.state.current_session_id == Some(session_id) {
+                            let read = session_view(&self.app.session_service, session_id).await?;
+                            self.state.refresh_canonical_conversation(&read);
+                        }
                         self.refresh_loaded_summary_for_session(session_id).await?;
                         self.state.status_message =
-                            Some("stored steer input for the active turn".to_string());
+                            Some("queued steer input for the active turn".to_string());
                     }
                     Err(message) => {
                         self.discard_pending_composer_submission(
@@ -1563,11 +1710,7 @@ impl TuiController {
         let read = session_view(&self.app.session_service, session_id).await?;
         self.cancel_pending_prompt_enhance();
         self.apply_access_mode_owner(read.session.access_mode);
-        self.state.load_turn_items_with_active_turn(
-            &read.session,
-            &read.turns.items,
-            read.active_turn_id,
-        );
+        self.state.load_canonical_session_read(&read);
         self.state.modal = Modal::None;
         Ok(())
     }
@@ -1597,7 +1740,7 @@ impl TuiController {
     }
 
     async fn open_or_rejoin_selected_history_session(&mut self) -> Result<(), AppRunError> {
-        if self.reject_agent_tree_navigation("session") {
+        if self.reject_active_root_navigation("session") {
             return Ok(());
         }
         let Some(session_id) = self.state.selected_session().map(|session| session.id) else {
@@ -1615,7 +1758,7 @@ impl TuiController {
     }
 
     async fn rejoin_selected_session(&mut self) -> Result<(), AppRunError> {
-        if self.reject_agent_tree_navigation("session") {
+        if self.reject_active_root_navigation("session") {
             return Ok(());
         }
         let Some(session_id) = self.state.selected_session().map(|session| session.id) else {
@@ -1644,11 +1787,7 @@ impl TuiController {
         let read = session_view(&self.app.session_service, session_id).await?;
         self.cancel_pending_prompt_enhance();
         self.apply_access_mode_owner(read.session.access_mode);
-        self.state.load_turn_items_with_active_turn(
-            &read.session,
-            &read.turns.items,
-            read.active_turn_id,
-        );
+        self.state.load_canonical_session_read(&read);
         self.state.status_message = Some(format!("rejoined running session {session_id}"));
         self.state.modal = Modal::None;
         Ok(())
@@ -1690,7 +1829,7 @@ impl TuiController {
     }
 
     async fn archive_selected_session(&mut self, archived: bool) -> Result<(), AppRunError> {
-        if self.reject_agent_tree_navigation("session") {
+        if self.reject_active_root_navigation("session") {
             return Ok(());
         }
         let Some(session_id) = self.state.selected_session().map(|session| session.id) else {
@@ -1710,6 +1849,7 @@ impl TuiController {
             self.state.current_session_id = None;
             self.state.current_session_title = "New Session".to_string();
             self.state.transcript_entries.clear();
+            self.state.pending_turn_inputs.clear();
             self.state.tool_statuses.clear();
             self.state.current_plan = None;
             self.state.run_status = RunStatus::Idle;
@@ -1719,7 +1859,7 @@ impl TuiController {
     }
 
     async fn rollback_selected_session(&mut self) -> Result<(), AppRunError> {
-        if self.reject_agent_tree_navigation("session") {
+        if self.reject_active_root_navigation("session") {
             return Ok(());
         }
         let Some(session_id) = self.state.selected_session().map(|session| session.id) else {
@@ -1881,6 +2021,7 @@ impl TuiController {
             Modal::ConfigEditor => self.render_config_editor(frame),
             Modal::EnhanceReview => self.render_enhance_review(frame),
             Modal::WorkspacePicker => self.render_workspace_picker(frame),
+            Modal::AgentPicker => self.render_agent_picker(frame),
             Modal::None => {}
         }
         if self.pending_permission.is_some() {
@@ -1950,7 +2091,9 @@ impl TuiController {
     }
 
     fn render_transcript(&self, frame: &mut Frame<'_>, area: Rect) {
-        let lines = if self.state.transcript_entries.is_empty() {
+        let mut lines = if self.state.transcript_entries.is_empty()
+            && self.state.pending_turn_inputs.is_empty()
+        {
             vec![Line::from(
                 "No transcript yet. Type a prompt and press Ctrl+Enter.",
             )]
@@ -1961,6 +2104,7 @@ impl TuiController {
                 .flat_map(entry_to_lines)
                 .collect::<Vec<_>>()
         };
+        lines.extend(pending_turn_input_lines(&self.state.pending_turn_inputs));
         let block = Block::default().borders(Borders::ALL).title("Transcript");
         let inner = block.inner(area);
         let scroll = wrapped_line_scroll(&lines, inner.width, inner.height);
@@ -2025,9 +2169,9 @@ impl TuiController {
             return;
         }
         let help = if self.state.route == Route::Home {
-            "Ctrl+Enter=send/open/steer  Ctrl+X=stop  F2=history  F3=config  F4=workspace  F5=explorer  F6=enhance  F7=review  F8=toggle_access  F9=export_md  Enter=ime  Ctrl+J=newline  Ctrl+Q=quit"
+            "Ctrl+Enter=send/open/steer  Ctrl+X=stop root  F2=history  F3=config  F4=workspace  F5=explorer  F6=enhance  F7=review  F8=toggle_access  F9=export_md  F10=agents  Enter=ime  Ctrl+J=newline  Ctrl+Q=quit"
         } else {
-            "Ctrl+Enter=send/steer  Ctrl+X=stop  F1=home  F2=history  F3=config  F4=workspace  F5=explorer  F6=enhance  F7=review  F8=toggle_access  F9=export_md  Enter=ime  Ctrl+J=newline  Ctrl+Q=quit"
+            "Ctrl+Enter=send/steer  Ctrl+X=stop root  F1=home  F2=history  F3=config  F4=workspace  F5=explorer  F6=enhance  F7=review  F8=toggle_access  F9=export_md  F10=agents  Enter=ime  Ctrl+J=newline  Ctrl+Q=quit"
         };
         frame.render_widget(Clear, area);
         let block = Block::default().borders(Borders::ALL).title(help);
@@ -2399,6 +2543,47 @@ impl TuiController {
         frame.render_widget(&workspace_picker, sections[1]);
     }
 
+    fn render_agent_picker(&self, frame: &mut Frame<'_>) {
+        let area = centered_rect(82, 62, frame.area());
+        frame.render_widget(Clear, area);
+        let items = self
+            .agent_picker_rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let style = if index == self.agent_picker_selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let turn = row
+                    .active_turn_id
+                    .map(|turn_id| turn_id.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                ListItem::new(format!(
+                    "{}  {}  turn={}  {}",
+                    row.agent_path,
+                    tui_agent_status_label(&row.status),
+                    turn,
+                    truncate_middle(&row.current_activity, 48)
+                ))
+                .style(style)
+            })
+            .collect::<Vec<_>>();
+        let title = if self.agent_picker_rows.is_empty() {
+            "Sub Agents  no retained agents  Esc=close"
+        } else {
+            "Sub Agents  Up/Down=select  x=interrupt exact running child  Esc=close"
+        };
+        frame.render_widget(
+            List::new(items).block(Block::default().borders(Borders::ALL).title(title)),
+            area,
+        );
+    }
+
     fn render_permission_overlay(&self, frame: &mut Frame<'_>) {
         let area = centered_rect(70, 40, frame.area());
         frame.render_widget(Clear, area);
@@ -2467,7 +2652,7 @@ impl TuiController {
                 Line::from(""),
                 Line::from("a = approve and run once"),
                 Line::from("d / Esc = do not run; stop the requesting task for new instructions"),
-                Line::from("Ctrl+X = stop the entire active agent tree"),
+                Line::from("Ctrl+X = stop the current requesting task"),
             ]);
             frame.render_widget(
                 Paragraph::new(Text::from(lines))
@@ -2509,7 +2694,6 @@ enum RuntimeMessage {
     SteerStored {
         submission_id: u64,
         session_id: SessionId,
-        prompt: String,
         result: Result<(), String>,
     },
     EnhanceFinished {
@@ -2532,16 +2716,20 @@ fn live_event_requires_canonical_refresh(event: &RunEvent) -> bool {
             | RunEvent::PermissionRequested { .. }
             | RunEvent::PermissionResolved { .. }
             | RunEvent::RecoverableRuntimeFeedback { .. }
+            | RunEvent::TurnTerminal { .. }
     )
 }
 
-fn event_requires_plan_refresh(event: &RunEvent) -> bool {
+fn event_requires_canonical_conversation_refresh(event: &RunEvent) -> bool {
     matches!(
         event,
-        RunEvent::ToolCallCompleted {
-            tool: crate::tool::ToolName::UpdatePlan,
-            ..
-        }
+        RunEvent::ModelRequestPrepared { .. }
+            | RunEvent::CompactionCompleted { .. }
+            | RunEvent::TurnTerminal { .. }
+            | RunEvent::ToolCallCompleted {
+                tool: crate::tool::ToolName::UpdatePlan,
+                ..
+            }
     )
 }
 
@@ -2635,16 +2823,6 @@ fn tui_terminal_error_status(cause: Option<&RunCancellationCause>) -> RunStatus 
         RunStatus::Cancelled
     } else {
         RunStatus::Failed
-    }
-}
-
-fn tui_run_status_for_session_status(status: SessionStatus) -> RunStatus {
-    match status {
-        SessionStatus::Idle => RunStatus::Idle,
-        SessionStatus::Running => RunStatus::Running,
-        SessionStatus::Completed => RunStatus::Completed,
-        SessionStatus::Cancelled => RunStatus::Cancelled,
-        SessionStatus::Failed => RunStatus::Failed,
     }
 }
 
@@ -2983,6 +3161,35 @@ fn entry_to_lines(entry: &TranscriptEntry) -> Vec<Line<'static>> {
     ))];
     push_multiline_text(&mut lines, &entry.body);
     lines.push(Line::from(""));
+    lines
+}
+
+fn pending_turn_input_lines(
+    inputs: &[crate::session::PendingTurnInputProjection],
+) -> Vec<Line<'static>> {
+    if inputs.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        "[Pending model input]",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    for input in inputs {
+        lines.push(Line::from(Span::styled(
+            format!("id={} turn={}", input.id, input.turn_id),
+            Style::default().fg(Color::DarkGray),
+        )));
+        push_multiline_text(&mut lines, &input.text);
+        if input.image_count > 0 {
+            lines.push(Line::from(format!(
+                "attachments: {} image(s)",
+                input.image_count
+            )));
+        }
+        lines.push(Line::from(""));
+    }
     lines
 }
 
@@ -3599,7 +3806,6 @@ mod key_tests {
             .send(RuntimeMessage::SteerStored {
                 submission_id: 11,
                 session_id,
-                prompt: "steer draft".to_string(),
                 result: Ok(()),
             })
             .expect("durable steer");
@@ -3610,11 +3816,14 @@ mod key_tests {
 
         assert_eq!(textarea_value(&controller.composer), "steer draft");
         assert!(controller.pending_composer_submissions.is_empty());
-        assert!(controller.state.transcript_entries.iter().any(|entry| {
-            entry.kind == TranscriptKind::User
-                && entry.title == "User Steer"
-                && entry.body == "steer draft"
-        }));
+        assert!(
+            controller
+                .state
+                .transcript_entries
+                .iter()
+                .all(|entry| entry.body != "steer draft"),
+            "an acknowledgement cannot invent a canonical transcript row"
+        );
     }
 
     #[test]
@@ -3759,6 +3968,31 @@ mod key_tests {
             .expect("drain cancellation event");
         assert!(controller.pending_permission.is_none());
         assert!(controller.state.permission.is_none());
+    }
+
+    #[tokio::test]
+    async fn tui_stop_without_a_root_resolves_only_the_displayed_approval_ticket() {
+        let (_temp, mut controller, _session_id) =
+            tui_controller_with_session("approval-owned-stop").await;
+        controller.state.run_status = RunStatus::Completed;
+        let request = test_tui_permission("detached-child-approval");
+        let (response, receiver) = mpsc::channel();
+        controller.pending_permission = Some(PendingPermission {
+            confirmation_id: 42,
+            request,
+            responder: response,
+            run_control: RunControl::new(),
+        });
+
+        controller.stop_current_run().await.expect("approval abort");
+
+        assert_eq!(receiver.try_recv(), Ok(ReviewDecision::Abort));
+        assert!(controller.pending_permission.is_none());
+        let expected_status = permission_decision_pending_status_message();
+        assert_eq!(
+            controller.state.status_message.as_deref(),
+            Some(expected_status.as_str())
+        );
     }
 
     #[tokio::test]
@@ -3969,7 +4203,7 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn tui_durable_only_tree_stop_preserves_completed_root_status() {
+    async fn tui_ctrl_x_does_not_stop_a_durable_child_when_root_is_completed() {
         use crate::session::{NewSession, SessionRepository as _};
 
         let (_temp, mut controller, root_session_id) =
@@ -4018,8 +4252,9 @@ mod key_tests {
             )
             .await
             .expect("spawn edge");
+        let child_turn_id = crate::protocol::TurnId::new();
         repository
-            .admit_session_turn(child.id, crate::protocol::TurnId::new())
+            .admit_session_turn(child.id, child_turn_id)
             .await
             .expect("child admission")
             .expect("child admitted");
@@ -4030,7 +4265,10 @@ mod key_tests {
         assert_eq!(controller.state.run_status, RunStatus::Completed);
         assert!(!controller.root_run_lifecycle.is_active());
 
-        controller.stop_current_run().await.expect("tree stop");
+        controller
+            .stop_current_run()
+            .await
+            .expect("exact root stop");
 
         assert_eq!(controller.state.run_status, RunStatus::Completed);
         assert_eq!(
@@ -4045,9 +4283,230 @@ mod key_tests {
             repository
                 .get_session(child.id)
                 .await
-                .expect("stopped child")
+                .expect("preserved child")
+                .status,
+            SessionStatus::Running
+        );
+
+        controller
+            .open_agent_picker()
+            .await
+            .expect("open explicit agent picker");
+        assert_eq!(controller.state.modal, Modal::AgentPicker);
+        assert_eq!(controller.agent_picker_rows.len(), 1);
+        assert_eq!(
+            controller.agent_picker_rows[0].active_turn_id,
+            Some(child_turn_id)
+        );
+        controller
+            .handle_agent_picker_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .await
+            .expect("interrupt selected exact child");
+        assert_eq!(controller.state.modal, Modal::None);
+        assert_eq!(
+            repository
+                .get_session(child.id)
+                .await
+                .expect("interrupted child")
                 .status,
             SessionStatus::Cancelled
+        );
+        assert_eq!(
+            repository
+                .durable_terminal_for_turn(child.id, child_turn_id)
+                .await
+                .expect("child terminal")
+                .expect("interrupted child terminal")
+                .outcome,
+            crate::protocol::TurnTerminalOutcome::Interrupted {
+                cause: TurnInterruptionCause::AgentInterrupted,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn tui_completed_root_allows_new_turn_while_durable_child_is_running() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (_temp, mut controller, root_session_id) =
+            tui_controller_with_session("durable-child-new-root-turn").await;
+        let repository = controller.app.store.session_repo();
+        let root_turn = crate::protocol::TurnId::new();
+        repository
+            .admit_session_turn(root_session_id, root_turn)
+            .await
+            .expect("root admission")
+            .expect("root admitted");
+        append_tui_user_history(&controller, root_session_id, "start detached work");
+        let root_target = repository
+            .captured_running_terminal_target(root_session_id)
+            .await
+            .expect("capture root target")
+            .expect("root running target");
+        assert!(
+            repository
+                .terminalize_captured_running_session_with_protocol_event(
+                    root_session_id,
+                    &completed_turn_event(root_session_id),
+                    root_target,
+                )
+                .await
+                .expect("complete root")
+        );
+        let child = repository
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "running durable child".to_string(),
+                cwd: controller.app.workspace.cwd.clone(),
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: crate::config::AccessMode::Default,
+            })
+            .await
+            .expect("child session");
+        repository
+            .insert_session_spawn_edge(
+                root_session_id,
+                root_session_id,
+                child.id,
+                "/root/running_child",
+                "running_child",
+            )
+            .await
+            .expect("spawn edge");
+        repository
+            .admit_session_turn(child.id, crate::protocol::TurnId::new())
+            .await
+            .expect("child admission")
+            .expect("child admitted");
+        controller
+            .open_session(root_session_id)
+            .await
+            .expect("open completed root");
+        assert!(
+            controller
+                .app
+                .run_service
+                .durable_agent_activity_records(root_session_id)
+                .await
+                .expect("durable activity")
+                .iter()
+                .any(|record| record.can_interrupt)
+        );
+        assert!(!controller.root_run_lifecycle.is_active());
+
+        let prompt = "continue root work while the child runs".to_string();
+        controller
+            .launch_run(prompt.clone(), PromptDispatchPart::raw(&prompt))
+            .await
+            .expect("launch independent root turn");
+        assert!(
+            controller.root_run_lifecycle.is_active(),
+            "descendant liveness must not block a new exact root owner"
+        );
+        controller
+            .stop_current_run()
+            .await
+            .expect("stop launched root turn");
+    }
+
+    #[tokio::test]
+    async fn tui_agent_picker_stale_turn_a_does_not_interrupt_replacement_turn_b() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (_temp, mut controller, root_session_id) =
+            tui_controller_with_session("stale-agent-picker").await;
+        let repository = controller.app.store.session_repo();
+        let child = repository
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "replaceable child".to_string(),
+                cwd: controller.app.workspace.cwd.clone(),
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: crate::config::AccessMode::Default,
+            })
+            .await
+            .expect("child session");
+        repository
+            .insert_session_spawn_edge(
+                root_session_id,
+                root_session_id,
+                child.id,
+                "/root/replaceable",
+                "replaceable",
+            )
+            .await
+            .expect("spawn edge");
+        let turn_a = crate::protocol::TurnId::new();
+        let admission_a = repository
+            .admit_session_turn(child.id, turn_a)
+            .await
+            .expect("turn A admission")
+            .expect("turn A admitted");
+        controller
+            .open_session(root_session_id)
+            .await
+            .expect("open root");
+        controller
+            .open_agent_picker()
+            .await
+            .expect("capture turn A in picker");
+        assert_eq!(controller.agent_picker_rows[0].active_turn_id, Some(turn_a));
+
+        let target_a = repository
+            .captured_running_terminal_target(child.id)
+            .await
+            .expect("capture turn A")
+            .expect("running turn A");
+        assert!(
+            repository
+                .terminalize_captured_running_session_with_protocol_event(
+                    child.id,
+                    &completed_turn_event(child.id),
+                    target_a,
+                )
+                .await
+                .expect("complete turn A")
+        );
+        assert!(
+            repository
+                .release_stopped_run_admission(child.id, admission_a.admission_id)
+                .await
+                .expect("release retained turn A admission")
+        );
+        let turn_b = crate::protocol::TurnId::new();
+        repository
+            .admit_session_turn(child.id, turn_b)
+            .await
+            .expect("turn B admission")
+            .expect("turn B admitted");
+
+        controller
+            .handle_agent_picker_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .await
+            .expect("reject stale picker action");
+        assert_eq!(
+            repository
+                .fresh_running_turn_for_session(child.id)
+                .await
+                .expect("replacement owner"),
+            Some(turn_b)
+        );
+        assert!(
+            repository
+                .durable_terminal_for_turn(child.id, turn_b)
+                .await
+                .expect("replacement terminal")
+                .is_none()
+        );
+        assert_eq!(controller.state.modal, Modal::AgentPicker);
+        assert!(
+            controller
+                .state
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("turn changed"))
         );
     }
 
@@ -4090,7 +4549,7 @@ mod key_tests {
         assert_eq!(
             permission_decision_for_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
             None,
-            "Ctrl+X remains the separate tree-wide stop action"
+            "Ctrl+X remains the separate exact root Stop action"
         );
     }
 

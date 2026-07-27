@@ -12,6 +12,7 @@ use crate::session::{
     SessionStatus, ToolCallStatus,
 };
 use crate::tui::state::{AppState, RunProgressPhase, RunStatus, TranscriptKind};
+use crate::workspace::project::project_display_name;
 
 use super::artifact_projection::{
     artifact_rows_from_file_changes, file_change_rows_from_turn_items_with_root,
@@ -240,7 +241,7 @@ fn build_project_rows(
             0,
             DesktopProjectRow {
                 project_id: current_project_id,
-                label: project_folder_label(current_path),
+                label: truncate_text(&project_display_name(current_path), 34),
                 path: current_path.to_string(),
             },
         );
@@ -265,13 +266,12 @@ fn internal_desktop_project_roots(data_dir: &camino::Utf8Path) -> Vec<camino::Ut
 }
 
 fn format_project_row(project: &ProjectRecord) -> String {
-    truncate_text(&project_folder_label(&project.root_path), 34)
-}
-
-fn project_folder_label(path: &camino::Utf8Path) -> String {
-    path.file_name()
-        .map(str::to_string)
-        .unwrap_or_else(|| path.to_string())
+    let display_name = if project.display_name.trim().is_empty() {
+        project_display_name(&project.root_path)
+    } else {
+        project.display_name.clone()
+    };
+    truncate_text(&display_name, 34)
 }
 
 pub fn select_session_index(
@@ -352,6 +352,7 @@ pub fn build_session_detail(
 struct TurnTranscriptGroup {
     turn_id: Option<crate::protocol::TurnId>,
     user_body: String,
+    user_history_item_id: Option<crate::protocol::HistoryItemId>,
     assistant_bodies: Vec<String>,
     tool_rows: Vec<String>,
     file_change_items: Vec<crate::protocol::TurnItem>,
@@ -421,6 +422,7 @@ pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed(
                 );
                 current.turn_id = Some(item.turn_id);
                 current.user_body = text.clone();
+                current.user_history_item_id = item.source_item_id;
             }
             crate::protocol::TurnItemPayload::SteerMessage { text } => {
                 let elapsed_ms = current
@@ -436,6 +438,7 @@ pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed(
                 );
                 current.turn_id = Some(item.turn_id);
                 current.user_body = text.clone();
+                current.user_history_item_id = item.source_item_id;
             }
             crate::protocol::TurnItemPayload::AgentMessage { text } => {
                 current.assistant_bodies.push(text.clone());
@@ -621,16 +624,21 @@ fn flush_turn_transcript_group(
 ) {
     if !group.has_content() {
         group.turn_id = None;
+        group.user_history_item_id = None;
         return;
     }
     if !group.user_body.trim().is_empty() {
-        rows.push(desktop_transcript_row(
+        let mut row = desktop_transcript_row(
             DesktopTranscriptRowKind::User,
             String::new(),
             "ユーザー依頼".to_string(),
             group.user_body.trim().to_string(),
             Vec::new(),
-        ));
+        );
+        row.stable_history_identity = group
+            .user_history_item_id
+            .map(|item_id| item_id.to_string());
+        rows.push(row);
     }
     let has_work_summary = turn_group_has_work_summary(group);
     rows.extend(group.system_rows.drain(..));
@@ -680,6 +688,7 @@ fn flush_turn_transcript_group(
     }
 
     group.user_body.clear();
+    group.user_history_item_id = None;
     group.assistant_bodies.clear();
     group.tool_rows.clear();
     group.file_change_items.clear();
@@ -1624,6 +1633,7 @@ mod tests {
                 has_more: false,
                 items: turn_items,
             },
+            pending_turn_inputs: Vec::new(),
             turn_elapsed_ms,
             latest_turn_id,
             active_turn_id: None,
@@ -2097,7 +2107,7 @@ mod tests {
         let projects = vec![ProjectRecord {
             id: other_project,
             root_path: Utf8PathBuf::from("C:/workspace/other"),
-            display_name: "Workspace".to_string(),
+            display_name: " Workspace ".to_string(),
             vcs_kind: "none".to_string(),
             created_at_ms: 1,
             updated_at_ms: 1,
@@ -2116,9 +2126,30 @@ mod tests {
             rows.iter()
                 .find(|row| row.project_id == other_project)
                 .map(|row| row.label.as_str()),
-            Some("other")
+            Some(" Workspace ")
         );
         assert!(rows.iter().any(|row| row.project_id == other_project));
+    }
+
+    #[test]
+    fn project_rows_keep_drive_root_authority_while_using_persisted_display_name() {
+        let project_id = ProjectId::new();
+        let root = Utf8PathBuf::from("R:/");
+        let projects = vec![ProjectRecord {
+            id: project_id,
+            root_path: root.clone(),
+            display_name: "MappedProjectFolder".to_string(),
+            vcs_kind: "none".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }];
+
+        let (rows, selected) = build_project_rows(&projects, project_id, &root, &[]);
+
+        assert_eq!(selected, 0);
+        assert_eq!(rows[0].project_id, project_id);
+        assert_eq!(rows[0].label, "MappedProjectFolder");
+        assert_eq!(rows[0].path, "R:/");
     }
 
     #[test]

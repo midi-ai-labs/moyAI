@@ -11,22 +11,8 @@ pub struct ToolSpecPlan {
     parallel_tool_calls: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentToolRole {
-    Root,
-    Child,
-}
-
 impl ToolSpecPlan {
     pub fn build(step: &StepContext, registry: &ToolRegistry) -> Self {
-        Self::build_for_agent(step, registry, AgentToolRole::Root)
-    }
-
-    pub fn build_for_agent(
-        step: &StepContext,
-        registry: &ToolRegistry,
-        agent_role: AgentToolRole,
-    ) -> Self {
         if !step.turn.policy.model.supports_tools {
             return Self {
                 router: ToolRegistry::empty(),
@@ -37,7 +23,16 @@ impl ToolSpecPlan {
 
         let mut router = registry.clone();
         if step.turn.mode.kind == ModeKind::Plan {
-            router.retain_effect(ToolEffectClass::Read, step.external_tools.mcp.as_ref());
+            router.retain_effect_with_exceptions(
+                ToolEffectClass::Read,
+                step.external_tools.mcp.as_ref(),
+                &[
+                    "spawn_agent",
+                    "send_message",
+                    "followup_task",
+                    "interrupt_agent",
+                ],
+            );
         }
         if step.turn.multi_agent_mode().is_none() {
             router.retain_tools(|name| {
@@ -51,8 +46,6 @@ impl ToolSpecPlan {
                         | "list_agents"
                 )
             });
-        } else if agent_role == AgentToolRole::Child {
-            router.retain_tools(|name| name != "spawn_agent");
         }
         if !step.external_tools.docling_enabled {
             router.retain_tools(|name| name != "docling_convert");
@@ -160,9 +153,12 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_keeps_plan_projection_and_hides_mutation_tools() {
-        let registry = ToolRegistry::core_agent();
-        let plan = ToolSpecPlan::build(&step(ModeKind::Plan), &registry);
+    fn plan_mode_keeps_plan_projection_and_codex_collaboration_surface() {
+        let mut config = ResolvedConfig::default();
+        config.multi_agent.enabled = true;
+        config.multi_agent.mode = crate::config::MultiAgentMode::Proactive;
+        let registry = ToolRegistry::core_agent_for_config(&config);
+        let plan = ToolSpecPlan::build(&step_for_config(ModeKind::Plan, &config), &registry);
         let names = plan.tool_names();
         assert!(!names.contains(&"apply_patch".to_string()));
         assert!(!names.contains(&"shell".to_string()));
@@ -170,12 +166,22 @@ mod tests {
         assert!(!names.contains(&"create_goal".to_string()));
         assert!(!names.contains(&"update_goal".to_string()));
         assert!(names.contains(&"update_plan".to_string()));
-        assert!(
-            plan.router()
-                .specs()
-                .iter()
-                .all(|spec| spec.effect.can_resolve_to(ToolEffectClass::Read, None))
-        );
+        for name in [
+            "spawn_agent",
+            "send_message",
+            "followup_task",
+            "wait_agent",
+            "interrupt_agent",
+            "list_agents",
+        ] {
+            assert!(names.contains(&name.to_string()), "missing {name}");
+            assert!(
+                plan.router()
+                    .validate_call_effect(name, &serde_json::json!({}), &config.mcp)
+                    .is_ok(),
+                "Plan must route collaboration tool {name}"
+            );
+        }
         assert!(
             plan.router()
                 .available_tool_names()
@@ -192,18 +198,17 @@ mod tests {
     }
 
     #[test]
-    fn child_agent_keeps_collaboration_tools_but_cannot_spawn() {
+    fn every_agent_keeps_normal_and_collaboration_tools() {
         let mut config = ResolvedConfig::default();
         config.multi_agent.enabled = true;
         config.multi_agent.mode = crate::config::MultiAgentMode::Proactive;
         let registry = ToolRegistry::core_agent_for_config(&config);
         let step = step_for_config(ModeKind::Default, &config);
 
-        let root = ToolSpecPlan::build_for_agent(&step, &registry, AgentToolRole::Root);
-        let child = ToolSpecPlan::build_for_agent(&step, &registry, AgentToolRole::Child);
-
-        assert!(root.tool_names().contains(&"spawn_agent".to_string()));
-        assert!(!child.tool_names().contains(&"spawn_agent".to_string()));
+        let plan = ToolSpecPlan::build(&step, &registry);
+        assert!(plan.tool_names().contains(&"spawn_agent".to_string()));
+        assert!(plan.tool_names().contains(&"read".to_string()));
+        assert!(plan.tool_names().contains(&"apply_patch".to_string()));
         for name in [
             "send_message",
             "followup_task",
@@ -212,11 +217,11 @@ mod tests {
             "list_agents",
         ] {
             assert!(
-                child.tool_names().contains(&name.to_string()),
+                plan.tool_names().contains(&name.to_string()),
                 "missing {name}"
             );
         }
-        assert_eq!(child.tool_names(), child.router().available_tool_names());
+        assert_eq!(plan.tool_names(), plan.router().available_tool_names());
     }
 
     #[test]

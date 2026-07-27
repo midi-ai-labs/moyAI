@@ -6,8 +6,9 @@ use crate::protocol::{
 };
 use crate::runtime::RunCancellationCause;
 use crate::session::{
-    DispatchTransformKind, LoadedSessionStatus, LoadedSessionSummary, PromptDispatchPart, RunEvent,
-    RunSummary, SessionId, SessionRecord, SessionStatus, ToolCallId, ToolCallStatus,
+    CanonicalSessionRead, DispatchTransformKind, DurableTurnTerminal, LoadedSessionStatus,
+    LoadedSessionSummary, PendingTurnInputProjection, PromptDispatchPart, RunEvent, RunSummary,
+    SessionId, SessionRecord, SessionStatus, ToolCallId, ToolCallStatus,
 };
 use crate::tool::{PermissionRequest, ToolName};
 
@@ -24,6 +25,7 @@ pub enum Modal {
     ConfigEditor,
     EnhanceReview,
     WorkspacePicker,
+    AgentPicker,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +201,7 @@ pub struct AppState {
     pub session_search_text: String,
     pub session_search_include_archived: bool,
     pub transcript_entries: Vec<TranscriptEntry>,
+    pub pending_turn_inputs: Vec<PendingTurnInputProjection>,
     pub tool_statuses: Vec<ToolStatusView>,
     pub current_plan: Option<PlanView>,
     pub run_status: RunStatus,
@@ -224,6 +227,7 @@ impl Default for AppState {
             session_search_text: String::new(),
             session_search_include_archived: false,
             transcript_entries: Vec::new(),
+            pending_turn_inputs: Vec::new(),
             tool_statuses: Vec::new(),
             current_plan: None,
             run_status: RunStatus::Idle,
@@ -262,6 +266,9 @@ impl AppState {
         self.current_session_id = Some(session.id);
         self.current_session_title = session.title.clone();
         self.transcript_entries = transcript_entries_from_turn_items(turn_items);
+        if previous_session_id != Some(session.id) {
+            self.pending_turn_inputs.clear();
+        }
         self.tool_statuses = if session.status == SessionStatus::Running {
             active_turn_id
                 .map(|turn_id| tool_statuses_from_turn_items_for_turn(turn_items, Some(turn_id)))
@@ -300,6 +307,25 @@ impl AppState {
         };
         self.permission = None;
         self.prompt_review = None;
+    }
+
+    pub fn load_canonical_session_read(&mut self, read: &CanonicalSessionRead) {
+        self.load_turn_items_with_active_turn(
+            &read.session,
+            &read.turns.items,
+            read.active_turn_id,
+        );
+        self.pending_turn_inputs = read.pending_turn_inputs.clone();
+    }
+
+    pub fn refresh_canonical_conversation(&mut self, read: &CanonicalSessionRead) -> bool {
+        if self.current_session_id != Some(read.session.id) {
+            return false;
+        }
+        self.transcript_entries = transcript_entries_from_turn_items(&read.turns.items);
+        self.pending_turn_inputs = read.pending_turn_inputs.clone();
+        self.refresh_plan_from_turn_items(&read.turns.items);
+        true
     }
 
     pub fn set_sessions(&mut self, sessions: Vec<SessionRecord>) {
@@ -622,23 +648,10 @@ impl AppState {
                 });
             }
             RunEvent::TurnTerminal { terminal, .. } => {
-                self.interruption_cause = terminal.interruption_cause();
-                self.permission = None;
-                self.progress.model_requests = terminal.metrics.model_request_count;
-                self.progress.tool_calls_started = terminal.tool_call_count;
-                self.progress.tool_calls_failed = terminal.failed_tool_count;
-                self.progress.current_phase = RunProgressPhase::Terminal;
-                self.progress.active_step = terminal.summary().to_string();
+                self.apply_durable_terminal(terminal);
                 match &terminal.outcome {
-                    TurnTerminalOutcome::Completed => {
-                        self.run_status = RunStatus::Completed;
-                        self.status_message = self.run_status.default_status_message();
-                        self.progress.status = "Completed".to_string();
-                    }
-                    TurnTerminalOutcome::Interrupted { cause } => {
-                        self.run_status = RunStatus::Cancelled;
-                        self.status_message = Some(interruption_status_message(*cause));
-                        self.progress.status = "Cancelled".to_string();
+                    TurnTerminalOutcome::Completed => {}
+                    TurnTerminalOutcome::Interrupted { .. } => {
                         self.transcript_entries.push(TranscriptEntry {
                             kind: TranscriptKind::System,
                             title: "Run interrupted".to_string(),
@@ -648,9 +661,6 @@ impl AppState {
                         });
                     }
                     TurnTerminalOutcome::Failed { error } => {
-                        self.run_status = RunStatus::Failed;
-                        self.status_message = Some(error.clone());
-                        self.progress.status = "Failed".to_string();
                         self.transcript_entries.push(TranscriptEntry {
                             kind: TranscriptKind::Error,
                             title: "Run failed".to_string(),
@@ -730,21 +740,6 @@ impl AppState {
         self.progress.active_step = "User input stored".to_string();
     }
 
-    pub fn apply_durable_steer_prompt(&mut self, prompt: &str) {
-        self.route = Route::Session;
-        self.transcript_entries.push(TranscriptEntry {
-            kind: TranscriptKind::User,
-            title: "User Steer".to_string(),
-            body: prompt.to_string(),
-            response_id: None,
-            tool_call_id: None,
-        });
-        self.run_status = RunStatus::Running;
-        self.progress.status = "Running".to_string();
-        self.progress.current_phase = RunProgressPhase::User;
-        self.progress.active_step = "Steer input stored".to_string();
-    }
-
     pub fn apply_durable_prompt_dispatch(&mut self, prompt_dispatch: &PromptDispatchPart) {
         self.route = Route::Session;
         if should_render_prompt_dispatch_summary(prompt_dispatch) {
@@ -817,7 +812,39 @@ impl AppState {
         ))
     }
 
-    pub fn set_summary(&mut self, summary: RunSummary) {
+    pub(crate) fn apply_terminal_outcome_projection(&mut self, outcome: &TurnTerminalOutcome) {
+        self.interruption_cause = outcome.interruption_cause();
+        self.permission = None;
+        self.progress.current_phase = RunProgressPhase::Terminal;
+        self.progress.active_step = outcome.summary().to_string();
+        match outcome {
+            TurnTerminalOutcome::Completed => {
+                self.run_status = RunStatus::Completed;
+                self.status_message = self.run_status.default_status_message();
+                self.progress.status = "Completed".to_string();
+            }
+            TurnTerminalOutcome::Interrupted { cause } => {
+                self.run_status = RunStatus::Cancelled;
+                self.status_message = Some(interruption_status_message(*cause));
+                self.progress.status = "Cancelled".to_string();
+            }
+            TurnTerminalOutcome::Failed { error } => {
+                self.run_status = RunStatus::Failed;
+                self.status_message = Some(error.clone());
+                self.progress.status = "Failed".to_string();
+            }
+        }
+    }
+
+    fn apply_durable_terminal(&mut self, terminal: &DurableTurnTerminal) {
+        self.progress.model_requests = terminal.metrics.model_request_count;
+        self.progress.tool_calls_started = terminal.tool_call_count;
+        self.progress.tool_calls_failed = terminal.failed_tool_count;
+        self.apply_terminal_outcome_projection(&terminal.outcome);
+    }
+
+    pub fn apply_run_summary(&mut self, summary: RunSummary) {
+        self.apply_durable_terminal(summary.terminal());
         self.last_summary = Some(summary);
     }
 }
@@ -1308,6 +1335,92 @@ mod tests {
         }
     }
 
+    fn canonical_read(
+        session: &SessionRecord,
+        turn_items: Vec<TurnItem>,
+        pending_turn_inputs: Vec<PendingTurnInputProjection>,
+        active_turn_id: Option<TurnId>,
+    ) -> CanonicalSessionRead {
+        CanonicalSessionRead {
+            session: session.clone(),
+            history: crate::session::CanonicalHistoryPage {
+                session: session.clone(),
+                offset: 0,
+                limit: 0,
+                total: 0,
+                has_more: false,
+                items: Vec::new(),
+            },
+            turns: crate::session::CanonicalTurnPage {
+                session: session.clone(),
+                offset: 0,
+                limit: 50,
+                total: turn_items.len(),
+                has_more: false,
+                items: turn_items,
+            },
+            pending_turn_inputs,
+            turn_elapsed_ms: Default::default(),
+            latest_turn_id: active_turn_id,
+            active_turn_id,
+            active_turn_sequence_no: active_turn_id.map(|_| 1),
+        }
+    }
+
+    #[test]
+    fn tui_pending_steer_is_separate_and_delivery_uses_canonical_projection_once() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let input_id = crate::protocol::HistoryItemId::new();
+        let mut session = test_session(session_id);
+        session.status = SessionStatus::Running;
+        session.completed_at_ms = None;
+        let queued = canonical_read(
+            &session,
+            Vec::new(),
+            vec![PendingTurnInputProjection {
+                id: input_id,
+                turn_id,
+                text: "same text".to_string(),
+                image_count: 0,
+                accepted_at_ms: 3,
+                client_user_message_id: None,
+            }],
+            Some(turn_id),
+        );
+        let mut state = AppState::default();
+
+        state.load_canonical_session_read(&queued);
+        assert!(state.transcript_entries.is_empty());
+        assert_eq!(state.pending_turn_inputs[0].id, input_id);
+
+        let delivered = canonical_read(
+            &session,
+            vec![TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id,
+                source_item_id: Some(input_id),
+                sequence_no: 1,
+                payload: TurnItemPayload::SteerMessage {
+                    text: "same text".to_string(),
+                },
+            }],
+            Vec::new(),
+            Some(turn_id),
+        );
+        assert!(state.refresh_canonical_conversation(&delivered));
+        assert!(state.pending_turn_inputs.is_empty());
+        assert_eq!(
+            state
+                .transcript_entries
+                .iter()
+                .filter(|entry| entry.body == "same text")
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn tui_primary_transcript_omits_internal_projection_items() {
         assert!(super::tui_primary_transcript_omits_internal_projection_items_fixture_passes());
@@ -1347,6 +1460,53 @@ mod tests {
         assert_eq!(state.run_status, RunStatus::Running);
         state.clear_permission();
         assert_eq!(state.run_status, RunStatus::Running);
+    }
+
+    #[test]
+    fn durable_summary_is_the_terminal_projection_owner_without_duplicate_transcript_rows() {
+        let session_id = SessionId::new();
+        let terminal = DurableTurnTerminal {
+            outcome: TurnTerminalOutcome::Interrupted {
+                cause: TurnInterruptionCause::UserStop,
+            },
+            final_response_id: None,
+            tool_call_count: 7,
+            failed_tool_count: 2,
+            change_count: 3,
+            metrics: crate::session::RunMetrics {
+                model_request_count: 5,
+                ..Default::default()
+            },
+        };
+        let mut state = AppState {
+            current_session_id: Some(session_id),
+            run_status: RunStatus::Running,
+            ..AppState::default()
+        };
+
+        state.apply_run_event(&RunEvent::TurnTerminal {
+            session_id,
+            terminal: Box::new(terminal.clone()),
+        });
+        let terminal_rows = state.transcript_entries.len();
+        state.apply_run_summary(RunSummary::from_terminal(
+            session_id,
+            TurnId::new(),
+            terminal,
+        ));
+
+        assert_eq!(state.run_status, RunStatus::Cancelled);
+        assert_eq!(
+            state.interruption_cause,
+            Some(TurnInterruptionCause::UserStop)
+        );
+        assert_eq!(state.status_message.as_deref(), Some("run stopped by user"));
+        assert_eq!(state.progress.status, "Cancelled");
+        assert_eq!(state.progress.model_requests, 5);
+        assert_eq!(state.progress.tool_calls_started, 7);
+        assert_eq!(state.progress.tool_calls_failed, 2);
+        assert_eq!(state.transcript_entries.len(), terminal_rows);
+        assert!(state.last_summary.is_some());
     }
 
     #[test]
@@ -1422,6 +1582,7 @@ mod tests {
                 attempt: 1,
                 elapsed_ms: 604,
                 terminal_status: None,
+                usage: None,
                 failure: None,
             },
         });
@@ -1561,6 +1722,7 @@ mod tests {
     fn latest_context_window_survives_same_session_reload() {
         let session_id = SessionId::new();
         let status = ContextWindowTokenStatus {
+            source: crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
             active_context_tokens: 2_100,
             full_context_window_limit: 131_072,
             configured_max_output_tokens: 8_192,
@@ -1586,6 +1748,7 @@ mod tests {
         let mut state = AppState {
             current_session_id: Some(previous_session_id),
             latest_context_window: Some(ContextWindowTokenStatus {
+                source: crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
                 active_context_tokens: 2_100,
                 full_context_window_limit: 131_072,
                 configured_max_output_tokens: 8_192,

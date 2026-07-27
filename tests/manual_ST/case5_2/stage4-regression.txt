@@ -1,0 +1,13 @@
+同じtaskの追加回帰条件です。現在の設計と実装を引き継いで修正してください。
+
+cancelが受理された時点でworkerがevent生成中でも、そのworkerが後から次を行ってはいけません。
+- eventまたはcompleted roundを追加commitする。
+- `cancelled` を `running`、`completed`、`failed` のいずれかで上書きする。
+- 最初のcancelで確定した `finished_at` を変更する。
+- cancel済みartifactを後から古いactive stateで上書きする。
+
+再cancel、`completed` / `failed` へのcancelもrepository updateやartifact rewriteを行わないことを、決定的なtest doubleと同期primitiveを使うregression testで確認してください。sleep時間や実networkに依存するtestにはしないでください。
+
+既存の成功response、404/409 contract、workspace境界、dependency禁止は維持してください。必要なら `cancel_contract.md` を最小限更新し、最後に `backend` directoryで次を実行して結果を報告してください。
+
+`python -X utf8 -m pytest -p no:cacheprovider -q`

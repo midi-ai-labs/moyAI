@@ -9,7 +9,7 @@
 - `project_sandbox/<task>/case3/workspace/` に fresh workspace を作る。
 - case1 相当の `calculator.py` と `test_calculator.py` を配置し、開始前の `python -m unittest` が成功することを確認する。
 - config/data directory を fresh にする。
-- tool-call出力上限はcurrent verified provider profileを使う。同梱のLM Studio/Qwen profileでは`max_output_tokens = 8192`であり、これを縮小したrunはrelease smokeの代替にしない。
+- provider requestはcurrent product defaultを使い、effective snapshotへ記録する。明示overrideを検証するscenarioでない限り、`max_output_tokens = 32768`、request / idle timeoutは各`1800000 ms`とする。historical profileの`8192`や短いtimeoutへ縮小したrunはcurrent release smokeの代替にしない。
 - stage1 から stage3 は同一 Project Chat session で実行する。
 
 ## Stage 1 request

@@ -514,6 +514,36 @@ export const ACTIONS: ActionDefinition[] = [
     },
   },
   {
+    id: "interrupt-agent",
+    label: "Sub Agentを停止",
+    enabled: (state, payload) => state.agent_activity_rows.some(
+      (row) => row.agent_path === payload.value
+        && row.status === "running"
+        && row.can_interrupt
+        && row.active_turn_id !== null,
+    ),
+    run: async (state, context, payload) => {
+      const row = state.agent_activity_rows.find((candidate) => candidate.agent_path === payload.value);
+      const rootSessionId = state.draft_target.sessionId;
+      if (
+        !row
+        || row.status !== "running"
+        || !row.can_interrupt
+        || row.active_turn_id === null
+        || rootSessionId === null
+      ) return;
+      await context.mutate("interrupt_agent", {
+        expectedTarget: {
+          workspacePath: state.workspace_path,
+          rootSessionId,
+          agentPath: row.agent_path,
+          childSessionId: row.session_id,
+          expectedTurnId: row.active_turn_id,
+        },
+      });
+    },
+  },
+  {
     id: "show-output-pane",
     label: "出力ペインに戻る",
     enabled: always,

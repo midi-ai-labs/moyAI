@@ -2,6 +2,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { actionById, menuActions, paletteActions, shortcutActions, type ActionDefinition, type ActionMenu } from "./actions.ts";
 import { icon } from "./icons.ts";
 import { turnPageLoadPending } from "./history_navigation.ts";
+import { renderMarkdown } from "./markdown.ts";
 import { renderEarlierHistoryTrigger, renderTranscriptRows } from "./render_transcript.ts";
 import { navigationIsIdle, quickChatDeleteAction, sessionRowCapabilities } from "./navigation_state.ts";
 import {
@@ -9,12 +10,13 @@ import {
   renderInlineAgentActivity,
   renderSubAgentSummaryTrigger,
 } from "./render_agent_activity.ts";
-import { agentActivitySummary, agentDisplayName, stableAgentVisual } from "./agent_activity.ts";
+import { agentDisplayName, stableAgentVisual } from "./agent_activity.ts";
 import { runCanBeCancelled, runSurfaceActive } from "./run_control.ts";
 import type {
   ConfigFieldProjection,
   DesktopViewState,
   DesktopWebState,
+  PendingTurnInput,
   ProjectRow,
   SessionRow,
 } from "./types.ts";
@@ -198,6 +200,13 @@ function renderProjectRow(row: ProjectRow, selected: boolean, index: number, act
   `;
 }
 
+function selectedProjectDisplayLabel(
+  state: Pick<DesktopViewState, "project_rows" | "selected_project_index" | "workspace_path">,
+): string {
+  const selected = state.project_rows[state.selected_project_index];
+  return selected?.label.trim() || shortenPath(state.workspace_path);
+}
+
 function renderProjectSessionRows(state: DesktopWebState): string {
   if (state.selected_project_index < 0) {
     return "";
@@ -346,7 +355,8 @@ export function renderSidebar(state: DesktopWebState): string {
 }
 
 export function renderTopbar(state: DesktopViewState): string {
-  const workspaceLabel = state.selected_project_index >= 0 ? shortenPath(state.workspace_path) : "プロジェクトなし";
+  const workspaceLabel =
+    state.selected_project_index >= 0 ? selectedProjectDisplayLabel(state) : "プロジェクトなし";
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
   const exportDisabled = !state.history_export_enabled || !navigationIsIdle(state);
   const exportTitle = exportDisabled ? "保存できる表示中の履歴がありません" : "表示中の履歴をMarkdown保存";
@@ -384,13 +394,10 @@ export function renderRunStatusStrip(state: DesktopWebState): string {
   if (!runCanBeCancelled(state)) {
     return "";
   }
-  const agentTreeOnly = state.agent_tree_active && !state.busy && !state.confirmation_visible;
-  const phase = agentTreeOnly ? "Sub Agent" : state.run_phase.trim() || "running";
-  const step = agentTreeOnly
-    ? agentActivitySummary(state.agent_activity_rows ?? [], true)
-    : state.run_active_step.trim() || state.status_message;
-  const toolLine = agentTreeOnly ? "子Agentの完了を待機中" : state.latest_tool_summary.trim() || "ツール待機中";
-  const statusLabel = state.confirmation_visible ? "確認待ち" : agentTreeOnly ? "Sub Agent実行中" : "実行中";
+  const phase = state.run_phase.trim() || "running";
+  const step = state.run_active_step.trim() || state.status_message;
+  const toolLine = state.latest_tool_summary.trim() || "ツール待機中";
+  const statusLabel = state.confirmation_visible ? "確認待ち" : "実行中";
   return `
     <section class="run-strip" aria-live="polite">
       <span class="busy-spinner" title="${statusLabel}"></span>
@@ -430,23 +437,68 @@ export function renderThreadContent(state: DesktopWebState): string {
       selectedTranscriptAgentPath,
     )
     : "";
-  if ((state.thread_empty || state.selected_session_index < 0) && state.file_change_rows.length === 0) {
+  const pendingInputs = visiblePendingTurnInputs(state);
+  const pending = renderPendingTurnInputs(pendingInputs);
+  if (
+    (state.thread_empty || state.selected_session_index < 0)
+    && state.file_change_rows.length === 0
+    && pendingInputs.length === 0
+  ) {
     return `${renderEmptyThread(state)}${agentActivity}`;
   }
   const earlier = renderEarlierHistoryTrigger(
     state.turn_page_offset,
     !state.turn_page_admission_open || turnPageLoadPending(state),
   );
-  return `${earlier}${agentActivity}${renderTranscriptRows(state.transcript_rows, {
-    includeRail: true,
-    agentActivityRows: state.agent_activity_rows,
-    currentTurnAgentActivityRows: state.current_turn_agent_activity_rows,
-    includeLiveAgentFallback: state.current_turn_agent_activity_rows.length > 0,
-    selectedAgentPath: selectedTranscriptAgentPath,
-    // Keep the newest response marker stable across streaming and the terminal
-    // projection that seals the same response.
-    stableLatestAssistant: true,
-  })}`;
+  const transcript = state.thread_empty
+    ? ""
+    : renderTranscriptRows(state.transcript_rows, {
+      includeRail: true,
+      agentActivityRows: state.agent_activity_rows,
+      currentTurnAgentActivityRows: state.current_turn_agent_activity_rows,
+      includeLiveAgentFallback: state.current_turn_agent_activity_rows.length > 0,
+      selectedAgentPath: selectedTranscriptAgentPath,
+      // Keep the newest response marker stable across streaming and the terminal
+      // projection that seals the same response.
+      stableLatestAssistant: true,
+    });
+  return `${earlier}${agentActivity}${transcript}${pending}`;
+}
+
+export function visiblePendingTurnInputs(
+  state: Pick<DesktopWebState, "pending_turn_inputs" | "transcript_rows">,
+): PendingTurnInput[] {
+  const delivered = new Set(
+    state.transcript_rows
+      .map((row) => row.stable_history_identity?.trim())
+      .filter((identity): identity is string => Boolean(identity)),
+  );
+  return state.pending_turn_inputs.filter((input) => !delivered.has(input.id));
+}
+
+export function renderPendingTurnInputs(inputs: readonly PendingTurnInput[]): string {
+  if (inputs.length === 0) return "";
+  return `
+    <section class="pending-turn-inputs" aria-label="モデルへの送信待ち" aria-live="polite">
+      <div class="pending-turn-inputs-heading">
+        <strong>モデルへの送信待ち</strong>
+        <small>現在の応答が終わると、順番に引き渡されます</small>
+      </div>
+      ${inputs.map((input) => `
+        <article class="message user pending-turn-input"
+          data-pending-input-id="${escapeHtml(input.id)}"
+          data-history-identity="${escapeHtml(input.id)}"
+          data-turn-id="${escapeHtml(input.turn_id)}">
+          <div class="message-body">
+            <div class="markdown-body">${renderMarkdown(input.text)}</div>
+            ${input.image_count > 0
+              ? `<small class="pending-turn-input-images">添付画像 ${input.image_count}件</small>`
+              : ""}
+          </div>
+        </article>
+      `).join("")}
+    </section>
+  `;
 }
 
 function renderEmptyThread(state: DesktopWebState): string {
@@ -459,7 +511,7 @@ function renderEmptyThread(state: DesktopWebState): string {
     <div class="empty-thread">
       <h2>${state.selected_project_index >= 0 ? "このプロジェクトで何を作りますか？" : "何に取り組みますか？"}</h2>
       <div class="empty-status">
-        ${state.selected_project_index >= 0 ? `<span>${escapeHtml(shortenPath(state.workspace_path))}</span>` : ""}
+        ${state.selected_project_index >= 0 ? `<span>${escapeHtml(selectedProjectDisplayLabel(state))}</span>` : ""}
         <span>${escapeHtml(projectText)}</span>
         <span>${escapeHtml(llmText)}</span>
         <span>${escapeHtml(displayAccessLabel(state.access_label))}</span>
@@ -469,7 +521,7 @@ function renderEmptyThread(state: DesktopWebState): string {
 }
 
 export function composerSendTitle(
-  state: Pick<DesktopWebState, "composer_submit_mode" | "navigation_loading" | "agent_tree_active" | "busy">,
+  state: Pick<DesktopWebState, "composer_submit_mode" | "navigation_loading" | "busy">,
   prompt: string,
 ): string {
   if (state.composer_submit_mode !== "blocked") {
@@ -480,13 +532,11 @@ export function composerSendTitle(
   }
   return state.navigation_loading
       ? "画面の切り替え完了後に送信できます"
-      : state.agent_tree_active
-        ? "Sub Agentの完了または停止後に送信できます"
-        : state.busy
-          ? "実行中は送信できません"
-          : prompt.trim().length === 0
-            ? "依頼文を入力してください"
-            : "現在は送信できません";
+      : state.busy
+        ? "実行中は送信できません"
+        : prompt.trim().length === 0
+          ? "依頼文を入力してください"
+          : "現在は送信できません";
 }
 
 export function renderComposer(state: DesktopWebState): string {
@@ -494,8 +544,6 @@ export function renderComposer(state: DesktopWebState): string {
   const sendTitle = composerSendTitle(state, state.draft_prompt);
   const enhanceTitle = state.navigation_loading
     ? "画面の切り替え完了後にEnhanceできます"
-    : state.agent_tree_active
-      ? "Sub Agentの完了または停止後にEnhanceできます"
     : state.busy
       ? "実行中はEnhanceできません"
       : state.draft_prompt.trim().length === 0

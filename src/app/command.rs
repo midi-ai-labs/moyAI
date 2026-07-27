@@ -6,6 +6,63 @@ use crate::error::StorageError;
 use crate::runtime::{SessionRuntimeEventHub, SessionRuntimeEventSubscription};
 use crate::session::{EditorContext, PromptDispatchPart, SessionId, ThreadGoalStatus};
 
+/// Process-lifetime owner for runtime state that must survive workspace/view replacement.
+///
+/// A workspace rebuild changes configuration, tools and the root `RunService`, but it must not
+/// replace the store's process-local leases, agent scheduler, session event bus, or session
+/// service while detached child tasks still own durable work. Each admitted execution captures
+/// its exact `RunService`; this host therefore does not keep an ever-growing service registry.
+#[derive(Clone)]
+pub(crate) struct AppProcessRuntime {
+    inner: std::sync::Arc<AppProcessRuntimeInner>,
+}
+
+struct AppProcessRuntimeInner {
+    store: crate::storage::StoreBundle,
+    session_service: crate::session::SessionService,
+    session_event_hub: SessionRuntimeEventHub,
+    agent_runtime: std::sync::Arc<crate::app::AgentRuntime>,
+}
+
+impl AppProcessRuntime {
+    pub(crate) fn new(
+        store: crate::storage::StoreBundle,
+        session_service: crate::session::SessionService,
+        session_event_hub: SessionRuntimeEventHub,
+        agent_runtime: std::sync::Arc<crate::app::AgentRuntime>,
+    ) -> Self {
+        Self {
+            inner: std::sync::Arc::new(AppProcessRuntimeInner {
+                store,
+                session_service,
+                session_event_hub,
+                agent_runtime,
+            }),
+        }
+    }
+
+    pub(crate) fn store(&self) -> crate::storage::StoreBundle {
+        self.inner.store.clone()
+    }
+
+    pub(crate) fn session_service(&self) -> crate::session::SessionService {
+        self.inner.session_service.clone()
+    }
+
+    pub(crate) fn session_event_hub(&self) -> SessionRuntimeEventHub {
+        self.inner.session_event_hub.clone()
+    }
+
+    pub(crate) fn agent_runtime(&self) -> std::sync::Arc<crate::app::AgentRuntime> {
+        std::sync::Arc::clone(&self.inner.agent_runtime)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ReviewRequest {
     Uncommitted,
@@ -20,6 +77,7 @@ pub struct App {
     pub session_service: crate::session::SessionService,
     pub run_service: std::sync::Arc<crate::app::RunService>,
     pub session_event_hub: SessionRuntimeEventHub,
+    pub(crate) process_runtime: AppProcessRuntime,
 }
 
 impl App {

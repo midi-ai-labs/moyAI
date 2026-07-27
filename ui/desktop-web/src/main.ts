@@ -425,6 +425,7 @@ function requiresRenderForStateChange(previous: DesktopWebState, state: DesktopW
     previous.turn_page_total !== state.turn_page_total ||
     previous.turn_page_has_more !== state.turn_page_has_more ||
     previous.transcript_rows.length !== state.transcript_rows.length ||
+    JSON.stringify(previous.pending_turn_inputs) !== JSON.stringify(state.pending_turn_inputs) ||
     previous.artifact_preview_available !== state.artifact_preview_available ||
     previous.artifact_preview_text !== state.artifact_preview_text ||
     previous.provider_metadata_mode !== state.provider_metadata_mode ||
@@ -559,6 +560,7 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
   const previousThreadWasNearEnd = previousThread ? isThreadNearEnd(previousThread) : true;
   const nextSessionKey = state.session_rows[state.selected_session_index]?.session_id ?? state.selected_session_title;
   const previousTranscriptCount = previous?.transcript_rows.length ?? 0;
+  const previousPendingInputCount = previous?.pending_turn_inputs.length ?? 0;
   const previousChangeCount = previous?.file_change_rows.length ?? 0;
   const previousAgentRows = previous?.agent_activity_rows ?? [];
   const agentRows = state.agent_activity_rows ?? [];
@@ -568,7 +570,9 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
   const prependViewportAnchor = historyPrependTransition.disposition === "consume" && previousThread
     ? captureViewportAnchor(previousThread)
     : null;
-  const contentAdvanced = state.transcript_rows.length > previousTranscriptCount || state.file_change_rows.length > previousChangeCount;
+  const contentAdvanced = state.transcript_rows.length > previousTranscriptCount
+    || state.pending_turn_inputs.length > previousPendingInputCount
+    || state.file_change_rows.length > previousChangeCount;
   const agentActivityAdvanced = previous
     ? agentActivityRowsChanged(previousAgentRows, agentRows) || (!previous.agent_tree_active && state.agent_tree_active)
     : agentRows.length > 0;

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::time::Duration;
 
 use crate::app::{AgentForkTurns, AgentRunContext};
 use crate::error::ToolError;
@@ -11,6 +12,7 @@ use crate::tool::{ToolName, ToolResult, ToolSpec};
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
 const MIN_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_WAIT_TIMEOUT_MS: u64 = 3_600_000;
+const DURABLE_STEER_POLL_INTERVAL_MS: u64 = 100;
 
 #[derive(Debug, Default)]
 pub struct SpawnAgentTool;
@@ -72,7 +74,15 @@ impl Tool for SpawnAgentTool {
         ToolSpec {
             name: ToolName::SpawnAgent,
             effect: crate::tool::ToolEffectPolicy::mutation(),
-            description: "Spawn an agent for a concrete, bounded task that can run independently alongside useful local work. The child has a canonical task path and the same workspace and permissions. This medium profile supports one child level, so only the root agent can spawn.",
+            description: r#"Spawns an agent to work on the specified task. If your current task is `/root/task1` and you spawn_agent with task_name "task_3" the agent will have canonical task name `/root/task1/task_3`.
+You are then able to refer to this agent as `task_3` or `/root/task1/task_3` interchangeably. However an agent `/root/task2/task_3` would only be able to communicate with this agent via its canonical name `/root/task1/task_3`.
+The spawned agent will have the same tools as you and the ability to spawn its own subagents.
+
+Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
+It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
+The new agent's canonical task name will be provided to it along with the message.
+
+Note that passing `fork_turns="none"` will not pass any surrounding context to the spawned subagent, which may cause the agent to lack the context it needs to complete its task, whereas `fork_turns="all"` will provide the subagent with all surrounding context."#,
             input_schema: json!({
                 "type": "object",
                 "required": ["task_name", "message"],
@@ -88,8 +98,7 @@ impl Tool for SpawnAgentTool {
                     },
                     "fork_turns": {
                         "type": "string",
-                        "enum": ["none", "all"],
-                        "description": "Context to fork. Defaults to `all`; use `none` to start without surrounding conversation context."
+                        "description": "Optional number of turns to fork. Defaults to `all`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
                     }
                 }
             }),
@@ -176,7 +185,7 @@ impl Tool for WaitAgentTool {
         ToolSpec {
             name: ToolName::WaitAgent,
             effect: crate::tool::ToolEffectPolicy::read(),
-            description: "Wait for a mailbox update from any live agent. The wait also ends early when new user input is steered into the active turn. Returns only an activity, interruption, or timeout summary, never hidden reasoning or message content.",
+            description: "Wait for a mailbox update from any live agent. The wait also ends early when new user input is steered into the active turn. Omit timeout_ms for normal delegated work so the activity-sensitive default avoids short polling. Returns only an activity, interruption, or timeout summary, never hidden reasoning or message content.",
             input_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -185,7 +194,7 @@ impl Tool for WaitAgentTool {
                         "type": "integer",
                         "minimum": MIN_WAIT_TIMEOUT_MS,
                         "maximum": MAX_WAIT_TIMEOUT_MS,
-                        "description": "Timeout in milliseconds. Defaults to 30000, min 10000, max 3600000."
+                        "description": "Timeout in milliseconds. Defaults to 30000, min 10000, max 3600000. The wait returns early when agent activity arrives."
                     }
                 }
             }),
@@ -202,24 +211,84 @@ impl Tool for WaitAgentTool {
         let agent = require_agent_context("wait_agent", ctx.agent)?;
         let active_runs = ctx.services.store.active_runs().clone();
         let session_id = ctx.session.session.id;
-        let steer_generation = active_runs
-            .steer_generation(session_id)
-            .map_err(|error| ToolError::Message(error.to_string()))?;
-        let result = tokio::select! {
-            result = agent.wait_for_activity(timeout_ms) => {
-                result.map_err(ToolError::Message)?
-            }
-            steer = active_runs.wait_for_steer_activity(session_id, steer_generation) => {
-                steer.map_err(|error| ToolError::Message(error.to_string()))?;
-                crate::app::AgentWaitResult {
-                    message: "Wait interrupted by new user input.".to_string(),
-                    timed_out: false,
-                    updated_agents: Vec::new(),
-                }
-            }
-        };
+        let result = wait_for_agent_activity_or_steer_with_poll_interval(
+            agent,
+            &active_runs,
+            session_id,
+            timeout_ms,
+            Duration::from_millis(DURABLE_STEER_POLL_INTERVAL_MS),
+        )
+        .await?;
         let output = serde_json::to_value(&result)?;
         json_result("Agent wait completed", output.clone(), output)
+    }
+}
+
+pub(crate) async fn wait_for_agent_activity_or_steer_with_poll_interval(
+    agent: &AgentRunContext,
+    active_runs: &crate::runtime::ActiveRunRegistry,
+    session_id: crate::session::SessionId,
+    timeout_ms: u64,
+    durable_poll_interval: Duration,
+) -> Result<crate::app::AgentWaitResult, ToolError> {
+    let steer_generation = active_runs
+        .steer_generation(session_id)
+        .map_err(|error| ToolError::Message(error.to_string()))?;
+    // The process-local generation is only a wakeup edge. The durable queue
+    // remains the content owner, so check it after capturing the generation
+    // and before waiting. A commit before the capture is observed here; a
+    // same-process commit after this check changes the generation and is
+    // observed by wait_for_steer_activity when it subscribes. The bounded
+    // durable poll covers another StoreBundle/process.
+    if agent
+        .has_pending_turn_steer_input()
+        .map_err(ToolError::Message)?
+    {
+        return Ok(steered_wait_result());
+    }
+    let result = tokio::select! {
+        result = agent.wait_for_activity(timeout_ms) => {
+            result.map_err(ToolError::Message)?
+        }
+        steer = active_runs.wait_for_steer_activity(session_id, steer_generation) => {
+            steer.map_err(|error| ToolError::Message(error.to_string()))?;
+            steered_wait_result()
+        }
+        durable_steer = wait_for_durable_turn_steer(agent, durable_poll_interval) => {
+            durable_steer.map_err(ToolError::Message)?;
+            steered_wait_result()
+        }
+    };
+    // A cross-process commit can land after the last bounded poll but before
+    // the timeout branch wins. Recheck the durable owner before accepting only
+    // a timeout; real mailbox activity returned above remains authoritative.
+    if result.timed_out
+        && agent
+            .has_pending_turn_steer_input()
+            .map_err(ToolError::Message)?
+    {
+        return Ok(steered_wait_result());
+    }
+    Ok(result)
+}
+
+fn steered_wait_result() -> crate::app::AgentWaitResult {
+    crate::app::AgentWaitResult {
+        message: "Wait interrupted by new user input.".to_string(),
+        timed_out: false,
+        updated_agents: Vec::new(),
+    }
+}
+
+async fn wait_for_durable_turn_steer(
+    agent: &AgentRunContext,
+    durable_poll_interval: Duration,
+) -> Result<(), String> {
+    loop {
+        tokio::time::sleep(durable_poll_interval).await;
+        if agent.has_pending_turn_steer_input()? {
+            return Ok(());
+        }
     }
 }
 
@@ -252,17 +321,18 @@ impl Tool for InterruptAgentTool {
         let input = serde_json::from_value::<InterruptAgentInput>(raw_arguments)?;
         let activity_id = ctx.tool_call_id.to_string();
         ctx.run_mutation_fence.assert_owned().await?;
+        let effect_commit = ctx.run_mutation_fence.begin_effect_commit()?;
         let agent = require_agent_context("interrupt_agent", ctx.agent)?;
-        let status = agent
-            .interrupt_agent(&input.target, activity_id.clone())
-            .map_err(ToolError::Message)?;
+        let interrupted = agent.interrupt_agent(&input.target, activity_id.clone());
+        effect_commit.release();
+        let (agent_path, status) = interrupted.map_err(ToolError::Message)?;
         let output = json!({
-            "agent_path": input.target,
+            "agent_path": agent_path,
             "status": status,
         });
         let metadata = json!({
             "activity_id": activity_id,
-            "agent_path": input.target,
+            "agent_path": agent_path,
             "status": status,
         });
         json_result("Agent interrupted", output, metadata)
@@ -314,24 +384,26 @@ async fn send_message(
     require_message(tool_name, &input.message)?;
     let activity_id = ctx.tool_call_id.to_string();
     ctx.run_mutation_fence.assert_owned().await?;
+    let effect_commit = ctx.run_mutation_fence.begin_effect_commit()?;
     let agent = require_agent_context(tool_name, ctx.agent)?;
-    agent
+    let delivery = agent
         .send_message(
             &input.target,
             input.message,
             trigger_turn,
             activity_id.clone(),
         )
-        .await
-        .map_err(ToolError::Message)?;
+        .await;
+    effect_commit.release();
+    let agent_path = delivery.map_err(ToolError::Message)?;
     let output = json!({
-        "agent_path": input.target,
+        "agent_path": agent_path,
         "queued": true,
         "trigger_turn": trigger_turn,
     });
     let metadata = json!({
         "activity_id": activity_id,
-        "agent_path": input.target,
+        "agent_path": agent_path,
         "queued": true,
         "trigger_turn": trigger_turn,
     });
@@ -400,20 +472,23 @@ fn parse_fork_turns(value: Option<&Value>) -> Result<AgentForkTurns, ToolError> 
     };
     let Some(value) = value.as_str() else {
         return Err(ToolError::Message(
-            "spawn_agent `fork_turns` must be the string `none` or `all`".to_string(),
+            "spawn_agent `fork_turns` must be `none`, `all`, or a positive integer string"
+                .to_string(),
         ));
     };
-    match value.trim() {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(AgentForkTurns::All);
+    }
+    match value.to_ascii_lowercase().as_str() {
         "none" => Ok(AgentForkTurns::None),
         "all" => Ok(AgentForkTurns::All),
-        value if value.parse::<usize>().is_ok_and(|turns| turns > 0) => {
-            Err(ToolError::Message(
-                "spawn_agent `fork_turns` positive turn counts are not supported by this moyAI multi-agent version; use `none` or `all`"
-                    .to_string(),
-            ))
-        }
+        value if value.parse::<usize>().is_ok_and(|turns| turns > 0) => Ok(AgentForkTurns::Recent(
+            value.parse::<usize>().expect("validated positive integer"),
+        )),
         _ => Err(ToolError::Message(
-            "spawn_agent `fork_turns` must be `none` or `all`".to_string(),
+            "spawn_agent `fork_turns` must be `none`, `all`, or a positive integer string"
+                .to_string(),
         )),
     }
 }
@@ -450,41 +525,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spawn_schema_matches_the_bounded_v2_surface() {
+    fn spawn_schema_matches_the_codex_fork_turns_surface() {
         let spec = SpawnAgentTool.spec();
         assert_eq!(spec.name, ToolName::SpawnAgent);
         assert_eq!(
             spec.input_schema["required"],
             json!(["task_name", "message"])
         );
-        assert_eq!(
-            spec.input_schema["properties"]["fork_turns"]["enum"],
-            json!(["none", "all"])
-        );
+        let fork_turns = &spec.input_schema["properties"]["fork_turns"];
+        assert_eq!(fork_turns["type"], json!("string"));
+        assert!(fork_turns.get("enum").is_none());
+        let fork_turns_description = fork_turns["description"]
+            .as_str()
+            .expect("fork_turns description");
+        assert!(fork_turns_description.contains("`none`"));
+        assert!(fork_turns_description.contains("`all`"));
+        assert!(fork_turns_description.contains("positive integer string"));
+        assert!(spec.description.contains("same tools"));
+        assert!(spec.description.contains("spawn its own subagents"));
+        assert!(spec.description.contains("fork_turns=\"none\""));
+        assert!(spec.description.contains("fork_turns=\"all\""));
         assert!(spec.input_schema["properties"].get("agent_type").is_none());
         assert!(spec.input_schema["properties"].get("model").is_none());
     }
 
     #[test]
-    fn fork_turns_defaults_to_all_and_rejects_partial_counts() {
-        assert!(matches!(
+    fn fork_turns_defaults_to_all_and_accepts_codex_string_values() {
+        assert_eq!(
             parse_fork_turns(None).expect("default"),
             AgentForkTurns::All
-        ));
-        assert!(matches!(
-            parse_fork_turns(Some(&json!("none"))).expect("none"),
-            AgentForkTurns::None
-        ));
-        let error = parse_fork_turns(Some(&json!("3"))).expect_err("partial fork");
-        assert!(
-            error
-                .to_string()
-                .contains("positive turn counts are not supported")
         );
+        assert_eq!(
+            parse_fork_turns(Some(&json!(" NoNe "))).expect("none"),
+            AgentForkTurns::None
+        );
+        assert_eq!(
+            parse_fork_turns(Some(&json!("ALL"))).expect("all"),
+            AgentForkTurns::All
+        );
+        assert_eq!(
+            parse_fork_turns(Some(&json!("  "))).expect("blank defaults to all"),
+            AgentForkTurns::All
+        );
+        assert_eq!(
+            parse_fork_turns(Some(&json!("3"))).expect("recent turns"),
+            AgentForkTurns::Recent(3)
+        );
+        for invalid in [json!("0"), json!("-1"), json!("1.5"), json!(3)] {
+            let error = parse_fork_turns(Some(&invalid)).expect_err("invalid fork_turns");
+            assert!(error.to_string().contains("positive integer string"));
+        }
     }
 
     #[test]
-    fn wait_timeout_has_codex_v2_bounds_and_default() {
+    fn wait_timeout_matches_codex_v2_default_and_bounds() {
         assert_eq!(validated_timeout(None).expect("default"), 30_000);
         assert_eq!(validated_timeout(Some(10_000)).expect("minimum"), 10_000);
         assert_eq!(

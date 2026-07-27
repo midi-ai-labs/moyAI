@@ -30,47 +30,54 @@ impl SqliteHarnessEventStore {
         event: &HarnessEvent,
         artifact: Option<&ArtifactManifest>,
     ) -> Result<(), StorageError> {
-        let payload_json = serde_json::to_string(&event.payload)?;
-        let kind_json = serde_json::to_string(&event.kind)?;
-        let contract_refs_json = serde_json::to_string(&event.contract_refs)?;
-        let artifact_refs_json = serde_json::to_string(&event.artifact_refs)?;
-        let parent_event_id = event.parent_event_id.map(|id| id.to_string());
-        let envelope_sha256 = event_envelope_sha256(
-            &event.id.to_string(),
-            &event.run_id.to_string(),
-            event.sequence_no,
-            &kind_json,
-            &payload_json,
-            &contract_refs_json,
-            &artifact_refs_json,
-            parent_event_id.as_deref(),
-            event.created_at_ms,
-        )?;
-
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO harness_events (id, run_id, sequence_no, kind, payload_json, contract_refs_json, artifact_refs_json, parent_event_id, payload_sha256, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                event.id.to_string(),
-                event.run_id.to_string(),
-                event.sequence_no,
-                kind_json,
-                payload_json,
-                contract_refs_json,
-                artifact_refs_json,
-                parent_event_id,
-                envelope_sha256,
-                event.created_at_ms,
-            ],
-        )?;
+        insert_event_in_connection(&transaction, event)?;
         if let Some(artifact) = artifact {
             insert_artifact_in_connection(&transaction, artifact)?;
         }
         transaction.commit()?;
         Ok(())
     }
+}
+
+pub(crate) fn insert_event_in_connection(
+    connection: &Connection,
+    event: &HarnessEvent,
+) -> Result<(), StorageError> {
+    let payload_json = serde_json::to_string(&event.payload)?;
+    let kind_json = serde_json::to_string(&event.kind)?;
+    let contract_refs_json = serde_json::to_string(&event.contract_refs)?;
+    let artifact_refs_json = serde_json::to_string(&event.artifact_refs)?;
+    let parent_event_id = event.parent_event_id.map(|id| id.to_string());
+    let envelope_sha256 = event_envelope_sha256(
+        &event.id.to_string(),
+        &event.run_id.to_string(),
+        event.sequence_no,
+        &kind_json,
+        &payload_json,
+        &contract_refs_json,
+        &artifact_refs_json,
+        parent_event_id.as_deref(),
+        event.created_at_ms,
+    )?;
+    connection.execute(
+        "INSERT INTO harness_events (id, run_id, sequence_no, kind, payload_json, contract_refs_json, artifact_refs_json, parent_event_id, payload_sha256, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            event.id.to_string(),
+            event.run_id.to_string(),
+            event.sequence_no,
+            kind_json,
+            payload_json,
+            contract_refs_json,
+            artifact_refs_json,
+            parent_event_id,
+            envelope_sha256,
+            event.created_at_ms,
+        ],
+    )?;
+    Ok(())
 }
 
 impl HarnessEventStore for SqliteHarnessEventStore {

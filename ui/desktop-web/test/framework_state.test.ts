@@ -132,6 +132,7 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
       workspacePath: "C:/workspace",
       sessionId: "session-a",
       runtimeOwnerToken: "idle:0",
+      permissionConfirmationId: null,
     } satisfies RunMutationTarget,
     enhance_enabled: true,
     image_input_enabled: true,
@@ -167,6 +168,7 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
     }],
     attached_images: [],
     transcript_rows: [],
+    pending_turn_inputs: [],
     thread_empty: true,
     artifact_rows: [],
     selected_artifact_index: -1,
@@ -201,7 +203,7 @@ test("local drafts produce a view without mutating the Rust projection", () => {
   assert.deepEqual(state, original);
 });
 
-test("all composer actions preserve the authoritative Rust admission gate", () => {
+test("child-only activity preserves the authoritative Rust new-request gate", () => {
   const ui = createUiLocalState();
   const state = projection({ draft_prompt: "" });
   reconcileUiDrafts(ui, null, state, null);
@@ -215,14 +217,63 @@ test("all composer actions preserve the authoritative Rust admission gate", () =
   const treeActive = projection({
     busy: false,
     agent_tree_active: true,
-    can_submit: false,
-    enhance_enabled: false,
+    can_submit: true,
+    enhance_enabled: true,
+    review_uncommitted_enabled: true,
   });
   const capabilities = deriveUiCapabilities(treeActive, ui);
-  assert.equal(capabilities.canSubmit, false);
-  assert.equal(capabilities.canEnhance, false);
-  assert.equal(capabilities.canReviewUncommitted, false);
+  assert.equal(capabilities.canSubmit, true);
+  assert.equal(capabilities.canEnhance, true);
+  assert.equal(capabilities.canReviewUncommitted, true);
   assert.equal(capabilities.canUseImageInput, true, "draft attachments remain available for the next prompt");
+
+  const baseSession = projection().session_rows[0]!;
+  const navigationState = projection({
+    busy: false,
+    agent_tree_active: true,
+    navigation_admission_open: true,
+    can_cancel_run: false,
+    session_rows: [
+      baseSession,
+      {
+        ...baseSession,
+        session_id: "session-b",
+        label: "Session B",
+        title: "Session B",
+        loaded_status: "active",
+        active_turn_id: "turn-b",
+        active_turn_sequence_no: 2,
+      },
+    ],
+  });
+  const sidebar = renderSidebar(navigationState);
+  for (const [label, pattern] of [
+    ["session search", /<input id="session-search"[^>]*>/],
+    ["new root chat", /<button class="row-action add-session" data-action="new-project-session"[^>]*>/],
+    ["new quick chat", /<button class="tiny-button icon-only" data-action="new-chat"[^>]*>/],
+    ["open session", /<button class="nav-row" data-action="session" data-index="1"[^>]*>/],
+    ["rejoin session", /<button class="row-action row-rejoin" data-action="rejoin-session" data-index="1"[^>]*>/],
+  ] as const) {
+    const tag = sidebar.match(pattern)?.[0];
+    assert.ok(tag, `${label} control is rendered`);
+    assert.doesNotMatch(tag, /\sdisabled(?:\s|>|=)/, `${label} stays enabled`);
+  }
+  assert.equal(
+    actionById("rejoin-session")?.enabled?.(navigationState, { index: 1, value: "" }),
+    true,
+  );
+  assert.equal(
+    actionById("toggle-session-archived-search")?.enabled?.(
+      navigationState,
+      { index: -1, value: "" },
+    ),
+    true,
+  );
+  assert.equal(
+    actionById("cancel-run")?.enabled?.(navigationState, { index: -1, value: "" }),
+    false,
+    "ordinary Stop is not inferred from detached child activity",
+  );
 });
 
 test("active root steering keeps an enabled send control labeled as additional instruction", () => {
@@ -1433,6 +1484,35 @@ test("topbar omits page replacement controls even when bounded history has more 
   assert.doesNotMatch(html, /data-action="load-next-turn-page"/);
 });
 
+test("drive-root projects use the selected Rust display label without changing path authority", () => {
+  const state = projection({
+    workspace_path: "R:/",
+    selected_project_index: 0,
+    selected_session_index: -1,
+    project_rows: [{
+      project_id: "project-r",
+      label: "MappedProjectFolder",
+      path: "R:/",
+    }],
+    session_rows: [],
+    transcript_rows: [],
+  });
+
+  const sidebar = renderSidebar(state);
+  assert.match(sidebar, /<span class="nav-title">MappedProjectFolder<\/span>/);
+  assert.match(sidebar, /<small>R:\/<\/small>/);
+
+  const topbar = renderTopbar(state);
+  assert.match(
+    topbar,
+    /data-action="open-workspace-folder" title="R:\/">MappedProjectFolder<\/button>/,
+  );
+
+  const thread = renderThreadContent(state);
+  assert.match(thread, /<div class="empty-status">[\s\S]*?<span>MappedProjectFolder<\/span>/);
+  assert.doesNotMatch(thread, /<div class="empty-status">[\s\S]*?<span>R:<\/span>/);
+});
+
 test("config commit capability never gates unrelated workspace or window actions", () => {
   const clean = projection();
   for (const id of ["browse-workspace", "toggle-maximize-window"]) {
@@ -1861,6 +1941,86 @@ test("canonical row_kind selects specialized transcript rendering", () => {
   assert.notEqual(completedDetailsKey, runningDetailsKey, "phase changes reset automatic disclosure state");
 });
 
+test("authoritative pending steer is separate from canonical transcript and keeps its durable identity", () => {
+  const id = "01PENDINGINPUT00000000000000";
+  const html = renderThreadContent(projection({
+    thread_empty: true,
+    transcript_rows: [],
+    pending_turn_inputs: [{
+      id,
+      turn_id: "01TURN000000000000000000000",
+      text: "追加で境界条件も確認してください",
+      image_count: 1,
+      accepted_at_ms: 42,
+    }],
+  }));
+
+  assert.match(html, /モデルへの送信待ち/);
+  assert.match(html, new RegExp(`data-pending-input-id="${id}"`));
+  assert.match(html, new RegExp(`data-history-identity="${id}"`));
+  assert.match(html, /追加で境界条件も確認してください/);
+  assert.match(html, /添付画像 1件/);
+  assert.doesNotMatch(html, /history-rail-marker/);
+  assert.doesNotMatch(html, /履歴はまだありません/);
+});
+
+test("pending steer transitions to one delivered transcript row by exact identity", () => {
+  const id = "01DELIVEREDINPUT000000000000";
+  const delivered = {
+    row_kind: "user" as const,
+    stable_history_identity: id,
+    step: "",
+    title: "ユーザー依頼",
+    body: "同じ本文",
+    file_changes: [],
+  };
+  const html = renderThreadContent(projection({
+    thread_empty: false,
+    transcript_rows: [delivered],
+    // A delayed acknowledgement must not resurrect a pending card when the
+    // same canonical identity has already crossed into history.
+    pending_turn_inputs: [{
+      id,
+      turn_id: "01TURN000000000000000000000",
+      text: "同じ本文",
+      image_count: 0,
+      accepted_at_ms: 43,
+    }],
+  }));
+
+  assert.equal((html.match(new RegExp(`data-history-identity="${id}"`, "g")) ?? []).length, 1);
+  assert.doesNotMatch(html, /data-pending-input-id=/);
+  assert.match(html, /同じ本文/);
+});
+
+test("identical pending steer text remains distinct when durable identities differ", () => {
+  const html = renderThreadContent(projection({
+    thread_empty: true,
+    transcript_rows: [],
+    pending_turn_inputs: [
+      {
+        id: "01PENDINGA000000000000000000",
+        turn_id: "01TURN000000000000000000000",
+        text: "重複して見える本文",
+        image_count: 0,
+        accepted_at_ms: 44,
+      },
+      {
+        id: "01PENDINGB000000000000000000",
+        turn_id: "01TURN000000000000000000000",
+        text: "重複して見える本文",
+        image_count: 0,
+        accepted_at_ms: 45,
+      },
+    ],
+  }));
+
+  assert.equal((html.match(/data-pending-input-id=/g) ?? []).length, 2);
+  assert.match(html, /01PENDINGA000000000000000000/);
+  assert.match(html, /01PENDINGB000000000000000000/);
+  assert.equal((html.match(/重複して見える本文/g) ?? []).length, 2);
+});
+
 test("conversation rows render naturally with stable rail anchors and inline earlier history", () => {
   const user = {
     row_kind: "user" as const,
@@ -2054,6 +2214,8 @@ test("durable Sub Agent events stay inside their turn history and the root final
       result_preview: "RAW CHILD REPORT",
       started_order: 1,
       updated: false,
+      active_turn_id: null,
+      can_interrupt: false,
     }],
   }));
 
@@ -2091,6 +2253,8 @@ test("Sub Agent lifecycle events coalesce to one described card per path in spaw
     result_preview: `RAW ${path} RESULT`,
     started_order: order,
     updated: true,
+    active_turn_id: null,
+    can_interrupt: false,
   });
   const html = renderThreadContent(projection({
     thread_empty: false,
@@ -2130,6 +2294,8 @@ test("live Sub Agent fallback is owned by the current turn and survives child qu
     result_preview: status === "completed" ? "done" : "",
     started_order: order,
     updated: false,
+    active_turn_id: status === "running" ? `turn-${order}` : null,
+    can_interrupt: status === "running",
   });
   const oldAgent = agent("/root/old_agent", "completed", 1);
   const currentAgent = agent("/root/current_agent", "completed", 2);
@@ -2169,6 +2335,8 @@ test("a current Sub Agent remains visible before the live WorkSummary is project
     result_preview: "",
     started_order: 1,
     updated: false,
+    active_turn_id: "turn-early",
+    can_interrupt: true,
   };
   const html = renderThreadContent(projection({
     thread_empty: false,
@@ -2195,6 +2363,8 @@ test("interleaved legacy communication markers coalesce to one card per Sub Agen
     result_preview: "done",
     started_order: order,
     updated: true,
+    active_turn_id: null,
+    can_interrupt: false,
   });
   const html = renderThreadContent(projection({
     thread_empty: false,
@@ -2224,6 +2394,8 @@ test("a started-only detached Sub Agent uses terminal status only at its latest 
     result_preview: "done",
     started_order: 1,
     updated: true,
+    active_turn_id: null,
+    can_interrupt: false,
   };
   const html = renderThreadContent(projection({
     thread_empty: false,
@@ -2262,6 +2434,8 @@ test("a bounded canonical suffix keeps unmatched durable Sub Agents visible as c
     result_preview: "done",
     started_order: 1,
     updated: false,
+    active_turn_id: null,
+    can_interrupt: false,
   };
   const html = renderThreadContent(projection({
     thread_empty: false,
@@ -2305,7 +2479,7 @@ test("run target mirrors the exact Rust Stop owner projection", () => {
 
   assert.deepEqual(
     Object.keys(target).sort(),
-    ["runtimeOwnerToken", "sessionId", "workspacePath"],
+    ["permissionConfirmationId", "runtimeOwnerToken", "sessionId", "workspacePath"],
   );
   assert.equal("ownerGeneration" in target, false);
 });

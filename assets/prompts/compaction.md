@@ -1,3 +1,9 @@
-# Conversation compaction
+You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
 
-Summarize the supplied earlier conversation so another coding agent can continue the same task without rereading it. Preserve the user's objective and constraints, decisions, completed work, exact files or commands that still matter, failures and their causes, pending work, and any tool results needed for the next action. Do not invent completion. Do not address the user. Return only the continuation summary.
+Include:
+- Current progress and key decisions made
+- Important context, constraints, or user preferences
+- What remains to be done (clear next steps)
+- Any critical data, examples, or references needed to continue
+
+Be concise, structured, and focused on helping the next LLM seamlessly continue the work.

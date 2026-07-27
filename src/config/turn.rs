@@ -539,6 +539,11 @@ mod tests {
                 config.model.request_timeout_ms = 0;
                 config
             }),
+            ("model.context_window", {
+                let mut config = ResolvedConfig::default();
+                config.model.context_window = 0;
+                config
+            }),
         ] {
             let error = ResolvedTurnConfig::capture(std::mem::take(&mut invalid))
                 .expect_err("invalid provider runtime config must fail closed");

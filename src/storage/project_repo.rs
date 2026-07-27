@@ -149,11 +149,10 @@ impl ProjectRepository for SqliteProjectRepository {
     async fn delete_project(&self, id: ProjectId) -> Result<(), StorageError> {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let active_session_id =
-            mutation_blocker_for_project_in_connection(&tx, id, SystemClock.now_ms())?;
+        let active_session_id = mutation_blocker_for_project_in_connection(&tx, id)?;
         if let Some(active_session_id) = active_session_id {
             return Err(StorageError::Message(format!(
-                "project {id} contains active session {active_session_id}; stop it before deleting the project"
+                "project {id} contains active or pending session {active_session_id}; stop it before deleting the project"
             )));
         }
         tx.execute(
@@ -202,6 +201,41 @@ impl ProjectRepository for SqliteProjectRepository {
             params![id.to_string()],
         )?;
         tx.execute(
+            "DELETE FROM agent_owner_resume_requests
+             WHERE owner_session_id IN (
+                       SELECT id FROM sessions WHERE project_id = ?1
+                   )
+                OR source_session_id IN (
+                       SELECT id FROM sessions WHERE project_id = ?1
+                   )",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM agent_deferred_completions
+             WHERE agent_session_id IN (
+                       SELECT id FROM sessions WHERE project_id = ?1
+                   )
+                OR parent_session_id IN (
+                       SELECT id FROM sessions WHERE project_id = ?1
+                   )",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM agent_completion_handoffs
+             WHERE child_session_id IN (
+                       SELECT id FROM sessions WHERE project_id = ?1
+                   )
+                OR parent_session_id IN (
+                       SELECT id FROM sessions WHERE project_id = ?1
+                   )",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM turn_steer_inputs
+             WHERE session_id IN (SELECT id FROM sessions WHERE project_id = ?1)",
+            params![id.to_string()],
+        )?;
+        tx.execute(
             "DELETE FROM protocol_turn_items
              WHERE session_id IN (SELECT id FROM sessions WHERE project_id = ?1)",
             params![id.to_string()],
@@ -226,6 +260,26 @@ impl ProjectRepository for SqliteProjectRepository {
              WHERE session_id IN (SELECT id FROM sessions WHERE project_id = ?1)",
             params![id.to_string()],
         )?;
+        let mut edge_statement = tx.prepare(
+            "SELECT edge.child_session_id
+             FROM session_spawn_edges AS edge
+             INNER JOIN sessions AS root ON root.id = edge.root_session_id
+             WHERE root.project_id = ?1
+             ORDER BY
+                 (LENGTH(edge.agent_path) - LENGTH(REPLACE(edge.agent_path, '/', ''))) DESC,
+                 edge.created_at_ms DESC,
+                 edge.child_session_id ASC",
+        )?;
+        let edge_child_ids = edge_statement
+            .query_map(params![id.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(edge_statement);
+        for child_session_id in edge_child_ids {
+            tx.execute(
+                "DELETE FROM session_spawn_edges WHERE child_session_id = ?1",
+                params![child_session_id],
+            )?;
+        }
         tx.execute(
             "DELETE FROM sessions WHERE project_id = ?1",
             params![id.to_string()],
@@ -362,6 +416,85 @@ mod tests {
             )
             .expect("allocator count");
         assert_eq!(allocator_count, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_project_removes_recursive_agent_edges_leaf_first() {
+        let (store, data_dir) = project_store_fixture();
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &data_dir, "recursive project", "none")
+            .await
+            .expect("project");
+        let repository = store.session_repo();
+        let mut sessions = Vec::new();
+        for title in ["root", "worker", "reviewer"] {
+            sessions.push(
+                repository
+                    .create_session(NewSession {
+                        project_id,
+                        title: title.to_string(),
+                        cwd: data_dir.clone(),
+                        model: "model".to_string(),
+                        base_url: "http://localhost:1234".to_string(),
+                        access_mode: AccessMode::Default,
+                    })
+                    .await
+                    .expect("session"),
+            );
+        }
+        repository
+            .insert_session_spawn_edge(
+                sessions[0].id,
+                sessions[0].id,
+                sessions[1].id,
+                "/root/worker",
+                "worker",
+            )
+            .await
+            .expect("worker edge");
+        repository
+            .insert_session_spawn_edge(
+                sessions[0].id,
+                sessions[1].id,
+                sessions[2].id,
+                "/root/worker/reviewer",
+                "reviewer",
+            )
+            .await
+            .expect("reviewer edge");
+
+        store
+            .project_repo()
+            .delete_project(project_id)
+            .await
+            .expect("delete recursive project");
+
+        let project_repository = store.project_repo();
+        let connection = project_repository.connection.lock().expect("sqlite mutex");
+        let counts = (
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                    params![project_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("project count"),
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE project_id = ?1",
+                    params![project_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("session count"),
+            connection
+                .query_row("SELECT COUNT(*) FROM session_spawn_edges", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("edge count"),
+        );
+        assert_eq!(counts, (0, 0, 0));
     }
 
     #[tokio::test]

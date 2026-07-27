@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use crate::app::App;
 use crate::cli::ReviewDecision;
 use crate::error::AppRunError;
+use crate::protocol::TurnId;
 use crate::session::{SessionId, SessionSpawnEdge};
 
 use super::app::{DesktopController, PendingPermissionResolution};
@@ -197,6 +198,7 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             rejoin_session,
             load_agent_execution,
             load_previous_agent_execution_page,
+            interrupt_agent,
             load_previous_turn_page,
             load_next_turn_page,
             select_chat_session,
@@ -417,6 +419,7 @@ struct DesktopRunMutationTarget {
     workspace_path: String,
     session_id: Option<String>,
     runtime_owner_token: String,
+    permission_confirmation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -610,10 +613,12 @@ fn validate_run_mutation_target(
     workspace_path: &str,
     session_id: Option<String>,
     runtime_owner_token: String,
+    permission_confirmation_id: Option<String>,
 ) -> Result<(), DesktopCommandConflict> {
     if expected.workspace_path != workspace_path
         || expected.session_id != session_id
         || expected.runtime_owner_token != runtime_owner_token
+        || expected.permission_confirmation_id != permission_confirmation_id
     {
         return Err(DesktopCommandConflict::new(
             "the active run owner changed before Stop was applied; review the current task and try again",
@@ -636,7 +641,39 @@ fn ensure_run_mutation_target(
             .current_session_id
             .map(|session_id| session_id.to_string()),
         runtime_owner_token,
+        controller
+            .pending_permission_confirmation_id()
+            .map(|confirmation_id| confirmation_id.to_string()),
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DesktopAgentInterruptTarget {
+    workspace_path: String,
+    root_session_id: String,
+    agent_path: String,
+    child_session_id: String,
+    expected_turn_id: String,
+}
+
+impl DesktopAgentInterruptTarget {
+    fn execution_target(&self) -> DesktopAgentExecutionTarget {
+        DesktopAgentExecutionTarget {
+            workspace_path: self.workspace_path.clone(),
+            root_session_id: self.root_session_id.clone(),
+            agent_path: self.agent_path.clone(),
+            child_session_id: self.child_session_id.clone(),
+        }
+    }
+
+    fn expected_turn_id(&self) -> Result<TurnId, DesktopCommandConflict> {
+        self.expected_turn_id.parse::<TurnId>().map_err(|_| {
+            DesktopCommandConflict::new(
+                "the requested Sub Agent turn is invalid; refresh the activity list and try again",
+            )
+        })
+    }
 }
 
 fn rejected_action(controller: &DesktopController, fallback: &str) -> DesktopCommandConflict {
@@ -1080,6 +1117,77 @@ async fn load_previous_agent_execution_page(
     let read_request = previous_agent_execution_page_request(expected_offset, expected_end)
         .map_err(read_only_command_conflict_error)?;
     load_agent_execution_projection(controller.inner(), expected_target, read_request).await
+}
+
+#[tauri::command]
+async fn interrupt_agent(
+    controller: State<'_, SharedController>,
+    expected_target: DesktopAgentInterruptTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    let execution_target = expected_target.execution_target();
+    let expected_turn_id = expected_target
+        .expected_turn_id()
+        .map_err(read_only_command_conflict_error)?;
+    let (app, root_session_id, child_session_id) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        let (root_session_id, child_session_id) = validate_agent_execution_owner(
+            &execution_target,
+            controller.app.workspace.root.as_str(),
+            controller.state.app_state.current_session_id,
+        )
+        .map_err(|conflict| command_conflict_error(&mut controller, conflict))?;
+        (controller.app.clone(), root_session_id, child_session_id)
+    };
+
+    let edge = load_agent_execution_edge(app.clone(), child_session_id).await?;
+    validate_agent_execution_edge(
+        &execution_target,
+        root_session_id,
+        child_session_id,
+        edge.as_ref(),
+    )
+    .map_err(read_only_command_conflict_error)?;
+
+    {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        validate_agent_execution_owner(
+            &execution_target,
+            controller.app.workspace.root.as_str(),
+            controller.state.app_state.current_session_id,
+        )
+        .map_err(|conflict| command_conflict_error(&mut controller, conflict))?;
+    }
+
+    let accepted = app
+        .run_service
+        .interrupt_agent_turn_exact(
+            root_session_id,
+            &execution_target.agent_path,
+            child_session_id,
+            expected_turn_id,
+        )
+        .await
+        .map_err(|error| {
+            DesktopCommandError::storage(format!(
+                "failed to interrupt the exact Sub Agent turn: {error}"
+            ))
+        })?;
+
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    if !accepted {
+        return Err(command_conflict_error(
+            &mut controller,
+            DesktopCommandConflict::new(
+                "the Sub Agent turn changed before interrupt was applied; refresh the activity list and try again",
+            ),
+        ));
+    }
+    controller
+        .next_web_state()
+        .map_err(DesktopCommandError::internal)
 }
 
 async fn load_agent_execution_projection(
@@ -2303,7 +2411,7 @@ fn ensure_config_draft_commit_admission(
 ) -> Result<(), DesktopCommandConflict> {
     if !controller.config_draft_mutation_admission_open() {
         return Err(DesktopCommandConflict::new(
-            "configuration cannot be committed while a run, Agent Tree, navigation, or owner mutation is active",
+            "configuration cannot be committed while a root run, navigation, or owner mutation is active",
         ));
     }
     Ok(())
@@ -2641,6 +2749,7 @@ mod tests {
             workspace_path: "C:/workspace".to_string(),
             session_id: Some("session-a".to_string()),
             runtime_owner_token: "root:11".to_string(),
+            permission_confirmation_id: Some("41".to_string()),
         };
         assert!(
             validate_run_mutation_target(
@@ -2648,24 +2757,34 @@ mod tests {
                 "C:/workspace",
                 Some("session-a".to_string()),
                 "root:11".to_string(),
+                Some("41".to_string()),
             )
             .is_ok()
         );
-        for (workspace, session_id, runtime_owner_token) in [
+        for (workspace, session_id, runtime_owner_token, permission_confirmation_id) in [
             (
                 "C:/other",
                 Some("session-a".to_string()),
                 "root:11".to_string(),
+                Some("41".to_string()),
             ),
             (
                 "C:/workspace",
                 Some("session-b".to_string()),
                 "root:11".to_string(),
+                Some("41".to_string()),
             ),
             (
                 "C:/workspace",
                 Some("session-a".to_string()),
                 "root:12".to_string(),
+                Some("41".to_string()),
+            ),
+            (
+                "C:/workspace",
+                Some("session-a".to_string()),
+                "root:11".to_string(),
+                Some("42".to_string()),
             ),
         ] {
             assert!(
@@ -2674,10 +2793,33 @@ mod tests {
                     workspace,
                     session_id,
                     runtime_owner_token,
+                    permission_confirmation_id,
                 )
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn stop_target_rejects_permission_confirmation_aba() {
+        let stale_permission_a = DesktopRunMutationTarget {
+            workspace_path: "C:/workspace".to_string(),
+            session_id: Some("session-a".to_string()),
+            runtime_owner_token: "root:11".to_string(),
+            permission_confirmation_id: Some("41".to_string()),
+        };
+
+        assert!(
+            validate_run_mutation_target(
+                &stale_permission_a,
+                "C:/workspace",
+                Some("session-a".to_string()),
+                "root:11".to_string(),
+                Some("42".to_string()),
+            )
+            .is_err(),
+            "a stale Stop rendered for permission A must not abort replacement permission B"
+        );
     }
 
     #[test]
@@ -2746,6 +2888,41 @@ mod tests {
     }
 
     #[test]
+    fn agent_interrupt_target_requires_exact_camel_case_turn_identity() {
+        let root_session_id = SessionId::new();
+        let child_session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let target: DesktopAgentInterruptTarget = serde_json::from_value(serde_json::json!({
+            "workspacePath": "C:/workspace",
+            "rootSessionId": root_session_id.to_string(),
+            "agentPath": "/root/review",
+            "childSessionId": child_session_id.to_string(),
+            "expectedTurnId": turn_id.to_string(),
+        }))
+        .expect("deserialize exact interrupt target");
+        assert_eq!(target.expected_turn_id().expect("turn id"), turn_id);
+        assert_eq!(
+            target.execution_target(),
+            DesktopAgentExecutionTarget {
+                workspace_path: "C:/workspace".to_string(),
+                root_session_id: root_session_id.to_string(),
+                agent_path: "/root/review".to_string(),
+                child_session_id: child_session_id.to_string(),
+            }
+        );
+        assert!(
+            serde_json::from_value::<DesktopAgentInterruptTarget>(serde_json::json!({
+                "workspacePath": "C:/workspace",
+                "rootSessionId": root_session_id.to_string(),
+                "agentPath": "/root/review",
+                "childSessionId": child_session_id.to_string(),
+            }))
+            .is_err(),
+            "a child interrupt without an exact turn must fail closed"
+        );
+    }
+
+    #[test]
     fn agent_execution_target_rejects_stale_workspace_or_root_owner() {
         let root_session_id = SessionId::new();
         let child_session_id = SessionId::new();
@@ -2784,6 +2961,7 @@ mod tests {
             child_session_id,
             agent_path: target.agent_path.clone(),
             task_name: "security_review".to_string(),
+            spawn_order: 1,
             created_at_ms: 1,
         };
         assert!(

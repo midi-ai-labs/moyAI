@@ -81,6 +81,12 @@ impl SandboxNetworkPolicy {
 pub(crate) struct WorkspaceWriteSandboxProfile {
     pub(crate) writable_roots: Vec<SandboxPathSnapshot>,
     pub(crate) read_only_roots: Vec<SandboxPathSnapshot>,
+    /// The admitted host temp root used by the parent to create one fresh
+    /// directory per workspace-write effect. The shared base is not itself a
+    /// writable capability; only the exact effect directory is added to the
+    /// execution-local writable roots before a child is launched.
+    pub(crate) effect_temp_base: Option<SandboxPathSnapshot>,
+    pub(crate) effect_temp_directory: Option<SandboxPathSnapshot>,
     pub(crate) network: SandboxNetworkPolicy,
 }
 
@@ -115,22 +121,9 @@ impl WorkspaceWriteSandboxProfile {
         workspace: &Workspace,
         config: &ResolvedConfig,
     ) -> Result<Self, SandboxProfileError> {
-        let mut temp_roots = Vec::new();
-        if let Ok(path) = Utf8PathBuf::from_path_buf(std::env::temp_dir()) {
-            if path.is_dir() {
-                temp_roots.push(path);
-            }
-        }
-        for key in ["TEMP", "TMP"] {
-            let Some(path) =
-                std::env::var_os(key).and_then(|value| Utf8PathBuf::from_os_string(value).ok())
-            else {
-                continue;
-            };
-            if path.is_dir() {
-                temp_roots.push(path);
-            }
-        }
+        let temp_roots = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .ok()
+            .into_iter();
 
         Self::compile_with_instructions(
             workspace,
@@ -140,7 +133,7 @@ impl WorkspaceWriteSandboxProfile {
     }
 
     #[cfg(test)]
-    fn compile(
+    pub(crate) fn compile(
         workspace: &Workspace,
         temp_roots: impl IntoIterator<Item = Utf8PathBuf>,
     ) -> Result<Self, SandboxProfileError> {
@@ -157,9 +150,11 @@ impl WorkspaceWriteSandboxProfile {
         for path in &workspace.path_policy.additional_write_roots {
             writable_roots.push(validate_writable_root(path, "additional write")?);
         }
-        for path in temp_roots {
-            writable_roots.push(validate_writable_root(&path, "temporary")?);
-        }
+        let effect_temp_base = temp_roots
+            .into_iter()
+            .next()
+            .map(|path| validate_writable_root(&path, "temporary"))
+            .transpose()?;
         sort_and_dedupe_snapshots(&mut writable_roots);
         let writable_paths = writable_roots
             .iter()
@@ -187,6 +182,21 @@ impl WorkspaceWriteSandboxProfile {
         )?);
         for protected in &workspace.protected_paths {
             let protected = normalize_absolute(protected, "protected")?;
+            if let Some(base) = &effect_temp_base {
+                if PathGuard::security_path_is_within(&base.requested, &protected).map_err(
+                    |error| {
+                        SandboxProfileError::new(format!(
+                            "failed to compare effect temp base `{}` with configured protected path `{protected}`: {error}",
+                            base.requested
+                        ))
+                    },
+                )? {
+                    return Err(SandboxProfileError::new(format!(
+                        "effect temp base `{}` is inside configured protected sandbox authority `{protected}`",
+                        base.requested
+                    )));
+                }
+            }
             if protected_overlaps_writable_root(&protected, &writable_paths)? {
                 if !protected.exists() {
                     return Err(SandboxProfileError::new(format!(
@@ -197,6 +207,38 @@ impl WorkspaceWriteSandboxProfile {
             }
         }
         normalize_sort_and_dedupe(&mut protected_paths);
+        if let Some(base) = &effect_temp_base {
+            for protected in &protected_paths {
+                if PathGuard::security_path_is_within(&base.requested, protected).map_err(
+                    |error| {
+                        SandboxProfileError::new(format!(
+                            "failed to compare effect temp base `{}` with protected path `{protected}`: {error}",
+                            base.requested
+                        ))
+                    },
+                )? {
+                    return Err(SandboxProfileError::new(format!(
+                        "effect temp base `{}` is inside protected sandbox authority `{protected}`",
+                        base.requested
+                    )));
+                }
+            }
+            for writable in &writable_paths {
+                if PathGuard::security_path_is_within(&base.requested, writable).map_err(
+                    |error| {
+                        SandboxProfileError::new(format!(
+                            "failed to compare effect temp base `{}` with writable root `{writable}`: {error}",
+                            base.requested
+                        ))
+                    },
+                )? {
+                    return Err(SandboxProfileError::new(format!(
+                        "effect temp base `{}` is inside writable sandbox root `{writable}`",
+                        base.requested
+                    )));
+                }
+            }
+        }
         reject_writable_roots_inside_protected_paths(&writable_paths, &protected_paths)?;
         read_only_roots.extend(
             protected_paths
@@ -209,15 +251,81 @@ impl WorkspaceWriteSandboxProfile {
         Ok(Self {
             writable_roots,
             read_only_roots,
+            effect_temp_base,
+            effect_temp_directory: None,
             network: SandboxNetworkPolicy::AdvisoryOfflineEnvironment,
         })
     }
 
+    pub(crate) fn admit_effect_temp_directory(
+        &mut self,
+        path: &Utf8Path,
+    ) -> Result<(), SandboxProfileError> {
+        if self.effect_temp_directory.is_some() {
+            return Err(SandboxProfileError::new(
+                "workspace-write profile already has an effect temp directory",
+            ));
+        }
+        let root = validate_writable_root(path, "effect temporary")?;
+        let base = self.effect_temp_base.as_ref().ok_or_else(|| {
+            SandboxProfileError::new("workspace-write profile has no effect temp base")
+        })?;
+        if !PathGuard::security_path_is_within(&root.requested, &base.requested).map_err(
+            |error| {
+                SandboxProfileError::new(format!(
+                    "failed to compare effect temp directory `{}` with base `{}`: {error}",
+                    root.requested, base.requested
+                ))
+            },
+        )? {
+            return Err(SandboxProfileError::new(format!(
+                "effect temp directory `{}` escaped admitted base `{}`",
+                root.requested, base.requested
+            )));
+        }
+        let mut conflicting_paths = self
+            .read_only_roots
+            .iter()
+            .map(|snapshot| snapshot.requested.clone())
+            .collect::<Vec<_>>();
+        normalize_sort_and_dedupe(&mut conflicting_paths);
+        if protected_overlaps_writable_root(&root.requested, &conflicting_paths)? {
+            return Err(SandboxProfileError::new(format!(
+                "effect temp directory `{}` overlaps a protected sandbox authority",
+                root.requested
+            )));
+        }
+        for writable in &self.writable_roots {
+            if PathGuard::security_path_is_within(&root.requested, &writable.requested).map_err(
+                |error| {
+                    SandboxProfileError::new(format!(
+                        "failed to compare effect temp directory `{}` with writable root `{}`: {error}",
+                        root.requested, writable.requested
+                    ))
+                },
+            )? {
+                return Err(SandboxProfileError::new(format!(
+                    "effect temp directory `{}` is inside existing writable sandbox root `{}`",
+                    root.requested, writable.requested
+                )));
+            }
+        }
+        self.effect_temp_directory = Some(root.clone());
+        self.writable_roots.push(root);
+        sort_and_dedupe_snapshots(&mut self.writable_roots);
+        Ok(())
+    }
+
     pub(crate) fn audit_description(&self) -> String {
         format!(
-            "workspace_write(writable_roots={}, read_only_roots={}, network={}, network_os_enforced={}, world_writable_audit=bounded_best_effort)",
+            "workspace_write(writable_roots={}, read_only_roots={}, effect_temp={}, network={}, network_os_enforced={}, world_writable_audit=bounded_best_effort)",
             self.writable_roots.len(),
             self.read_only_roots.len(),
+            if self.effect_temp_base.is_some() {
+                "per_effect"
+            } else {
+                "unavailable"
+            },
             self.network.audit_label(),
             self.network.is_os_enforced(),
         )
@@ -830,13 +938,32 @@ mod tests {
         assert_eq!(unrestricted, ProcessSandboxPlan::Unrestricted);
         assert_eq!(unrestricted.audit_description(), "unrestricted");
 
-        let profile = WorkspaceWriteSandboxProfile::compile(&workspace, [scratch])
+        let profile = WorkspaceWriteSandboxProfile::compile(&workspace, [scratch.clone()])
             .expect("workspace-write profile");
         assert!(!profile.network.is_os_enforced());
+        assert_eq!(
+            profile
+                .effect_temp_base
+                .as_ref()
+                .map(|snapshot| &snapshot.requested),
+            Some(&scratch)
+        );
+        assert!(
+            profile
+                .writable_roots
+                .iter()
+                .all(|root| root.requested != scratch),
+            "the shared host TEMP base must not be a child writable capability"
+        );
         assert!(
             profile
                 .audit_description()
                 .contains("network=advisory_offline_environment")
+        );
+        assert!(
+            profile
+                .audit_description()
+                .contains("effect_temp=per_effect")
         );
         assert!(
             profile
@@ -850,15 +977,16 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = utf8(temp.path().join("workspace"));
         let scratch = utf8(temp.path().join("scratch"));
+        let temp_base = utf8(temp.path().join("temp"));
         std::fs::create_dir_all(&root).expect("workspace root");
         std::fs::create_dir_all(&scratch).expect("scratch root");
+        std::fs::create_dir_all(&temp_base).expect("temp root");
         let mut workspace = workspace(&root);
         workspace.path_policy.additional_write_roots =
             vec![scratch.join("child/.."), scratch.clone()];
 
-        let profile =
-            WorkspaceWriteSandboxProfile::compile(&workspace, [root.join("."), scratch.clone()])
-                .expect("profile");
+        let profile = WorkspaceWriteSandboxProfile::compile(&workspace, [temp_base.clone()])
+            .expect("profile");
 
         assert_eq!(profile.writable_roots.len(), 2);
         assert!(
@@ -872,6 +1000,74 @@ mod tests {
                 .writable_roots
                 .iter()
                 .any(|snapshot| snapshot.requested == scratch)
+        );
+        assert_eq!(
+            profile
+                .effect_temp_base
+                .as_ref()
+                .map(|snapshot| &snapshot.requested),
+            Some(&temp_base)
+        );
+    }
+
+    #[test]
+    fn unused_later_temp_candidate_cannot_invalidate_the_selected_base() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = utf8(temp.path().join("workspace"));
+        let selected = utf8(temp.path().join("selected-temp"));
+        let unused_missing = utf8(temp.path().join("unused-missing-temp"));
+        std::fs::create_dir_all(&root).expect("workspace root");
+        std::fs::create_dir_all(&selected).expect("selected temp root");
+        let workspace = workspace(&root);
+
+        let profile =
+            WorkspaceWriteSandboxProfile::compile(&workspace, [selected.clone(), unused_missing])
+                .expect("only the selected host temp base should be admitted");
+
+        assert_eq!(
+            profile
+                .effect_temp_base
+                .as_ref()
+                .map(|snapshot| &snapshot.requested),
+            Some(&selected)
+        );
+    }
+
+    #[test]
+    fn effect_temp_base_cannot_be_inside_protected_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = utf8(temp.path().join("workspace"));
+        std::fs::create_dir_all(root.join(".moyai")).expect("workspace authority");
+        let mut workspace = workspace(&root);
+
+        let parent_base = utf8(temp.path().to_path_buf());
+        WorkspaceWriteSandboxProfile::compile(&workspace, [parent_base])
+            .expect("a base above the workspace creates a non-authority sibling");
+        let error = WorkspaceWriteSandboxProfile::compile(&workspace, [root.clone()])
+            .expect_err("a base inside a writable root exposes the pre-private-DACL window");
+        assert!(
+            error.to_string().contains("effect temp base")
+                && error.to_string().contains("inside writable"),
+            "{error}"
+        );
+        let base = root.join(".moyai");
+        let error = WorkspaceWriteSandboxProfile::compile(&workspace, [base])
+            .expect_err("effect temp base inside protected authority must fail closed");
+        assert!(
+            error.to_string().contains("effect temp base")
+                && error.to_string().contains("inside protected"),
+            "{error}"
+        );
+
+        let external_protected = utf8(temp.path().join("external-protected"));
+        std::fs::create_dir_all(&external_protected).expect("external protected authority");
+        workspace.protected_paths = vec![external_protected.clone()];
+        let error = WorkspaceWriteSandboxProfile::compile(&workspace, [external_protected])
+            .expect_err("external configured protection must also constrain the temp base");
+        assert!(
+            error.to_string().contains("effect temp base")
+                && error.to_string().contains("configured protected"),
+            "{error}"
         );
     }
 

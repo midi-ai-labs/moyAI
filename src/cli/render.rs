@@ -754,6 +754,7 @@ pub fn cli_session_read_payload_preserves_metadata_pages_fixture_passes() -> boo
             items: Vec::new(),
         },
         turn_elapsed_ms: Default::default(),
+        pending_turn_inputs: Vec::new(),
         latest_turn_id: Some(active_turn_id),
         active_turn_id: Some(active_turn_id),
         active_turn_sequence_no: Some(42),

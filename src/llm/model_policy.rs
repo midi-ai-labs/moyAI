@@ -21,8 +21,12 @@ pub struct ModelPolicy {
     pub id: String,
     pub base_instructions: String,
     pub default_reasoning: Option<ReasoningEffort>,
+    /// Provider-advertised context window before Codex-style input headroom.
     pub context_window: u32,
     pub working_context_token_limit: u32,
+    /// Effective full input limit after Codex's 95% headroom and any
+    /// non-inverting configured overflow margin.
+    pub effective_context_token_limit: u32,
     pub max_output_tokens: u32,
     pub input_modalities: BTreeSet<InputModality>,
     pub supports_tools: bool,
@@ -36,23 +40,10 @@ impl ModelPolicy {
         if config.model.supports_images {
             input_modalities.insert(InputModality::Image);
         }
-        let hard_request_limit = config.model.context_window.saturating_sub(
-            config
-                .model
-                .max_output_tokens
-                .saturating_add(config.session.overflow_margin_tokens as u32),
+        let context_limits = ContextWindowLimits::resolve(
+            config.model.context_window,
+            config.session.overflow_margin_tokens,
         );
-        // Keep the normal working set below 40% of the advertised context.
-        // For the default 131,072-token profile this triggers before a roughly
-        // 52k-token full-history resend, while the hard request limit remains a
-        // separate last-resort safety boundary.
-        let working_context_target = config.model.context_window.saturating_mul(2) / 5;
-        let compact_margin = config
-            .model
-            .max_output_tokens
-            .saturating_add(config.session.overflow_margin_tokens as u32)
-            .saturating_add(config.model.context_window / 20);
-        let legacy_margin_limit = config.model.context_window.saturating_sub(compact_margin);
         Self {
             id: config.model.model.clone(),
             base_instructions: format!(
@@ -62,9 +53,8 @@ impl ModelPolicy {
             ),
             default_reasoning: config.model.reasoning_effort.clone(),
             context_window: config.model.context_window,
-            working_context_token_limit: working_context_target
-                .min(hard_request_limit)
-                .min(legacy_margin_limit),
+            working_context_token_limit: context_limits.working,
+            effective_context_token_limit: context_limits.effective_full,
             max_output_tokens: config.model.max_output_tokens,
             input_modalities,
             supports_tools: config.model.supports_tools,
@@ -79,7 +69,10 @@ impl ModelPolicy {
     ) -> ModelProfile {
         ModelProfile {
             name: self.id.clone(),
-            context_window: self.context_window,
+            // Transport admission receives the immutable effective input
+            // window. The advertised value remains on ModelPolicy and in the
+            // resolved config used for provider-specific `num_ctx`.
+            context_window: self.effective_context_token_limit,
             max_output_tokens: self.max_output_tokens,
             provider_metadata_mode,
             capabilities: ModelCapabilities {
@@ -89,6 +82,49 @@ impl ModelPolicy {
             },
         }
     }
+}
+
+/// The single owner of the relationship between advertised, working, and hard
+/// context limits.
+///
+/// Codex starts automatic compaction at 90% of the advertised context and
+/// treats 95% as the effective full input window. A configured overflow margin
+/// may lower the hard limit only when the result remains strictly above the
+/// working limit. `max_output_tokens` is intentionally absent: it is a
+/// generation cap, not an input reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContextWindowLimits {
+    pub working: u32,
+    pub effective_full: u32,
+}
+
+impl ContextWindowLimits {
+    pub(crate) fn resolve(
+        advertised_context_window: u32,
+        configured_overflow_margin_tokens: usize,
+    ) -> Self {
+        let working = percentage_of(advertised_context_window, 90);
+        let minimum_hard = working.saturating_add(1).min(advertised_context_window);
+        let codex_effective_full = percentage_of(advertised_context_window, 95).max(minimum_hard);
+        let configured_margin = configured_overflow_margin_tokens.min(u32::MAX as usize) as u32;
+        let margin_limited = advertised_context_window.saturating_sub(configured_margin);
+        let effective_full = if margin_limited > working {
+            codex_effective_full.min(margin_limited)
+        } else {
+            // A fixed margin must never make the hard boundary precede
+            // automatic compaction. Ignore that invalid cap and retain the
+            // Codex effective window.
+            codex_effective_full
+        };
+        Self {
+            working,
+            effective_full,
+        }
+    }
+}
+
+fn percentage_of(value: u32, percent: u32) -> u32 {
+    (u64::from(value) * u64::from(percent) / 100).min(u64::from(u32::MAX)) as u32
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,7 +144,6 @@ impl ProviderCapabilities {
                 .unwrap_or(ProviderReasoningCapability::Unsupported),
             ProviderApiMode::Responses => ProviderReasoningCapability::Responses {
                 supports_summary: true,
-                supports_previous_response_id: true,
             },
         };
         Self {
@@ -245,10 +280,63 @@ mod tests {
     }
 
     #[test]
-    fn default_working_context_triggers_before_fifty_two_k_resend() {
-        let config = ResolvedConfig::default();
+    fn working_context_is_ninety_percent_independent_of_max_output() {
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 131_072;
+        config.model.max_output_tokens = 65_536;
+        let large_output = ModelPolicy::from_config(&config);
+        config.model.max_output_tokens = 8_192;
+        let small_output = ModelPolicy::from_config(&config);
+
+        assert_eq!(large_output.working_context_token_limit, 117_964);
+        assert_eq!(large_output.effective_context_token_limit, 124_518);
+        assert_eq!(
+            large_output.working_context_token_limit,
+            small_output.working_context_token_limit
+        );
+        assert_eq!(
+            large_output.effective_context_token_limit,
+            small_output.effective_context_token_limit
+        );
+    }
+
+    #[test]
+    fn small_context_ignores_a_margin_that_would_precede_compaction() {
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 8_192;
+        config.session.overflow_margin_tokens = 1_024;
+
         let policy = ModelPolicy::from_config(&config);
-        assert!(policy.working_context_token_limit <= 52_428);
-        assert!(policy.working_context_token_limit < config.model.context_window);
+
+        assert_eq!(policy.working_context_token_limit, 7_372);
+        assert_eq!(policy.effective_context_token_limit, 7_782);
+        assert!(
+            policy.working_context_token_limit < policy.effective_context_token_limit,
+            "hard context limit must remain after automatic compaction"
+        );
+        assert_eq!(
+            policy
+                .transport_profile(config.model.provider_metadata_mode)
+                .context_window,
+            policy.effective_context_token_limit
+        );
+    }
+
+    #[test]
+    fn a_safe_configured_margin_can_lower_the_effective_full_limit() {
+        let limits = ContextWindowLimits::resolve(16_384, 1_024);
+
+        assert_eq!(limits.working, 14_745);
+        assert_eq!(limits.effective_full, 15_360);
+        assert!(limits.working < limits.effective_full);
+    }
+
+    #[test]
+    fn percentage_limits_do_not_overflow_large_profiles() {
+        let limits = ContextWindowLimits::resolve(u32::MAX, 0);
+
+        assert_eq!(limits.working, 3_865_470_565);
+        assert_eq!(limits.effective_full, 4_080_218_930);
+        assert!(limits.working < limits.effective_full);
     }
 }

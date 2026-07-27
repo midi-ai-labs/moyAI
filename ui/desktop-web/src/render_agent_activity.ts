@@ -99,7 +99,7 @@ function renderAgentJobCard(row: AgentActivityRow, selectedAgentPath: string | n
   const status = agentStatusLabel(row.status);
   const preview = plainAgentPreview(activityPreview(row) || row.task_preview.trim());
   const selected = selectedAgentPath === row.agent_path;
-  return `
+  return `<div class="agent-job-card-shell">
     <button type="button" class="agent-job-card agent-tone-${visual.tone} agent-status-${row.status} ${row.updated ? "updated" : ""}"
       data-action="show-agent-pane" data-agent-path="${escapeHtml(row.agent_path)}"
       data-focus-key="agent-job:${escapeHtml(row.agent_path)}" title="${escapeHtml(`${row.agent_path} · ${status}`)}"
@@ -110,13 +110,14 @@ function renderAgentJobCard(row: AgentActivityRow, selectedAgentPath: string | n
       <span class="agent-status-label">${escapeHtml(status)}</span>
       <span class="agent-job-chevron" aria-hidden="true">›</span>
     </button>
-  `;
+    ${renderAgentInterruptButton(row)}
+  </div>`;
 }
 
 function renderInspectorListCard(row: AgentActivityRow): string {
   const visual = stableAgentVisual(row.agent_path);
   const preview = plainAgentPreview(activityPreview(row) || row.task_preview.trim());
-  return `
+  return `<div class="sub-agent-list-card-shell">
     <button type="button" class="sub-agent-list-card agent-tone-${visual.tone} agent-status-${row.status} ${row.updated ? "updated" : ""}"
       data-action="show-agent-pane" data-agent-path="${escapeHtml(row.agent_path)}"
       data-focus-key="sub-agent-card:${escapeHtml(row.agent_path)}"
@@ -127,7 +128,8 @@ function renderInspectorListCard(row: AgentActivityRow): string {
       <span class="agent-status-label">${escapeHtml(agentStatusLabel(row.status))}</span>
       <span class="agent-job-chevron" aria-hidden="true">›</span>
     </button>
-  `;
+    ${renderAgentInterruptButton(row)}
+  </div>`;
 }
 
 function renderAgentExecution(row: AgentActivityRow, execution: AgentExecutionCacheEntry | null): string {
@@ -152,6 +154,7 @@ function renderAgentExecution(row: AgentActivityRow, execution: AgentExecutionCa
       <div class="agent-execution-meta">
         <span>${escapeHtml(agentStatusLabel(row.status))}</span>
         <small>${escapeHtml(count || `Session ${row.session_id}`)}</small>
+        ${renderAgentInterruptButton(row)}
       </div>
       ${execution?.status === "loading" && !projection ? '<div class="agent-execution-state"><span class="busy-spinner small"></span><span>実行履歴を読み込んでいます</span></div>' : ""}
       ${execution?.status === "error" ? `<div class="agent-execution-error" role="status"><span>${escapeHtml(execution.error)}</span><button type="button" data-action="show-agent-pane" data-agent-path="${escapeHtml(row.agent_path)}">再試行</button></div>` : ""}
@@ -163,6 +166,14 @@ function renderAgentExecution(row: AgentActivityRow, execution: AgentExecutionCa
           : '<div class="empty agent-execution-empty">表示できる実行履歴はありません</div>'}
     </section>
   `;
+}
+
+function renderAgentInterruptButton(row: AgentActivityRow): string {
+  if (row.status !== "running" || !row.can_interrupt || row.active_turn_id === null) return "";
+  return `<button type="button" class="icon-only danger agent-interrupt"
+    data-action="interrupt-agent" data-agent-path="${escapeHtml(row.agent_path)}"
+    title="${escapeHtml(`${agentDisplayName(row)}を停止`)}"
+    aria-label="${escapeHtml(`${agentDisplayName(row)}の実行中turnを停止`)}">■</button>`;
 }
 
 function renderSummarySymbol(row: AgentActivityRow): string {

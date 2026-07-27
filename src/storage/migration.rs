@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
@@ -93,6 +93,22 @@ const V44_UNIQUE_TURN_TERMINAL: &str =
     include_str!("../../migrations/V44__unique_turn_terminal.sql");
 const V45_RESTORE_AUTO_REVIEW_ACCESS_MODE: &str =
     include_str!("../../migrations/V45__restore_auto_review_access_mode.sql");
+const V46_CODEX_COMPACTION_CHECKPOINT: &str =
+    include_str!("../../migrations/V46__codex_compaction_checkpoint.sql");
+const V47_RECURSIVE_SESSION_SPAWN_EDGES: &str =
+    include_str!("../../migrations/V47__recursive_session_spawn_edges.sql");
+const V48_AGENT_OWNER_RESUME_REQUESTS: &str =
+    include_str!("../../migrations/V48__agent_owner_resume_requests.sql");
+const V49_AGENT_TREE_STOP_FENCES: &str =
+    include_str!("../../migrations/V49__agent_tree_stop_fences.sql");
+const V50_DURABLE_AGENT_MAILBOX: &str =
+    include_str!("../../migrations/V50__durable_agent_mailbox.sql");
+const V51_DURABLE_TURN_INPUT_QUEUE: &str =
+    include_str!("../../migrations/V51__durable_turn_input_queue.sql");
+const V52_HARNESS_TURN_IDENTITY: &str =
+    include_str!("../../migrations/V52__harness_turn_identity.sql");
+const V53_AGENT_TRIGGER_TURN_CLAIMS: &str =
+    include_str!("../../migrations/V53__agent_trigger_turn_claims.sql");
 const LEGACY_PLANNER_CUTOVER_VERSION: i64 = 32;
 const CANONICAL_PROTOCOL_STORAGE_VERSION: i64 = 33;
 const DROP_SESSIONS_MEMORY_MODE_VERSION: i64 = 34;
@@ -107,6 +123,23 @@ const TYPED_HISTORY_SCOPE_VERSION: i64 = 42;
 const INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION: i64 = 43;
 const UNIQUE_TURN_TERMINAL_VERSION: i64 = 44;
 const RESTORE_AUTO_REVIEW_ACCESS_MODE_VERSION: i64 = 45;
+const CODEX_COMPACTION_CHECKPOINT_VERSION: i64 = 46;
+const RECURSIVE_SESSION_SPAWN_EDGES_VERSION: i64 = 47;
+const AGENT_OWNER_RESUME_REQUESTS_VERSION: i64 = 48;
+const AGENT_TREE_STOP_FENCES_VERSION: i64 = 49;
+const DURABLE_AGENT_MAILBOX_VERSION: i64 = 50;
+const DURABLE_TURN_INPUT_QUEUE_VERSION: i64 = 51;
+const HARNESS_TURN_IDENTITY_VERSION: i64 = 52;
+const AGENT_TRIGGER_TURN_CLAIMS_VERSION: i64 = 53;
+const CODEX_COMPACTION_CHECKPOINT_NAME: &str = "codex_compaction_checkpoint";
+const RECURSIVE_SESSION_SPAWN_EDGES_NAME: &str = "recursive_session_spawn_edges";
+const AGENT_OWNER_RESUME_REQUESTS_NAME: &str = "agent_owner_resume_requests";
+const AGENT_TREE_STOP_FENCES_NAME: &str = "agent_tree_stop_fences";
+const DURABLE_AGENT_MAILBOX_NAME: &str = "durable_agent_mailbox";
+const DURABLE_TURN_INPUT_QUEUE_NAME: &str = "durable_turn_input_queue";
+const HARNESS_TURN_IDENTITY_NAME: &str = "harness_turn_identity";
+const AGENT_TRIGGER_TURN_CLAIMS_NAME: &str = "agent_trigger_turn_claims";
+const COMPACTION_CHECKPOINT_MIGRATION_PAGE_SIZE: usize = 200;
 const SESSION_STATUS_DOMAIN: &[&str] = &["idle", "running", "completed", "cancelled", "failed"];
 const SESSION_ACCESS_MODE_DOMAIN: &[&str] = &["default", "auto_review", "full_access"];
 const RELEASED_V18_SESSION_STATUS_DOMAIN: &[&str] = &[
@@ -127,18 +160,89 @@ const TOOL_CALL_STATUS_DOMAIN: &[&str] = &[
 ];
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
+    if schema_migration_applied(connection, AGENT_TRIGGER_TURN_CLAIMS_VERSION)? {
+        validate_canonical_protocol_schema(connection)?;
+        validate_durable_agent_mailbox_data(connection)?;
+        validate_durable_turn_input_queue_data(connection)?;
+        validate_harness_turn_identity_schema(connection)?;
+        validate_harness_turn_identity_data(connection)?;
+        validate_agent_trigger_turn_claims_schema(connection)?;
+        validate_agent_trigger_turn_claims_data(connection)?;
+        return Ok(());
+    }
+    if schema_migration_applied(connection, HARNESS_TURN_IDENTITY_VERSION)? {
+        // V53 has no recoverable backfill: it starts recording exact wake ownership for
+        // admissions made after this endpoint.  Validate the complete V52 database before
+        // creating its marker or schema so a pre-existing corruption leaves the database at the
+        // exact V52 endpoint instead of committing a misleading partial upgrade.
+        validate_canonical_protocol_schema(connection)?;
+        validate_durable_agent_mailbox_data(connection)?;
+        validate_durable_turn_input_queue_data(connection)?;
+        validate_harness_turn_identity_schema(connection)?;
+        validate_harness_turn_identity_data(connection)?;
+        run_agent_trigger_turn_claims(connection)?;
+        validate_canonical_protocol_schema(connection)?;
+        validate_durable_agent_mailbox_data(connection)?;
+        validate_durable_turn_input_queue_data(connection)?;
+        validate_harness_turn_identity_schema(connection)?;
+        validate_harness_turn_identity_data(connection)?;
+        return Ok(());
+    }
+    if schema_migration_applied(connection, DURABLE_TURN_INPUT_QUEUE_VERSION)? {
+        run_harness_turn_identity(connection)?;
+        validate_canonical_protocol_schema(connection)?;
+        validate_durable_agent_mailbox_data(connection)?;
+        validate_durable_turn_input_queue_data(connection)?;
+        return Ok(());
+    }
+    if schema_migration_applied(connection, DURABLE_AGENT_MAILBOX_VERSION)? {
+        run_durable_turn_input_queue(connection)?;
+        validate_canonical_protocol_schema(connection)?;
+        validate_durable_agent_mailbox_data(connection)?;
+        return Ok(());
+    }
+    if schema_migration_applied(connection, AGENT_TREE_STOP_FENCES_VERSION)? {
+        run_durable_agent_mailbox(connection)?;
+        validate_canonical_protocol_schema(connection)?;
+        return Ok(());
+    }
+    if schema_migration_applied(connection, AGENT_OWNER_RESUME_REQUESTS_VERSION)? {
+        run_agent_owner_resume_requests(connection)?;
+        validate_canonical_protocol_schema(connection)?;
+        return Ok(());
+    }
+    if schema_migration_applied(connection, RECURSIVE_SESSION_SPAWN_EDGES_VERSION)? {
+        run_agent_owner_resume_requests(connection)?;
+        validate_canonical_protocol_schema(connection)?;
+        return Ok(());
+    }
+    if schema_migration_applied(connection, CODEX_COMPACTION_CHECKPOINT_VERSION)? {
+        run_recursive_session_spawn_edges(connection)?;
+        run_agent_owner_resume_requests(connection)?;
+        validate_canonical_protocol_schema(connection)?;
+        return Ok(());
+    }
     if schema_migration_applied(connection, RESTORE_AUTO_REVIEW_ACCESS_MODE_VERSION)? {
+        run_codex_compaction_checkpoint(connection)?;
+        run_recursive_session_spawn_edges(connection)?;
+        run_agent_owner_resume_requests(connection)?;
         validate_canonical_protocol_schema(connection)?;
         return Ok(());
     }
     if schema_migration_applied(connection, UNIQUE_TURN_TERMINAL_VERSION)? {
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
+        run_recursive_session_spawn_edges(connection)?;
+        run_agent_owner_resume_requests(connection)?;
         validate_canonical_protocol_schema(connection)?;
         return Ok(());
     }
     if schema_migration_applied(connection, INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION)? {
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
+        run_recursive_session_spawn_edges(connection)?;
+        run_agent_owner_resume_requests(connection)?;
         validate_canonical_protocol_schema(connection)?;
         return Ok(());
     }
@@ -146,6 +250,9 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
+        run_recursive_session_spawn_edges(connection)?;
+        run_agent_owner_resume_requests(connection)?;
         validate_canonical_protocol_schema(connection)?;
         return Ok(());
     }
@@ -154,6 +261,9 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
+        run_recursive_session_spawn_edges(connection)?;
+        run_agent_owner_resume_requests(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -163,6 +273,9 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
+        run_recursive_session_spawn_edges(connection)?;
+        run_agent_owner_resume_requests(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -173,6 +286,9 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
+        run_recursive_session_spawn_edges(connection)?;
+        run_agent_owner_resume_requests(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -184,6 +300,9 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
+        run_recursive_session_spawn_edges(connection)?;
+        run_agent_owner_resume_requests(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -196,6 +315,9 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
+        run_recursive_session_spawn_edges(connection)?;
+        run_agent_owner_resume_requests(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -209,6 +331,9 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
+        run_recursive_session_spawn_edges(connection)?;
+        run_agent_owner_resume_requests(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -223,6 +348,9 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
+        run_recursive_session_spawn_edges(connection)?;
+        run_agent_owner_resume_requests(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -238,6 +366,9 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
+        run_recursive_session_spawn_edges(connection)?;
+        run_agent_owner_resume_requests(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -254,6 +385,9 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         run_indexed_internal_file_ownership(connection)?;
         run_unique_turn_terminal(connection)?;
         run_restore_auto_review_access_mode(connection)?;
+        run_codex_compaction_checkpoint(connection)?;
+        run_recursive_session_spawn_edges(connection)?;
+        run_agent_owner_resume_requests(connection)?;
         validate_canonical_protocol_storage(connection)?;
         return Ok(());
     }
@@ -277,6 +411,9 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
     run_indexed_internal_file_ownership(connection)?;
     run_unique_turn_terminal(connection)?;
     run_restore_auto_review_access_mode(connection)?;
+    run_codex_compaction_checkpoint(connection)?;
+    run_recursive_session_spawn_edges(connection)?;
+    run_agent_owner_resume_requests(connection)?;
     validate_canonical_protocol_storage(connection)?;
     Ok(())
 }
@@ -913,6 +1050,763 @@ fn run_restore_auto_review_access_mode(connection: &Connection) -> Result<(), St
         V45_RESTORE_AUTO_REVIEW_ACCESS_MODE,
         "V45 auto-review access mode restoration migration",
     )
+}
+
+fn run_codex_compaction_checkpoint(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        let _ = canonicalize_compaction_checkpoint_history(connection)?;
+        validate_compaction_checkpoint_history(connection)?;
+        connection.execute_batch(V46_CODEX_COMPACTION_CHECKPOINT)?;
+        if !schema_migration_has_exact_name(
+            connection,
+            CODEX_COMPACTION_CHECKPOINT_VERSION,
+            CODEX_COMPACTION_CHECKPOINT_NAME,
+        )? {
+            return Err(StorageError::Message(
+                "V46 compaction checkpoint migration did not record its exact schema marker"
+                    .to_string(),
+            ));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn run_recursive_session_spawn_edges(connection: &Connection) -> Result<(), StorageError> {
+    run_foreign_keys_disabled_migration_action(
+        connection,
+        "V47 recursive session spawn-edge migration",
+        |connection| {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                connection.execute_batch(V47_RECURSIVE_SESSION_SPAWN_EDGES)?;
+                if !schema_migration_has_exact_name(
+                    connection,
+                    RECURSIVE_SESSION_SPAWN_EDGES_VERSION,
+                    RECURSIVE_SESSION_SPAWN_EDGES_NAME,
+                )? {
+                    return Err(StorageError::Message(
+                        "V47 recursive spawn-edge migration did not record its exact schema marker"
+                            .to_string(),
+                    ));
+                }
+                validate_recursive_session_spawn_edge_schema(connection)?;
+                validate_recursive_session_spawn_edge_data(connection)?;
+                let foreign_key_errors = connection.query_row(
+                    "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                if foreign_key_errors != 0 {
+                    return Err(StorageError::Message(format!(
+                        "V47 recursive spawn-edge migration produced {foreign_key_errors} foreign-key violation(s)"
+                    )));
+                }
+                Ok::<_, StorageError>(())
+            })();
+            match result {
+                Ok(()) => connection
+                    .execute_batch("COMMIT")
+                    .map_err(StorageError::from),
+                Err(error) => {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        },
+    )
+}
+
+fn run_agent_owner_resume_requests(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if !schema_migration_applied(connection, AGENT_OWNER_RESUME_REQUESTS_VERSION)? {
+            connection.execute_batch(V48_AGENT_OWNER_RESUME_REQUESTS)?;
+        }
+        if !schema_migration_has_exact_name(
+            connection,
+            AGENT_OWNER_RESUME_REQUESTS_VERSION,
+            AGENT_OWNER_RESUME_REQUESTS_NAME,
+        )? {
+            return Err(StorageError::Message(
+                "V48 owner-resume migration did not record its exact schema marker".to_string(),
+            ));
+        }
+        if !schema_migration_applied(connection, AGENT_TREE_STOP_FENCES_VERSION)? {
+            connection.execute_batch(V49_AGENT_TREE_STOP_FENCES)?;
+        }
+        if !schema_migration_has_exact_name(
+            connection,
+            AGENT_TREE_STOP_FENCES_VERSION,
+            AGENT_TREE_STOP_FENCES_NAME,
+        )? {
+            return Err(StorageError::Message(
+                "V49 tree-stop fence migration did not record its exact schema marker".to_string(),
+            ));
+        }
+        validate_agent_owner_resume_request_schema(connection)?;
+        validate_agent_owner_resume_request_data(connection)?;
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection.execute_batch("COMMIT")?,
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    run_durable_agent_mailbox(connection)
+}
+
+fn run_durable_agent_mailbox(connection: &Connection) -> Result<(), StorageError> {
+    run_foreign_keys_disabled_migration_action(
+        connection,
+        "V50 durable agent-mailbox migration",
+        |connection| {
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| {
+                if !schema_migration_applied(connection, DURABLE_AGENT_MAILBOX_VERSION)? {
+                    connection.execute_batch(V50_DURABLE_AGENT_MAILBOX)?;
+                }
+                if !schema_migration_has_exact_name(
+                    connection,
+                    DURABLE_AGENT_MAILBOX_VERSION,
+                    DURABLE_AGENT_MAILBOX_NAME,
+                )? {
+                    return Err(StorageError::Message(
+                        "V50 durable agent-mailbox migration did not record its exact schema marker"
+                            .to_string(),
+                    ));
+                }
+                validate_durable_agent_mailbox_schema(connection)?;
+                validate_durable_agent_mailbox_data(connection)?;
+                let foreign_key_errors = connection.query_row(
+                    "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                if foreign_key_errors != 0 {
+                    return Err(StorageError::Message(format!(
+                        "V50 durable agent-mailbox migration produced {foreign_key_errors} foreign-key violation(s)"
+                    )));
+                }
+                Ok::<_, StorageError>(())
+            })();
+            let transaction_result = match result {
+                Ok(()) => connection
+                    .execute_batch("COMMIT")
+                    .map_err(StorageError::from),
+                Err(error) => {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            };
+            let pragma_result = connection
+                .execute_batch("PRAGMA legacy_alter_table = OFF")
+                .map_err(StorageError::from);
+            match (transaction_result, pragma_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(()), Err(error)) => Err(error),
+                (Err(migration_error), Err(cleanup_error)) => Err(StorageError::Message(format!(
+                    "V50 durable agent-mailbox migration failed: {migration_error}; legacy-alter-table cleanup failed: {cleanup_error}"
+                ))),
+            }
+        },
+    )?;
+    run_durable_turn_input_queue(connection)
+}
+
+fn run_durable_turn_input_queue(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if !schema_migration_applied(connection, DURABLE_TURN_INPUT_QUEUE_VERSION)? {
+            connection.execute_batch(V51_DURABLE_TURN_INPUT_QUEUE)?;
+        }
+        if !schema_migration_has_exact_name(
+            connection,
+            DURABLE_TURN_INPUT_QUEUE_VERSION,
+            DURABLE_TURN_INPUT_QUEUE_NAME,
+        )? {
+            return Err(StorageError::Message(
+                "V51 durable turn-input queue migration did not record its exact schema marker"
+                    .to_string(),
+            ));
+        }
+        validate_durable_turn_input_queue_schema(connection)?;
+        validate_durable_turn_input_queue_data(connection)?;
+        let foreign_key_errors =
+            connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        if foreign_key_errors != 0 {
+            return Err(StorageError::Message(format!(
+                "V51 durable turn-input queue migration produced {foreign_key_errors} foreign-key violation(s)"
+            )));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(StorageError::from),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }?;
+    run_harness_turn_identity(connection)
+}
+
+fn run_harness_turn_identity(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if !schema_migration_applied(connection, HARNESS_TURN_IDENTITY_VERSION)? {
+            connection.execute_batch(V52_HARNESS_TURN_IDENTITY)?;
+        }
+        if !schema_migration_has_exact_name(
+            connection,
+            HARNESS_TURN_IDENTITY_VERSION,
+            HARNESS_TURN_IDENTITY_NAME,
+        )? {
+            return Err(StorageError::Message(
+                "V52 harness turn-identity migration did not record its exact schema marker"
+                    .to_string(),
+            ));
+        }
+        validate_harness_turn_identity_schema(connection)?;
+        validate_harness_turn_identity_data(connection)?;
+        let foreign_key_errors =
+            connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        if foreign_key_errors != 0 {
+            return Err(StorageError::Message(format!(
+                "V52 harness turn-identity migration produced {foreign_key_errors} foreign-key violation(s)"
+            )));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(StorageError::from),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }?;
+    run_agent_trigger_turn_claims(connection)
+}
+
+fn run_agent_trigger_turn_claims(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if !schema_migration_applied(connection, AGENT_TRIGGER_TURN_CLAIMS_VERSION)? {
+            connection.execute_batch(V53_AGENT_TRIGGER_TURN_CLAIMS)?;
+        }
+        if !schema_migration_has_exact_name(
+            connection,
+            AGENT_TRIGGER_TURN_CLAIMS_VERSION,
+            AGENT_TRIGGER_TURN_CLAIMS_NAME,
+        )? {
+            return Err(StorageError::Message(
+                "V53 agent trigger-turn claim migration did not record its exact schema marker"
+                    .to_string(),
+            ));
+        }
+        validate_agent_trigger_turn_claims_schema(connection)?;
+        validate_agent_trigger_turn_claims_data(connection)?;
+        let foreign_key_errors =
+            connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        if foreign_key_errors != 0 {
+            return Err(StorageError::Message(format!(
+                "V53 agent trigger-turn claim migration produced {foreign_key_errors} foreign-key violation(s)"
+            )));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(StorageError::from),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CompactionCheckpointMigrationStats {
+    pages: usize,
+    rows: usize,
+    max_page_rows: usize,
+}
+
+fn canonicalize_compaction_checkpoint_history(
+    connection: &Connection,
+) -> Result<CompactionCheckpointMigrationStats, StorageError> {
+    validate_v39_history_json(connection)?;
+    let missing_append_order = connection
+        .query_row(
+            "SELECT history.id
+             FROM protocol_history_items AS history
+             LEFT JOIN protocol_item_append_order AS append_order
+               ON append_order.session_id = history.session_id
+              AND append_order.source_kind = 'history_item'
+              AND append_order.source_id = history.id
+             WHERE json_extract(history.payload_json, '$.kind') = 'compaction'
+               AND append_order.append_position IS NULL
+             ORDER BY history.id ASC
+             LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(id) = missing_append_order {
+        return Err(StorageError::Message(format!(
+            "V46 compaction history item {id} has no canonical append-order entry"
+        )));
+    }
+
+    let mut stats = CompactionCheckpointMigrationStats::default();
+    let mut after_append_position: Option<i64> = None;
+    loop {
+        let mut statement = connection.prepare(
+            "SELECT history.id, history.session_id, history.payload_json,
+                    history.payload_sha256, append_order.append_position
+             FROM protocol_history_items AS history
+             INNER JOIN protocol_item_append_order AS append_order
+               ON append_order.session_id = history.session_id
+              AND append_order.source_kind = 'history_item'
+              AND append_order.source_id = history.id
+             WHERE (?1 IS NULL OR append_order.append_position > ?1)
+               AND json_extract(history.payload_json, '$.kind') = 'compaction'
+             ORDER BY append_order.append_position ASC
+             LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    after_append_position,
+                    i64::try_from(COMPACTION_CHECKPOINT_MIGRATION_PAGE_SIZE).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        if rows.is_empty() {
+            break;
+        }
+        stats.pages = stats.pages.saturating_add(1);
+        stats.rows = stats.rows.saturating_add(rows.len());
+        stats.max_page_rows = stats.max_page_rows.max(rows.len());
+        after_append_position = rows.last().map(|(.., append_position)| *append_position);
+
+        for (id, session_id, payload_json, payload_sha256, append_position) in rows {
+            let payload =
+                serde_json::from_str::<serde_json::Value>(&payload_json).map_err(|error| {
+                    StorageError::Message(format!(
+                        "V46 cannot inspect protocol history item {id}: invalid JSON: {error}"
+                    ))
+                })?;
+            let mut object = payload.as_object().cloned().ok_or_else(|| {
+                StorageError::Message(format!(
+                    "V46 compaction history item {id} is not a JSON object"
+                ))
+            })?;
+            if payload_sha256 != sha256_text(&payload_json) {
+                return Err(StorageError::Message(format!(
+                    "V46 compaction history item {id} has a stale payload hash"
+                )));
+            }
+
+            let has_layout = object.contains_key("layout");
+            let has_preserved_messages = object.contains_key("preserved_user_messages");
+            let legacy_payload = match (has_layout, has_preserved_messages) {
+                (false, false) => {
+                    object.insert(
+                        "layout".to_string(),
+                        serde_json::Value::String("legacy_prefix".to_string()),
+                    );
+                    object.insert(
+                        "preserved_user_messages".to_string(),
+                        serde_json::Value::Array(Vec::new()),
+                    );
+                    true
+                }
+                (true, true) => false,
+                _ => {
+                    return Err(StorageError::Message(format!(
+                        "V46 compaction history item {id} mixes legacy and current checkpoint fields"
+                    )));
+                }
+            };
+
+            let mut current = decode_current_compaction_payload(&id, &object)?;
+            if legacy_payload {
+                let crate::protocol::HistoryItemPayload::Compaction {
+                    layout,
+                    preserved_user_messages,
+                    replacement_item_ids,
+                    ..
+                } = &mut current
+                else {
+                    unreachable!("current payload was decoded as compaction");
+                };
+                let recovered = recover_legacy_compaction_user_messages(
+                    connection,
+                    &id,
+                    &session_id,
+                    append_position,
+                    replacement_item_ids,
+                )?;
+                if !recovered.is_empty() {
+                    *layout = crate::protocol::CompactionLayout::UserAnchoredCheckpoint;
+                    *preserved_user_messages = recovered;
+                }
+            }
+            let canonical_json = serde_json::to_string(&current)?;
+            connection.execute(
+                "UPDATE protocol_history_items
+                 SET payload_json = ?1, payload_sha256 = ?2
+                 WHERE id = ?3",
+                (&canonical_json, sha256_text(&canonical_json), &id),
+            )?;
+        }
+    }
+    Ok(stats)
+}
+
+fn recover_legacy_compaction_user_messages(
+    connection: &Connection,
+    root_id: &str,
+    session_id: &str,
+    root_append_position: i64,
+    replacement_item_ids: &[crate::protocol::HistoryItemId],
+) -> Result<Vec<String>, StorageError> {
+    let mut budget = crate::context::context_window::CompactionUserMessageBudget::new();
+    'replacements: for replacement_item_id in replacement_item_ids.iter().rev() {
+        let item_id = replacement_item_id.to_string();
+        let row = connection
+            .query_row(
+                "SELECT history.session_id, history.payload_json, history.payload_sha256,
+                        append_order.append_position
+                 FROM protocol_history_items AS history
+                 LEFT JOIN protocol_item_append_order AS append_order
+                   ON append_order.session_id = history.session_id
+                  AND append_order.source_kind = 'history_item'
+                  AND append_order.source_id = history.id
+                 WHERE history.id = ?1",
+                [&item_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((replacement_session_id, payload_json, payload_sha256, append_position)) = row
+        else {
+            return Err(StorageError::Message(format!(
+                "V46 legacy compaction history item {root_id} references missing replacement item {item_id}"
+            )));
+        };
+        if replacement_session_id != session_id {
+            return Err(StorageError::Message(format!(
+                "V46 legacy compaction history item {root_id} references cross-session replacement item {item_id}"
+            )));
+        }
+        let Some(append_position) = append_position else {
+            return Err(StorageError::Message(format!(
+                "V46 legacy compaction history item {root_id} references item {item_id} without a canonical append-order entry"
+            )));
+        };
+        if append_position >= root_append_position {
+            return Err(StorageError::Message(format!(
+                "V46 legacy compaction history item {root_id} has a replacement cycle or forward reference through item {item_id}"
+            )));
+        }
+        if payload_sha256 != sha256_text(&payload_json) {
+            return Err(StorageError::Message(format!(
+                "V46 legacy compaction history item {root_id} references item {item_id} with a stale payload hash"
+            )));
+        }
+        let payload =
+            serde_json::from_str::<crate::protocol::HistoryItemPayload>(&payload_json).map_err(
+                |error| {
+                    StorageError::Message(format!(
+                        "V46 legacy compaction history item {root_id} cannot decode replacement item {item_id}: {error}"
+                    ))
+                },
+            )?;
+
+        let messages = match payload {
+            crate::protocol::HistoryItemPayload::UserTurn { content, .. }
+            | crate::protocol::HistoryItemPayload::SteerTurn { content, .. } => {
+                let text = content
+                    .iter()
+                    .filter_map(|part| match part {
+                        crate::protocol::ContentPart::Text { text } => Some(text.as_str()),
+                        crate::protocol::ContentPart::Image { .. } => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if text.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    vec![text]
+                }
+            }
+            crate::protocol::HistoryItemPayload::Compaction {
+                layout,
+                preserved_user_messages,
+                ..
+            } if layout.appends_checkpoint() => preserved_user_messages,
+            _ => Vec::new(),
+        };
+        for message in messages
+            .into_iter()
+            .rev()
+            .filter(|message| !message.trim().is_empty())
+        {
+            if !budget.push_newest(message) {
+                break 'replacements;
+            }
+        }
+    }
+    Ok(budget.finish())
+}
+
+fn decode_current_compaction_payload(
+    id: &str,
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<crate::protocol::HistoryItemPayload, StorageError> {
+    const ALLOWED_FIELDS: &[&str] = &[
+        "kind",
+        "mode",
+        "layout",
+        "preserved_user_messages",
+        "summary",
+        "replacement_item_ids",
+    ];
+    let unexpected = object
+        .keys()
+        .filter(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        return Err(StorageError::Message(format!(
+            "V46 compaction history item {id} contains unexpected fields: {}",
+            unexpected.join(", ")
+        )));
+    }
+    for field in ALLOWED_FIELDS {
+        if !object.contains_key(*field) {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} has no `{field}` field"
+            )));
+        }
+    }
+
+    let current = serde_json::from_value::<crate::protocol::HistoryItemPayload>(
+        serde_json::Value::Object(object.clone()),
+    )
+    .map_err(|error| {
+        StorageError::Message(format!(
+            "V46 compaction history item {id} violates the current payload contract: {error}"
+        ))
+    })?;
+    let crate::protocol::HistoryItemPayload::Compaction {
+        layout,
+        preserved_user_messages,
+        ..
+    } = &current
+    else {
+        return Err(StorageError::Message(format!(
+            "V46 compaction history item {id} decoded as another payload kind"
+        )));
+    };
+    if matches!(layout, crate::protocol::CompactionLayout::LegacyPrefix)
+        && !preserved_user_messages.is_empty()
+    {
+        return Err(StorageError::Message(format!(
+            "V46 legacy-prefix compaction history item {id} retains user-anchor messages"
+        )));
+    }
+    Ok(current)
+}
+
+fn validate_compaction_checkpoint_history(connection: &Connection) -> Result<(), StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id, session_id, payload_json, payload_sha256
+         FROM protocol_history_items
+         ORDER BY id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, session_id, payload_json, payload_sha256) = row?;
+        let payload = serde_json::from_str::<serde_json::Value>(&payload_json).map_err(|error| {
+            StorageError::Message(format!(
+                "V46 marker exists but protocol history item {id} contains invalid JSON: {error}"
+            ))
+        })?;
+        let Some(object) = payload.as_object() else {
+            continue;
+        };
+        if object.get("kind").and_then(serde_json::Value::as_str) != Some("compaction") {
+            continue;
+        }
+        if payload_sha256 != sha256_text(&payload_json) {
+            return Err(StorageError::Message(format!(
+                "V46 marker exists but compaction history item {id} has a stale payload hash"
+            )));
+        }
+        let current = decode_current_compaction_payload(&id, object)?;
+        validate_current_compaction_storage(connection, &id, &session_id, &current)?;
+    }
+    Ok(())
+}
+
+fn validate_current_compaction_storage(
+    connection: &Connection,
+    id: &str,
+    session_id: &str,
+    payload: &crate::protocol::HistoryItemPayload,
+) -> Result<(), StorageError> {
+    let crate::protocol::HistoryItemPayload::Compaction {
+        preserved_user_messages,
+        replacement_item_ids,
+        ..
+    } = payload
+    else {
+        return Err(StorageError::Message(format!(
+            "V46 compaction history item {id} decoded as another payload kind"
+        )));
+    };
+    let anchor_tokens = preserved_user_messages
+        .iter()
+        .map(|message| crate::context::context_window::estimate_text_tokens(message))
+        .fold(0usize, usize::saturating_add);
+    if anchor_tokens > crate::context::context_window::COMPACTION_USER_MESSAGE_MAX_TOKENS {
+        return Err(StorageError::Message(format!(
+            "V46 compaction history item {id} retains {anchor_tokens} estimated user-anchor tokens, exceeding the 20000-token checkpoint bound"
+        )));
+    }
+
+    let root_append_position = connection
+        .query_row(
+            "SELECT append_position
+             FROM protocol_item_append_order
+             WHERE session_id = ?1
+               AND source_kind = 'history_item'
+               AND source_id = ?2",
+            params![session_id, id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StorageError::Message(format!(
+                "V46 compaction history item {id} has no canonical append-order entry"
+            ))
+        })?;
+
+    let mut unique_replacements = BTreeSet::new();
+    for replacement_item_id in replacement_item_ids {
+        let replacement_item_id = replacement_item_id.to_string();
+        if replacement_item_id == id {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} replaces itself"
+            )));
+        }
+        if !unique_replacements.insert(replacement_item_id.clone()) {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} repeats replacement item {replacement_item_id}"
+            )));
+        }
+        let replacement = connection
+            .query_row(
+                "SELECT history.session_id, history.payload_json, history.payload_sha256,
+                        append_order.append_position
+                 FROM protocol_history_items AS history
+                 LEFT JOIN protocol_item_append_order AS append_order
+                   ON append_order.session_id = history.session_id
+                  AND append_order.source_kind = 'history_item'
+                  AND append_order.source_id = history.id
+                 WHERE history.id = ?1",
+                [&replacement_item_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            replacement_session_id,
+            replacement_payload_json,
+            replacement_payload_sha256,
+            replacement_append_position,
+        )) = replacement
+        else {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} references missing or cross-session replacement item {replacement_item_id}"
+            )));
+        };
+        if replacement_session_id != session_id {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} references missing or cross-session replacement item {replacement_item_id}"
+            )));
+        }
+        if replacement_payload_sha256 != sha256_text(&replacement_payload_json) {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} references replacement item {replacement_item_id} with a stale payload hash"
+            )));
+        }
+        let Some(replacement_append_position) = replacement_append_position else {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} references replacement item {replacement_item_id} without a canonical append-order entry"
+            )));
+        };
+        if replacement_append_position >= root_append_position {
+            return Err(StorageError::Message(format!(
+                "V46 compaction history item {id} has a replacement cycle or forward reference through item {replacement_item_id}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn run_raw_tool_call_history_migration(connection: &Connection) -> Result<(), StorageError> {
@@ -1794,6 +2688,93 @@ fn run_through_v36(connection: &Connection) -> Result<(), StorageError> {
 }
 
 fn validate_canonical_protocol_schema(connection: &Connection) -> Result<(), StorageError> {
+    if !schema_migration_applied(connection, DURABLE_TURN_INPUT_QUEUE_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V51 durable turn-input queue marker".to_string(),
+        ));
+    }
+    if !schema_migration_has_exact_name(
+        connection,
+        DURABLE_TURN_INPUT_QUEUE_VERSION,
+        DURABLE_TURN_INPUT_QUEUE_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V51 durable turn-input queue marker has a name other than `{DURABLE_TURN_INPUT_QUEUE_NAME}`"
+        )));
+    }
+    validate_durable_turn_input_queue_schema(connection)?;
+    if !schema_migration_applied(connection, DURABLE_AGENT_MAILBOX_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V50 durable agent-mailbox marker".to_string(),
+        ));
+    }
+    if !schema_migration_has_exact_name(
+        connection,
+        DURABLE_AGENT_MAILBOX_VERSION,
+        DURABLE_AGENT_MAILBOX_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V50 durable agent-mailbox marker has a name other than `{DURABLE_AGENT_MAILBOX_NAME}`"
+        )));
+    }
+    validate_durable_agent_mailbox_schema(connection)?;
+    if !schema_migration_applied(connection, AGENT_TREE_STOP_FENCES_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V49 agent tree-stop fence marker".to_string(),
+        ));
+    }
+    if !schema_migration_has_exact_name(
+        connection,
+        AGENT_TREE_STOP_FENCES_VERSION,
+        AGENT_TREE_STOP_FENCES_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V49 tree-stop fence marker has a name other than `{AGENT_TREE_STOP_FENCES_NAME}`"
+        )));
+    }
+    if !schema_migration_applied(connection, AGENT_OWNER_RESUME_REQUESTS_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V48 agent owner-resume marker".to_string(),
+        ));
+    }
+    if !schema_migration_has_exact_name(
+        connection,
+        AGENT_OWNER_RESUME_REQUESTS_VERSION,
+        AGENT_OWNER_RESUME_REQUESTS_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V48 owner-resume marker has a name other than `{AGENT_OWNER_RESUME_REQUESTS_NAME}`"
+        )));
+    }
+    validate_agent_owner_resume_request_schema(connection)?;
+    if !schema_migration_applied(connection, RECURSIVE_SESSION_SPAWN_EDGES_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V47 recursive session spawn-edge marker".to_string(),
+        ));
+    }
+    if !schema_migration_has_exact_name(
+        connection,
+        RECURSIVE_SESSION_SPAWN_EDGES_VERSION,
+        RECURSIVE_SESSION_SPAWN_EDGES_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V47 recursive spawn-edge marker has a name other than `{RECURSIVE_SESSION_SPAWN_EDGES_NAME}`"
+        )));
+    }
+    if !schema_migration_applied(connection, CODEX_COMPACTION_CHECKPOINT_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V46 Codex compaction checkpoint marker".to_string(),
+        ));
+    }
+    if !schema_migration_has_exact_name(
+        connection,
+        CODEX_COMPACTION_CHECKPOINT_VERSION,
+        CODEX_COMPACTION_CHECKPOINT_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V46 compaction checkpoint marker has a name other than `{CODEX_COMPACTION_CHECKPOINT_NAME}`"
+        )));
+    }
     if !schema_migration_applied(connection, RESTORE_AUTO_REVIEW_ACCESS_MODE_VERSION)? {
         return Err(StorageError::Message(
             "current storage is missing the V45 auto-review access mode restoration marker"
@@ -1892,12 +2873,13 @@ fn validate_canonical_protocol_schema(connection: &Connection) -> Result<(), Sto
     validate_indexed_collaboration_mode_lookup(connection)?;
     validate_indexed_internal_file_ownership(connection)?;
     validate_unique_turn_terminal_index(connection)?;
-    validate_flat_session_spawn_edge_schema(connection)?;
+    validate_recursive_session_spawn_edge_schema(connection)?;
     Ok(())
 }
 
 fn validate_canonical_protocol_storage(connection: &Connection) -> Result<(), StorageError> {
     validate_canonical_protocol_schema(connection)?;
+    validate_agent_owner_resume_request_data(connection)?;
     validate_typed_history_scope_data(connection)?;
     if legacy_reasoning_projection_row_count(connection)? != 0 {
         return Err(StorageError::Message(
@@ -1905,9 +2887,10 @@ fn validate_canonical_protocol_storage(connection: &Connection) -> Result<(), St
                 .to_string(),
         ));
     }
-    validate_flat_session_spawn_edge_data(connection)?;
+    validate_recursive_session_spawn_edge_data(connection)?;
     validate_terminal_outcome_storage(connection)?;
     validate_raw_tool_call_history(connection)?;
+    validate_compaction_checkpoint_history(connection)?;
     Ok(())
 }
 
@@ -1941,6 +2924,14 @@ fn validate_typed_history_scope_schema(connection: &Connection) -> Result<(), St
         ));
     }
 
+    let append_scope_fragment = if schema_migration_applied(
+        connection,
+        DURABLE_AGENT_MAILBOX_VERSION,
+    )? {
+        "scope_kind = 'session' and turn_id is null and source_kind in ('history_item', 'mailbox_message')"
+    } else {
+        "scope_kind = 'session' and turn_id is null and source_kind = 'history_item'"
+    };
     for (table, required_fragments) in [
         (
             "protocol_history_items",
@@ -1955,7 +2946,7 @@ fn validate_typed_history_scope_schema(connection: &Connection) -> Result<(), St
             &[
                 "scope_kind in ('turn', 'session')",
                 "scope_kind = 'turn' and turn_id is not null",
-                "scope_kind = 'session' and turn_id is null and source_kind = 'history_item'",
+                append_scope_fragment,
             ][..],
         ),
     ] {
@@ -2031,26 +3022,65 @@ fn validate_typed_history_scope_data(connection: &Connection) -> Result<(), Stor
             "V42 typed history scope has {invalid_history_rows} invalid durable row(s)"
         )));
     }
-    let invalid_append_rows = connection.query_row(
-        "SELECT COUNT(*)
-         FROM protocol_item_append_order AS append_order
-         LEFT JOIN protocol_history_items AS history
-           ON append_order.source_kind = 'history_item'
-          AND history.id = append_order.source_id
-          AND history.session_id = append_order.session_id
-         WHERE (append_order.scope_kind = 'turn') <> (append_order.turn_id IS NOT NULL)
-            OR (append_order.scope_kind = 'session'
-                AND append_order.source_kind <> 'history_item')
-            OR (append_order.source_kind = 'history_item'
-                AND (
-                    history.id IS NULL
-                    OR history.scope_kind <> append_order.scope_kind
-                    OR history.turn_id IS NOT append_order.turn_id
-                    OR history.sequence_no <> append_order.sequence_no
-                ))",
-        [],
-        |row| row.get::<_, i64>(0),
-    )?;
+    let mailbox_is_current = schema_migration_applied(connection, DURABLE_AGENT_MAILBOX_VERSION)?;
+    let invalid_append_rows = if mailbox_is_current {
+        connection.query_row(
+            "SELECT COUNT(*)
+             FROM protocol_item_append_order AS append_order
+             LEFT JOIN protocol_history_items AS history
+               ON append_order.source_kind = 'history_item'
+              AND history.id = append_order.source_id
+              AND history.session_id = append_order.session_id
+             LEFT JOIN agent_mailbox_messages AS mailbox
+               ON append_order.source_kind = 'mailbox_message'
+              AND mailbox.id = append_order.source_id
+              AND mailbox.recipient_session_id = append_order.session_id
+             WHERE (append_order.scope_kind = 'turn') <>
+                   (append_order.turn_id IS NOT NULL)
+                OR (append_order.scope_kind = 'session'
+                    AND append_order.source_kind NOT IN (
+                        'history_item',
+                        'mailbox_message'
+                    ))
+                OR (append_order.source_kind = 'mailbox_message'
+                    AND (
+                        mailbox.id IS NULL
+                        OR append_order.scope_kind <> 'session'
+                        OR append_order.turn_id IS NOT NULL
+                    ))
+                OR (append_order.source_kind = 'history_item'
+                    AND (
+                        history.id IS NULL
+                        OR history.scope_kind <> append_order.scope_kind
+                        OR history.turn_id IS NOT append_order.turn_id
+                        OR history.sequence_no <> append_order.sequence_no
+                    ))",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?
+    } else {
+        connection.query_row(
+            "SELECT COUNT(*)
+             FROM protocol_item_append_order AS append_order
+             LEFT JOIN protocol_history_items AS history
+               ON append_order.source_kind = 'history_item'
+              AND history.id = append_order.source_id
+              AND history.session_id = append_order.session_id
+             WHERE (append_order.scope_kind = 'turn') <>
+                   (append_order.turn_id IS NOT NULL)
+                OR (append_order.scope_kind = 'session'
+                    AND append_order.source_kind <> 'history_item')
+                OR (append_order.source_kind = 'history_item'
+                    AND (
+                        history.id IS NULL
+                        OR history.scope_kind <> append_order.scope_kind
+                        OR history.turn_id IS NOT append_order.turn_id
+                        OR history.sequence_no <> append_order.sequence_no
+                    ))",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?
+    };
     if invalid_append_rows != 0 {
         return Err(StorageError::Message(format!(
             "V42 typed append order has {invalid_append_rows} invalid scope projection row(s)"
@@ -2238,63 +3268,6 @@ fn validate_unique_turn_terminal_index(connection: &Connection) -> Result<(), St
     Ok(())
 }
 
-fn validate_flat_session_spawn_edge_schema(connection: &Connection) -> Result<(), StorageError> {
-    let table_sql = connection
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_spawn_edges'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-        .ok_or_else(|| {
-            StorageError::Message(
-                "V40 marker exists but session_spawn_edges is missing".to_string(),
-            )
-        })?;
-    let normalized_table_sql = table_sql
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    for required_constraint in [
-        "check(parent_session_id = root_session_id)",
-        "check(child_session_id <> root_session_id)",
-        "check(task_name <> '')",
-        "check(task_name <> 'root')",
-        "check(task_name not glob '*[^a-z0-9_]*')",
-        "check(agent_path = '/root/' || task_name)",
-    ] {
-        if !normalized_table_sql.contains(required_constraint) {
-            return Err(StorageError::Message(format!(
-                "V40 marker exists but session_spawn_edges lacks `{required_constraint}`"
-            )));
-        }
-    }
-
-    let capacity_trigger = connection
-        .query_row(
-            "SELECT sql FROM sqlite_master
-             WHERE type = 'trigger' AND name = 'limit_session_spawn_edges_per_root'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    let trigger_is_current = capacity_trigger.is_some_and(|sql| {
-        sql.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_ascii_lowercase()
-            .contains(">= 255")
-    });
-    if !trigger_is_current {
-        return Err(StorageError::Message(
-            "V40 marker exists but the per-root retained-child capacity trigger is missing or stale"
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn validate_flat_session_spawn_edge_data(connection: &Connection) -> Result<(), StorageError> {
     let invalid_rows = connection.query_row(
         "SELECT COUNT(*)
@@ -2329,6 +3302,2334 @@ fn validate_flat_session_spawn_edge_data(connection: &Connection) -> Result<(), 
         )));
     }
 
+    Ok(())
+}
+
+fn validate_recursive_session_spawn_edge_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let table_names: &[&str] =
+        if schema_migration_applied(connection, DURABLE_AGENT_MAILBOX_VERSION)? {
+            &["session_spawn_edges"]
+        } else {
+            &["session_spawn_edges", "agent_completion_handoffs"]
+        };
+    for table_name in table_names {
+        validate_v47_table_schema(connection, table_name)?;
+    }
+    Ok(())
+}
+
+fn validate_agent_owner_resume_request_schema(connection: &Connection) -> Result<(), StorageError> {
+    let table_names: &[&str] =
+        if schema_migration_applied(connection, DURABLE_AGENT_MAILBOX_VERSION)? {
+            &[
+                "agent_deferred_completions",
+                "agent_tree_stop_fences",
+                "effective_agent_deferred_completions",
+            ]
+        } else {
+            &[
+                "agent_owner_resume_requests",
+                "agent_deferred_completions",
+                "agent_tree_stop_fences",
+                "effective_agent_deferred_completions",
+            ]
+        };
+    for table_name in table_names {
+        let expected = canonical_agent_owner_resume_request_schema(table_name)?;
+        let observed = normalized_schema_objects_for_table(connection, table_name)?;
+        for ((object_type, object_name), expected_sql) in &expected {
+            let Some(observed_sql) = observed.get(&(object_type.clone(), object_name.clone()))
+            else {
+                return Err(StorageError::Message(format!(
+                    "V49 marker exists but required {object_type} `{object_name}` is missing"
+                )));
+            };
+            if observed_sql != expected_sql {
+                return Err(StorageError::Message(format!(
+                    "V49 marker exists but {object_type} `{object_name}` has stale SQL"
+                )));
+            }
+        }
+        for (object_type, object_name) in observed.keys() {
+            if !expected.contains_key(&(object_type.clone(), object_name.clone())) {
+                return Err(StorageError::Message(format!(
+                    "V49 marker exists but unexpected {object_type} `{object_name}` owns `{table_name}`"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn canonical_agent_owner_resume_request_schema(
+    table_name: &str,
+) -> Result<NormalizedSchemaObjects, StorageError> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(
+        "CREATE TABLE sessions (
+             id TEXT PRIMARY KEY NOT NULL,
+             project_id TEXT NOT NULL,
+             status TEXT NOT NULL,
+             active_run_id TEXT
+         );
+         CREATE TABLE moyai_schema_migrations (
+             version INTEGER PRIMARY KEY NOT NULL,
+             name TEXT NOT NULL
+         );
+         CREATE TABLE session_spawn_edges (
+             root_session_id TEXT NOT NULL,
+             parent_session_id TEXT NOT NULL,
+             child_session_id TEXT PRIMARY KEY NOT NULL,
+             agent_path TEXT NOT NULL,
+             task_name TEXT NOT NULL,
+             spawn_order INTEGER NOT NULL,
+             created_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE protocol_runtime_events (
+             id TEXT PRIMARY KEY NOT NULL,
+             session_id TEXT NOT NULL,
+             turn_id TEXT NOT NULL,
+             msg_json TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE protocol_history_items (
+             id TEXT PRIMARY KEY NOT NULL,
+             session_id TEXT NOT NULL,
+             scope_kind TEXT NOT NULL,
+             payload_json TEXT NOT NULL
+         );
+         CREATE TABLE protocol_item_append_order (
+             append_position INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id TEXT NOT NULL,
+             scope_kind TEXT NOT NULL,
+             turn_id TEXT,
+             source_kind TEXT NOT NULL,
+             source_id TEXT NOT NULL
+         );
+         CREATE TABLE agent_completion_handoffs (
+             child_session_id TEXT NOT NULL,
+             child_turn_id TEXT NOT NULL,
+             child_terminal_event_id TEXT NOT NULL,
+             parent_session_id TEXT NOT NULL,
+             parent_history_item_id TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL,
+             PRIMARY KEY(child_session_id, child_turn_id)
+         );",
+    )?;
+    connection.execute_batch(V48_AGENT_OWNER_RESUME_REQUESTS)?;
+    connection.execute_batch(V49_AGENT_TREE_STOP_FENCES)?;
+    normalized_schema_objects_for_table(&connection, table_name)
+}
+
+fn validate_durable_agent_mailbox_schema(connection: &Connection) -> Result<(), StorageError> {
+    for table_name in [
+        "agent_mailbox_messages",
+        "protocol_item_append_order",
+        "agent_completion_handoffs",
+        "agent_owner_resume_requests",
+    ] {
+        let expected = canonical_durable_agent_mailbox_schema(table_name)?;
+        let mut observed = normalized_schema_objects_for_table(connection, table_name)?;
+        if table_name == "agent_mailbox_messages"
+            && schema_migration_applied(connection, AGENT_TRIGGER_TURN_CLAIMS_VERSION)?
+        {
+            // V53 deliberately adds one trigger to the V50 mailbox table.  Its exact SQL is
+            // owned and validated by validate_agent_trigger_turn_claims_schema below; remove
+            // only that later-owned object before enforcing the otherwise closed V50 schema.
+            observed.remove(&(
+                "trigger".to_string(),
+                "validate_claimed_agent_mailbox_resolution_before_update".to_string(),
+            ));
+        }
+        for ((object_type, object_name), expected_sql) in &expected {
+            let Some(observed_sql) = observed.get(&(object_type.clone(), object_name.clone()))
+            else {
+                return Err(StorageError::Message(format!(
+                    "V50 marker exists but required {object_type} `{object_name}` is missing"
+                )));
+            };
+            if observed_sql != expected_sql {
+                return Err(StorageError::Message(format!(
+                    "V50 marker exists but {object_type} `{object_name}` has stale SQL"
+                )));
+            }
+        }
+        for (object_type, object_name) in observed.keys() {
+            if !expected.contains_key(&(object_type.clone(), object_name.clone())) {
+                return Err(StorageError::Message(format!(
+                    "V50 marker exists but unexpected {object_type} `{object_name}` owns `{table_name}`"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_durable_turn_input_queue_schema(connection: &Connection) -> Result<(), StorageError> {
+    let expected_connection = canonical_durable_turn_input_queue_connection()?;
+    for table_name in ["turn_steer_inputs", "turn_steer_input_enqueue_order"] {
+        let expected = normalized_schema_objects_for_table(&expected_connection, table_name)?;
+        let observed = normalized_schema_objects_for_table(connection, table_name)?;
+        for ((object_type, object_name), expected_sql) in &expected {
+            let Some(observed_sql) = observed.get(&(object_type.clone(), object_name.clone()))
+            else {
+                return Err(StorageError::Message(format!(
+                    "V51 marker exists but required {object_type} `{object_name}` is missing"
+                )));
+            };
+            if observed_sql != expected_sql {
+                return Err(StorageError::Message(format!(
+                    "V51 marker exists but {object_type} `{object_name}` has stale SQL"
+                )));
+            }
+        }
+        for (object_type, object_name) in observed.keys() {
+            if !expected.contains_key(&(object_type.clone(), object_name.clone())) {
+                return Err(StorageError::Message(format!(
+                    "V51 marker exists but unexpected {object_type} `{object_name}` owns `{table_name}`"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_harness_turn_identity_schema(connection: &Connection) -> Result<(), StorageError> {
+    if !schema_migration_applied(connection, HARNESS_TURN_IDENTITY_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V52 harness turn-identity marker".to_string(),
+        ));
+    }
+    if !schema_migration_has_exact_name(
+        connection,
+        HARNESS_TURN_IDENTITY_VERSION,
+        HARNESS_TURN_IDENTITY_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V52 harness turn-identity marker has a name other than `{HARNESS_TURN_IDENTITY_NAME}`"
+        )));
+    }
+
+    let columns = connection
+        .prepare(
+            "SELECT name, type, [notnull]
+             FROM pragma_table_info('harness_runs')",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, String>(1)?, row.get::<_, i64>(2)?),
+            ))
+        })?
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    for column_name in ["protocol_turn_id", "canonical_terminal_runtime_event_id"] {
+        let Some((declared_type, not_null)) = columns.get(column_name) else {
+            return Err(StorageError::Message(format!(
+                "V52 marker exists but harness_runs.{column_name} is missing"
+            )));
+        };
+        if !declared_type.eq_ignore_ascii_case("TEXT") || *not_null != 0 {
+            return Err(StorageError::Message(format!(
+                "V52 marker exists but harness_runs.{column_name} is not nullable TEXT"
+            )));
+        }
+    }
+
+    let expected_connection = canonical_harness_turn_identity_connection()?;
+    for (table_name, object_names) in [
+        (
+            "harness_runs",
+            &[
+                "idx_harness_runs_protocol_turn",
+                "idx_harness_runs_canonical_terminal",
+            ][..],
+        ),
+        (
+            "harness_events",
+            &["idx_harness_events_unique_run_terminal"][..],
+        ),
+    ] {
+        let expected = normalized_schema_objects_for_table(&expected_connection, table_name)?;
+        let observed = normalized_schema_objects_for_table(connection, table_name)?;
+        for object_name in object_names {
+            let key = ("index".to_string(), (*object_name).to_string());
+            let Some(expected_sql) = expected.get(&key) else {
+                return Err(StorageError::Message(format!(
+                    "V52 canonical schema fixture is missing index `{object_name}`"
+                )));
+            };
+            let Some(observed_sql) = observed.get(&key) else {
+                return Err(StorageError::Message(format!(
+                    "V52 marker exists but required index `{object_name}` is missing"
+                )));
+            };
+            if observed_sql != expected_sql {
+                return Err(StorageError::Message(format!(
+                    "V52 marker exists but index `{object_name}` has stale SQL"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn canonical_harness_turn_identity_connection() -> Result<Connection, StorageError> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY);
+         CREATE TABLE moyai_schema_migrations (
+             version INTEGER PRIMARY KEY NOT NULL,
+             name TEXT NOT NULL
+         );",
+    )?;
+    connection.execute_batch(V14_HARNESS_ENGINE)?;
+    connection.execute_batch(V52_HARNESS_TURN_IDENTITY)?;
+    Ok(connection)
+}
+
+fn validate_harness_turn_identity_data(connection: &Connection) -> Result<(), StorageError> {
+    let invalid_links = connection.query_row(
+        "SELECT COUNT(*)
+         FROM harness_runs AS run
+         LEFT JOIN protocol_runtime_events AS terminal
+           ON terminal.id = run.canonical_terminal_runtime_event_id
+          AND terminal.session_id = run.session_id
+          AND terminal.turn_id = run.protocol_turn_id
+          AND json_extract(terminal.msg_json, '$.kind') = 'turn_terminal'
+         LEFT JOIN protocol_item_append_order AS terminal_order
+           ON terminal_order.session_id = terminal.session_id
+          AND terminal_order.scope_kind = 'turn'
+          AND terminal_order.turn_id = terminal.turn_id
+          AND terminal_order.sequence_no = terminal.sequence_no
+          AND terminal_order.source_kind = 'runtime_event'
+          AND terminal_order.source_id = terminal.id
+         WHERE (run.protocol_turn_id IS NOT NULL AND run.session_id IS NULL)
+            OR (
+                run.protocol_turn_id IS NOT NULL
+                AND run.canonical_terminal_runtime_event_id IS NULL
+                AND (
+                    run.status <> '\"started\"'
+                    OR run.completed_at_ms IS NOT NULL
+                )
+            )
+            OR (
+                run.canonical_terminal_runtime_event_id IS NOT NULL
+                AND (
+                    run.session_id IS NULL
+                    OR run.protocol_turn_id IS NULL
+                    OR run.completed_at_ms IS NULL
+                    OR terminal.id IS NULL
+                    OR terminal_order.append_position IS NULL
+                    OR run.completed_at_ms <> terminal.created_at_ms
+                    OR run.status <> CASE
+                        json_extract(
+                            terminal.msg_json,
+                            '$.terminal.outcome.kind'
+                        )
+                        WHEN 'completed' THEN '\"pass\"'
+                        WHEN 'interrupted' THEN '\"blocked\"'
+                        WHEN 'failed' THEN '\"fail\"'
+                        ELSE NULL
+                    END
+                    OR (
+                        SELECT COUNT(*)
+                        FROM harness_events AS harness_terminal
+                        WHERE harness_terminal.run_id = run.id
+                          AND json_extract(harness_terminal.kind, '$') =
+                              'run_terminalized'
+                    ) <> 1
+                )
+            )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_links != 0 {
+        return Err(StorageError::Message(format!(
+            "V52 marker exists but {invalid_links} harness run(s) violate canonical terminal linkage"
+        )));
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT run.id, run.session_id, run.protocol_turn_id,
+                run.canonical_terminal_runtime_event_id,
+                terminal.msg_json, terminal.payload_sha256,
+                harness_terminal.payload_json
+         FROM harness_runs AS run
+         INNER JOIN protocol_runtime_events AS terminal
+           ON terminal.id = run.canonical_terminal_runtime_event_id
+         INNER JOIN harness_events AS harness_terminal
+           ON harness_terminal.run_id = run.id
+          AND json_extract(harness_terminal.kind, '$') = 'run_terminalized'
+         WHERE run.canonical_terminal_runtime_event_id IS NOT NULL",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    for row in rows {
+        let (
+            run_id,
+            session_id,
+            turn_id,
+            terminal_event_id,
+            terminal_msg_json,
+            terminal_payload_sha256,
+            harness_payload_json,
+        ) = row?;
+        turn_id
+            .parse::<crate::protocol::TurnId>()
+            .map_err(|error| {
+                StorageError::Message(format!(
+                    "V52 marker exists but harness run {run_id} has invalid turn id `{turn_id}`: {error}"
+                ))
+            })?;
+        terminal_event_id
+            .parse::<crate::protocol::RuntimeEventId>()
+            .map_err(|error| {
+                StorageError::Message(format!(
+                    "V52 marker exists but harness run {run_id} has invalid terminal event id `{terminal_event_id}`: {error}"
+                ))
+            })?;
+        if sha256_text(&terminal_msg_json) != terminal_payload_sha256 {
+            return Err(StorageError::Message(format!(
+                "V52 marker exists but harness run {run_id} links a terminal payload hash mismatch"
+            )));
+        }
+        let msg =
+            serde_json::from_str::<crate::protocol::RuntimeEventMsg>(&terminal_msg_json)
+                .map_err(|error| {
+                    StorageError::Message(format!(
+                        "V52 marker exists but harness run {run_id} links an invalid typed terminal: {error}"
+                    ))
+                })?;
+        let crate::protocol::RuntimeEventMsg::TurnTerminal { terminal } = msg else {
+            return Err(StorageError::Message(format!(
+                "V52 marker exists but harness run {run_id} does not link TurnTerminal"
+            )));
+        };
+        let expected_payload = serde_json::to_string(
+            &crate::harness::HarnessEventPayload::generic(
+                serde_json::to_value(crate::session::RunEvent::TurnTerminal {
+                    session_id: session_id
+                    .parse::<crate::session::SessionId>()
+                    .map_err(|error| {
+                        StorageError::Message(format!(
+                            "V52 marker exists but harness run {run_id} has invalid session id `{session_id}`: {error}"
+                        ))
+                    })?,
+                    terminal,
+                })?,
+            ),
+        )?;
+        if harness_payload_json != expected_payload {
+            return Err(StorageError::Message(format!(
+                "V52 marker exists but harness run {run_id} terminal payload diverges from canonical truth"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_agent_trigger_turn_claims_schema(connection: &Connection) -> Result<(), StorageError> {
+    if !schema_migration_applied(connection, AGENT_TRIGGER_TURN_CLAIMS_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V53 agent trigger-turn claim marker".to_string(),
+        ));
+    }
+    if !schema_migration_has_exact_name(
+        connection,
+        AGENT_TRIGGER_TURN_CLAIMS_VERSION,
+        AGENT_TRIGGER_TURN_CLAIMS_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V53 agent trigger-turn claim marker has a name other than `{AGENT_TRIGGER_TURN_CLAIMS_NAME}`"
+        )));
+    }
+    let expected_connection = canonical_agent_trigger_turn_claims_connection()?;
+    let expected =
+        normalized_schema_objects_for_table(&expected_connection, "agent_trigger_turn_claims")?;
+    let observed = normalized_schema_objects_for_table(connection, "agent_trigger_turn_claims")?;
+    for ((object_type, object_name), expected_sql) in &expected {
+        let Some(observed_sql) = observed.get(&(object_type.clone(), object_name.clone())) else {
+            return Err(StorageError::Message(format!(
+                "V53 marker exists but required {object_type} `{object_name}` is missing"
+            )));
+        };
+        if observed_sql != expected_sql {
+            return Err(StorageError::Message(format!(
+                "V53 marker exists but {object_type} `{object_name}` has stale SQL"
+            )));
+        }
+    }
+    for (object_type, object_name) in observed.keys() {
+        if !expected.contains_key(&(object_type.clone(), object_name.clone())) {
+            return Err(StorageError::Message(format!(
+                "V53 marker exists but unexpected {object_type} `{object_name}` owns `agent_trigger_turn_claims`"
+            )));
+        }
+    }
+    let mailbox_trigger_key = (
+        "trigger".to_string(),
+        "validate_claimed_agent_mailbox_resolution_before_update".to_string(),
+    );
+    let expected_mailbox =
+        normalized_schema_objects_for_table(&expected_connection, "agent_mailbox_messages")?;
+    let observed_mailbox =
+        normalized_schema_objects_for_table(connection, "agent_mailbox_messages")?;
+    let expected_trigger = expected_mailbox.get(&mailbox_trigger_key).ok_or_else(|| {
+        StorageError::Message(
+            "canonical V53 schema omitted its claimed-mailbox resolution trigger".to_string(),
+        )
+    })?;
+    let observed_trigger = observed_mailbox.get(&mailbox_trigger_key).ok_or_else(|| {
+        StorageError::Message(
+            "V53 marker exists but claimed-mailbox resolution trigger is missing".to_string(),
+        )
+    })?;
+    if observed_trigger != expected_trigger {
+        return Err(StorageError::Message(
+            "V53 marker exists but claimed-mailbox resolution trigger has stale SQL".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_agent_trigger_turn_claims_connection() -> Result<Connection, StorageError> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE sessions (
+             id TEXT PRIMARY KEY,
+             status TEXT NOT NULL,
+             active_run_id TEXT,
+             active_turn_id TEXT,
+             active_run_lease_expires_at_ms INTEGER
+         );
+         CREATE TABLE agent_mailbox_messages (
+              id TEXT PRIMARY KEY,
+              recipient_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+              trigger_turn INTEGER NOT NULL,
+              state TEXT NOT NULL,
+              delivered_turn_id TEXT,
+              delivered_history_item_id TEXT,
+              resolved_by_terminal_event_id TEXT,
+              discarded_by_stopped_session_id TEXT,
+              discarded_after_append_position INTEGER
+          );
+         CREATE TABLE protocol_runtime_events (
+             id TEXT PRIMARY KEY,
+             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+             turn_id TEXT NOT NULL,
+             msg_json TEXT NOT NULL
+         );
+         CREATE TABLE moyai_schema_migrations (
+             version INTEGER PRIMARY KEY NOT NULL,
+             name TEXT NOT NULL
+         );",
+    )?;
+    connection.execute_batch(V53_AGENT_TRIGGER_TURN_CLAIMS)?;
+    Ok(connection)
+}
+
+fn validate_agent_trigger_turn_claims_data(connection: &Connection) -> Result<(), StorageError> {
+    let invalid_claims = connection.query_row(
+        "SELECT COUNT(*)
+         FROM agent_trigger_turn_claims AS claim
+         LEFT JOIN sessions AS session
+           ON session.id = claim.recipient_session_id
+         LEFT JOIN agent_mailbox_messages AS mailbox
+           ON mailbox.id = claim.history_item_id
+           AND mailbox.recipient_session_id = claim.recipient_session_id
+           AND mailbox.trigger_turn = 1
+         WHERE mailbox.id IS NULL
+            OR NOT (
+                (
+                    session.status = 'running'
+                    AND session.active_run_id = claim.admission_id
+                    AND session.active_turn_id = claim.turn_id
+                    AND session.active_run_lease_expires_at_ms IS NOT NULL
+                    AND (
+                        mailbox.state = 'pending'
+                        OR (
+                            mailbox.state = 'delivered'
+                            AND mailbox.delivered_turn_id = claim.turn_id
+                            AND mailbox.delivered_history_item_id = mailbox.id
+                            AND mailbox.resolved_by_terminal_event_id IS NULL
+                            AND mailbox.discarded_by_stopped_session_id IS NULL
+                            AND mailbox.discarded_after_append_position IS NULL
+                        )
+                        OR (
+                            mailbox.state = 'discarded'
+                            AND mailbox.resolved_by_terminal_event_id IS NULL
+                            AND mailbox.discarded_by_stopped_session_id IS NOT NULL
+                            AND mailbox.discarded_after_append_position IS NOT NULL
+                        )
+                    )
+                )
+                OR (
+                    EXISTS (
+                        SELECT 1
+                        FROM protocol_runtime_events AS terminal
+                        WHERE terminal.session_id = claim.recipient_session_id
+                          AND terminal.turn_id = claim.turn_id
+                          AND json_extract(terminal.msg_json, '$.kind') = 'turn_terminal'
+                    )
+                    AND (
+                        (
+                            mailbox.state = 'delivered'
+                            AND mailbox.delivered_turn_id = claim.turn_id
+                            AND mailbox.delivered_history_item_id = mailbox.id
+                            AND mailbox.resolved_by_terminal_event_id IS NULL
+                            AND mailbox.discarded_by_stopped_session_id IS NULL
+                            AND mailbox.discarded_after_append_position IS NULL
+                        )
+                        OR (
+                            mailbox.state = 'discarded'
+                            AND mailbox.resolved_by_terminal_event_id IS NOT NULL
+                            AND mailbox.discarded_by_stopped_session_id IS NULL
+                            AND mailbox.discarded_after_append_position IS NULL
+                            AND EXISTS (
+                                SELECT 1
+                                FROM protocol_runtime_events AS resolver
+                                WHERE resolver.id = mailbox.resolved_by_terminal_event_id
+                                  AND resolver.session_id = claim.recipient_session_id
+                                  AND resolver.turn_id = claim.turn_id
+                                  AND json_extract(resolver.msg_json, '$.kind')
+                                      = 'turn_terminal'
+                                  AND json_extract(
+                                          resolver.msg_json,
+                                          '$.terminal.outcome.kind'
+                                      ) = 'interrupted'
+                            )
+                        )
+                        OR (
+                            mailbox.state = 'discarded'
+                            AND mailbox.resolved_by_terminal_event_id IS NULL
+                            AND mailbox.discarded_by_stopped_session_id IS NOT NULL
+                            AND mailbox.discarded_after_append_position IS NOT NULL
+                            AND EXISTS (
+                                SELECT 1
+                                FROM protocol_runtime_events AS stopped_terminal
+                                WHERE stopped_terminal.session_id =
+                                      claim.recipient_session_id
+                                  AND stopped_terminal.turn_id = claim.turn_id
+                                  AND json_extract(
+                                          stopped_terminal.msg_json,
+                                          '$.kind'
+                                      ) = 'turn_terminal'
+                                  AND json_extract(
+                                          stopped_terminal.msg_json,
+                                          '$.terminal.outcome.kind'
+                                      ) = 'interrupted'
+                                  AND json_extract(
+                                          stopped_terminal.msg_json,
+                                          '$.terminal.outcome.cause'
+                                      ) = 'tree_stopped'
+                            )
+                        )
+                    )
+                )
+            )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_claims != 0 {
+        return Err(StorageError::Message(format!(
+            "V53 marker exists but {invalid_claims} explicit agent wake claim(s) do not own an exact active or terminal turn"
+        )));
+    }
+    Ok(())
+}
+
+fn canonical_durable_turn_input_queue_connection() -> Result<Connection, StorageError> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(
+        "CREATE TABLE sessions (
+             id TEXT PRIMARY KEY NOT NULL,
+             project_id TEXT NOT NULL,
+             status TEXT NOT NULL,
+             active_run_id TEXT,
+             active_turn_id TEXT,
+             active_run_lease_expires_at_ms INTEGER
+         );
+         CREATE TABLE moyai_schema_migrations (
+             version INTEGER PRIMARY KEY NOT NULL,
+             name TEXT NOT NULL
+         );
+         CREATE TABLE protocol_history_items (
+             id TEXT PRIMARY KEY NOT NULL,
+             session_id TEXT NOT NULL,
+             scope_kind TEXT NOT NULL,
+             turn_id TEXT,
+             sequence_no INTEGER NOT NULL,
+             payload_json TEXT NOT NULL,
+             payload_sha256 TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE protocol_runtime_events (
+             id TEXT PRIMARY KEY NOT NULL,
+             session_id TEXT NOT NULL,
+             turn_id TEXT NOT NULL,
+             sequence_no INTEGER NOT NULL,
+             msg_json TEXT NOT NULL,
+             payload_sha256 TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE protocol_item_append_order (
+             append_position INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id TEXT NOT NULL,
+             scope_kind TEXT NOT NULL,
+             turn_id TEXT,
+             sequence_no INTEGER NOT NULL,
+             source_kind TEXT NOT NULL,
+             source_id TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE agent_tree_stop_fences (
+             stopped_session_id TEXT NOT NULL,
+             after_append_position INTEGER NOT NULL,
+             PRIMARY KEY(stopped_session_id, after_append_position)
+         );",
+    )?;
+    connection.execute_batch(V51_DURABLE_TURN_INPUT_QUEUE)?;
+    Ok(connection)
+}
+
+fn validate_durable_turn_input_queue_data(connection: &Connection) -> Result<(), StorageError> {
+    let invalid_inputs = connection.query_row(
+        "SELECT COUNT(*)
+         FROM turn_steer_inputs AS input
+         LEFT JOIN sessions AS session
+           ON session.id = input.session_id
+         LEFT JOIN turn_steer_input_enqueue_order AS enqueue
+           ON enqueue.input_id = input.id
+         LEFT JOIN protocol_history_items AS history
+           ON history.id = input.id
+         LEFT JOIN protocol_item_append_order AS history_order
+           ON history_order.source_kind = 'history_item'
+          AND history_order.source_id = input.id
+         LEFT JOIN protocol_runtime_events AS terminal
+           ON terminal.id = input.resolved_by_terminal_event_id
+         LEFT JOIN protocol_item_append_order AS terminal_order
+           ON terminal_order.source_kind = 'runtime_event'
+          AND terminal_order.source_id = input.resolved_by_terminal_event_id
+         WHERE session.id IS NULL
+            OR json_extract(input.payload_json, '$.kind') IS NOT 'steer_turn'
+            OR json_extract(input.payload_json, '$.expected_turn_id')
+               IS NOT input.turn_id
+            OR input.accepted_at_ms < 0
+            OR input.updated_at_ms < input.accepted_at_ms
+            OR (
+                input.origin_kind = 'runtime'
+                AND (
+                    enqueue.input_id IS NULL
+                    OR enqueue.session_id <> input.session_id
+                    OR enqueue.turn_id <> input.turn_id
+                    OR enqueue.created_at_ms <> input.accepted_at_ms
+                )
+            )
+            OR (
+                input.origin_kind IN ('legacy_history', 'fork')
+                AND enqueue.input_id IS NOT NULL
+            )
+            OR (
+                input.state = 'queued'
+                AND (
+                    input.origin_kind <> 'runtime'
+                    OR session.status <> 'running'
+                    OR session.active_run_id IS NOT input.admission_id
+                    OR session.active_turn_id IS NOT input.turn_id
+                    OR session.active_run_lease_expires_at_ms IS NULL
+                    OR session.active_run_lease_expires_at_ms <
+                       input.accepted_at_ms
+                    OR history.id IS NOT NULL
+                    OR history_order.append_position IS NOT NULL
+                    OR input.delivered_at_ms IS NOT NULL
+                    OR input.discarded_at_ms IS NOT NULL
+                    OR input.resolved_by_terminal_event_id IS NOT NULL
+                )
+            )
+            OR (
+                input.state = 'delivered'
+                AND (
+                    history.id IS NULL
+                    OR history.id <> input.id
+                    OR history.session_id <> input.session_id
+                    OR history.scope_kind <> 'turn'
+                    OR history.turn_id IS NOT input.turn_id
+                    OR history.payload_json <> input.payload_json
+                    OR history.payload_sha256 <> input.payload_sha256
+                    OR json_extract(history.payload_json, '$.kind')
+                       IS NOT 'steer_turn'
+                    OR history_order.append_position IS NULL
+                    OR history_order.session_id <> input.session_id
+                    OR history_order.scope_kind <> 'turn'
+                    OR history_order.turn_id IS NOT input.turn_id
+                    OR history_order.sequence_no <> history.sequence_no
+                    OR input.delivered_at_ms IS NULL
+                    OR input.delivered_at_ms < input.accepted_at_ms
+                    OR input.updated_at_ms < input.delivered_at_ms
+                    OR input.discarded_at_ms IS NOT NULL
+                    OR input.resolved_by_terminal_event_id IS NOT NULL
+                )
+            )
+            OR (
+                input.state = 'discarded'
+                AND (
+                    input.origin_kind <> 'runtime'
+                    OR history.id IS NOT NULL
+                    OR history_order.append_position IS NOT NULL
+                    OR input.delivered_at_ms IS NOT NULL
+                    OR input.discarded_at_ms IS NULL
+                    OR input.discarded_at_ms < input.accepted_at_ms
+                    OR input.updated_at_ms < input.discarded_at_ms
+                    OR terminal.id IS NULL
+                    OR terminal.session_id <> input.session_id
+                    OR terminal.turn_id <> input.turn_id
+                    OR json_extract(terminal.msg_json, '$.kind')
+                       IS NOT 'turn_terminal'
+                    OR json_extract(
+                           terminal.msg_json,
+                           '$.terminal.outcome.kind'
+                       ) IS NOT 'interrupted'
+                    OR terminal.created_at_ms < input.accepted_at_ms
+                    OR terminal_order.append_position IS NULL
+                    OR terminal_order.session_id <> input.session_id
+                    OR terminal_order.scope_kind <> 'turn'
+                    OR terminal_order.turn_id IS NOT input.turn_id
+                    OR terminal_order.sequence_no <> terminal.sequence_no
+                )
+            )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_inputs != 0 {
+        return Err(StorageError::Message(format!(
+            "V51 marker exists but {invalid_inputs} turn-steer input(s) violate queue, admission, order, or history identity"
+        )));
+    }
+
+    {
+        let mut statement = connection.prepare(
+            "SELECT id, turn_id, payload_json, payload_sha256
+                 FROM turn_steer_inputs",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (input_id, turn_id, payload_json, payload_sha256) = row?;
+            if sha256_text(&payload_json) != payload_sha256 {
+                return Err(StorageError::Message(format!(
+                    "V51 marker exists but turn-steer input {input_id} has a payload hash mismatch"
+                )));
+            }
+            let payload = serde_json::from_str::<crate::protocol::HistoryItemPayload>(
+                &payload_json,
+            )
+            .map_err(|error| {
+                StorageError::Message(format!(
+                    "V51 marker exists but turn-steer input {input_id} has invalid typed payload: {error}"
+                ))
+            })?;
+            let crate::protocol::HistoryItemPayload::SteerTurn {
+                expected_turn_id, ..
+            } = payload
+            else {
+                return Err(StorageError::Message(format!(
+                    "V51 marker exists but turn-steer input {input_id} is not SteerTurn"
+                )));
+            };
+            if expected_turn_id.to_string() != turn_id {
+                return Err(StorageError::Message(format!(
+                    "V51 marker exists but turn-steer input {input_id} targets {expected_turn_id}, not {turn_id}"
+                )));
+            }
+        }
+    }
+
+    let unowned_orders = connection.query_row(
+        "SELECT COUNT(*)
+         FROM turn_steer_input_enqueue_order AS enqueue
+         LEFT JOIN turn_steer_inputs AS input
+           ON input.id = enqueue.input_id
+         WHERE input.id IS NULL
+            OR input.origin_kind <> 'runtime'
+            OR input.session_id <> enqueue.session_id
+            OR input.turn_id <> enqueue.turn_id",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if unowned_orders != 0 {
+        return Err(StorageError::Message(format!(
+            "V51 marker exists but {unowned_orders} turn-steer enqueue position(s) have no exact runtime owner"
+        )));
+    }
+
+    let unowned_history = connection.query_row(
+        "SELECT COUNT(*)
+         FROM protocol_history_items AS history
+         WHERE history.scope_kind = 'turn'
+           AND json_extract(history.payload_json, '$.kind') = 'steer_turn'
+           AND NOT EXISTS (
+               SELECT 1
+               FROM turn_steer_inputs AS input
+               WHERE input.id = history.id
+                 AND input.state = 'delivered'
+                 AND input.delivered_history_item_id = history.id
+           )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if unowned_history != 0 {
+        return Err(StorageError::Message(format!(
+            "V51 marker exists but {unowned_history} canonical SteerTurn item(s) have no delivered queue provenance"
+        )));
+    }
+    Ok(())
+}
+
+fn canonical_durable_agent_mailbox_schema(
+    table_name: &str,
+) -> Result<NormalizedSchemaObjects, StorageError> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(
+        "CREATE TABLE sessions (
+             id TEXT PRIMARY KEY NOT NULL,
+             project_id TEXT NOT NULL
+         );
+         CREATE TABLE moyai_schema_migrations (
+             version INTEGER PRIMARY KEY NOT NULL,
+             name TEXT NOT NULL
+         );
+         CREATE TABLE session_spawn_edges (
+             root_session_id TEXT NOT NULL,
+             parent_session_id TEXT NOT NULL,
+             child_session_id TEXT PRIMARY KEY NOT NULL,
+             agent_path TEXT NOT NULL
+         );
+         CREATE TABLE protocol_runtime_events (
+             id TEXT PRIMARY KEY NOT NULL,
+             session_id TEXT NOT NULL,
+             turn_id TEXT NOT NULL,
+             msg_json TEXT NOT NULL
+         );
+         CREATE TABLE protocol_history_items (
+             id TEXT PRIMARY KEY NOT NULL,
+             session_id TEXT NOT NULL,
+             scope_kind TEXT NOT NULL,
+             turn_id TEXT,
+             sequence_no INTEGER NOT NULL,
+             payload_json TEXT NOT NULL,
+             payload_sha256 TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE protocol_item_append_order (
+             append_position INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id TEXT NOT NULL,
+             scope_kind TEXT NOT NULL,
+             turn_id TEXT,
+             sequence_no INTEGER NOT NULL,
+             source_kind TEXT NOT NULL,
+             source_id TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL
+         );
+         CREATE INDEX idx_protocol_item_append_order_session_position
+             ON protocol_item_append_order(session_id, append_position ASC);
+         CREATE INDEX idx_protocol_item_append_order_turn_position
+             ON protocol_item_append_order(
+                 session_id,
+                 turn_id,
+                 append_position ASC
+             )
+             WHERE scope_kind = 'turn';
+         CREATE TABLE agent_tree_stop_fences (
+             root_session_id TEXT NOT NULL,
+             stopped_session_id TEXT NOT NULL,
+             after_append_position INTEGER NOT NULL,
+             cause TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL,
+             PRIMARY KEY(stopped_session_id, after_append_position)
+         );
+         CREATE TABLE agent_completion_handoffs (
+             child_session_id TEXT NOT NULL,
+             child_turn_id TEXT NOT NULL,
+             child_terminal_event_id TEXT NOT NULL,
+             parent_session_id TEXT NOT NULL,
+             parent_history_item_id TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL,
+             PRIMARY KEY(child_session_id, child_turn_id)
+         );
+         CREATE TABLE agent_owner_resume_requests (
+             owner_session_id TEXT NOT NULL,
+             source_session_id TEXT NOT NULL,
+             source_history_item_id TEXT NOT NULL,
+             state TEXT NOT NULL,
+             claimed_turn_id TEXT,
+             created_at_ms INTEGER NOT NULL,
+             updated_at_ms INTEGER NOT NULL,
+             claimed_at_ms INTEGER,
+             resolved_at_ms INTEGER,
+             PRIMARY KEY(owner_session_id, source_history_item_id)
+         );",
+    )?;
+    connection.execute_batch(V50_DURABLE_AGENT_MAILBOX)?;
+    normalized_schema_objects_for_table(&connection, table_name)
+}
+
+fn validate_durable_agent_mailbox_data(connection: &Connection) -> Result<(), StorageError> {
+    let invalid_identity = connection.query_row(
+        "SELECT COUNT(*)
+         FROM agent_mailbox_messages AS mailbox
+         LEFT JOIN sessions AS root ON root.id = mailbox.root_session_id
+         LEFT JOIN sessions AS author ON author.id = mailbox.author_session_id
+         LEFT JOIN sessions AS recipient
+           ON recipient.id = mailbox.recipient_session_id
+         LEFT JOIN session_spawn_edges AS author_edge
+           ON author_edge.root_session_id = mailbox.root_session_id
+          AND author_edge.child_session_id = mailbox.author_session_id
+         LEFT JOIN session_spawn_edges AS recipient_edge
+           ON recipient_edge.root_session_id = mailbox.root_session_id
+          AND recipient_edge.child_session_id = mailbox.recipient_session_id
+         WHERE root.id IS NULL
+            OR recipient.id IS NULL
+            OR root.project_id <> recipient.project_id
+            OR (
+                mailbox.author_session_id IS NULL
+                AND mailbox.state = 'pending'
+            )
+            OR (
+                mailbox.author_session_id IS NOT NULL
+                AND (
+                    author.id IS NULL
+                    OR root.project_id <> author.project_id
+                )
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM session_spawn_edges AS root_edge
+                WHERE root_edge.child_session_id = mailbox.root_session_id
+            )
+            OR json_extract(mailbox.payload_json, '$.kind')
+               IS NOT 'inter_agent_communication'
+            OR json_extract(
+                   mailbox.payload_json,
+                   '$.communication.trigger_turn'
+               ) IS NOT mailbox.trigger_turn
+            OR (
+                mailbox.author_session_id IS NOT NULL
+                AND
+                mailbox.author_session_id = mailbox.root_session_id
+                AND json_extract(
+                        mailbox.payload_json,
+                        '$.communication.author'
+                    ) IS NOT '/root'
+            )
+            OR (
+                mailbox.author_session_id IS NOT NULL
+                AND
+                mailbox.author_session_id <> mailbox.root_session_id
+                AND (
+                    author_edge.child_session_id IS NULL
+                    OR json_extract(
+                           mailbox.payload_json,
+                           '$.communication.author'
+                       ) IS NOT author_edge.agent_path
+                )
+            )
+            OR (
+                mailbox.recipient_session_id = mailbox.root_session_id
+                AND json_extract(
+                        mailbox.payload_json,
+                        '$.communication.recipient'
+                    ) IS NOT '/root'
+            )
+            OR (
+                mailbox.recipient_session_id <> mailbox.root_session_id
+                AND (
+                    recipient_edge.child_session_id IS NULL
+                    OR json_extract(
+                           mailbox.payload_json,
+                           '$.communication.recipient'
+                       ) IS NOT recipient_edge.agent_path
+                )
+            )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_identity != 0 {
+        return Err(StorageError::Message(format!(
+            "V50 marker exists but {invalid_identity} mailbox message(s) violate canonical tree or payload identity"
+        )));
+    }
+
+    let invalid_lifecycle = connection.query_row(
+        "SELECT COUNT(*)
+         FROM agent_mailbox_messages AS mailbox
+         LEFT JOIN protocol_history_items AS history
+           ON history.id = mailbox.delivered_history_item_id
+          AND history.session_id = mailbox.recipient_session_id
+         WHERE (
+                mailbox.state = 'pending'
+                AND (
+                    history.id IS NOT NULL
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM protocol_item_append_order AS enqueue_order
+                        WHERE enqueue_order.session_id =
+                              mailbox.recipient_session_id
+                          AND enqueue_order.scope_kind = 'session'
+                          AND enqueue_order.turn_id IS NULL
+                          AND enqueue_order.source_kind = 'mailbox_message'
+                          AND enqueue_order.source_id = mailbox.id
+                    )
+                )
+            )
+            OR (
+                mailbox.state = 'discarded'
+                AND (
+                    history.id IS NOT NULL
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM protocol_item_append_order AS enqueue_order
+                        WHERE enqueue_order.session_id =
+                              mailbox.recipient_session_id
+                          AND enqueue_order.scope_kind = 'session'
+                          AND enqueue_order.turn_id IS NULL
+                          AND enqueue_order.source_kind = 'mailbox_message'
+                          AND enqueue_order.source_id = mailbox.id
+                    )
+                )
+            )
+            OR (
+                mailbox.state = 'delivered'
+                AND (
+                    history.id IS NULL
+                    OR history.payload_json <> mailbox.payload_json
+                    OR history.payload_sha256 <> mailbox.payload_sha256
+                    OR (
+                        history.scope_kind = 'turn'
+                        AND history.turn_id IS NOT mailbox.delivered_turn_id
+                    )
+                    OR (
+                        history.scope_kind = 'session'
+                        AND mailbox.delivered_turn_id IS NOT NULL
+                    )
+                )
+            )
+            OR (
+                mailbox.state <> 'delivered'
+                AND EXISTS (
+                    SELECT 1
+                    FROM protocol_history_items AS unexpected_history
+                    WHERE unexpected_history.id = mailbox.id
+                )
+            )
+            OR (
+                mailbox.state = 'delivered'
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM protocol_item_append_order AS history_order
+                    WHERE history_order.session_id =
+                          mailbox.recipient_session_id
+                      AND history_order.source_kind = 'history_item'
+                      AND history_order.source_id = mailbox.id
+                )
+            )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_lifecycle != 0 {
+        return Err(StorageError::Message(format!(
+            "V50 marker exists but {invalid_lifecycle} mailbox message(s) violate pending, delivered, or discarded projection state"
+        )));
+    }
+
+    let orphan_history = connection.query_row(
+        "SELECT COUNT(*)
+         FROM protocol_history_items AS history
+         LEFT JOIN agent_mailbox_messages AS mailbox ON mailbox.id = history.id
+         LEFT JOIN session_spawn_edges AS recipient_edge
+           ON recipient_edge.child_session_id = history.session_id
+         WHERE json_extract(history.payload_json, '$.kind')
+               = 'inter_agent_communication'
+           AND json_extract(
+                   history.payload_json,
+                   '$.communication.recipient'
+               ) = CASE
+                       WHEN recipient_edge.child_session_id IS NULL
+                       THEN '/root'
+                       ELSE recipient_edge.agent_path
+                   END
+           AND (
+               json_extract(
+                   history.payload_json,
+                   '$.communication.author'
+               ) = '/root'
+               OR EXISTS (
+                   SELECT 1
+                   FROM session_spawn_edges AS author_edge
+                   WHERE author_edge.root_session_id =
+                         COALESCE(
+                             recipient_edge.root_session_id,
+                             history.session_id
+                         )
+                     AND author_edge.agent_path = json_extract(
+                         history.payload_json,
+                         '$.communication.author'
+                     )
+               )
+           )
+           AND (
+               mailbox.id IS NULL
+               OR mailbox.state <> 'delivered'
+               OR mailbox.recipient_session_id <> history.session_id
+           )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if orphan_history != 0 {
+        return Err(StorageError::Message(format!(
+            "V50 marker exists but {orphan_history} delivered IAC history item(s) have no durable delivered mailbox owner"
+        )));
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT id, payload_json, payload_sha256
+         FROM agent_mailbox_messages
+         ORDER BY id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, payload_json, payload_sha256) = row?;
+        let mut digest = Sha256::new();
+        digest.update(payload_json.as_bytes());
+        let expected = format!("{:x}", digest.finalize());
+        if payload_sha256 != expected {
+            return Err(StorageError::Message(format!(
+                "V50 mailbox message {id} has a stale payload hash"
+            )));
+        }
+    }
+
+    validate_durable_agent_mailbox_links(connection)
+}
+
+fn validate_durable_agent_mailbox_links(connection: &Connection) -> Result<(), StorageError> {
+    let invalid_handoffs = connection.query_row(
+        "SELECT COUNT(*)
+         FROM agent_completion_handoffs AS handoff
+         LEFT JOIN session_spawn_edges AS edge
+           ON edge.child_session_id = handoff.child_session_id
+          AND edge.parent_session_id = handoff.parent_session_id
+         LEFT JOIN protocol_runtime_events AS terminal
+           ON terminal.id = handoff.child_terminal_event_id
+          AND terminal.session_id = handoff.child_session_id
+          AND terminal.turn_id = handoff.child_turn_id
+         LEFT JOIN agent_mailbox_messages AS mailbox
+           ON mailbox.id = handoff.parent_history_item_id
+          AND mailbox.recipient_session_id = handoff.parent_session_id
+          AND mailbox.author_session_id = handoff.child_session_id
+         WHERE edge.child_session_id IS NULL
+            OR terminal.id IS NULL
+            OR json_extract(terminal.msg_json, '$.kind') IS NOT 'turn_terminal'
+            OR COALESCE(
+                   json_extract(terminal.msg_json, '$.terminal.outcome.kind'),
+                   ''
+               ) NOT IN ('completed', 'failed')
+            OR mailbox.id IS NULL
+            OR mailbox.trigger_turn <> 0
+            OR instr(
+                   COALESCE(
+                       json_extract(
+                           mailbox.payload_json,
+                           '$.communication.content'
+                       ),
+                       ''
+                   ),
+                   'Message Type: FINAL_ANSWER' || char(10)
+                         || 'Task name: ' ||
+                         CASE
+                             WHEN edge.parent_session_id =
+                                  edge.root_session_id
+                             THEN '/root'
+                             ELSE (
+                                 SELECT parent_edge.agent_path
+                                 FROM session_spawn_edges AS parent_edge
+                                 WHERE parent_edge.child_session_id =
+                                       edge.parent_session_id
+                             )
+                         END
+                         || char(10) || 'Sender: ' || edge.agent_path
+                         || char(10) || 'Payload:' || char(10)
+               ) <> 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_handoffs != 0 {
+        return Err(StorageError::Message(format!(
+            "V50 marker exists but {invalid_handoffs} completion handoff(s) do not reference their stable FINAL mailbox identity"
+        )));
+    }
+
+    let invalid_resume = connection.query_row(
+        "SELECT COUNT(*)
+         FROM agent_owner_resume_requests AS request
+         LEFT JOIN sessions AS owner ON owner.id = request.owner_session_id
+         LEFT JOIN sessions AS source ON source.id = request.source_session_id
+         LEFT JOIN agent_mailbox_messages AS mailbox
+           ON mailbox.id = request.source_history_item_id
+          AND mailbox.recipient_session_id = request.source_session_id
+         LEFT JOIN session_spawn_edges AS owner_edge
+           ON owner_edge.child_session_id = request.owner_session_id
+         WHERE owner.id IS NULL
+            OR source.id IS NULL
+            OR mailbox.id IS NULL
+            OR owner_edge.child_session_id IS NULL
+            OR request.source_session_id <> request.owner_session_id
+            OR mailbox.trigger_turn <> 0
+            OR request.state NOT IN ('pending', 'claimed', 'resolved', 'cancelled')
+            OR (request.state = 'pending'
+                AND (request.claimed_turn_id IS NOT NULL
+                     OR request.claimed_at_ms IS NOT NULL
+                     OR request.resolved_at_ms IS NOT NULL))
+            OR (request.state = 'claimed'
+                AND (request.claimed_turn_id IS NULL
+                     OR request.claimed_at_ms IS NULL
+                     OR request.resolved_at_ms IS NOT NULL))
+            OR (request.state = 'resolved'
+                AND (request.claimed_turn_id IS NULL
+                     OR request.claimed_at_ms IS NULL
+                     OR request.resolved_at_ms IS NULL))
+            OR (request.state = 'cancelled'
+                AND (request.resolved_at_ms IS NULL
+                     OR (request.claimed_turn_id IS NULL)
+                        IS NOT (request.claimed_at_ms IS NULL)))
+            OR (
+                (
+                    request.state IN ('claimed', 'resolved')
+                    OR (
+                        request.state = 'cancelled'
+                        AND request.claimed_turn_id IS NOT NULL
+                    )
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM protocol_runtime_events AS started
+                    WHERE started.session_id = request.owner_session_id
+                      AND started.turn_id = request.claimed_turn_id
+                      AND json_extract(started.msg_json, '$.kind')
+                          = 'warning'
+                      AND json_extract(started.msg_json, '$.message')
+                          LIKE 'thread started:%'
+                )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM agent_completion_handoffs AS handoff
+                INNER JOIN session_spawn_edges AS child_edge
+                  ON child_edge.child_session_id = handoff.child_session_id
+                 AND child_edge.parent_session_id =
+                     request.owner_session_id
+                WHERE handoff.parent_session_id =
+                      request.owner_session_id
+                  AND handoff.parent_history_item_id =
+                      request.source_history_item_id
+            )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_resume != 0 {
+        return Err(StorageError::Message(format!(
+            "V50 marker exists but {invalid_resume} owner-resume request(s) do not reference a direct-child stable mailbox identity"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_agent_owner_resume_request_data(connection: &Connection) -> Result<(), StorageError> {
+    let mailbox_is_current = schema_migration_applied(connection, DURABLE_AGENT_MAILBOX_VERSION)?;
+    if mailbox_is_current {
+        validate_durable_agent_mailbox_links(connection)?;
+    }
+    let invalid_fences = connection.query_row(
+        "SELECT COUNT(*)
+         FROM agent_tree_stop_fences AS fence
+         LEFT JOIN sessions AS root
+           ON root.id = fence.root_session_id
+         LEFT JOIN sessions AS stopped
+           ON stopped.id = fence.stopped_session_id
+         WHERE root.id IS NULL
+            OR stopped.id IS NULL
+            OR stopped.project_id <> root.project_id
+            OR fence.after_append_position < 0
+            OR fence.after_append_position > MAX(
+                COALESCE(
+                    (
+                        SELECT MAX(append_position)
+                        FROM protocol_item_append_order
+                    ),
+                    0
+                ),
+                COALESCE(
+                    (
+                        SELECT seq
+                        FROM sqlite_sequence
+                        WHERE name = 'protocol_item_append_order'
+                    ),
+                    0
+                )
+            )
+            OR fence.created_at_ms < 0
+            OR fence.cause NOT IN (
+                'approval_aborted',
+                'user_stop',
+                'tree_stopped',
+                'root_failed'
+            )
+            OR (
+                fence.cause = 'root_failed'
+                AND fence.stopped_session_id <> fence.root_session_id
+            )
+            OR (
+                fence.cause = 'tree_stopped'
+                AND (
+                    WITH RECURSIVE origin_scope(
+                        root_session_id,
+                        stopped_session_id,
+                        after_append_position,
+                        session_id
+                    ) AS (
+                        SELECT
+                            origin.root_session_id,
+                            origin.stopped_session_id,
+                            origin.after_append_position,
+                            origin.stopped_session_id
+                        FROM agent_tree_stop_fences AS origin
+                        WHERE origin.root_session_id =
+                              fence.root_session_id
+                          AND origin.after_append_position =
+                              fence.after_append_position
+                          AND origin.cause IN (
+                              'approval_aborted',
+                              'user_stop',
+                              'root_failed'
+                          )
+                        UNION ALL
+                        SELECT
+                            origin_scope.root_session_id,
+                            origin_scope.stopped_session_id,
+                            origin_scope.after_append_position,
+                            child.child_session_id
+                        FROM origin_scope
+                        INNER JOIN session_spawn_edges AS child
+                          ON child.root_session_id =
+                             origin_scope.root_session_id
+                         AND child.parent_session_id =
+                             origin_scope.session_id
+                    )
+                    SELECT COUNT(*)
+                    FROM origin_scope
+                    WHERE session_id = fence.stopped_session_id
+                ) <> 1
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM session_spawn_edges AS owner
+                WHERE owner.child_session_id = fence.root_session_id
+            )
+            OR (
+                fence.stopped_session_id <> fence.root_session_id
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM session_spawn_edges AS stopped_edge
+                    WHERE stopped_edge.root_session_id =
+                          fence.root_session_id
+                      AND stopped_edge.child_session_id =
+                          fence.stopped_session_id
+                )
+            )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_fences != 0 {
+        return Err(StorageError::Message(format!(
+            "V49 marker exists but {invalid_fences} tree-stop fence row(s) violate durable root, subtree, or append-boundary identity"
+        )));
+    }
+
+    let invalid = if mailbox_is_current {
+        0
+    } else {
+        connection.query_row(
+            "SELECT COUNT(*)
+         FROM agent_owner_resume_requests AS request
+         LEFT JOIN sessions AS owner ON owner.id = request.owner_session_id
+         LEFT JOIN sessions AS source ON source.id = request.source_session_id
+         LEFT JOIN protocol_history_items AS history
+           ON history.id = request.source_history_item_id
+          AND history.session_id = request.source_session_id
+         LEFT JOIN session_spawn_edges AS owner_edge
+           ON owner_edge.child_session_id = request.owner_session_id
+         WHERE owner.id IS NULL
+            OR source.id IS NULL
+            OR history.id IS NULL
+            OR owner_edge.child_session_id IS NULL
+            OR request.source_session_id <> request.owner_session_id
+            OR json_extract(history.payload_json, '$.kind')
+                 IS NOT 'inter_agent_communication'
+            OR history.scope_kind <> 'session'
+            OR json_extract(
+                 history.payload_json,
+                 '$.communication.trigger_turn'
+               ) IS NOT 0
+            OR NOT EXISTS (
+                SELECT 1
+                FROM agent_completion_handoffs AS handoff
+                INNER JOIN session_spawn_edges AS child_edge
+                  ON child_edge.child_session_id = handoff.child_session_id
+                 AND child_edge.parent_session_id = request.owner_session_id
+                WHERE handoff.parent_session_id = request.owner_session_id
+                  AND handoff.parent_history_item_id =
+                      request.source_history_item_id
+            )
+            OR request.state NOT IN ('pending', 'claimed', 'resolved', 'cancelled')
+            OR (request.state = 'pending'
+                AND (request.claimed_turn_id IS NOT NULL
+                     OR request.claimed_at_ms IS NOT NULL
+                     OR request.resolved_at_ms IS NOT NULL))
+            OR (request.state = 'claimed'
+                AND (request.claimed_turn_id IS NULL
+                     OR request.claimed_at_ms IS NULL
+                     OR request.resolved_at_ms IS NOT NULL))
+            OR (request.state = 'resolved'
+                AND (request.claimed_turn_id IS NULL
+                     OR request.claimed_at_ms IS NULL
+                     OR request.resolved_at_ms IS NULL))
+            OR (request.state = 'cancelled'
+                AND (request.resolved_at_ms IS NULL
+                     OR (request.claimed_turn_id IS NULL)
+                        IS NOT (request.claimed_at_ms IS NULL)))
+            OR (
+                (
+                    request.state IN ('claimed', 'resolved')
+                    OR (
+                        request.state = 'cancelled'
+                        AND request.claimed_turn_id IS NOT NULL
+                    )
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM protocol_runtime_events AS started
+                    WHERE started.session_id = request.owner_session_id
+                      AND started.turn_id = request.claimed_turn_id
+                      AND json_extract(started.msg_json, '$.kind')
+                          = 'warning'
+                      AND json_extract(started.msg_json, '$.message')
+                          LIKE 'thread started:%'
+                )
+            )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?
+    };
+    if invalid != 0 {
+        return Err(StorageError::Message(format!(
+            "V49 marker exists but {invalid} owner-resume request row(s) violate durable identity or state"
+        )));
+    }
+
+    let invalid_deferred = connection.query_row(
+        "SELECT COUNT(*)
+         FROM agent_deferred_completions AS deferred
+         LEFT JOIN session_spawn_edges AS edge
+           ON edge.child_session_id = deferred.agent_session_id
+          AND edge.parent_session_id = deferred.parent_session_id
+         LEFT JOIN protocol_runtime_events AS terminal
+           ON terminal.id = deferred.terminal_event_id
+          AND terminal.session_id = deferred.agent_session_id
+          AND terminal.turn_id = deferred.agent_turn_id
+         LEFT JOIN protocol_runtime_events AS resolver
+           ON resolver.id = deferred.resolved_by_terminal_event_id
+         WHERE edge.child_session_id IS NULL
+            OR terminal.id IS NULL
+            OR json_extract(terminal.msg_json, '$.kind') IS NOT 'turn_terminal'
+            OR (
+                deferred.kind = 'completed_early'
+                AND json_extract(
+                      terminal.msg_json,
+                      '$.terminal.outcome.kind'
+                    ) IS NOT 'completed'
+            )
+            OR (
+                deferred.kind = 'crash_failed'
+                AND json_extract(
+                      terminal.msg_json,
+                      '$.terminal.outcome.kind'
+                    ) IS NOT 'failed'
+            )
+            OR deferred.kind NOT IN ('completed_early', 'crash_failed')
+            OR deferred.state NOT IN ('pending', 'superseded', 'released', 'discarded')
+            OR (
+                deferred.state = 'pending'
+                AND (
+                    deferred.resolved_by_terminal_event_id IS NOT NULL
+                    OR deferred.resolved_at_ms IS NOT NULL
+                    OR EXISTS (
+                        SELECT 1
+                        FROM agent_completion_handoffs AS handoff
+                        WHERE handoff.child_session_id = deferred.agent_session_id
+                          AND handoff.child_turn_id = deferred.agent_turn_id
+                    )
+                )
+            )
+            OR (
+                deferred.state IN ('superseded', 'released', 'discarded')
+                AND (
+                    resolver.id IS NULL
+                    OR deferred.resolved_at_ms IS NULL
+                )
+            )
+            OR (
+                deferred.state = 'superseded'
+                AND NOT (
+                    EXISTS (
+                        SELECT 1
+                        FROM protocol_runtime_events AS source_terminal
+                        INNER JOIN session_spawn_edges AS child_edge
+                          ON child_edge.child_session_id =
+                             source_terminal.session_id
+                         AND child_edge.parent_session_id =
+                             deferred.agent_session_id
+                        INNER JOIN agent_completion_handoffs AS handoff
+                          ON handoff.child_session_id =
+                             source_terminal.session_id
+                         AND handoff.child_turn_id = source_terminal.turn_id
+                         AND handoff.parent_session_id =
+                             deferred.agent_session_id
+                        WHERE source_terminal.id =
+                              deferred.resolved_by_terminal_event_id
+                          AND json_extract(
+                                source_terminal.msg_json,
+                                '$.kind'
+                              ) = 'turn_terminal'
+                          AND json_extract(
+                                source_terminal.msg_json,
+                                '$.terminal.outcome.kind'
+                              ) IN ('completed', 'failed')
+                    )
+                    OR (
+                        deferred.kind = 'crash_failed'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM protocol_runtime_events AS source_terminal
+                            INNER JOIN protocol_item_append_order AS source_order
+                              ON source_order.session_id =
+                                 source_terminal.session_id
+                             AND source_order.source_kind = 'runtime_event'
+                             AND source_order.source_id = source_terminal.id
+                            INNER JOIN protocol_item_append_order AS deferred_order
+                              ON deferred_order.session_id = terminal.session_id
+                             AND deferred_order.source_kind = 'runtime_event'
+                             AND deferred_order.source_id = terminal.id
+                            WHERE source_terminal.id =
+                                  deferred.resolved_by_terminal_event_id
+                              AND source_terminal.session_id =
+                                  deferred.agent_session_id
+                              AND source_terminal.turn_id <>
+                                  deferred.agent_turn_id
+                              AND json_extract(
+                                    source_terminal.msg_json,
+                                    '$.kind'
+                                  ) = 'turn_terminal'
+                              AND json_extract(
+                                    source_terminal.msg_json,
+                                    '$.terminal.outcome.kind'
+                                  ) IN ('completed', 'failed')
+                              AND source_order.append_position >
+                                  deferred_order.append_position
+                        )
+                    )
+                )
+            )
+            OR (
+                deferred.state = 'released'
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM agent_completion_handoffs AS handoff
+                    WHERE handoff.child_session_id = deferred.agent_session_id
+                      AND handoff.child_turn_id = deferred.agent_turn_id
+                )
+            )
+            OR (
+                deferred.state = 'released'
+                AND NOT EXISTS (
+                    WITH RECURSIVE descendants(session_id) AS (
+                        SELECT child.child_session_id
+                        FROM session_spawn_edges AS child
+                        WHERE child.parent_session_id =
+                              deferred.agent_session_id
+                        UNION ALL
+                        SELECT child.child_session_id
+                        FROM session_spawn_edges AS child
+                        INNER JOIN descendants AS parent
+                          ON child.parent_session_id = parent.session_id
+                    )
+                    SELECT 1
+                    FROM descendants
+                    INNER JOIN protocol_runtime_events AS resolution_terminal
+                      ON resolution_terminal.session_id =
+                         descendants.session_id
+                     AND resolution_terminal.id =
+                         deferred.resolved_by_terminal_event_id
+                    INNER JOIN protocol_item_append_order AS resolution_order
+                      ON resolution_order.session_id =
+                         resolution_terminal.session_id
+                     AND resolution_order.source_kind = 'runtime_event'
+                     AND resolution_order.source_id =
+                         resolution_terminal.id
+                    INNER JOIN protocol_item_append_order AS deferred_order
+                      ON deferred_order.session_id = terminal.session_id
+                     AND deferred_order.source_kind = 'runtime_event'
+                     AND deferred_order.source_id = terminal.id
+                    WHERE json_extract(
+                              resolution_terminal.msg_json,
+                              '$.kind'
+                          ) = 'turn_terminal'
+                      AND json_extract(
+                              resolution_terminal.msg_json,
+                              '$.terminal.outcome.kind'
+                          ) = 'interrupted'
+                      AND (
+                          (
+                              deferred.state = 'released'
+                              AND json_extract(
+                                    resolution_terminal.msg_json,
+                                    '$.terminal.outcome.cause'
+                                  ) = 'agent_interrupted'
+                          )
+                          OR
+                          (
+                              deferred.state = 'discarded'
+                              AND json_extract(
+                                    resolution_terminal.msg_json,
+                                    '$.terminal.outcome.cause'
+                                  ) IN (
+                                      'approval_aborted',
+                                      'user_stop',
+                                      'tree_stopped'
+                                  )
+                          )
+                      )
+                      AND resolution_order.append_position >
+                          deferred_order.append_position
+                )
+            )
+            OR (
+                deferred.state = 'discarded'
+                AND EXISTS (
+                    SELECT 1
+                    FROM agent_completion_handoffs AS handoff
+                    WHERE handoff.child_session_id =
+                          deferred.agent_session_id
+                      AND handoff.child_turn_id = deferred.agent_turn_id
+                )
+            )
+            OR (
+                deferred.state = 'discarded'
+                AND NOT (
+                    EXISTS (
+                        WITH RECURSIVE descendants(session_id) AS (
+                            SELECT child.child_session_id
+                            FROM session_spawn_edges AS child
+                            WHERE child.parent_session_id =
+                                  deferred.agent_session_id
+                            UNION ALL
+                            SELECT child.child_session_id
+                            FROM session_spawn_edges AS child
+                            INNER JOIN descendants AS parent
+                              ON child.parent_session_id = parent.session_id
+                        )
+                        SELECT 1
+                        FROM descendants
+                        INNER JOIN protocol_runtime_events AS resolution_terminal
+                          ON resolution_terminal.session_id =
+                             descendants.session_id
+                         AND resolution_terminal.id =
+                             deferred.resolved_by_terminal_event_id
+                        INNER JOIN protocol_item_append_order AS resolution_order
+                          ON resolution_order.session_id =
+                             resolution_terminal.session_id
+                         AND resolution_order.source_kind = 'runtime_event'
+                         AND resolution_order.source_id =
+                             resolution_terminal.id
+                        INNER JOIN protocol_item_append_order AS deferred_order
+                          ON deferred_order.session_id = terminal.session_id
+                         AND deferred_order.source_kind = 'runtime_event'
+                         AND deferred_order.source_id = terminal.id
+                        WHERE json_extract(
+                                  resolution_terminal.msg_json,
+                                  '$.kind'
+                              ) = 'turn_terminal'
+                          AND json_extract(
+                                  resolution_terminal.msg_json,
+                                  '$.terminal.outcome.kind'
+                              ) = 'interrupted'
+                          AND json_extract(
+                                  resolution_terminal.msg_json,
+                                  '$.terminal.outcome.cause'
+                              ) IN (
+                                  'approval_aborted',
+                                  'user_stop',
+                                  'tree_stopped'
+                              )
+                          AND resolution_order.append_position >
+                              deferred_order.append_position
+                    )
+                    OR (
+                        EXISTS (
+                            SELECT 1
+                            FROM protocol_runtime_events AS resolution_terminal
+                            INNER JOIN protocol_item_append_order AS resolution_order
+                              ON resolution_order.session_id =
+                                 resolution_terminal.session_id
+                             AND resolution_order.source_kind = 'runtime_event'
+                             AND resolution_order.source_id =
+                                 resolution_terminal.id
+                            INNER JOIN protocol_item_append_order AS deferred_order
+                              ON deferred_order.session_id = terminal.session_id
+                             AND deferred_order.source_kind = 'runtime_event'
+                             AND deferred_order.source_id = terminal.id
+                            WHERE resolution_terminal.id =
+                                  deferred.resolved_by_terminal_event_id
+                              AND resolution_terminal.session_id =
+                                  deferred.agent_session_id
+                              AND resolution_terminal.turn_id <>
+                                  deferred.agent_turn_id
+                              AND json_extract(
+                                    resolution_terminal.msg_json,
+                                    '$.kind'
+                                  ) = 'turn_terminal'
+                              AND json_extract(
+                                    resolution_terminal.msg_json,
+                                    '$.terminal.outcome.kind'
+                                  ) = 'interrupted'
+                              AND json_extract(
+                                    resolution_terminal.msg_json,
+                                    '$.terminal.outcome.cause'
+                                  ) IN (
+                                      'approval_aborted',
+                                      'user_stop',
+                                      'tree_stopped'
+                                  )
+                              AND resolution_order.append_position >
+                                  deferred_order.append_position
+                        )
+                    )
+                    OR (
+                        deferred.kind = 'crash_failed'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM protocol_runtime_events AS resolution_terminal
+                            INNER JOIN protocol_item_append_order AS resolution_order
+                              ON resolution_order.session_id =
+                                 resolution_terminal.session_id
+                             AND resolution_order.source_kind = 'runtime_event'
+                             AND resolution_order.source_id =
+                                 resolution_terminal.id
+                            INNER JOIN protocol_item_append_order AS deferred_order
+                              ON deferred_order.session_id = terminal.session_id
+                             AND deferred_order.source_kind = 'runtime_event'
+                             AND deferred_order.source_id = terminal.id
+                            WHERE resolution_terminal.id =
+                                  deferred.resolved_by_terminal_event_id
+                              AND resolution_terminal.session_id =
+                                  deferred.agent_session_id
+                              AND resolution_terminal.turn_id <>
+                                  deferred.agent_turn_id
+                              AND json_extract(
+                                    resolution_terminal.msg_json,
+                                    '$.kind'
+                                  ) = 'turn_terminal'
+                              AND json_extract(
+                                    resolution_terminal.msg_json,
+                                    '$.terminal.outcome.kind'
+                                  ) = 'interrupted'
+                              AND resolution_order.append_position >
+                                  deferred_order.append_position
+                        )
+                    )
+                    OR (
+                        deferred.resolved_by_terminal_event_id =
+                            deferred.terminal_event_id
+                        AND EXISTS (
+                            WITH RECURSIVE
+                            fenced_scope(
+                                root_session_id,
+                                stopped_session_id,
+                                after_append_position,
+                                session_id
+                            ) AS (
+                                SELECT
+                                    fence.root_session_id,
+                                    fence.stopped_session_id,
+                                    fence.after_append_position,
+                                    fence.stopped_session_id
+                                FROM agent_tree_stop_fences AS fence
+                                UNION ALL
+                                SELECT
+                                    fenced.root_session_id,
+                                    fenced.stopped_session_id,
+                                    fenced.after_append_position,
+                                    child.child_session_id
+                                FROM fenced_scope AS fenced
+                                INNER JOIN session_spawn_edges AS child
+                                  ON child.root_session_id =
+                                     fenced.root_session_id
+                                 AND child.parent_session_id =
+                                     fenced.session_id
+                            ),
+                            deferred_scope(session_id) AS (
+                                SELECT deferred.agent_session_id
+                                UNION ALL
+                                SELECT child.child_session_id
+                                FROM session_spawn_edges AS child
+                                INNER JOIN deferred_scope AS owner
+                                  ON child.parent_session_id =
+                                     owner.session_id
+                            )
+                            SELECT 1
+                            FROM protocol_item_append_order AS terminal_order
+                            INNER JOIN fenced_scope AS fenced
+                              ON (
+                                  fenced.session_id =
+                                      deferred.agent_session_id
+                                  OR EXISTS (
+                                      SELECT 1
+                                      FROM deferred_scope AS descendant
+                                      WHERE descendant.session_id =
+                                            fenced.stopped_session_id
+                                  )
+                              )
+                            WHERE terminal_order.session_id =
+                                  deferred.agent_session_id
+                              AND terminal_order.source_kind =
+                                  'runtime_event'
+                              AND terminal_order.source_id =
+                                  deferred.terminal_event_id
+                              AND (
+                                  SELECT MIN(turn_order.append_position)
+                                  FROM protocol_item_append_order AS turn_order
+                                  WHERE turn_order.session_id =
+                                        deferred.agent_session_id
+                                    AND turn_order.turn_id =
+                                        deferred.agent_turn_id
+                              ) <= fenced.after_append_position
+                              AND terminal_order.append_position <=
+                                  fenced.after_append_position
+                        )
+                    )
+                    OR EXISTS (
+                        WITH RECURSIVE
+                        owner_scope(session_id) AS (
+                            SELECT deferred.agent_session_id
+                            UNION ALL
+                            SELECT child.child_session_id
+                            FROM session_spawn_edges AS child
+                            INNER JOIN owner_scope AS owner
+                              ON child.parent_session_id = owner.session_id
+                        ),
+                        fenced_scope(
+                            root_session_id,
+                            after_append_position,
+                            session_id
+                        ) AS (
+                            SELECT
+                                fence.root_session_id,
+                                fence.after_append_position,
+                                fence.stopped_session_id
+                            FROM agent_tree_stop_fences AS fence
+                            UNION ALL
+                            SELECT
+                                fenced.root_session_id,
+                                fenced.after_append_position,
+                                child.child_session_id
+                            FROM fenced_scope AS fenced
+                            INNER JOIN session_spawn_edges AS child
+                              ON child.root_session_id =
+                                 fenced.root_session_id
+                             AND child.parent_session_id =
+                                 fenced.session_id
+                        )
+                        SELECT 1
+                        FROM protocol_runtime_events AS resolution_terminal
+                        INNER JOIN protocol_item_append_order AS resolution_order
+                          ON resolution_order.session_id =
+                             resolution_terminal.session_id
+                         AND resolution_order.source_kind = 'runtime_event'
+                         AND resolution_order.source_id =
+                             resolution_terminal.id
+                        INNER JOIN owner_scope AS owner
+                          ON owner.session_id =
+                             resolution_terminal.session_id
+                        INNER JOIN fenced_scope AS fenced
+                          ON fenced.session_id =
+                             resolution_terminal.session_id
+                        WHERE resolution_terminal.id =
+                              deferred.resolved_by_terminal_event_id
+                          AND json_extract(
+                                resolution_terminal.msg_json,
+                                '$.kind'
+                              ) = 'turn_terminal'
+                          AND (
+                              SELECT MIN(turn_order.append_position)
+                              FROM protocol_item_append_order AS turn_order
+                              WHERE turn_order.session_id =
+                                    deferred.agent_session_id
+                                AND turn_order.turn_id =
+                                    deferred.agent_turn_id
+                          ) <= fenced.after_append_position
+                          AND resolution_order.append_position >
+                              fenced.after_append_position
+                    )
+                )
+            )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_deferred != 0 {
+        return Err(StorageError::Message(format!(
+            "V49 marker exists but {invalid_deferred} deferred-completion row(s) violate durable identity or state"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_v47_table_schema(
+    connection: &Connection,
+    table_name: &str,
+) -> Result<(), StorageError> {
+    let expected = canonical_recursive_session_spawn_edge_schema(table_name)?;
+    let observed = normalized_schema_objects_for_table(connection, table_name)?;
+
+    for ((object_type, object_name), expected_sql) in &expected {
+        let Some(observed_sql) = observed.get(&(object_type.clone(), object_name.clone())) else {
+            return Err(StorageError::Message(format!(
+                "V47 marker exists but required {object_type} `{object_name}` for `{table_name}` is missing"
+            )));
+        };
+        if observed_sql != expected_sql {
+            return Err(StorageError::Message(format!(
+                "V47 marker exists but {object_type} `{object_name}` has stale SQL"
+            )));
+        }
+    }
+    for (object_type, object_name) in observed.keys() {
+        if !expected.contains_key(&(object_type.clone(), object_name.clone())) {
+            return Err(StorageError::Message(format!(
+                "V47 marker exists but unexpected {object_type} `{object_name}` owns `{table_name}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+type NormalizedSchemaObjects = BTreeMap<(String, String), String>;
+
+fn canonical_recursive_session_spawn_edge_schema(
+    table_name: &str,
+) -> Result<NormalizedSchemaObjects, StorageError> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(
+        "CREATE TABLE sessions (
+             id TEXT PRIMARY KEY NOT NULL,
+             project_id TEXT NOT NULL
+         );
+         CREATE TABLE moyai_schema_migrations (
+             version INTEGER PRIMARY KEY NOT NULL,
+             name TEXT NOT NULL
+         );
+         CREATE TABLE session_spawn_edges (
+             root_session_id TEXT NOT NULL,
+             parent_session_id TEXT NOT NULL,
+             child_session_id TEXT PRIMARY KEY NOT NULL,
+             agent_path TEXT NOT NULL,
+             task_name TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE protocol_runtime_events (
+             id TEXT PRIMARY KEY NOT NULL,
+             session_id TEXT NOT NULL,
+             turn_id TEXT NOT NULL,
+             msg_json TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE protocol_history_items (
+             id TEXT PRIMARY KEY NOT NULL,
+             session_id TEXT NOT NULL,
+             payload_json TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE protocol_item_append_order (
+             append_position INTEGER PRIMARY KEY,
+             session_id TEXT NOT NULL,
+             source_kind TEXT NOT NULL,
+             source_id TEXT NOT NULL
+         );",
+    )?;
+    connection.execute_batch(V47_RECURSIVE_SESSION_SPAWN_EDGES)?;
+    normalized_schema_objects_for_table(&connection, table_name)
+}
+
+fn normalized_schema_objects_for_table(
+    connection: &Connection,
+    table_name: &str,
+) -> Result<NormalizedSchemaObjects, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, sql
+         FROM sqlite_master
+         WHERE tbl_name = ?1
+           AND sql IS NOT NULL
+         ORDER BY type ASC, name ASC",
+    )?;
+    Ok(statement
+        .query_map([table_name], |row| {
+            let object_type = row.get::<_, String>(0)?;
+            let object_name = row.get::<_, String>(1)?;
+            let sql = row.get::<_, String>(2)?;
+            Ok((
+                (object_type, object_name),
+                sql.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase(),
+            ))
+        })?
+        .collect::<Result<BTreeMap<_, _>, _>>()?)
+}
+
+fn validate_recursive_session_spawn_edge_data(connection: &Connection) -> Result<(), StorageError> {
+    let invalid_shape = connection.query_row(
+        "SELECT COUNT(*)
+         FROM session_spawn_edges
+         WHERE child_session_id = root_session_id
+            OR parent_session_id = child_session_id
+            OR spawn_order <= 0
+            OR task_name = ''
+            OR task_name = 'root'
+            OR task_name GLOB '*[^a-z0-9_]*'
+            OR agent_path NOT GLOB '/root/*'
+            OR agent_path GLOB '*[^/a-z0-9_]*'
+            OR agent_path GLOB '*//*'
+            OR agent_path LIKE '%/'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_shape != 0 {
+        return Err(StorageError::Message(format!(
+            "V47 marker exists but {invalid_shape} session spawn edge(s) have a non-canonical shape"
+        )));
+    }
+
+    let invalid_lineage = connection.query_row(
+        "SELECT COUNT(*)
+         FROM session_spawn_edges AS edge
+         LEFT JOIN session_spawn_edges AS parent
+           ON parent.root_session_id = edge.root_session_id
+          AND parent.child_session_id = edge.parent_session_id
+         WHERE (
+             edge.parent_session_id = edge.root_session_id
+             AND edge.agent_path <> '/root/' || edge.task_name
+         )
+         OR (
+             edge.parent_session_id <> edge.root_session_id
+             AND (
+                 parent.child_session_id IS NULL
+                 OR edge.agent_path <> parent.agent_path || '/' || edge.task_name
+             )
+         )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_lineage != 0 {
+        return Err(StorageError::Message(format!(
+            "V47 marker exists but {invalid_lineage} session spawn edge(s) have an orphan, cross-tree parent, or non-canonical parent path"
+        )));
+    }
+
+    let invalid_ownership = connection.query_row(
+        "SELECT COUNT(*)
+         FROM session_spawn_edges AS edge
+         INNER JOIN sessions AS root ON root.id = edge.root_session_id
+         INNER JOIN sessions AS parent ON parent.id = edge.parent_session_id
+         INNER JOIN sessions AS child ON child.id = edge.child_session_id
+         WHERE root.project_id <> parent.project_id
+            OR root.project_id <> child.project_id
+            OR EXISTS (
+                SELECT 1
+                FROM session_spawn_edges AS owner
+                WHERE owner.child_session_id = edge.root_session_id
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM session_spawn_edges AS owned_tree
+                WHERE owned_tree.root_session_id = edge.child_session_id
+            )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_ownership != 0 {
+        return Err(StorageError::Message(format!(
+            "V47 marker exists but {invalid_ownership} session spawn edge(s) violate same-project single-tree ownership"
+        )));
+    }
+
+    let duplicate_spawn_order = connection.query_row(
+        "SELECT COUNT(*)
+         FROM (
+             SELECT root_session_id, spawn_order
+             FROM session_spawn_edges
+             GROUP BY root_session_id, spawn_order
+             HAVING COUNT(*) <> 1
+         )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if duplicate_spawn_order != 0 {
+        return Err(StorageError::Message(
+            "V47 marker exists but an agent tree has duplicate durable spawn orders".to_string(),
+        ));
+    }
+
+    let unreachable = connection.query_row(
+        "WITH RECURSIVE reachable(root_session_id, child_session_id) AS (
+             SELECT root_session_id, child_session_id
+             FROM session_spawn_edges
+             WHERE parent_session_id = root_session_id
+             UNION ALL
+             SELECT child.root_session_id, child.child_session_id
+             FROM session_spawn_edges AS child
+             INNER JOIN reachable AS parent
+               ON parent.root_session_id = child.root_session_id
+              AND parent.child_session_id = child.parent_session_id
+         )
+         SELECT COUNT(*)
+         FROM session_spawn_edges AS edge
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM reachable
+             WHERE reachable.root_session_id = edge.root_session_id
+               AND reachable.child_session_id = edge.child_session_id
+         )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if unreachable != 0 {
+        return Err(StorageError::Message(format!(
+            "V47 marker exists but {unreachable} session spawn edge(s) are not reachable from their root"
+        )));
+    }
+
+    let max_descendants = connection.query_row(
+        "SELECT COALESCE(MAX(descendant_count), 0)
+         FROM (
+             SELECT COUNT(*) AS descendant_count
+             FROM session_spawn_edges
+             GROUP BY root_session_id
+         )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if max_descendants > 255 {
+        return Err(StorageError::Message(format!(
+            "V47 marker exists but one agent tree retains {max_descendants} descendants"
+        )));
+    }
+    validate_agent_completion_handoff_data(connection)?;
+    Ok(())
+}
+
+fn validate_agent_completion_handoff_data(connection: &Connection) -> Result<(), StorageError> {
+    if schema_migration_applied(connection, DURABLE_AGENT_MAILBOX_VERSION)? {
+        return validate_durable_agent_mailbox_links(connection);
+    }
+    let invalid_handoffs = connection.query_row(
+        "SELECT COUNT(*)
+         FROM agent_completion_handoffs AS handoff
+         LEFT JOIN session_spawn_edges AS edge
+           ON edge.child_session_id = handoff.child_session_id
+          AND edge.parent_session_id = handoff.parent_session_id
+         LEFT JOIN protocol_runtime_events AS terminal
+           ON terminal.id = handoff.child_terminal_event_id
+          AND terminal.session_id = handoff.child_session_id
+          AND terminal.turn_id = handoff.child_turn_id
+         LEFT JOIN protocol_history_items AS history
+           ON history.id = handoff.parent_history_item_id
+          AND history.session_id = handoff.parent_session_id
+         LEFT JOIN session_spawn_edges AS parent_edge
+           ON parent_edge.root_session_id = edge.root_session_id
+          AND parent_edge.child_session_id = edge.parent_session_id
+         WHERE edge.child_session_id IS NULL
+            OR terminal.id IS NULL
+            OR json_extract(terminal.msg_json, '$.kind') IS NOT 'turn_terminal'
+            OR COALESCE(
+                   json_extract(terminal.msg_json, '$.terminal.outcome.kind'),
+                   ''
+               )
+                NOT IN ('completed', 'failed')
+            OR history.id IS NULL
+            OR json_extract(history.payload_json, '$.kind')
+                IS NOT 'inter_agent_communication'
+            OR json_extract(history.payload_json, '$.communication.author')
+                IS NOT edge.agent_path
+            OR json_extract(history.payload_json, '$.communication.recipient')
+                IS NOT CASE
+                           WHEN edge.parent_session_id = edge.root_session_id THEN '/root'
+                           ELSE parent_edge.agent_path
+                       END
+            OR json_extract(history.payload_json, '$.communication.trigger_turn') IS NOT 0
+            OR instr(
+                   COALESCE(
+                       json_extract(history.payload_json, '$.communication.content'),
+                       ''
+                   ),
+                   'Message Type: FINAL_ANSWER' || char(10)
+                         || 'Task name: ' ||
+                         CASE
+                             WHEN edge.parent_session_id = edge.root_session_id THEN '/root'
+                             ELSE parent_edge.agent_path
+                         END
+                         || char(10) || 'Sender: ' || edge.agent_path
+                         || char(10) || 'Payload:' || char(10)
+               ) <> 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_handoffs != 0 {
+        return Err(StorageError::Message(format!(
+            "V47 marker exists but {invalid_handoffs} agent completion handoff receipt(s) do not link an eligible child terminal to the immediate parent's FINAL history"
+        )));
+    }
     Ok(())
 }
 
@@ -3056,6 +6357,24 @@ fn schema_migration_applied(connection: &Connection, version: i64) -> Result<boo
         )
         .optional()?
         .is_some())
+}
+
+fn schema_migration_has_exact_name(
+    connection: &Connection,
+    version: i64,
+    expected_name: &str,
+) -> Result<bool, StorageError> {
+    if !table_exists(connection, "moyai_schema_migrations")? {
+        return Ok(false);
+    }
+    let name = connection
+        .query_row(
+            "SELECT name FROM moyai_schema_migrations WHERE version = ?1",
+            [version],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(name.as_deref() == Some(expected_name))
 }
 
 #[cfg(test)]
@@ -4017,10 +7336,83 @@ mod tests {
         run_typed_history_scope(connection).expect("V42 schema");
     }
 
-    fn run_through_v44(connection: &Connection) {
+    fn run_through_v43(connection: &Connection) {
         run_through_v42(connection);
         run_indexed_internal_file_ownership(connection).expect("V43 schema");
+    }
+
+    fn run_through_v44(connection: &Connection) {
+        run_through_v43(connection);
         run_unique_turn_terminal(connection).expect("V44 schema");
+    }
+
+    fn run_through_v45(connection: &Connection) {
+        run_through_v44(connection);
+        run_restore_auto_review_access_mode(connection).expect("V45 schema");
+    }
+
+    fn run_through_v46(connection: &Connection) {
+        run_through_v45(connection);
+        run_codex_compaction_checkpoint(connection).expect("V46 schema");
+    }
+
+    fn insert_v46_compaction_parent(connection: &Connection) {
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('v46-project', 'C:/workspace', 'workspace', 'none', 1, 1);
+                 INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms)
+                 VALUES ('v46-session', 'v46-project', 'session', 'completed',
+                         'C:/workspace', 'model', 'http://localhost', 2, 2, 2);",
+            )
+            .expect("V46 compaction parent rows");
+    }
+
+    fn insert_v46_compaction(
+        connection: &Connection,
+        id: &str,
+        sequence_no: i64,
+        payload_json: &str,
+        payload_sha256: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO protocol_history_items
+                 (id, session_id, scope_kind, turn_id, sequence_no,
+                  payload_json, payload_sha256, created_at_ms)
+                 VALUES (?1, 'v46-session', 'turn', '01J00000000000000000000000',
+                         ?2, ?3, ?4, ?2)",
+                params![id, sequence_no, payload_json, payload_sha256],
+            )
+            .expect("V46 compaction fixture");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, scope_kind, turn_id, sequence_no,
+                  source_kind, source_id, created_at_ms)
+                 VALUES ('v46-session', 'turn', '01J00000000000000000000000', ?1,
+                         'history_item', ?2, ?1)",
+                params![sequence_no, id],
+            )
+            .expect("V46 compaction append-order fixture");
+    }
+
+    fn insert_v46_replacement(connection: &Connection, id: &str, sequence_no: i64) {
+        let payload_json = serde_json::json!({
+            "kind": "error",
+            "message": "replacement evidence",
+        })
+        .to_string();
+        insert_v46_compaction(
+            connection,
+            id,
+            sequence_no,
+            &payload_json,
+            &sha256_text(&payload_json),
+        );
     }
 
     fn insert_tool_call_parent_rows(connection: &Connection) {
@@ -4245,6 +7637,33 @@ mod tests {
             schema_migration_applied(&connection, INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION)
                 .expect("indexed internal-file ownership marker")
         );
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                AGENT_OWNER_RESUME_REQUESTS_VERSION,
+                AGENT_OWNER_RESUME_REQUESTS_NAME,
+            )
+            .expect("V48 marker")
+        );
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                AGENT_TREE_STOP_FENCES_VERSION,
+                AGENT_TREE_STOP_FENCES_NAME,
+            )
+            .expect("V49 marker")
+        );
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                DURABLE_AGENT_MAILBOX_VERSION,
+                DURABLE_AGENT_MAILBOX_NAME,
+            )
+            .expect("V50 marker")
+        );
+        validate_durable_agent_mailbox_schema(&connection).expect("current durable mailbox schema");
+        validate_agent_owner_resume_request_schema(&connection)
+            .expect("current owner-resume schema");
         validate_indexed_collaboration_mode_lookup(&connection)
             .expect("current collaboration-mode partial index");
         validate_indexed_internal_file_ownership(&connection)
@@ -4264,6 +7683,25 @@ mod tests {
         assert!(table_exists(&connection, "protocol_history_items").expect("history table"));
         assert!(table_exists(&connection, "protocol_turn_items").expect("turn table"));
         assert!(table_exists(&connection, "protocol_runtime_events").expect("runtime table"));
+        assert!(
+            table_exists(&connection, "agent_owner_resume_requests").expect("owner-resume table")
+        );
+        assert!(
+            table_exists(&connection, "agent_tree_stop_fences").expect("tree-stop fence table")
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM sqlite_master
+                     WHERE type = 'view'
+                       AND name = 'effective_agent_deferred_completions'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("effective deferred-completion view"),
+            1
+        );
     }
 
     #[test]
@@ -4300,8 +7738,14 @@ mod tests {
             schema_migration_applied(&connection, INDEXED_INTERNAL_FILE_OWNERSHIP_VERSION)
                 .expect("V43 marker")
         );
+        assert!(
+            schema_migration_applied(&connection, RECURSIVE_SESSION_SPAWN_EDGES_VERSION)
+                .expect("V47 marker")
+        );
         validate_indexed_collaboration_mode_lookup(&connection).expect("V41 index contract");
         validate_indexed_internal_file_ownership(&connection).expect("V43 index contract");
+        validate_recursive_session_spawn_edge_schema(&connection)
+            .expect("V47 recursive spawn-edge contract");
     }
 
     #[test]
@@ -4949,7 +8393,7 @@ mod tests {
     }
 
     #[test]
-    fn v40_keeps_only_bounded_flat_edges_without_deleting_detached_sessions() {
+    fn v40_cleanup_reaches_v47_recursive_lineage_without_deleting_detached_sessions() {
         let connection = Connection::open_in_memory().expect("database");
         connection
             .pragma_update(None, "foreign_keys", "ON")
@@ -5006,12 +8450,15 @@ mod tests {
             )
             .expect("legacy nested edge");
 
-        run(&connection).expect("V40 cutover");
-        run(&connection).expect("idempotent V40 validation");
+        run(&connection).expect("V40 cleanup through current storage");
 
         assert!(
             schema_migration_applied(&connection, FLATTEN_SESSION_SPAWN_EDGES_VERSION)
                 .expect("V40 marker")
+        );
+        assert!(
+            schema_migration_applied(&connection, RECURSIVE_SESSION_SPAWN_EDGES_VERSION)
+                .expect("V47 marker")
         );
         assert_eq!(
             connection
@@ -5053,32 +8500,48 @@ mod tests {
                   created_at_ms, updated_at_ms, completed_at_ms)
                  VALUES
                  ('other-root', 'flat-project', 'other root', 'idle', 'C:/flat', 'model',
-                  'http://localhost', 2000, 2000, NULL),
+                   'http://localhost', 2000, 2000, NULL),
+                 ('other-parent', 'flat-project', 'other parent', 'idle', 'C:/flat', 'model',
+                   'http://localhost', 2001, 2001, NULL),
                  ('other-child', 'flat-project', 'other child', 'idle', 'C:/flat', 'model',
-                  'http://localhost', 2001, 2001, NULL);",
+                   'http://localhost', 2002, 2002, NULL);
+                 INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, spawn_order, created_at_ms)
+                 VALUES ('other-root', 'other-root', 'other-parent',
+                         '/root/other_parent', 'other_parent', 1, 2001);",
             )
             .expect("post-cutover sessions");
-        assert!(
+        connection
+            .execute(
+                "INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, spawn_order, created_at_ms)
+                 VALUES ('other-root', 'other-parent', 'other-child',
+                         '/root/other_parent/other_child', 'other_child', 2, 2002)",
+                [],
+            )
+            .expect("V47 must accept canonical nested lineage");
+        run(&connection).expect("idempotent current validation with nested lineage");
+        assert_eq!(
             connection
-                .execute(
-                    "INSERT INTO session_spawn_edges
-                     (root_session_id, parent_session_id, child_session_id,
-                      agent_path, task_name, created_at_ms)
-                     VALUES ('other-root', 'flat-child-000', 'other-child',
-                             '/root/child_000/other', 'other', 2001)",
+                .query_row(
+                    "SELECT COUNT(*) FROM session_spawn_edges
+                     WHERE root_session_id = 'other-root'",
                     [],
+                    |row| row.get::<_, i64>(0),
                 )
-                .is_err(),
-            "the rebuilt table must reject nested lineage"
+                .expect("recursive edge count"),
+            2
         );
         assert!(
             connection
                 .execute(
                     "INSERT INTO session_spawn_edges
                      (root_session_id, parent_session_id, child_session_id,
-                      agent_path, task_name, created_at_ms)
+                      agent_path, task_name, spawn_order, created_at_ms)
                      VALUES ('flat-root', 'flat-root', 'flat-child-255',
-                             '/root/child_255', 'child_255', 3000)",
+                             '/root/child_255', 'child_255', 256, 3000)",
                     [],
                 )
                 .is_err(),
@@ -6162,7 +9625,7 @@ mod tests {
     #[test]
     fn v45_missing_marker_reapplies_without_collapsing_auto_review() {
         let connection = Connection::open_in_memory().expect("database");
-        run(&connection).expect("fresh current schema");
+        run_through_v45(&connection);
         connection
             .execute_batch(
                 r#"INSERT INTO projects
@@ -6195,11 +9658,786 @@ mod tests {
     #[test]
     fn v45_marker_requires_the_exact_three_mode_domain() {
         let connection = Connection::open_in_memory().expect("database");
-        run(&connection).expect("fresh current schema");
+        run_through_v45(&connection);
         run_remove_auto_review_access_mode(&connection).expect("replace with stale V38 domain");
 
         let error = run(&connection).expect_err("V45 marker must validate the access mode domain");
         assert!(error.to_string().contains("V45 access mode marker"));
+    }
+
+    #[test]
+    fn v46_migrates_v1_compaction_payload_and_is_idempotent() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+        let replaced_id = crate::protocol::HistoryItemId::new().to_string();
+        insert_v46_replacement(&connection, &replaced_id, 0);
+        let legacy_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "legacy checkpoint",
+            "replacement_item_ids": [replaced_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            "legacy-compaction",
+            1,
+            &legacy_payload,
+            &sha256_text(&legacy_payload),
+        );
+
+        run(&connection).expect("V46 forward migration");
+        let (migrated_json, migrated_hash) = connection
+            .query_row(
+                "SELECT payload_json, payload_sha256
+                 FROM protocol_history_items WHERE id = 'legacy-compaction'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("migrated compaction");
+        let migrated: serde_json::Value =
+            serde_json::from_str(&migrated_json).expect("current compaction JSON");
+        assert_eq!(migrated["layout"], "legacy_prefix");
+        assert_eq!(migrated["preserved_user_messages"], serde_json::json!([]));
+        assert_eq!(migrated["summary"], "legacy checkpoint");
+        assert_eq!(
+            migrated["replacement_item_ids"],
+            serde_json::json!([replaced_id])
+        );
+        assert_eq!(migrated_hash, sha256_text(&migrated_json));
+        let decoded = serde_json::from_str::<crate::protocol::HistoryItemPayload>(&migrated_json)
+            .expect("typed current compaction");
+        assert!(matches!(
+            decoded,
+            crate::protocol::HistoryItemPayload::Compaction {
+                layout: crate::protocol::CompactionLayout::LegacyPrefix,
+                preserved_user_messages,
+                ..
+            } if preserved_user_messages.is_empty()
+        ));
+        assert!(
+            schema_migration_applied(&connection, CODEX_COMPACTION_CHECKPOINT_VERSION)
+                .expect("V46 marker")
+        );
+
+        run(&connection).expect("idempotent V46 migration");
+        let second = connection
+            .query_row(
+                "SELECT payload_json, payload_sha256
+                 FROM protocol_history_items WHERE id = 'legacy-compaction'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("idempotent compaction");
+        assert_eq!(second, (migrated_json, migrated_hash));
+    }
+
+    #[test]
+    fn v46_recovers_real_user_anchors_through_nested_legacy_compactions() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+
+        let user_id = crate::protocol::HistoryItemId::new().to_string();
+        let user_payload = serde_json::json!({
+            "kind": "user_turn",
+            "content": [{
+                "kind": "text",
+                "text": "Use task.md and create all four requested documents."
+            }],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &user_id,
+            0,
+            &user_payload,
+            &sha256_text(&user_payload),
+        );
+
+        let first_compaction_id = crate::protocol::HistoryItemId::new().to_string();
+        let first_compaction_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "The source investigation is complete.",
+            "replacement_item_ids": [user_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &first_compaction_id,
+            1,
+            &first_compaction_payload,
+            &sha256_text(&first_compaction_payload),
+        );
+
+        let second_compaction_id = crate::protocol::HistoryItemId::new().to_string();
+        let second_compaction_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "Continue from the completed investigation.",
+            "replacement_item_ids": [first_compaction_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &second_compaction_id,
+            2,
+            &second_compaction_payload,
+            &sha256_text(&second_compaction_payload),
+        );
+
+        run(&connection).expect("V46 nested legacy recovery");
+
+        let migrated_json = connection
+            .query_row(
+                "SELECT payload_json FROM protocol_history_items WHERE id = ?1",
+                [&second_compaction_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("outer migrated compaction");
+        let migrated: serde_json::Value =
+            serde_json::from_str(&migrated_json).expect("outer current compaction JSON");
+        assert_eq!(migrated["layout"], "user_anchored_checkpoint");
+        assert_eq!(
+            migrated["preserved_user_messages"],
+            serde_json::json!(["Use task.md and create all four requested documents."])
+        );
+        assert!(
+            !migrated["summary"]
+                .as_str()
+                .expect("summary")
+                .contains("four requested documents")
+        );
+        assert_eq!(
+            migrated["replacement_item_ids"],
+            serde_json::json!([first_compaction_id])
+        );
+    }
+
+    #[test]
+    fn v46_preserves_effective_replacement_order_when_late_input_precedes_a_checkpoint() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+
+        let original_user_id = crate::protocol::HistoryItemId::new().to_string();
+        let late_user_id = crate::protocol::HistoryItemId::new().to_string();
+        let first_compaction_id = crate::protocol::HistoryItemId::new().to_string();
+        let second_compaction_id = crate::protocol::HistoryItemId::new().to_string();
+        let original_user_payload = serde_json::json!({
+            "kind": "user_turn",
+            "content": [{"kind": "text", "text": "original task"}],
+        })
+        .to_string();
+        let late_user_payload = serde_json::json!({
+            "kind": "steer_turn",
+            "expected_turn_id": "01J00000000000000000000000",
+            "content": [{"kind": "text", "text": "late clarification"}],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &original_user_id,
+            0,
+            &original_user_payload,
+            &sha256_text(&original_user_payload),
+        );
+        insert_v46_compaction(
+            &connection,
+            &late_user_id,
+            1,
+            &late_user_payload,
+            &sha256_text(&late_user_payload),
+        );
+        let first_compaction_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "first summary",
+            "replacement_item_ids": [original_user_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &first_compaction_id,
+            2,
+            &first_compaction_payload,
+            &sha256_text(&first_compaction_payload),
+        );
+        let second_compaction_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "second summary",
+            "replacement_item_ids": [first_compaction_id, late_user_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &second_compaction_id,
+            3,
+            &second_compaction_payload,
+            &sha256_text(&second_compaction_payload),
+        );
+
+        run(&connection).expect("V46 late-input recovery");
+
+        let migrated_json = connection
+            .query_row(
+                "SELECT payload_json FROM protocol_history_items WHERE id = ?1",
+                [&second_compaction_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("outer migrated compaction");
+        let migrated: serde_json::Value =
+            serde_json::from_str(&migrated_json).expect("outer current JSON");
+        assert_eq!(
+            migrated["preserved_user_messages"],
+            serde_json::json!(["original task", "late clarification"])
+        );
+    }
+
+    #[test]
+    fn v46_legacy_recovery_follows_append_order_instead_of_row_id_order() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+
+        let user_id = "01J00000000000000000000000";
+        let inner_compaction_id = "01J0000000000000000000000Z";
+        let later_user_id = "01J00000000000000000000002";
+        let outer_compaction_id = "01J00000000000000000000001";
+        assert!(outer_compaction_id < inner_compaction_id);
+
+        let original_user = format!("HEAD-{}-TAIL", "x".repeat(100_000));
+        let user_payload = serde_json::json!({
+            "kind": "user_turn",
+            "content": [{"kind": "text", "text": original_user}],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            user_id,
+            0,
+            &user_payload,
+            &sha256_text(&user_payload),
+        );
+        let inner_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "inner summary",
+            "replacement_item_ids": [user_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            inner_compaction_id,
+            1,
+            &inner_payload,
+            &sha256_text(&inner_payload),
+        );
+        let later_user_payload = serde_json::json!({
+            "kind": "user_turn",
+            "content": [{"kind": "text", "text": "latest instruction"}],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            later_user_id,
+            2,
+            &later_user_payload,
+            &sha256_text(&later_user_payload),
+        );
+        let outer_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "outer summary",
+            "replacement_item_ids": [inner_compaction_id, later_user_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            outer_compaction_id,
+            3,
+            &outer_payload,
+            &sha256_text(&outer_payload),
+        );
+
+        run(&connection).expect("append-ordered V46 recovery");
+
+        let outer_json = connection
+            .query_row(
+                "SELECT payload_json FROM protocol_history_items WHERE id = ?1",
+                [outer_compaction_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("outer migrated compaction");
+        let outer: serde_json::Value =
+            serde_json::from_str(&outer_json).expect("outer current JSON");
+        let anchors = outer["preserved_user_messages"]
+            .as_array()
+            .expect("outer anchors");
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors[1], "latest instruction");
+        assert_eq!(
+            anchors[0]
+                .as_str()
+                .expect("boundary anchor")
+                .matches("compaction checkpoint truncated")
+                .count(),
+            1
+        );
+        assert!(
+            anchors[0]
+                .as_str()
+                .expect("boundary anchor")
+                .starts_with("HEAD-")
+        );
+        assert!(
+            anchors[0]
+                .as_str()
+                .expect("boundary anchor")
+                .ends_with("-TAIL")
+        );
+    }
+
+    #[test]
+    fn v46_legacy_replacement_cycle_rolls_back_without_a_marker() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+
+        let first_id = crate::protocol::HistoryItemId::new().to_string();
+        let second_id = crate::protocol::HistoryItemId::new().to_string();
+        let first_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "first legacy summary",
+            "replacement_item_ids": [second_id],
+        })
+        .to_string();
+        let second_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "second legacy summary",
+            "replacement_item_ids": [first_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &first_id,
+            0,
+            &first_payload,
+            &sha256_text(&first_payload),
+        );
+        insert_v46_compaction(
+            &connection,
+            &second_id,
+            1,
+            &second_payload,
+            &sha256_text(&second_payload),
+        );
+        let before = text_snapshot(
+            &connection,
+            "SELECT json_group_array(json_array(id, payload_json, payload_sha256))
+             FROM (SELECT id, payload_json, payload_sha256 FROM protocol_history_items ORDER BY id)",
+        );
+
+        let error = run(&connection).expect_err("cyclic V46 lineage must fail");
+
+        assert!(error.to_string().contains("replacement cycle"));
+        let after = text_snapshot(
+            &connection,
+            "SELECT json_group_array(json_array(id, payload_json, payload_sha256))
+             FROM (SELECT id, payload_json, payload_sha256 FROM protocol_history_items ORDER BY id)",
+        );
+        assert_eq!(after, before);
+        assert!(
+            !schema_migration_applied(&connection, CODEX_COMPACTION_CHECKPOINT_VERSION)
+                .expect("rolled-back V46 marker")
+        );
+    }
+
+    #[test]
+    fn v46_full_audit_rejects_a_cycle_between_current_checkpoints() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh current schema");
+        insert_v46_compaction_parent(&connection);
+
+        let first_id = crate::protocol::HistoryItemId::new().to_string();
+        let second_id = crate::protocol::HistoryItemId::new().to_string();
+        let first_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "layout": "user_anchored_checkpoint",
+            "preserved_user_messages": ["first task"],
+            "summary": "first current summary",
+            "replacement_item_ids": [second_id],
+        })
+        .to_string();
+        let second_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "layout": "user_anchored_checkpoint",
+            "preserved_user_messages": ["second task"],
+            "summary": "second current summary",
+            "replacement_item_ids": [first_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            &first_id,
+            0,
+            &first_payload,
+            &sha256_text(&first_payload),
+        );
+        insert_v46_compaction(
+            &connection,
+            &second_id,
+            1,
+            &second_payload,
+            &sha256_text(&second_payload),
+        );
+
+        let error = validate_canonical_protocol_storage(&connection)
+            .expect_err("current checkpoint cycle must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("replacement cycle or forward reference")
+        );
+    }
+
+    #[test]
+    fn v46_reapplication_preserves_user_anchored_checkpoint_payload() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+        let replacement_id = crate::protocol::HistoryItemId::new().to_string();
+        insert_v46_replacement(&connection, &replacement_id, 0);
+        let checkpoint_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "layout": "user_anchored_checkpoint",
+            "preserved_user_messages": ["follow task.md", "keep auto review"],
+            "summary": "continue implementation",
+            "replacement_item_ids": [replacement_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            "current-compaction",
+            1,
+            &checkpoint_payload,
+            &sha256_text(&checkpoint_payload),
+        );
+        run_codex_compaction_checkpoint(&connection).expect("initial V46 migration");
+        let first = connection
+            .query_row(
+                "SELECT payload_json, payload_sha256
+                 FROM protocol_history_items WHERE id = 'current-compaction'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("canonical checkpoint");
+
+        connection
+            .execute(
+                "DELETE FROM moyai_schema_migrations WHERE version = ?1",
+                [CODEX_COMPACTION_CHECKPOINT_VERSION],
+            )
+            .expect("remove V46 marker");
+        run(&connection).expect("reapply V46");
+        let second = connection
+            .query_row(
+                "SELECT payload_json, payload_sha256
+                 FROM protocol_history_items WHERE id = 'current-compaction'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("reapplied checkpoint");
+        assert_eq!(second, first);
+        let value: serde_json::Value =
+            serde_json::from_str(&second.0).expect("reapplied checkpoint JSON");
+        assert_eq!(
+            value["preserved_user_messages"],
+            serde_json::json!(["follow task.md", "keep auto review"])
+        );
+    }
+
+    #[test]
+    fn v46_mixed_payload_rolls_back_all_rewrites_and_marker() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+        let replacement_id = crate::protocol::HistoryItemId::new().to_string();
+        insert_v46_replacement(&connection, &replacement_id, 0);
+        let valid_legacy = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "first row would migrate",
+            "replacement_item_ids": [replacement_id],
+        })
+        .to_string();
+        let mixed = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "layout": "user_anchored_checkpoint",
+            "summary": "missing preserved messages",
+            "replacement_item_ids": [],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            "a-valid-compaction",
+            1,
+            &valid_legacy,
+            &sha256_text(&valid_legacy),
+        );
+        insert_v46_compaction(
+            &connection,
+            "z-mixed-compaction",
+            2,
+            &mixed,
+            &sha256_text(&mixed),
+        );
+        let before = text_snapshot(
+            &connection,
+            "SELECT json_group_array(json_array(id, payload_json, payload_sha256))
+             FROM (SELECT id, payload_json, payload_sha256 FROM protocol_history_items ORDER BY id)",
+        );
+
+        let error = run(&connection).expect_err("mixed V46 payload must fail");
+        assert!(error.to_string().contains("mixes legacy and current"));
+        let after = text_snapshot(
+            &connection,
+            "SELECT json_group_array(json_array(id, payload_json, payload_sha256))
+             FROM (SELECT id, payload_json, payload_sha256 FROM protocol_history_items ORDER BY id)",
+        );
+        assert_eq!(after, before);
+        assert!(
+            !schema_migration_applied(&connection, CODEX_COMPACTION_CHECKPOINT_VERSION)
+                .expect("rolled-back V46 marker")
+        );
+    }
+
+    #[test]
+    fn v46_rejects_stale_compaction_hash_without_rewriting_data() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+        let legacy_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "summary": "hash must be trusted",
+            "replacement_item_ids": [],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            "stale-hash-compaction",
+            1,
+            &legacy_payload,
+            "stale",
+        );
+
+        let error = run(&connection).expect_err("stale V46 hash must fail");
+        assert!(error.to_string().contains("stale payload hash"));
+        let stored = connection
+            .query_row(
+                "SELECT payload_json, payload_sha256
+                 FROM protocol_history_items WHERE id = 'stale-hash-compaction'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("unmodified stale row");
+        assert_eq!(stored, (legacy_payload, "stale".to_string()));
+        assert!(
+            !schema_migration_applied(&connection, CODEX_COMPACTION_CHECKPOINT_VERSION)
+                .expect("absent V46 marker")
+        );
+    }
+
+    #[test]
+    fn v46_marker_is_fast_path_and_full_audit_checks_payload_contract() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh current schema");
+        connection
+            .execute(
+                "DELETE FROM moyai_schema_migrations WHERE version = ?1",
+                [CODEX_COMPACTION_CHECKPOINT_VERSION],
+            )
+            .expect("remove V46 marker");
+        let marker_error =
+            run(&connection).expect_err("current V47 fast path must require the V46 marker");
+        assert!(
+            marker_error
+                .to_string()
+                .contains("V46 Codex compaction checkpoint marker")
+        );
+        connection
+            .execute_batch(V46_CODEX_COMPACTION_CHECKPOINT)
+            .expect("restore V46 marker");
+
+        insert_v46_compaction_parent(&connection);
+        let invalid_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "layout": "unknown_layout",
+            "preserved_user_messages": [],
+            "summary": "invalid current checkpoint",
+            "replacement_item_ids": [],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            "invalid-current-compaction",
+            1,
+            &invalid_payload,
+            &sha256_text(&invalid_payload),
+        );
+
+        run(&connection).expect("current fast path must remain marker and schema only");
+        let audit_error = validate_canonical_protocol_storage(&connection)
+            .expect_err("full audit must inspect V46 payloads");
+        assert!(
+            audit_error
+                .to_string()
+                .contains("violates the current payload contract")
+        );
+    }
+
+    #[test]
+    fn v46_marker_requires_the_exact_migration_name() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh current schema");
+        connection
+            .execute(
+                "UPDATE moyai_schema_migrations SET name = 'wrong_v46_name' WHERE version = ?1",
+                [CODEX_COMPACTION_CHECKPOINT_VERSION],
+            )
+            .expect("corrupt V46 marker name");
+
+        let error = run(&connection).expect_err("V46 marker name must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("name other than `codex_compaction_checkpoint`")
+        );
+    }
+
+    #[test]
+    fn v46_rewrite_pages_only_compaction_rows() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_through_v45(&connection);
+        insert_v46_compaction_parent(&connection);
+
+        let large_non_compaction = serde_json::json!({
+            "kind": "error",
+            "message": "x".repeat(1_000_000),
+        })
+        .to_string();
+        insert_v46_compaction(
+            &connection,
+            "000-large-non-compaction",
+            0,
+            &large_non_compaction,
+            &sha256_text(&large_non_compaction),
+        );
+        for index in 0..=COMPACTION_CHECKPOINT_MIGRATION_PAGE_SIZE {
+            let payload = serde_json::json!({
+                "kind": "compaction",
+                "mode": "automatic",
+                "summary": format!("legacy checkpoint {index}"),
+                "replacement_item_ids": [],
+            })
+            .to_string();
+            insert_v46_compaction(
+                &connection,
+                &format!("compaction-{index:03}"),
+                i64::try_from(index + 1).expect("fixture sequence"),
+                &payload,
+                &sha256_text(&payload),
+            );
+        }
+
+        let stats = canonicalize_compaction_checkpoint_history(&connection)
+            .expect("bounded V46 canonicalization");
+
+        assert_eq!(stats.pages, 2);
+        assert_eq!(stats.rows, COMPACTION_CHECKPOINT_MIGRATION_PAGE_SIZE + 1);
+        assert_eq!(
+            stats.max_page_rows,
+            COMPACTION_CHECKPOINT_MIGRATION_PAGE_SIZE
+        );
+        let stored_non_compaction = connection
+            .query_row(
+                "SELECT payload_json FROM protocol_history_items
+                 WHERE id = '000-large-non-compaction'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("non-compaction payload");
+        assert_eq!(stored_non_compaction, large_non_compaction);
+    }
+
+    #[test]
+    fn v46_full_audit_rejects_invalid_lineage_and_oversized_anchors() {
+        let missing_replacement = Connection::open_in_memory().expect("database");
+        run(&missing_replacement).expect("fresh current schema");
+        insert_v46_compaction_parent(&missing_replacement);
+        let missing_replacement_id = crate::protocol::HistoryItemId::new().to_string();
+        let missing_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "layout": "user_anchored_checkpoint",
+            "preserved_user_messages": ["retain the user task"],
+            "summary": "continue from the checkpoint",
+            "replacement_item_ids": [missing_replacement_id],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &missing_replacement,
+            "missing-lineage-compaction",
+            1,
+            &missing_payload,
+            &sha256_text(&missing_payload),
+        );
+        let lineage_error = validate_canonical_protocol_storage(&missing_replacement)
+            .expect_err("full audit must reject missing replacement lineage");
+        assert!(
+            lineage_error
+                .to_string()
+                .contains("missing or cross-session replacement item")
+        );
+
+        let oversized_anchor = Connection::open_in_memory().expect("database");
+        run(&oversized_anchor).expect("fresh current schema");
+        insert_v46_compaction_parent(&oversized_anchor);
+        let oversized_payload = serde_json::json!({
+            "kind": "compaction",
+            "mode": "automatic",
+            "layout": "user_anchored_checkpoint",
+            "preserved_user_messages": ["x".repeat(80_004)],
+            "summary": "continue from the checkpoint",
+            "replacement_item_ids": [],
+        })
+        .to_string();
+        insert_v46_compaction(
+            &oversized_anchor,
+            "oversized-anchor-compaction",
+            1,
+            &oversized_payload,
+            &sha256_text(&oversized_payload),
+        );
+        let anchor_error = validate_canonical_protocol_storage(&oversized_anchor)
+            .expect_err("full audit must enforce the user-anchor budget");
+        assert!(
+            anchor_error
+                .to_string()
+                .contains("exceeding the 20000-token checkpoint bound")
+        );
     }
 
     #[test]
@@ -6667,11 +10905,21 @@ mod tests {
     }
 
     #[test]
-    fn run_creates_session_spawn_edges_on_a_fresh_database_and_is_idempotent() {
+    fn v47_fresh_schema_accepts_recursive_lineage_and_rejects_invalid_parentage() {
         let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
 
         run(&connection).expect("fresh migration");
-        run(&connection).expect("idempotent migration");
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                RECURSIVE_SESSION_SPAWN_EDGES_VERSION,
+                RECURSIVE_SESSION_SPAWN_EDGES_NAME,
+            )
+            .expect("V47 marker")
+        );
 
         let mut statement = connection
             .prepare("PRAGMA table_info(session_spawn_edges)")
@@ -6689,8 +10937,1366 @@ mod tests {
                 "child_session_id",
                 "agent_path",
                 "task_name",
+                "spawn_order",
                 "created_at_ms",
             ]
+        );
+        let mut statement = connection
+            .prepare("PRAGMA table_info(agent_completion_handoffs)")
+            .expect("completion handoff columns");
+        let handoff_columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("handoff column rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("handoff columns");
+        assert_eq!(
+            handoff_columns,
+            vec![
+                "child_session_id",
+                "child_turn_id",
+                "child_terminal_event_id",
+                "parent_session_id",
+                "parent_history_item_id",
+                "created_at_ms",
+            ]
+        );
+
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('recursive-project', 'C:/recursive', 'recursive', 'none', 1, 1);
+                 INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms)
+                 VALUES
+                 ('recursive-root', 'recursive-project', 'root', 'idle', 'C:/recursive',
+                  'model', 'http://localhost', 1, 1, NULL),
+                 ('recursive-parent', 'recursive-project', 'parent', 'idle', 'C:/recursive',
+                  'model', 'http://localhost', 2, 2, NULL),
+                 ('recursive-grandchild', 'recursive-project', 'grandchild', 'idle', 'C:/recursive',
+                  'model', 'http://localhost', 3, 3, NULL),
+                 ('wrong-path-child', 'recursive-project', 'wrong path', 'idle', 'C:/recursive',
+                  'model', 'http://localhost', 4, 4, NULL),
+                 ('unattached-parent', 'recursive-project', 'unattached parent', 'idle', 'C:/recursive',
+                  'model', 'http://localhost', 5, 5, NULL),
+                 ('unattached-child', 'recursive-project', 'unattached child', 'idle', 'C:/recursive',
+                  'model', 'http://localhost', 6, 6, NULL),
+                 ('other-root', 'recursive-project', 'other root', 'idle', 'C:/recursive',
+                  'model', 'http://localhost', 7, 7, NULL),
+                 ('other-parent', 'recursive-project', 'other parent', 'idle', 'C:/recursive',
+                  'model', 'http://localhost', 8, 8, NULL),
+                 ('cross-tree-child', 'recursive-project', 'cross tree child', 'idle', 'C:/recursive',
+                  'model', 'http://localhost', 9, 9, NULL);
+                 INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, spawn_order, created_at_ms)
+                 VALUES
+                 ('recursive-root', 'recursive-root', 'recursive-parent',
+                  '/root/parent', 'parent', 1, 2),
+                 ('recursive-root', 'recursive-parent', 'recursive-grandchild',
+                  '/root/parent/grandchild', 'grandchild', 2, 3),
+                 ('other-root', 'other-root', 'other-parent',
+                  '/root/other_parent', 'other_parent', 1, 8);",
+            )
+            .expect("valid recursive trees");
+
+        for (sql, label) in [
+            (
+                "INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, spawn_order, created_at_ms)
+                 VALUES ('recursive-root', 'recursive-parent', 'wrong-path-child',
+                         '/root/wrong_path', 'wrong_path', 3, 10)",
+                "wrong canonical parent path",
+            ),
+            (
+                "INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, spawn_order, created_at_ms)
+                 VALUES ('recursive-root', 'unattached-parent', 'unattached-child',
+                         '/root/unattached_parent/unattached_child', 'unattached_child', 3, 11)",
+                "unattached parent",
+            ),
+            (
+                "INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, spawn_order, created_at_ms)
+                 VALUES ('recursive-root', 'other-parent', 'cross-tree-child',
+                         '/root/other_parent/cross_tree_child', 'cross_tree_child', 3, 12)",
+                "cross-tree parent",
+            ),
+        ] {
+            assert!(
+                connection.execute(sql, []).is_err(),
+                "V47 must reject {label}"
+            );
+        }
+
+        run(&connection).expect("idempotent migration with recursive lineage");
+        validate_recursive_session_spawn_edge_data(&connection)
+            .expect("recursive lineage data contract");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_spawn_edges
+                     WHERE root_session_id = 'recursive-root'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("recursive edge count"),
+            2
+        );
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v47_marker_rejects_a_stale_recursive_lookup_index() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh migration");
+        connection
+            .execute_batch("DROP INDEX idx_session_spawn_edges_parent_created")
+            .expect("corrupt V47 index");
+
+        let error = run(&connection).expect_err("V47 marker must validate its lookup indexes");
+
+        assert!(
+            error
+                .to_string()
+                .contains("idx_session_spawn_edges_parent_created")
+        );
+    }
+
+    #[test]
+    fn v47_marker_rejects_partial_unique_indexes_that_never_enforce_ownership() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh migration");
+        let canonical_table_sql = connection
+            .query_row(
+                "SELECT sql
+                 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'session_spawn_edges'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("canonical table SQL");
+        let stale_table_sql = canonical_table_sql
+            .replace("UNIQUE(root_session_id, agent_path),", "")
+            .replace("UNIQUE(root_session_id, spawn_order),", "");
+        assert_ne!(
+            stale_table_sql, canonical_table_sql,
+            "the fixture must remove both inline unique owners"
+        );
+        let owned_object_sql = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT sql
+                     FROM sqlite_master
+                     WHERE tbl_name = 'session_spawn_edges'
+                       AND type IN ('index', 'trigger')
+                       AND sql IS NOT NULL
+                     ORDER BY type ASC, name ASC",
+                )
+                .expect("owned schema objects");
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("owned schema rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("owned schema SQL")
+        };
+
+        connection
+            .execute_batch("DROP TABLE session_spawn_edges")
+            .expect("drop canonical table");
+        connection
+            .execute_batch(&stale_table_sql)
+            .expect("recreate stale table");
+        for sql in owned_object_sql {
+            connection
+                .execute_batch(&sql)
+                .expect("restore canonical explicit schema object");
+        }
+        connection
+            .execute_batch(
+                "CREATE UNIQUE INDEX stale_session_spawn_edges_root_path
+                     ON session_spawn_edges(root_session_id, agent_path)
+                     WHERE 0;
+                 CREATE UNIQUE INDEX stale_session_spawn_edges_root_order
+                     ON session_spawn_edges(root_session_id, spawn_order)
+                     WHERE 0;",
+            )
+            .expect("non-enforcing unique indexes");
+
+        let error = run(&connection)
+            .expect_err("V47 marker must reject partial indexes as unique ownership");
+
+        assert!(error.to_string().contains("session_spawn_edges"));
+        assert!(error.to_string().contains("stale SQL"));
+    }
+
+    #[test]
+    fn v47_marker_rejects_a_trigger_disabled_by_an_always_false_when_clause() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh migration");
+        connection
+            .execute_batch(
+                "DROP TRIGGER limit_session_spawn_edges_per_root;
+                 CREATE TRIGGER limit_session_spawn_edges_per_root
+                 BEFORE INSERT ON session_spawn_edges
+                 WHEN 0 AND (
+                     SELECT COUNT(*)
+                     FROM session_spawn_edges
+                     WHERE root_session_id = NEW.root_session_id
+                 ) >= 255
+                 BEGIN
+                     SELECT RAISE(
+                         ABORT,
+                         'agent tree reached its retained-descendant capacity of 255'
+                     );
+                 END;",
+            )
+            .expect("disable capacity trigger while retaining its marker fragments");
+
+        let error =
+            run(&connection).expect_err("V47 marker must reject an always-disabled trigger");
+
+        assert!(
+            error
+                .to_string()
+                .contains("limit_session_spawn_edges_per_root")
+        );
+        assert!(error.to_string().contains("stale SQL"));
+    }
+
+    #[test]
+    fn v47_marker_rejects_a_disabled_completion_handoff_integrity_trigger() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh migration");
+        connection
+            .execute_batch(
+                "DROP TRIGGER validate_agent_completion_handoff_before_insert;
+                 CREATE TRIGGER validate_agent_completion_handoff_before_insert
+                 BEFORE INSERT ON agent_completion_handoffs
+                 WHEN 0
+                 BEGIN
+                     SELECT RAISE(ABORT, 'disabled handoff validation');
+                 END;",
+            )
+            .expect("disable completion handoff trigger");
+
+        let error = run(&connection)
+            .expect_err("V47 marker must reject a disabled handoff integrity trigger");
+        assert!(
+            error
+                .to_string()
+                .contains("validate_agent_completion_handoff_before_insert")
+        );
+        assert!(error.to_string().contains("stale SQL"));
+    }
+
+    #[test]
+    fn v47_upgrades_v46_direct_edges_and_is_idempotent() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_v46(&connection);
+        assert!(
+            schema_migration_applied(&connection, CODEX_COMPACTION_CHECKPOINT_VERSION)
+                .expect("V46 marker")
+        );
+        assert!(
+            !schema_migration_applied(&connection, RECURSIVE_SESSION_SPAWN_EDGES_VERSION)
+                .expect("no V47 marker")
+        );
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('upgrade-project', 'C:/upgrade', 'upgrade', 'none', 1, 1);
+                 INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms)
+                 VALUES
+                 ('upgrade-root', 'upgrade-project', 'root', 'idle', 'C:/upgrade',
+                  'model', 'http://localhost', 1, 1, NULL),
+                 ('upgrade-parent', 'upgrade-project', 'parent', 'idle', 'C:/upgrade',
+                  'model', 'http://localhost', 2, 2, NULL),
+                 ('upgrade-grandchild', 'upgrade-project', 'grandchild', 'idle', 'C:/upgrade',
+                  'model', 'http://localhost', 3, 3, NULL);
+                 INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, created_at_ms)
+                 VALUES ('upgrade-root', 'upgrade-root', 'upgrade-parent',
+                         '/root/parent', 'parent', 2);",
+            )
+            .expect("V46 direct-edge fixture");
+        let direct_edge_before = text_snapshot(
+            &connection,
+            "SELECT json_group_array(json_array(root_session_id, parent_session_id,
+                                                child_session_id, agent_path, task_name,
+                                                created_at_ms))
+             FROM session_spawn_edges",
+        );
+
+        run(&connection).expect("V46 to V47 upgrade");
+
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                RECURSIVE_SESSION_SPAWN_EDGES_VERSION,
+                RECURSIVE_SESSION_SPAWN_EDGES_NAME,
+            )
+            .expect("V47 marker")
+        );
+        assert_eq!(
+            text_snapshot(
+                &connection,
+                "SELECT json_group_array(json_array(root_session_id, parent_session_id,
+                                                    child_session_id, agent_path, task_name,
+                                                    created_at_ms))
+                 FROM session_spawn_edges",
+            ),
+            direct_edge_before
+        );
+        connection
+            .execute(
+                "INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, spawn_order, created_at_ms)
+                 VALUES ('upgrade-root', 'upgrade-parent', 'upgrade-grandchild',
+                         '/root/parent/grandchild', 'grandchild', 2, 3)",
+                [],
+            )
+            .expect("nested descendant after V47");
+
+        run(&connection).expect("idempotent V47 validation");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_spawn_edges
+                     WHERE root_session_id = 'upgrade-root'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("upgraded edge count"),
+            2
+        );
+        validate_recursive_session_spawn_edge_data(&connection)
+            .expect("upgraded recursive data contract");
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v49_upgrades_v47_schema_and_is_idempotent() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_v46(&connection);
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .expect("disable foreign keys for V47 endpoint");
+        connection
+            .execute_batch(V47_RECURSIVE_SESSION_SPAWN_EDGES)
+            .expect("create exact V47 endpoint");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("restore foreign keys");
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                RECURSIVE_SESSION_SPAWN_EDGES_VERSION,
+                RECURSIVE_SESSION_SPAWN_EDGES_NAME,
+            )
+            .expect("V47 marker")
+        );
+        assert!(
+            !schema_migration_applied(&connection, AGENT_OWNER_RESUME_REQUESTS_VERSION)
+                .expect("V48 absent")
+        );
+        assert!(
+            !schema_migration_applied(&connection, AGENT_TREE_STOP_FENCES_VERSION)
+                .expect("V49 absent")
+        );
+
+        run(&connection).expect("V47 to V49 upgrade");
+        run(&connection).expect("idempotent V49 validation");
+
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                AGENT_OWNER_RESUME_REQUESTS_VERSION,
+                AGENT_OWNER_RESUME_REQUESTS_NAME,
+            )
+            .expect("V48 marker")
+        );
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                AGENT_TREE_STOP_FENCES_VERSION,
+                AGENT_TREE_STOP_FENCES_NAME,
+            )
+            .expect("V49 marker")
+        );
+        validate_agent_owner_resume_request_schema(&connection).expect("V49 exact schema");
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v49_upgrades_exact_v48_endpoint_and_is_idempotent() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_v46(&connection);
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .expect("disable foreign keys for V48 endpoint");
+        connection
+            .execute_batch(V47_RECURSIVE_SESSION_SPAWN_EDGES)
+            .expect("create exact V47 endpoint");
+        connection
+            .execute_batch(V48_AGENT_OWNER_RESUME_REQUESTS)
+            .expect("create exact V48 endpoint");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("restore foreign keys");
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                AGENT_OWNER_RESUME_REQUESTS_VERSION,
+                AGENT_OWNER_RESUME_REQUESTS_NAME,
+            )
+            .expect("V48 marker")
+        );
+        assert!(
+            !schema_migration_applied(&connection, AGENT_TREE_STOP_FENCES_VERSION)
+                .expect("V49 absent")
+        );
+
+        run(&connection).expect("V48 to V49 upgrade");
+        run(&connection).expect("idempotent V49 validation");
+
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                AGENT_TREE_STOP_FENCES_VERSION,
+                AGENT_TREE_STOP_FENCES_NAME,
+            )
+            .expect("V49 marker")
+        );
+        validate_agent_owner_resume_request_schema(&connection).expect("V49 exact schema");
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v49_backfills_tree_close_fences_and_cancels_v48_late_result_resume_seed() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_v46(&connection);
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .expect("disable foreign keys for exact V47 endpoint");
+        connection
+            .execute_batch(V47_RECURSIVE_SESSION_SPAWN_EDGES)
+            .expect("create exact V47 endpoint");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("restore foreign keys");
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('backfill-project', 'C:/backfill', 'backfill',
+                         'none', 1, 1);
+                 INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms)
+                 VALUES
+                 ('backfill-root', 'backfill-project', 'root', 'cancelled',
+                  'C:/backfill', 'model', 'http://localhost', 1, 4, 4),
+                 ('backfill-owner', 'backfill-project', 'owner', 'completed',
+                  'C:/backfill', 'model', 'http://localhost', 2, 5, 5),
+                 ('backfill-child', 'backfill-project', 'child', 'completed',
+                  'C:/backfill', 'model', 'http://localhost', 3, 6, 6),
+                 ('backfill-failed-root', 'backfill-project', 'failed root',
+                  'failed', 'C:/backfill', 'model', 'http://localhost',
+                  7, 8, 8);
+                 INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, spawn_order, created_at_ms)
+                 VALUES
+                 ('backfill-root', 'backfill-root', 'backfill-owner',
+                  '/root/owner', 'owner', 1, 2),
+                 ('backfill-root', 'backfill-owner', 'backfill-child',
+                  '/root/owner/child', 'child', 2, 3);",
+            )
+            .expect("exact V47 tree fixture");
+
+        let warning_payload = r#"{"kind":"warning","message":"thread started: migration fixture"}"#;
+        let user_stop_payload = r#"{"kind":"turn_terminal","terminal":{"outcome":{"kind":"interrupted","cause":"user_stop"}}}"#;
+        let completed_payload =
+            r#"{"kind":"turn_terminal","terminal":{"outcome":{"kind":"completed"}}}"#;
+        let failed_payload = r#"{"kind":"turn_terminal","terminal":{"outcome":{"kind":"failed"}}}"#;
+        let tree_stopped_payload = r#"{"kind":"turn_terminal","terminal":{"outcome":{"kind":"interrupted","cause":"tree_stopped"}}}"#;
+        for (event_id, session_id, turn_id, sequence_no, payload, created_at_ms) in [
+            (
+                "backfill-child-start",
+                "backfill-child",
+                "backfill-child-turn",
+                0_i64,
+                warning_payload,
+                3_i64,
+            ),
+            (
+                "backfill-owner-start",
+                "backfill-owner",
+                "backfill-owner-turn",
+                0,
+                warning_payload,
+                3,
+            ),
+            (
+                "backfill-owner-terminal",
+                "backfill-owner",
+                "backfill-owner-turn",
+                1,
+                completed_payload,
+                3,
+            ),
+            (
+                "backfill-root-stop",
+                "backfill-root",
+                "backfill-root-turn",
+                0,
+                user_stop_payload,
+                4,
+            ),
+            (
+                "backfill-child-terminal",
+                "backfill-child",
+                "backfill-child-turn",
+                1,
+                completed_payload,
+                6,
+            ),
+            (
+                "backfill-failed-start",
+                "backfill-failed-root",
+                "backfill-failed-turn",
+                0,
+                warning_payload,
+                7,
+            ),
+            (
+                "backfill-failed-terminal",
+                "backfill-failed-root",
+                "backfill-failed-turn",
+                1,
+                failed_payload,
+                8,
+            ),
+            (
+                "backfill-followup-start",
+                "backfill-child",
+                "backfill-followup-turn",
+                0,
+                warning_payload,
+                9,
+            ),
+            (
+                "backfill-followup-stop",
+                "backfill-child",
+                "backfill-followup-turn",
+                1,
+                tree_stopped_payload,
+                10,
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO protocol_runtime_events
+                     (id, session_id, turn_id, sequence_no, msg_json,
+                      payload_sha256, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        event_id,
+                        session_id,
+                        turn_id,
+                        sequence_no,
+                        payload,
+                        sha256_text(payload),
+                        created_at_ms
+                    ],
+                )
+                .expect("backfill runtime event");
+            connection
+                .execute(
+                    "INSERT INTO protocol_item_append_order
+                     (session_id, scope_kind, turn_id, sequence_no,
+                      source_kind, source_id, created_at_ms)
+                     VALUES (?1, 'turn', ?2, ?3, 'runtime_event', ?4, ?5)",
+                    params![session_id, turn_id, sequence_no, event_id, created_at_ms],
+                )
+                .expect("backfill runtime append order");
+        }
+
+        let final_payload = serde_json::json!({
+            "kind": "inter_agent_communication",
+            "communication": {
+                "author": "/root/owner/child",
+                "recipient": "/root/owner",
+                "content": "Message Type: FINAL_ANSWER\nTask name: /root/owner\nSender: /root/owner/child\nPayload:\nlate result",
+                "trigger_turn": false
+            }
+        })
+        .to_string();
+        connection
+            .execute(
+                "INSERT INTO protocol_history_items
+                 (id, session_id, scope_kind, turn_id, sequence_no,
+                  payload_json, payload_sha256, created_at_ms)
+                 VALUES ('backfill-final', 'backfill-owner', 'session', NULL, 0,
+                         ?1, ?2, 6)",
+                params![final_payload, sha256_text(&final_payload)],
+            )
+            .expect("late child FINAL");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, scope_kind, turn_id, sequence_no,
+                  source_kind, source_id, created_at_ms)
+                 VALUES ('backfill-owner', 'session', NULL, 0,
+                         'history_item', 'backfill-final', 6)",
+                [],
+            )
+            .expect("late child FINAL append order");
+        connection
+            .execute(
+                "INSERT INTO agent_completion_handoffs
+                 (child_session_id, child_turn_id, child_terminal_event_id,
+                  parent_session_id, parent_history_item_id, created_at_ms)
+                 VALUES ('backfill-child', 'backfill-child-turn',
+                         'backfill-child-terminal', 'backfill-owner',
+                         'backfill-final', 6)",
+                [],
+            )
+            .expect("late child handoff");
+
+        connection
+            .execute_batch(V48_AGENT_OWNER_RESUME_REQUESTS)
+            .expect("exact V48 endpoint with seeded late result");
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO agent_deferred_completions
+                 (agent_session_id, agent_turn_id, terminal_event_id,
+                  parent_session_id, kind, state,
+                  resolved_by_terminal_event_id, created_at_ms, updated_at_ms,
+                  resolved_at_ms)
+                 VALUES ('backfill-owner', 'backfill-owner-turn',
+                         'backfill-owner-terminal', 'backfill-root',
+                         'completed_early', 'pending', NULL, 3, 3, NULL)",
+                [],
+            )
+            .expect("legacy V48 pending deferred receipt");
+
+        run(&connection).expect("V48 through V49 backfill");
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT cause
+                     FROM agent_tree_stop_fences
+                     WHERE stopped_session_id = 'backfill-root'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("backfilled root Stop fence"),
+            "user_stop"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT cause
+                     FROM agent_tree_stop_fences
+                     WHERE stopped_session_id = 'backfill-failed-root'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("backfilled root Failed fence"),
+            "root_failed"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM agent_tree_stop_fences
+                     WHERE stopped_session_id = 'backfill-child'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("post-fence follow-up child fence count"),
+            0,
+            "a later TreeStopped terminal must not invent a new child generation"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state
+                     FROM agent_owner_resume_requests
+                     WHERE owner_session_id = 'backfill-owner'
+                       AND source_history_item_id = 'backfill-final'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("V48 seed resolved by V49"),
+            "cancelled"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state || ':' || resolved_by_terminal_event_id
+                     FROM agent_deferred_completions
+                     WHERE agent_session_id = 'backfill-owner'
+                       AND agent_turn_id = 'backfill-owner-turn'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("V49 physical deferred sweep"),
+            "discarded:backfill-owner-terminal"
+        );
+        validate_agent_owner_resume_request_data(&connection).expect("backfilled V49 durable data");
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v49_tree_stop_fence_rejects_invalid_subtree_and_full_audit_detects_tampering() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run(&connection).expect("fresh current schema");
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('fence-project', 'C:/fence', 'fence', 'none', 1, 1);
+                 INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms)
+                 VALUES
+                 ('fence-root', 'fence-project', 'root', 'idle', 'C:/fence',
+                  'model', 'http://localhost', 1, 1),
+                 ('fence-orphan', 'fence-project', 'orphan', 'idle', 'C:/fence',
+                  'model', 'http://localhost', 2, 2);",
+            )
+            .expect("fence identity fixtures");
+
+        let direct_error = connection
+            .execute(
+                "INSERT INTO agent_tree_stop_fences
+                 (root_session_id, stopped_session_id, after_append_position,
+                  cause, created_at_ms)
+                 VALUES ('fence-root', 'fence-orphan', 0, 'user_stop', 3)",
+                [],
+            )
+            .expect_err("unowned stopped session must be rejected");
+        assert!(
+            direct_error
+                .to_string()
+                .contains("stopped session must belong to the canonical tree"),
+            "unexpected insert error: {direct_error}"
+        );
+
+        let validation_trigger_sql = connection
+            .query_row(
+                "SELECT sql
+                 FROM sqlite_master
+                 WHERE type = 'trigger'
+                   AND name =
+                       'validate_agent_tree_stop_fence_subtree_before_insert'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("canonical fence validation trigger");
+        connection
+            .execute_batch("DROP TRIGGER validate_agent_tree_stop_fence_subtree_before_insert")
+            .expect("temporarily bypass fence validation");
+        connection
+            .execute(
+                "INSERT INTO agent_tree_stop_fences
+                 (root_session_id, stopped_session_id, after_append_position,
+                  cause, created_at_ms)
+                 VALUES ('fence-root', 'fence-orphan', 0, 'user_stop', 3)",
+                [],
+            )
+            .expect("tampered fence row");
+        connection
+            .execute_batch(&validation_trigger_sql)
+            .expect("restore canonical validation trigger");
+        validate_agent_owner_resume_request_schema(&connection)
+            .expect("tamper fixture retains exact V49 schema");
+
+        let error = validate_canonical_protocol_storage(&connection)
+            .expect_err("full storage audit must reject tampered fence identity");
+        assert!(
+            error.to_string().contains("tree-stop fence row"),
+            "unexpected full-audit error: {error}"
+        );
+    }
+
+    #[test]
+    fn v49_marker_rejects_a_missing_effective_deferred_completion_view() {
+        let connection = Connection::open_in_memory().expect("database");
+        run(&connection).expect("fresh current schema");
+        connection
+            .execute_batch("DROP VIEW effective_agent_deferred_completions")
+            .expect("remove effective deferred-completion view");
+
+        let error = run(&connection).expect_err("V49 marker must own the exact effective view");
+        assert!(
+            error
+                .to_string()
+                .contains("effective_agent_deferred_completions"),
+            "unexpected schema error: {error}"
+        );
+    }
+
+    #[test]
+    fn v49_tree_stop_fences_cascade_with_stopped_session_deletion() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run(&connection).expect("fresh current schema");
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('delete-fence-project', 'C:/delete-fence',
+                         'delete fence', 'none', 1, 1);
+                 INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms)
+                 VALUES
+                 ('delete-fence-root', 'delete-fence-project', 'root', 'idle',
+                  'C:/delete-fence', 'model', 'http://localhost', 1, 1),
+                 ('delete-fence-child', 'delete-fence-project', 'child', 'idle',
+                  'C:/delete-fence', 'model', 'http://localhost', 2, 2),
+                 ('delete-fence-solo', 'delete-fence-project', 'solo', 'idle',
+                  'C:/delete-fence', 'model', 'http://localhost', 3, 3);
+                 INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, spawn_order, created_at_ms)
+                 VALUES ('delete-fence-root', 'delete-fence-root',
+                         'delete-fence-child', '/root/child', 'child', 1, 2);
+                 INSERT INTO agent_tree_stop_fences
+                 (root_session_id, stopped_session_id, after_append_position,
+                  cause, created_at_ms)
+                 VALUES
+                 ('delete-fence-root', 'delete-fence-child', 0, 'user_stop', 4),
+                 ('delete-fence-solo', 'delete-fence-solo', 0, 'root_failed', 5);",
+            )
+            .expect("deletable fence fixtures");
+
+        connection
+            .execute(
+                "DELETE FROM sessions
+                 WHERE id IN ('delete-fence-child', 'delete-fence-solo')",
+                [],
+            )
+            .expect("delete stopped subtree and standalone stopped root");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM agent_tree_stop_fences", [], |row| row
+                    .get::<_, i64>(0),)
+                .expect("remaining fence count"),
+            0
+        );
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v49_fence_boundary_survives_append_rollback_watermark_and_reopen() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let database_path = temp.path().join("fence-watermark.sqlite");
+        {
+            let connection = Connection::open(&database_path).expect("database");
+            connection
+                .pragma_update(None, "foreign_keys", "ON")
+                .expect("foreign keys");
+            run(&connection).expect("fresh current schema");
+            connection
+                .execute_batch(
+                    "INSERT INTO projects
+                     (id, root_path, display_name, vcs_kind,
+                      created_at_ms, updated_at_ms)
+                     VALUES ('watermark-project', 'C:/watermark',
+                             'watermark', 'none', 1, 1);
+                     INSERT INTO sessions
+                     (id, project_id, title, status, cwd_path, model_name,
+                      base_url, created_at_ms, updated_at_ms)
+                     VALUES ('watermark-root', 'watermark-project', 'root',
+                             'idle', 'C:/watermark', 'model',
+                             'http://localhost', 1, 1);
+                     INSERT INTO protocol_item_append_order
+                     (session_id, scope_kind, turn_id, sequence_no,
+                      source_kind, source_id, created_at_ms)
+                     VALUES ('watermark-root', 'turn', 'rolled-back-turn', 0,
+                             'runtime_event', 'rolled-back-source', 2);
+                     DELETE FROM protocol_item_append_order
+                     WHERE source_id = 'rolled-back-source';
+                     INSERT INTO agent_tree_stop_fences
+                     (root_session_id, stopped_session_id,
+                      after_append_position, cause, created_at_ms)
+                     VALUES ('watermark-root', 'watermark-root', 1,
+                             'user_stop', 3);",
+                )
+                .expect("fence at retained AUTOINCREMENT watermark");
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM protocol_item_append_order",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("live append count"),
+                0
+            );
+            validate_canonical_protocol_storage(&connection).expect("watermark-backed fence audit");
+        }
+
+        let reopened = Connection::open(&database_path).expect("reopened database");
+        reopened
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("reopened foreign keys");
+        run(&reopened).expect("reopened current migration");
+        validate_canonical_protocol_storage(&reopened)
+            .expect("reopened watermark-backed fence audit");
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT after_append_position
+                     FROM agent_tree_stop_fences
+                     WHERE stopped_session_id = 'watermark-root'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("reopened fence"),
+            1
+        );
+    }
+
+    #[test]
+    fn v49_fence_physically_discards_pre_fence_receipt_and_allows_post_fence_pending() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run(&connection).expect("fresh current schema");
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('discard-project', 'C:/discard', 'discard',
+                         'none', 1, 1);
+                 INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms)
+                 VALUES
+                 ('discard-root', 'discard-project', 'root', 'idle',
+                  'C:/discard', 'model', 'http://localhost', 1, 1, NULL),
+                 ('discard-owner', 'discard-project', 'owner', 'completed',
+                  'C:/discard', 'model', 'http://localhost', 2, 2, 2),
+                 ('discard-child', 'discard-project', 'child', 'completed',
+                  'C:/discard', 'model', 'http://localhost', 3, 3, 3);
+                 INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, spawn_order, created_at_ms)
+                 VALUES
+                 ('discard-root', 'discard-root', 'discard-owner',
+                  '/root/owner', 'owner', 1, 2),
+                 ('discard-root', 'discard-owner', 'discard-child',
+                  '/root/owner/child', 'child', 2, 3);",
+            )
+            .expect("discard tree fixture");
+
+        let warning_payload = r#"{"kind":"warning","message":"thread started: discard fixture"}"#;
+        let completed_payload =
+            r#"{"kind":"turn_terminal","terminal":{"outcome":{"kind":"completed"}}}"#;
+        for (event_id, session_id, turn_id, sequence_no, payload, created_at_ms) in [
+            (
+                "discard-owner-start",
+                "discard-owner",
+                "discard-owner-turn",
+                0_i64,
+                warning_payload,
+                2_i64,
+            ),
+            (
+                "discard-owner-terminal",
+                "discard-owner",
+                "discard-owner-turn",
+                1,
+                completed_payload,
+                3,
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO protocol_runtime_events
+                     (id, session_id, turn_id, sequence_no, msg_json,
+                      payload_sha256, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        event_id,
+                        session_id,
+                        turn_id,
+                        sequence_no,
+                        payload,
+                        sha256_text(payload),
+                        created_at_ms
+                    ],
+                )
+                .expect("owner runtime event");
+            connection
+                .execute(
+                    "INSERT INTO protocol_item_append_order
+                     (session_id, scope_kind, turn_id, sequence_no,
+                      source_kind, source_id, created_at_ms)
+                     VALUES (?1, 'turn', ?2, ?3, 'runtime_event', ?4, ?5)",
+                    params![session_id, turn_id, sequence_no, event_id, created_at_ms],
+                )
+                .expect("owner append order");
+        }
+        connection
+            .execute(
+                "INSERT INTO agent_deferred_completions
+                 (agent_session_id, agent_turn_id, terminal_event_id,
+                  parent_session_id, kind, state,
+                  resolved_by_terminal_event_id, created_at_ms, updated_at_ms,
+                  resolved_at_ms)
+                 VALUES ('discard-owner', 'discard-owner-turn',
+                         'discard-owner-terminal', 'discard-root',
+                         'completed_early', 'pending', NULL, 3, 3, NULL)",
+                [],
+            )
+            .expect("pre-fence deferred owner");
+        connection
+            .execute(
+                "INSERT INTO agent_tree_stop_fences
+                 (root_session_id, stopped_session_id, after_append_position,
+                  cause, created_at_ms)
+                 VALUES ('discard-root', 'discard-child', 2, 'user_stop', 4)",
+                [],
+            )
+            .expect("descendant stop fence");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM effective_agent_deferred_completions
+                     WHERE agent_session_id = 'discard-owner'
+                       AND state = 'pending'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("effective pending count after descendant fence"),
+            0
+        );
+        connection
+            .execute(
+                "UPDATE agent_deferred_completions
+                 SET state = 'discarded',
+                     resolved_by_terminal_event_id = terminal_event_id,
+                     updated_at_ms = 4,
+                     resolved_at_ms = 4
+                 WHERE agent_session_id = 'discard-owner'
+                   AND agent_turn_id = 'discard-owner-turn'",
+                [],
+            )
+            .expect("physical fence-backed deferred discard");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM effective_agent_deferred_completions
+                     WHERE agent_session_id = 'discard-owner'
+                       AND state = 'discarded'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("effective forensic receipt count"),
+            1
+        );
+
+        for (event_id, sequence_no, payload, created_at_ms) in [
+            ("discard-followup-start", 0_i64, warning_payload, 5_i64),
+            ("discard-followup-terminal", 1_i64, completed_payload, 6_i64),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO protocol_runtime_events
+                     (id, session_id, turn_id, sequence_no, msg_json,
+                      payload_sha256, created_at_ms)
+                     VALUES (?1, 'discard-owner', 'discard-followup-turn',
+                             ?2, ?3, ?4, ?5)",
+                    params![
+                        event_id,
+                        sequence_no,
+                        payload,
+                        sha256_text(payload),
+                        created_at_ms
+                    ],
+                )
+                .expect("post-fence follow-up event");
+            connection
+                .execute(
+                    "INSERT INTO protocol_item_append_order
+                     (session_id, scope_kind, turn_id, sequence_no,
+                      source_kind, source_id, created_at_ms)
+                     VALUES ('discard-owner', 'turn', 'discard-followup-turn',
+                             ?1, 'runtime_event', ?2, ?3)",
+                    params![sequence_no, event_id, created_at_ms],
+                )
+                .expect("post-fence follow-up append order");
+        }
+
+        connection
+            .execute(
+                "INSERT INTO agent_deferred_completions
+                 (agent_session_id, agent_turn_id, terminal_event_id,
+                  parent_session_id, kind, state,
+                  resolved_by_terminal_event_id, created_at_ms, updated_at_ms,
+                  resolved_at_ms)
+                 VALUES ('discard-owner', 'discard-followup-turn',
+                         'discard-followup-terminal', 'discard-root',
+                         'completed_early', 'pending', NULL, 6, 6, NULL)",
+                [],
+            )
+            .expect("post-fence pending receipt reuses the unique owner slot");
+        connection
+            .execute(
+                "UPDATE agent_deferred_completions
+                 SET state = 'discarded',
+                     resolved_by_terminal_event_id = 'discard-owner-terminal',
+                     updated_at_ms = 7,
+                     resolved_at_ms = 7
+                 WHERE agent_session_id = 'discard-owner'
+                   AND agent_turn_id = 'discard-followup-turn'",
+                [],
+            )
+            .expect_err("an old terminal must not discard the post-fence receipt");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM effective_agent_deferred_completions
+                     WHERE agent_session_id = 'discard-owner'
+                       AND state = 'pending'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("effective post-fence pending count"),
+            1
+        );
+        validate_agent_owner_resume_request_data(&connection)
+            .expect("fence-backed discarded receipt is canonical");
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v47_backfills_existing_terminal_final_pairs_without_rejecting_a_missing_legacy_final() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_v46(&connection);
+        let root_session_id = crate::session::SessionId::new();
+        let paired_child_id = crate::session::SessionId::new();
+        let missing_child_id = crate::session::SessionId::new();
+        connection
+            .execute(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('handoff-upgrade-project', 'C:/upgrade-handoff',
+                         'upgrade handoff', 'none', 1, 1)",
+                [],
+            )
+            .expect("project");
+        for (index, (session_id, title, status)) in [
+            (root_session_id, "root", "idle"),
+            (paired_child_id, "paired child", "completed"),
+            (missing_child_id, "missing child", "completed"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            connection
+                .execute(
+                    "INSERT INTO sessions
+                     (id, project_id, title, status, cwd_path, model_name, base_url,
+                      created_at_ms, updated_at_ms, completed_at_ms)
+                     VALUES (?1, 'handoff-upgrade-project', ?2, ?3,
+                             'C:/upgrade-handoff', 'model', 'http://localhost',
+                             ?4, ?4, CASE WHEN ?3 = 'completed' THEN ?4 ELSE NULL END)",
+                    params![
+                        session_id.to_string(),
+                        title,
+                        status,
+                        i64::try_from(index + 1).expect("fixture time")
+                    ],
+                )
+                .expect("session");
+        }
+        connection
+            .execute(
+                "INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, created_at_ms)
+                 VALUES
+                 (?1, ?1, ?2, '/root/paired', 'paired', 2),
+                 (?1, ?1, ?3, '/root/missing', 'missing', 3)",
+                params![
+                    root_session_id.to_string(),
+                    paired_child_id.to_string(),
+                    missing_child_id.to_string()
+                ],
+            )
+            .expect("V46 edges");
+
+        for (index, child_session_id) in [paired_child_id, missing_child_id].into_iter().enumerate()
+        {
+            let turn_id = crate::protocol::TurnId::new();
+            let event_id = crate::protocol::RuntimeEventId::new();
+            let terminal = crate::protocol::RuntimeEventMsg::TurnTerminal {
+                terminal: Box::new(crate::session::DurableTurnTerminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                    final_response_id: None,
+                    tool_call_count: 0,
+                    failed_tool_count: 0,
+                    change_count: 0,
+                    metrics: Default::default(),
+                }),
+            };
+            let terminal_json = serde_json::to_string(&terminal).expect("terminal JSON");
+            let created_at_ms = 10 + i64::try_from(index).expect("fixture time");
+            connection
+                .execute(
+                    "INSERT INTO protocol_runtime_events
+                     (id, session_id, turn_id, sequence_no, msg_json,
+                      payload_sha256, created_at_ms)
+                     VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
+                    params![
+                        event_id.to_string(),
+                        child_session_id.to_string(),
+                        turn_id.to_string(),
+                        terminal_json,
+                        sha256_text(&terminal_json),
+                        created_at_ms
+                    ],
+                )
+                .expect("legacy terminal");
+            connection
+                .execute(
+                    "INSERT INTO protocol_item_append_order
+                     (session_id, scope_kind, turn_id, sequence_no,
+                      source_kind, source_id, created_at_ms)
+                     VALUES (?1, 'turn', ?2, 0, 'runtime_event', ?3, ?4)",
+                    params![
+                        child_session_id.to_string(),
+                        turn_id.to_string(),
+                        event_id.to_string(),
+                        created_at_ms
+                    ],
+                )
+                .expect("terminal append order");
+        }
+
+        let parent_history_id = crate::protocol::HistoryItemId::new();
+        let communication = crate::protocol::InterAgentCommunication {
+            author: "/root/paired".to_string(),
+            recipient: "/root".to_string(),
+            content: crate::protocol::render_inter_agent_message(
+                crate::protocol::InterAgentMessageType::FinalAnswer,
+                "/root",
+                "/root/paired",
+                "legacy delivered result",
+            ),
+            trigger_turn: false,
+        };
+        let history_json = serde_json::to_string(
+            &crate::protocol::HistoryItemPayload::InterAgentCommunication { communication },
+        )
+        .expect("parent FINAL JSON");
+        connection
+            .execute(
+                "INSERT INTO protocol_history_items
+                 (id, session_id, scope_kind, turn_id, sequence_no,
+                  payload_json, payload_sha256, created_at_ms)
+                 VALUES (?1, ?2, 'session', NULL, 0, ?3, ?4, 20)",
+                params![
+                    parent_history_id.to_string(),
+                    root_session_id.to_string(),
+                    history_json,
+                    sha256_text(&history_json)
+                ],
+            )
+            .expect("legacy parent FINAL");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, scope_kind, turn_id, sequence_no,
+                  source_kind, source_id, created_at_ms)
+                 VALUES (?1, 'session', NULL, 0, 'history_item', ?2, 20)",
+                params![root_session_id.to_string(), parent_history_id.to_string()],
+            )
+            .expect("parent FINAL append order");
+
+        run(&connection).expect("V46 to V47 handoff upgrade");
+        let receipts = connection
+            .prepare(
+                "SELECT child_session_id, parent_history_item_id
+                 FROM agent_completion_handoffs
+                 ORDER BY child_session_id",
+            )
+            .expect("receipt query")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("receipt rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("receipts");
+        assert_eq!(
+            receipts,
+            vec![(paired_child_id.to_string(), parent_history_id.to_string())]
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM protocol_runtime_events
+                     WHERE session_id = ?1
+                       AND json_extract(msg_json, '$.kind') = 'turn_terminal'",
+                    params![missing_child_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("missing-final terminal remains"),
+            1
+        );
+        run(&connection).expect("idempotent handoff backfill");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_completion_handoffs",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .expect("idempotent receipt count"),
+            1
         );
     }
 
@@ -6728,8 +12334,9 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO session_spawn_edges
-                 (root_session_id, parent_session_id, child_session_id, agent_path, task_name, created_at_ms)
-                 VALUES ('root', 'root', 'child', '/root/child', 'child', 3)",
+                 (root_session_id, parent_session_id, child_session_id, agent_path, task_name,
+                  spawn_order, created_at_ms)
+                 VALUES ('root', 'root', 'child', '/root/child', 'child', 1, 3)",
                 [],
             )
             .expect("spawn edge");
@@ -6751,13 +12358,7 @@ mod tests {
     #[test]
     fn v44_rejects_preexisting_duplicate_turn_terminals_and_rolls_back() {
         let connection = Connection::open_in_memory().expect("database");
-        run(&connection).expect("fresh current schema");
-        connection
-            .execute_batch(
-                "DROP INDEX idx_protocol_runtime_events_unique_turn_terminal;
-                 DELETE FROM moyai_schema_migrations WHERE version IN (44, 45);",
-            )
-            .expect("restore V43 fixture");
+        run_through_v43(&connection);
         let terminal = crate::session::DurableTurnTerminal {
             outcome: crate::protocol::TurnTerminalOutcome::Completed,
             final_response_id: None,
@@ -6863,7 +12464,7 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_fast_path_does_not_scan_canonical_payload_rows() {
+    fn current_schema_fast_path_audits_durable_mailbox_identity() {
         let connection = Connection::open_in_memory().expect("database");
         connection
             .pragma_update(None, "foreign_keys", "ON")
@@ -6879,22 +12480,1395 @@ mod tests {
                   created_at_ms, updated_at_ms, completed_at_ms)
                  VALUES
                  ('session', 'project', 'session', 'completed', 'C:/workspace', 'model',
-                  'http://localhost', 1, 1, 1);
-                 INSERT INTO protocol_history_items
-                 (id, session_id, scope_kind, turn_id, sequence_no, payload_json, payload_sha256, created_at_ms)
+                  'http://localhost', 1, 1, 1),
+                 ('owner', 'project', 'owner', 'idle', 'C:/workspace', 'model',
+                  'http://localhost', 2, 2, NULL),
+                 ('child', 'project', 'child', 'completed', 'C:/workspace', 'model',
+                  'http://localhost', 3, 3, 3);
+                 INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, spawn_order, created_at_ms)
                  VALUES
-                 ('corrupt-history', 'session', 'turn', 'turn', 1,
-                  '{\"kind\":\"reasoning\",\"text\":\"retired\"}', 'stale', 1);",
+                 ('session', 'session', 'owner', '/root/owner', 'owner', 1, 2),
+                 ('session', 'owner', 'child', '/root/owner/child', 'child', 2, 3);",
             )
             .expect("current-schema corruption fixture");
+        let resume_payload = serde_json::json!({
+            "kind": "inter_agent_communication",
+            "communication": {
+                "author": "/root/owner/child",
+                "recipient": "/root/owner",
+                "content": "Message Type: FINAL_ANSWER\nTask name: /root/owner\nSender: /root/owner/child\nPayload:\ncompleted",
+                "trigger_turn": false
+            }
+        })
+        .to_string();
+        let child_terminal_payload =
+            serde_json::to_string(&crate::protocol::RuntimeEventMsg::TurnTerminal {
+                terminal: Box::new(crate::session::DurableTurnTerminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                    final_response_id: None,
+                    tool_call_count: 0,
+                    failed_tool_count: 0,
+                    change_count: 0,
+                    metrics: Default::default(),
+                }),
+            })
+            .expect("child terminal payload");
+        connection
+            .execute(
+                "INSERT INTO protocol_runtime_events
+                 (id, session_id, turn_id, sequence_no, msg_json,
+                  payload_sha256, created_at_ms)
+                 VALUES ('resume-terminal', 'child', 'child-turn', 0, ?1, ?2, 3)",
+                params![child_terminal_payload, sha256_text(&child_terminal_payload)],
+            )
+            .expect("valid V48 child terminal");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, scope_kind, turn_id, sequence_no,
+                  source_kind, source_id, created_at_ms)
+                 VALUES ('child', 'turn', 'child-turn', 0,
+                         'runtime_event', 'resume-terminal', 3)",
+                [],
+            )
+            .expect("valid V48 child terminal append order");
+        connection
+            .execute(
+                "INSERT INTO agent_mailbox_messages
+                 (id, root_session_id, author_session_id, recipient_session_id,
+                  payload_json, payload_sha256, trigger_turn, state,
+                  delivered_turn_id, delivered_history_item_id,
+                  resolved_by_terminal_event_id,
+                  discarded_by_stopped_session_id,
+                  discarded_after_append_position, created_at_ms,
+                  updated_at_ms, resolved_at_ms)
+                 VALUES ('resume-source', 'session', 'child', 'owner',
+                         ?1, ?2, 0, 'pending',
+                         NULL, NULL, NULL, NULL, NULL, 4, 4, NULL)",
+                params![resume_payload, sha256_text(&resume_payload)],
+            )
+            .expect("valid V50 source mailbox");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, scope_kind, turn_id, sequence_no,
+                  source_kind, source_id, created_at_ms)
+                 VALUES ('owner', 'session', NULL, 2,
+                         'mailbox_message', 'resume-source', 4)",
+                [],
+            )
+            .expect("valid V50 source mailbox append order");
+        connection
+            .execute(
+                "INSERT INTO agent_completion_handoffs
+                 (child_session_id, child_turn_id, child_terminal_event_id,
+                  parent_session_id, parent_history_item_id, created_at_ms)
+                 VALUES ('child', 'child-turn', 'resume-terminal',
+                         'owner', 'resume-source', 4)",
+                [],
+            )
+            .expect("valid V48 direct-child handoff");
+        connection
+            .execute(
+                "INSERT INTO agent_owner_resume_requests
+                 (owner_session_id, source_session_id, source_history_item_id,
+                  state, claimed_turn_id, created_at_ms, updated_at_ms,
+                  claimed_at_ms, resolved_at_ms)
+                 VALUES ('owner', 'owner', 'resume-source', 'pending',
+                         NULL, 4, 4, NULL, NULL)",
+                [],
+            )
+            .expect("valid V48 request");
+        let corrupt_resume_payload = serde_json::json!({
+            "kind": "inter_agent_communication",
+            "communication": {
+                "author": "/root/owner/child",
+                "recipient": "/root/wrong_owner",
+                "content": "corrupt owner resume source",
+                "trigger_turn": false
+            }
+        })
+        .to_string();
+        let mailbox_validation_trigger = connection
+            .query_row(
+                "SELECT sql
+                 FROM sqlite_master
+                 WHERE type = 'trigger'
+                   AND name = 'validate_agent_mailbox_message_before_update'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("mailbox update trigger");
+        connection
+            .execute_batch("DROP TRIGGER validate_agent_mailbox_message_before_update")
+            .expect("temporarily bypass mailbox update validation");
+        connection
+            .execute(
+                "UPDATE agent_mailbox_messages
+                 SET payload_json = ?2, payload_sha256 = ?3
+                 WHERE id = ?1",
+                params![
+                    "resume-source",
+                    corrupt_resume_payload,
+                    sha256_text(&corrupt_resume_payload)
+                ],
+            )
+            .expect("corrupt V48 source after its insert trigger");
+        connection
+            .execute_batch(&mailbox_validation_trigger)
+            .expect("restore mailbox update trigger");
 
-        run(&connection).expect("current schema validation must remain bounded to schema shape");
-        let error = validate_canonical_protocol_storage(&connection)
-            .expect_err("the explicit full cutover audit must still reject corrupt payloads");
+        let error = run(&connection)
+            .expect_err("current schema fast path must reject corrupt mailbox identity");
+        assert!(
+            error.to_string().contains("mailbox message(s) violate"),
+            "unexpected current-schema audit error: {error}"
+        );
+    }
+
+    fn run_through_exact_v49_endpoint(connection: &Connection) {
+        run_through_v46(connection);
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .expect("disable foreign keys for exact released endpoint");
+        connection
+            .execute_batch(V47_RECURSIVE_SESSION_SPAWN_EDGES)
+            .expect("V47 endpoint");
+        connection
+            .execute_batch(V48_AGENT_OWNER_RESUME_REQUESTS)
+            .expect("V48 endpoint");
+        connection
+            .execute_batch(V49_AGENT_TREE_STOP_FENCES)
+            .expect("V49 endpoint");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("restore foreign keys");
+    }
+
+    fn run_through_exact_v50_endpoint(connection: &Connection) {
+        run_through_exact_v49_endpoint(connection);
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .expect("disable foreign keys for exact V50 endpoint");
+        connection
+            .execute_batch(V50_DURABLE_AGENT_MAILBOX)
+            .expect("V50 endpoint");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("restore foreign keys");
+    }
+
+    fn run_through_exact_v51_endpoint(connection: &Connection) {
+        run_through_exact_v50_endpoint(connection);
+        connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .expect("disable foreign keys for exact V51 endpoint");
+        connection
+            .execute_batch(V51_DURABLE_TURN_INPUT_QUEUE)
+            .expect("V51 endpoint");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("restore foreign keys");
+    }
+
+    fn insert_v51_history_fixture(
+        connection: &Connection,
+        id: &str,
+        session_id: &str,
+        turn_id: &str,
+        sequence_no: i64,
+        created_at_ms: i64,
+        payload_json: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO protocol_history_items (
+                     id, session_id, scope_kind, turn_id, sequence_no,
+                     payload_json, payload_sha256, created_at_ms
+                 )
+                 VALUES (?1, ?2, 'turn', ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id,
+                    session_id,
+                    turn_id,
+                    sequence_no,
+                    payload_json,
+                    sha256_text(payload_json),
+                    created_at_ms,
+                ],
+            )
+            .expect("V51 history fixture");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order (
+                     session_id, scope_kind, turn_id, sequence_no,
+                     source_kind, source_id, created_at_ms
+                 )
+                 VALUES (?1, 'turn', ?2, ?3, 'history_item', ?4, ?5)",
+                params![session_id, turn_id, sequence_no, id, created_at_ms,],
+            )
+            .expect("V51 append-order fixture");
+    }
+
+    fn exact_v50_with_one_legacy_steer() -> (Connection, String, String, String, String) {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v50_endpoint(&connection);
+        let session_id = crate::session::SessionId::new().to_string();
+        let turn_id = crate::protocol::TurnId::new();
+        let input_id = crate::protocol::HistoryItemId::new().to_string();
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('v51-project', 'C:/v51', 'v51', 'none', 1, 1);",
+            )
+            .expect("V51 project");
+        connection
+            .execute(
+                "INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms)
+                 VALUES (?1, 'v51-project', 'session', 'idle', 'C:/v51',
+                         'model', 'http://localhost', 1, 1, NULL)",
+                [&session_id],
+            )
+            .expect("V51 session");
+        let payload_json = serde_json::to_string(&crate::protocol::HistoryItemPayload::SteerTurn {
+            expected_turn_id: turn_id,
+            content: vec![crate::protocol::ContentPart::Text {
+                text: "legacy exact steer".to_string(),
+            }],
+            additional_context: Default::default(),
+            client_user_message_id: Some("legacy-client-id".to_string()),
+        })
+        .expect("typed legacy steer");
+        insert_v51_history_fixture(
+            &connection,
+            &input_id,
+            &session_id,
+            &turn_id.to_string(),
+            0,
+            2,
+            &payload_json,
+        );
+        (
+            connection,
+            session_id,
+            turn_id.to_string(),
+            input_id,
+            payload_json,
+        )
+    }
+
+    fn current_v51_with_one_queued_runtime_steer()
+    -> (Connection, String, String, String, String, String) {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run(&connection).expect("fresh current schema");
+        let session_id = crate::session::SessionId::new().to_string();
+        let admission_id = crate::session::AdmissionId::new().to_string();
+        let turn_id = crate::protocol::TurnId::new();
+        let input_id = crate::protocol::HistoryItemId::new().to_string();
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('v51-runtime-project', 'C:/v51-runtime', 'v51-runtime', 'none', 1, 1);",
+            )
+            .expect("V51 runtime project");
+        connection
+            .execute(
+                "INSERT INTO sessions (
+                     id, project_id, title, status, cwd_path, model_name, base_url,
+                     created_at_ms, updated_at_ms, completed_at_ms,
+                     active_run_id, active_turn_id, active_run_lease_expires_at_ms
+                 )
+                 VALUES (
+                     ?1, 'v51-runtime-project', 'session', 'running',
+                     'C:/v51-runtime', 'model', 'http://localhost',
+                     1, 100, NULL, ?2, ?3, 1000
+                 )",
+                params![session_id, admission_id, turn_id.to_string()],
+            )
+            .expect("V51 running session");
+        let payload_json = serde_json::to_string(&crate::protocol::HistoryItemPayload::SteerTurn {
+            expected_turn_id: turn_id,
+            content: vec![crate::protocol::ContentPart::Text {
+                text: "queued runtime steer".to_string(),
+            }],
+            additional_context: Default::default(),
+            client_user_message_id: Some("runtime-client-id".to_string()),
+        })
+        .expect("typed runtime steer");
+        connection
+            .execute(
+                "INSERT INTO turn_steer_inputs (
+                     id, session_id, admission_id, turn_id, payload_json,
+                     payload_sha256, origin_kind, state,
+                     delivered_history_item_id, resolved_by_terminal_event_id,
+                     accepted_at_ms, delivered_at_ms, discarded_at_ms, updated_at_ms
+                 )
+                 VALUES (
+                     ?1, ?2, ?3, ?4, ?5, ?6, 'runtime', 'queued',
+                     NULL, NULL, 100, NULL, NULL, 100
+                 )",
+                params![
+                    input_id,
+                    session_id,
+                    admission_id,
+                    turn_id.to_string(),
+                    payload_json,
+                    sha256_text(&payload_json),
+                ],
+            )
+            .expect("V51 runtime queue");
+        validate_durable_turn_input_queue_data(&connection).expect("valid runtime queue");
+        (
+            connection,
+            session_id,
+            admission_id,
+            turn_id.to_string(),
+            input_id,
+            payload_json,
+        )
+    }
+
+    #[test]
+    fn v51_backfills_legacy_steer_as_exact_delivered_provenance_without_queue_order() {
+        let (connection, session_id, turn_id, input_id, payload_json) =
+            exact_v50_with_one_legacy_steer();
+
+        run(&connection).expect("V50 to V51 upgrade");
+        run(&connection).expect("idempotent V51 reopen");
+
+        let stored = connection
+            .query_row(
+                "SELECT session_id, admission_id, turn_id, payload_json,
+                        payload_sha256, origin_kind, state,
+                        delivered_history_item_id, accepted_at_ms,
+                        delivered_at_ms, updated_at_ms
+                 FROM turn_steer_inputs
+                 WHERE id = ?1",
+                [&input_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, i64>(10)?,
+                    ))
+                },
+            )
+            .expect("backfilled legacy steer");
+        assert_eq!(stored.0, session_id);
+        assert_eq!(stored.1, None);
+        assert_eq!(stored.2, turn_id);
+        assert_eq!(stored.3, payload_json);
+        assert_eq!(stored.4, sha256_text(&payload_json));
+        assert_eq!(stored.5, "legacy_history");
+        assert_eq!(stored.6, "delivered");
+        assert_eq!(stored.7.as_deref(), Some(input_id.as_str()));
+        assert_eq!((stored.8, stored.9, stored.10), (2, Some(2), 2));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM turn_steer_input_enqueue_order",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("no invented legacy FIFO position"),
+            0
+        );
+        validate_durable_turn_input_queue_schema(&connection).expect("exact V51 schema");
+        validate_durable_turn_input_queue_data(&connection).expect("valid V51 data");
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                },)
+                .expect("V51 foreign-key check"),
+            0
+        );
+    }
+
+    #[test]
+    fn v51_fast_path_rejects_schema_marker_and_payload_hash_tampering() {
+        let schema_connection = Connection::open_in_memory().expect("database");
+        run(&schema_connection).expect("fresh current schema");
+        schema_connection
+            .execute_batch("DROP TRIGGER prevent_turn_steer_enqueue_order_update")
+            .expect("drop V51 immutable trigger");
+        let schema_error = run(&schema_connection).expect_err("stale V51 schema must fail closed");
+        assert!(schema_error.to_string().contains("V51 marker"));
+
+        let marker_connection = Connection::open_in_memory().expect("database");
+        run(&marker_connection).expect("fresh current schema");
+        marker_connection
+            .execute(
+                "UPDATE moyai_schema_migrations
+                 SET name = 'tampered_v51'
+                 WHERE version = ?1",
+                [DURABLE_TURN_INPUT_QUEUE_VERSION],
+            )
+            .expect("tamper V51 marker");
+        let marker_error = run(&marker_connection).expect_err("wrong V51 marker must fail closed");
+        assert!(
+            marker_error
+                .to_string()
+                .contains(DURABLE_TURN_INPUT_QUEUE_NAME)
+        );
+
+        let (hash_connection, _, _, input_id, _) = exact_v50_with_one_legacy_steer();
+        run(&hash_connection).expect("V51 upgrade");
+        let transition_trigger = hash_connection
+            .query_row(
+                "SELECT sql
+                 FROM sqlite_master
+                 WHERE type = 'trigger'
+                   AND name = 'validate_turn_steer_input_transition_before_update'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("V51 transition trigger");
+        hash_connection
+            .execute_batch("DROP TRIGGER validate_turn_steer_input_transition_before_update")
+            .expect("temporarily bypass immutable update validation");
+        hash_connection
+            .execute(
+                "UPDATE turn_steer_inputs
+                 SET payload_sha256 = 'stale'
+                 WHERE id = ?1",
+                [&input_id],
+            )
+            .expect("tamper payload hash");
+        hash_connection
+            .execute_batch(&transition_trigger)
+            .expect("restore exact transition trigger");
+        let hash_error =
+            run(&hash_connection).expect_err("stale V51 payload hash must fail closed");
+        assert!(
+            hash_error.to_string().contains("V51 marker")
+                && hash_error.to_string().contains("turn-steer input"),
+            "unexpected V51 hash audit error: {hash_error}"
+        );
+    }
+
+    #[test]
+    fn v52_preserves_legacy_harness_rows_without_inventing_turn_identity() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v51_endpoint(&connection);
+        let run_id = crate::harness::HarnessRunId::new().to_string();
+        let event_id = crate::harness::HarnessEventId::new().to_string();
+        let artifact_id = crate::harness::ArtifactId::new().to_string();
+        connection
+            .execute(
+                "INSERT INTO harness_runs
+                 (id, session_id, workspace_root, artifact_root, mode,
+                  started_at_ms, completed_at_ms, status)
+                 VALUES (?1, NULL, 'C:/workspace', 'C:/artifact',
+                         'legacy_replay', 1, 2, '\"pass\"')",
+                [&run_id],
+            )
+            .expect("legacy harness run");
+        connection
+            .execute(
+                "INSERT INTO harness_events
+                 (id, run_id, sequence_no, kind, payload_json,
+                  contract_refs_json, artifact_refs_json, parent_event_id,
+                  payload_sha256, created_at_ms)
+                 VALUES (?1, ?2, 0, '\"quality_gate_evaluated\"',
+                         '{\"type\":\"generic\",\"data\":null}',
+                         '[]', '[]', NULL, 'legacy-hash', 2)",
+                params![event_id, run_id],
+            )
+            .expect("legacy harness event");
+        connection
+            .execute(
+                "INSERT INTO harness_artifacts
+                 (id, run_id, kind, relative_path, sha256, size_bytes,
+                  tags_json, created_by_event_id, contract_refs_json,
+                  created_at_ms)
+                 VALUES (?1, ?2, '\"verification_log\"', 'legacy.json',
+                         'artifact-hash', 1, '[]', ?3, '[]', 2)",
+                params![artifact_id, run_id, event_id],
+            )
+            .expect("legacy harness artifact");
+
+        run(&connection).expect("V51 to V52 upgrade");
+        run(&connection).expect("idempotent V52 reopen");
+
+        let retained = connection
+            .query_row(
+                "SELECT protocol_turn_id,
+                        canonical_terminal_runtime_event_id,
+                        status
+                 FROM harness_runs WHERE id = ?1",
+                [&run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .expect("retained harness run");
+        assert_eq!(retained, (None, None, "\"pass\"".to_string()));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM harness_events WHERE run_id = ?1",
+                    [&run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("retained events"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM harness_artifacts WHERE run_id = ?1",
+                    [&run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("retained artifacts"),
+            1
+        );
+        validate_harness_turn_identity_schema(&connection).expect("exact V52 schema");
+        validate_harness_turn_identity_data(&connection).expect("valid V52 data");
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                HARNESS_TURN_IDENTITY_VERSION,
+                HARNESS_TURN_IDENTITY_NAME,
+            )
+            .expect("V52 marker")
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("V52 foreign-key check"),
+            0
+        );
+    }
+
+    #[test]
+    fn v52_fast_path_rejects_schema_marker_and_linkage_tampering() {
+        let schema_connection = Connection::open_in_memory().expect("database");
+        run(&schema_connection).expect("fresh current schema");
+        schema_connection
+            .execute_batch("DROP INDEX idx_harness_events_unique_run_terminal")
+            .expect("drop V52 terminal index");
+        let schema_error = run(&schema_connection).expect_err("stale V52 schema must fail closed");
+        assert!(schema_error.to_string().contains("V52 marker"));
+
+        let marker_connection = Connection::open_in_memory().expect("database");
+        run(&marker_connection).expect("fresh current schema");
+        marker_connection
+            .execute(
+                "UPDATE moyai_schema_migrations
+                 SET name = 'tampered_v52'
+                 WHERE version = ?1",
+                [HARNESS_TURN_IDENTITY_VERSION],
+            )
+            .expect("tamper V52 marker");
+        let marker_error = run(&marker_connection).expect_err("wrong V52 marker must fail closed");
+        assert!(
+            marker_error
+                .to_string()
+                .contains(HARNESS_TURN_IDENTITY_NAME)
+        );
+
+        let linkage_connection = Connection::open_in_memory().expect("database");
+        run(&linkage_connection).expect("fresh current schema");
+        linkage_connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .expect("disable foreign keys for corruption fixture");
+        linkage_connection
+            .execute(
+                "INSERT INTO harness_runs
+                 (id, session_id, protocol_turn_id,
+                  canonical_terminal_runtime_event_id,
+                  workspace_root, artifact_root, mode, started_at_ms,
+                  completed_at_ms, status)
+                 VALUES (?1, ?2, ?3, ?4, 'C:/workspace', 'C:/artifact',
+                         'native_runtime', 1, 2, '\"pass\"')",
+                params![
+                    crate::harness::HarnessRunId::new().to_string(),
+                    crate::session::SessionId::new().to_string(),
+                    crate::protocol::TurnId::new().to_string(),
+                    crate::protocol::RuntimeEventId::new().to_string(),
+                ],
+            )
+            .expect("corrupt V52 linkage");
+        linkage_connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("restore foreign keys");
+        let linkage_error = run(&linkage_connection).expect_err("orphan linkage must fail closed");
+        assert!(
+            linkage_error
+                .to_string()
+                .contains("canonical terminal linkage"),
+            "unexpected V52 linkage audit error: {linkage_error}"
+        );
+    }
+
+    #[test]
+    fn v53_upgrades_exact_v52_reopens_idempotently_and_owns_exact_schema() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v51_endpoint(&connection);
+        connection
+            .execute_batch(V52_HARNESS_TURN_IDENTITY)
+            .expect("exact V52 endpoint");
+
+        run(&connection).expect("V52 to V53 upgrade");
+        run(&connection).expect("idempotent V53 reopen");
+
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                AGENT_TRIGGER_TURN_CLAIMS_VERSION,
+                AGENT_TRIGGER_TURN_CLAIMS_NAME,
+            )
+            .expect("V53 marker")
+        );
+        validate_agent_trigger_turn_claims_schema(&connection).expect("exact V53 schema");
+        validate_agent_trigger_turn_claims_data(&connection).expect("valid V53 data");
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v53_rejects_invalid_v52_before_creating_schema_or_marker() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v51_endpoint(&connection);
+        connection
+            .execute_batch(V52_HARNESS_TURN_IDENTITY)
+            .expect("exact V52 endpoint");
+        connection
+            .execute_batch("DROP INDEX idx_protocol_runtime_events_unique_turn_terminal")
+            .expect("inject pre-existing V52 canonical-schema corruption");
+
+        let error = run(&connection).expect_err("invalid V52 must fail before V53 mutation");
         assert!(
             error
                 .to_string()
-                .contains("retired reasoning or prompt-dispatch")
+                .contains("idx_protocol_runtime_events_unique_turn_terminal"),
+            "unexpected V52 prevalidation error: {error}"
+        );
+        assert!(
+            !schema_migration_applied(&connection, AGENT_TRIGGER_TURN_CLAIMS_VERSION)
+                .expect("V53 marker query"),
+            "failed upgrade must leave the exact V52 marker endpoint"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM sqlite_master
+                     WHERE name IN (
+                         'agent_trigger_turn_claims',
+                         'validate_agent_trigger_turn_claim_before_insert',
+                         'prevent_agent_trigger_turn_claim_update',
+                         'validate_claimed_agent_mailbox_resolution_before_update'
+                     )",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("V53 schema object count"),
+            0,
+            "failed V52 prevalidation must not leave partial V53 schema"
+        );
+    }
+
+    #[test]
+    fn v53_fast_path_rejects_schema_marker_and_claim_identity_tampering() {
+        let schema_connection = Connection::open_in_memory().expect("database");
+        run(&schema_connection).expect("fresh current schema");
+        schema_connection
+            .execute_batch("DROP TRIGGER prevent_agent_trigger_turn_claim_update")
+            .expect("drop V53 immutability trigger");
+        let schema_error = run(&schema_connection).expect_err("stale V53 schema must fail closed");
+        assert!(
+            schema_error.to_string().contains("V53 marker"),
+            "unexpected V53 schema audit error: {schema_error}"
+        );
+
+        let mailbox_schema_connection = Connection::open_in_memory().expect("database");
+        run(&mailbox_schema_connection).expect("fresh current schema");
+        mailbox_schema_connection
+            .execute_batch("DROP TRIGGER validate_claimed_agent_mailbox_resolution_before_update")
+            .expect("drop V53 claimed-mailbox trigger");
+        let mailbox_schema_error =
+            run(&mailbox_schema_connection).expect_err("missing V53 mailbox trigger must fail");
+        assert!(
+            mailbox_schema_error
+                .to_string()
+                .contains("claimed-mailbox resolution trigger"),
+            "unexpected V53 mailbox schema error: {mailbox_schema_error}"
+        );
+
+        let marker_connection = Connection::open_in_memory().expect("database");
+        run(&marker_connection).expect("fresh current schema");
+        marker_connection
+            .execute(
+                "UPDATE moyai_schema_migrations
+                 SET name = 'tampered_v53'
+                 WHERE version = ?1",
+                [AGENT_TRIGGER_TURN_CLAIMS_VERSION],
+            )
+            .expect("tamper V53 marker");
+        let marker_error = run(&marker_connection).expect_err("wrong V53 marker must fail closed");
+        assert!(
+            marker_error
+                .to_string()
+                .contains(AGENT_TRIGGER_TURN_CLAIMS_NAME)
+        );
+
+        let data_connection = Connection::open_in_memory().expect("database");
+        run(&data_connection).expect("fresh current schema");
+        data_connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .expect("disable foreign keys for corruption fixture");
+        data_connection
+            .execute(
+                "INSERT INTO agent_trigger_turn_claims
+                 (history_item_id, recipient_session_id, admission_id, turn_id, created_at_ms)
+                 VALUES ('missing-wake', 'missing-session', 'missing-admission',
+                         'missing-turn', 1)",
+                [],
+            )
+            .expect_err("canonical insert trigger rejects an orphan claim");
+        let validation_trigger_sql = data_connection
+            .query_row(
+                "SELECT sql
+                 FROM sqlite_master
+                 WHERE type = 'trigger'
+                   AND name = 'validate_agent_trigger_turn_claim_before_insert'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("V53 validation trigger");
+        data_connection
+            .execute_batch("DROP TRIGGER validate_agent_trigger_turn_claim_before_insert")
+            .expect("temporarily bypass V53 identity trigger");
+        data_connection
+            .execute(
+                "INSERT INTO agent_trigger_turn_claims
+                 (history_item_id, recipient_session_id, admission_id, turn_id, created_at_ms)
+                 VALUES ('missing-wake', 'missing-session', 'missing-admission',
+                         'missing-turn', 1)",
+                [],
+            )
+            .expect("inject orphan V53 claim");
+        data_connection
+            .execute_batch(&validation_trigger_sql)
+            .expect("restore V53 validation trigger");
+        data_connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("restore foreign keys");
+        let data_error = validate_agent_trigger_turn_claims_data(&data_connection)
+            .expect_err("orphan V53 claim must fail closed");
+        assert!(
+            data_error.to_string().contains("explicit agent wake claim"),
+            "unexpected V53 claim audit error: {data_error}"
+        );
+        assert!(
+            run(&data_connection).is_err(),
+            "current-schema reopen must execute the V53 claim audit"
+        );
+    }
+
+    #[test]
+    fn v53_claimed_mailbox_discard_requires_its_interrupted_terminal() {
+        let connection =
+            canonical_agent_trigger_turn_claims_connection().expect("canonical V53 database");
+        connection
+            .execute(
+                "INSERT INTO sessions (
+                     id, status, active_run_id, active_turn_id,
+                     active_run_lease_expires_at_ms
+                 )
+                 VALUES ('session-1', 'running', 'admission-1', 'turn-1', 100)",
+                [],
+            )
+            .expect("active session owner");
+        connection
+            .execute(
+                "INSERT INTO agent_mailbox_messages (
+                     id, recipient_session_id, trigger_turn, state
+                 )
+                 VALUES ('wake-1', 'session-1', 1, 'pending')",
+                [],
+            )
+            .expect("pending explicit wake");
+        connection
+            .execute(
+                "INSERT INTO agent_trigger_turn_claims (
+                     history_item_id, recipient_session_id, admission_id,
+                     turn_id, created_at_ms
+                 )
+                 VALUES ('wake-1', 'session-1', 'admission-1', 'turn-1', 1)",
+                [],
+            )
+            .expect("exact wake claim");
+        connection
+            .execute(
+                "INSERT INTO protocol_runtime_events (
+                     id, session_id, turn_id, msg_json
+                 )
+                 VALUES (
+                     'failed-terminal', 'session-1', 'turn-1',
+                     '{\"kind\":\"turn_terminal\",\"terminal\":{\"outcome\":{\"kind\":\"failed\"}}}'
+                 )",
+                [],
+            )
+            .expect("failed terminal");
+
+        let failed_discard = connection
+            .execute(
+                "UPDATE agent_mailbox_messages
+                 SET state = 'discarded',
+                     resolved_by_terminal_event_id = 'failed-terminal'
+                 WHERE id = 'wake-1'",
+                [],
+            )
+            .expect_err("Failed terminal must not discard its claimed wake");
+        assert!(
+            failed_discard
+                .to_string()
+                .contains("claimed agent mailbox resolution"),
+            "unexpected failed-discard error: {failed_discard}"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state FROM agent_mailbox_messages WHERE id = 'wake-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("wake state after rejected discard"),
+            "pending"
+        );
+
+        connection
+            .execute(
+                "INSERT INTO protocol_runtime_events (
+                     id, session_id, turn_id, msg_json
+                 )
+                 VALUES (
+                     'interrupted-terminal', 'session-1', 'turn-1',
+                     '{\"kind\":\"turn_terminal\",\"terminal\":{\"outcome\":{\"kind\":\"interrupted\"}}}'
+                 )",
+                [],
+            )
+            .expect("interrupted terminal");
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE agent_mailbox_messages
+                     SET state = 'discarded',
+                         resolved_by_terminal_event_id = 'interrupted-terminal'
+                     WHERE id = 'wake-1'",
+                    [],
+                )
+                .expect("Interrupted terminal owns exact wake discard"),
+            1
+        );
+        validate_agent_trigger_turn_claims_data(&connection)
+            .expect("interrupted discard remains valid V53 data");
+    }
+
+    #[test]
+    fn v51_rejects_invalid_delivery_order_and_non_interrupted_discard_resolution() {
+        let (order_connection, _, _, _, order_input_id, _) =
+            current_v51_with_one_queued_runtime_steer();
+        let immutable_order_trigger = order_connection
+            .query_row(
+                "SELECT sql
+                 FROM sqlite_master
+                 WHERE type = 'trigger'
+                   AND name = 'prevent_turn_steer_enqueue_order_update'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("V51 immutable order trigger");
+        order_connection
+            .execute_batch("DROP TRIGGER prevent_turn_steer_enqueue_order_update")
+            .expect("temporarily bypass immutable queue order");
+        order_connection
+            .execute(
+                "UPDATE turn_steer_input_enqueue_order
+                 SET created_at_ms = 101
+                 WHERE input_id = ?1",
+                [&order_input_id],
+            )
+            .expect("tamper enqueue timestamp");
+        order_connection
+            .execute_batch(&immutable_order_trigger)
+            .expect("restore immutable queue-order trigger");
+        let order_error = validate_durable_turn_input_queue_data(&order_connection)
+            .expect_err("mismatched enqueue identity must fail closed");
+        assert!(
+            order_error.to_string().contains("turn-steer input"),
+            "unexpected V51 order audit error: {order_error}"
+        );
+        assert!(
+            run(&order_connection).is_err(),
+            "the current-schema reopen must run the V51 data audit"
+        );
+
+        let (
+            delivered_connection,
+            delivered_session_id,
+            _,
+            delivered_turn_id,
+            delivered_input_id,
+            delivered_payload_json,
+        ) = current_v51_with_one_queued_runtime_steer();
+        delivered_connection
+            .execute(
+                "INSERT INTO protocol_history_items (
+                     id, session_id, scope_kind, turn_id, sequence_no,
+                     payload_json, payload_sha256, created_at_ms
+                 )
+                 VALUES (?1, ?2, 'turn', ?3, 0, ?4, ?5, 110)",
+                params![
+                    delivered_input_id,
+                    delivered_session_id,
+                    delivered_turn_id,
+                    delivered_payload_json,
+                    sha256_text(&delivered_payload_json),
+                ],
+            )
+            .expect("delivered history without append-order provenance");
+        let delivered_transition_trigger = delivered_connection
+            .query_row(
+                "SELECT sql
+                 FROM sqlite_master
+                 WHERE type = 'trigger'
+                   AND name = 'validate_turn_steer_input_transition_before_update'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("V51 delivery transition trigger");
+        delivered_connection
+            .execute_batch("DROP TRIGGER validate_turn_steer_input_transition_before_update")
+            .expect("temporarily bypass delivery transition");
+        delivered_connection
+            .execute(
+                "UPDATE turn_steer_inputs
+                 SET state = 'delivered',
+                     delivered_history_item_id = id,
+                     delivered_at_ms = 110,
+                     updated_at_ms = 110
+                 WHERE id = ?1",
+                [&delivered_input_id],
+            )
+            .expect("inject delivered row without append order");
+        delivered_connection
+            .execute_batch(&delivered_transition_trigger)
+            .expect("restore delivery transition trigger");
+        let delivered_error = validate_durable_turn_input_queue_data(&delivered_connection)
+            .expect_err("delivered input without exact append order must fail closed");
+        assert!(
+            delivered_error.to_string().contains("turn-steer input"),
+            "unexpected V51 delivery audit error: {delivered_error}"
+        );
+
+        let (discard_connection, discard_session_id, _, discard_turn_id, discard_input_id, _) =
+            current_v51_with_one_queued_runtime_steer();
+        let terminal_id = crate::protocol::RuntimeEventId::new().to_string();
+        let terminal_json =
+            serde_json::to_string(&crate::protocol::RuntimeEventMsg::TurnTerminal {
+                terminal: Box::new(crate::session::DurableTurnTerminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                    final_response_id: None,
+                    tool_call_count: 0,
+                    failed_tool_count: 0,
+                    change_count: 0,
+                    metrics: Default::default(),
+                }),
+            })
+            .expect("typed completed terminal");
+        discard_connection
+            .execute(
+                "INSERT INTO protocol_runtime_events (
+                     id, session_id, turn_id, sequence_no, msg_json,
+                     payload_sha256, created_at_ms
+                 )
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5, 110)",
+                params![
+                    terminal_id,
+                    discard_session_id,
+                    discard_turn_id,
+                    terminal_json,
+                    sha256_text(&terminal_json),
+                ],
+            )
+            .expect("completed terminal fixture");
+        discard_connection
+            .execute(
+                "INSERT INTO protocol_item_append_order (
+                     session_id, scope_kind, turn_id, sequence_no,
+                     source_kind, source_id, created_at_ms
+                 )
+                 VALUES (?1, 'turn', ?2, 0, 'runtime_event', ?3, 110)",
+                params![discard_session_id, discard_turn_id, terminal_id],
+            )
+            .expect("completed terminal append order");
+        let direct_discard_error = discard_connection
+            .execute(
+                "UPDATE turn_steer_inputs
+                 SET state = 'discarded',
+                     resolved_by_terminal_event_id = ?2,
+                     discarded_at_ms = 110,
+                     updated_at_ms = 110
+                 WHERE id = ?1",
+                params![discard_input_id, terminal_id],
+            )
+            .expect_err("completed terminal must not resolve a discarded steer");
+        assert!(
+            direct_discard_error
+                .to_string()
+                .contains("lifecycle transition"),
+            "unexpected V51 discard transition error: {direct_discard_error}"
+        );
+        let discard_transition_trigger = discard_connection
+            .query_row(
+                "SELECT sql
+                 FROM sqlite_master
+                 WHERE type = 'trigger'
+                   AND name = 'validate_turn_steer_input_transition_before_update'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("V51 discard transition trigger");
+        discard_connection
+            .execute_batch("DROP TRIGGER validate_turn_steer_input_transition_before_update")
+            .expect("temporarily bypass discard transition");
+        discard_connection
+            .execute(
+                "UPDATE turn_steer_inputs
+                 SET state = 'discarded',
+                     resolved_by_terminal_event_id = ?2,
+                     discarded_at_ms = 110,
+                     updated_at_ms = 110
+                 WHERE id = ?1",
+                params![discard_input_id, terminal_id],
+            )
+            .expect("inject invalid discard resolver");
+        discard_connection
+            .execute_batch(&discard_transition_trigger)
+            .expect("restore discard transition trigger");
+        let discard_error = validate_durable_turn_input_queue_data(&discard_connection)
+            .expect_err("non-interrupted discard resolver must fail closed");
+        assert!(
+            discard_error.to_string().contains("turn-steer input"),
+            "unexpected V51 discard audit error: {discard_error}"
+        );
+    }
+
+    #[test]
+    fn v50_upgrades_exact_v49_endpoint_and_is_idempotent() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v49_endpoint(&connection);
+
+        run(&connection).expect("V49 to V50 upgrade");
+        run(&connection).expect("idempotent V50 validation");
+
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                DURABLE_AGENT_MAILBOX_VERSION,
+                DURABLE_AGENT_MAILBOX_NAME,
+            )
+            .expect("V50 marker")
+        );
+        validate_durable_agent_mailbox_schema(&connection).expect("exact V50 schema");
+        validate_durable_agent_mailbox_data(&connection).expect("valid V50 data");
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v50_backfills_only_canonical_live_mail_and_preserves_append_boundary() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v49_endpoint(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('v50-project', 'C:/v50', 'v50', 'none', 1, 1);
+                 INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms)
+                 VALUES
+                 ('v50-root', 'v50-project', 'root', 'idle', 'C:/v50',
+                  'model', 'http://localhost', 1, 1, NULL),
+                 ('v50-child', 'v50-project', 'child', 'idle', 'C:/v50',
+                  'model', 'http://localhost', 2, 2, NULL);
+                 INSERT INTO session_spawn_edges
+                 (root_session_id, parent_session_id, child_session_id,
+                  agent_path, task_name, spawn_order, created_at_ms)
+                 VALUES ('v50-root', 'v50-root', 'v50-child',
+                         '/root/child', 'child', 1, 2);",
+            )
+            .expect("V50 agent tree");
+        let pending = serde_json::json!({
+            "kind": "inter_agent_communication",
+            "communication": {
+                "author": "/root/child",
+                "recipient": "/root",
+                "content": "Message Type: MESSAGE\nTask name: /root\nSender: /root/child\nPayload:\nqueued",
+                "trigger_turn": true
+            }
+        })
+        .to_string();
+        let delivered = serde_json::json!({
+            "kind": "inter_agent_communication",
+            "communication": {
+                "author": "/root/child",
+                "recipient": "/root",
+                "content": "Message Type: MESSAGE\nTask name: /root\nSender: /root/child\nPayload:\ndelivered",
+                "trigger_turn": false
+            }
+        })
+        .to_string();
+        let inert_copy = serde_json::json!({
+            "kind": "inter_agent_communication",
+            "communication": {
+                "author": "/root",
+                "recipient": "/root/child",
+                "content": "fork context copy",
+                "trigger_turn": false
+            }
+        })
+        .to_string();
+        connection
+            .execute(
+                "INSERT INTO protocol_history_items
+                 (id, session_id, scope_kind, turn_id, sequence_no,
+                  payload_json, payload_sha256, created_at_ms)
+                 VALUES ('v50-delivered', 'v50-root', 'turn', 'root-turn',
+                         0, ?1, ?2, 4)",
+                params![delivered, sha256_text(&delivered)],
+            )
+            .expect("delivered history");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, scope_kind, turn_id, sequence_no,
+                  source_kind, source_id, created_at_ms)
+                 VALUES ('v50-root', 'turn', 'root-turn', 0,
+                         'history_item', 'v50-delivered', 4)",
+                [],
+            )
+            .expect("delivered append order");
+        connection
+            .execute(
+                "INSERT INTO protocol_history_items
+                 (id, session_id, scope_kind, turn_id, sequence_no,
+                  payload_json, payload_sha256, created_at_ms)
+                 VALUES ('v50-pending', 'v50-root', 'session', NULL, 0, ?1, ?2, 5)",
+                params![pending, sha256_text(&pending)],
+            )
+            .expect("pending history");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, scope_kind, turn_id, sequence_no,
+                  source_kind, source_id, created_at_ms)
+                 VALUES ('v50-root', 'session', NULL, 0,
+                         'history_item', 'v50-pending', 5)",
+                [],
+            )
+            .expect("pending append order");
+        let pending_position = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO protocol_history_items
+                 (id, session_id, scope_kind, turn_id, sequence_no,
+                  payload_json, payload_sha256, created_at_ms)
+                 VALUES ('v50-inert-copy', 'v50-root', 'session', NULL, 1,
+                         ?1, ?2, 6)",
+                params![inert_copy, sha256_text(&inert_copy)],
+            )
+            .expect("inert fork history");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, scope_kind, turn_id, sequence_no,
+                  source_kind, source_id, created_at_ms)
+                 VALUES ('v50-root', 'session', NULL, 1,
+                         'history_item', 'v50-inert-copy', 6)",
+                [],
+            )
+            .expect("inert fork append order");
+
+        run(&connection).expect("V50 classified backfill");
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state FROM agent_mailbox_messages
+                     WHERE id = 'v50-pending'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("pending mailbox"),
+            "pending"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT source_kind || ':' || append_position
+                     FROM protocol_item_append_order
+                     WHERE source_id = 'v50-pending'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("pending enqueue order"),
+            format!("mailbox_message:{pending_position}")
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM protocol_history_items
+                     WHERE id = 'v50-pending'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("pending history removed"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state FROM agent_mailbox_messages
+                     WHERE id = 'v50-delivered'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("delivered mailbox"),
+            "delivered"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_mailbox_messages
+                     WHERE id = 'v50-inert-copy'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("inert mailbox count"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM protocol_history_items
+                     WHERE id = 'v50-inert-copy'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("inert history retained"),
+            1
+        );
+        validate_durable_agent_mailbox_data(&connection).expect("backfilled V50 data");
+
+        let pending_delete_error = connection
+            .execute("DELETE FROM sessions WHERE id = 'v50-child'", [])
+            .expect_err("pending outgoing mailbox must block author deletion");
+        assert!(
+            pending_delete_error
+                .to_string()
+                .contains("invalid agent mailbox lifecycle transition"),
+            "unexpected pending-author deletion error: {pending_delete_error}"
+        );
+        connection
+            .execute_batch(
+                "DELETE FROM protocol_item_append_order
+                 WHERE source_kind = 'mailbox_message'
+                   AND source_id = 'v50-pending';
+                 DELETE FROM agent_mailbox_messages
+                 WHERE id = 'v50-pending';
+                 DELETE FROM sessions WHERE id = 'v50-child';",
+            )
+            .expect("delete author after pending mail is explicitly removed");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT author_session_id IS NULL
+                     FROM agent_mailbox_messages
+                     WHERE id = 'v50-delivered'",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .expect("delivered mailbox author tombstone"),
+            true
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM protocol_history_items
+                     WHERE id = 'v50-delivered'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("ancestor delivered history retained"),
+            1
+        );
+        validate_durable_agent_mailbox_data(&connection)
+            .expect("author tombstone preserves delivered owner");
+    }
+
+    #[test]
+    fn v50_fast_path_rejects_schema_tampering() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run(&connection).expect("fresh V50 schema");
+        connection
+            .execute_batch("DROP TRIGGER validate_agent_mailbox_message_before_update;")
+            .expect("tamper lifecycle trigger");
+
+        let error = run(&connection).expect_err("V50 exact schema must reject tampering");
+        assert!(
+            error
+                .to_string()
+                .contains("validate_agent_mailbox_message_before_update"),
+            "unexpected V50 schema error: {error}"
         );
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -21,6 +21,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     effect_filter: Option<ToolEffectClass>,
+    effect_filter_exceptions: HashSet<String>,
 }
 
 impl ToolRegistry {
@@ -28,6 +29,7 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             effect_filter: None,
+            effect_filter_exceptions: HashSet::new(),
         }
     }
 
@@ -35,13 +37,17 @@ impl ToolRegistry {
         self.tools.retain(|name, _| predicate(name));
     }
 
-    pub(crate) fn retain_effect(
+    pub(crate) fn retain_effect_with_exceptions(
         &mut self,
         effect: ToolEffectClass,
         mcp: Option<&crate::config::McpConfig>,
+        exceptions: &[&str],
     ) {
-        self.tools
-            .retain(|_, tool| tool.spec().effect.can_resolve_to(effect, mcp));
+        self.effect_filter_exceptions = exceptions.iter().map(|name| (*name).to_string()).collect();
+        self.tools.retain(|name, tool| {
+            self.effect_filter_exceptions.contains(name)
+                || tool.spec().effect.can_resolve_to(effect, mcp)
+        });
         self.effect_filter = Some(effect);
     }
 
@@ -82,6 +88,7 @@ impl ToolRegistry {
         Self {
             tools,
             effect_filter: None,
+            effect_filter_exceptions: HashSet::new(),
         }
     }
 
@@ -91,6 +98,7 @@ impl ToolRegistry {
         Self {
             tools,
             effect_filter: None,
+            effect_filter_exceptions: HashSet::new(),
         }
     }
 
@@ -115,6 +123,7 @@ impl ToolRegistry {
         Self {
             tools,
             effect_filter: None,
+            effect_filter_exceptions: HashSet::new(),
         }
     }
 
@@ -144,6 +153,7 @@ impl ToolRegistry {
         Self {
             tools,
             effect_filter: self.effect_filter,
+            effect_filter_exceptions: self.effect_filter_exceptions.clone(),
         }
     }
 
@@ -188,7 +198,9 @@ impl ToolRegistry {
             .get(name)
             .ok_or_else(|| self.unknown_tool_error(name))?;
         let effect = tool.spec().effect.resolve(raw_arguments, mcp);
-        if self.effect_filter.is_some_and(|allowed| allowed != effect) {
+        if self.effect_filter.is_some_and(|allowed| allowed != effect)
+            && !self.effect_filter_exceptions.contains(name)
+        {
             return Err(ToolError::Message(format!(
                 "tool `{name}` resolves to `{effect}` effect, which is not allowed by the active turn mode"
             )));
@@ -350,6 +362,7 @@ mod tests {
     #[test]
     fn core_agent_for_config_omits_external_tools_when_disabled() {
         let mut config = crate::config::ResolvedConfig::default();
+        config.multi_agent.enabled = false;
         config.docling.enabled = false;
         config.mcp.enabled = false;
 
@@ -379,8 +392,8 @@ mod tests {
 
     #[test]
     fn core_agent_for_config_includes_multi_agent_tools_only_when_enabled() {
-        let mut config = crate::config::ResolvedConfig::default();
-        config.multi_agent.enabled = true;
+        let config = crate::config::ResolvedConfig::default();
+        assert!(config.multi_agent.enabled);
 
         let names = super::ToolRegistry::core_agent_for_config(&config).available_tool_names();
 
