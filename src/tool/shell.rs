@@ -57,9 +57,9 @@ pub struct ShellTool;
 impl Tool for ShellTool {
     fn spec(&self) -> ToolSpec {
         let description = if cfg!(windows) {
-            "Run a PowerShell command. Workspace modes use the native workspace-write OS sandbox. Keep sandbox_permissions=use_default unless this exact command is known to require unrestricted execution or a prior default run shows a sandbox-caused OS access denial, including a Windows child-created protected-DACL temp path; a nonzero exit alone is not sufficient. require_escalated starts a new reviewed execution, requires concise justification, and never replays the failed command automatically. Approved elevation and Full Access run without the sandbox. Shell side effects have no typed file-change owner, so every edit baseline for the current session is invalidated before execution."
+            "Run a PowerShell command. Workspace modes use the native workspace-write OS sandbox. Keep sandbox_permissions=use_default unless this exact command is known to require unrestricted execution or a prior default run shows a sandbox-caused OS access denial, including a Windows child-created protected-DACL temp path; a nonzero exit alone is not sufficient. require_escalated starts a new reviewed execution, requires concise justification, and never replays the failed command automatically. Approved elevation and Full Access run without the sandbox. Shell side effects have no typed file-change owner; current edit baselines are retained and revalidated per path against current contents before the next whole-file write."
         } else {
-            "Run a bash command. Workspace modes require a supported native workspace-write OS sandbox. Keep sandbox_permissions=use_default unless this exact command is known to require unrestricted execution or a prior default run shows a sandbox-caused OS access denial; a nonzero exit alone is not sufficient. require_escalated starts a new reviewed execution, requires concise justification, and never replays the failed command automatically. Approved elevation and Full Access run without the sandbox. Shell side effects have no typed file-change owner, so every edit baseline for the current session is invalidated before execution."
+            "Run a bash command. Workspace modes require a supported native workspace-write OS sandbox. Keep sandbox_permissions=use_default unless this exact command is known to require unrestricted execution or a prior default run shows a sandbox-caused OS access denial; a nonzero exit alone is not sufficient. require_escalated starts a new reviewed execution, requires concise justification, and never replays the failed command automatically. Approved elevation and Full Access run without the sandbox. Shell side effects have no typed file-change owner; current edit baselines are retained and revalidated per path against current contents before the next whole-file write."
         };
         ToolSpec {
             name: ToolName::Shell,
@@ -115,12 +115,6 @@ impl Tool for ShellTool {
         ctx.run_mutation_fence.assert_owned().await?;
         effect_admission.admit()?;
         PathGuard::revalidate(&guarded)?;
-        let effect_may_start = !ctx.cancel.is_cancelled();
-        if effect_may_start {
-            ctx.services
-                .edit_safety
-                .invalidate_session(ctx.session.session.id)?;
-        }
         let output = execute_shell_command(
             &ctx.config.shell,
             &guarded.absolute,
@@ -169,7 +163,7 @@ impl Tool for ShellTool {
                 "change_evidence": {
                     "status": change_evidence_status,
                     "effects_unknown": output.effect_started,
-                    "session_edit_baselines_invalidated": effect_may_start,
+                    "session_edit_baselines_invalidated": false,
                 },
                 "sandbox": effect_admission.sandbox_plan().audit_description(),
             }),
@@ -1156,10 +1150,482 @@ fn command_mentions_configured_instruction_target(
 #[cfg(test)]
 mod tests {
     use camino::Utf8PathBuf;
+    use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
-    use crate::config::ResolvedConfig;
+    use crate::cli::ConfirmationPrompt;
+    use crate::config::{AccessMode, ResolvedConfig};
+    use crate::edit::{ChangeTracker, EditSafety, Formatter};
+    use crate::protocol::{ModelResponseId, ReviewDecision, TurnId};
+    use crate::runtime::RunControl;
+    use crate::session::{
+        NewSession, ProjectId, ProjectRepository, SessionContext, SessionRepository, ToolCallId,
+    };
+    use crate::storage::session_repo::{ModelResponseWrite, PendingToolCallWrite};
+    use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
+    use crate::tool::context::{RunMutationFence, ToolContext, ToolServices};
+    use crate::tool::registry::Tool;
+    use crate::tool::truncate::ToolTruncator;
     use crate::workspace::WorkspaceDiscovery;
+
+    #[derive(Default)]
+    struct AllowPrompt;
+
+    impl ConfirmationPrompt for AllowPrompt {
+        fn confirm(
+            &mut self,
+            _request: &crate::tool::PermissionRequest,
+        ) -> Result<ReviewDecision, crate::error::CliPromptError> {
+            Ok(ReviewDecision::Approved)
+        }
+    }
+
+    struct ShellToolFixture {
+        _temp: tempfile::TempDir,
+        config: ResolvedConfig,
+        session: SessionContext,
+        services: ToolServices,
+    }
+
+    async fn shell_tool_fixture() -> ShellToolFixture {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root =
+            Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 workspace");
+        let data_dir = Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8 data");
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::create_dir_all(&data_dir).expect("data directory");
+        let storage_paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let sqlite = SqliteStore::open(&storage_paths).expect("store");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &root, "shell baseline fixture", "none")
+            .await
+            .expect("project");
+        let session = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id,
+                title: "shell baseline fixture".to_string(),
+                cwd: root.clone(),
+                model: "model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+                access_mode: AccessMode::FullAccess,
+            })
+            .await
+            .expect("session");
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::FullAccess;
+        let workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace discovery");
+        let services = ToolServices {
+            edit_safety: EditSafety::default(),
+            formatter: Formatter::new(config.format.clone()),
+            change_tracker: ChangeTracker,
+            store,
+            storage_paths,
+            truncator: ToolTruncator,
+            mcp: Arc::new(crate::mcp::McpClient::new(config.mcp.clone())),
+            skills: crate::skill::SkillsService::new(),
+        };
+        ShellToolFixture {
+            _temp: temp,
+            config,
+            session: SessionContext { session, workspace },
+            services,
+        }
+    }
+
+    async fn admit_test_run(fixture: &ShellToolFixture) -> (RunControl, RunMutationFence) {
+        let turn_id = TurnId::new();
+        let admission_id = fixture
+            .services
+            .store
+            .session_repo()
+            .admit_session_turn(fixture.session.session.id, turn_id)
+            .await
+            .expect("run admission")
+            .expect("fresh session must admit")
+            .admission_id;
+        let control = RunControl::new();
+        let mutation_fence = RunMutationFence::new(
+            fixture.services.store.session_repo(),
+            fixture.session.session.id,
+            admission_id,
+            turn_id,
+            control.clone(),
+        );
+        (control, mutation_fence)
+    }
+
+    async fn execute_tool_in_test_run<T: Tool + ?Sized>(
+        fixture: &ShellToolFixture,
+        tool: &T,
+        raw_arguments: serde_json::Value,
+        control: &RunControl,
+        mutation_fence: &RunMutationFence,
+    ) -> Result<crate::tool::ToolResult, crate::error::ToolError> {
+        execute_tool_with_id_in_test_run(
+            fixture,
+            tool,
+            raw_arguments,
+            ToolCallId::new(),
+            control,
+            mutation_fence,
+        )
+        .await
+    }
+
+    async fn execute_tool_with_id_in_test_run<T: Tool + ?Sized>(
+        fixture: &ShellToolFixture,
+        tool: &T,
+        raw_arguments: serde_json::Value,
+        tool_call_id: ToolCallId,
+        control: &RunControl,
+        mutation_fence: &RunMutationFence,
+    ) -> Result<crate::tool::ToolResult, crate::error::ToolError> {
+        let mut prompt = AllowPrompt;
+        tool.execute(
+            raw_arguments,
+            ToolContext {
+                session: &fixture.session,
+                workspace: &fixture.session.workspace,
+                config: &fixture.config,
+                tool_call_id,
+                cancel: control.token(),
+                run_control: control.clone(),
+                run_mutation_fence: mutation_fence.clone(),
+                prompt: &mut prompt,
+                services: &fixture.services,
+                agent: None,
+                permission_guardian: None,
+            },
+        )
+        .await
+    }
+
+    #[cfg(windows)]
+    fn successful_read_only_command() -> String {
+        "Write-Output baseline-preserved".to_string()
+    }
+
+    #[cfg(not(windows))]
+    fn successful_read_only_command() -> String {
+        "printf baseline-preserved".to_string()
+    }
+
+    #[cfg(windows)]
+    fn replace_baseline_command() -> String {
+        "[System.IO.File]::WriteAllText((Join-Path (Get-Location) 'baseline.txt'), 'shell')"
+            .to_string()
+    }
+
+    #[cfg(not(windows))]
+    fn replace_baseline_command() -> String {
+        "printf shell > baseline.txt".to_string()
+    }
+
+    #[cfg(windows)]
+    fn delete_baseline_command() -> String {
+        "[System.IO.File]::Delete((Join-Path (Get-Location) 'baseline.txt'))".to_string()
+    }
+
+    #[cfg(not(windows))]
+    fn delete_baseline_command() -> String {
+        "rm -- baseline.txt".to_string()
+    }
+
+    async fn write_baseline_in_test_run(
+        fixture: &ShellToolFixture,
+        content: &str,
+        control: &RunControl,
+        mutation_fence: &RunMutationFence,
+    ) -> Result<crate::tool::ToolResult, crate::error::ToolError> {
+        execute_tool_in_test_run(
+            fixture,
+            &crate::tool::write::WriteTool,
+            serde_json::json!({
+                "path": "baseline.txt",
+                "content": content,
+            }),
+            control,
+            mutation_fence,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn untouched_baseline_survives_shell_and_the_next_whole_file_write() {
+        let fixture = shell_tool_fixture().await;
+        let path = fixture.session.workspace.root.join("baseline.txt");
+        std::fs::write(&path, "original\n").expect("seed baseline");
+        let session_id = fixture.session.session.id;
+        fixture
+            .services
+            .edit_safety
+            .record_current_file_state(session_id, &path, 1_024)
+            .expect("record baseline");
+        let (control, mutation_fence) = admit_test_run(&fixture).await;
+
+        let result = execute_tool_in_test_run(
+            &fixture,
+            &super::ShellTool,
+            serde_json::json!({
+                "command": successful_read_only_command(),
+                "workdir": fixture.session.workspace.root,
+            }),
+            &control,
+            &mutation_fence,
+        )
+        .await
+        .expect("read-only shell");
+        write_baseline_in_test_run(&fixture, "original\n", &control, &mutation_fence)
+            .await
+            .expect("untouched baseline remains writable");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("typed write result"),
+            "original\n"
+        );
+        assert_eq!(
+            result.metadata["change_evidence"]["session_edit_baselines_invalidated"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_changed_target_is_rejected_by_the_next_whole_file_write() {
+        let fixture = shell_tool_fixture().await;
+        let path = fixture.session.workspace.root.join("baseline.txt");
+        std::fs::write(&path, "original").expect("seed baseline");
+        let session_id = fixture.session.session.id;
+        fixture
+            .services
+            .edit_safety
+            .record_current_file_state(session_id, &path, 1_024)
+            .expect("record baseline");
+        let (control, mutation_fence) = admit_test_run(&fixture).await;
+
+        execute_tool_in_test_run(
+            &fixture,
+            &super::ShellTool,
+            serde_json::json!({
+                "command": replace_baseline_command(),
+                "workdir": fixture.session.workspace.root,
+            }),
+            &control,
+            &mutation_fence,
+        )
+        .await
+        .expect("shell replacement");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("shell result"),
+            "shell"
+        );
+        assert!(
+            fixture
+                .services
+                .edit_safety
+                .get_stamp(session_id, &path)
+                .is_some(),
+            "shell retains the pre-shell baseline for lazy per-path validation"
+        );
+        let error = write_baseline_in_test_run(&fixture, "typed-write", &control, &mutation_fence)
+            .await
+            .expect_err("shell-changed content must reject the next whole-file write");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its current contents")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("shell result remains"),
+            "shell"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_deleted_target_is_rejected_by_the_next_whole_file_write() {
+        let fixture = shell_tool_fixture().await;
+        let path = fixture.session.workspace.root.join("baseline.txt");
+        std::fs::write(&path, "original").expect("seed baseline");
+        let session_id = fixture.session.session.id;
+        fixture
+            .services
+            .edit_safety
+            .record_current_file_state(session_id, &path, 1_024)
+            .expect("record baseline");
+        let (control, mutation_fence) = admit_test_run(&fixture).await;
+
+        execute_tool_in_test_run(
+            &fixture,
+            &super::ShellTool,
+            serde_json::json!({
+                "command": delete_baseline_command(),
+                "workdir": fixture.session.workspace.root,
+            }),
+            &control,
+            &mutation_fence,
+        )
+        .await
+        .expect("shell deletion");
+        assert!(!path.exists());
+
+        let error = write_baseline_in_test_run(&fixture, "typed-write", &control, &mutation_fence)
+            .await
+            .expect_err("shell-deleted content must reject the next whole-file write");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its current contents")
+        );
+        assert!(
+            !path.exists(),
+            "stale write must not recreate a deleted target"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_patch_add_recovers_a_shell_deleted_target_and_refreshes_its_baseline() {
+        let fixture = shell_tool_fixture().await;
+        let path = fixture.session.workspace.root.join("baseline.txt");
+        std::fs::write(&path, "original\n").expect("seed baseline");
+        let session_id = fixture.session.session.id;
+        fixture
+            .services
+            .edit_safety
+            .record_current_file_state(session_id, &path, 1_024)
+            .expect("record baseline");
+
+        let turn_id = TurnId::new();
+        let admission_id = fixture
+            .services
+            .store
+            .session_repo()
+            .admit_session_turn(session_id, turn_id)
+            .await
+            .expect("run admission")
+            .expect("fresh session must admit")
+            .admission_id;
+        let control = RunControl::new();
+        let mutation_fence = RunMutationFence::new(
+            fixture.services.store.session_repo(),
+            session_id,
+            admission_id,
+            turn_id,
+            control.clone(),
+        );
+        let patch_text = "*** Begin Patch\n*** Add File: baseline.txt\n+restored\n*** End Patch";
+        let patch_call_id = ToolCallId::new();
+        fixture
+            .services
+            .store
+            .session_repo()
+            .record_model_response_with_protocol_bundle(
+                session_id,
+                admission_id,
+                turn_id,
+                ModelResponseWrite {
+                    response_id: ModelResponseId::new(),
+                    assistant_text: None,
+                    assistant_protocol_sequence_no: None,
+                    tool_calls: vec![PendingToolCallWrite {
+                        id: patch_call_id,
+                        model_call_id: "intentional-shell-delete-recovery".to_string(),
+                        tool_name: "apply_patch".to_string(),
+                        arguments_json: serde_json::json!({
+                            "patch_text": patch_text,
+                        })
+                        .to_string(),
+                        protocol_sequence_no: None,
+                    }],
+                },
+            )
+            .await
+            .expect("persist patch tool call");
+
+        execute_tool_in_test_run(
+            &fixture,
+            &super::ShellTool,
+            serde_json::json!({
+                "command": delete_baseline_command(),
+                "workdir": fixture.session.workspace.root,
+            }),
+            &control,
+            &mutation_fence,
+        )
+        .await
+        .expect("shell deletion");
+        assert!(!path.exists());
+
+        execute_tool_with_id_in_test_run(
+            &fixture,
+            &crate::tool::apply_patch::ApplyPatchTool,
+            serde_json::json!({ "patch_text": patch_text }),
+            patch_call_id,
+            &control,
+            &mutation_fence,
+        )
+        .await
+        .expect("explicit patch add");
+        let restored = std::fs::read_to_string(&path).expect("restored file");
+        assert_eq!(restored.lines().collect::<Vec<_>>(), vec!["restored"]);
+
+        write_baseline_in_test_run(&fixture, &restored, &control, &mutation_fence)
+            .await
+            .expect("patch add refreshes the whole-file write baseline");
+    }
+
+    #[tokio::test]
+    async fn shell_spawn_failure_preserves_the_existing_edit_baseline() {
+        let mut fixture = shell_tool_fixture().await;
+        let path = fixture.session.workspace.root.join("baseline.txt");
+        std::fs::write(&path, "original\n").expect("seed baseline");
+        let session_id = fixture.session.session.id;
+        fixture
+            .services
+            .edit_safety
+            .record_current_file_state(session_id, &path, 1_024)
+            .expect("record baseline");
+        fixture.config.shell.program =
+            Some(fixture.session.workspace.root.join("missing-shell-program"));
+        let (control, mutation_fence) = admit_test_run(&fixture).await;
+
+        execute_tool_in_test_run(
+            &fixture,
+            &super::ShellTool,
+            serde_json::json!({
+                "command": successful_read_only_command(),
+                "workdir": fixture.session.workspace.root,
+            }),
+            &control,
+            &mutation_fence,
+        )
+        .await
+        .expect_err("missing shell executable must fail before an effect starts");
+        write_baseline_in_test_run(&fixture, "original\n", &control, &mutation_fence)
+            .await
+            .expect("spawn failure must not destroy an untouched baseline");
+    }
+
+    #[test]
+    fn shell_spec_describes_lazy_whole_file_baseline_revalidation() {
+        let spec = crate::tool::registry::Tool::spec(&super::ShellTool);
+        assert!(spec.description.contains("edit baselines are retained"));
+        assert!(
+            spec.description
+                .contains("revalidated per path against current contents")
+        );
+        assert!(spec.description.contains("next whole-file write"));
+        assert!(!spec.description.contains("every edit baseline"));
+    }
 
     #[test]
     fn shell_output_is_factual_without_retry_coaching() {

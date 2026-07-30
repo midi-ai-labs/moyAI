@@ -134,6 +134,9 @@ impl Tool for WriteTool {
                     )?;
                     (Some(original), Some(identity))
                 } else {
+                    services
+                        .edit_safety
+                        .assert_fresh_create(session_id, &path_in_task)?;
                     (None, None)
                 };
                 let normalized = services.formatter.normalize_text(

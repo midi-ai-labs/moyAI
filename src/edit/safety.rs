@@ -252,6 +252,19 @@ impl EditSafety {
         Ok(())
     }
 
+    pub fn assert_fresh_create(
+        &self,
+        session_id: SessionId,
+        path: &Utf8Path,
+    ) -> Result<(), EditError> {
+        if self.get_stamp(session_id, path).is_some() {
+            return Err(EditError::Message(format!(
+                "the edit baseline for path `{path}` does not match its current contents because the previously present target is now absent; inspect the current path and use an explicit apply_patch Add operation if recreating it is intentional"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn assert_path_unchanged(
         &self,
         path: &Utf8Path,
