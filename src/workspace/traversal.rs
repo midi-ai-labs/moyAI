@@ -13,6 +13,7 @@ use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use similar::TextDiff;
 
 use crate::error::ToolError;
 use crate::workspace::path_guard::ExistingObjectIdentity;
@@ -30,6 +31,13 @@ const MAX_TRAVERSAL_IGNORE_SOURCES_PER_SNAPSHOT: usize =
 const MAX_IGNORE_SOURCE_BYTES: u64 = 1024 * 1024;
 const MAX_IGNORE_SOURCE_BYTES_PER_SNAPSHOT: u64 = 8 * 1024 * 1024;
 const MAX_IGNORE_ANCESTOR_DIRECTORIES: usize = 256;
+const MAX_EXACT_FILE_CANDIDATES: usize = 5;
+const MAX_EXACT_FILE_CANDIDATE_VISITS: usize = 4_096;
+const MAX_SIMILAR_SIBLING_CANDIDATES: usize = 3;
+const MAX_SIMILAR_SIBLING_RESULTS: usize = 64;
+const MAX_SIMILAR_SIBLING_VISITS: usize = 128;
+const MAX_SIMILAR_FILENAME_CHARS: usize = 128;
+const MIN_SIMILAR_FILENAME_RATIO: f32 = 0.75;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TraversalOptions {
@@ -142,6 +150,12 @@ pub struct TraversalPage {
     pub visited_entries: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExactFileCandidateScan {
+    pub(crate) paths: Vec<Utf8PathBuf>,
+    pub(crate) truncated: bool,
+}
+
 fn compare_traversal_path(left: &Path, right: &Path) -> Ordering {
     left.cmp(right)
 }
@@ -163,6 +177,167 @@ pub(crate) fn walk_guarded_page(
     options: TraversalOptions,
 ) -> Result<TraversalPage, ToolError> {
     walk_page_with_before_release(root, workspace, cursor, options, |_, _| Ok(()))
+}
+
+pub(crate) fn find_exact_workspace_file_candidates(
+    workspace: &Workspace,
+    requested_basename: &str,
+    requested_suffix: Option<&Utf8Path>,
+) -> Result<ExactFileCandidateScan, ToolError> {
+    find_exact_workspace_file_candidates_with_limits(
+        workspace,
+        requested_basename,
+        requested_suffix,
+        MAX_EXACT_FILE_CANDIDATES,
+        MAX_EXACT_FILE_CANDIDATE_VISITS,
+    )
+}
+
+pub(crate) fn find_similar_sibling_file_candidates(
+    workspace: &Workspace,
+    requested: &Utf8Path,
+) -> Result<ExactFileCandidateScan, ToolError> {
+    let requested_guard = PathGuard::require_path(workspace, requested, AccessKind::Read)?;
+    if !requested_guard.inside_workspace {
+        return Err(ToolError::Message(format!(
+            "read candidate target `{}` is outside workspace authority",
+            requested_guard.absolute
+        )));
+    }
+    let parent = requested_guard.absolute.parent().ok_or_else(|| {
+        ToolError::Message(format!(
+            "read candidate target `{}` has no parent directory",
+            requested_guard.absolute
+        ))
+    })?;
+    let parent_guard = PathGuard::require_path(workspace, parent, AccessKind::Search)?;
+    if !parent_guard.inside_workspace {
+        return Err(ToolError::Message(format!(
+            "read candidate parent `{}` is outside workspace authority",
+            parent_guard.absolute
+        )));
+    }
+    let page = walk_page_filtered_with_observers(
+        &parent_guard,
+        workspace,
+        None,
+        TraversalOptions {
+            include_hidden: false,
+            max_depth: Some(1),
+            include_files: true,
+            include_directories: false,
+            result_limit: MAX_SIMILAR_SIBLING_RESULTS,
+            visit_limit: MAX_SIMILAR_SIBLING_VISITS,
+        },
+        |_, _, _, is_file| is_file.then_some(0),
+        false,
+        || Ok(()),
+        || Ok(()),
+        |_, _| Ok(()),
+    )?;
+    let Some(requested_stem) = requested_guard.absolute.file_stem() else {
+        return Ok(ExactFileCandidateScan {
+            paths: Vec::new(),
+            truncated: page.truncated,
+        });
+    };
+    if requested_stem.chars().count() > MAX_SIMILAR_FILENAME_CHARS {
+        return Ok(ExactFileCandidateScan {
+            paths: Vec::new(),
+            truncated: page.truncated,
+        });
+    }
+    let requested_extension = requested_guard.absolute.extension();
+
+    let mut candidates = Vec::new();
+    for entry in page.entries {
+        if entry.path.extension() != requested_extension
+            || PathGuard::same_path_identity(&entry.path, &requested_guard.absolute)
+        {
+            continue;
+        }
+        let Some(candidate_stem) = entry.path.file_stem() else {
+            continue;
+        };
+        if candidate_stem.chars().count() > MAX_SIMILAR_FILENAME_CHARS {
+            continue;
+        }
+        let ratio = TextDiff::from_chars(requested_stem, candidate_stem).ratio();
+        if ratio < MIN_SIMILAR_FILENAME_RATIO {
+            continue;
+        }
+        let relative_path = PathGuard::relative_path_from_root(
+            &entry.path,
+            workspace.authority_root(),
+        )
+        .ok_or_else(|| {
+            ToolError::Message(format!(
+                "read candidate `{}` could not be projected relative to workspace root `{}`",
+                entry.path,
+                workspace.authority_root()
+            ))
+        })?;
+        candidates.push((ratio, relative_path));
+    }
+    candidates.sort_by(|(left_score, left_path), (right_score, right_path)| {
+        right_score
+            .total_cmp(left_score)
+            .then_with(|| compare_traversal_path(left_path.as_std_path(), right_path.as_std_path()))
+    });
+    candidates.truncate(MAX_SIMILAR_SIBLING_CANDIDATES);
+    Ok(ExactFileCandidateScan {
+        paths: candidates.into_iter().map(|(_, path)| path).collect(),
+        truncated: page.truncated,
+    })
+}
+
+fn find_exact_workspace_file_candidates_with_limits(
+    workspace: &Workspace,
+    requested_basename: &str,
+    requested_suffix: Option<&Utf8Path>,
+    result_limit: usize,
+    visit_limit: usize,
+) -> Result<ExactFileCandidateScan, ToolError> {
+    let root = PathGuard::require_path(workspace, workspace.authority_root(), AccessKind::Search)?;
+    let result_limit = result_limit.clamp(1, MAX_EXACT_FILE_CANDIDATES);
+    let visit_limit = visit_limit.clamp(1, MAX_EXACT_FILE_CANDIDATE_VISITS);
+    let requested_suffix = requested_suffix.filter(|suffix| !suffix.as_str().is_empty());
+    let page = walk_page_filtered_with_observers(
+        &root,
+        workspace,
+        None,
+        TraversalOptions {
+            include_hidden: false,
+            max_depth: None,
+            include_files: true,
+            include_directories: false,
+            result_limit,
+            visit_limit,
+        },
+        |_, relative_path, _, is_file| {
+            if !is_file {
+                None
+            } else if requested_suffix.is_some_and(|suffix| relative_path.ends_with(suffix)) {
+                Some(0)
+            } else if relative_path.file_name() == Some(requested_basename) {
+                Some(1)
+            } else {
+                None
+            }
+        },
+        false,
+        || Ok(()),
+        || Ok(()),
+        |_, _| Ok(()),
+    )?;
+    Ok(ExactFileCandidateScan {
+        paths: page
+            .entries
+            .into_iter()
+            .map(|entry| entry.relative_path)
+            .collect(),
+        truncated: page.truncated,
+    })
 }
 
 fn walk_page_with_before_release(
@@ -192,6 +367,35 @@ fn walk_page_with_observers(
     before_ignore_revalidation: impl FnOnce() -> Result<(), ToolError>,
     before_release: impl FnOnce(usize, usize) -> Result<(), ToolError>,
 ) -> Result<TraversalPage, ToolError> {
+    walk_page_filtered_with_observers(
+        root,
+        workspace,
+        cursor,
+        options,
+        |_, _, _, _| Some(0),
+        true,
+        after_ignore_capture,
+        before_ignore_revalidation,
+        before_release,
+    )
+}
+
+fn walk_page_filtered_with_observers(
+    root: &GuardedPath,
+    workspace: &Workspace,
+    cursor: Option<&str>,
+    options: TraversalOptions,
+    include_entry: impl Fn(&Utf8Path, &Utf8Path, bool, bool) -> Option<u8>,
+    retain_cursor_snapshot: bool,
+    after_ignore_capture: impl FnOnce() -> Result<(), ToolError>,
+    before_ignore_revalidation: impl FnOnce() -> Result<(), ToolError>,
+    before_release: impl FnOnce(usize, usize) -> Result<(), ToolError>,
+) -> Result<TraversalPage, ToolError> {
+    if !retain_cursor_snapshot && options.include_directories {
+        return Err(ToolError::Message(
+            "non-paginated filtered traversal supports regular files only".to_string(),
+        ));
+    }
     let requested_root_handle = PathGuard::open_validated_metadata_handle(root)?;
     if !requested_root_handle.metadata()?.is_dir() {
         return Err(ToolError::Message(format!(
@@ -391,6 +595,8 @@ fn walk_page_with_observers(
     let mut continuation = None;
     let mut exhausted = true;
     let mut retained_files = Vec::<(GuardedPath, fs::File)>::new();
+    let mut entry_priorities = Vec::<u8>::new();
+    let mut selection_truncated = false;
 
     for entry in builder.build() {
         if let Some(error) = filter_error
@@ -446,17 +652,40 @@ fn walk_page_with_observers(
         if (!is_directory || !options.include_directories) && (!is_file || !options.include_files) {
             continue;
         }
-        if entries.len() >= result_limit {
-            continuation = Some(path);
-            exhausted = false;
-            break;
-        }
         let relative_path = PathGuard::relative_path_from_root(&path, &traversal_root)
             .ok_or_else(|| {
                 ToolError::Message(format!(
                     "traversal entry `{path}` could not be projected relative to root `{traversal_root}`"
                 ))
             })?;
+        let Some(entry_priority) = include_entry(&path, &relative_path, is_directory, is_file)
+        else {
+            continue;
+        };
+        let replacement_index = if entries.len() >= result_limit {
+            if retain_cursor_snapshot {
+                continuation = Some(path);
+                exhausted = false;
+                break;
+            }
+            selection_truncated = true;
+            let worst_priority = entry_priorities
+                .iter()
+                .copied()
+                .max()
+                .expect("a full traversal result has a priority");
+            if entry_priority >= worst_priority {
+                continue;
+            }
+            Some(
+                entry_priorities
+                    .iter()
+                    .rposition(|priority| *priority == worst_priority)
+                    .expect("the worst traversal priority is present"),
+            )
+        } else {
+            None
+        };
         let size_bytes = if is_file {
             let guarded = PathGuard::require_descendant(workspace, &traversal_guard, &path)?;
             let handle = PathGuard::open_validated_metadata_handle(&guarded)?;
@@ -475,14 +704,29 @@ fn walk_page_with_observers(
         } else {
             None
         };
-        entries.push(TraversalEntry {
+        let selected_entry = TraversalEntry {
             depth: relative_path.components().count(),
             relative_path,
             path,
             is_directory,
             size_bytes,
             cursor: String::new(),
-        });
+        };
+        if let Some(index) = replacement_index {
+            debug_assert!(!selected_entry.is_directory);
+            #[cfg(windows)]
+            {
+                let retained = retained_files
+                    .pop()
+                    .expect("a selected diagnostic file retains its validated handle");
+                retained_files[index] = retained;
+            }
+            entries[index] = selected_entry;
+            entry_priorities[index] = entry_priority;
+        } else {
+            entries.push(selected_entry);
+            entry_priorities.push(entry_priority);
+        }
     }
 
     if let Some(error) = filter_error
@@ -520,21 +764,41 @@ fn walk_page_with_observers(
         .expect("retained traversal directory mutex poisoned")
         .len();
     before_release(retained_directory_count, retained_files.len())?;
-    snapshot.admissible_resumes.clear();
-    for entry in &mut entries {
-        entry.cursor = register_resume_cursor(&snapshot_id, &mut snapshot, &entry.path)?;
+    if !retain_cursor_snapshot {
+        let mut ranked_entries = entries
+            .into_iter()
+            .zip(entry_priorities)
+            .collect::<Vec<_>>();
+        ranked_entries.sort_by(|(left, left_priority), (right, right_priority)| {
+            left_priority.cmp(right_priority).then_with(|| {
+                compare_traversal_path(
+                    left.relative_path.as_std_path(),
+                    right.relative_path.as_std_path(),
+                )
+            })
+        });
+        entries = ranked_entries.into_iter().map(|(entry, _)| entry).collect();
     }
-    let continuation = continuation
-        .as_ref()
-        .map(|path| register_resume_cursor(&snapshot_id, &mut snapshot, path))
-        .transpose()?;
-    if !entries.is_empty() || continuation.is_some() {
-        workspace.traversal_registry.store(snapshot_id, snapshot)?;
-    }
+    let continuation = if retain_cursor_snapshot {
+        snapshot.admissible_resumes.clear();
+        for entry in &mut entries {
+            entry.cursor = register_resume_cursor(&snapshot_id, &mut snapshot, &entry.path)?;
+        }
+        let continuation = continuation
+            .as_ref()
+            .map(|path| register_resume_cursor(&snapshot_id, &mut snapshot, path))
+            .transpose()?;
+        if !entries.is_empty() || continuation.is_some() {
+            workspace.traversal_registry.store(snapshot_id, snapshot)?;
+        }
+        continuation
+    } else {
+        None
+    };
 
     Ok(TraversalPage {
         entries,
-        truncated: !exhausted,
+        truncated: !exhausted || selection_truncated,
         continuation,
         visited_entries,
     })
@@ -1290,8 +1554,9 @@ mod tests {
 
     use super::{
         MAX_ACTIVE_ONE_SHOT_CONTINUATIONS, TraversalOptions, TraversalRegistry,
-        capture_ignore_source_with_observers, compare_traversal_path, walk_page,
-        walk_page_with_before_release, walk_page_with_observers,
+        capture_ignore_source_with_observers, compare_traversal_path,
+        find_exact_workspace_file_candidates_with_limits, find_similar_sibling_file_candidates,
+        walk_page, walk_page_with_before_release, walk_page_with_observers,
     };
 
     #[cfg(windows)]
@@ -2498,6 +2763,202 @@ mod tests {
 
         assert_eq!(second.entries[0].relative_path, "b.txt");
         assert!(!second.entries[0].relative_path.is_absolute());
+    }
+
+    #[test]
+    fn exact_file_candidates_are_regular_workspace_files_matched_by_basename_or_suffix() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let container =
+            Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 container");
+        let root = container.join("workspace");
+        let protected = root.join("protected");
+        let outside = container.join("outside");
+        for directory in [
+            root.join("a"),
+            root.join("b"),
+            root.join("c/src"),
+            root.join("directory/target.rs"),
+            protected.clone(),
+            outside.clone(),
+        ] {
+            std::fs::create_dir_all(directory).expect("candidate fixture directory");
+        }
+        for path in [
+            root.join("a/target.rs"),
+            root.join("b/target.rs"),
+            root.join("c/src/lib.rs"),
+            protected.join("target.rs"),
+            outside.join("target.rs"),
+        ] {
+            std::fs::write(path, "fixture").expect("candidate fixture file");
+        }
+        let mut workspace =
+            WorkspaceDiscovery::discover_fixed_root(&root, &ResolvedConfig::default())
+                .expect("workspace");
+        workspace.protected_paths.push(protected);
+
+        let scan = find_exact_workspace_file_candidates_with_limits(
+            &workspace,
+            "target.rs",
+            Some(camino::Utf8Path::new("src/lib.rs")),
+            5,
+            128,
+        )
+        .expect("exact candidate scan");
+
+        assert_eq!(
+            scan.paths,
+            vec![
+                Utf8PathBuf::from("c/src/lib.rs"),
+                Utf8PathBuf::from("a/target.rs"),
+                Utf8PathBuf::from("b/target.rs"),
+            ]
+        );
+        assert!(!scan.truncated);
+        assert!(scan.paths.iter().all(|path| !path.is_absolute()));
+        assert!(
+            workspace
+                .traversal_registry
+                .inner
+                .lock()
+                .expect("traversal registry")
+                .snapshots
+                .is_empty(),
+            "diagnostic scans must not evict or consume user traversal cursors"
+        );
+    }
+
+    #[test]
+    fn exact_file_candidate_scan_caps_results_and_visits() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root =
+            Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 workspace");
+        for directory in [root.join("a"), root.join("b"), root.join("c")] {
+            std::fs::create_dir_all(directory).expect("candidate fixture directory");
+        }
+        for path in [
+            root.join("a/target.rs"),
+            root.join("b/target.rs"),
+            root.join("c/target.rs"),
+        ] {
+            std::fs::write(path, "fixture").expect("candidate fixture file");
+        }
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &ResolvedConfig::default())
+            .expect("workspace");
+
+        let result_capped =
+            find_exact_workspace_file_candidates_with_limits(&workspace, "target.rs", None, 2, 128)
+                .expect("result-bounded scan");
+        assert_eq!(result_capped.paths.len(), 2);
+        assert!(result_capped.truncated);
+
+        let visit_capped =
+            find_exact_workspace_file_candidates_with_limits(&workspace, "target.rs", None, 5, 1)
+                .expect("visit-bounded scan");
+        assert!(visit_capped.paths.is_empty());
+        assert!(visit_capped.truncated);
+    }
+
+    #[test]
+    fn exact_file_candidate_scan_prioritizes_suffix_beyond_the_basename_cap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root =
+            Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 workspace");
+        for index in 0..6 {
+            let directory = root.join(format!("a{index}"));
+            std::fs::create_dir_all(&directory).expect("basename fixture directory");
+            std::fs::write(directory.join("target.rs"), "fixture").expect("basename fixture file");
+        }
+        let suffix_directory = root.join("z/preferred");
+        std::fs::create_dir_all(&suffix_directory).expect("suffix fixture directory");
+        std::fs::write(suffix_directory.join("target.rs"), "fixture").expect("suffix fixture file");
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &ResolvedConfig::default())
+            .expect("workspace");
+
+        let scan = find_exact_workspace_file_candidates_with_limits(
+            &workspace,
+            "target.rs",
+            Some(camino::Utf8Path::new("preferred/target.rs")),
+            5,
+            128,
+        )
+        .expect("priority candidate scan");
+
+        assert_eq!(
+            scan.paths,
+            vec![
+                Utf8PathBuf::from("z/preferred/target.rs"),
+                Utf8PathBuf::from("a0/target.rs"),
+                Utf8PathBuf::from("a1/target.rs"),
+                Utf8PathBuf::from("a2/target.rs"),
+                Utf8PathBuf::from("a3/target.rs"),
+            ]
+        );
+        assert!(scan.truncated);
+    }
+
+    #[test]
+    fn similar_sibling_candidates_recover_repository_typo_without_registry_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root =
+            Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 workspace");
+        let parent = root.join("backend/app/infrastructure/repositories");
+        std::fs::create_dir_all(&parent).expect("repository fixture directory");
+        std::fs::write(parent.join("__init__.py"), "fixture").expect("unrelated fixture");
+        std::fs::write(parent.join("sqlite_repositories.py"), "fixture").expect("similar fixture");
+        std::fs::write(root.join("z.txt"), "fixture").expect("pagination fixture");
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &ResolvedConfig::default())
+            .expect("workspace");
+        let public_page = walk_page(
+            &root,
+            &workspace,
+            None,
+            TraversalOptions {
+                include_hidden: false,
+                max_depth: Some(1),
+                include_files: true,
+                include_directories: true,
+                result_limit: 1,
+                visit_limit: 16,
+            },
+        )
+        .expect("public pagination seed");
+        assert!(public_page.continuation.is_some());
+        let registry_before = {
+            let registry = workspace
+                .traversal_registry
+                .inner
+                .lock()
+                .expect("traversal registry");
+            let mut snapshots = registry.snapshots.keys().cloned().collect::<Vec<_>>();
+            snapshots.sort();
+            (snapshots, registry.one_shot_continuations.len())
+        };
+
+        let scan = find_similar_sibling_file_candidates(
+            &workspace,
+            &parent.join("sqlite_run_repository.py"),
+        )
+        .expect("similar sibling scan");
+
+        assert_eq!(
+            scan.paths,
+            vec![Utf8PathBuf::from(
+                "backend/app/infrastructure/repositories/sqlite_repositories.py"
+            )]
+        );
+        assert!(!scan.truncated);
+        let registry_after = {
+            let registry = workspace
+                .traversal_registry
+                .inner
+                .lock()
+                .expect("traversal registry");
+            let mut snapshots = registry.snapshots.keys().cloned().collect::<Vec<_>>();
+            snapshots.sort();
+            (snapshots, registry.one_shot_continuations.len())
+        };
+        assert_eq!(registry_after, registry_before);
     }
 
     #[cfg(windows)]

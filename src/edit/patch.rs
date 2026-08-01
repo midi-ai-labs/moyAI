@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::PatchError;
 
+const MAX_PATCH_FAILURE_CANDIDATE_LINES: usize = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PatchLine {
     Context(String),
@@ -107,6 +109,16 @@ impl PatchParser {
                         "update file section `{path}` must include at least one hunk; after `*** Update File: {path}`, add `@@`, then prefix each body line with one space for context, `-` for deletion, or `+` for insertion"
                     )));
                 }
+                let has_change_marker = hunks
+                    .iter()
+                    .flat_map(|hunk| &hunk.lines)
+                    .any(|line| matches!(line, PatchLine::Insert(_) | PatchLine::Delete(_)));
+                if !has_change_marker && move_to.is_none() {
+                    return Err(PatchError::Message(
+                        "apply_patch failure kind=missing_change_markers; an Update must contain at least one `+` insertion or `-` deletion; context lines identify existing content and are not replacement content"
+                            .to_string(),
+                    ));
+                }
                 operations.push(PatchOperation::Update {
                     path: Utf8PathBuf::from(path),
                     hunks,
@@ -133,6 +145,14 @@ impl PatchParser {
     }
 
     pub fn apply_to_text(original: &str, hunks: &[PatchChunk]) -> Result<String, PatchError> {
+        Self::apply_to_text_with_diagnostics(original, hunks, false)
+    }
+
+    pub(crate) fn apply_to_text_with_diagnostics(
+        original: &str,
+        hunks: &[PatchChunk],
+        include_target_diagnostics: bool,
+    ) -> Result<String, PatchError> {
         let original_lines = original
             .lines()
             .map(|line| line.to_string())
@@ -140,8 +160,15 @@ impl PatchParser {
         let mut replacements = Vec::new();
         let mut line_index = 0usize;
 
-        for hunk in hunks {
-            line_index = locate_change_context_start(&original_lines, hunk, line_index)?;
+        for (hunk_index, hunk) in hunks.iter().enumerate() {
+            let hunk_number = hunk_index.saturating_add(1);
+            line_index = locate_change_context_start(
+                &original_lines,
+                hunk,
+                line_index,
+                hunk_number,
+                include_target_diagnostics,
+            )?;
             let old_segment = old_segment_for_hunk(hunk);
             let new_segment = new_segment_for_hunk(hunk);
             if old_segment.is_empty() {
@@ -155,6 +182,9 @@ impl PatchParser {
                 line_index,
                 &old_segment,
                 &new_segment,
+                hunk_number,
+                original.ends_with('\n'),
+                include_target_diagnostics,
             )?;
             replacements.push((start, matched_old_len, replacement));
             line_index = start + matched_old_len;
@@ -173,6 +203,8 @@ fn locate_change_context_start(
     original_lines: &[String],
     hunk: &PatchChunk,
     cursor: usize,
+    hunk_number: usize,
+    include_target_diagnostics: bool,
 ) -> Result<usize, PatchError> {
     let Some(change_context) = &hunk.change_context else {
         return Ok(cursor);
@@ -183,8 +215,17 @@ fn locate_change_context_start(
         cursor,
         false,
     ) else {
+        let target_detail = if include_target_diagnostics {
+            format!(
+                " search_start_line={} target_lines={}",
+                cursor.saturating_add(1),
+                original_lines.len()
+            )
+        } else {
+            String::new()
+        };
         return Err(PatchError::Message(format!(
-            "failed to find context `{change_context}`"
+            "apply_patch failure kind=named_context_not_found hunk={hunk_number}{target_detail}; the named `@@ context` was not found after the prior hunk, so read the target around the search start and regenerate this hunk"
         )));
     };
     Ok(found + 1)
@@ -263,6 +304,9 @@ fn locate_hunk_replacement(
     cursor: usize,
     old_segment: &[String],
     new_segment: &[String],
+    hunk_number: usize,
+    target_trailing_newline: bool,
+    include_target_diagnostics: bool,
 ) -> Result<(usize, usize, Vec<String>), PatchError> {
     let mut old_pattern = old_segment;
     let mut new_pattern = new_segment;
@@ -279,11 +323,120 @@ fn locate_hunk_replacement(
     found
         .map(|start| (start, old_pattern.len(), new_pattern.to_vec()))
         .ok_or_else(|| {
-            PatchError::Message(format!(
-                "failed to find expected lines `{}`",
-                old_segment.join("\\n")
-            ))
+            patch_context_mismatch_error(
+                original_lines,
+                old_pattern,
+                cursor,
+                hunk_number,
+                hunk.is_end_of_file,
+                target_trailing_newline,
+                old_segment.last().is_some_and(String::is_empty),
+                include_target_diagnostics,
+            )
         })
+}
+
+fn patch_context_mismatch_error(
+    original_lines: &[String],
+    old_pattern: &[String],
+    cursor: usize,
+    hunk_number: usize,
+    is_end_of_file: bool,
+    target_trailing_newline: bool,
+    patch_tail_empty: bool,
+    include_target_diagnostics: bool,
+) -> PatchError {
+    let kind = if is_end_of_file {
+        "eof_context_mismatch"
+    } else {
+        "context_mismatch"
+    };
+    let expected_old_lines = old_pattern.len();
+    let target_detail = if !include_target_diagnostics {
+        String::new()
+    } else if is_end_of_file {
+        let target_lines = original_lines.len();
+        let required_tail_start_line = target_lines
+            .checked_sub(expected_old_lines)
+            .map(|index| index.saturating_add(1))
+            .map(|line| line.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        format!(
+            " search_start_line={} target_lines={target_lines} required_tail_start_line={required_tail_start_line} target_trailing_newline={target_trailing_newline} patch_tail_empty={patch_tail_empty}",
+            cursor.saturating_add(1)
+        )
+    } else {
+        let candidates =
+            patch_candidate_start_lines(original_lines, old_pattern, cursor).unwrap_or_default();
+        let candidates = if candidates.is_empty() {
+            "none".to_string()
+        } else {
+            candidates
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            " search_start_line={} target_lines={} candidate_start_lines={candidates}",
+            cursor.saturating_add(1),
+            original_lines.len()
+        )
+    };
+    let recovery = if is_end_of_file {
+        "read the final bounded range and regenerate the EOF-constrained hunk"
+    } else {
+        "read the target around the search start or candidate lines and regenerate this hunk"
+    };
+    PatchError::Message(format!(
+        "apply_patch failure kind={kind} hunk={hunk_number} expected_old_lines={expected_old_lines}{target_detail}; {recovery}"
+    ))
+}
+
+fn patch_candidate_start_lines(
+    lines: &[String],
+    pattern: &[String],
+    cursor: usize,
+) -> Option<Vec<usize>> {
+    let (anchor_offset, anchor) = pattern
+        .iter()
+        .enumerate()
+        .find(|(_, line)| !line.trim().is_empty())?;
+    let search_start = cursor.saturating_add(anchor_offset).min(lines.len());
+    let mut candidates = Vec::new();
+    for compare in [
+        exact_line_match as fn(&str, &str) -> bool,
+        trailing_whitespace_line_match,
+        surrounding_whitespace_line_match,
+        normalized_unicode_line_match,
+    ] {
+        for (actual_index, actual) in lines.iter().enumerate().skip(search_start) {
+            if !compare(actual, anchor) {
+                continue;
+            }
+            let Some(candidate_start) = actual_index.checked_sub(anchor_offset) else {
+                continue;
+            };
+            if candidate_start < cursor || candidates.contains(&candidate_start) {
+                continue;
+            }
+            candidates.push(candidate_start);
+            if candidates.len() == MAX_PATCH_FAILURE_CANDIDATE_LINES {
+                return Some(
+                    candidates
+                        .into_iter()
+                        .map(|index| index.saturating_add(1))
+                        .collect(),
+                );
+            }
+        }
+    }
+    Some(
+        candidates
+            .into_iter()
+            .map(|index| index.saturating_add(1))
+            .collect(),
+    )
 }
 
 fn old_segment_for_hunk(hunk: &PatchChunk) -> Vec<String> {
@@ -482,7 +635,7 @@ mod tests {
     #[test]
     fn bare_empty_line_in_explicit_update_hunk_is_empty_context() {
         let operations = PatchParser::parse(
-            "*** Begin Patch\n*** Update File: a.txt\n@@\n before\n\n after\n*** End Patch",
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n before\n\n-after\n+after\n*** End Patch",
         )
         .expect("bare empty update line should match Codex parser compatibility");
 
@@ -494,7 +647,8 @@ mod tests {
             vec![
                 PatchLine::Context("before".to_string()),
                 PatchLine::Context(String::new()),
-                PatchLine::Context("after".to_string()),
+                PatchLine::Delete("after".to_string()),
+                PatchLine::Insert("after".to_string()),
             ]
         );
         assert_eq!(
@@ -506,7 +660,7 @@ mod tests {
     #[test]
     fn bare_empty_line_in_implicit_update_hunk_is_empty_context() {
         let operations = PatchParser::parse(
-            "*** Begin Patch\n*** Update File: a.txt\n before\n\n after\n*** End Patch",
+            "*** Begin Patch\n*** Update File: a.txt\n before\n\n-after\n+after\n*** End Patch",
         )
         .expect("implicit hunk should share empty-context compatibility");
 
@@ -514,6 +668,35 @@ mod tests {
             panic!("expected update operation");
         };
         assert_eq!(hunks[0].lines[1], PatchLine::Context(String::new()));
+    }
+
+    #[test]
+    fn context_only_update_requires_explicit_change_markers() {
+        for patch in [
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n before\n after\n*** End Patch",
+            "*** Begin Patch\n*** Update File: a.txt\n before\n after\n*** End Patch",
+        ] {
+            let error = PatchParser::parse(patch)
+                .expect_err("context-only updates must fail before matching or mutation");
+            assert!(error.to_string().contains("kind=missing_change_markers"));
+        }
+    }
+
+    #[test]
+    fn move_with_context_remains_valid_without_content_change_markers() {
+        let operations = PatchParser::parse(
+            "*** Begin Patch\n*** Update File: old.txt\n*** Move to: new.txt\n@@\n existing\n*** End Patch",
+        )
+        .expect("a move may use context without changing file contents");
+
+        let super::PatchOperation::Update { move_to, hunks, .. } = &operations[0] else {
+            panic!("expected update operation");
+        };
+        assert_eq!(move_to.as_deref(), Some(camino::Utf8Path::new("new.txt")));
+        assert_eq!(
+            hunks[0].lines,
+            vec![PatchLine::Context("existing".to_string())]
+        );
     }
 
     #[test]
@@ -568,8 +751,52 @@ mod tests {
             PatchParser::apply_to_text("head\nanchor\ntail", hunks)
                 .expect_err("missing named context must not silently append")
                 .to_string()
-                .contains("failed to find context `definitely-absent`")
+                .contains("kind=named_context_not_found")
         );
+    }
+
+    #[test]
+    fn named_context_failure_does_not_echo_patch_or_target_content() {
+        let operations = PatchParser::parse(
+            "*** Begin Patch\n*** Update File: a.txt\n@@ patch-secret-context\n+appended\n*** End Patch",
+        )
+        .expect("named change context should parse");
+        let super::PatchOperation::Update { hunks, .. } = &operations[0] else {
+            panic!("expected update operation");
+        };
+
+        let message = PatchParser::apply_to_text("target-secret\nother", hunks)
+            .expect_err("missing named context")
+            .to_string();
+
+        assert!(message.contains("kind=named_context_not_found"));
+        assert!(message.contains("hunk=1"));
+        assert!(!message.contains("search_start_line"));
+        assert!(!message.contains("target_lines"));
+        assert!(!message.contains("patch-secret-context"));
+        assert!(!message.contains("target-secret"));
+    }
+
+    #[test]
+    fn workspace_named_context_failure_reports_position_without_source() {
+        let operations = PatchParser::parse(
+            "*** Begin Patch\n*** Update File: a.txt\n@@ patch-secret-context\n+appended\n*** End Patch",
+        )
+        .expect("named change context should parse");
+        let super::PatchOperation::Update { hunks, .. } = &operations[0] else {
+            panic!("expected update operation");
+        };
+
+        let message =
+            PatchParser::apply_to_text_with_diagnostics("target-secret\nother", hunks, true)
+                .expect_err("missing named context")
+                .to_string();
+
+        assert!(message.contains("kind=named_context_not_found"));
+        assert!(message.contains("search_start_line=1"));
+        assert!(message.contains("target_lines=2"));
+        assert!(!message.contains("patch-secret-context"));
+        assert!(!message.contains("target-secret"));
     }
 
     #[test]
@@ -667,8 +894,88 @@ mod tests {
             PatchParser::apply_to_text("old\ntrailing", hunks)
                 .expect_err("Codex EOF marker requires the old segment at the file ending")
                 .to_string()
-                .contains("failed to find expected lines")
+                .contains("kind=eof_context_mismatch")
         );
+    }
+
+    #[test]
+    fn context_mismatch_reports_at_most_three_candidate_lines_without_source() {
+        let operations = PatchParser::parse(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-anchor\n-missing-after-anchor\n+replacement\n*** End Patch",
+        )
+        .expect("patch");
+        let super::PatchOperation::Update { hunks, .. } = &operations[0] else {
+            panic!("expected update operation");
+        };
+        let original =
+            "secret\nanchor\ncurrent-a\nanchor\ncurrent-b\nanchor\ncurrent-c\nanchor\ncurrent-d";
+
+        let message = PatchParser::apply_to_text_with_diagnostics(original, hunks, true)
+            .expect_err("old segment must not match")
+            .to_string();
+
+        assert!(message.contains("kind=context_mismatch"));
+        assert!(message.contains("expected_old_lines=2"));
+        assert!(message.contains("candidate_start_lines=2,4,6"));
+        assert!(!message.contains("candidate_start_lines=2,4,6,8"));
+        for source in ["secret", "anchor", "current-a", "missing-after-anchor"] {
+            assert!(
+                !message.contains(source),
+                "diagnostic leaked source or patch content `{source}`: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_only_context_mismatch_omits_content_derived_candidates() {
+        let operations = PatchParser::parse(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-anchor\n-missing\n+replacement\n*** End Patch",
+        )
+        .expect("patch");
+        let super::PatchOperation::Update { hunks, .. } = &operations[0] else {
+            panic!("expected update operation");
+        };
+
+        let message = PatchParser::apply_to_text_with_diagnostics(
+            "external-secret\nanchor\ncurrent",
+            hunks,
+            false,
+        )
+        .expect_err("old segment must not match")
+        .to_string();
+
+        assert!(message.contains("kind=context_mismatch"));
+        assert!(!message.contains("candidate_start_lines"));
+        assert!(!message.contains("search_start_line"));
+        assert!(!message.contains("target_lines"));
+        assert!(!message.contains("external-secret"));
+        assert!(!message.contains("current"));
+    }
+
+    #[test]
+    fn eof_mismatch_reports_tail_shape_and_newline_without_source() {
+        let operations = PatchParser::parse(
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-source-old-secret\n+new\n*** End of File\n*** End Patch",
+        )
+        .expect("patch");
+        let super::PatchOperation::Update { hunks, .. } = &operations[0] else {
+            panic!("expected update operation");
+        };
+
+        let message = PatchParser::apply_to_text_with_diagnostics(
+            "source-old-secret\ntrailing-secret\n",
+            hunks,
+            true,
+        )
+        .expect_err("old segment is not at EOF")
+        .to_string();
+
+        assert!(message.contains("kind=eof_context_mismatch"));
+        assert!(message.contains("required_tail_start_line=2"));
+        assert!(message.contains("target_trailing_newline=true"));
+        assert!(message.contains("patch_tail_empty=false"));
+        assert!(!message.contains("source-old-secret"));
+        assert!(!message.contains("trailing-secret"));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::edit::{
     CommittedFileMutation, FileContentIdentity, FormatterExecutionOptions, PatchOperation,
     PatchParser, ensure_edit_read_limit, path_for_change_storage,
 };
-use crate::error::{EditError, ToolError};
+use crate::error::{EditError, PatchError, ToolError};
 use crate::session::ChangeRepository;
 use crate::tool::context::{ToolContext, ToolEffectAdmission, ToolFormatterPlan};
 use crate::tool::registry::Tool;
@@ -26,9 +26,11 @@ pub struct ApplyPatchInput {
     pub patch_text: String,
 }
 
-const APPLY_PATCH_DESCRIPTION: &str = "Apply a structured patch to one or more files using the exact `*** Begin Patch` / `*** End Patch` grammar. For an existing file, use `*** Update File: path`, then `@@` (or `@@ context` to continue after that named source line), and canonically prefix every hunk body line with one space for unchanged context, `-` for deletion, or `+` for insertion; a physically empty body line is also accepted as empty context for Codex compatibility. Put optional `*** End of File` after a non-empty hunk to require its old lines at the file ending. Update hunks are matched against the current UTF-8 file contents; if context does not match, read the relevant range and regenerate the hunk. A bare `@@` hunk containing only `+` lines appends those lines at end of file; it does not replace existing content. For a new file, use `*** Add File: path` and prefix every content line with `+`; delete with `*** Delete File: path`. Use only one content-changing section per path in a call and group multiple edits as `@@` hunks in that section. After a successful write/apply_patch, the resulting file contents become the current edit baseline unless another tool changes the file.";
+const APPLY_PATCH_DESCRIPTION: &str = "Apply a structured patch to one or more files using the exact `*** Begin Patch` / `*** End Patch` grammar. For an existing file, use `*** Update File: path`, then `@@` (or `@@ context` to continue after that named source line), and canonically prefix every hunk body line with one space for unchanged context, `-` for deletion, or `+` for insertion; a physically empty body line is also accepted as empty context for Codex compatibility. Every non-move Update section must contain at least one `-` deletion or `+` insertion across its hunks; context-only Updates are invalid. Put optional `*** End of File` after a non-empty hunk to require its old lines at the file ending. Update hunks are matched against the current UTF-8 file contents; if context does not match, read the relevant range and regenerate the hunk. A bare `@@` hunk containing only `+` lines appends those lines at end of file; it does not replace existing content. For a new file, use `*** Add File: path` and prefix every content line with `+`; delete with `*** Delete File: path`. Use only one content-changing section per path in a call and group multiple edits as `@@` hunks in that section. After a successful write/apply_patch, the resulting file contents become the current edit baseline unless another tool changes the file.";
 
-const APPLY_PATCH_TEXT_DESCRIPTION: &str = "Entire patch text. It must start with `*** Begin Patch` and end with `*** End Patch`. Update example: `*** Begin Patch\n*** Update File: a.txt\n@@\n unchanged\n-before\n+after\n*** End Patch`; the leading space before `unchanged` is required. Canonically, each update hunk body line starts with space (context), `-` (delete), or `+` (insert); a physically empty body line is accepted as empty context. Use `@@ context` only when the named source line must anchor the following hunk. Put optional `*** End of File` after the hunk body to require the old lines at EOF. A bare `@@` hunk with only `+` lines appends them at EOF without replacing existing content. Use one `*** Update File` section per path and put multiple edits in multiple `@@` hunks. An optional `*** Move to: new-path` goes immediately after the Update header. For new files, use `*** Add File: path` and prefix every added line with `+`, including blank lines and top-level code or declaration lines. Delete with `*** Delete File: path`. Do not include unified diff file markers such as `---` or `+++`.";
+const APPLY_PATCH_TEXT_DESCRIPTION: &str = "Entire patch text. It must start with `*** Begin Patch` and end with `*** End Patch`. Update example: `*** Begin Patch\n*** Update File: a.txt\n@@\n unchanged\n-before\n+after\n*** End Patch`; the leading space before `unchanged` is required. Canonically, each update hunk body line starts with space (context), `-` (delete), or `+` (insert); a physically empty body line is accepted as empty context. Every non-move Update section must contain at least one `-` deletion or `+` insertion across its hunks; context-only Updates are invalid. Use `@@ context` only when the named source line must anchor the following hunk. Put optional `*** End of File` after the hunk body to require the old lines at EOF. A bare `@@` hunk with only `+` lines appends them at EOF without replacing existing content. Use one `*** Update File` section per path and put multiple edits in multiple `@@` hunks. An optional `*** Move to: new-path` goes immediately after the Update header. For new files, use `*** Add File: path` and prefix every added line with `+`, including blank lines and top-level code or declaration lines. Delete with `*** Delete File: path`. Do not include unified diff file markers such as `---` or `+++`.";
+const MAX_APPLY_PATCH_DIAGNOSTIC_BYTES: usize = 2 * 1024;
+const MAX_APPLY_PATCH_DIAGNOSTIC_PATH_BYTES: usize = 512;
 
 #[derive(Debug, Default)]
 pub struct ApplyPatchTool;
@@ -59,7 +61,8 @@ impl Tool for ApplyPatchTool {
         mut ctx: ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
         let input = serde_json::from_value::<ApplyPatchInput>(raw_arguments)?;
-        let operations = PatchParser::parse(&input.patch_text).map_err(ToolError::Patch)?;
+        let operations =
+            PatchParser::parse(&input.patch_text).map_err(bounded_patch_parser_error)?;
         validate_apply_patch_participant_ownership(&ctx, operations.as_slice())?;
         let permission_admission =
             build_patch_permission_admission(ctx.config, ctx.workspace, operations.as_slice())?;
@@ -758,6 +761,23 @@ fn truncate_utf8_bytes(value: &str, maximum_bytes: usize) -> String {
     bounded
 }
 
+fn bounded_patch_parser_error(error: PatchError) -> ToolError {
+    ToolError::Patch(PatchError::Message(truncate_utf8_bytes(
+        &error.to_string(),
+        MAX_APPLY_PATCH_DIAGNOSTIC_BYTES,
+    )))
+}
+
+fn bounded_patch_application_error(path: &Utf8Path, error: PatchError) -> ToolError {
+    let bounded_path = truncate_utf8_bytes(path.as_str(), MAX_APPLY_PATCH_DIAGNOSTIC_PATH_BYTES);
+    let prefix = format!("apply_patch could not update requested path `{bounded_path}`: ");
+    let detail = truncate_utf8_bytes(
+        &error.to_string(),
+        MAX_APPLY_PATCH_DIAGNOSTIC_BYTES.saturating_sub(prefix.len()),
+    );
+    ToolError::from(EditError::Message(format!("{prefix}{detail}")))
+}
+
 fn rollback_patch_mutation(
     mutation: &PatchMutation,
     committed_state: &CommittedFileState,
@@ -955,8 +975,12 @@ async fn classify_patch_operations_before_side_effects(
                     &guarded,
                     ctx.config.file_guard.max_inline_read_bytes,
                 )?;
-                let patched = PatchParser::apply_to_text(&original, hunks)
-                    .map_err(|error| crate::error::EditError::Message(error.to_string()))?;
+                let patched = PatchParser::apply_to_text_with_diagnostics(
+                    &original,
+                    hunks,
+                    guarded.inside_workspace,
+                )
+                .map_err(|error| bounded_patch_application_error(path, error))?;
                 let normalized = ctx.services.formatter.normalize_text(
                     &ctx.config.format,
                     &destination,
@@ -1492,8 +1516,10 @@ mod tests {
 
     use super::{
         APPLY_PATCH_TEXT_DESCRIPTION, ApplyPatchTool, CommittedFileState, FileRollbackState,
-        PatchMutation, apply_patch_mutations, build_patch_permission_admission,
-        committed_file_mutations, restore_file_state, validate_patch_formatter_plan_target,
+        MAX_APPLY_PATCH_DIAGNOSTIC_BYTES, PatchMutation, apply_patch_mutations,
+        bounded_patch_application_error, bounded_patch_parser_error,
+        build_patch_permission_admission, committed_file_mutations, restore_file_state,
+        validate_patch_formatter_plan_target,
     };
 
     #[derive(Default)]
@@ -1563,6 +1589,8 @@ mod tests {
             "`*** End of File`",
             "require the old lines at EOF",
             "physically empty",
+            "non-move Update section",
+            "context-only Updates are invalid",
             "appends them at EOF",
             "one `*** Update File` section per path",
             "*** Move to: new-path",
@@ -1585,6 +1613,34 @@ mod tests {
 
         let advertised = "*** Begin Patch\n*** Update File: a.txt\n@@\n unchanged\n-before\n+after\n*** End Patch";
         PatchParser::parse(advertised).expect("advertised update example must remain parseable");
+    }
+
+    #[test]
+    fn patch_failure_diagnostics_are_utf8_bounded() {
+        let oversized = "診断".repeat(MAX_APPLY_PATCH_DIAGNOSTIC_BYTES);
+        let parser_error =
+            bounded_patch_parser_error(crate::error::PatchError::Message(oversized.clone()));
+        let crate::error::ToolError::Patch(crate::error::PatchError::Message(parser_message)) =
+            parser_error
+        else {
+            panic!("parser error must retain the patch error surface");
+        };
+        assert!(parser_message.len() <= MAX_APPLY_PATCH_DIAGNOSTIC_BYTES);
+        assert!(parser_message.is_char_boundary(parser_message.len()));
+
+        let long_path = Utf8PathBuf::from(format!("{}.txt", "長".repeat(1_024)));
+        let application_error = bounded_patch_application_error(
+            &long_path,
+            crate::error::PatchError::Message(oversized),
+        );
+        let crate::error::ToolError::Edit(crate::error::EditError::Message(application_message)) =
+            application_error
+        else {
+            panic!("application error must retain the pre-commit edit failure surface");
+        };
+        assert!(application_message.len() <= MAX_APPLY_PATCH_DIAGNOSTIC_BYTES);
+        assert!(application_message.is_char_boundary(application_message.len()));
+        assert!(application_message.contains("...[truncated]"));
     }
 
     #[tokio::test]

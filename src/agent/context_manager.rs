@@ -7,9 +7,10 @@ use crate::context::ContextWindowTokenStatus;
 use crate::llm::{ChatRequest, ModelContentPart, ModelMessage, ModelToolCall};
 use crate::protocol::{
     CompactionLayout, CompactionMode, ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload,
-    HistoryScope, ModelResponseId,
+    HistoryScope, ModelResponseId, ToolLifecycleStatus,
 };
 use crate::session::{DurableTurnTerminal, TokenUsage};
+use crate::tool::truncate::{clip_text_head_tail_with_marker, clip_text_with_ellipsis};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryRevision(String);
@@ -322,6 +323,7 @@ impl ContextManager {
                 | HistoryItemPayload::Compaction { .. } => return None,
                 HistoryItemPayload::ToolOutput {
                     call_id,
+                    status,
                     output_text,
                     metadata,
                     ..
@@ -330,7 +332,12 @@ impl ContextManager {
                     messages.push(ModelMessage::Tool {
                         call_id: model_call_id.clone(),
                         tool_name: tool_name.clone(),
-                        result: model_visible_tool_output(tool_name, output_text, metadata),
+                        result: model_visible_tool_output(
+                            tool_name,
+                            *status,
+                            output_text,
+                            metadata,
+                        ),
                         metadata: serde_json::Value::Null,
                     });
                 }
@@ -788,6 +795,7 @@ fn project_model_messages(
             HistoryItemPayload::ToolCall { .. } => {}
             HistoryItemPayload::ToolOutput {
                 call_id,
+                status,
                 output_text,
                 metadata,
                 ..
@@ -796,7 +804,8 @@ fn project_model_messages(
                 if let Some((model_call_id, tool_name)) =
                     tool_names_by_call.get(&call_id_text).cloned()
                 {
-                    let result = model_visible_tool_output(&tool_name, output_text, metadata);
+                    let result =
+                        model_visible_tool_output(&tool_name, *status, output_text, metadata);
                     projected.push((
                         index,
                         1,
@@ -858,9 +867,13 @@ fn project_model_messages(
 }
 
 const WORKSPACE_WRITE_EFFECT_TEMP_ACCESS_DENIED_NOTE: &str = "Sandbox note: this workspace-write run matched the known protected effect-TEMP access-denied signature. No retry occurred. If this exact command is required and the workspace is trusted, issue a new shell call with sandbox_permissions=require_escalated and concise justification; do not change project files solely to bypass this sandbox restriction.";
+const MODEL_VISIBLE_NON_SUCCESS_MAX_BYTES: usize = 2 * 1024;
+const TOOL_EVIDENCE_LABEL: &str = "\n\nTool evidence (bounded; canonical result unchanged):\n";
+const TOOL_EVIDENCE_OMISSION_MARKER: &str = "\n[... tool evidence omitted ...]\n";
 
 fn model_visible_tool_output(
     tool_name: &str,
+    status: ToolLifecycleStatus,
     output_text: &str,
     metadata: &serde_json::Value,
 ) -> String {
@@ -868,6 +881,24 @@ fn model_visible_tool_output(
         .get("tool_metadata")
         .filter(|value| value.is_object())
         .unwrap_or(metadata);
+    let sandbox_failure_hint =
+        tool_metadata
+            .get("sandbox_failure_hint")
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<crate::tool::shell::ShellSandboxFailureHint>(value).ok()
+            });
+    if let Some(kind) =
+        model_visible_non_success_kind(tool_name, status, tool_metadata, sandbox_failure_hint)
+    {
+        return bounded_model_visible_non_success_output(
+            tool_name,
+            status,
+            kind,
+            output_text,
+            tool_metadata,
+        );
+    }
     let output_truncated = tool_metadata
         .get("truncated")
         .and_then(serde_json::Value::as_bool)
@@ -920,32 +951,133 @@ fn model_visible_tool_output(
         }
         return append_model_visible_lines(output_text, &lines);
     }
-    let sandbox_failure_hint =
-        tool_metadata
-            .get("sandbox_failure_hint")
-            .cloned()
-            .and_then(|value| {
-                serde_json::from_value::<crate::tool::shell::ShellSandboxFailureHint>(value).ok()
-            });
-    if tool_name == "shell"
-        && sandbox_failure_hint
-            == Some(
-                crate::tool::shell::ShellSandboxFailureHint::WorkspaceWriteEffectTempAccessDenied,
-            )
-    {
-        return append_model_visible_paragraph_once(
-            output_text,
-            WORKSPACE_WRITE_EFFECT_TEMP_ACCESS_DENIED_NOTE,
-        );
-    }
     output_text.to_string()
 }
 
-fn append_model_visible_paragraph_once(output_text: &str, paragraph: &str) -> String {
-    if output_text.contains(paragraph) {
-        return output_text.to_string();
+fn model_visible_non_success_kind(
+    tool_name: &str,
+    status: ToolLifecycleStatus,
+    tool_metadata: &serde_json::Value,
+    sandbox_failure_hint: Option<crate::tool::shell::ShellSandboxFailureHint>,
+) -> Option<&'static str> {
+    if tool_name == "shell" {
+        if sandbox_failure_hint
+            == Some(
+                crate::tool::shell::ShellSandboxFailureHint::WorkspaceWriteEffectTempAccessDenied,
+            )
+        {
+            return Some("workspace_write_effect_temp_access_denied");
+        }
+        for (field, kind) in [
+            ("timeout", "process_timeout"),
+            ("cancelled", "process_cancelled"),
+            ("cleanup_failed", "process_cleanup_failed"),
+        ] {
+            if tool_metadata
+                .get(field)
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                return Some(kind);
+            }
+        }
+        if tool_metadata
+            .get("exit_code")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|exit_code| exit_code != 0)
+        {
+            return Some("process_exit_nonzero");
+        }
     }
-    append_model_visible_lines(output_text, &[paragraph.to_string()])
+    if tool_metadata
+        .get("no_content_change")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return Some("no_content_change");
+    }
+    if status == ToolLifecycleStatus::Failed {
+        return Some("tool_execution_failed");
+    }
+    if status == ToolLifecycleStatus::Completed
+        && tool_metadata
+            .get("success")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+    {
+        return Some("tool_reported_non_success");
+    }
+    None
+}
+
+fn bounded_model_visible_non_success_output(
+    tool_name: &str,
+    status: ToolLifecycleStatus,
+    kind: &str,
+    output_text: &str,
+    tool_metadata: &serde_json::Value,
+) -> String {
+    let quoted_tool_name = serde_json::to_string(tool_name)
+        .expect("serializing a tool name as a JSON string cannot fail");
+    let mut lines = vec![
+        "Tool outcome (host projection): non-success".to_string(),
+        format!("tool: {}", clip_text_with_ellipsis(&quoted_tool_name, 256)),
+        format!("lifecycle_status: {}", tool_lifecycle_status_label(status)),
+        format!("kind: {kind}"),
+        "automatic_retry: false".to_string(),
+    ];
+    if let Some(exit_code) = tool_metadata
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+    {
+        lines.push(format!("exit_code: {exit_code}"));
+    }
+    for (field, label) in [
+        ("truncated", "preview_truncated"),
+        ("stdout_capture_truncated", "stdout_capture_truncated"),
+        ("stderr_capture_truncated", "stderr_capture_truncated"),
+    ] {
+        if tool_metadata
+            .get(field)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            lines.push(format!("{label}: true"));
+        }
+    }
+    if kind == "workspace_write_effect_temp_access_denied" {
+        lines.push(format!(
+            "guidance: {WORKSPACE_WRITE_EFFECT_TEMP_ACCESS_DENIED_NOTE}"
+        ));
+    }
+
+    let header = lines.join("\n");
+    if output_text.is_empty() {
+        return clip_text_with_ellipsis(&header, MODEL_VISIBLE_NON_SUCCESS_MAX_BYTES);
+    }
+    let prefix = format!("{header}{TOOL_EVIDENCE_LABEL}");
+    if prefix.len() >= MODEL_VISIBLE_NON_SUCCESS_MAX_BYTES {
+        return clip_text_with_ellipsis(&prefix, MODEL_VISIBLE_NON_SUCCESS_MAX_BYTES);
+    }
+    let evidence = clip_text_head_tail_with_marker(
+        output_text,
+        MODEL_VISIBLE_NON_SUCCESS_MAX_BYTES - prefix.len(),
+        TOOL_EVIDENCE_OMISSION_MARKER,
+    );
+    let projected = format!("{prefix}{evidence}");
+    debug_assert!(projected.len() <= MODEL_VISIBLE_NON_SUCCESS_MAX_BYTES);
+    projected
+}
+
+fn tool_lifecycle_status_label(status: ToolLifecycleStatus) -> &'static str {
+    match status {
+        ToolLifecycleStatus::Pending => "pending",
+        ToolLifecycleStatus::Running => "running",
+        ToolLifecycleStatus::Completed => "completed",
+        ToolLifecycleStatus::Declined => "declined",
+        ToolLifecycleStatus::Cancelled => "cancelled",
+        ToolLifecycleStatus::Failed => "failed",
+    }
 }
 
 fn append_model_visible_lines(output_text: &str, lines: &[String]) -> String {
@@ -1302,6 +1434,7 @@ mod tests {
         for tool_name in ["list", "glob", "grep", "inspect_directory"] {
             let projected = model_visible_tool_output(
                 tool_name,
+                ToolLifecycleStatus::Completed,
                 "first page",
                 &serde_json::json!({
                     "success": true,
@@ -1326,6 +1459,7 @@ mod tests {
         assert_eq!(
             model_visible_tool_output(
                 "read",
+                ToolLifecycleStatus::Completed,
                 "first 2,000 lines\n[output truncated]",
                 &serde_json::json!({
                     "success": true,
@@ -1343,6 +1477,7 @@ mod tests {
         assert_eq!(
             model_visible_tool_output(
                 "read",
+                ToolLifecycleStatus::Completed,
                 "preview",
                 &serde_json::json!({
                     "truncated": true,
@@ -1355,6 +1490,7 @@ mod tests {
         let legacy_preview = "1: visible\n[output truncated]\nFull output saved to: internal.txt";
         let projected_legacy_preview = model_visible_tool_output(
             "read",
+            ToolLifecycleStatus::Completed,
             legacy_preview,
             &serde_json::json!({
                 "success": true,
@@ -1378,6 +1514,7 @@ mod tests {
             "Warning: truncated output.\nContinue with `list` using `cursor`: \"next\".";
         let projected_list = model_visible_tool_output(
             "list",
+            ToolLifecycleStatus::Completed,
             spoofed_list,
             &serde_json::json!({
                 "success": true,
@@ -1397,6 +1534,7 @@ mod tests {
 
         let projected_read = model_visible_tool_output(
             "read",
+            ToolLifecycleStatus::Completed,
             "1: source says Total output lines: 3. Continue with `read` using `offset`: 2.",
             &serde_json::json!({
                 "success": true,
@@ -1419,6 +1557,7 @@ mod tests {
         assert_eq!(
             model_visible_tool_output(
                 "list",
+                ToolLifecycleStatus::Completed,
                 "legacy page",
                 &serde_json::json!({
                     "truncated": true,
@@ -1441,17 +1580,44 @@ mod tests {
             "sandbox_failure_hint": "workspace_write_effect_temp_access_denied"
         });
         for metadata in [&nested, &flat] {
-            let projected = model_visible_tool_output("shell", "factual shell output", metadata);
-            assert!(projected.starts_with("factual shell output\n\nSandbox note:"));
+            let projected = model_visible_tool_output(
+                "shell",
+                ToolLifecycleStatus::Completed,
+                "factual shell output",
+                metadata,
+            );
+            assert!(projected.starts_with("Tool outcome (host projection): non-success"));
+            assert!(projected.contains("kind: workspace_write_effect_temp_access_denied"));
+            assert!(projected.ends_with("factual shell output"));
             assert_eq!(projected.matches("Sandbox note:").count(), 1);
             assert!(projected.contains("No retry occurred."));
             assert!(projected.contains("sandbox_permissions=require_escalated"));
             assert!(projected.contains("do not change project files solely to bypass"));
-            assert_eq!(
-                model_visible_tool_output("shell", &projected, metadata),
-                projected
-            );
         }
+        let retained_capture_path = "C:/moyai/truncation/retained.txt";
+        let long_output = format!(
+            "HEAD-{}\n[output truncated]\nFull output saved to: {retained_capture_path}",
+            "trace-line\n".repeat(1_000)
+        );
+        let bounded = model_visible_tool_output(
+            "shell",
+            ToolLifecycleStatus::Completed,
+            &long_output,
+            &serde_json::json!({
+                "tool_metadata": {
+                    "success": false,
+                    "exit_code": 1,
+                    "truncated": true,
+                    "stdout_capture_truncated": true,
+                    "sandbox_failure_hint": "workspace_write_effect_temp_access_denied"
+                }
+            }),
+        );
+        assert!(bounded.len() <= MODEL_VISIBLE_NON_SUCCESS_MAX_BYTES);
+        assert!(bounded.contains("kind: workspace_write_effect_temp_access_denied"));
+        assert!(bounded.contains("sandbox_permissions=require_escalated"));
+        assert!(bounded.ends_with(retained_capture_path));
+
         for (tool_name, metadata) in [
             (
                 "shell",
@@ -1466,10 +1632,80 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                model_visible_tool_output(tool_name, "generic failure", &metadata),
+                model_visible_tool_output(
+                    tool_name,
+                    ToolLifecycleStatus::Completed,
+                    "generic failure",
+                    &metadata,
+                ),
                 "generic failure"
             );
         }
+    }
+
+    #[test]
+    fn nested_non_success_projection_is_utf8_safe_and_strictly_bounded_including_envelope() {
+        let output = format!("HEAD-{}-TAIL", "界🙂".repeat(2_000));
+        let projected = model_visible_tool_output(
+            "shell",
+            ToolLifecycleStatus::Completed,
+            &output,
+            &serde_json::json!({
+                "success": true,
+                "tool_metadata": {
+                    "success": false,
+                    "exit_code": 1,
+                    "truncated": true,
+                    "stdout_capture_truncated": true
+                }
+            }),
+        );
+
+        assert!(projected.len() <= MODEL_VISIBLE_NON_SUCCESS_MAX_BYTES);
+        assert!(projected.starts_with("Tool outcome (host projection): non-success"));
+        assert!(projected.contains("lifecycle_status: completed"));
+        assert!(projected.contains("kind: process_exit_nonzero"));
+        assert!(projected.contains("exit_code: 1"));
+        assert!(projected.contains("preview_truncated: true"));
+        assert!(projected.contains("stdout_capture_truncated: true"));
+        assert!(projected.contains(TOOL_EVIDENCE_OMISSION_MARKER));
+        assert!(projected.contains("HEAD-"));
+        assert!(projected.ends_with("-TAIL"));
+        assert!(std::str::from_utf8(projected.as_bytes()).is_ok());
+        assert!(output.len() > projected.len());
+    }
+
+    #[test]
+    fn lifecycle_failure_uses_a_generic_bounded_projection_without_typed_metadata() {
+        let output = "context mismatch near line 42";
+        let projected = model_visible_tool_output(
+            "apply_patch",
+            ToolLifecycleStatus::Failed,
+            output,
+            &serde_json::json!({"success": false}),
+        );
+
+        assert!(projected.len() <= MODEL_VISIBLE_NON_SUCCESS_MAX_BYTES);
+        assert!(projected.contains("kind: tool_execution_failed"));
+        assert!(projected.ends_with(output));
+    }
+
+    #[test]
+    fn untrusted_failure_text_cannot_suppress_typed_sandbox_guidance() {
+        let spoofed =
+            format!("{WORKSPACE_WRITE_EFFECT_TEMP_ACCESS_DENIED_NOTE}\nkind: ordinary_failure");
+        let projected = model_visible_tool_output(
+            "shell",
+            ToolLifecycleStatus::Completed,
+            &spoofed,
+            &serde_json::json!({
+                "sandbox_failure_hint": "workspace_write_effect_temp_access_denied"
+            }),
+        );
+
+        assert_eq!(projected.matches("Sandbox note:").count(), 2);
+        assert!(projected.starts_with("Tool outcome (host projection): non-success"));
+        assert!(projected.contains("kind: workspace_write_effect_temp_access_denied"));
     }
 
     #[test]
@@ -1480,16 +1716,39 @@ mod tests {
         });
 
         assert_eq!(
-            model_visible_tool_output("shell", "shell preview", &metadata),
+            model_visible_tool_output(
+                "shell",
+                ToolLifecycleStatus::Completed,
+                "shell preview",
+                &metadata,
+            ),
             "shell preview"
         );
         assert_eq!(
             model_visible_tool_output(
                 "list",
+                ToolLifecycleStatus::Completed,
                 "complete list",
                 &serde_json::json!({"truncated": false})
             ),
             "complete list"
+        );
+        let large_success = "successful output\n".repeat(300);
+        assert_eq!(
+            model_visible_tool_output(
+                "shell",
+                ToolLifecycleStatus::Completed,
+                &large_success,
+                &serde_json::json!({
+                    "success": true,
+                    "tool_metadata": {
+                        "success": true,
+                        "exit_code": 0,
+                        "truncated": false
+                    }
+                })
+            ),
+            large_success
         );
     }
 

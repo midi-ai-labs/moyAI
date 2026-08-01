@@ -2,7 +2,7 @@ use std::io::Read;
 use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -10,8 +10,15 @@ use crate::error::ToolError;
 use crate::runtime::SystemClock;
 use crate::tool::context::ToolContext;
 use crate::tool::registry::Tool;
+use crate::tool::truncate::clip_text_with_ellipsis;
 use crate::tool::{ToolName, ToolResult, ToolSpec};
+use crate::workspace::traversal::{
+    ExactFileCandidateScan, find_exact_workspace_file_candidates,
+    find_similar_sibling_file_candidates,
+};
 use crate::workspace::{AccessKind, PathGuard, Workspace, instruction_file_names};
+
+const MAX_MISSING_READ_DIAGNOSTIC_BYTES: usize = 1_024;
 
 #[derive(Debug, Deserialize)]
 pub struct ReadInput {
@@ -61,7 +68,54 @@ impl Tool for ReadTool {
         .await?
         .admit()?;
 
-        let mut opened = resolved.into_read_file()?;
+        let missing_read_request = if permission.inside_workspace {
+            input.path.file_name().map(|basename| MissingReadRequest {
+                requested: input.path.clone(),
+                absolute: permission.absolute.to_path_buf(),
+                basename: basename.to_string(),
+                suffix: exact_candidate_suffix(&input.path, permission.absolute, ctx.workspace),
+                max_diagnostic_bytes: ctx
+                    .config
+                    .tool_output
+                    .max_bytes
+                    .min(MAX_MISSING_READ_DIAGNOSTIC_BYTES)
+                    .max(1),
+            })
+        } else {
+            None
+        };
+        let mut opened = match resolved.into_read_file() {
+            Ok(opened) => opened,
+            Err(error) if is_not_found_error(&error) => {
+                let Some(request) = missing_read_request else {
+                    return Err(error);
+                };
+                let (scan, candidate_kind) =
+                    match find_similar_sibling_file_candidates(ctx.workspace, &request.absolute) {
+                        Ok(scan) if !scan.paths.is_empty() => {
+                            (scan, MissingCandidateKind::SimilarSibling)
+                        }
+                        Ok(_) => {
+                            let Ok(scan) = find_exact_workspace_file_candidates(
+                                ctx.workspace,
+                                &request.basename,
+                                request.suffix.as_deref(),
+                            ) else {
+                                return Err(error);
+                            };
+                            (scan, MissingCandidateKind::Exact)
+                        }
+                        Err(_) => return Err(error),
+                    };
+                return Err(ToolError::Message(render_missing_read_diagnostic(
+                    &request.requested,
+                    &scan,
+                    candidate_kind,
+                    request.max_diagnostic_bytes,
+                )));
+            }
+            Err(error) => return Err(error),
+        };
         let metadata = require_readable_file_metadata(opened.absolute(), opened.metadata()?)?;
         let size_bytes = metadata.len();
         let extension = normalized_extension(opened.absolute());
@@ -200,6 +254,115 @@ impl Tool for ReadTool {
             _internal_file_lease: None,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MissingReadRequest {
+    requested: Utf8PathBuf,
+    absolute: Utf8PathBuf,
+    basename: String,
+    suffix: Option<Utf8PathBuf>,
+    max_diagnostic_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingCandidateKind {
+    Exact,
+    SimilarSibling,
+}
+
+fn exact_candidate_suffix(
+    requested: &Utf8Path,
+    absolute: &Utf8Path,
+    workspace: &Workspace,
+) -> Option<Utf8PathBuf> {
+    let source = if requested.is_absolute() {
+        PathGuard::relative_path_from_root(absolute, workspace.authority_root())?
+    } else {
+        requested.to_path_buf()
+    };
+    let mut suffix = Utf8PathBuf::new();
+    for component in source.components() {
+        match component {
+            Utf8Component::Normal(value) => suffix.push(value),
+            Utf8Component::CurDir => {}
+            Utf8Component::ParentDir | Utf8Component::RootDir | Utf8Component::Prefix(_) => {
+                return None;
+            }
+        }
+    }
+    (!suffix.as_str().is_empty()).then_some(suffix)
+}
+
+fn is_not_found_error(error: &ToolError) -> bool {
+    matches!(
+        error,
+        ToolError::Workspace(crate::error::WorkspaceError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn render_missing_read_diagnostic(
+    requested: &Utf8Path,
+    scan: &ExactFileCandidateScan,
+    candidate_kind: MissingCandidateKind,
+    max_bytes: usize,
+) -> String {
+    let max_bytes = max_bytes.max(1);
+    let requested_budget = (max_bytes / 3).min(256);
+    let requested = clip_text_with_ellipsis(requested.as_str(), requested_budget);
+    let mut output = format!("read path not found: `{requested}`.");
+    if output.len() > max_bytes {
+        return clip_text_with_ellipsis(&output, max_bytes);
+    }
+
+    let summary = match (candidate_kind, scan.paths.is_empty()) {
+        (_, true) => {
+            " No exact basename or suffix candidate was found in the bounded workspace scan."
+        }
+        (MissingCandidateKind::Exact, false) => {
+            " Exact workspace candidates from the bounded scan (not auto-selected):"
+        }
+        (MissingCandidateKind::SimilarSibling, false) => {
+            " Similar filenames in the same directory (not auto-selected):"
+        }
+    };
+    if !append_diagnostic_segment(&mut output, summary, max_bytes) {
+        return output;
+    }
+
+    let mut included = 0usize;
+    for path in &scan.paths {
+        let path = path.as_str().replace('\\', "/");
+        let candidate = format!("\n- `{path}`");
+        if !append_diagnostic_segment(&mut output, &candidate, max_bytes) {
+            break;
+        }
+        included = included.saturating_add(1);
+    }
+    if !scan.paths.is_empty() && included == 0 {
+        let _ = append_diagnostic_segment(
+            &mut output,
+            " Candidate paths exceeded the diagnostic byte limit.",
+            max_bytes,
+        );
+    }
+    if scan.truncated {
+        let _ = append_diagnostic_segment(
+            &mut output,
+            "\nThe workspace scan stopped at its result or visit limit.",
+            max_bytes,
+        );
+    }
+    output
+}
+
+fn append_diagnostic_segment(output: &mut String, segment: &str, max_bytes: usize) -> bool {
+    if output.len().saturating_add(segment.len()) > max_bytes {
+        return false;
+    }
+    output.push_str(segment);
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -444,11 +607,14 @@ mod tests {
     use crate::config::ResolvedConfig;
     use crate::edit::{EditSafety, FileReadStamp, read_file_with_identity};
     use crate::session::SessionId;
+    use crate::workspace::traversal::ExactFileCandidateScan;
     use crate::workspace::{AccessKind, PathGuard, WorkspaceDiscovery};
 
     use super::{
-        bounded_line_page, edit_baseline_decision, find_instruction_sources, read_up_to_limit,
-        record_edit_baseline_if_eligible, require_readable_file_metadata,
+        MissingCandidateKind, bounded_line_page, edit_baseline_decision, exact_candidate_suffix,
+        find_instruction_sources, is_not_found_error, read_up_to_limit,
+        record_edit_baseline_if_eligible, render_missing_read_diagnostic,
+        require_readable_file_metadata,
     };
 
     #[cfg(unix)]
@@ -664,6 +830,107 @@ mod tests {
             error.to_string(),
             format!("path `{directory}` is a directory")
         );
+    }
+
+    #[test]
+    fn missing_read_suffix_is_exact_and_rejects_parent_traversal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root =
+            Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 workspace");
+        std::fs::create_dir_all(&root).expect("workspace root");
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &ResolvedConfig::default())
+            .expect("workspace");
+        let absolute = root.join("backend/app/repository.rs");
+
+        assert_eq!(
+            exact_candidate_suffix(
+                camino::Utf8Path::new("app/repository.rs"),
+                &absolute,
+                &workspace,
+            ),
+            Some(Utf8PathBuf::from("app/repository.rs"))
+        );
+        assert_eq!(
+            exact_candidate_suffix(&absolute, &absolute, &workspace),
+            Some(Utf8PathBuf::from("backend/app/repository.rs"))
+        );
+        assert!(
+            exact_candidate_suffix(
+                camino::Utf8Path::new("../app/repository.rs"),
+                &absolute,
+                &workspace,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn missing_read_diagnostic_keeps_only_whole_exact_candidates_within_byte_limit() {
+        let scan = ExactFileCandidateScan {
+            paths: vec![
+                Utf8PathBuf::from("a/target.rs"),
+                Utf8PathBuf::from("nested/target.rs"),
+                Utf8PathBuf::from(format!("very-long/{}/target.rs", "x".repeat(256))),
+            ],
+            truncated: true,
+        };
+
+        let rendered = render_missing_read_diagnostic(
+            camino::Utf8Path::new("missing/target.rs"),
+            &scan,
+            MissingCandidateKind::Exact,
+            192,
+        );
+
+        assert!(rendered.len() <= 192);
+        assert!(rendered.contains("not auto-selected"));
+        assert!(rendered.contains("- `a/target.rs`"));
+        for line in rendered.lines().filter(|line| line.starts_with("- `")) {
+            assert!(line.ends_with('`'));
+            assert!(
+                scan.paths
+                    .iter()
+                    .any(|path| { line == format!("- `{}`", path.as_str().replace('\\', "/")) })
+            );
+        }
+    }
+
+    #[test]
+    fn similar_sibling_diagnostic_is_explicitly_non_resolving() {
+        let scan = ExactFileCandidateScan {
+            paths: vec![Utf8PathBuf::from(
+                "backend/app/infrastructure/repositories/sqlite_repositories.py",
+            )],
+            truncated: false,
+        };
+
+        let rendered = render_missing_read_diagnostic(
+            camino::Utf8Path::new(
+                "backend/app/infrastructure/repositories/sqlite_run_repository.py",
+            ),
+            &scan,
+            MissingCandidateKind::SimilarSibling,
+            1_024,
+        );
+
+        assert!(rendered.contains("Similar filenames in the same directory"));
+        assert!(rendered.contains("not auto-selected"));
+        assert!(rendered.contains("sqlite_repositories.py"));
+    }
+
+    #[test]
+    fn only_a_typed_not_found_open_error_enables_candidate_diagnostics() {
+        let not_found = crate::error::ToolError::Workspace(crate::error::WorkspaceError::Io(
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        ));
+        let denied = crate::error::ToolError::Workspace(crate::error::WorkspaceError::Io(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        ));
+        let boundary = crate::error::ToolError::Message("outside allowed roots".to_string());
+
+        assert!(is_not_found_error(&not_found));
+        assert!(!is_not_found_error(&denied));
+        assert!(!is_not_found_error(&boundary));
     }
 
     #[cfg(windows)]

@@ -203,6 +203,40 @@ pub fn clip_text_with_ellipsis(text: &str, max_bytes: usize) -> String {
     clipped
 }
 
+pub(crate) fn clip_text_head_tail_with_marker(
+    text: &str,
+    max_bytes: usize,
+    marker: &str,
+) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    if max_bytes == 0 {
+        return String::new();
+    }
+    if marker.len() >= max_bytes {
+        return clip_text_to_char_boundary(text, max_bytes);
+    }
+
+    let retained_budget = max_bytes - marker.len();
+    let head_budget = retained_budget / 3;
+    let tail_budget = retained_budget - head_budget;
+    let head = clip_text_to_char_boundary(text, head_budget);
+    let tail = utf8_suffix_within_bytes(text, tail_budget);
+    format!("{head}{marker}{tail}")
+}
+
+fn utf8_suffix_within_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::io::AsyncWriteExt as _;
@@ -254,5 +288,27 @@ mod tests {
                 .expect("read spool");
         assert_eq!(stored, "abcd\nefgh\nijkl");
         assert!(!output.preview_text.contains("Use `read`"));
+    }
+
+    #[test]
+    fn head_tail_clip_is_utf8_safe_and_respects_the_total_byte_budget() {
+        let source = format!("HEAD-{}-TAIL", "界🙂".repeat(100));
+        let marker = "\n[... omitted ...]\n";
+        let clipped = super::clip_text_head_tail_with_marker(&source, 80, marker);
+
+        assert!(clipped.len() <= 80);
+        assert!(clipped.starts_with("HEAD-"));
+        assert!(clipped.ends_with("-TAIL"));
+        assert!(clipped.contains(marker));
+    }
+
+    #[test]
+    fn head_tail_clip_handles_zero_and_tiny_budgets() {
+        for max_bytes in 0..16 {
+            let clipped =
+                super::clip_text_head_tail_with_marker("先頭-middle-末尾", max_bytes, "[marker]");
+            assert!(clipped.len() <= max_bytes);
+            assert!(std::str::from_utf8(clipped.as_bytes()).is_ok());
+        }
     }
 }
