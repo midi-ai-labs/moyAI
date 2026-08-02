@@ -755,7 +755,7 @@ mod tests {
         let text = fs::read_to_string(path).expect("read config");
         assert!(text.contains("[model]"));
         assert!(text.contains("base_url = \"http://127.0.0.1:1234\""));
-        assert!(text.contains("model = \"qwen/qwen3.6-35b-a3b\""));
+        assert!(text.contains("model = \"qwen/qwen3.6-27b\""));
         assert!(text.contains("provider_metadata_mode = \"lm_studio_native_required\""));
         assert!(text.contains("provider_api_mode = \"responses\""));
         assert!(text.contains("reasoning_summary = \"none\""));

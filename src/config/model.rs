@@ -6,7 +6,7 @@ use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_MODEL_BASE_URL: &str = "http://127.0.0.1:1234";
-pub const DEFAULT_MODEL_NAME: &str = "qwen/qwen3.6-35b-a3b";
+pub const DEFAULT_MODEL_NAME: &str = "qwen/qwen3.6-27b";
 pub const DEFAULT_MODEL_CONTEXT_WINDOW: u32 = 131_072;
 pub const DEFAULT_MODEL_MAX_OUTPUT_TOKENS: u32 = 32_768;
 pub const DEFAULT_MODEL_REQUEST_TIMEOUT_MS: u64 = 1_800_000;

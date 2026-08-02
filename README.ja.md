@@ -163,7 +163,7 @@ Desktop、TUI、CLI ともに、同じ設定を共通で参照します。
 ```toml
 [model]
 base_url = "http://127.0.0.1:1234"
-model = "qwen/qwen3.6-35b-a3b"
+model = "qwen/qwen3.6-27b"
 provider_metadata_mode = "lm_studio_native_required"
 provider_api_mode = "responses"
 reasoning_summary = "none"
@@ -657,9 +657,9 @@ release zip の `docs/release/manual-gui-st-results.md` に同梱されます。
 
 ## 開発状況
 
-moyAI は現在、主に Windows で開発・検証しています。current agent loopの固定behavioral-validation
-baselineは、LM Studioでホストした`qwen/qwen3.6-27b`です。配布するexampleとdefault modelは
-`qwen/qwen3.6-35b-a3b`のままであり、比較baselineの選択によってuserの設定済みmodelを書き換えません。
+moyAI は現在、主に Windows で開発・検証しています。prompt、compaction、agent loopは、LM Studioで
+ホストした`qwen/qwen3.6-27b`を主な最適化・挙動検証対象としており、配布するdefault / example modelも
+同modelです。既存のuser configは引き続き正となり、製品defaultの変更によって書き換えません。
 
 OpenAI 互換 model であれば他の model も利用できますが、tool-use quality、context length、vision support、応答速度は provider / model によって変わります。
 

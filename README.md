@@ -162,7 +162,7 @@ Example:
 ```toml
 [model]
 base_url = "http://127.0.0.1:1234"
-model = "qwen/qwen3.6-35b-a3b"
+model = "qwen/qwen3.6-27b"
 provider_metadata_mode = "lm_studio_native_required"
 provider_api_mode = "responses"
 reasoning_summary = "none"
@@ -763,10 +763,10 @@ the release zip under `docs/release/manual-gui-st-results.md`.
 
 ## Status
 
-moyAI is currently developed and tested primarily on Windows. The fixed behavioral-validation
-baseline for the current agent loop uses `qwen/qwen3.6-27b` hosted by LM Studio. The shipped example
-and default model remain `qwen/qwen3.6-35b-a3b`; choosing a comparison baseline does not rewrite a
-user's configured model.
+moyAI is currently developed and tested primarily on Windows. Its prompt, compaction, and agent-loop
+behavior are primarily optimized and behaviorally validated for `qwen/qwen3.6-27b` hosted by LM
+Studio, which is also the shipped default and example model. Existing user config files remain
+authoritative and are not rewritten when the product default changes.
 
 Other OpenAI-compatible models can be used, but model behavior, tool-use quality, context length, and vision support vary by provider and model.
 

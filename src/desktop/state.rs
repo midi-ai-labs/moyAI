@@ -2605,7 +2605,7 @@ mod tests {
     fn startup_uses_config_only_and_catalog_remains_an_explicit_operation() {
         let mut config = ResolvedConfig::default();
         config.model.base_url = "http://127.0.0.1:1234".to_string();
-        config.model.model = "qwen/qwen3.6-35b-a3b".to_string();
+        config.model.model = "configured-model".to_string();
         config.docling.enabled = false;
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
 
@@ -2845,7 +2845,7 @@ mod tests {
     fn configured_provider_startup_overlay_can_be_closed() {
         let mut config = ResolvedConfig::default();
         config.model.base_url = String::new();
-        config.model.model = "qwen/qwen3.6-35b-a3b".to_string();
+        config.model.model = "configured-model".to_string();
         config.docling.enabled = false;
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), config);
 
@@ -2864,7 +2864,7 @@ mod tests {
     fn missing_config_startup_overlay_remains_blocking() {
         let mut config = ResolvedConfig::default();
         config.model.base_url = "http://127.0.0.1:1234".to_string();
-        config.model.model = "qwen/qwen3.6-35b-a3b".to_string();
+        config.model.model = "configured-model".to_string();
         config.docling.enabled = false;
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), config.clone());
 

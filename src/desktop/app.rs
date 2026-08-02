@@ -11084,7 +11084,7 @@ mod tests {
             base_url: "http://127.0.0.1:1234".to_string(),
             metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
             config_generation: 1,
-            selected_model_id: "qwen/qwen3.6-35b-a3b".to_string(),
+            selected_model_id: "selected-model".to_string(),
         };
         let provider_request_id = LatestRequestTracker::default().begin(provider_target.clone());
         let history_target = HistoryExportRequestTarget {
@@ -11395,7 +11395,7 @@ mod tests {
             &Utf8PathBuf::from("C:/workspace"),
             session_id,
             "http://127.0.0.1:1234",
-            "qwen/qwen3.6-35b-a3b",
+            "fixture-model",
             &rows,
             &[],
         );
@@ -11464,7 +11464,7 @@ mod tests {
             &Utf8PathBuf::from("C:/workspace"),
             session_id,
             "http://127.0.0.1:1234",
-            "qwen/qwen3.6-35b-a3b",
+            "fixture-model",
             &rows,
             &changes,
         );
@@ -11516,7 +11516,7 @@ mod tests {
             &Utf8PathBuf::from("C:/workspace"),
             session_id,
             "http://127.0.0.1:1234",
-            "qwen/qwen3.6-35b-a3b",
+            "fixture-model",
             &rows,
             &[],
         );
@@ -12313,7 +12313,7 @@ pub fn desktop_open_transcript_markdown_preserves_visible_evidence_fixture_passe
         &Utf8PathBuf::from("C:/workspace"),
         session_id,
         "http://127.0.0.1:1234",
-        "qwen/qwen3.6-35b-a3b",
+        "fixture-model",
         &rows,
         &changes,
     );

@@ -25,7 +25,7 @@ Desktop では左 rail の `LLM URL` または topbar の model/base URL 表示�
 4. 現在の UI session だけに効かせる場合は `UIセッションに適用` を使う。
 5. 次回以降の既定値にする場合は `設定ファイルに保存` を使う。
 
-製品デフォルトの base URL は `http://127.0.0.1:1234`。LM Studio を別端末で動かす場合は `http://your-lm-studio-host:1234` のように、GUI または config で明示設定する。
+製品デフォルトのbase URLは`http://127.0.0.1:1234`、modelは`qwen/qwen3.6-27b`。moyAIのprompt、compaction、agent loopはこのmodelを主な最適化・挙動検証対象とする。LM Studioを別端末で動かす場合は`http://your-lm-studio-host:1234`のようにGUIまたはconfigで明示設定する。既存のuser configは製品defaultより優先され、自動的には書き換えない。
 
 設定ファイル:
 
