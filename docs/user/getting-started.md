@@ -45,6 +45,13 @@ Desktop では左 rail の `LLM URL` または topbar の model/base URL 表示�
 ただしproactive multi-agent modeのstatic model instructionは、非自明なtaskで最小限のgrounding後、
 広い調査前に早期`update_plan`を呼ぶよう求める。これはruntime gateやplan本文のhost解釈ではない。
 
+非自明な調査・設計では、共通base instructionsがmodelへrequested outcomeから必要最小限のinternal evidence
+ledgerを組み立てるよう求める。material claimごとにcurrent owner、direct consumer / verification、
+`missing` / `observed` / `conflicting`を追い、独立readをまとめ、required rowへ直接証拠が揃えば探索を止め、
+未解決source factを明示する。このledgerはmodel内の一時的な作業補助であり、moyAIがsemantic complianceを
+保証したり、保存・解釈するcompletion / quality gateではない。別のrequest
+Framer、state deltaの自動注入、host-owned coverage / convergence scoreも使わない。
+
 model transportの既定値は次の通り。
 
 ```toml

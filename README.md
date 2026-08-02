@@ -535,6 +535,14 @@ turn, trigger compaction, or unlock another tool surface. A durable Plan mode ex
 `update_plan`, and hides mutation tools, but no CLI, TUI, or Desktop mode selector is currently
 exposed.
 
+For a non-trivial investigation or design, the common base instructions also ask the model to keep
+the smallest useful internal evidence ledger: material claims are grouped by their current owner,
+linked to a direct consumer or verification, and marked missing, observed, or conflicting. The model
+should batch independent reads, stop discovery once every required row has direct evidence, and name
+any unresolved source fact. This ledger is ephemeral model working context; moyAI does not save or
+interpret it as a completion or quality gate, and does not add a separate request Framer, injected
+state delta, or host-owned coverage/convergence score.
+
 At the model policy's 90% working target, moyAI selects model-visible semantic units rather than a
 fixed item count. When available, the latest provider-reported total is rehydrated from the durable
 turn terminal and combined with only the local items appended after that model response. Otherwise,
@@ -755,7 +763,10 @@ the release zip under `docs/release/manual-gui-st-results.md`.
 
 ## Status
 
-moyAI is currently developed and tested primarily on Windows. The main development profile uses `qwen/qwen3.6-35b-a3b` hosted by LM Studio, especially the `lmstudio-community` build.
+moyAI is currently developed and tested primarily on Windows. The fixed behavioral-validation
+baseline for the current agent loop uses `qwen/qwen3.6-27b` hosted by LM Studio. The shipped example
+and default model remain `qwen/qwen3.6-35b-a3b`; choosing a comparison baseline does not rewrite a
+user's configured model.
 
 Other OpenAI-compatible models can be used, but model behavior, tool-use quality, context length, and vision support vary by provider and model.
 

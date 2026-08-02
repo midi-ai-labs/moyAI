@@ -466,6 +466,12 @@ claimed turnへdeliveryし、Interrupted settlementはそのwakeだけをdiscard
 tool surfaceの解除にも使いません。durableなPlan modeは内部に存在し、`update_plan`を保持してmutation toolだけを
 隠しますが、現時点でCLI/TUI/Desktopにmode selectorはありません。
 
+非自明な調査・設計では、共通base instructionsがmodel自身に必要最小限のinternal evidence ledgerを求めます。
+material claimをcurrent owner単位にまとめ、direct consumer / verificationと`missing` / `observed` / `conflicting`を
+区別し、独立readをbatchしてrequired rowへ直接証拠が揃った時点で探索を止め、未解決source factを明示します。
+このledgerはmodelの一時的なworking contextであり、moyAIが保存・解釈するcompletion / quality gateではありません。
+別のrequest Framer、state deltaの自動注入、host-owned coverage / convergence scoreも追加しません。
+
 model policyの90% working targetへ達すると、固定item件数ではなくmodel-visibleなsemantic unitを選びます。
 provider報告total usageがある場合はdurable turn terminalから復元し、そのmodel response後に追加されたlocal itemだけをCodexと同じ粗いUTF-8 bytes/4で加算します。usageがないかresponse境界を照合できない場合だけfull prepared requestのlocal推定へfallbackし、request diagnosticsは使用したsourceを区別します。
 同じprovider responseのassistant、call、settled outputは一単位に保ち、tool responseが未完了の間はcompaction自体を
@@ -651,7 +657,9 @@ release zip の `docs/release/manual-gui-st-results.md` に同梱されます。
 
 ## 開発状況
 
-moyAI は現在、主に Windows で開発・検証しています。主な検証構成は、LM Studio でホストした `qwen/qwen3.6-35b-a3b`、特に `lmstudio-community` 版です。
+moyAI は現在、主に Windows で開発・検証しています。current agent loopの固定behavioral-validation
+baselineは、LM Studioでホストした`qwen/qwen3.6-27b`です。配布するexampleとdefault modelは
+`qwen/qwen3.6-35b-a3b`のままであり、比較baselineの選択によってuserの設定済みmodelを書き換えません。
 
 OpenAI 互換 model であれば他の model も利用できますが、tool-use quality、context length、vision support、応答速度は provider / model によって変わります。
 
