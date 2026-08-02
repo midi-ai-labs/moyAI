@@ -1,6 +1,6 @@
 # moyAI Getting Started
 
-2026-07-27 時点のv1.1.1 release向け最小手順。durableな再帰Agent Tree、canonical runtime/storage、Codex型Desktop履歴、3種類のpermission mode、Windows workspace sandbox、Responses transportを含む。正確なversionと機能は利用するrelease packageと製品READMEを確認する。
+2026-08-03 時点のv1.2.1 release向け最小手順。`qwen/qwen3.6-27b`を既定profileとし、durableな再帰Agent Tree、canonical runtime/storage、structured compaction、3種類のpermission mode、Windows workspace sandbox、Responses transportを含む。正確なversionと機能は利用するrelease packageと製品READMEを確認する。
 
 ## 初回起動
 

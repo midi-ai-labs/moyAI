@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.1"><img alt="Release" src="https://img.shields.io/badge/release-v1.1.1-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.2.1"><img alt="Release" src="https://img.shields.io/badge/release-v1.2.1-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.ja.md">日本語 README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.1">Download release</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.2.1">Download release</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -83,12 +83,12 @@ moyAI is designed around those constraints:
 
 The current release is available here:
 
-[**moyAI v1.1.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.1)
+[**moyAI v1.2.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v1.2.1)
 
-v1.1.1 keeps a selected nested directory as the exact tool and sandbox authority boundary even when
-an ancestor is the Git project root. Glob, typed file tools, shell effect review, Windows sandboxing,
-session reopen, and built-in Git review now agree on that selected directory without losing
-project-level Git identity or ancestor instructions.
+v1.2.1 makes `qwen/qwen3.6-27b` the shipped default and the primary behaviorally validated local-LLM
+profile. It adds structured, validation-gated compaction checkpoints; keeps model-visible tool failures
+bounded; improves generic recovery hints for malformed patches and missing reads; and preserves typed
+edit baselines across shell commands so external replacement is rejected instead of overwritten.
 
 The Windows release zip includes:
 
@@ -136,7 +136,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 1.1.1 -ManualGuiStResultsPath path\to\RESULTS.md
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 1.2.1 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
 
 Run packaging from the clean source commit for that release. If `v<version>` already exists, the
@@ -550,12 +550,14 @@ the full prepared request uses the same coarse UTF-8-bytes/4 fallback as Codex. 
 identify which source was used. One provider response's assistant text,
 calls, and settled outputs stay together; no compaction is attempted while a tool response is
 unsettled. Summary generation keeps the base instructions and native User / Assistant / tool
-structure, appends the Codex checkpoint prompt as the final User input, and sends no tools or provider
+structure, appends the C8 evidence-grounded checkpoint prompt as the final User input, and sends no tools or provider
 cursor. It first sends that full native request. Only a typed `context_length_exceeded` response removes
 the oldest provider-native item (and its exact call/output counterpart when required) before retrying;
 there is no semantic map/reduce path.
-The exact checkpoint text in `assets/prompts/compaction.md` is a source-level Codex prompt-asset
-contract; that text match does not claim full Codex runtime parity.
+The exact checkpoint text in `assets/prompts/compaction.md` is the current source-level contract.
+Runtime validation proves only that its six required headings occur once, in order, with non-empty
+bodies. Evidence grounding and semantic completeness remain model-quality concerns over the native
+input; structural acceptance does not claim either one.
 
 The resulting checkpoint retains the newest real User and Steer text inputs in original order
 within a conservative 20,000-token budget. One boundary input is middle-truncated instead of being

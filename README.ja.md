@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.1"><img alt="Release" src="https://img.shields.io/badge/release-v1.1.1-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.2.1"><img alt="Release" src="https://img.shields.io/badge/release-v1.2.1-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.md">English README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.1">release をダウンロード</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.2.1">release をダウンロード</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -84,12 +84,12 @@ moyAI は、そうした環境でも使いやすい開発用の相棒を目指�
 
 現在の release を公開しています。
 
-[**moyAI v1.1.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v1.1.1)
+[**moyAI v1.2.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v1.2.1)
 
-v1.1.1では、ancestorがGit project rootであっても、選択したnested directoryをtoolとsandboxの
-正確なauthority境界として維持します。Glob、typed file tool、shell effect review、Windows sandbox、
-session reopen、built-in Git reviewが同じ選択directoryを使い、project単位のGit identityとancestor
-instructionは引き続き利用できます。
+v1.2.1では、`qwen/qwen3.6-27b`を製品defaultかつ主なbehavioral validation対象としました。
+構造化・validation付きcompaction checkpoint、model-visible tool failureのbounded化、malformed patchと
+missing readへの汎用的なrecovery hint、shell commandをまたいで保持されるtyped edit baselineを追加し、
+外部replacementを上書きせず拒否します。
 
 Windows 向け release zip には、次のものが含まれています。
 
@@ -137,7 +137,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 1.1.1 -ManualGuiStResultsPath path\to\RESULTS.md
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 1.2.1 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
 
 packageはそのrelease用のclean source commitから作成します。`v<version>` tagが既に存在する場合、
@@ -475,12 +475,13 @@ material claimをcurrent owner単位にまとめ、direct consumer / verificatio
 model policyの90% working targetへ達すると、固定item件数ではなくmodel-visibleなsemantic unitを選びます。
 provider報告total usageがある場合はdurable turn terminalから復元し、そのmodel response後に追加されたlocal itemだけをCodexと同じ粗いUTF-8 bytes/4で加算します。usageがないかresponse境界を照合できない場合だけfull prepared requestのlocal推定へfallbackし、request diagnosticsは使用したsourceを区別します。
 同じprovider responseのassistant、call、settled outputは一単位に保ち、tool responseが未完了の間はcompaction自体を
-開始しません。summary生成はbase instructionsとnativeなUser / Assistant / tool構造を保ち、Codexのcheckpoint promptを
+開始しません。summary生成はbase instructionsとnativeなUser / Assistant / tool構造を保ち、C8のevidence-grounded checkpoint promptを
 最後のUser inputへ追加し、toolsとprovider cursorを送りません。最初にfull native requestを一回送り、typed
 `context_length_exceeded`の場合だけ最古のprovider-native itemと必要なcall/output対応相手を除いて再試行します。
 semantic map/reduce経路は持ちません。
-`assets/prompts/compaction.md`のexact checkpoint textはsource-levelのCodex prompt-asset contractです。
-このtext一致だけでCodex runtime全体とのparityを主張しません。
+`assets/prompts/compaction.md`のexact checkpoint textをcurrent source-level contractとします。runtime validationが
+証明するのは6つの必須見出しが一度ずつ正しい順序で現れ、各bodyが非空であることだけです。native inputに対する
+evidence groundingとsemantic completenessはmodel品質に残り、構造acceptanceはそのどちらも保証しません。
 
 生成したcheckpointは、real User / Steer text inputのうち新しいものからoriginal orderのまま保守的な20,000 token
 以内に保持します。境界の一件は丸ごと捨てず中央を切り詰め、prefix付きsummaryを最後のUser inputにします。古いsummaryを
