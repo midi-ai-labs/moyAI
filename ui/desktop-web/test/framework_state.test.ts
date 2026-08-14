@@ -13,7 +13,11 @@ import {
   shouldBeginKeyboardInteraction,
   shouldBeginPointerInteraction,
 } from "../src/interaction_lifecycle.ts";
-import { shouldDispatchDelegatedKeyboardAction, wireEvents } from "../src/events.ts";
+import {
+  beginConfigImportMutation,
+  shouldDispatchDelegatedKeyboardAction,
+  wireEvents,
+} from "../src/events.ts";
 import { transcriptAnchors } from "../src/history_navigation.ts";
 import { globalShortcutAction } from "../src/keyboard_shortcut.ts";
 import { autoRefreshAllowed, runtimePollingRequired } from "../src/polling_state.ts";
@@ -1971,6 +1975,91 @@ test("settings exposes separate config and user data folder actions", () => {
     actionById("open-user-data-folder")?.enabled?.(state, { index: -1, value: "" }),
     true,
   );
+});
+
+test("initial setup renders typed config import failures inside the active modal", () => {
+  for (const overlay of ["config", "provider"] as const) {
+    const state = projection({
+      overlay,
+      status_code: "config_import_failed",
+      status_message: "設定ファイルをImportできませんでした。",
+      status_detail: "invalid <model.request_timeout_ms>",
+    });
+    state.startup = {
+      ...state.startup,
+      status: "requires_config",
+      action_overlay: overlay,
+      initial_setup_required: true,
+    };
+
+    const html = renderOverlay(state);
+    assert.match(html, /role="alert" aria-live="assertive"/);
+    assert.match(html, /設定ファイルをImportできませんでした。/);
+    assert.match(html, /invalid &lt;model\.request_timeout_ms&gt;/);
+    assert.match(html, /TOML設定をImport/);
+    assert.doesNotMatch(html, /invalid <model\.request_timeout_ms>/);
+  }
+
+  const preferences = projection({
+    overlay: "config",
+    status_code: "config_import_failed",
+    status_message: "stale import failure",
+  });
+  assert.doesNotMatch(renderOverlay(preferences), /role="alert"/);
+});
+
+test("initial setup replaces an old import failure with current mutation progress", () => {
+  const state = projection({
+    overlay: "config",
+    status_code: "config_import_failed",
+    status_message: "stale import failure",
+  });
+  state.startup = {
+    ...state.startup,
+    status: "requires_config",
+    action_overlay: "config",
+    initial_setup_required: true,
+  };
+  setRenderContext({
+    artifactPaneCollapsed: false,
+    attachmentTrayOpen: false,
+    configDirty: false,
+    configMutationPending: true,
+    configOwnerMutationOpen: false,
+    configDraftEditOpen: false,
+    configDraftDiscardOpen: false,
+    configDraftCommitOpen: false,
+  });
+
+  const html = renderOverlay(state);
+  assert.match(html, /role="status" aria-live="polite">設定を確認しています…/);
+  assert.doesNotMatch(html, /stale import failure/);
+
+  setRenderContext({
+    artifactPaneCollapsed: false,
+    attachmentTrayOpen: false,
+    configDirty: false,
+    configMutationPending: false,
+    configOwnerMutationOpen: true,
+    configDraftEditOpen: true,
+    configDraftDiscardOpen: false,
+    configDraftCommitOpen: false,
+  });
+});
+
+test("config import begins its mutation owner before the pending rerender", () => {
+  const ui = createUiLocalState();
+  const state = projection({ overlay: "config" });
+  const observations: Array<{ external: boolean; generation: bigint | null }> = [];
+
+  const request = beginConfigImportMutation(ui, state.config_target, () => {
+    observations.push({
+      external: ui.externalConfigMutationPending,
+      generation: ui.activeConfigMutationGeneration,
+    });
+  });
+
+  assert.deepEqual(observations, [{ external: true, generation: request.generation }]);
 });
 
 test("settings enum controls render only Rust-projected option values", () => {

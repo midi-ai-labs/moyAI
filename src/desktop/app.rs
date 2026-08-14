@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::fs;
 use std::io::Write;
 use std::path::{Component, Path};
 use std::process::Command as ProcessCommand;
@@ -17,7 +16,9 @@ use crate::cli::{
     ConfirmationOutcome, ConfirmationPrompt, EventRenderer, OutputMode, ReviewDecision,
     SharedConfirmationPrompt,
 };
-use crate::config::loader::{global_config_path, read_toml_utf8_bounded};
+use crate::config::loader::{
+    acquire_global_config_write_lease, global_config_path, read_toml_utf8_bounded,
+};
 use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::model::{PartialModelConfig, PartialResolvedConfig};
 use crate::config::{ConfigLoader, ProviderMetadataMode, ResolvedConfig, ShellFamily};
@@ -63,7 +64,7 @@ use super::query::{
     load_latest_session_detail, load_session_detail, load_snapshot, load_snapshot_continue_last,
     load_snapshot_for_selection, load_snapshot_for_session_search,
 };
-use super::state::DesktopState;
+use super::state::{DesktopState, DesktopStatusCode};
 #[cfg(test)]
 use super::web_model::desktop_web_state;
 use super::web_model::{
@@ -8000,8 +8001,10 @@ impl DesktopController {
         match pick_config_toml_file() {
             Ok(path) => path,
             Err(error) => {
-                self.state
-                    .set_status_message(format!("config import failed: {error}"));
+                self.state.set_typed_status_message(
+                    DesktopStatusCode::ConfigImportFailed,
+                    format!("config import failed: {error}"),
+                );
                 None
             }
         }
@@ -8010,7 +8013,7 @@ impl DesktopController {
     pub(crate) fn import_global_config_toml_path(&mut self, path: &Utf8Path) -> bool {
         match import_global_config_toml(path) {
             Ok(message) => {
-                if !self.reload_config() {
+                if !self.reload_config_with_status_code(DesktopStatusCode::ConfigImportFailed) {
                     return false;
                 }
                 self.state.mark_startup_config_reviewed();
@@ -8018,14 +8021,20 @@ impl DesktopController {
                 true
             }
             Err(error) => {
-                self.state
-                    .set_status_message(format!("config import failed: {error}"));
+                self.state.set_typed_status_message(
+                    DesktopStatusCode::ConfigImportFailed,
+                    format!("config import failed: {error}"),
+                );
                 false
             }
         }
     }
 
     fn reload_config(&mut self) -> bool {
+        self.reload_config_with_status_code(DesktopStatusCode::Plain)
+    }
+
+    fn reload_config_with_status_code(&mut self, failure_code: DesktopStatusCode) -> bool {
         match ConfigLoader::load(&self.app.workspace.root, None) {
             Ok(config) => {
                 self.app.config = config.clone();
@@ -8033,8 +8042,10 @@ impl DesktopController {
                 true
             }
             Err(error) => {
-                self.state
-                    .set_status_message(format!("failed to reload config: {error}"));
+                self.state.set_typed_status_message(
+                    failure_code,
+                    format!("failed to reload config: {error}"),
+                );
                 false
             }
         }
@@ -10909,7 +10920,8 @@ mod tests {
         SessionRefreshRequestTarget, SessionRuntimeListenerTarget, SteerSubmissionTarget,
         deliver_desktop_session_runtime_events, desktop_terminal_status_message,
         fallback_workspace_after_project_delete, finish_steer_operation_if_current,
-        first_restorable_project_root, normalize_image_attachment_path, notification_session_title,
+        first_restorable_project_root, import_global_config_toml_to,
+        normalize_image_attachment_path, notification_session_title,
         open_transcript_rows_to_markdown, provider_catalog_probe_config,
         publish_desktop_run_finished, resolve_pending_permission, run_completion_notification_body,
         run_terminal_event_notification_body, test_desktop_control_plane,
@@ -11582,6 +11594,92 @@ mod tests {
         assert_eq!(body, "vision GUI を停止しました: run stopped by user");
     }
 
+    #[test]
+    fn config_import_accepts_toml_files_regardless_of_base_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let text = "[model]\nmodel = \"renamed-config-model\"\n";
+        let target =
+            Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 target");
+
+        for file_name in ["config(1).toml", "config_202608.toml", "CONFIG_BACKUP.TOML"] {
+            let path = Utf8PathBuf::from_path_buf(temp.path().join(file_name)).expect("utf8 path");
+            std::fs::write(path.as_std_path(), text).expect("config fixture");
+            std::fs::write(target.as_std_path(), "sentinel").expect("target fixture");
+
+            import_global_config_toml_to(&path, &target)
+                .expect("renamed TOML config should be imported");
+            assert_eq!(std::fs::read_to_string(target.as_std_path()).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn config_import_rejects_paths_without_a_toml_extension() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target =
+            Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 target");
+        let sentinel = "[model]\nmodel = \"existing\"\n";
+
+        for file_name in ["config_202608.txt", "config_backup", "config.toml.bak"] {
+            let path = Utf8PathBuf::from_path_buf(temp.path().join(file_name)).expect("utf8 path");
+            std::fs::write(path.as_std_path(), "[model]\nmodel = \"valid\"\n")
+                .expect("config fixture");
+            std::fs::write(target.as_std_path(), sentinel).expect("target fixture");
+
+            assert_eq!(
+                import_global_config_toml_to(&path, &target),
+                Err("select a .toml file".to_string())
+            );
+            assert_eq!(
+                std::fs::read_to_string(target.as_std_path()).unwrap(),
+                sentinel
+            );
+        }
+    }
+
+    #[test]
+    fn config_import_rejects_malformed_toml() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path =
+            Utf8PathBuf::from_path_buf(temp.path().join("config_backup.toml")).expect("utf8 path");
+        let target =
+            Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 target");
+        let sentinel = "[model]\nmodel = \"existing\"\n";
+        std::fs::write(path.as_std_path(), "[model\nmodel =").expect("config fixture");
+        std::fs::write(target.as_std_path(), sentinel).expect("target fixture");
+
+        assert!(import_global_config_toml_to(&path, &target).is_err());
+        assert_eq!(
+            std::fs::read_to_string(target.as_std_path()).unwrap(),
+            sentinel
+        );
+    }
+
+    #[test]
+    fn config_import_rejects_semantically_invalid_config_before_replacing_target() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source =
+            Utf8PathBuf::from_path_buf(temp.path().join("config(1).toml")).expect("utf8 source");
+        let target =
+            Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 target");
+        let sentinel = "[model]\nmodel = \"existing\"\n";
+        std::fs::write(
+            source.as_std_path(),
+            "[workspace]\nprotected_paths = [\"relative/path\"]\n",
+        )
+        .expect("semantic-invalid config fixture");
+        std::fs::write(target.as_std_path(), sentinel).expect("target fixture");
+
+        let error = import_global_config_toml_to(&source, &target)
+            .expect_err("semantic-invalid config must not be imported");
+
+        assert!(error.contains("workspace.protected_paths"));
+        assert!(error.contains("absolute path"));
+        assert_eq!(
+            std::fs::read_to_string(target.as_std_path()).unwrap(),
+            sentinel
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_toast_script_quotes_notification_text() {
@@ -12200,8 +12298,7 @@ fn pick_image_file(_start_dir: Option<&Utf8Path>) -> Result<Option<Utf8PathBuf>,
 #[cfg(feature = "tauri-desktop")]
 fn pick_config_toml_file() -> Result<Option<Utf8PathBuf>, String> {
     match rfd::FileDialog::new()
-        .add_filter("moyAI config.toml", &["toml"])
-        .set_file_name("config.toml")
+        .add_filter("moyAI TOML config", &["toml"])
         .pick_file()
     {
         Some(path) => Utf8PathBuf::from_path_buf(path)
@@ -12217,19 +12314,19 @@ fn pick_config_toml_file() -> Result<Option<Utf8PathBuf>, String> {
 }
 
 fn import_global_config_toml(source: &Utf8Path) -> Result<String, String> {
-    let file_name = source
-        .file_name()
-        .ok_or_else(|| "selected file has no file name".to_string())?;
-    if !file_name.eq_ignore_ascii_case("config.toml") {
-        return Err("select a file named config.toml".to_string());
-    }
-    let text = read_toml_utf8_bounded(source).map_err(|error| error.to_string())?;
-    toml::from_str::<PartialResolvedConfig>(&text).map_err(|error| error.to_string())?;
     let target = global_config_path().map_err(|error| error.to_string())?;
+    import_global_config_toml_to(source, &target)?;
+    Ok(format!("imported config.toml to {}", target))
+}
+
+fn import_global_config_toml_to(source: &Utf8Path, target: &Utf8Path) -> Result<(), String> {
+    validate_import_config_extension(source)?;
     let parent = target
         .parent()
         .ok_or_else(|| format!("global config path has no parent: {target}"))?;
-    fs::create_dir_all(parent.as_std_path()).map_err(|error| error.to_string())?;
+    let _write_lease =
+        acquire_global_config_write_lease(target).map_err(|error| error.to_string())?;
+    let text = read_import_config_toml(source)?;
     let mut temp =
         NamedTempFile::new_in(parent.as_std_path()).map_err(|error| error.to_string())?;
     temp.write_all(text.as_bytes())
@@ -12239,7 +12336,24 @@ fn import_global_config_toml(source: &Utf8Path) -> Result<String, String> {
         .map_err(|error| error.to_string())?;
     temp.persist(target.as_std_path())
         .map_err(|error| error.error.to_string())?;
-    Ok(format!("imported config.toml to {}", target))
+    Ok(())
+}
+
+fn read_import_config_toml(source: &Utf8Path) -> Result<String, String> {
+    validate_import_config_extension(source)?;
+    let text = read_toml_utf8_bounded(source).map_err(|error| error.to_string())?;
+    ConfigLoader::validate_global_config_text(source, &text).map_err(|error| error.to_string())?;
+    Ok(text)
+}
+
+fn validate_import_config_extension(source: &Utf8Path) -> Result<(), String> {
+    if !source
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("toml"))
+    {
+        return Err("select a .toml file".to_string());
+    }
+    Ok(())
 }
 
 fn normalize_markdown_export_path(path: Utf8PathBuf) -> Utf8PathBuf {

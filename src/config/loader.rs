@@ -64,14 +64,43 @@ impl ConfigLoader {
         cli: Option<&RunArgs>,
     ) -> Result<ResolvedConfig, ConfigError> {
         let config_source = global_config_path.clone();
+        let global = read_optional(global_config_path)?;
+        Self::resolve_global_config(&config_source, global, cli)
+    }
+
+    #[cfg(feature = "tauri-desktop")]
+    pub(crate) fn validate_global_config_text(
+        config_source: &Utf8Path,
+        text: &str,
+    ) -> Result<(), ConfigError> {
+        let global = parse_global_config_text(config_source, text)?;
+        Self::resolve_config(config_source, Some(global), None, None).map(drop)
+    }
+
+    fn resolve_global_config(
+        config_source: &Utf8Path,
+        global: Option<PartialResolvedConfig>,
+        cli: Option<&RunArgs>,
+    ) -> Result<ResolvedConfig, ConfigError> {
+        validate_env_overrides()?;
+        Self::resolve_config(config_source, global, Some(env_patch()), cli)
+    }
+
+    fn resolve_config(
+        config_source: &Utf8Path,
+        global: Option<PartialResolvedConfig>,
+        environment: Option<PartialResolvedConfig>,
+        cli: Option<&RunArgs>,
+    ) -> Result<ResolvedConfig, ConfigError> {
         let mut resolved = ResolvedConfig::default();
 
-        if let Some(global) = read_optional(global_config_path)? {
+        if let Some(global) = global {
             resolved = apply_patch(resolved, global);
         }
 
-        validate_env_overrides()?;
-        resolved = apply_patch(resolved, env_patch());
+        if let Some(environment) = environment {
+            resolved = apply_patch(resolved, environment);
+        }
 
         if let Some(run_args) = cli {
             let mut patch = PartialResolvedConfig::default();
@@ -127,13 +156,17 @@ fn read_optional(path: Utf8PathBuf) -> Result<Option<PartialResolvedConfig>, Con
         return Ok(None);
     }
     let text = read_toml_utf8_bounded(&path)?;
-    let parsed = toml::from_str::<PartialResolvedConfig>(&text).map_err(|source| {
-        ConfigError::ParseFile {
-            path: path.to_string(),
-            source,
-        }
-    })?;
-    Ok(Some(parsed))
+    parse_global_config_text(&path, &text).map(Some)
+}
+
+fn parse_global_config_text(
+    path: &Utf8Path,
+    text: &str,
+) -> Result<PartialResolvedConfig, ConfigError> {
+    toml::from_str::<PartialResolvedConfig>(text).map_err(|source| ConfigError::ParseFile {
+        path: path.to_string(),
+        source,
+    })
 }
 
 pub(crate) fn read_toml_utf8_bounded(path: &Utf8Path) -> Result<String, ConfigError> {
@@ -954,6 +987,24 @@ mod tests {
             assert!(diagnostic.contains(field));
             assert!(diagnostic.contains(path.as_str()));
         }
+    }
+
+    #[cfg(feature = "tauri-desktop")]
+    #[test]
+    fn imported_config_validation_cannot_be_masked_by_runtime_overrides() {
+        let source = Utf8Path::new("config(1).toml");
+        let text = "[model]\nrequest_timeout_ms = 0\n";
+        let global = parse_global_config_text(source, text).expect("parse import candidate");
+        let mut environment = PartialResolvedConfig::default();
+        environment.model.get_or_insert_default().request_timeout_ms = Some(1_000);
+
+        ConfigLoader::resolve_config(source, Some(global), Some(environment), None)
+            .expect("a later override demonstrates how an invalid file value can be masked");
+        let error = ConfigLoader::validate_global_config_text(source, text)
+            .expect_err("the selected file must remain invalid on its own");
+
+        assert!(error.to_string().contains("model.request_timeout_ms"));
+        assert!(error.to_string().contains(source.as_str()));
     }
 
     #[test]

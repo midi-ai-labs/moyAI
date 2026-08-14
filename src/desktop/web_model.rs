@@ -1197,6 +1197,13 @@ fn display_status_projection(code: DesktopStatusCode, message: &str) -> (String,
                 message.to_string(),
             );
         }
+        DesktopStatusCode::ConfigImportFailed => {
+            return (
+                "設定ファイルをImportできませんでした。選択したTOMLを確認してください。"
+                    .to_string(),
+                message.to_string(),
+            );
+        }
         DesktopStatusCode::Plain
         | DesktopStatusCode::ApprovalAborted
         | DesktopStatusCode::UserStopped
@@ -1345,6 +1352,11 @@ mod tests {
             display_status_projection(DesktopStatusCode::PermissionPolicyDenied, message);
         assert!(permission.contains("許可されませんでした"));
         assert_eq!(permission_detail, message);
+
+        let (config_import, config_import_detail) =
+            display_status_projection(DesktopStatusCode::ConfigImportFailed, message);
+        assert!(config_import.contains("Importできませんでした"));
+        assert_eq!(config_import_detail, message);
     }
 
     #[test]

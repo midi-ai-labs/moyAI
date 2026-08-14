@@ -2995,6 +2995,14 @@ pre {
   margin: 10px 22px 0;
 }
 
+.settings-status-stack > .initial-setup-status {
+  margin: 10px 22px 0;
+}
+
+.settings-status-stack > .initial-setup-status .setup-message {
+  margin-bottom: 8px;
+}
+
 .config-grid,
 .review-grid {
   display: grid;

@@ -212,6 +212,7 @@ export type DesktopStatusCode =
   | "model_unavailable"
   | "image_unsupported"
   | "permission_policy_denied"
+  | "config_import_failed"
   | "approval_aborted"
   | "user_stopped"
   | "agent_interrupted"

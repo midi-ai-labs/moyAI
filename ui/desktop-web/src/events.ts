@@ -747,10 +747,12 @@ async function dispatchAction(action: string, index: number, value: string, stat
     case "import-config-toml":
       {
         if (!state.config_draft.external_owner_mutation_open) return;
-        context.uiState.externalConfigMutationPending = true;
         try {
-          context.rerender();
-          const request = beginConfigMutation(context.uiState, state.config_target);
+          const request = beginConfigImportMutation(
+            context.uiState,
+            state.config_target,
+            context.rerender,
+          );
           let nextState: DesktopWebState;
           let imported: boolean;
           try {
@@ -792,6 +794,17 @@ async function dispatchAction(action: string, index: number, value: string, stat
     default:
       return;
   }
+}
+
+export function beginConfigImportMutation(
+  uiState: UiLocalState,
+  target: ConfigMutationTarget,
+  rerender: () => void,
+) {
+  uiState.externalConfigMutationPending = true;
+  const request = beginConfigMutation(uiState, target);
+  rerender();
+  return request;
 }
 
 function startupSetupRequired(state: DesktopWebState): boolean {

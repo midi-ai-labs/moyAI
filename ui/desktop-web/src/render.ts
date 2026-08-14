@@ -796,7 +796,7 @@ function renderProviderOverlay(state: DesktopViewState): string {
           <h2 id="provider-dialog-title">${setupRequired ? "初期設定" : "LLM URL"}</h2>
           ${setupRequired ? "" : `<button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>`}
         </div>
-        ${setupRequired ? `<p class="setup-message">${escapeHtml(state.startup.message)} ${escapeHtml(state.startup.detail)}</p>` : ""}
+        ${setupRequired ? renderInitialSetupStatus(state) : ""}
         <label class="field-label" for="provider-url">ベースURL</label>
         <input id="provider-url" value="${escapeHtml(state.provider_base_url)}" />
         <label class="field-label">Provider mode</label>
@@ -824,7 +824,7 @@ function renderProviderOverlay(state: DesktopViewState): string {
           <button data-action="load-provider-models" ${providerCapabilities(state).canLoadProviderModels ? "" : "disabled"}>${state.provider_loading ? "読込中" : "モデル読込"}</button>
           <button data-action="apply-provider-session" ${state.provider_apply_enabled ? "" : "disabled"}>UIセッションに適用</button>
           <button data-action="save-provider-global" ${state.provider_apply_enabled ? "" : "disabled"}>設定ファイルに保存</button>
-          ${setupRequired ? `<button data-action="import-config-toml" ${configOwnerMutationIsOpen ? "" : "disabled"}>config.tomlをImport</button>` : ""}
+          ${setupRequired ? `<button data-action="import-config-toml" ${configOwnerMutationIsOpen ? "" : "disabled"}>TOML設定をImport</button>` : ""}
         </div>
         <div class="select-list">
           ${state.provider_models
@@ -871,6 +871,23 @@ function providerStatusView(state: DesktopWebState): { kind: string; title: stri
   };
 }
 
+function renderInitialSetupStatus(state: DesktopWebState): string {
+  const guidance = `<p class="setup-message">${escapeHtml(state.startup.message)} ${escapeHtml(state.startup.detail)}</p>`;
+  if (configMutationInFlight) {
+    return `<div class="initial-setup-status">${guidance}<div class="validation" role="status" aria-live="polite">設定を確認しています…</div></div>`;
+  }
+  if (state.status_code !== "config_import_failed") {
+    return `<div class="initial-setup-status">${guidance}</div>`;
+  }
+  return `<div class="initial-setup-status">${guidance}
+    <div class="validation error" role="alert" aria-live="assertive">
+      <strong>${escapeHtml(state.status_message)}</strong>
+      ${state.status_detail.trim().length > 0
+        ? `<details><summary>詳細</summary><pre>${escapeHtml(state.status_detail)}</pre></details>`
+        : ""}
+    </div></div>`;
+}
+
 function renderConfigOverlay(state: DesktopWebState): string {
   const setupRequired = startupSetupRequired(state);
   const title = setupRequired ? "初期設定" : "Preferences";
@@ -888,11 +905,13 @@ function renderConfigOverlay(state: DesktopWebState): string {
             <button data-action="discard-config-draft" ${configDirty ? "" : "hidden"} ${configDraftDiscardIsOpen ? "" : "disabled"}>変更を破棄</button>
             <button data-action="apply-session-config" ${configCommitDisabled ? "disabled" : ""}>UIセッションに適用</button>
             <button data-action="save-global-config" ${configCommitDisabled ? "disabled" : ""}>設定ファイルに保存</button>
-            ${setupRequired ? `<button data-action="import-config-toml" ${configOwnerMutationIsOpen ? "" : "disabled"}>config.tomlをImport</button>` : `<button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>`}
+            ${setupRequired ? `<button data-action="import-config-toml" ${configOwnerMutationIsOpen ? "" : "disabled"}>TOML設定をImport</button>` : `<button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>`}
           </div>
         </div>
-        ${setupRequired ? `<p class="setup-message">${escapeHtml(state.startup.message)} ${escapeHtml(state.startup.detail)}</p>` : ""}
-        <div id="settings-validation" class="validation ok">${configDirty ? "未保存の設定があります。Apply、保存、または変更を破棄するまで別画面からの設定変更は停止します。" : "入力形式は問題ありません。"}</div>
+        <div class="settings-status-stack">
+          ${setupRequired ? renderInitialSetupStatus(state) : ""}
+          <div id="settings-validation" class="validation ok">${configDirty ? "未保存の設定があります。Apply、保存、または変更を破棄するまで別画面からの設定変更は停止します。" : "入力形式は問題ありません。"}</div>
+        </div>
         <div class="settings-layout">
           <nav class="settings-nav" aria-label="設定カテゴリ">
             <a href="#settings-provider">Provider</a>

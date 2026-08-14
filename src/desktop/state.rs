@@ -32,6 +32,7 @@ pub enum DesktopStatusCode {
     ModelUnavailable,
     ImageUnsupported,
     PermissionPolicyDenied,
+    ConfigImportFailed,
     ApprovalAborted,
     UserStopped,
     AgentInterrupted,
