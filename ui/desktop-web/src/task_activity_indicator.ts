@@ -78,6 +78,12 @@ export function renderTaskActivityIndicator(
   return `<span class="task-activity-indicator${options.small ? " small" : ""}" data-task-activity="${presentation.state}" ${accessibility}></span>`;
 }
 
+export function renderTaskActivityBadge(state: TaskActivityState): string {
+  const presentation = classifyTaskActivity(state);
+  if (!presentation) return "";
+  return `<span class="task-activity-badge" data-task-activity-badge="${presentation.state}" role="status" aria-live="polite" aria-atomic="true">${renderTaskActivityIndicator(presentation.state, { decorative: true })}<strong>${presentation.label}</strong></span>`;
+}
+
 export function reconcileTaskActivityAnimationEpoch(
   previous: TaskActivityAnimationEpoch | null,
   input: TaskActivityAnimationInput,

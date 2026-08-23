@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   classifyTaskActivity,
   reconcileTaskActivityAnimationEpoch,
+  renderTaskActivityBadge,
   renderTaskActivityIndicator,
   taskActivityAnimationDelay,
   taskActivityStateForSessionRow,
@@ -46,11 +47,12 @@ test("task activity presentation is typed, accessible, and idle-safe", () => {
   }
   assert.equal(classifyTaskActivity("idle"), null);
   assert.equal(renderTaskActivityIndicator("idle"), "");
+  assert.equal(renderTaskActivityBadge("idle"), "");
   assert.equal(taskActivityStateForView("idle", true), "running");
   assert.equal(taskActivityStateForView("finalizing", true), "finalizing");
 });
 
-test("session rows derive background activity while selected lifecycle state remains authoritative", () => {
+test("selected Rust activity remains authoritative while background rows derive attention", () => {
   const row = (
     loaded_status: "not_loaded" | "idle" | "active" | "system_error",
     pending_permission_requests = 0,
@@ -60,11 +62,32 @@ test("session rows derive background activity while selected lifecycle state rem
   assert.equal(taskActivityStateForSessionRow(row("active"), "idle"), "running");
   assert.equal(taskActivityStateForSessionRow(row("active", 1), "idle"), "attention");
   assert.equal(taskActivityStateForSessionRow(row("active", 0, 1), "idle"), "attention");
+  assert.equal(taskActivityStateForSessionRow(row("active", 1), "running"), "running");
+  assert.equal(taskActivityStateForSessionRow(row("active", 0, 1), "running"), "running");
+  assert.equal(taskActivityStateForSessionRow(row("active"), "attention"), "attention");
   assert.equal(taskActivityStateForSessionRow(row("active", 1, 1), "finalizing"), "finalizing");
   assert.equal(taskActivityStateForSessionRow(row("idle"), "running"), "running");
   assert.equal(taskActivityStateForSessionRow(row("system_error"), "attention"), "attention");
   for (const loadedStatus of ["not_loaded", "idle", "system_error"] as const) {
     assert.equal(taskActivityStateForSessionRow(row(loadedStatus), "idle"), "idle");
+  }
+});
+
+test("task activity badge owns the live status while its icon stays decorative", () => {
+  for (const [state, label] of [
+    ["running", "実行中"],
+    ["finalizing", "最終反映中"],
+    ["attention", "確認待ち"],
+  ] as const) {
+    const html = renderTaskActivityBadge(state);
+    assert.match(html, new RegExp(`data-task-activity-badge="${state}"`));
+    assert.match(html, /role="status"/);
+    assert.match(html, /aria-live="polite"/);
+    assert.match(html, /aria-atomic="true"/);
+    assert.match(html, /aria-hidden="true"/);
+    assert.match(html, new RegExp(`<strong>${label}</strong>`));
+    assert.doesNotMatch(html, /role="img"/);
+    assert.doesNotMatch(html, /aria-label=/);
   }
 });
 
@@ -83,8 +106,11 @@ test("run status strip exposes one typed state label", () => {
       status_message: "running",
       latest_tool_summary: "ツール待機中",
     } as DesktopWebState);
+    assert.match(html, new RegExp(`data-task-activity-badge="${state}"`));
     assert.match(html, new RegExp(`data-task-activity="${state}"`));
     assert.match(html, new RegExp(`<strong>${label}</strong>`));
+    assert.equal([...html.matchAll(/role="status"/g)].length, 1);
+    assert.equal([...html.matchAll(/aria-live="polite"/g)].length, 1);
     assert.match(html, /aria-hidden="true"/);
     assert.doesNotMatch(html, new RegExp(`aria-label="${label}"`));
     assert.match(html, /class="run-strip has-stop"/);
@@ -108,6 +134,7 @@ test("activity status remains visible when the exact Stop capability is absent",
       latest_tool_summary: "結果を同期中",
     } as DesktopWebState);
     assert.match(html, /class="run-strip"/);
+    assert.match(html, new RegExp(`data-task-activity-badge="${state}"`));
     assert.match(html, new RegExp(`data-task-activity="${state}"`));
     assert.match(html, new RegExp(`<strong>${label}</strong>`));
     assert.doesNotMatch(html, /data-action="cancel-run"/);

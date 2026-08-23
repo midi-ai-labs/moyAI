@@ -1397,14 +1397,14 @@ test("quick-chat activity uses the selected chat identity and keeps background r
     session_id: QUICK_SESSION,
     title: "Selected quick chat",
     short_id: "selected-quick",
-    label: "Selected quick chat",
+    label: "Selected quick chat [実行中] selected-quick",
   };
   const backgroundQuickChat: SessionRow = {
     ...activeSession,
     session_id: SESSION_ACTIVE,
     title: "Background quick chat",
     short_id: "background-quick",
-    label: "Background quick chat",
+    label: "Background quick chat [実行中] background-quick",
   };
   const html = renderSidebar(representativeState({
     selected_project_index: -1,
@@ -1418,13 +1418,44 @@ test("quick-chat activity uses the selected chat identity and keeps background r
 
   assert.ok(selectedRow);
   assert.match(selectedRow, /aria-current="page"/);
-  assert.match(selectedRow, /class="task-activity-indicator" data-task-activity="finalizing"/);
+  assert.match(selectedRow, /class="task-activity-indicator" data-task-activity="finalizing" aria-hidden="true"/);
   assert.doesNotMatch(selectedRow, /class="task-activity-indicator small"/);
+  assert.match(selectedRow, /<small>最終反映中 · turn 4<\/small>/);
+  assert.doesNotMatch(selectedRow, /\[実行中\]/);
   assert.ok(backgroundRow);
   assert.doesNotMatch(backgroundRow, /aria-current="page"/);
-  assert.match(backgroundRow, /class="task-activity-indicator small" data-task-activity="running"/);
+  assert.match(backgroundRow, /class="task-activity-indicator small" data-task-activity="running" aria-hidden="true"/);
+  assert.match(backgroundRow, /<small>実行中 · turn 4<\/small>/);
+  assert.doesNotMatch(backgroundRow, /\[実行中\]/);
+  assert.match(html, /data-task-activity-row="finalizing"/);
+  assert.match(html, /data-task-activity-row="running"/);
+  assert.doesNotMatch(html, /class="task-activity-indicator[^>]*aria-label=/);
   assert.match(html, /<span class="section-label">チャット<\/span>/);
   assert.equal(Array.from(html.matchAll(/class="task-activity-indicator/g)).length, 2);
+});
+
+test("a selected active row keeps the Rust state and removes its duplicate durable status", () => {
+  const pendingInputSession: SessionRow = {
+    ...activeSession,
+    pending_user_input_requests: 1,
+    label: "Active session [実行中] active",
+  };
+  const html = renderSidebar(representativeState({
+    selected_project_index: 0,
+    selected_session_index: 0,
+    session_rows: [pendingInputSession],
+    task_activity_state: "running",
+  }));
+
+  assert.match(html, /data-task-activity-row="running"/);
+  assert.match(
+    html,
+    /class="task-activity-indicator" data-task-activity="running" aria-hidden="true"/,
+  );
+  assert.match(html, /<span>Active session active<\/span>/);
+  assert.match(html, /<small>実行中 · turn 4<\/small>/);
+  assert.doesNotMatch(html, /\[実行中\]/);
+  assert.doesNotMatch(html, /class="task-activity-indicator[^>]*aria-label=/);
 });
 
 test("Desktop markup is pure across A to B to A local-presentation renders", () => {

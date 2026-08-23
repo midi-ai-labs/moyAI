@@ -23,6 +23,7 @@ import { agentDisplayName, stableAgentVisual } from "./agent_activity.ts";
 import { runCanBeCancelled, runSurfaceActive } from "./run_control.ts";
 import {
   classifyTaskActivity,
+  renderTaskActivityBadge,
   renderTaskActivityIndicator,
   taskActivityStateForSessionRow,
 } from "./task_activity_indicator.ts";
@@ -827,9 +828,10 @@ function renderProjectSessionRows(state: DesktopWebState): string {
       const selectedActivityState = runSurfaceActive(state) && selected
         ? state.task_activity_state
         : "idle";
+      const taskActivityState = taskActivityStateForSessionRow(row, selectedActivityState);
       return renderNavRow(
-        row.label,
-        sessionRowSubtitle(row, "開発チャット"),
+        sessionRowTitle(row, taskActivityState),
+        sessionRowSubtitle(row, "開発チャット", taskActivityState),
         selected,
         "session",
         index,
@@ -837,7 +839,7 @@ function renderProjectSessionRows(state: DesktopWebState): string {
         capabilities.secondaryAction,
         capabilities.rollbackAction,
         capabilities.deleteAction,
-        taskActivityStateForSessionRow(row, selectedActivityState),
+        taskActivityState,
         !navigationIsIdle(state),
         `session:${row.session_id}`,
       );
@@ -857,11 +859,15 @@ function renderActiveProjectSessionPlaceholder(state: DesktopWebState): string {
   if (!label) {
     return "";
   }
+  const activity = classifyTaskActivity(state.task_activity_state);
+  const activityAttribute = activity
+    ? ` data-task-activity-row="${activity.state}"`
+    : "";
   return `
-    <div class="nav-row-wrap selected project-session-placeholder">
+    <div class="nav-row-wrap selected project-session-placeholder"${activityAttribute}>
       <div class="nav-row">
-        <span class="nav-title">${renderTaskActivityIndicator(state.task_activity_state)}<span>${escapeHtml(label)}</span></span>
-        <small>開発チャット</small>
+        <span class="nav-title">${renderTaskActivityIndicator(state.task_activity_state, { decorative: true })}<span>${escapeHtml(label)}</span></span>
+        <small>${activity ? `${activity.label} · ` : ""}開発チャット</small>
       </div>
     </div>
   `;
@@ -894,9 +900,10 @@ function renderChatRows(state: DesktopWebState): string {
         && selected
         ? state.task_activity_state
         : "idle";
+      const taskActivityState = taskActivityStateForSessionRow(row, selectedActivityState);
       return renderNavRow(
-        row.label,
-        sessionRowSubtitle(row, "通常チャット"),
+        sessionRowTitle(row, taskActivityState),
+        sessionRowSubtitle(row, "通常チャット", taskActivityState),
         selected,
         "chat-session",
         index,
@@ -904,7 +911,7 @@ function renderChatRows(state: DesktopWebState): string {
         "",
         "",
         quickChatDeleteAction(row.loaded_status),
-        taskActivityStateForSessionRow(row, selectedActivityState),
+        taskActivityState,
         !navigationIsIdle(state),
         `chat-session:${row.session_id}`,
       );
@@ -912,17 +919,28 @@ function renderChatRows(state: DesktopWebState): string {
     .join("");
 }
 
-function sessionRowSubtitle(row: SessionRow, fallback: string): string {
-  if (row.loaded_status === "active") {
-    const pending = row.pending_user_input_requests + row.pending_permission_requests;
-    const prefix = pending > 0 ? "確認待ち" : "実行中";
+function sessionRowTitle(row: SessionRow, taskActivityState: TaskActivityState): string {
+  if (taskActivityState === "idle") return row.label;
+  const title = row.title.trim();
+  if (!title) return row.label;
+  const shortId = row.short_id.trim();
+  return shortId ? `${title} ${shortId}` : title;
+}
+
+function sessionRowSubtitle(
+  row: SessionRow,
+  fallback: string,
+  taskActivityState: TaskActivityState,
+): string {
+  const activity = classifyTaskActivity(taskActivityState);
+  if (activity) {
     const turn =
       typeof row.active_turn_sequence_no === "number"
         ? `turn ${row.active_turn_sequence_no}`
         : row.active_turn_id
           ? `turn ${row.active_turn_id.slice(0, 8)}`
           : "active turn";
-    return `${prefix} · ${turn}`;
+    return `${activity.label} · ${turn}`;
   }
   if (row.loaded_status === "system_error") {
     return "状態取得エラー";
@@ -1007,16 +1025,15 @@ export function renderTopbar(
 }
 
 export function renderRunStatusStrip(state: DesktopWebState): string {
-  const activity = classifyTaskActivity(state.task_activity_state);
-  if (!activity) return "";
+  const activityBadge = renderTaskActivityBadge(state.task_activity_state);
+  if (!activityBadge) return "";
   const canCancel = runCanBeCancelled(state);
   const phase = state.run_phase.trim() || "running";
   const step = state.run_active_step.trim() || state.status_message;
   const toolLine = state.latest_tool_summary.trim() || "ツール待機中";
   return `
-    <section class="run-strip${canCancel ? " has-stop" : ""}" aria-live="polite">
-      ${renderTaskActivityIndicator(activity.state, { decorative: true })}
-      <strong>${activity.label}</strong>
+    <section class="run-strip${canCancel ? " has-stop" : ""}">
+      ${activityBadge}
       <span>${escapeHtml(phase)}</span>
       <span>${escapeHtml(step)}</span>
       <small>${escapeHtml(toolLine)}</small>
@@ -2665,10 +2682,13 @@ function renderNavRow(
   const rollbackLabel = actionLabel(rollbackAction, "最新turnを戻す");
   const deleteLabel = actionLabel(deleteAction, "削除");
   const disabled = mutationDisabled ? ' disabled aria-disabled="true"' : "";
+  const activityAttribute = taskActivityState === "idle"
+    ? ""
+    : ` data-task-activity-row="${taskActivityState}"`;
   return `
-    <div class="nav-row-wrap ${actionClass} ${selected ? "selected" : ""}">
+    <div class="nav-row-wrap ${actionClass} ${selected ? "selected" : ""}"${activityAttribute}>
       <button class="nav-row" data-action="${kind}" data-index="${index}" data-focus-key="${escapeHtml(focusKey)}:select"${selected ? ' aria-current="page"' : ""}${disabled}>
-        <span class="nav-title">${renderTaskActivityIndicator(taskActivityState, { small: !selected })}<span>${escapeHtml(label)}</span></span>
+        <span class="nav-title">${renderTaskActivityIndicator(taskActivityState, { small: !selected, decorative: true })}<span>${escapeHtml(label)}</span></span>
         <small>${escapeHtml(detail)}</small>
       </button>
       ${

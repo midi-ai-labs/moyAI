@@ -200,6 +200,22 @@ function selectedIndicatorOwnsTarget(observation, target) {
       === `${observation?.row_action}:${target?.sessionId}:select`;
 }
 
+function centralBadgeIsSemantic(observation, state, label) {
+  return observation?.count === 1
+    && observation?.state === state
+    && observation?.visible === true
+    && observation?.role === "status"
+    && observation?.aria_live === "polite"
+    && observation?.aria_atomic === "true"
+    && observation?.label === label
+    && observation?.label_visible === true;
+}
+
+function indicatorOwnsCssBox(observation, size) {
+  return observation?.css_width === `${size}px`
+    && observation?.css_height === `${size}px`;
+}
+
 export function runStopInFlightFailures(sample) {
   const failures = [];
   const surface = sample?.surface;
@@ -232,19 +248,42 @@ export function runStopInFlightFailures(sample) {
     failures.push("semantic-stop-not-interactable");
   }
   const taskActivity = surface?.task_activity;
+  if (taskActivity?.total_count !== 2
+    || taskActivity?.visible_count !== 2
+    || taskActivity?.activity_row_count !== 1) {
+    failures.push("running-task-activity-cardinality-mismatch");
+  }
+  if (!centralBadgeIsSemantic(taskActivity?.central_badge, "running", "実行中")) {
+    failures.push("central-running-badge-not-semantic");
+  }
   if (!visibleTaskIndicator(taskActivity?.run_strip, "running", 17)
     || taskActivity?.run_strip?.small !== false
-    || taskActivity?.run_strip?.aria_hidden !== "true"
-    || taskActivity?.run_label !== "実行中") {
+    || taskActivity?.run_strip?.aria_hidden !== "true") {
     failures.push("central-running-indicator-not-visible");
   }
+  if (!indicatorOwnsCssBox(taskActivity?.run_strip, 20)) {
+    failures.push("central-running-indicator-size-mismatch");
+  }
   if (!visibleTaskIndicator(taskActivity?.selected_sidebar, "running", 17)
-    || taskActivity?.selected_sidebar?.small !== false
-    || taskActivity?.selected_sidebar?.aria_label !== "実行中") {
+    || taskActivity?.selected_sidebar?.small !== false) {
     failures.push("selected-running-indicator-not-visible");
+  }
+  if (!indicatorOwnsCssBox(taskActivity?.selected_sidebar, 18)) {
+    failures.push("selected-running-indicator-size-mismatch");
+  }
+  if (taskActivity?.selected_sidebar?.aria_hidden !== "true"
+    || taskActivity?.selected_sidebar?.aria_label !== null) {
+    failures.push("selected-running-indicator-not-decorative");
   }
   if (!selectedIndicatorOwnsTarget(taskActivity?.selected_sidebar, target)) {
     failures.push("selected-running-indicator-owner-mismatch");
+  }
+  if (taskActivity?.selected_sidebar?.row_task_activity !== "running") {
+    failures.push("selected-running-row-state-mismatch");
+  }
+  if (typeof taskActivity?.selected_sidebar?.row_subtitle !== "string"
+    || !taskActivity.selected_sidebar.row_subtitle.startsWith("実行中 · ")) {
+    failures.push("selected-running-row-label-mismatch");
   }
   if (!indicatorHasPaint(taskActivity?.run_strip)) {
     failures.push("central-running-indicator-not-painted");
@@ -305,6 +344,8 @@ export function runStopTerminalFailures(sample, expectedTarget) {
   }
   if (surface?.task_activity?.total_count !== 0
     || surface?.task_activity?.visible_count !== 0
+    || surface?.task_activity?.activity_row_count !== 0
+    || surface?.task_activity?.central_badge?.count !== 0
     || surface?.task_activity?.run_strip?.count !== 0
     || surface?.task_activity?.selected_sidebar?.count !== 0) {
     failures.push("terminal-task-indicator-not-cleared");
@@ -435,6 +476,8 @@ async function observeRunStopSurface(cdp) {
         visible: visible(element),
         width: rect?.width ?? null,
         height: rect?.height ?? null,
+        css_width: style?.width ?? null,
+        css_height: style?.height ?? null,
         small: element?.classList.contains('small') ?? null,
         aria_hidden: element?.getAttribute('aria-hidden') ?? null,
         aria_label: element?.getAttribute('aria-label') ?? null,
@@ -445,6 +488,26 @@ async function observeRunStopSurface(cdp) {
         row_session_id: rowSessionId,
         row_selected: row?.classList.contains('selected') ?? false,
         row_aria_current: rowButton?.getAttribute('aria-current') ?? null,
+        row_task_activity: row instanceof HTMLElement
+          ? row.dataset.taskActivityRow ?? null
+          : null,
+        row_subtitle: (rowButton?.querySelector('small')?.textContent ?? '').trim(),
+      };
+    };
+    const badgeObservation = (elements) => {
+      const element = elements.length === 1 && elements[0] instanceof HTMLElement
+        ? elements[0]
+        : null;
+      const label = element?.querySelector('strong') ?? null;
+      return {
+        count: elements.length,
+        state: element?.dataset.taskActivityBadge ?? null,
+        visible: visible(element),
+        role: element?.getAttribute('role') ?? null,
+        aria_live: element?.getAttribute('aria-live') ?? null,
+        aria_atomic: element?.getAttribute('aria-atomic') ?? null,
+        label: (label?.textContent ?? '').trim(),
+        label_visible: visible(label),
       };
     };
     const stopButtons = Array.from(document.querySelectorAll(
@@ -454,8 +517,14 @@ async function observeRunStopSurface(cdp) {
     const prompt = document.querySelector('section.composer textarea#prompt');
     const send = document.querySelector('section.composer button[data-action="send"]');
     const allTaskIndicators = Array.from(document.querySelectorAll('.task-activity-indicator'));
+    const centralTaskBadges = Array.from(document.querySelectorAll(
+      'section.run-strip [data-task-activity-badge]'
+    ));
     const runStripIndicators = Array.from(document.querySelectorAll(
       'section.run-strip .task-activity-indicator'
+    ));
+    const activityRows = Array.from(document.querySelectorAll(
+      'aside.sidebar .nav-row-wrap[data-task-activity-row]'
     ));
     const selectedSidebarIndicators = Array.from(document.querySelectorAll(
       'aside.sidebar .nav-row-wrap.selected .task-activity-indicator'
@@ -481,8 +550,9 @@ async function observeRunStopSurface(cdp) {
       task_activity: {
         total_count: allTaskIndicators.length,
         visible_count: allTaskIndicators.filter(visible).length,
+        activity_row_count: activityRows.length,
         prefers_reduced_motion: matchMedia('(prefers-reduced-motion: reduce)').matches,
-        run_label: (document.querySelector('section.run-strip > strong')?.textContent ?? '').trim(),
+        central_badge: badgeObservation(centralTaskBadges),
         run_strip: indicatorObservation(runStripIndicators),
         selected_sidebar: indicatorObservation(selectedSidebarIndicators),
       },

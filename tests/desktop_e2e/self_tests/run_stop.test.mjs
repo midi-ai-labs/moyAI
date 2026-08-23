@@ -104,6 +104,8 @@ function runningIndicator(overrides = {}) {
     visible: true,
     width: 18,
     height: 18,
+    css_width: "18px",
+    css_height: "18px",
     small: false,
     opacity: "1",
     color: "rgb(229, 233, 240)",
@@ -141,6 +143,8 @@ function runningIndicator(overrides = {}) {
     row_session_id: null,
     row_selected: false,
     row_aria_current: null,
+    row_task_activity: null,
+    row_subtitle: "",
   };
   return {
     ...base,
@@ -172,18 +176,32 @@ function runningSample(overrides = {}) {
       task_activity: {
         total_count: 2,
         visible_count: 2,
+        activity_row_count: 1,
         prefers_reduced_motion: false,
-        run_label: "実行中",
+        central_badge: {
+          count: 1,
+          state: "running",
+          visible: true,
+          role: "status",
+          aria_live: "polite",
+          aria_atomic: "true",
+          label: "実行中",
+          label_visible: true,
+        },
         run_strip: runningIndicator({
           aria_hidden: "true",
+          css_width: "20px",
+          css_height: "20px",
         }),
         selected_sidebar: runningIndicator({
-          aria_label: "実行中",
+          aria_hidden: "true",
           row_action: "chat-session",
           row_focus_key: `chat-session:${SESSION_ID}:select`,
           row_session_id: SESSION_ID,
           row_selected: true,
           row_aria_current: "page",
+          row_task_activity: "running",
+          row_subtitle: "実行中 · turn 1",
         }),
       },
       visible_fatal_count: 0,
@@ -247,8 +265,9 @@ function terminalSample(overrides = {}) {
       task_activity: {
         total_count: 0,
         visible_count: 0,
+        activity_row_count: 0,
         prefers_reduced_motion: false,
-        run_label: "",
+        central_badge: { count: 0 },
         run_strip: { count: 0 },
         selected_sidebar: { count: 0 },
       },
@@ -313,6 +332,32 @@ test("in-flight oracle binds one held provider request to the projected and row 
   centralHidden.surface.task_activity.run_strip.visible = false;
   assert.ok(runStopInFlightFailures(centralHidden).includes("central-running-indicator-not-visible"));
 
+  const centralWrongSize = runningSample();
+  centralWrongSize.surface.task_activity.run_strip.css_width = "18px";
+  assert.ok(runStopInFlightFailures(centralWrongSize).includes("central-running-indicator-size-mismatch"));
+
+  const selectedWrongSize = runningSample();
+  selectedWrongSize.surface.task_activity.selected_sidebar.css_height = "20px";
+  assert.ok(runStopInFlightFailures(selectedWrongSize).includes("selected-running-indicator-size-mismatch"));
+
+  for (const [field, value] of [
+    ["count", 2],
+    ["state", "attention"],
+    ["visible", false],
+    ["role", "img"],
+    ["aria_live", "assertive"],
+    ["aria_atomic", "false"],
+    ["label", ""],
+    ["label_visible", false],
+  ]) {
+    const invalidBadge = runningSample();
+    invalidBadge.surface.task_activity.central_badge[field] = value;
+    assert.ok(
+      runStopInFlightFailures(invalidBadge).includes("central-running-badge-not-semantic"),
+      field,
+    );
+  }
+
   const selectedWrongState = runningSample();
   selectedWrongState.surface.task_activity.selected_sidebar.state = "finalizing";
   assert.ok(runStopInFlightFailures(selectedWrongState).includes("selected-running-indicator-not-visible"));
@@ -325,6 +370,23 @@ test("in-flight oracle binds one held provider request to the projected and row 
   wrongSelectedOwner.surface.task_activity.selected_sidebar.row_focus_key = `chat-session:${OTHER_SESSION_ID}:select`;
   wrongSelectedOwner.surface.task_activity.selected_sidebar.row_session_id = OTHER_SESSION_ID;
   assert.ok(runStopInFlightFailures(wrongSelectedOwner).includes("selected-running-indicator-owner-mismatch"));
+
+  const selectedMarkerNamed = runningSample();
+  selectedMarkerNamed.surface.task_activity.selected_sidebar.aria_hidden = null;
+  selectedMarkerNamed.surface.task_activity.selected_sidebar.aria_label = "実行中";
+  assert.ok(runStopInFlightFailures(selectedMarkerNamed).includes("selected-running-indicator-not-decorative"));
+
+  const selectedRowStateMissing = runningSample();
+  selectedRowStateMissing.surface.task_activity.selected_sidebar.row_task_activity = null;
+  assert.ok(runStopInFlightFailures(selectedRowStateMissing).includes("selected-running-row-state-mismatch"));
+
+  const selectedRowLabelWrong = runningSample();
+  selectedRowLabelWrong.surface.task_activity.selected_sidebar.row_subtitle = "確認待ち · turn 1";
+  assert.ok(runStopInFlightFailures(selectedRowLabelWrong).includes("selected-running-row-label-mismatch"));
+
+  const duplicateActivityRow = runningSample();
+  duplicateActivityRow.surface.task_activity.activity_row_count = 2;
+  assert.ok(runStopInFlightFailures(duplicateActivityRow).includes("running-task-activity-cardinality-mismatch"));
 
   const transparentCentral = runningSample();
   eraseIndicatorPaint(transparentCentral.surface.task_activity.run_strip);

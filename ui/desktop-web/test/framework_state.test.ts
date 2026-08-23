@@ -3209,7 +3209,9 @@ test("project and quick-chat rows expose selected and background task activity",
     session_rows: [selected],
     chat_session_rows: [selected, attention, inactive],
   }));
-  assert.match(buttonFor(quickSidebar, `chat-session:${SESSION_A}`), /data-task-activity="running"/);
+  const selectedQuickChat = buttonFor(quickSidebar, `chat-session:${SESSION_A}`);
+  assert.match(selectedQuickChat, /data-task-activity="running"/);
+  assert.match(selectedQuickChat, /<small>実行中 · active turn<\/small>/);
   assert.match(buttonFor(quickSidebar, "chat-session:session-c"), /data-task-activity="attention"/);
   assert.doesNotMatch(buttonFor(quickSidebar, "chat-session:session-d"), /task-activity-indicator/);
 });

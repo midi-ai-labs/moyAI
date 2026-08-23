@@ -242,40 +242,55 @@ test("task activity keeps distinct shapes and selected versus background emphasi
   const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
   assert.match(
     css,
-    /\.task-activity-indicator\[data-task-activity="running"\]\s*\{[^}]*border:\s*2px solid rgb\(121 170 255 \/ 38%\)[^}]*border-radius:\s*999px[^}]*background:\s*rgb\(85 142 236 \/ 18%\)[^}]*animation:\s*moyai-task-activity-running 900ms linear infinite/s,
+    /\.task-activity-indicator\s*\{[^}]*width:\s*18px[^}]*min-width:\s*18px[^}]*height:\s*18px/s,
+  );
+  const running = css.match(
+    /\.task-activity-indicator\[data-task-activity="running"\]\s*\{([^}]*)\}/,
+  )?.[1];
+  const finalizing = css.match(
+    /\.task-activity-indicator\[data-task-activity="finalizing"\]\s*\{([^}]*)\}/,
+  )?.[1];
+  const attention = css.match(
+    /\.task-activity-indicator\[data-task-activity="attention"\]\s*\{([^}]*)\}/,
+  )?.[1];
+  assert.ok(running);
+  assert.match(running, /border-radius:\s*999px/);
+  assert.match(running, /animation:\s*moyai-task-activity-running/);
+  assert.match(css, /data-task-activity="running"\]::after\s*\{[^}]*width:\s*4px[^}]*height:\s*4px/s);
+  assert.ok(finalizing);
+  assert.match(finalizing, /border:\s*3px double/);
+  assert.match(finalizing, /border-radius:\s*5px/);
+  assert.match(finalizing, /animation:\s*moyai-task-activity-finalizing/);
+  assert.match(css, /data-task-activity="finalizing"\]::after\s*\{[^}]*rotate\(45deg\)/s);
+  assert.ok(attention);
+  assert.match(attention, /border-radius:\s*2px/);
+  assert.match(attention, /transform:\s*rotate\(45deg\)/);
+  assert.doesNotMatch(attention, /scale\(/);
+  assert.match(css, /data-task-activity="attention"\]::after\s*\{[^}]*content:\s*"!"/s);
+
+  assert.match(
+    css,
+    /\.task-activity-indicator\.small\s*\{[^}]*width:\s*16px[^}]*min-width:\s*16px[^}]*height:\s*16px/s,
   );
   assert.match(
     css,
-    /\.task-activity-indicator\[data-task-activity="running"\]::after\s*\{[^}]*width:\s*4px[^}]*height:\s*4px[^}]*border-radius:\s*999px[^}]*background:\s*#dceaff/s,
+    /\.task-activity-badge \.task-activity-indicator\s*\{[^}]*width:\s*20px[^}]*min-width:\s*20px[^}]*height:\s*20px/s,
   );
   assert.match(
     css,
-    /\.task-activity-indicator\[data-task-activity="finalizing"\]\s*\{[^}]*border:\s*3px double #c4a9ff[^}]*border-radius:\s*5px[^}]*animation:\s*moyai-task-activity-finalizing 1600ms ease-in-out infinite/s,
+    /\.nav-row-wrap:not\(\.selected\) \.task-activity-indicator\s*\{[^}]*animation:\s*none/s,
   );
+  for (const state of ["running", "finalizing", "attention"]) {
+    assert.match(css, new RegExp(`data-task-activity-badge="${state}"`));
+  }
+  assert.match(css, /\.nav-row-wrap\[data-task-activity-row\]::before/);
+  assert.match(css, /\.nav-row-wrap\[data-task-activity-row="attention"\]\s*\{[^}]*background:/s);
   assert.match(
     css,
-    /\.task-activity-indicator\[data-task-activity="finalizing"\]::after\s*\{[^}]*width:\s*4px[^}]*height:\s*4px[^}]*border-radius:\s*1px[^}]*background:\s*#e3d7ff[^}]*rotate\(45deg\)/s,
+    /\.nav-row-wrap\.selected\[data-task-activity-row="attention"\]\s*\{[^}]*background:[^}]*box-shadow:\s*inset/s,
   );
-  assert.match(
-    css,
-    /\.task-activity-indicator\[data-task-activity="attention"\]\s*\{[^}]*border:\s*2px solid #ffc766[^}]*border-radius:\s*2px[^}]*transform:\s*rotate\(45deg\) scale\(0\.78\)/s,
-  );
-  assert.match(
-    css,
-    /\.task-activity-indicator\[data-task-activity="attention"\]::after\s*\{[^}]*content:\s*"!"[^}]*color:\s*#fff4d6/s,
-  );
-  assert.match(
-    css,
-    /\.task-activity-indicator\.small\s*\{[^}]*width:\s*14px[^}]*min-width:\s*14px[^}]*height:\s*14px/s,
-  );
-  assert.match(
-    css,
-    /\.nav-row-wrap:not\(\.selected\) \.task-activity-indicator\[data-task-activity="running"\]\s*\{[^}]*box-shadow:\s*none[^}]*animation-duration:\s*1200ms/s,
-  );
-  assert.match(
-    css,
-    /\.nav-row-wrap:not\(\.selected\) \.task-activity-indicator\[data-task-activity="finalizing"\]\s*\{[^}]*box-shadow:\s*none[^}]*animation-duration:\s*1900ms/s,
-  );
+  assert.match(css, /@media \(forced-colors: active\)/);
+  assert.match(css, /forced-color-adjust:\s*none/);
 });
 
 test("responsive output visibility owns its cascade", () => {
