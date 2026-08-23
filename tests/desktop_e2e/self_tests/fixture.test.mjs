@@ -67,4 +67,8 @@ test("fixture config mode rejects ambiguous present and absent ownership", async
     /absent fixture cannot provide a config source/,
   );
   await assert.rejects(prepareDesktopFixture({ ...base, configMode: "legacy" }), /unsupported fixture config mode/);
+  await assert.rejects(
+    prepareDesktopFixture({ ...base, configText: "[model]", sentinelName: null }),
+    /without a sentinel requires empty sentinel text/,
+  );
 });

@@ -27,7 +27,8 @@ tests/desktop_e2e/
 - `DesktopScenario` は操作意図、product predicate、scenario固有resourceのquiesce、input/probe cleanupを所有する。process、profile、port、SQLite、共通deadline、screenshot path、verdictは所有しない。
 - `CdpDriver` はWebView内のsemantic locator、trusted browser input、DOM/AX/event観測を所有する。native dialogはexact HWNDへ束縛したWindows UI Automation / Win32 adapterで扱い、foreground依存の`SendInput`は入力先を証明できない環境で送信しない。
 - `DesktopCommandProbe` は製品APIの単一・非干渉command observerへ短命に接続し、trusted DOM操作が実際に発行したmutation commandとpayloadを取得する。Tauri内部関数の差し替えやcommand再送を行わず、observerの例外やpayload cloneの変更は製品command deliveryへ影響させない。
-- `ProcessLedger` はこのexecutionが起動したexact PID、start time、executable、descendant、profileだけを所有する。process名だけのglobal killを禁止する。
+- `ProcessLedger` はこのexecutionが起動したDesktopのexact PID、start time、executable、descendant、profileだけを所有する。process名だけのglobal killを禁止する。
+- `windows_external_process` ownerは外部verification commandをexecution-owned `TEMP` / `TMP` / `TMPDIR`で起動し、creation-timeにWindows Jobへrootを割り当ててrootと全descendantのzeroを終了条件にする。scenarioはPID ledgerやkill処理を重複所有しない。
 - `drivers/scripted_provider.mjs` はexecution固有のloopback endpointを所有し、OSのephemeral portがFetch forbidden portに当たった場合はlisten socketを閉じてboundedに再bindする。scenario側で固定portや独自の回避listを持たず、このpredicateとself-testを共通ownerとする。
 - `WindowsTauriHost` はscenarioが明示するboundedな `MOYAI_*` config overrideだけをprocess environmentへ追加できる。config / data / preferences pathは常にharness ownerであり、scenarioから上書きできない。missing-config試験は `prepareDesktopFixture({ configMode: "absent" })` を使い、空のplaceholder configを作らない。
 - product `src/harness/` のeventやreplay resultはread-only補助証拠であり、GUI PASSのoracleにしない。
@@ -82,11 +83,12 @@ Windowsの初期adapterは、製品binaryをtest pluginで変更しない外部b
 
 - pure self-test: `npm run test:desktop-e2e-harness`
 - actual shell baseline: `npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe --artifact-parent <absolute-task-root>`
-- representative scenario: 上記commandへ `--scenario input.pointer-keyboard`、`--scenario native-dialog.cancel`、`--scenario provider.restart`、`--scenario settings.initial-setup`、`--scenario settings.session`、`--scenario settings.preferences`、`--scenario settings.docling-readiness`、`--scenario run.stop`、`--scenario agent.interrupt` のいずれかを追加する。
+- representative scenario: 上記commandへ `--scenario input.pointer-keyboard`、`--scenario native-dialog.cancel`、`--scenario provider.restart`、`--scenario settings.initial-setup`、`--scenario settings.session`、`--scenario settings.preferences`、`--scenario settings.docling-readiness`、`--scenario run.stop`、`--scenario agent.interrupt` のいずれかを追加する。live LLM benchmarkは下記の `manual.case5_2` routeを使う。
 - Prompt Review exact-target changed-path scenario: 上記commandへ `--scenario prompt-review.cancel` を追加する。trusted typing後、`run_target.expectedState.admissionRevision`を意図的にずらしたdirect IPC Enhanceがtyped conflictとなりprovider接続、review作成、draft/run owner変更を一切起こさないことを先に確認する。その後trusted Enhance / Escapeを実Tauriで操作し、`run_target.expectedState`と`review_target.expectedState`のrequired decimal-string revisionを含むexact tagged union、Rustが生成するcanonical `requestId`を持つreview targetの連続観測同一性、推敲文DOM、元composer owner/draft、共通provider contractのcatalog GET 1件→enhancement POST 1件を同じsealed executionで検証する。新規sessionの初期revisionは`"0"`として検証する。
 - gate 1はprimitiveとshell readinessのself-test、gate 2は同じ共通orchestratorへのexecution-level fault injectionで検証する。
 - gate 3はfinal sourceごとにfresh executionで行う。sealed `execution.json` がbinary identityと本directory全fileのinventory / tree SHAを所有し、task-local `RESULTS.md` がexecution IDを所有する。
 - gate 4は`input.pointer-keyboard`、`native-dialog.cancel`、`provider.restart`でpointer / keyboard / native dialog / provider / restartを、各executionのclosed-store auditでSQLiteをqualification済みである。これは共通基盤のadmission完了であり、製品の全面GUI coverage完了を意味しない。
+- `input.pointer-keyboard` はfresh empty composerへUnicode multiline textを1回のCDP `Input.insertText`で投入するactual gateを持つ。WebView2がnewlineを複数のtrusted input eventへ分割する場合も、同じtarget identity / `inputType` / trusted flag / event orderからexact textを再構成し、DOM valueとlocal draft ownerの一致、trusted clearによるempty復帰まで判定する。
 - `prompt-review.cancel` はreusable scenarioとして登録済みであり、final source/binaryごとの合否はREADMEではなくfresh executionの`result.json` / `seal.json`を正とする。
 - `run.stop` はscripted providerの1件のResponses requestをpeer closeまでin-flightに保ち、required admission revision付きTurn targetを持つ実行停止をtrusted pointerで1回だけactivationする。in-flight oracleは中央badgeが`role=status` / polite live / atomicかつ「実行中」を可視表示すること、選択sidebar rowが`data-task-activity-row=running`と同じ状態subtitleを持ち、そのmarkerだけは`aria-hidden`な装飾であることをexact cardinalityで観測する。さらに選択rowのsemantic focus identityがexact Stop sessionと一致すること、中央20px・選択row 18pxのcomputed CSS box、中央・sidebar双方の可視ringと中央glyphが実paintを持つことをmachine判定する。実行時の`prefers-reduced-motion`に従い、通常motionならboundedな継続animation、reduced-motionなら同じ静的形状を要求するが、一つのexecution内でmedia preferenceを注入・切替して両分岐を証明しない。停止後はbadge、row activity contract、両indicatorの消失も要求するため`manualGate`は`not_required`のままとし、screenshotは補助的なvisible evidenceとして保存する。最終判定はcommand responseだけでなくfresh `desktop_state` polling後のdurable `UserStop` / Idle、provider replay 0、error overlay 0、共通cleanup / SQLite auditを束ねる。reduced-motion分岐、Finalizing / Attentionの形状、selected / backgroundの階層はfrontendのdeterministic unit / CSS contractでも検証し、このRunning / Stop scenarioへ未取得phaseやproduct stateを注入しない。child/descendant cascadeはRustのdeterministic owner testへ委ねる。
 - `agent.interrupt` はtool-enabled scripted providerのbounded 3-request flowでrootの`spawn_agent`、root final、exact child request holdを再現する。右output paneのexact child list→execution inspectorをcanonical操作経路とし、trusted pointerが実際に発行した唯一の`interrupt_agent.expectedTarget`を`DesktopCommandProbe`で取得して直前control ownerと照合する。response後のpollではdurable `AgentInterrupted` row、child cancelled history、agent tree Idle、root turn不変、newer root turn 0、provider replay 0、error overlay 0、共通cleanup / SQLite auditを束ねる。collapsed work summaryの可視性やprivate表示文言は合否ownerにしない。sibling/descendant non-cascadeはこの代表scenarioへ追加stateを注入せず、Rustのdeterministic owner testへ委ねる。
@@ -94,6 +96,24 @@ Windowsの初期adapterは、製品binaryをtest pluginで変更しない外部b
 - `settings.docling-readiness` はDoclingを有効化したclean fixtureでもcold-start HTTP 0を要求し、trusted Settings→Tools→`Test Docling`だけが一回のexact `check_docling_readiness.expectedTarget`とGET `/ready`を発行することを検証する。共通scripted loopbackは応答をholdし、Rust projectionとlive regionの`checking`、button disabled、pending async operationを観測してからHTTP 204をreleaseする。その後typed `ready` / HTTP 204、error overlay 0、clean closeとfocus return、late request 0を共通quiesceまで要求する。これはimplicit-network-zeroを所有する`settings.preferences`とは別executionとし、どちらのoracleも緩めない。
 - `settings.initial-setup` はconfig pathを実在させないfixtureで専用fullscreen shellを起動し、`start → provider → model → permissions → tools → finish` の6stepをstable `data-surface` / `data-step` / `data-action` locatorで操作する。Provider stepのEscapeがownerを変えないこと、StartにImport入口があること、`finish_initial_setup` が全config values・config target・setup targetを一回だけ送ること、Finish後に通常shellへ切り替わること、exact restart後もwizardが再表示されないことを検証する。main providerとenabled Doclingは一つのloopback ledgerへenvironment overrideし、起動、step移動、Finish、restart、安定観測、quiesceまでHTTP 0を要求する。
 - `settings.session` はboundedな2-turn scripted providerでroot A / root Bを実GUIから作り、topbar model chipからroot-only panelを開く。badge、Provider / Model / Access / Context / Max outputの全field、global save不存在、explicit closeとEscapeのdirty guard、local discard、exact `apply_session_settings` target、Apply後のcanonical rebaseを検証する。root Bでglobal defaultが見えること、root Aへ戻すとoverrideが戻ること、exact restart後にも同じroot A値が安定復元されることを一つのSQLite / process lifecycleで判定し、別root非漏洩をDOM表示だけでなくRust typed targetと保存revisionで束ねる。
+- `manual.case5_2` はoperator指定のRippleFish physical sourceを共通clean-seed adapterでfresh workspaceへcopyし、Quality profileを固定したlive Main LLMでStage 1〜4を同じProject Chatへtrusted GUI入力する。Stage 1 terminalでsession ownerが成立した直後、Settingsのmanual model ID経路からtool-less Side Chatを保存するが、Side Chat sendはscenarioの操作経路に含めず、restart復元時とStage 4 terminalのpersisted message 0、時点付き各sampleでselected Side model unloadedを要求する。trusted Side Sendの独立event ledgerとremote providerのtraffic ledgerは持たないためgeneration request 0そのものはmachine証明せず、`manual_pending` evidenceへ明記する。Stage 1/2 scope、各normal terminal、visible Stopによるnon-convergence cutoff、Stage 3 public suite、exact process/profile zeroを挟むrestart、同一session/history prefix、Stage 4 public/hidden evaluator、frontend/dependency/fixture/Python environment safety、providerのactual instance ID再取得・unload・連続stable-zero確認を一つのsealed executionで判定する。case固有のsource/provider/modelはhash付き `--scenario-config` JSONで渡し、runnerへRun番号や固定portを追加しない。
+
+`manual.case5_2` はproviderへrequested contextを渡した値と、LM Studioのload response / catalogで確認したapplied/effective contextを別fieldでsealする。appliedがrequested以上でも一致しない場合はcapacity machine predicateを満たし得るが、exact profileではなくcomparability deviationとしてtask-local `RESULTS.md`へ残す。Stage 1〜4のmachine predicateとcleanupがすべて成立してもscenario resultは`manual_pending`であり、人手rubric、transcript、成果物の採点が完了するまでfull PASSではない。
+
+Windows Jobはexternal evaluatorのprocess lifecycle ownerであり、filesystem / network sandboxではない。current comparison Runは通常のexternal CPython / pytest条件を維持し、workspace全file、fixture seed、Python user/system site roots、known dependency/runtime path、canonical transcriptをmachine evidenceとして比較する。任意のworkspace外namespace全体を不変と証明したとは扱わず、残るoutside-mutation評価は`manual_pending`のrubricで明示的に裁定する。
+
+`manual.case5_2` のscenario configは次の6fieldを必須とする。pathとmodelをrepositoryへ固定せず、実行ごとの外部input identityとしてsealする。
+
+```json
+{
+  "fixture_source": "C:\\absolute\\RippleFish",
+  "provider_base_url": "http://127.0.0.1:1234",
+  "main_model": "provider/main-model",
+  "side_model": "provider/side-model",
+  "expected_main_variant": "provider/main-model@variant",
+  "expected_side_variant": "provider/side-model@variant"
+}
+```
 
 ```powershell
 npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe --artifact-parent <absolute-task-root> --scenario prompt-review.cancel
@@ -103,6 +123,7 @@ npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe -
 npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe --artifact-parent <absolute-task-root> --scenario settings.docling-readiness
 npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe --artifact-parent <absolute-task-root> --scenario settings.initial-setup
 npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe --artifact-parent <absolute-task-root> --scenario settings.session
+npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe --artifact-parent <absolute-task-root> --scenario manual.case5_2 --scenario-config <absolute-scenario-config.json>
 ```
 
 ## Artifact layout

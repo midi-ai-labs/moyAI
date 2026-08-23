@@ -11,6 +11,7 @@ const SEMANTIC_IDENTITY_FIELDS = Object.freeze([
   "modal",
   "step",
   "field",
+  "detailsKey",
   "href",
 ]);
 const STABLE_IDENTITY_FIELDS = Object.freeze(SEMANTIC_IDENTITY_FIELDS.filter((field) => field !== "tag"));
@@ -40,10 +41,10 @@ const NAMED_KEYS = Object.freeze({
 const PAGE_IDENTITY_SOURCE = `
   const semanticIdentity = (value) => {
     if (!(value instanceof Element)) {
-      return { tag: "", id: null, action: null, focusKey: null, configKey: null, sideSetting: null, sessionSetting: null, sessionSettingsTrigger: null, surface: null, modal: null, step: null, field: null, href: null };
+      return { tag: "", id: null, action: null, focusKey: null, configKey: null, sideSetting: null, sessionSetting: null, sessionSettingsTrigger: null, surface: null, modal: null, step: null, field: null, detailsKey: null, href: null };
     }
     const owner = value.closest(
-      '[data-action], [data-focus-key], [data-config-key], [data-side-chat-setting], [data-session-setting], [data-session-settings-trigger], [data-surface], [data-modal], [data-step], [data-field], button, input, textarea, select, a[href], [tabindex], [role]'
+      '[data-action], [data-focus-key], [data-config-key], [data-side-chat-setting], [data-session-setting], [data-session-settings-trigger], [data-surface], [data-modal], [data-step], [data-field], [data-details-key], button, input, textarea, select, a[href], [tabindex], [role]'
     ) ?? value;
     return {
       tag: owner.tagName.toUpperCase(),
@@ -58,6 +59,7 @@ const PAGE_IDENTITY_SOURCE = `
       modal: owner instanceof HTMLElement ? (owner.dataset.modal ?? null) : null,
       step: owner instanceof HTMLElement ? (owner.dataset.step ?? null) : null,
       field: owner instanceof HTMLElement ? (owner.dataset.field ?? null) : null,
+      detailsKey: owner instanceof HTMLElement ? (owner.dataset.detailsKey ?? null) : null,
       href: owner instanceof HTMLAnchorElement ? owner.getAttribute('href') : null,
     };
   };
@@ -126,7 +128,7 @@ export function normalizeSemanticLocator(value) {
   const identity = normalizeSemanticIdentity(value.identity, { partial: true });
   invariant(
     STABLE_IDENTITY_FIELDS.some((field) => Object.hasOwn(identity, field) && identity[field] !== null),
-    "semantic locator requires id, action, focusKey, configKey, sideSetting, sessionSetting, sessionSettingsTrigger, surface, modal, step, field, or href identity",
+    "semantic locator requires id, action, focusKey, configKey, sideSetting, sessionSetting, sessionSettingsTrigger, surface, modal, step, field, detailsKey, or href identity",
   );
   invariant(value.requireVisible === undefined || typeof value.requireVisible === "boolean", "requireVisible must be boolean");
   invariant(value.requireEnabled === undefined || typeof value.requireEnabled === "boolean", "requireEnabled must be boolean");
@@ -368,6 +370,13 @@ function removeProbeExpression(probeId) {
   })()`;
 }
 
+function activeSemanticIdentityExpression() {
+  return `(() => {
+    ${PAGE_IDENTITY_SOURCE}
+    return semanticIdentity(document.activeElement);
+  })()`;
+}
+
 function probeFailure(code, message, evidence) {
   throw new WebviewInputError(code, message, evidence);
 }
@@ -416,6 +425,46 @@ export function assertTrustedProbeSequence(snapshot, { afterSequence, expected }
     after_sequence: afterSequence,
     last_sequence: observed.at(-1).sequence,
     events: clone(observed),
+  };
+}
+
+export function assertTrustedTextInsertion(snapshot, { afterSequence, identity, text }) {
+  invariant(identity !== null && typeof identity === "object" && !Array.isArray(identity), "text insertion identity is required");
+  invariant(typeof text === "string" && text.length > 0, "inserted probe text must be non-empty");
+  const inputEvents = Array.isArray(snapshot?.events)
+    ? snapshot.events.filter((event) => event?.type === "input")
+    : [];
+  if (inputEvents.length === 0) {
+    probeFailure("event-probe-cardinality", "WebView text insertion produced no trusted input event", {
+      afterSequence,
+      identity,
+      text,
+      snapshot,
+    });
+  }
+  const acquired = assertTrustedProbeSequence(snapshot, {
+    afterSequence,
+    expected: inputEvents.map(() => ({ type: "input", identity, inputType: "insertText" })),
+  });
+  const reconstructed = acquired.events.map((event, index) => {
+    if (event.data === null) return "\n";
+    if (typeof event.data === "string") return event.data;
+    probeFailure("event-probe-detail", "WebView text insertion event data was neither text nor a newline boundary", {
+      index,
+      event,
+    });
+  }).join("");
+  if (reconstructed !== text) {
+    probeFailure("event-probe-text", "WebView trusted input events did not reconstruct the exact inserted text", {
+      expected: text,
+      reconstructed,
+      events: acquired.events,
+    });
+  }
+  return {
+    ...acquired,
+    reconstructed_text: reconstructed,
+    segment_count: acquired.events.length,
   };
 }
 
@@ -741,6 +790,37 @@ export class WebviewInput {
       await this.pressKey(character);
     }
     return { text, character_count: characters.length };
+  }
+
+  async insertText(locatorValue, text) {
+    invariant(typeof text === "string" && text.length > 0, "WebView inserted text must be non-empty");
+    invariant(!text.includes("\0") && Buffer.byteLength(text, "utf8") <= 1_000_000, "WebView inserted text is invalid");
+    const target = await this.resolveExactTarget(locatorValue);
+    const activeIdentity = normalizeSemanticIdentity(await this.#cdp.evaluate(activeSemanticIdentityExpression()));
+    if (!identityMatches(activeIdentity, target.identity)) {
+      throw new WebviewInputError(
+        "text-insert-focus-owner",
+        "WebView text insertion target is not the exact active semantic owner",
+        { target, active_identity: activeIdentity },
+      );
+    }
+    try {
+      await this.#cdp.call("Input.insertText", { text });
+    } catch (error) {
+      throw new WebviewInputError(
+        "text-insert-delivery-ambiguous",
+        "WebView text insertion delivery is ambiguous and must not be retried",
+        { target, active_identity: activeIdentity, message: errorMessage(error) },
+      );
+    }
+    return {
+      target,
+      active_identity: activeIdentity,
+      text,
+      character_count: Array.from(text).length,
+      utf8_byte_count: Buffer.byteLength(text, "utf8"),
+      delivery: "confirmed",
+    };
   }
 
   async releasePressedKeys() {

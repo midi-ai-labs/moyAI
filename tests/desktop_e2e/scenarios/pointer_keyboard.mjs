@@ -1,7 +1,11 @@
 import { DesktopE2eError } from "../core/execution.mjs";
 import { TabFocusNavigator } from "../core/focus_navigation.mjs";
 import { waitForObservation } from "../core/deadline.mjs";
-import { WebviewInput, assertTrustedProbeSequence } from "../drivers/webview_input.mjs";
+import {
+  WebviewInput,
+  assertTrustedProbeSequence,
+  assertTrustedTextInsertion,
+} from "../drivers/webview_input.mjs";
 import {
   acquireInteractiveShell,
   cleanupShellBaseline,
@@ -17,6 +21,11 @@ import {
 } from "./observations.mjs";
 
 const OWNER = "scenario:input.pointer-keyboard";
+const COMPOSER_TEXT = "Unicode入力 😀\n複数行のactual GUI確認";
+const COMPOSER = Object.freeze({
+  selector: "section.composer textarea#prompt",
+  identity: { tag: "TEXTAREA", id: "prompt" },
+});
 const SHORTCUTS = Object.freeze({
   selector: 'button[data-action="show-shortcuts"]',
   identity: { tag: "BUTTON", action: "show-shortcuts" },
@@ -26,6 +35,104 @@ const REMEMBERED_DIALOG_KEY = "moyai.desktop_e2e.shortcuts-held-dialog.v1";
 
 function sameValue(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
+}
+
+async function observeComposer(cdp) {
+  return cdp.evaluate(`(async () => {
+    const invoke = window.__TAURI_INTERNALS__?.invoke;
+    if (typeof invoke !== 'function') throw new Error('tauri-invoke-unavailable');
+    const projection = await invoke('desktop_state');
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const visible = (element) => {
+      if (!(element instanceof HTMLElement) || !element.isConnected) return false;
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0
+        && rect.width > 0 && rect.height > 0;
+    };
+    const nodes = Array.from(document.querySelectorAll('section.composer textarea#prompt'));
+    const prompt = nodes.length === 1 ? nodes[0] : null;
+    return {
+      projection,
+      prompt: {
+        count: nodes.length,
+        value: prompt instanceof HTMLTextAreaElement ? prompt.value : null,
+        active: prompt !== null && document.activeElement === prompt,
+        visible: visible(prompt),
+        enabled: prompt instanceof HTMLTextAreaElement
+          && !prompt.disabled
+          && prompt.getAttribute('aria-disabled') !== 'true'
+          && prompt.closest('[inert]') === null,
+        selection_start: prompt instanceof HTMLTextAreaElement ? prompt.selectionStart : null,
+        selection_end: prompt instanceof HTMLTextAreaElement ? prompt.selectionEnd : null,
+      },
+      fatal_count: Array.from(document.querySelectorAll('.fatal')).filter(visible).length,
+      recoverable_error_count: Array.from(document.querySelectorAll('.ui-error-notice')).filter(visible).length,
+    };
+  })()`);
+}
+
+export function composerQualificationFailures(surface, expected) {
+  const failures = [];
+  if (surface?.prompt?.count !== 1) failures.push("composer-cardinality");
+  if (surface?.prompt?.visible !== true) failures.push("composer-not-visible");
+  if (surface?.prompt?.enabled !== true) failures.push("composer-not-enabled");
+  if (surface?.prompt?.active !== expected.active) failures.push("composer-focus-drift");
+  if (surface?.prompt?.value !== expected.domValue) failures.push("composer-dom-value-drift");
+  if (surface?.prompt?.selection_start !== expected.selectionOffset
+    || surface?.prompt?.selection_end !== expected.selectionOffset) {
+    failures.push("composer-selection-drift");
+  }
+  if (surface?.projection?.overlay !== "none") failures.push("composer-overlay-drift");
+  if (surface?.projection?.draft_prompt !== "") failures.push("composer-projected-draft-drift");
+  if (!sameValue(surface?.projection?.draft_target, expected.draftTarget)) failures.push("composer-draft-target-drift");
+  if (!sameValue(surface?.projection?.run_target, expected.runTarget)) failures.push("composer-run-target-drift");
+  if (surface?.projection?.composer_commit_generation !== expected.composerCommitGeneration) {
+    failures.push("composer-commit-generation-drift");
+  }
+  if (!sameValue(selectedNavigationIdentity(surface?.projection), expected.navigationIdentity)) {
+    failures.push("composer-navigation-drift");
+  }
+  if (surface?.fatal_count !== 0) failures.push("composer-fatal-visible");
+  if (surface?.recoverable_error_count !== 0) failures.push("composer-recoverable-error-visible");
+  return failures;
+}
+
+async function waitForComposerQualification(cdp, { label, expected, code, message }) {
+  try {
+    return await waitForObservation({
+      label,
+      timeoutMs: 10_000,
+      pollMs: 50,
+      sample: () => observeComposer(cdp),
+      accept: (surface) => composerQualificationFailures(surface, expected).length === 0,
+      retrySampleErrors: false,
+    });
+  } catch (error) {
+    if (error?.code !== "observation-timeout" || error?.evidence?.last_error) throw error;
+    throw productFailure(code, message, {
+      ...error.evidence,
+      failures: composerQualificationFailures(error?.evidence?.last_value, expected),
+      expected,
+    });
+  }
+}
+
+async function trustedClick(input, locator) {
+  const start = (await input.snapshotProbe()).sequence;
+  const target = await input.click(locator);
+  const snapshot = await input.snapshotProbe(start);
+  return {
+    target,
+    probe: assertTrustedProbeSequence(snapshot, {
+      afterSequence: start,
+      expected: [
+        { type: "pointerdown", identity: locator.identity, button: 0, buttons: 1 },
+        { type: "pointerup", identity: locator.identity, button: 0, buttons: 0 },
+        { type: "click", identity: locator.identity, button: 0, buttons: 0 },
+      ],
+    }),
+  };
 }
 
 async function observeShortcutsDialog(cdp, { remember = false } = {}) {
@@ -233,13 +340,107 @@ export function createPointerKeyboardScenario() {
         evidenceOwner: OWNER,
         screenshotStem: "input-shell-ready",
       });
-      const initial = await invokeDesktopCommand(cdp, "desktop_state");
+      const initialSurface = await observeComposer(cdp);
+      const initial = initialSurface.projection;
       const initialIdentity = selectedNavigationIdentity(initial);
+      const composerOwner = {
+        draftTarget: initial.draft_target,
+        runTarget: initial.run_target,
+        composerCommitGeneration: initial.composer_commit_generation,
+        navigationIdentity: initialIdentity,
+      };
+      const freshComposerExpected = {
+        ...composerOwner,
+        active: initialSurface?.prompt?.active === true,
+        domValue: "",
+        selectionOffset: 0,
+      };
+      const freshComposerFailures = composerQualificationFailures(initialSurface, freshComposerExpected);
+      if (freshComposerFailures.length > 0) {
+        throw productFailure(
+          "composer-not-fresh",
+          "the common input qualification did not start from an empty, interactive composer",
+          { failures: freshComposerFailures, surface: initialSurface },
+        );
+      }
       const input = new WebviewInput(cdp, { probeId: "pointer-keyboard" });
       let primaryError = null;
       try {
         await input.installProbe();
-        const pointerStart = (await input.snapshotProbe()).sequence;
+
+        const composerClick = await trustedClick(input, COMPOSER);
+        const insertStart = (await input.snapshotProbe()).sequence;
+        const insertion = await input.insertText(COMPOSER, COMPOSER_TEXT);
+        const insertSnapshot = await input.snapshotProbe(insertStart);
+        const trustedInsertion = assertTrustedTextInsertion(insertSnapshot, {
+          afterSequence: insertStart,
+          identity: COMPOSER.identity,
+          text: COMPOSER_TEXT,
+        });
+        const insertedComposer = await waitForComposerQualification(cdp, {
+          label: "Unicode multiline composer insertion",
+          expected: {
+            ...composerOwner,
+            active: true,
+            domValue: COMPOSER_TEXT,
+            selectionOffset: COMPOSER_TEXT.length,
+          },
+          code: "composer-insertion-state-drift",
+          message: "trusted Input.insertText did not produce the exact local draft while preserving the Rust owner projection",
+        });
+        await sink.record("trusted-composer-insert-text-acquired", {
+          input_kind: "browser_trusted",
+          composer_click: composerClick,
+          insertion,
+          probe: trustedInsertion,
+          dom_value: insertedComposer.value.prompt.value,
+          projected_draft: insertedComposer.value.projection.draft_prompt,
+          draft_target: insertedComposer.value.projection.draft_target,
+          run_target: insertedComposer.value.projection.run_target,
+        }, { phase: "executing", owner: OWNER });
+
+        const restoreStart = insertSnapshot.sequence;
+        await input.keyDown("Control");
+        try {
+          await input.pressKey("a");
+        } finally {
+          await input.keyUp("Control");
+        }
+        await input.pressKey("Backspace");
+        const restoreSnapshot = await input.snapshotProbe(restoreStart);
+        const trustedRestore = assertTrustedProbeSequence(restoreSnapshot, {
+          afterSequence: restoreStart,
+          expected: [
+            { type: "keydown", identity: COMPOSER.identity, key: "Control", code: "ControlLeft" },
+            { type: "keydown", identity: COMPOSER.identity, key: "a", code: "KeyA" },
+            { type: "keyup", identity: COMPOSER.identity, key: "a", code: "KeyA" },
+            { type: "keyup", identity: COMPOSER.identity, key: "Control", code: "ControlLeft" },
+            { type: "keydown", identity: COMPOSER.identity, key: "Backspace", code: "Backspace" },
+            { type: "input", identity: COMPOSER.identity, inputType: "deleteContentBackward", data: null },
+            { type: "keyup", identity: COMPOSER.identity, key: "Backspace", code: "Backspace" },
+          ],
+        });
+        const restoredComposer = await waitForComposerQualification(cdp, {
+          label: "trusted composer draft restoration",
+          expected: {
+            ...composerOwner,
+            active: true,
+            domValue: "",
+            selectionOffset: 0,
+          },
+          code: "composer-restoration-state-drift",
+          message: "trusted Ctrl+A and Backspace did not restore the exact fresh composer state",
+        });
+        await sink.record("trusted-composer-draft-restored", {
+          input_kind: "browser_trusted",
+          probe: trustedRestore,
+          dom_value: restoredComposer.value.prompt.value,
+          projected_draft: restoredComposer.value.projection.draft_prompt,
+          draft_target: restoredComposer.value.projection.draft_target,
+          run_target: restoredComposer.value.projection.run_target,
+        }, { phase: "executing", owner: OWNER });
+
+        const pointerStart = restoreSnapshot.sequence;
         const pointerTarget = await input.click(SHORTCUTS);
         const pointerProbe = await input.snapshotProbe(pointerStart);
         const trustedPointer = assertTrustedProbeSequence(pointerProbe, {

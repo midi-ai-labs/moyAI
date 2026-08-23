@@ -41,6 +41,7 @@ export async function createDesktopRunContext({
   binary,
   executionId,
   scenarioId,
+  scenarioConfig = null,
   harnessRoot,
   now = () => new Date().toISOString(),
 }) {
@@ -72,6 +73,7 @@ export async function createDesktopRunContext({
     schema_version: "desktop-e2e.execution.v1",
     execution_id: executionId,
     scenario_id: scenarioId,
+    scenario_config: scenarioConfig === null ? null : structuredClone(scenarioConfig),
     started_at: now(),
     binary: { path: exactBinary, sha256: sha256(binaryBytes), size_bytes: binaryItem.size },
     harness,

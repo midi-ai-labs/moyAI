@@ -5,8 +5,57 @@ import { DesktopE2eError } from "../core/execution.mjs";
 import {
   PointerKeyboardCleanupOwner,
   assertTrustedTabNavigation,
+  composerQualificationFailures,
   shortcutsDialogReady,
 } from "../scenarios/pointer_keyboard.mjs";
+
+function composerSurface(overrides = {}) {
+  return {
+    projection: {
+      overlay: "none",
+      draft_prompt: "",
+      draft_target: { workspace_path: "C:\\workspace", composer_generation: "4" },
+      run_target: { kind: "idle", admission_revision: "9" },
+      composer_commit_generation: "4",
+      workspace_path: "C:\\workspace",
+      selected_project_index: 0,
+      selected_session_index: 0,
+      project_rows: [{ project_id: "project-1", path: "C:\\workspace" }],
+      session_rows: [{ session_id: "session-1" }],
+    },
+    prompt: {
+      count: 1,
+      value: "Unicode入力 😀\n複数行",
+      active: true,
+      visible: true,
+      enabled: true,
+      selection_start: 16,
+      selection_end: 16,
+    },
+    fatal_count: 0,
+    recoverable_error_count: 0,
+    ...overrides,
+  };
+}
+
+function composerExpected(surface) {
+  return {
+    active: true,
+    domValue: surface.prompt.value,
+    selectionOffset: surface.prompt.selection_end,
+    draftTarget: surface.projection.draft_target,
+    runTarget: surface.projection.run_target,
+    composerCommitGeneration: surface.projection.composer_commit_generation,
+    navigationIdentity: {
+      workspace_path: "C:\\workspace",
+      project_id: "project-1",
+      project_path: "C:\\workspace",
+      session_id: "session-1",
+      project_row_ids: ["project-1"],
+      session_row_ids: ["session-1"],
+    },
+  };
+}
 
 function dialogObservation(overrides = {}) {
   return {
@@ -59,6 +108,25 @@ test("Tab acquisition failures remain harness-owned while acquired focus drift i
     { classification: "acquired", transition: "in_document", reasons: [] },
     { active: { tag: "BUTTON", action: "refresh" } },
   ).transition, "in_document");
+});
+
+test("composer qualification binds exact local text to an unchanged Rust owner projection", () => {
+  const valid = composerSurface();
+  const expected = composerExpected(valid);
+  assert.deepEqual(composerQualificationFailures(valid, expected), []);
+
+  const domDrift = composerSurface({ prompt: { ...valid.prompt, value: "different" } });
+  assert.ok(composerQualificationFailures(domDrift, expected).includes("composer-dom-value-drift"));
+
+  const projectedDraftDrift = composerSurface({
+    projection: { ...valid.projection, draft_prompt: valid.prompt.value },
+  });
+  assert.ok(composerQualificationFailures(projectedDraftDrift, expected).includes("composer-projected-draft-drift"));
+
+  const ownerDrift = composerSurface({
+    projection: { ...valid.projection, draft_target: { workspace_path: "C:\\other", composer_generation: "5" } },
+  });
+  assert.ok(composerQualificationFailures(ownerDrift, expected).includes("composer-draft-target-drift"));
 });
 
 test("cleanup failure preserves a primary product failure and reports scenario cleanup failure", async () => {

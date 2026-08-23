@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { open, readFile } from "node:fs/promises";
+import { lstat, mkdir, open, readFile } from "node:fs/promises";
 
 import { DesktopE2eError, exactCleanupPassed } from "../core/execution.mjs";
 import { CdpClient, assertLocalTargetEndpoint, discoverDevToolsEndpoint, waitForExactCdpTarget } from "./cdp.mjs";
@@ -141,6 +141,7 @@ export class WindowsTauriHost {
   #logPaths = [];
   #stdoutHandle = null;
   #stderrHandle = null;
+  #processTemp = null;
 
   async preflight({ context, sink, phase }) {
     if (process.platform !== "win32") {
@@ -173,7 +174,21 @@ export class WindowsTauriHost {
   }
 
   async launch({ context, scenario, sink, phase }) {
+    const launchStartedAt = new Date().toISOString();
     this.#generation += 1;
+    const processTemp = path.join(context.paths.logs, "desktop-temp");
+    if (this.#processTemp === null) {
+      await mkdir(processTemp, { recursive: false });
+      this.#processTemp = processTemp;
+    } else if (path.resolve(this.#processTemp).toLowerCase() !== path.resolve(processTemp).toLowerCase()) {
+      throw new DesktopE2eError("harness", "desktop-temp-owner-drift", "Desktop process temp owner changed across generations");
+    }
+    const processTempItem = await lstat(processTemp);
+    if (!processTempItem.isDirectory() || processTempItem.isSymbolicLink()) {
+      throw new DesktopE2eError("harness", "desktop-temp-owner-invalid", "Desktop process temp owner is not a physical directory", {
+        process_temp: processTemp,
+      });
+    }
     const stdout = this.#generation === 1
       ? context.paths.stdout
       : path.join(context.paths.logs, `desktop.g${this.#generation}.stdout.log`);
@@ -193,6 +208,9 @@ export class WindowsTauriHost {
         MOYAI_DESKTOP_PREFS_PATH: context.paths.prefs_file,
         WEBVIEW2_USER_DATA_FOLDER: context.paths.webview,
         WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: "--remote-debugging-port=0",
+        TEMP: processTemp,
+        TMP: processTemp,
+        TMPDIR: processTemp,
         RUST_BACKTRACE: "1",
       },
       windowsHide: false,
@@ -218,12 +236,20 @@ export class WindowsTauriHost {
     const ownerName = this.#generation === 1 ? "owners/desktop.json" : `owners/desktop.g${this.#generation}.json`;
     const identity = await sink.writeJson(ownerName, owner);
     this.#desktopOwnerPath = path.join(sink.root, ...identity.relative_path.split("/"));
-    await sink.record("desktop-launched", { generation: this.#generation, owner, stdout, stderr }, { phase, owner: "desktop-app" });
+    await sink.record("desktop-launched", {
+      generation: this.#generation,
+      owner,
+      stdout,
+      stderr,
+      process_temp: processTemp,
+      launch_started_at: launchStartedAt,
+    }, { phase, owner: "desktop-app" });
     return {
       generation: this.#generation,
       desktop_process_id: this.#desktop.pid,
       desktop_owner: owner,
       desktop_owner_path: this.#desktopOwnerPath,
+      launch_started_at: launchStartedAt,
     };
   }
 

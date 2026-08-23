@@ -13,13 +13,15 @@
 - operatorが用意したRippleFish fixtureから、source/config/tests/examples/sample dataだけを含むimmutable clean seedを作る。`frontend/node_modules`、build/test output、cache、virtualenv、egg-info、backend runtime data、runtime `.env` / `.env.local`、旧`task.md`は含めない。`.env.example` とpublic suiteが参照する `examples/templates` はconfig/test evidenceとして残す。
 - clean seedのsource path、file count、byte count、manifest hash、copy ruleをtask-local `RESULTS.md`へ記録する。
 - versionごとにfresh workspace、config/data、preferences、logs、screenshots directoryを作り、同じseedをcopyする。workspaceをresetして再利用しない。
-- このdirectoryの `task.md` をworkspace rootへ配置する。stage promptは `stage2-design.txt`、`stage3-implement.txt`、`stage4-regression.txt` をbyte-identicalに使用する。
+- このdirectoryの `task.md` をworkspace rootへ配置する。stage prompt fileのraw path / hash / byte countをsealしたうえで、GUIへ投入するtextはWindows checkoutのCRLFまたはCRをLFへcanonicalizeする。raw identityとGUI投入textのhash / byte countは分離し、canonicalize後のtextをtrusted input event、DOM value、wire promptでexactに照合する。
 - 同一provider/model、temperature、output budget、tool設定を全versionで使い、versionが所有するwire behaviorはbackportしない。
 - Quality profileはcurrent製品既定値 `context_window = 131072`、provider側 `num_ctx = 131072`、`max_output_tokens = 32768`、`request_timeout_ms = 3600000` とする。このtimeoutは最初のPOST attemptからstream terminalまでの単一deadlineである。historical版とのpaired比較では各runの実値と当時のtimeout contractを記録し、output budgetの意図的な縮小は行わない。artifact完成度とhidden contractを主に採点し、compactionは観測項目であって発生しなくてもfailまたはinconclusiveにしない。
+- provider loadのrequested contextと、load response / catalogで観測したapplied/effective contextは別fieldでsealする。appliedがrequested以上でもexactに一致しない場合はcapacity predicateとprofile comparabilityを分け、task-local `RESULTS.md`へdeviationを記録する。
 - Stress profileは `context_window = 32768`、provider側 `num_ctx = 32768`、`max_output_tokens = 8192` とする。これはcompaction/recoveryを確実に観測する意図的overrideであり、Quality profileやrelease smokeの代用にしない。
 - access modeは `auto_review`（現UI: 代理で承認、旧UI: 自動レビュー）を要求する。versionがそのmodeを実装しない場合は暗黙に同等扱いせず、requested/effective modeとhuman approval回数を記録する。
 - multi-agent、MCP、Doclingは無効にする。dependency installとexternal fixture mutationは禁止する。
 - visible Tauri Desktopを実際に操作し、各stageを同じProject Chat sessionへ送る。
+- Stage 1 terminal後に同じProject ChatのSide Chatへ指定provider/modelをSettingsのmanual model ID経路から保存する。Side Chat Sendはscenario操作に含めず、restart復元時とStage 4 terminalのpersisted message count、provider catalogの時点付きunloaded sampleを記録する。remote traffic ledgerを持たない場合はgeneration request 0をmachine PASSとせず、未検証境界として残す。
 
 ## Execution
 
@@ -46,7 +48,7 @@ current directory の `task.md` に従って作業してください。
 
 ### Reopen boundary
 
-Stage 3 terminal completion後に `cdp-action.mjs <port> exit-app` またはtrayの終了操作でDesktop appを通常終了し、記録済みPIDの終了を確認する。タイトルバーの「閉じる」はtrayへ隠す操作なので再起動gateには使わない。同じworkspace、config/data、preferencesを使ってDesktopを再起動し、同じProject Chat sessionとtranscriptを再開する。新しいsessionを作らず、履歴を手動要約または再投入しない。
+Stage 3 terminal completion後に共通actual E2E hostのgraceful exit contractでDesktop appを通常終了し、exact PID / start time / executableとprofile WebViewのzeroを確認する。タイトルバーの「閉じる」はtrayへ隠す操作なので再起動gateには使わない。同じworkspace、config/data、preferencesを使って共通hostがfresh process generationとして再起動し、同じProject Chat sessionとtranscriptを再開する。新しいsessionを作らず、履歴を手動要約または再投入しない。
 
 ### Stage 4: regression repair
 

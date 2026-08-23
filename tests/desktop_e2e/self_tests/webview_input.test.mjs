@@ -5,6 +5,7 @@ import {
   WebviewInput,
   assertExactSemanticTarget,
   assertTrustedProbeSequence,
+  assertTrustedTextInsertion,
   normalizeSemanticLocator,
   normalizeWebviewKey,
 } from "../drivers/webview_input.mjs";
@@ -83,7 +84,7 @@ test("semantic locators require stable identity and exact hit-tested ownership",
   });
   assert.throws(
     () => normalizeSemanticLocator({ selector: "button", identity: { tag: "BUTTON" } }),
-    /requires id, action, focusKey, configKey, sideSetting, sessionSetting, sessionSettingsTrigger, surface, modal, step, field, or href/,
+    /requires id, action, focusKey, configKey, sideSetting, sessionSetting, sessionSettingsTrigger, surface, modal, step, field, detailsKey, or href/,
   );
   assert.deepEqual(normalizeSemanticLocator({
     selector: 'a[href="#settings-tools"]',
@@ -91,6 +92,15 @@ test("semantic locators require stable identity and exact hit-tested ownership",
   }), {
     selector: 'a[href="#settings-tools"]',
     identity: { tag: "A", href: "#settings-tools" },
+    requireVisible: true,
+    requireEnabled: true,
+  });
+  assert.deepEqual(normalizeSemanticLocator({
+    selector: 'details[data-details-key="side-chat-manual-model"] > summary',
+    identity: { tag: "DETAILS", detailsKey: "side-chat-manual-model" },
+  }), {
+    selector: 'details[data-details-key="side-chat-manual-model"] > summary',
+    identity: { tag: "DETAILS", detailsKey: "side-chat-manual-model" },
     requireVisible: true,
     requireEnabled: true,
   });
@@ -342,6 +352,102 @@ test("Escape, Tab, and printable keys expose distinct browser keyDown and keyUp 
   assert.equal(cdp.calls[4].params.unmodifiedText, "a");
   assert.deepEqual(input.pressedKeys, []);
   assert.throws(() => normalizeWebviewKey("A"), /unsupported WebView key/);
+});
+
+test("exact focused text insertion supports byte-identical Unicode and multiline input without DOM assignment", async () => {
+  const identity = {
+    tag: "TEXTAREA",
+    id: "prompt",
+    action: null,
+    focusKey: null,
+    configKey: null,
+    sideSetting: null,
+    sessionSetting: null,
+    sessionSettingsTrigger: null,
+    surface: null,
+    modal: null,
+    step: null,
+    field: null,
+    href: null,
+  };
+  const prompt = {
+    selector: "textarea#prompt",
+    identity: { tag: "TEXTAREA", id: "prompt" },
+  };
+  const observation = targetObservation({ identity, hit_identity: identity });
+  const text = "日本語の依頼です。\nsecond line\n";
+  const cdp = new FakeCdp([observation, identity]);
+  const input = new WebviewInput(cdp);
+
+  const inserted = await input.insertText(prompt, text);
+  assert.equal(inserted.delivery, "confirmed");
+  assert.equal(inserted.text, text);
+  assert.equal(inserted.character_count, Array.from(text).length);
+  assert.equal(inserted.utf8_byte_count, Buffer.byteLength(text, "utf8"));
+  assert.deepEqual(cdp.calls, [{ method: "Input.insertText", params: { text } }]);
+  assert.doesNotMatch(cdp.evaluationExpressions.join("\n"), /\.value\s*=/);
+});
+
+test("trusted multiline insertion reconstructs WebView2 newline event segmentation exactly", () => {
+  const identity = { tag: "TEXTAREA", id: "prompt" };
+  const snapshot = {
+    found: true,
+    probe_id: "text-segments",
+    sequence: 3,
+    dropped_through: 0,
+    active: identity,
+    events: [
+      event(1, "input", identity, { inputType: "insertText", data: "Unicode入力 😀" }),
+      event(2, "input", identity, { inputType: "insertText", data: null }),
+      event(3, "input", identity, { inputType: "insertText", data: "複数行" }),
+    ],
+  };
+  const acquired = assertTrustedTextInsertion(snapshot, {
+    afterSequence: 0,
+    identity,
+    text: "Unicode入力 😀\n複数行",
+  });
+  assert.equal(acquired.segment_count, 3);
+  assert.equal(acquired.reconstructed_text, "Unicode入力 😀\n複数行");
+  assert.throws(
+    () => assertTrustedTextInsertion(snapshot, { afterSequence: 0, identity, text: "Unicode入力 😀複数行" }),
+    (error) => error.code === "event-probe-text",
+  );
+});
+
+test("text insertion fail-stops before delivery on focus drift and after ambiguous CDP delivery", async () => {
+  const identity = {
+    tag: "TEXTAREA",
+    id: "prompt",
+    action: null,
+    focusKey: null,
+    configKey: null,
+    sideSetting: null,
+    sessionSetting: null,
+    sessionSettingsTrigger: null,
+    surface: null,
+    modal: null,
+    step: null,
+    field: null,
+    href: null,
+  };
+  const prompt = { selector: "textarea#prompt", identity: { tag: "TEXTAREA", id: "prompt" } };
+  const observation = targetObservation({ identity, hit_identity: identity });
+  const drifted = { ...identity, id: "different" };
+  const focusDrift = new FakeCdp([observation, drifted]);
+  await assert.rejects(
+    new WebviewInput(focusDrift).insertText(prompt, "request"),
+    (error) => error.code === "text-insert-focus-owner",
+  );
+  assert.equal(focusDrift.calls.length, 0);
+
+  const ambiguous = new FakeCdp([observation, identity]);
+  ambiguous.failCall = (call) => call.method === "Input.insertText";
+  await assert.rejects(
+    new WebviewInput(ambiguous).insertText(prompt, "request"),
+    (error) => error.code === "text-insert-delivery-ambiguous",
+  );
+  assert.equal(ambiguous.calls.length, 1, "ambiguous delivery is attempted exactly once");
 });
 
 test("pressed-key cleanup attempts every key in reverse order and retains only failed releases", async () => {

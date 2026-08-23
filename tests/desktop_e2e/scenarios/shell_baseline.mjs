@@ -355,7 +355,14 @@ export async function acquireInteractiveShell(
   const screenshot = await cdp.screenshot();
   const screenshotIdentity = await sink.writeBytes(`screenshots/${screenshotStem}.png`, screenshot);
   await sink.record("shell-screenshot", screenshotIdentity, { phase: "executing", owner: evidenceOwner });
-  return { acquisition: "pass", oracle: "not_required", manual: "not_required", observation, screenshot: screenshotIdentity };
+  return {
+    acquisition: "pass",
+    oracle: "not_required",
+    manual: "not_required",
+    observation,
+    readiness: { attempts: readiness.attempts, elapsed_ms: readiness.elapsed_ms },
+    screenshot: screenshotIdentity,
+  };
 }
 
 export async function requestGracefulExit(cdp) {

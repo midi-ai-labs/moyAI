@@ -43,6 +43,16 @@ core / agent-loop / release の広い regression では、必要に応じて `ca
 6. workspace diff、transcript Markdown export、必要な protocol/provider diagnostics、screenshots を保存する。
 7. 共通cleanup ownerがtask-owned exact process / profileを終了し、必要なSQLite最終確認後にresultとevidenceをsealする。
 
+外部verification commandはexecution-owned `TEMP` / `TMP` / `TMPDIR`で起動し、Windows Jobがrootと全descendantを所有する。command終了後のroot / descendant zeroまでをmachine gateに含め、scenario固有のprocess listやglobal killへ分岐しない。
+
+`case5_2` のcurrent execution ownerは `tests/desktop_e2e/` の `manual.case5_2` scenarioである。operator指定fixtureとprovider/modelはhash付きscenario configで渡し、旧 `prepare-fixture.ps1` / `launch-desktop.ps1` / `cdp-action.mjs` をrun controllerとして組み合わせない。旧helperはhistorical/manual diagnosis用であり、fresh context、dynamic CDP、restart generation、SQLite audit、provider cleanup、sealを共通ownerから分離しない。providerへrequested contextを渡した値とLM Studioのload response / catalogから取得したapplied/effective contextは別々にsealし、appliedがrequested以上でも一致しなければprofile deviationとして`RESULTS.md`へ明記する。
+
+`manual.case5_2` はStage 1〜4のmachine predicateとcleanupが成立した時点でも`manual_pending`を返す。transcript、成果物、公開・hidden evaluator evidenceをtask-local rubricで人手採点し、その結果を`RESULTS.md`へ確定するまではfull PASSではない。
+
+Side Chat Sendはscenarioの操作経路に含めず、restart復元時とStage 4 terminalのpersisted message count、provider catalogの時点付き各sampleでselected Side model unloadedを記録する。trusted Side Sendを独立event ledgerから集計しているわけではなく、remote providerにもtraffic ledgerがないためgeneration request 0そのものはmachine証明せず、`RESULTS.md`で観測済み事実と未検証境界を分ける。
+
+Windows Jobが証明するのはexternal evaluatorのroot / descendant lifecycleであり、filesystem / network sandboxではない。比較条件を変えない通常のexternal CPython / pytestでは、workspace、fixture seed、Python site roots、known dependency/runtime pathをmachine比較し、任意のworkspace外namespace全体についてはcanonical transcriptと人手rubricで裁定する。targeted evidenceだけからworkspace外mutation全般のPASSを宣言しない。
+
 CLI から Desktop を起動する場合の current option は `moyai desktop --dir <workspace>`。実際の binary / option は current `--help` を優先する。
 
 ## Evidence
@@ -54,9 +64,9 @@ CLI から Desktop を起動する場合の current option は `moyai desktop --
 - transcript Markdown export または同等の canonical session evidence
 - required verification の stdout / stderr / exit code
 - workspace output と diff summary
-- provider/image変更時の model capability と request diagnostics（configured/effective `max_output_tokens`を含む）
+- provider/image変更時の model capability と request diagnostics（requestedとapplied/effective context、configured/effective `max_output_tokens`を含む）
 
-release package の gate artifact は `Manual ST Gate: PASS` を含め、`scripts/package-release.ps1` の入力条件を満たす。
+release package の gate artifact は `Manual ST Gate: PASS` を含め、`scripts/package-release.ps1` の入力条件を満たす。`manual_pending`のmachine artifactだけではこのgateを満たさない。
 
 ## Failure handling
 

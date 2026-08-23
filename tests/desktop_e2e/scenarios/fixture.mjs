@@ -40,11 +40,14 @@ export async function prepareDesktopFixture({
   if (configMode === "absent" && (configSourcePath !== null || configText !== null)) {
     throw new TypeError("absent fixture cannot provide a config source");
   }
-  if (!validFixtureSentinelName(sentinelName)) {
+  if (sentinelName !== null && !validFixtureSentinelName(sentinelName)) {
     throw new TypeError(`invalid fixture sentinel name: ${sentinelName}`);
   }
-  const sentinel = path.join(context.paths.workspace, sentinelName);
-  await writeFile(sentinel, sentinelText, { flag: "wx" });
+  if (sentinelName === null && sentinelText !== "") {
+    throw new TypeError("fixture without a sentinel requires empty sentinel text");
+  }
+  const sentinel = sentinelName === null ? null : path.join(context.paths.workspace, sentinelName);
+  if (sentinel !== null) await writeFile(sentinel, sentinelText, { flag: "wx" });
   if (configMode === "absent") {
     // The missing path is the product input. Do not create a placeholder.
   } else if (configSourcePath !== null) {
@@ -64,7 +67,7 @@ export async function prepareDesktopFixture({
     prefs: context.paths.prefs_file,
     webview: context.paths.webview,
     identities: {
-      sentinel: await fileIdentity(sentinel),
+      sentinel: sentinel === null ? null : await fileIdentity(sentinel),
       config: configMode === "present" ? await fileIdentity(context.paths.config_file) : null,
       preferences: await fileIdentity(context.paths.prefs_file),
     },

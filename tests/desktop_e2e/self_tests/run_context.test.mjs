@@ -32,6 +32,7 @@ test("run context validates identity before writes and seals its harness source 
     binary,
     executionId: "e2e-20260822-context-test",
     scenarioId: "shell.baseline",
+    scenarioConfig: { path: "C:\\inputs\\scenario.json", sha256: "a".repeat(64), size_bytes: 42 },
     harnessRoot,
     now: () => "2026-08-22T00:00:00.000Z",
   });
@@ -40,5 +41,10 @@ test("run context validates identity before writes and seals its harness source 
   assert.deepEqual(sealedManifest, rootManifest);
   assert.match(rootManifest.harness.tree_sha256, /^[a-f0-9]{64}$/);
   assert.equal(rootManifest.harness.files.some((entry) => entry.relative_path === "core/desktop_execution.mjs"), true);
+  assert.deepEqual(rootManifest.scenario_config, {
+    path: "C:\\inputs\\scenario.json",
+    sha256: "a".repeat(64),
+    size_bytes: 42,
+  });
   assert.equal(prepared.context.sealedManifest.relative_path, "execution.json");
 });

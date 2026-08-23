@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import process from "node:process";
+import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 import { executeDesktopScenario } from "./core/desktop_execution.mjs";
@@ -9,7 +10,7 @@ import { WindowsTauriHost } from "./drivers/windows_tauri_host.mjs";
 import { createScenario, scenarioIds } from "./scenario_registry.mjs";
 
 const harnessRoot = path.dirname(fileURLToPath(import.meta.url));
-const ALLOWED_ARGUMENTS = new Set(["binary", "artifact-parent", "execution-id", "scenario"]);
+const ALLOWED_ARGUMENTS = new Set(["binary", "artifact-parent", "execution-id", "scenario", "scenario-config"]);
 
 export function parseArguments(argv) {
   const result = {};
@@ -32,16 +33,40 @@ export function freshExecutionId() {
   return `e2e-${stamp}-${crypto.randomUUID().slice(0, 8)}`;
 }
 
+export async function readScenarioConfig(candidate) {
+  if (candidate === undefined) return { options: {}, identity: null };
+  const exact = path.resolve(candidate);
+  const item = await stat(exact);
+  if (!item.isFile()) throw new TypeError(`scenario config is not a file: ${exact}`);
+  const bytes = await readFile(exact);
+  let options;
+  try { options = JSON.parse(bytes.toString("utf8")); }
+  catch (error) { throw new TypeError(`scenario config is not valid JSON: ${error.message}`); }
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new TypeError("scenario config must contain one JSON object");
+  }
+  return {
+    options,
+    identity: {
+      path: exact,
+      sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+      size_bytes: bytes.byteLength,
+    },
+  };
+}
+
 export async function runCli(argv = process.argv.slice(2)) {
   const args = parseArguments(argv);
   if (!args.binary) throw new TypeError("--binary is required");
   if (!args["artifact-parent"]) throw new TypeError("--artifact-parent is required");
-  const scenario = createScenario(args.scenario ?? "shell.baseline");
+  const scenarioConfig = await readScenarioConfig(args["scenario-config"]);
+  const scenario = createScenario(args.scenario ?? "shell.baseline", scenarioConfig.options);
   const prepared = await createDesktopRunContext({
     artifactParent: args["artifact-parent"],
     binary: args.binary,
     executionId: args["execution-id"] ?? freshExecutionId(),
     scenarioId: scenario.id,
+    scenarioConfig: scenarioConfig.identity,
     harnessRoot,
   });
   return executeDesktopScenario({
