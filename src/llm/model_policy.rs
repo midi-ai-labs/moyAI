@@ -65,7 +65,7 @@ impl ModelPolicy {
 
     pub fn transport_profile(
         &self,
-        provider_metadata_mode: crate::config::ProviderMetadataMode,
+        provider_profile: crate::config::ProviderProfile,
     ) -> ModelProfile {
         ModelProfile {
             name: self.id.clone(),
@@ -74,7 +74,7 @@ impl ModelPolicy {
             // resolved config used for provider-specific `num_ctx`.
             context_window: self.effective_context_token_limit,
             max_output_tokens: self.max_output_tokens,
-            provider_metadata_mode,
+            provider_profile,
             capabilities: ModelCapabilities {
                 supports_tools: self.supports_tools,
                 supports_reasoning: self.supports_reasoning,
@@ -135,7 +135,7 @@ pub struct ProviderCapabilities {
 
 impl ProviderCapabilities {
     pub fn from_config(config: &ResolvedConfig) -> Self {
-        let api_mode = config.model.provider_api_mode;
+        let api_mode = config.model.provider_profile.api_mode();
         let reasoning = match api_mode {
             ProviderApiMode::ChatCompletions => config
                 .model
@@ -249,7 +249,7 @@ mod tests {
         config.model.reasoning_effort = None;
         assert!(
             ModelPolicy::from_config(&config)
-                .transport_profile(config.model.provider_metadata_mode)
+                .transport_profile(config.model.provider_profile)
                 .capabilities
                 .supports_reasoning
         );
@@ -258,7 +258,7 @@ mod tests {
         config.model.reasoning_effort = Some(ReasoningEffort::High);
         assert!(
             !ModelPolicy::from_config(&config)
-                .transport_profile(config.model.provider_metadata_mode)
+                .transport_profile(config.model.provider_profile)
                 .capabilities
                 .supports_reasoning
         );
@@ -316,7 +316,7 @@ mod tests {
         );
         assert_eq!(
             policy
-                .transport_profile(config.model.provider_metadata_mode)
+                .transport_profile(config.model.provider_profile)
                 .context_window,
             policy.effective_context_token_limit
         );

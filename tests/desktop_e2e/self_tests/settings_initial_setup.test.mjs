@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  INITIAL_SETUP_PROVIDER_API_KEY_ENV,
+  INITIAL_SETUP_PROVIDER_PROFILE,
+  INITIAL_SETUP_PROVIDER_PROFILE_OPTIONS,
   INITIAL_SETUP_STEPS,
   createSettingsInitialSetupScenario,
   createStableInitialSetupClosedDecision,
@@ -38,6 +41,8 @@ function surface(step = "start", overrides = {}) {
       config_fields: [
         { key: "model.base_url", value: "http://127.0.0.1:43111" },
         { key: "model.model", value: "e2e/scripted-responses" },
+        { key: "model.provider_profile", value: INITIAL_SETUP_PROVIDER_PROFILE },
+        { key: "model.api_key_env", value: INITIAL_SETUP_PROVIDER_API_KEY_ENV },
       ],
     },
     wizard: {
@@ -54,6 +59,21 @@ function surface(step = "start", overrides = {}) {
       back: { count: step === "start" ? 0 : 1, visible: step !== "start", enabled: step !== "start" },
       finish: { count: step === "finish" ? 1 : 0, visible: step === "finish", enabled: step === "finish" },
       import_config: { count: step === "start" ? 1 : 0, visible: step === "start", enabled: step === "start" },
+      provider: {
+        profile: {
+          count: step === "provider" ? 1 : 0,
+          visible: step === "provider",
+          enabled: step === "provider",
+          value: step === "provider" ? INITIAL_SETUP_PROVIDER_PROFILE : null,
+          options: step === "provider" ? [...INITIAL_SETUP_PROVIDER_PROFILE_OPTIONS] : [],
+        },
+        api_key_env: {
+          count: step === "provider" ? 1 : 0,
+          visible: step === "provider",
+          enabled: step === "provider",
+          value: step === "provider" ? INITIAL_SETUP_PROVIDER_API_KEY_ENV : null,
+        },
+      },
     },
     viewport: { width: 1440, height: 900 },
     visible_shell_count: 0,
@@ -81,6 +101,24 @@ test("Initial Setup predicate requires the exact fullscreen six-step zero-networ
       startup: { ...surface("provider").projection.startup, setup_target: { ...setupTarget, setupGeneration: "8" } },
     },
   }), [], "provider", workspace), true, "a fresh owner is accepted when all exact projected and DOM state agrees");
+  assert.equal(initialSetupStepReady(surface("provider", {
+    wizard: {
+      ...surface("provider").wizard,
+      provider: {
+        ...surface("provider").wizard.provider,
+        profile: { ...surface("provider").wizard.provider.profile, options: ["openai_responses"] },
+      },
+    },
+  }), [], "provider", workspace), false, "the provider step requires the complete four-profile selector");
+  assert.equal(initialSetupStepReady(surface("provider", {
+    wizard: {
+      ...surface("provider").wizard,
+      provider: {
+        ...surface("provider").wizard.provider,
+        api_key_env: { ...surface("provider").wizard.provider.api_key_env, enabled: false },
+      },
+    },
+  }), [], "provider", workspace), false, "the optional API-key env field remains directly editable");
 });
 
 test("Initial Setup Finish expectation carries all values and both exact targets", () => {
@@ -90,6 +128,8 @@ test("Initial Setup Finish expectation carries all values and both exact targets
       values: [
         { key: "model.base_url", text: "http://127.0.0.1:43111" },
         { key: "model.model", text: "e2e/scripted-responses" },
+        { key: "model.provider_profile", text: INITIAL_SETUP_PROVIDER_PROFILE },
+        { key: "model.api_key_env", text: INITIAL_SETUP_PROVIDER_API_KEY_ENV },
       ],
       expectedConfigTarget: configTarget,
       expectedSetupTarget: setupTarget,

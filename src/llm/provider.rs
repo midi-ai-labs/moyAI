@@ -6,20 +6,13 @@ use ulid::Ulid;
 use crate::error::LlmError;
 
 pub fn resolve_api_key_from_env(env_name: Option<&str>) -> Result<Option<String>, LlmError> {
-    let Some(env_name) = env_name else {
+    let Some(env_name) = crate::config::canonical_api_key_env_name(env_name).map_err(|_| {
+        LlmError::Message("configured API-key environment variable name is invalid".to_string())
+    })?
+    else {
         return Ok(None);
     };
-    let env_name = env_name.trim();
-    if env_name.is_empty()
-        || !env_name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_')
-    {
-        return Err(LlmError::Message(
-            "configured API-key environment variable name is invalid".to_string(),
-        ));
-    }
-    let value = std::env::var_os(env_name).ok_or_else(|| {
+    let value = std::env::var_os(&env_name).ok_or_else(|| {
         LlmError::Message(format!(
             "configured API-key environment variable `{env_name}` is not set"
         ))

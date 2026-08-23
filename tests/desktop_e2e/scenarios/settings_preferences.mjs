@@ -28,6 +28,14 @@ const OWNER = "scenario:settings.preferences";
 export const SETTINGS_RESTORE_STABILITY_MS = 500;
 export const PROVIDER_CONTEXT_BEFORE = "65536";
 export const PROVIDER_CONTEXT_AFTER = "65537";
+export const SETTINGS_PROVIDER_PROFILE = "openai_responses";
+export const SETTINGS_PROVIDER_API_KEY_ENV = "";
+export const PROVIDER_PROFILE_OPTIONS = Object.freeze([
+  "lm_studio",
+  "openai_compatible",
+  "openai_responses",
+  "lm_studio_chat_completions",
+]);
 
 const SHOW_PROVIDER = Object.freeze({
   selector: 'aside.sidebar button[data-action="show-provider"][title="LLM URL"]',
@@ -136,8 +144,7 @@ export function settingsPreferencesFixtureConfig(baseUrl) {
   return `[model]
 base_url = ${JSON.stringify(baseUrl)}
 model = ${JSON.stringify(SCRIPTED_PROVIDER_MODEL_ID)}
-provider_metadata_mode = "openai_compatible_only"
-provider_api_mode = "responses"
+provider_profile = ${JSON.stringify(SETTINGS_PROVIDER_PROFILE)}
 reasoning_summary = "none"
 connect_timeout_ms = 1000
 request_timeout_ms = 30000
@@ -207,6 +214,18 @@ export async function observeSettingsPreferencesSurface(cdp) {
         checked: found.node instanceof HTMLInputElement && found.node.type === 'checkbox' ? found.node.checked : null,
       };
     };
+    const select = (selector) => {
+      const found = one(selector);
+      return {
+        count: found.count,
+        visible: found.visible,
+        enabled: found.node instanceof HTMLSelectElement && !found.node.disabled,
+        value: found.node instanceof HTMLSelectElement ? found.node.value : null,
+        options: found.node instanceof HTMLSelectElement
+          ? Array.from(found.node.options).map((option) => option.value)
+          : [],
+      };
+    };
     const button = (selector) => {
       const found = one(selector);
       return {
@@ -231,6 +250,8 @@ export async function observeSettingsPreferencesSurface(cdp) {
       provider: {
         dialog_count: providerDialog.count,
         dialog_visible: providerDialog.visible,
+        profile: select('[role="dialog"][aria-labelledby="provider-dialog-title"] #provider-profile'),
+        api_key_env: input('[role="dialog"][aria-labelledby="provider-dialog-title"] #provider-api-key-env'),
         context: input('[role="dialog"][aria-labelledby="provider-dialog-title"] #provider-context-window'),
         save: button('[role="dialog"][aria-labelledby="provider-dialog-title"] button[data-action="save-provider-global"]'),
         load_models: button('[role="dialog"][aria-labelledby="provider-dialog-title"] button[data-action="load-provider-models"]'),
@@ -240,6 +261,8 @@ export async function observeSettingsPreferencesSurface(cdp) {
         dialog_count: settingsDialog.count,
         dialog_visible: settingsDialog.visible,
         dialog_inert: settingsDialog.node instanceof HTMLElement && settingsDialog.node.closest('[inert]') !== null,
+        profile: select('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.provider_profile"]'),
+        api_key_env: input('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.api_key_env"]'),
         context: input('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.context_window"]'),
         docling: input('[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[data-config-key="docling.enabled"]'),
         docling_label: {
@@ -329,6 +352,15 @@ export function providerEditorReady(surface, ledger, expectedContext = PROVIDER_
     && surface?.projection?.overlay === "provider"
     && surface?.provider?.dialog_count === 1
     && surface.provider.dialog_visible === true
+    && surface.provider.profile.count === 1
+    && surface.provider.profile.visible === true
+    && surface.provider.profile.enabled === true
+    && surface.provider.profile.value === SETTINGS_PROVIDER_PROFILE
+    && sameValue(surface.provider.profile.options, PROVIDER_PROFILE_OPTIONS)
+    && surface.provider.api_key_env.count === 1
+    && surface.provider.api_key_env.visible === true
+    && surface.provider.api_key_env.enabled === true
+    && surface.provider.api_key_env.value === SETTINGS_PROVIDER_API_KEY_ENV
     && surface.provider.context.count === 1
     && surface.provider.context.visible === true
     && surface.provider.context.enabled === true
@@ -346,6 +378,15 @@ export function preferencesReady(surface, ledger, { contextWindow, doclingEnable
     && surface?.projection?.overlay === "config"
     && surface?.settings?.dialog_count === 1
     && surface.settings.dialog_visible === true
+    && surface.settings.profile.count === 1
+    && surface.settings.profile.visible === true
+    && surface.settings.profile.enabled === true
+    && surface.settings.profile.value === SETTINGS_PROVIDER_PROFILE
+    && sameValue(surface.settings.profile.options, PROVIDER_PROFILE_OPTIONS)
+    && surface.settings.api_key_env.count === 1
+    && surface.settings.api_key_env.visible === true
+    && surface.settings.api_key_env.enabled === true
+    && surface.settings.api_key_env.value === SETTINGS_PROVIDER_API_KEY_ENV
     && surface.settings.context.count === 1
     && surface.settings.context.value === contextWindow
     && surface.settings.docling.count === 1
@@ -358,6 +399,8 @@ export function preferencesReady(surface, ledger, { contextWindow, doclingEnable
     && surface?.close_confirmation?.count === 0
     && surface?.visible_dialog_count === 1
     && fieldValue(surface.projection, "model.context_window") === contextWindow
+    && fieldValue(surface.projection, "model.provider_profile") === SETTINGS_PROVIDER_PROFILE
+    && fieldValue(surface.projection, "model.api_key_env") === SETTINGS_PROVIDER_API_KEY_ENV
     && fieldValue(surface.projection, "docling.enabled") === String(doclingEnabled);
 }
 
@@ -447,7 +490,8 @@ export function expectedProviderGlobalSave(surface, contextWindow = PROVIDER_CON
     args: {
       input: {
         baseUrl: projection.provider_base_url,
-        metadataMode: projection.provider_metadata_mode,
+        providerProfile: projection.provider_profile,
+        apiKeyEnv: projection.provider_api_key_env,
         contextWindow,
         maxOutputTokens: projection.provider_max_output_tokens,
         selectedModelId,

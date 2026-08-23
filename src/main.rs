@@ -14,9 +14,9 @@ use moyai::app::{
 use moyai::cli::parse::parse as parse_cli;
 use moyai::cli::{
     CliCommand, EventRenderer, HumanRenderer, JsonRenderer, ModelAvailabilityArgs, OutputMode,
-    RunArgs, SharedConfirmationPrompt, StdConfirmationPrompt,
+    ProviderConnectionOverrideArgs, RunArgs, SharedConfirmationPrompt, StdConfirmationPrompt,
 };
-use moyai::config::{ConfigLoader, ProviderMetadataMode, ShellFamily};
+use moyai::config::{ConfigLoader, ProviderMetadataMode, ProviderProfile, ShellFamily};
 #[cfg(feature = "tauri-desktop")]
 use moyai::desktop;
 use moyai::harness::artifact::hash_file;
@@ -27,8 +27,9 @@ use moyai::harness::{
 };
 use moyai::protocol::TurnInterruptionCause;
 use moyai::runtime::SystemClock;
-use moyai::session::SessionStatus;
-use moyai::session::{ActiveTurnExpectation, EditorContext};
+use moyai::session::{
+    ActiveTurnExpectation, EditorContext, SessionProviderConnection, SessionStatus,
+};
 use moyai::storage::{SqliteStore, StoragePaths};
 use moyai::tui;
 use tempfile::NamedTempFile;
@@ -340,8 +341,8 @@ fn to_app_command(
             cwd: app.workspace.cwd.clone(),
             config: RunConfigInput::Layered {
                 model: args.model_override.clone().unwrap_or_default(),
-                base_url: args.base_url_override.clone().unwrap_or_default(),
-                config_override: None,
+                base_url: String::new(),
+                config_override: args.provider_connection_override.config_patch(),
             },
             output_mode: args.output_mode,
             show_reasoning_summary: args.show_reasoning_summary,
@@ -398,7 +399,10 @@ fn to_app_command(
                 session_id: args.session_id,
                 cwd: args.cwd.clone(),
                 model: args.model.clone(),
-                base_url: args.base_url.clone(),
+                base_url: args.provider_connection_override.base_url.clone(),
+                provider_connection: session_provider_connection_from_cli(
+                    &args.provider_connection_override,
+                ),
                 access_mode: args.access_mode,
                 reset_model_parameters: args.reset_model_parameters,
                 temperature: args.temperature,
@@ -514,6 +518,18 @@ fn to_app_command(
     })
 }
 
+fn session_provider_connection_from_cli(
+    provider: &ProviderConnectionOverrideArgs,
+) -> Option<SessionProviderConnection> {
+    provider
+        .provider_profile
+        .map(|profile| SessionProviderConnection {
+            profile,
+            api_key_env: provider.api_key_env.clone(),
+            extra_headers: std::collections::BTreeMap::new(),
+        })
+}
+
 fn command_output_mode(command: &CliCommand) -> OutputMode {
     match command {
         CliCommand::Run(args) => args.output_mode,
@@ -567,7 +583,7 @@ async fn run_model_availability_command(args: ModelAvailabilityArgs) -> Result<(
         title: None,
         directory: args.directory.clone(),
         model_override: args.model_override.clone(),
-        base_url_override: args.base_url_override.clone(),
+        provider_connection_override: args.provider_connection_override.clone(),
         output_mode: OutputMode::Json,
         show_reasoning_summary: false,
         review_uncommitted: false,
@@ -580,15 +596,20 @@ async fn run_model_availability_command(args: ModelAvailabilityArgs) -> Result<(
     let mut config = ConfigLoader::load(&start_dir, Some(&config_args))
         .map_err(|error| (3, error.to_string()))?;
     if args.openai_compatible_only {
-        config.model.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+        let mut legacy_override = args.provider_connection_override.clone();
+        legacy_override.provider_profile = Some(ProviderProfile::from_legacy_modes(
+            ProviderMetadataMode::OpenAiCompatibleOnly,
+            config.model.provider_profile.api_mode(),
+        ));
+        config = moyai::config::merge::apply_patch(
+            config,
+            legacy_override
+                .config_patch()
+                .expect("the legacy compatibility flag always supplies a provider profile"),
+        );
     }
-    let report = moyai::llm::check_model_availability(
-        &config,
-        args.model_override.as_deref(),
-        args.base_url_override.as_deref(),
-        args.require_vision,
-    )
-    .await;
+    let report =
+        moyai::llm::check_model_availability(&config, None, None, args.require_vision).await;
     let encoded = serde_json::to_string_pretty(&report).map_err(|error| (4, error.to_string()))?;
     if let Some(output) = args.output.as_ref() {
         write_cli_artifact_atomic(output, &encoded).map_err(|error| (4, error))?;
@@ -802,6 +823,29 @@ fn write_cli_artifact_atomic(path: &Utf8PathBuf, text: &str) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_cli_connection_becomes_one_durable_snapshot() {
+        let provider = ProviderConnectionOverrideArgs {
+            base_url: Some("https://provider.example/v1".to_string()),
+            provider_profile: Some(ProviderProfile::OpenAiCompatible),
+            api_key_env: Some("PROVIDER_KEY".to_string()),
+        };
+
+        let snapshot = session_provider_connection_from_cli(&provider)
+            .expect("complete CLI connection has a durable snapshot");
+
+        assert_eq!(snapshot.profile, ProviderProfile::OpenAiCompatible);
+        assert_eq!(snapshot.api_key_env.as_deref(), Some("PROVIDER_KEY"));
+        assert!(snapshot.extra_headers.is_empty());
+        assert!(
+            session_provider_connection_from_cli(&ProviderConnectionOverrideArgs {
+                base_url: Some("https://provider.example/v1".to_string()),
+                ..Default::default()
+            })
+            .is_none()
+        );
+    }
 
     #[test]
     fn cancelled_cli_exit_uses_only_the_typed_interruption_cause() {

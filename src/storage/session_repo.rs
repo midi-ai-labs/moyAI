@@ -23,9 +23,9 @@ use crate::protocol::{
 use crate::runtime::{AgentPath, Clock, SystemClock};
 use crate::session::{
     ActiveTurnExpectation, AdmissionId, DurableTurnTerminal, NewSession, ProjectId, RunEvent,
-    SessionForkResult, SessionId, SessionModelParameters, SessionRecord, SessionRepository,
-    SessionSettingsPatch, SessionSettingsUpdate, SessionSpawnEdge, SessionStatus,
-    SessionTitleUpdate, ThreadGoal, ThreadGoalStatus, ToolCallId, ToolCallStatus,
+    SessionForkResult, SessionId, SessionModelParameters, SessionProviderConnection, SessionRecord,
+    SessionRepository, SessionSettingsPatch, SessionSettingsUpdate, SessionSpawnEdge,
+    SessionStatus, SessionTitleUpdate, ThreadGoal, ThreadGoalStatus, ToolCallId, ToolCallStatus,
     validate_session_page_limit, validate_thread_goal_objective,
 };
 
@@ -1154,11 +1154,17 @@ impl SqliteSessionRepository {
             .as_str()
             .to_string();
         let next_access_mode = patch.access_mode.unwrap_or(current.access_mode);
+        let next_provider_connection = provider_connection_for_settings_update(
+            &current,
+            &next_base_url,
+            patch.provider_connection.as_ref(),
+        );
         let next_model_parameters = patch.apply_to_model_parameters(&current.model_parameters);
         let changed = next_cwd != current.cwd
             || next_model != current.model
             || next_base_url != current.base_url
             || next_access_mode != current.access_mode
+            || next_provider_connection != current.provider_connection
             || next_model_parameters != current.model_parameters;
         if !changed {
             transaction.commit()?;
@@ -1190,10 +1196,11 @@ impl SqliteSessionRepository {
         let updated = transaction.execute(
             "UPDATE sessions
              SET cwd_path = ?2, model_name = ?3, base_url = ?4, access_mode = ?5,
-                 model_parameters_json = ?6, updated_at_ms = ?7,
+                 model_parameters_json = ?6, provider_connection_json = ?7,
+                 updated_at_ms = ?8,
                  session_settings_revision = session_settings_revision + 1
              WHERE id = ?1
-               AND session_settings_revision = ?8
+               AND session_settings_revision = ?9
                AND session_settings_revision < 9223372036854775807
                AND NOT EXISTS (
                    SELECT 1 FROM session_spawn_edges
@@ -1206,6 +1213,7 @@ impl SqliteSessionRepository {
                 next_base_url,
                 next_access_mode.as_str(),
                 serde_json::to_string(&next_model_parameters)?,
+                serialize_provider_connection(&next_provider_connection)?,
                 now,
                 expected_revision,
             ],
@@ -1252,6 +1260,7 @@ impl SqliteSessionRepository {
                      sessions.id, sessions.project_id, sessions.title, sessions.status,
                      sessions.cwd_path, sessions.model_name, sessions.base_url,
                      sessions.access_mode, sessions.model_parameters_json,
+                     sessions.provider_connection_json,
                      sessions.created_at_ms, sessions.updated_at_ms,
                      sessions.completed_at_ms, sessions.session_settings_revision,
                      sessions.status,
@@ -1296,8 +1305,8 @@ impl SqliteSessionRepository {
                 |row| {
                     Ok((
                         session_record_with_identity_from_row(row)?,
-                        raw_session_runtime_state_from_row(row, 13)?,
-                        row.get::<_, i64>(19)?,
+                        raw_session_runtime_state_from_row(row, 14)?,
+                        row.get::<_, i64>(20)?,
                     ))
                 },
             )?
@@ -1455,7 +1464,8 @@ impl SqliteSessionRepository {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
-                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    model_parameters_json, provider_connection_json,
+                    created_at_ms, updated_at_ms, completed_at_ms,
                     session_settings_revision,
                     archived_at_ms IS NOT NULL, active_run_id, active_turn_id,
                     active_run_lease_expires_at_ms,
@@ -1496,7 +1506,8 @@ impl SqliteSessionRepository {
         };
         let sql = format!(
             "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
-                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    model_parameters_json, provider_connection_json,
+                    created_at_ms, updated_at_ms, completed_at_ms,
                     session_settings_revision,
                     archived_at_ms IS NOT NULL, active_run_id, active_turn_id,
                     active_run_lease_expires_at_ms,
@@ -1559,7 +1570,8 @@ impl SqliteSessionRepository {
         };
         let sql = format!(
             "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
-                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    model_parameters_json, provider_connection_json,
+                    created_at_ms, updated_at_ms, completed_at_ms,
                     session_settings_revision,
                     archived_at_ms IS NOT NULL, active_run_id, active_turn_id,
                     active_run_lease_expires_at_ms,
@@ -1820,10 +1832,11 @@ impl SqliteSessionRepository {
         let inserted = transaction.execute(
             "INSERT INTO sessions (
                  id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
-                 model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms
+                 model_parameters_json, provider_connection_json,
+                 created_at_ms, updated_at_ms, completed_at_ms
              )
              SELECT ?2, project_id, ?3, 'idle', cwd_path, model_name, base_url, access_mode,
-                    model_parameters_json, ?4, ?4, NULL
+                     model_parameters_json, provider_connection_json, ?4, ?4, NULL
              FROM sessions WHERE id = ?1",
             params![
                 source_session_id.to_string(),
@@ -5925,7 +5938,8 @@ impl SessionRepository for SqliteSessionRepository {
         let row = connection
             .query_row(
                 "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
-                        model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                        model_parameters_json, provider_connection_json,
+                        created_at_ms, updated_at_ms, completed_at_ms,
                         session_settings_revision,
                         status, active_run_id, active_turn_id, active_run_lease_expires_at_ms,
                         (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
@@ -5980,7 +5994,8 @@ impl SessionRepository for SqliteSessionRepository {
         };
         let sql = format!(
             "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
-                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    model_parameters_json, provider_connection_json,
+                    created_at_ms, updated_at_ms, completed_at_ms,
                     session_settings_revision,
                     status, active_run_id, active_turn_id, active_run_lease_expires_at_ms,
                     (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
@@ -6020,7 +6035,8 @@ impl SessionRepository for SqliteSessionRepository {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
             "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
-                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    model_parameters_json, provider_connection_json,
+                    created_at_ms, updated_at_ms, completed_at_ms,
                     session_settings_revision,
                     status, active_run_id, active_turn_id, active_run_lease_expires_at_ms,
                     (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
@@ -6074,7 +6090,8 @@ impl SessionRepository for SqliteSessionRepository {
         };
         let sql = format!(
             "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
-                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    model_parameters_json, provider_connection_json,
+                    created_at_ms, updated_at_ms, completed_at_ms,
                     session_settings_revision,
                     status, active_run_id, active_turn_id, active_run_lease_expires_at_ms,
                     (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
@@ -6171,11 +6188,17 @@ impl SessionRepository for SqliteSessionRepository {
             .as_str()
             .to_string();
         let next_access_mode = patch.access_mode.unwrap_or(current.access_mode);
+        let next_provider_connection = provider_connection_for_settings_update(
+            &current,
+            &next_base_url,
+            patch.provider_connection.as_ref(),
+        );
         let next_model_parameters = patch.apply_to_model_parameters(&current.model_parameters);
         let changed = next_cwd != current.cwd
             || next_model != current.model
             || next_base_url != current.base_url
             || next_access_mode != current.access_mode
+            || next_provider_connection != current.provider_connection
             || next_model_parameters != current.model_parameters;
         if !changed {
             transaction.commit()?;
@@ -6200,7 +6223,8 @@ impl SessionRepository for SqliteSessionRepository {
         let updated = transaction.execute(
             "UPDATE sessions
              SET cwd_path = ?2, model_name = ?3, base_url = ?4, access_mode = ?5,
-                 model_parameters_json = ?6, updated_at_ms = ?7,
+                 model_parameters_json = ?6, provider_connection_json = ?7,
+                 updated_at_ms = ?8,
                  session_settings_revision = session_settings_revision + 1
              WHERE id = ?1
                AND session_settings_revision < 9223372036854775807",
@@ -6211,6 +6235,7 @@ impl SessionRepository for SqliteSessionRepository {
                 next_base_url,
                 next_access_mode.as_str(),
                 serde_json::to_string(&next_model_parameters)?,
+                serialize_provider_connection(&next_provider_connection)?,
                 now,
             ],
         )?;
@@ -6557,10 +6582,11 @@ fn session_record_with_identity_from_row(
         base_url: parse_provider_endpoint_column(row, 6)?,
         access_mode: parse_access_mode_column(row, 7)?,
         model_parameters: parse_session_model_parameters(&row.get::<_, String>(8)?, 8)?,
-        created_at_ms: row.get(9)?,
-        updated_at_ms: row.get(10)?,
-        completed_at_ms: row.get(11)?,
-        session_settings_revision: parse_session_settings_revision_column(row, 12)?,
+        provider_connection: parse_provider_connection_column(row, 9)?,
+        created_at_ms: row.get(10)?,
+        updated_at_ms: row.get(11)?,
+        completed_at_ms: row.get(12)?,
+        session_settings_revision: parse_session_settings_revision_column(row, 13)?,
     })
 }
 
@@ -6568,7 +6594,7 @@ fn session_record_with_raw_runtime_state_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<(SessionRecord, RawSessionRuntimeState)> {
     let session = session_record_with_identity_from_row(row)?;
-    let raw = raw_session_runtime_state_from_row(row, 13)?;
+    let raw = raw_session_runtime_state_from_row(row, 14)?;
     Ok((session, raw))
 }
 
@@ -6601,14 +6627,14 @@ fn session_projection_from_row(
 ) -> rusqlite::Result<RawSessionProjectionState> {
     Ok(RawSessionProjectionState {
         session: session_record_with_identity_from_row(row)?,
-        archived: row.get(13)?,
-        active_run_id: row.get(14)?,
-        active_turn_id: row.get(15)?,
-        active_run_lease_expires_at_ms: row.get(16)?,
-        terminal_count: row.get(17)?,
-        terminal_json: row.get(18)?,
-        active_turn_sequence_no: row.get(19)?,
-        admission_revision: row.get(20)?,
+        archived: row.get(14)?,
+        active_run_id: row.get(15)?,
+        active_turn_id: row.get(16)?,
+        active_run_lease_expires_at_ms: row.get(17)?,
+        terminal_count: row.get(18)?,
+        terminal_json: row.get(19)?,
+        active_turn_sequence_no: row.get(20)?,
+        admission_revision: row.get(21)?,
     })
 }
 
@@ -6674,8 +6700,8 @@ pub(crate) fn insert_session_in_transaction(
     now_ms: i64,
 ) -> Result<SessionRecord, StorageError> {
     transaction.execute(
-        "INSERT INTO sessions (id, project_id, title, status, cwd_path, model_name, base_url, access_mode, model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms)
-         VALUES (?1, ?2, ?3, 'idle', ?4, ?5, ?6, ?7, '{}', ?8, ?8, NULL)",
+        "INSERT INTO sessions (id, project_id, title, status, cwd_path, model_name, base_url, access_mode, model_parameters_json, provider_connection_json, created_at_ms, updated_at_ms, completed_at_ms)
+         VALUES (?1, ?2, ?3, 'idle', ?4, ?5, ?6, ?7, '{}', ?8, ?9, ?9, NULL)",
         params![
             id.to_string(),
             draft.project_id.to_string(),
@@ -6684,6 +6710,7 @@ pub(crate) fn insert_session_in_transaction(
             draft.model.as_str(),
             draft.base_url.as_str(),
             draft.access_mode.as_str(),
+            serialize_provider_connection(&draft.provider_connection)?,
             now_ms,
         ],
     )?;
@@ -6752,7 +6779,8 @@ pub(crate) fn session_record_from_connection(
     ) = connection
         .query_row(
             "SELECT project_id, title, status, cwd_path, model_name, base_url, access_mode,
-                    model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    model_parameters_json, provider_connection_json,
+                    created_at_ms, updated_at_ms, completed_at_ms,
                     session_settings_revision,
                     active_run_id, active_turn_id, active_run_lease_expires_at_ms,
                     (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
@@ -6787,16 +6815,17 @@ pub(crate) fn session_record_from_connection(
                             &row.get::<_, String>(7)?,
                             7,
                         )?,
-                        created_at_ms: row.get(8)?,
-                        updated_at_ms: row.get(9)?,
-                        completed_at_ms: row.get(10)?,
-                        session_settings_revision: parse_session_settings_revision_column(row, 11)?,
+                        provider_connection: parse_provider_connection_column(row, 8)?,
+                        created_at_ms: row.get(9)?,
+                        updated_at_ms: row.get(10)?,
+                        completed_at_ms: row.get(11)?,
+                        session_settings_revision: parse_session_settings_revision_column(row, 12)?,
                     },
-                    row.get::<_, Option<String>>(12)?,
                     row.get::<_, Option<String>>(13)?,
-                    row.get::<_, Option<i64>>(14)?,
-                    row.get::<_, i64>(15)?,
-                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<i64>>(15)?,
+                    row.get::<_, i64>(16)?,
+                    row.get::<_, Option<String>>(17)?,
                 ))
             },
         )
@@ -10116,6 +10145,71 @@ fn parse_session_model_parameters(
     })
 }
 
+fn provider_connection_for_settings_update(
+    current: &SessionRecord,
+    next_base_url: &str,
+    explicit: Option<&SessionProviderConnection>,
+) -> Option<SessionProviderConnection> {
+    if let Some(explicit) = explicit {
+        return Some(explicit.clone());
+    }
+    current.provider_connection.as_ref().map(|connection| {
+        if current.base_url == next_base_url {
+            connection.clone()
+        } else {
+            connection.without_credentials()
+        }
+    })
+}
+
+fn serialize_provider_connection(
+    value: &Option<SessionProviderConnection>,
+) -> Result<Option<String>, StorageError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    value.validate().map_err(StorageError::Message)?;
+    #[derive(serde::Serialize)]
+    struct PersistedProviderConnection<'a> {
+        profile: crate::config::ProviderProfile,
+        api_key_env: Option<&'a str>,
+        extra_headers: &'a BTreeMap<String, String>,
+    }
+    Ok(Some(serde_json::to_string(&PersistedProviderConnection {
+        profile: value.profile,
+        api_key_env: value.api_key_env.as_deref(),
+        extra_headers: &value.extra_headers,
+    })?))
+}
+
+fn parse_provider_connection_column(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+) -> rusqlite::Result<Option<SessionProviderConnection>> {
+    let Some(value) = row.get::<_, Option<String>>(column)? else {
+        return Ok(None);
+    };
+    let connection =
+        serde_json::from_str::<SessionProviderConnection>(&value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    connection.validate().map_err(|message| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            )),
+        )
+    })?;
+    Ok(Some(connection))
+}
+
 fn insert_protocol_projection_if_requested(
     transaction: &rusqlite::Transaction<'_>,
     event: &RunEvent,
@@ -12141,13 +12235,16 @@ mod tests {
     use camino::Utf8PathBuf;
 
     use super::*;
-    use crate::config::AccessMode;
+    use crate::config::{AccessMode, ProviderProfile};
     use crate::harness::{HarnessRunId, HarnessRunRecord, HarnessRunStatus, HarnessRunStore};
     use crate::protocol::{
         ContentPart, InterAgentCommunication, ModeKind, ProtocolEventStore, ToolLifecycleStatus,
         UserInputItem,
     };
-    use crate::session::{ChangeId, ChangeKind, ChangeRepository, NewSession, ProjectRepository};
+    use crate::session::{
+        ChangeId, ChangeKind, ChangeRepository, NewSession, ProjectRepository,
+        SessionProviderConnection,
+    };
     use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
 
     async fn test_repo() -> (StoreBundle, SessionId) {
@@ -12176,6 +12273,7 @@ mod tests {
                 model: "model".to_string(),
                 base_url: "http://localhost:1234".to_string(),
                 access_mode: AccessMode::Default,
+                provider_connection: None,
             })
             .await
             .expect("session");
@@ -12212,6 +12310,7 @@ mod tests {
             model: root.model,
             base_url: root.base_url,
             access_mode: root.access_mode,
+            provider_connection: root.provider_connection,
         }
     }
 
@@ -18777,6 +18876,7 @@ mod tests {
                 model: root.model,
                 base_url: root.base_url,
                 access_mode: root.access_mode,
+                provider_connection: root.provider_connection,
             })
             .await
             .expect("foreign child");
@@ -19606,6 +19706,185 @@ mod tests {
                 .expect("persisted session")
                 .access_mode,
             AccessMode::AutoReview
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_connection_round_trips_updates_atomically_and_is_copied_by_forks() {
+        let (store, fixture_session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let fixture = repository
+            .get_session(fixture_session_id)
+            .await
+            .expect("fixture session");
+        assert_eq!(
+            fixture.provider_connection, None,
+            "nullable snapshots preserve the explicit pre-V60 compatibility state"
+        );
+        let initial_connection = SessionProviderConnection {
+            profile: ProviderProfile::OpenAiCompatible,
+            api_key_env: Some("OMLX_API_KEY".to_string()),
+            extra_headers: BTreeMap::from([("X-Provider".to_string(), "omlx".to_string())]),
+        };
+        let created = repository
+            .create_session(NewSession {
+                project_id: fixture.project_id,
+                title: "provider snapshot".to_string(),
+                cwd: fixture.cwd.clone(),
+                model: "openai-compatible-model".to_string(),
+                base_url: "http://provider.example:8119/v1".to_string(),
+                access_mode: AccessMode::Default,
+                provider_connection: Some(initial_connection.clone()),
+            })
+            .await
+            .expect("provider-bound session");
+        assert_eq!(
+            created.provider_connection.as_ref(),
+            Some(&initial_connection)
+        );
+
+        let next_connection = SessionProviderConnection {
+            profile: ProviderProfile::OpenAiResponses,
+            api_key_env: Some("OPENAI_API_KEY".to_string()),
+            extra_headers: BTreeMap::new(),
+        };
+        let update = repository
+            .compare_and_set_root_session_settings(
+                created.id,
+                created.session_settings_revision,
+                &SessionSettingsPatch {
+                    model: Some("gpt-compatible".to_string()),
+                    base_url: Some("https://provider.example/v1".to_string()),
+                    provider_connection: Some(next_connection.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("provider connection CAS")
+            .expect("matching provider connection revision");
+        assert!(update.changed);
+        assert_eq!(
+            update.session.session_settings_revision,
+            created.session_settings_revision + 1
+        );
+        assert_eq!(
+            update.session.provider_connection.as_ref(),
+            Some(&next_connection)
+        );
+        let raw_snapshot = repository
+            .connection
+            .lock()
+            .expect("sqlite mutex")
+            .query_row(
+                "SELECT provider_connection_json FROM sessions WHERE id = ?1",
+                [created.id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("raw provider snapshot");
+        assert_eq!(
+            serde_json::from_str::<SessionProviderConnection>(&raw_snapshot)
+                .expect("typed raw provider snapshot"),
+            next_connection
+        );
+
+        let fork = repository
+            .fork_session_snapshot(created.id, Some("provider fork".to_string()))
+            .await
+            .expect("provider-bound fork");
+        assert_eq!(
+            fork.forked_session.provider_connection,
+            update.session.provider_connection
+        );
+
+        let paths = store.paths().clone();
+        drop(store);
+        let reopened_sqlite = SqliteStore::open(&paths).expect("reopen provider store");
+        reopened_sqlite
+            .migrate()
+            .expect("audit reopened provider store");
+        let reopened = StoreBundle::new(reopened_sqlite);
+        assert_eq!(
+            reopened
+                .session_repo()
+                .get_session(created.id)
+                .await
+                .expect("reopened provider session")
+                .provider_connection,
+            Some(next_connection)
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_url_only_settings_updates_clear_hidden_credentials() {
+        let (store, fixture_session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let fixture = repository
+            .get_session(fixture_session_id)
+            .await
+            .expect("fixture session");
+        let connection = SessionProviderConnection {
+            profile: ProviderProfile::OpenAiCompatible,
+            api_key_env: Some("PROVIDER_A_KEY".to_string()),
+            extra_headers: BTreeMap::from([(
+                "Authorization".to_string(),
+                "Bearer provider-a-secret".to_string(),
+            )]),
+        };
+        let created = repository
+            .create_session(NewSession {
+                project_id: fixture.project_id,
+                title: "credential boundary".to_string(),
+                cwd: fixture.cwd,
+                model: "model-a".to_string(),
+                base_url: "https://provider-a.example/v1".to_string(),
+                access_mode: AccessMode::Default,
+                provider_connection: Some(connection.clone()),
+            })
+            .await
+            .expect("provider-bound session");
+
+        let generic = repository
+            .update_session_settings(
+                created.id,
+                &SessionSettingsPatch {
+                    base_url: Some("https://provider-b.example/v1".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("generic URL-only update");
+        assert_eq!(
+            generic.session.provider_connection,
+            Some(connection.without_credentials())
+        );
+
+        let rebound = repository
+            .compare_and_set_root_session_settings(
+                created.id,
+                generic.session.session_settings_revision,
+                &SessionSettingsPatch {
+                    provider_connection: Some(connection.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rebind credentials")
+            .expect("matching revision");
+        let root = repository
+            .compare_and_set_root_session_settings(
+                created.id,
+                rebound.session.session_settings_revision,
+                &SessionSettingsPatch {
+                    base_url: Some("https://provider-c.example/v1".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("root URL-only update")
+            .expect("matching revision");
+        assert_eq!(
+            root.session.provider_connection,
+            Some(connection.without_credentials())
         );
     }
 
@@ -23806,6 +24085,7 @@ mod tests {
                 model: root.model.clone(),
                 base_url: root.base_url.clone(),
                 access_mode: root.access_mode,
+                provider_connection: root.provider_connection.clone(),
             })
             .await
             .expect("child session");

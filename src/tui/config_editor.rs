@@ -333,6 +333,15 @@ fn apply_dirty_toml_field(
             model.remove("stream_idle_timeout_ms");
         }
     }
+    if field == ConfigField::ProviderProfile {
+        if let Some(model) = root.get_mut("model") {
+            let model = model
+                .as_table_mut()
+                .ok_or_else(|| "global config section `model` must be a TOML table".to_string())?;
+            model.remove("provider_metadata_mode");
+            model.remove("provider_api_mode");
+        }
+    }
     Ok(())
 }
 
@@ -394,7 +403,7 @@ mod tests {
         ConfigEditorState, ConfigField, GlobalConfigAdoptionPolicy, compare_and_set_access_mode,
         parse_editor_patch, save_access_mode,
     };
-    use crate::config::{AccessMode, ProviderMetadataMode, ResolvedConfig};
+    use crate::config::{AccessMode, ProviderProfile, ResolvedConfig};
 
     fn save_config_sections(
         path: &camino::Utf8Path,
@@ -552,22 +561,59 @@ mod tests {
     }
 
     #[test]
-    fn config_editor_projects_provider_metadata_mode_patch() {
+    fn config_editor_projects_atomic_provider_profile_patch() {
         let config = ResolvedConfig::default();
         let mut editor = ConfigEditorState::from_config(&config);
         let field = editor
             .fields
             .iter_mut()
-            .find(|field| field.key == ConfigField::ProviderMetadataMode)
-            .expect("provider metadata mode field is present");
-        field.value = "openai_compatible_only".to_string();
+            .find(|field| field.key == ConfigField::ProviderProfile)
+            .expect("provider profile field is present");
+        field.value = "openai_compatible".to_string();
 
-        let patch = parse_editor_patch(&editor).expect("provider mode parses");
+        let patch = parse_editor_patch(&editor).expect("provider profile parses");
 
         assert_eq!(
-            patch.model.and_then(|model| model.provider_metadata_mode),
-            Some(ProviderMetadataMode::OpenAiCompatibleOnly)
+            patch.model.and_then(|model| model.provider_profile),
+            Some(ProviderProfile::OpenAiCompatible)
         );
+    }
+
+    #[test]
+    fn saving_provider_profile_replaces_both_legacy_split_fields() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        std::fs::write(
+            &path,
+            "[model]\nprovider_metadata_mode = \"lm_studio_native_required\"\nprovider_api_mode = \"responses\"\nmodel = \"keep-model\"\n",
+        )
+        .expect("legacy provider config");
+        let mut effective = ResolvedConfig::default();
+        effective.model.model = "keep-model".to_string();
+        let mut editor = ConfigEditorState::from_config(&effective);
+        let profile = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::ProviderProfile)
+            .expect("provider profile field");
+        profile.value = "openai_compatible".to_string();
+        profile.dirty = true;
+
+        let resolved = save_config_sections(&path, &editor).expect("save canonical profile");
+        assert_eq!(
+            resolved.model.provider_profile,
+            ProviderProfile::OpenAiCompatible
+        );
+        let saved = std::fs::read_to_string(&path).expect("saved config");
+        let saved: toml::Value = toml::from_str(&saved).expect("parse saved config");
+        assert_eq!(
+            saved["model"]["provider_profile"].as_str(),
+            Some("openai_compatible")
+        );
+        assert!(saved["model"].get("provider_metadata_mode").is_none());
+        assert!(saved["model"].get("provider_api_mode").is_none());
+        assert_eq!(saved["model"]["model"].as_str(), Some("keep-model"));
     }
 
     #[test]

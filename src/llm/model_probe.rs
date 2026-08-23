@@ -144,7 +144,7 @@ pub async fn fetch_provider_model_infos(
     let client = build_probe_client(config)?;
     let headers = build_probe_headers(config)?;
 
-    let mut models = match config.model.provider_metadata_mode {
+    let mut models = match config.model.provider_profile.metadata_mode() {
         ProviderMetadataMode::LmStudioNativeRequired => {
             fetch_lmstudio_model_infos(&client, &base_url, headers).await?
         }
@@ -167,11 +167,12 @@ pub async fn check_model_availability(
     base_url_override: Option<&str>,
     require_vision: bool,
 ) -> ModelAvailabilityReport {
+    let probe_config = availability_probe_config(config, base_url_override);
     let model = model_override
-        .unwrap_or(&config.model.model)
+        .unwrap_or(&probe_config.model.model)
         .trim()
         .to_string();
-    let endpoint = ProviderEndpoint::parse(base_url_override.unwrap_or(&config.model.base_url))
+    let endpoint = ProviderEndpoint::parse(&probe_config.model.base_url)
         .map(|endpoint| endpoint.catalog_root());
     let base_url = endpoint
         .as_ref()
@@ -188,7 +189,7 @@ pub async fn check_model_availability(
         generated_by: "moyai_model_availability_v4_catalog_and_load_state".to_string(),
         model,
         base_url,
-        provider_metadata_mode: config.model.provider_metadata_mode,
+        provider_metadata_mode: probe_config.model.provider_profile.metadata_mode(),
         v1_present: false,
         native_present: false,
         require_vision,
@@ -228,7 +229,7 @@ pub async fn check_model_availability(
         return report;
     }
 
-    let client = match build_probe_client(config) {
+    let client = match build_probe_client(&probe_config) {
         Ok(client) => client,
         Err(error) => {
             let message = error.to_string();
@@ -237,7 +238,7 @@ pub async fn check_model_availability(
             return report;
         }
     };
-    let headers = match build_probe_headers(config) {
+    let headers = match build_probe_headers(&probe_config) {
         Ok(headers) => headers,
         Err(error) => {
             let message = error.to_string();
@@ -315,6 +316,29 @@ pub async fn check_model_availability(
         report.readiness_detail = Some(model_readiness_failure_detail(&report));
     }
     report
+}
+
+fn availability_probe_config(
+    config: &ResolvedConfig,
+    base_url_override: Option<&str>,
+) -> ResolvedConfig {
+    let mut probe_config = config.clone();
+    let Some(base_url_override) = base_url_override else {
+        return probe_config;
+    };
+    let same_endpoint = match (
+        ProviderEndpoint::parse(&config.model.base_url),
+        ProviderEndpoint::parse(base_url_override),
+    ) {
+        (Ok(current), Ok(next)) => current == next,
+        _ => config.model.base_url.trim() == base_url_override.trim(),
+    };
+    if !same_endpoint {
+        probe_config.model.api_key_env = None;
+        probe_config.model.extra_headers.clear();
+    }
+    probe_config.model.base_url = base_url_override.to_string();
+    probe_config
 }
 
 fn model_readiness_failure_detail(report: &ModelAvailabilityReport) -> String {
@@ -446,10 +470,11 @@ pub fn validate_model_availability_report(
             "model availability report does not match the configured provider".to_string(),
         ));
     }
-    if config.provider_metadata_mode != report.provider_metadata_mode {
+    if config.provider_profile.metadata_mode() != report.provider_metadata_mode {
         return Err(LlmError::Message(format!(
             "model availability report metadata mode {:?} does not match configured mode {:?}",
-            report.provider_metadata_mode, config.provider_metadata_mode
+            report.provider_metadata_mode,
+            config.provider_profile.metadata_mode()
         )));
     }
     if report.require_vision != require_vision {
@@ -518,7 +543,7 @@ pub fn validate_model_availability_report(
             report.model
         )));
     }
-    if config.provider_metadata_mode == ProviderMetadataMode::LmStudioNativeRequired
+    if config.provider_profile.metadata_mode() == ProviderMetadataMode::LmStudioNativeRequired
         && report.load_state != ProviderModelLoadState::Loaded
     {
         return Err(LlmError::Message(format!(
@@ -927,6 +952,7 @@ fn summarize_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProviderProfile;
 
     #[test]
     fn provider_catalog_normalization_accepts_lm_studio_root_and_v1() {
@@ -965,6 +991,26 @@ mod tests {
         assert!(!debug.contains("hidden"));
     }
 
+    #[test]
+    fn availability_override_never_forwards_credentials_to_another_endpoint() {
+        let mut config = ResolvedConfig::default();
+        config.model.base_url = "https://provider-a.example/v1".to_string();
+        config.model.api_key_env = Some("PROVIDER_A_KEY".to_string());
+        config.model.extra_headers.insert(
+            "Authorization".to_string(),
+            "Bearer provider-a-secret".to_string(),
+        );
+
+        let changed = availability_probe_config(&config, Some("https://provider-b.example/v1"));
+        assert_eq!(changed.model.base_url, "https://provider-b.example/v1");
+        assert_eq!(changed.model.api_key_env, None);
+        assert!(changed.model.extra_headers.is_empty());
+
+        let same = availability_probe_config(&config, Some("https://provider-a.example/v1/"));
+        assert_eq!(same.model.api_key_env, config.model.api_key_env);
+        assert_eq!(same.model.extra_headers, config.model.extra_headers);
+    }
+
     fn passing_availability_report(
         config: &crate::config::model::ModelConfig,
         require_vision: bool,
@@ -987,7 +1033,7 @@ mod tests {
             generated_by: "test".to_string(),
             model: config.model.trim().to_string(),
             base_url: normalize_provider_base_url(&config.base_url),
-            provider_metadata_mode: config.provider_metadata_mode,
+            provider_metadata_mode: config.provider_profile.metadata_mode(),
             v1_present: true,
             native_present: true,
             require_vision,
@@ -1013,7 +1059,7 @@ mod tests {
         let mut config = ResolvedConfig::default().model;
         config.base_url = "http://provider.local/v1".to_string();
         config.model = "configured-model".to_string();
-        config.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+        config.provider_profile = ProviderProfile::OpenAiResponses;
         config.context_window = 4_096;
         config.max_output_tokens = 512;
         config.supports_tools = false;
@@ -1043,7 +1089,7 @@ mod tests {
         let mut config = ResolvedConfig::default().model;
         config.base_url = "http://provider.local".to_string();
         config.model = "configured-model".to_string();
-        config.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+        config.provider_profile = ProviderProfile::OpenAiResponses;
         let report = passing_availability_report(&config, false);
 
         let mut stale_model = report.clone();
@@ -1238,7 +1284,7 @@ mod tests {
         });
 
         let mut config = ResolvedConfig::default();
-        config.model.provider_metadata_mode = ProviderMetadataMode::LmStudioNativeRequired;
+        config.model.provider_profile = ProviderProfile::LmStudio;
 
         let models = fetch_provider_model_infos(&config, &format!("http://{addr}"))
             .await
@@ -1392,7 +1438,7 @@ mod tests {
             axum::serve(listener, app).await.expect("test server");
         });
         let mut config = ResolvedConfig::default();
-        config.model.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+        config.model.provider_profile = ProviderProfile::OpenAiResponses;
 
         let error = fetch_provider_model_infos(&config, &format!("http://{addr}"))
             .await

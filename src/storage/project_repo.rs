@@ -387,6 +387,7 @@ mod tests {
                 model: "model".to_string(),
                 base_url: "http://localhost:1234".to_string(),
                 access_mode: AccessMode::Default,
+                provider_connection: None,
             })
             .await
             .expect("session");
@@ -439,6 +440,7 @@ mod tests {
                         model: "model".to_string(),
                         base_url: "http://localhost:1234".to_string(),
                         access_mode: AccessMode::Default,
+                        provider_connection: None,
                     })
                     .await
                     .expect("session"),
@@ -524,6 +526,7 @@ mod tests {
                 model: "model".to_string(),
                 base_url: "http://localhost:1234".to_string(),
                 access_mode: AccessMode::Default,
+                provider_connection: None,
             })
             .await
             .expect("session");
@@ -562,6 +565,7 @@ mod tests {
                 model: "model".to_string(),
                 base_url: "http://localhost:1234".to_string(),
                 access_mode: AccessMode::Default,
+                provider_connection: None,
             })
             .await
             .expect("session");
@@ -623,6 +627,7 @@ mod tests {
                 model: "model".to_string(),
                 base_url: "http://localhost:1234".to_string(),
                 access_mode: AccessMode::Default,
+                provider_connection: None,
             })
             .await
             .expect("active session");
@@ -634,6 +639,7 @@ mod tests {
                 model: "model".to_string(),
                 base_url: "http://localhost:1234".to_string(),
                 access_mode: AccessMode::Default,
+                provider_connection: None,
             })
             .await
             .expect("corrupt session");

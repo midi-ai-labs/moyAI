@@ -15,11 +15,12 @@ pub use model::{
     ProjectRecord, PromptDispatchPart, RequestDiagnosticsPart, RequestMessageDiagnostic,
     RequestToolCallDiagnostic, RequestToolSchemaDiagnostic, RequestWireDiagnostic,
     RunConfigSnapshot, RunEvent, RunEventDurability, RunMetrics, RunSummary, RunningSessionRejoin,
-    SessionContext, SessionForkResult, SessionModelParameters, SessionRecord,
-    SessionRollbackResult, SessionSelector, SessionSettingsPatch, SessionSettingsUpdate,
-    SessionSpawnEdge, SessionStartRequest, SessionStatus, SessionTitleUpdate, ThreadGoal,
-    ThreadGoalClearResult, ThreadGoalGetResult, ThreadGoalSetResult, ThreadGoalStatus, TokenUsage,
-    ToolCallStatus, validate_thread_goal_objective,
+    SessionContext, SessionForkResult, SessionModelParameters, SessionProviderConnection,
+    SessionRecord, SessionRollbackResult, SessionSelector, SessionSettingsPatch,
+    SessionSettingsUpdate, SessionSpawnEdge, SessionStartRequest, SessionStatus,
+    SessionTitleUpdate, ThreadGoal, ThreadGoalClearResult, ThreadGoalGetResult,
+    ThreadGoalSetResult, ThreadGoalStatus, TokenUsage, ToolCallStatus, resolved_config_for_session,
+    validate_thread_goal_objective,
 };
 pub use repository::{
     ChangeRepository, MAX_SESSION_PAGE_LIMIT, ProjectRepository, SessionRepository,

@@ -54,6 +54,7 @@ import type {
   DesktopViewState,
   DesktopWebState,
   ProjectRow,
+  ProviderProfile,
   RowMutationTarget,
   SessionSettingsMutationTarget,
   SessionRow,
@@ -136,6 +137,7 @@ export interface ActionContext {
   loadSideChatModels: (args: {
     ownerSessionId: string;
     baseUrl: string;
+    providerProfile: ProviderProfile;
     expectedConfigGeneration: string;
   }) => Promise<SideChatCatalogResult>;
   jumpToHistoryAnchor: (anchorId: string) => void;
@@ -617,6 +619,8 @@ async function applySessionSettings(
         input: {
           baseUrl: request.draft.baseUrl,
           model: request.draft.model,
+          providerProfile: request.draft.providerProfile,
+          apiKeyEnv: request.draft.apiKeyEnv,
           accessMode: request.draft.accessMode,
           contextWindow: request.draft.contextWindow,
           maxOutputTokens: request.draft.maxOutputTokens,
@@ -971,6 +975,7 @@ async function loadSideChatModels(state: DesktopWebState, context: ActionContext
     const result = await context.loadSideChatModels({
       ownerSessionId: request.ownerSessionId,
       baseUrl: request.baseUrl,
+      providerProfile: request.providerProfile,
       expectedConfigGeneration: request.configGeneration,
     });
     const settlement = finishSideChatCatalogLoad(
@@ -1017,11 +1022,13 @@ async function configureSideChat(state: DesktopWebState, context: ActionContext)
   ) return;
   const baseUrl = draft.setupBaseUrl.trim();
   const model = draft.setupModel.trim();
+  const providerProfile = draft.setupProviderProfile;
   if (!validateSideChatProviderSettings(baseUrl, model).ok) return;
   if (
     state.side_chat.configured
     && baseUrl === state.side_chat.base_url.trim()
     && model === state.side_chat.model.trim()
+    && providerProfile === state.side_chat.provider_profile
   ) return;
   context.uiState.sideChatMutations.set(ownerSessionId, {
     kind: "configure",
@@ -1036,6 +1043,7 @@ async function configureSideChat(state: DesktopWebState, context: ActionContext)
       ownerSessionId,
       baseUrl,
       model,
+      providerProfile,
       expectedConfigGeneration,
     });
     const current = context.getProjection();
@@ -1046,6 +1054,7 @@ async function configureSideChat(state: DesktopWebState, context: ActionContext)
         ownerSessionId,
         baseUrl,
         model,
+        providerProfile,
       );
     }
   } finally {
@@ -1692,7 +1701,8 @@ const ACTION_DEFINITIONS = [
         && validation.ok
         && (!state.side_chat.configured
           || model.local.sideChat.setupBaseUrl.trim() !== state.side_chat.base_url.trim()
-          || model.local.sideChat.setupModel.trim() !== state.side_chat.model.trim());
+          || model.local.sideChat.setupModel.trim() !== state.side_chat.model.trim()
+          || model.local.sideChat.setupProviderProfile !== state.side_chat.provider_profile);
     },
     run: (state, context) => configureSideChat(state, context),
   },
@@ -1913,21 +1923,6 @@ const ACTION_DEFINITIONS = [
     enabled: (state, _payload, model) => state.config_draft.commit_enabled
       && !model.local.configMutationPending,
     run: (_state, context) => runConfigMutation("save_global_config", context),
-  },
-  {
-    id: "set-provider-mode",
-    label: "Provider mode 切替",
-    enabled: (_state, payload) => payload.value === "lm_studio_native_required"
-      || payload.value === "openai_compatible_only",
-    run: (_state, context, payload) => {
-      if (payload.value !== "lm_studio_native_required" && payload.value !== "openai_compatible_only") return;
-      if (context.uiState.drafts.provider.metadataMode !== payload.value) {
-        context.uiState.drafts.providerCatalogIdentityRevision += 1;
-      }
-      context.uiState.drafts.provider.metadataMode = payload.value;
-      context.uiState.drafts.providerRevision += 1;
-      context.rerender();
-    },
   },
   {
     id: "select-provider-model",

@@ -2,6 +2,7 @@ import { scenario as shellBaseline } from "./scenarios/shell_baseline.mjs";
 import { createNativeDialogCancelScenario } from "./scenarios/native_dialog_cancel.mjs";
 import { createPointerKeyboardScenario } from "./scenarios/pointer_keyboard.mjs";
 import { createPromptReviewCancelScenario } from "./scenarios/prompt_review_cancel.mjs";
+import { createProviderConnectionLiveScenario } from "./scenarios/provider_connection_live.mjs";
 import { createProviderRestartScenario } from "./scenarios/provider_restart.mjs";
 import { createRunStopScenario } from "./scenarios/run_stop.mjs";
 import { createSettingsDoclingReadinessScenario } from "./scenarios/settings_docling_readiness.mjs";
@@ -16,6 +17,7 @@ const factories = new Map([
   ["agent.interrupt", createAgentInterruptScenario],
   ["input.pointer-keyboard", createPointerKeyboardScenario],
   ["manual.case5_2", createCase52Scenario],
+  ["manual.provider-openai-compatible", createProviderConnectionLiveScenario],
   ["native-dialog.cancel", createNativeDialogCancelScenario],
   ["prompt-review.cancel", createPromptReviewCancelScenario],
   ["provider.restart", createProviderRestartScenario],
@@ -25,7 +27,7 @@ const factories = new Map([
   ["settings.session", createSettingsSessionScenario],
   ["run.stop", createRunStopScenario],
 ]);
-const configurableScenarios = new Set(["manual.case5_2"]);
+const configurableScenarios = new Set(["manual.case5_2", "manual.provider-openai-compatible"]);
 
 export const scenarioIds = Object.freeze([...factories.keys()]);
 

@@ -12,8 +12,6 @@ use crate::protocol::{
 #[cfg(test)]
 use crate::protocol::{TurnItem, UserTurn};
 use crate::runtime::{ActiveRunInterruptOutcome, RunCancellationCause};
-#[cfg(test)]
-use crate::session::AdmissionId;
 use crate::session::{
     ActiveTurnExpectation, CanonicalHistoryPage, CanonicalRuntimeEventPage, CanonicalSessionFence,
     CanonicalSessionRead, CanonicalSessionSnapshot, CanonicalTurnPage, DurableTurnTerminal,
@@ -23,6 +21,8 @@ use crate::session::{
     SessionRepository, SessionRollbackResult, SessionSelector, SessionSettingsPatch,
     SessionSettingsUpdate, SessionStartRequest, SessionStatus, SessionTitleUpdate,
 };
+#[cfg(test)]
+use crate::session::{AdmissionId, SessionProviderConnection};
 use crate::storage::StoreBundle;
 use crate::storage::session_repo::{
     AgentExecutionWakeTerminalOwner, AgentExecutionWakeTerminalSettlement, AgentTreeStopFence,
@@ -107,6 +107,17 @@ impl SessionService {
                 workspace.authority_root()
             )));
         }
+        if matches!(request.selector, SessionSelector::New) {
+            let provider_connection = request.provider_connection.as_ref().ok_or_else(|| {
+                SessionError::Message(
+                    "new sessions require an explicit provider connection profile snapshot"
+                        .to_string(),
+                )
+            })?;
+            provider_connection
+                .validate()
+                .map_err(SessionError::Message)?;
+        }
         let repository = self.store.session_repo();
         let session = match &request.selector {
             SessionSelector::New => {
@@ -119,6 +130,7 @@ impl SessionService {
                         model: request.model.clone(),
                         base_url: request.base_url.clone(),
                         access_mode: request.access_mode,
+                        provider_connection: request.provider_connection.clone(),
                     })
                     .await?
             }
@@ -1231,6 +1243,16 @@ impl SessionService {
         source_session_id: SessionId,
         title: Option<String>,
     ) -> Result<SessionForkResult, SessionError> {
+        let source = self
+            .store
+            .session_repo()
+            .get_session(source_session_id)
+            .await?;
+        if source.provider_connection.is_none() {
+            return Err(SessionError::Message(format!(
+                "session {source_session_id} predates durable provider connection profiles; save its Connection type, URL, model, and optional API-key environment variable before forking"
+            )));
+        }
         Ok(self
             .store
             .session_repo()
@@ -1777,6 +1799,20 @@ fn normalize_session_settings_patch(
                 .map_err(|error| SessionError::Message(error.to_string()))
         })
         .transpose()?;
+    let mut provider_connection = patch.provider_connection;
+    if let Some(connection) = provider_connection.as_mut()
+        && let Some(api_key_env) = connection.api_key_env.as_mut()
+    {
+        *api_key_env = api_key_env.trim().to_string();
+        if api_key_env.is_empty() {
+            return Err(SessionError::Message(
+                "session provider API key environment-variable name must not be empty".to_string(),
+            ));
+        }
+    }
+    if let Some(connection) = &provider_connection {
+        connection.validate().map_err(SessionError::Message)?;
+    }
     if let Some(value) = patch.temperature {
         validate_finite_non_negative("session settings temperature", value)?;
     }
@@ -1802,6 +1838,7 @@ fn normalize_session_settings_patch(
         model,
         base_url,
         access_mode: patch.access_mode,
+        provider_connection,
         reset_model_parameters: patch.reset_model_parameters,
         temperature: patch.temperature,
         top_p: patch.top_p,
@@ -1899,11 +1936,92 @@ mod tests {
                     model: "model".to_string(),
                     base_url: "http://localhost:1234".to_string(),
                     access_mode: AccessMode::Default,
+                    provider_connection: Some(SessionProviderConnection {
+                        profile: crate::config::ProviderProfile::LmStudio,
+                        api_key_env: None,
+                        extra_headers: Default::default(),
+                    }),
                 },
                 workspace.clone(),
             )
             .await
             .expect("session")
+    }
+
+    #[tokio::test]
+    async fn new_sessions_require_a_provider_snapshot_while_migrated_null_rows_remain_readable() {
+        let (service, workspace, _) = service_fixture().await;
+        let missing = service
+            .start_or_resume(
+                SessionStartRequest {
+                    selector: SessionSelector::New,
+                    title: Some("missing connection".to_string()),
+                    cwd: workspace.cwd.clone(),
+                    model: "model".to_string(),
+                    base_url: "http://localhost:1234".to_string(),
+                    access_mode: AccessMode::Default,
+                    provider_connection: None,
+                },
+                workspace.clone(),
+            )
+            .await
+            .expect_err("new session must capture its provider connection");
+        assert!(
+            missing
+                .to_string()
+                .contains("explicit provider connection profile snapshot")
+        );
+        assert!(
+            service
+                .store
+                .session_repo()
+                .latest_session(workspace.project_id)
+                .await
+                .expect("latest session")
+                .is_none()
+        );
+
+        let migrated = service
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: workspace.project_id,
+                title: "migrated null snapshot".to_string(),
+                cwd: workspace.cwd.clone(),
+                model: "legacy-model".to_string(),
+                base_url: "http://legacy-provider:1234".to_string(),
+                access_mode: AccessMode::Default,
+                provider_connection: None,
+            })
+            .await
+            .expect("legacy fixture");
+        let resumed = service
+            .start_or_resume(
+                SessionStartRequest {
+                    selector: SessionSelector::ById(migrated.id),
+                    title: None,
+                    cwd: workspace.cwd.clone(),
+                    model: "ignored".to_string(),
+                    base_url: "http://localhost:1234".to_string(),
+                    access_mode: AccessMode::Default,
+                    provider_connection: None,
+                },
+                workspace,
+            )
+            .await
+            .expect("migrated session remains resumable");
+        assert_eq!(resumed.session.id, migrated.id);
+        assert_eq!(resumed.session.provider_connection, None);
+
+        let fork_error = service
+            .fork_session(migrated.id, Some("must not fork unbound".to_string()))
+            .await
+            .expect_err("legacy NULL session must be bound before creating a new fork");
+        assert!(
+            fork_error
+                .to_string()
+                .contains("save its Connection type, URL, model")
+        );
     }
 
     #[tokio::test]
@@ -1923,6 +2041,7 @@ mod tests {
                         model: "model".to_string(),
                         base_url: endpoint.to_string(),
                         access_mode: AccessMode::Default,
+                        provider_connection: None,
                     },
                     workspace.clone(),
                 )
@@ -2342,6 +2461,7 @@ mod tests {
                     model: "model".to_string(),
                     base_url: "http://localhost:1234".to_string(),
                     access_mode: AccessMode::Default,
+                    provider_connection: None,
                 },
                 workspace.clone(),
             )
@@ -2509,6 +2629,7 @@ mod tests {
                 model: "child-model".to_string(),
                 base_url: "http://localhost:1234".to_string(),
                 access_mode: AccessMode::Default,
+                provider_connection: root.session.provider_connection.clone(),
             })
             .await
             .expect("child session");

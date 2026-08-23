@@ -14,7 +14,7 @@ import type {
   ConfigMutationTarget,
   DesktopWebState,
   PromptReviewMutationTarget,
-  ProviderMetadataMode,
+  ProviderProfile,
   SideChatCatalogModel,
   SideChatCatalogResult,
 } from "./types.ts";
@@ -47,7 +47,8 @@ import { validateProviderBaseUrl } from "./utils.ts";
 
 export interface ProviderDraft {
   baseUrl: string;
-  metadataMode: DesktopWebState["provider_metadata_mode"];
+  providerProfile: DesktopWebState["provider_profile"];
+  apiKeyEnv: string;
   contextWindow: string;
   maxOutputTokens: string;
   selectedModelId: string;
@@ -57,7 +58,8 @@ export interface ProviderCatalogTarget {
   readonly providerOwner: string;
   readonly providerRevision: number;
   readonly baseUrl: string;
-  readonly metadataMode: ProviderMetadataMode;
+  readonly providerProfile: ProviderProfile;
+  readonly apiKeyEnv: string | null;
 }
 
 export interface ProviderCatalogRequest extends ProviderCatalogTarget {
@@ -140,6 +142,7 @@ export interface SideChatLocalDraft {
   saveQueued: boolean;
   setupBaseUrl: string;
   setupModel: string;
+  setupProviderProfile: ProviderProfile;
   setupRevision: number;
 }
 
@@ -154,7 +157,7 @@ export type SideChatCatalogStatus = "idle" | "loading" | "ready" | "error";
 export interface SideChatCatalogEntry {
   ownerSessionId: string;
   baseUrl: string;
-  metadataMode: ProviderMetadataMode;
+  providerProfile: ProviderProfile;
   configGeneration: string;
   models: SideChatCatalogModel[];
   status: Exclude<SideChatCatalogStatus, "idle">;
@@ -167,7 +170,7 @@ export interface SideChatCatalogTarget {
   readonly ownerSessionId: string;
   readonly setupRevision: number;
   readonly baseUrl: string;
-  readonly metadataMode: ProviderMetadataMode;
+  readonly providerProfile: ProviderProfile;
   readonly configGeneration: string;
 }
 
@@ -299,7 +302,8 @@ export function createUiLocalState(): UiLocalState {
       sessionSearch: "",
       provider: {
         baseUrl: "",
-        metadataMode: "openai_compatible_only",
+        providerProfile: "openai_compatible",
+        apiKeyEnv: "",
         contextWindow: "",
         maxOutputTokens: "",
         selectedModelId: "",
@@ -407,7 +411,11 @@ export function setArtifactPaneCollapsed(uiState: UiLocalState, collapsed: boole
 
 type SideChatOwnerState = Pick<
   DesktopWebState,
-  "draft_target" | "provider_base_url" | "provider_effective_base_url" | "side_chat"
+  | "draft_target"
+  | "provider_base_url"
+  | "provider_effective_base_url"
+  | "provider_effective_profile"
+  | "side_chat"
 >;
 
 export function sideChatOwnerSessionId(state: SideChatOwnerState): string | null {
@@ -471,6 +479,7 @@ export function sideChatDraftForState(
       || state.provider_effective_base_url.trim()
       || state.provider_base_url.trim(),
     setupModel: state.side_chat.model,
+    setupProviderProfile: state.side_chat.provider_profile || state.provider_effective_profile,
     setupRevision: 0,
   };
   uiState.sideChatDrafts.set(ownerSessionId, draft);
@@ -513,6 +522,7 @@ export function rebaseSideChatDraftAfterConfigure(
   ownerSessionId: string,
   requestedBaseUrl: string,
   requestedModel: string,
+  requestedProviderProfile: ProviderProfile,
 ): boolean {
   if (
     sideChatOwnerSessionId(state) !== ownerSessionId
@@ -520,6 +530,7 @@ export function rebaseSideChatDraftAfterConfigure(
     || canonicalSideChatProviderBaseUrl(state.side_chat.base_url)
       !== canonicalSideChatProviderBaseUrl(requestedBaseUrl)
     || state.side_chat.model.trim() !== requestedModel.trim()
+    || state.side_chat.provider_profile !== requestedProviderProfile
   ) return false;
 
   const draft = sideChatDraftForState(uiState, state);
@@ -527,6 +538,7 @@ export function rebaseSideChatDraftAfterConfigure(
   const locallyDirty = draft.text !== draft.persistedText;
   draft.setupBaseUrl = state.side_chat.base_url;
   draft.setupModel = state.side_chat.model;
+  draft.setupProviderProfile = state.side_chat.provider_profile || requestedProviderProfile;
   draft.setupRevision += 1;
   draft.persistedText = state.side_chat.draft_text;
   draft.persistedRevision = state.side_chat.draft_revision;
@@ -538,8 +550,12 @@ export function sideChatCatalogUrlValid(input: string): boolean {
   return canonicalSideChatCatalogBaseUrl(input).length > 0;
 }
 
-export function sideChatCatalogKey(ownerSessionId: string, baseUrl: string): string {
-  return `${ownerSessionId}\u0000${canonicalSideChatCatalogBaseUrl(baseUrl)}`;
+export function sideChatCatalogKey(
+  ownerSessionId: string,
+  baseUrl: string,
+  providerProfile: ProviderProfile,
+): string {
+  return `${ownerSessionId}\u0000${canonicalSideChatCatalogBaseUrl(baseUrl)}\u0000${providerProfile}`;
 }
 
 export function sideChatCatalogViewForState(
@@ -550,13 +566,13 @@ export function sideChatCatalogViewForState(
   const draft = sideChatDraftForState(uiState, state);
   if (!ownerSessionId || !draft) return emptySideChatCatalogView();
   const baseUrl = canonicalSideChatCatalogBaseUrl(draft.setupBaseUrl);
-  const key = sideChatCatalogKey(ownerSessionId, baseUrl);
+  const key = sideChatCatalogKey(ownerSessionId, baseUrl, draft.setupProviderProfile);
   const local = uiState.sideChatCatalogs.get(key);
   if (
     local
     && local.ownerSessionId === ownerSessionId
     && local.baseUrl === baseUrl
-    && local.metadataMode === state.provider_effective_metadata_mode
+    && local.providerProfile === draft.setupProviderProfile
     && local.configGeneration === state.config_target.configGeneration
   ) {
     return {
@@ -568,7 +584,7 @@ export function sideChatCatalogViewForState(
       error: local.error,
     };
   }
-  const seeded = mainProviderCatalogSeed(state, baseUrl);
+  const seeded = mainProviderCatalogSeed(state, baseUrl, draft.setupProviderProfile);
   if (seeded.length > 0) {
     return {
       status: "ready",
@@ -592,6 +608,8 @@ export function sessionSettingsDraftFromProjection(
   return {
     baseUrl: projection.base_url,
     model: projection.model,
+    providerProfile: projection.provider_profile,
+    apiKeyEnv: projection.api_key_env,
     contextWindow: projection.context_window,
     maxOutputTokens: projection.max_output_tokens,
     accessMode: projection.access_mode,
@@ -637,6 +655,8 @@ export function sessionSettingsMutationAvailability(
   }
   const providerChanged = draft.baseUrl !== baseline.baseUrl
     || draft.model !== baseline.model
+    || draft.providerProfile !== baseline.providerProfile
+    || draft.apiKeyEnv !== baseline.apiKeyEnv
     || draft.contextWindow !== baseline.contextWindow
     || draft.maxOutputTokens !== baseline.maxOutputTokens;
   const accessChanged = draft.accessMode !== baseline.accessMode;
@@ -757,20 +777,20 @@ export function beginSideChatCatalogLoad(
   const draft = sideChatDraftForState(uiState, state);
   if (!ownerSessionId || !draft) return null;
   const baseUrl = canonicalSideChatCatalogBaseUrl(draft.setupBaseUrl);
-  const key = sideChatCatalogKey(ownerSessionId, baseUrl);
+  const key = sideChatCatalogKey(ownerSessionId, baseUrl, draft.setupProviderProfile);
   const request = beginAsyncTransaction(uiState.sideChatCatalogTransaction, {
     key,
     ownerSessionId,
     setupRevision: draft.setupRevision,
     baseUrl,
-    metadataMode: state.provider_effective_metadata_mode,
+    providerProfile: draft.setupProviderProfile,
     configGeneration: state.config_target.configGeneration,
   } satisfies SideChatCatalogTarget, "supersede", (token, target) => ({ token, ...target }));
   const previous = sideChatCatalogViewForState(uiState, state);
   uiState.sideChatCatalogs.set(key, {
     ownerSessionId,
     baseUrl,
-    metadataMode: request.metadataMode,
+    providerProfile: request.providerProfile,
     configGeneration: request.configGeneration,
     models: previous.models,
     status: "loading",
@@ -796,13 +816,13 @@ export function finishSideChatCatalogLoad(
   }
   const responseMatches = result.ownerSessionId === request.ownerSessionId
     && canonicalSideChatCatalogBaseUrl(result.baseUrl) === request.baseUrl
-    && result.metadataMode === request.metadataMode
+    && result.providerProfile === request.providerProfile
     && result.configGeneration === request.configGeneration;
   if (!responseMatches) {
     uiState.sideChatCatalogs.set(request.key, {
       ownerSessionId: request.ownerSessionId,
       baseUrl: request.baseUrl,
-      metadataMode: request.metadataMode,
+      providerProfile: request.providerProfile,
       configGeneration: request.configGeneration,
       models: [],
       status: "error",
@@ -814,7 +834,7 @@ export function finishSideChatCatalogLoad(
   uiState.sideChatCatalogs.set(request.key, {
     ownerSessionId: request.ownerSessionId,
     baseUrl: request.baseUrl,
-    metadataMode: request.metadataMode,
+    providerProfile: request.providerProfile,
     configGeneration: request.configGeneration,
     models: result.models,
     status: "ready",
@@ -842,7 +862,7 @@ export function failSideChatCatalogLoad(
   uiState.sideChatCatalogs.set(request.key, {
     ownerSessionId: request.ownerSessionId,
     baseUrl: request.baseUrl,
-    metadataMode: request.metadataMode,
+    providerProfile: request.providerProfile,
     configGeneration: request.configGeneration,
     models: previous?.models ?? [],
     status: "error",
@@ -871,7 +891,7 @@ function sideChatCatalogRequestStillTargets(
     && draft !== null
     && draft.setupRevision === request.setupRevision
     && canonicalSideChatCatalogBaseUrl(draft.setupBaseUrl) === request.baseUrl
-    && state.provider_effective_metadata_mode === request.metadataMode
+    && draft.setupProviderProfile === request.providerProfile
     && state.config_target.configGeneration === request.configGeneration;
 }
 
@@ -892,7 +912,7 @@ function rejectStaleSideChatCatalogEntry(
   uiState.sideChatCatalogs.set(request.key, {
     ownerSessionId: request.ownerSessionId,
     baseUrl: request.baseUrl,
-    metadataMode: request.metadataMode,
+    providerProfile: request.providerProfile,
     configGeneration: request.configGeneration,
     models: [],
     status: "error",
@@ -904,11 +924,13 @@ function rejectStaleSideChatCatalogEntry(
 function mainProviderCatalogSeed(
   state: DesktopWebState,
   baseUrl: string,
+  providerProfile: ProviderProfile,
 ): SideChatCatalogModel[] {
   if (
     !state.provider_catalog_base_url
     || canonicalSideChatCatalogBaseUrl(state.provider_catalog_base_url) !== baseUrl
-    || state.provider_catalog_metadata_mode !== state.provider_effective_metadata_mode
+    || state.provider_catalog_profile !== providerProfile
+    || state.provider_effective_profile !== providerProfile
   ) return [];
   return state.provider_model_ids.flatMap((id, index) => {
     const modelId = id.trim();

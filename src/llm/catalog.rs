@@ -19,8 +19,7 @@ impl ConfigModelCatalog {
     }
 
     fn build_profile(&self) -> ModelProfile {
-        ModelPolicy::from_config(&self.config)
-            .transport_profile(self.config.model.provider_metadata_mode)
+        ModelPolicy::from_config(&self.config).transport_profile(self.config.model.provider_profile)
     }
 }
 

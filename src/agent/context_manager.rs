@@ -1192,8 +1192,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::config::model::{ProviderApiMode, ProviderReasoningCapability};
-    use crate::config::{ProviderDeadlines, ProviderMetadataMode, ProviderTarget};
+    use crate::config::model::ProviderReasoningCapability;
+    use crate::config::{ProviderDeadlines, ProviderProfile, ProviderTarget};
     use crate::context::ActiveContextTokenSource;
     use crate::llm::{ModelCapabilities, ModelProfile};
     use crate::protocol::{HistoryScope, ModelResponseId, ToolLifecycleStatus, TurnId};
@@ -1224,7 +1224,7 @@ mod tests {
             name: "test".to_string(),
             context_window: 32_768,
             max_output_tokens: 512,
-            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            provider_profile: ProviderProfile::OpenAiCompatible,
             capabilities: ModelCapabilities {
                 supports_tools: true,
                 supports_reasoning: false,
@@ -1234,8 +1234,7 @@ mod tests {
         let provider = ProviderTarget::new(
             "http://localhost",
             &model.name,
-            model.provider_metadata_mode,
-            ProviderApiMode::ChatCompletions,
+            model.provider_profile,
             ProviderDeadlines {
                 request_timeout_ms: 1,
                 connect_timeout_ms: 1,

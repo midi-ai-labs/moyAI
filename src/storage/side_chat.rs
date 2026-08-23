@@ -7,13 +7,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ulid::Ulid;
 
-use crate::config::{
-    AccessMode, ModelConfig, ProviderApiMode, ProviderEndpoint, ProviderMetadataMode,
-};
+use crate::config::{AccessMode, ModelConfig, ProviderEndpoint, ProviderProfile};
 use crate::error::StorageError;
 use crate::protocol::{ContentPart, HistoryItemId, HistoryItemPayload, RuntimeEventMsg};
 use crate::runtime::{Clock, SystemClock};
-use crate::session::{NewSession, SessionId, SessionStatus};
+use crate::session::{NewSession, SessionId, SessionProviderConnection, SessionStatus};
 
 use super::session_repo::{
     AdmittedTurnSnapshot, DurableSessionStopState, SqliteSessionRepository, delete_session_rows,
@@ -81,8 +79,7 @@ impl SideChatContextScope {
 pub struct SideChatProviderTarget {
     pub base_url: String,
     pub model: String,
-    pub provider_metadata_mode: ProviderMetadataMode,
-    pub provider_api_mode: ProviderApiMode,
+    pub provider_profile: ProviderProfile,
     pub context_window: u32,
     pub max_output_tokens: u32,
     pub request_timeout_ms: u64,
@@ -131,8 +128,7 @@ impl TryFrom<&ModelConfig> for SideChatProviderTarget {
         Self {
             base_url: config.base_url.clone(),
             model: config.model.clone(),
-            provider_metadata_mode: config.provider_metadata_mode,
-            provider_api_mode: config.provider_api_mode,
+            provider_profile: config.provider_profile,
             context_window: config.context_window,
             max_output_tokens: config.max_output_tokens,
             request_timeout_ms: config.request_timeout_ms,
@@ -153,8 +149,7 @@ pub struct SideChatBinding {
     pub conversation_session_id: SessionId,
     pub base_url: String,
     pub model: String,
-    pub provider_metadata_mode: ProviderMetadataMode,
-    pub provider_api_mode: ProviderApiMode,
+    pub provider_profile: ProviderProfile,
     pub context_window: u32,
     pub max_output_tokens: u32,
     pub request_timeout_ms: u64,
@@ -177,8 +172,7 @@ impl SideChatBinding {
         SideChatProviderTarget {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
-            provider_metadata_mode: self.provider_metadata_mode,
-            provider_api_mode: self.provider_api_mode,
+            provider_profile: self.provider_profile,
             context_window: self.context_window,
             max_output_tokens: self.max_output_tokens,
             request_timeout_ms: self.request_timeout_ms,
@@ -260,6 +254,18 @@ impl SqliteSideChatRepository {
     ) -> Result<SideChatBinding, StorageError> {
         validate_timestamp(now_ms)?;
         let target = target.validate()?;
+        let provider_connection = SessionProviderConnection {
+            profile: target.provider_profile,
+            api_key_env: None,
+            extra_headers: Default::default(),
+        };
+        // Provider connection snapshots are deliberately not generally serializable: their
+        // custom headers may contain credentials. This is the narrow durable-storage projection.
+        let provider_connection_json = serde_json::to_string(&serde_json::json!({
+            "profile": provider_connection.profile,
+            "api_key_env": provider_connection.api_key_env,
+            "extra_headers": provider_connection.extra_headers,
+        }))?;
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = binding_for_owner(&transaction, owner_session_id)?;
@@ -275,13 +281,15 @@ impl SqliteSideChatRepository {
                          '$.max_output_tokens',
                          ?4
                      ),
-                     updated_at_ms = MAX(updated_at_ms, ?5)
+                     provider_connection_json = ?5,
+                     updated_at_ms = MAX(updated_at_ms, ?6)
                  WHERE id = ?1",
                 params![
                     existing.conversation_session_id.to_string(),
                     target.model.as_str(),
                     target.base_url.as_str(),
                     i64::from(target.max_output_tokens),
+                    provider_connection_json.as_str(),
                     now_ms,
                 ],
             )?;
@@ -289,25 +297,23 @@ impl SqliteSideChatRepository {
                 "UPDATE side_chat_bindings
                  SET base_url = ?3,
                      model = ?4,
-                     provider_metadata_mode = ?5,
-                     provider_api_mode = ?6,
-                     context_window = ?7,
-                     max_output_tokens = ?8,
-                     request_timeout_ms = ?9,
-                     connect_timeout_ms = ?10,
-                     max_retries = ?11,
-                     supports_images = ?12,
-                     supports_tools = ?13,
-                     supports_reasoning = ?14,
-                     updated_at_ms = MAX(updated_at_ms, ?15)
+                     provider_profile = ?5,
+                     context_window = ?6,
+                     max_output_tokens = ?7,
+                     request_timeout_ms = ?8,
+                     connect_timeout_ms = ?9,
+                     max_retries = ?10,
+                     supports_images = ?11,
+                     supports_tools = ?12,
+                     supports_reasoning = ?13,
+                     updated_at_ms = MAX(updated_at_ms, ?14)
                  WHERE id = ?1 AND owner_session_id = ?2",
                 params![
                     existing.id.to_string(),
                     owner_session_id.to_string(),
                     target.base_url.as_str(),
                     target.model.as_str(),
-                    metadata_mode_text(target.provider_metadata_mode),
-                    api_mode_text(target.provider_api_mode),
+                    target.provider_profile.as_str(),
                     i64::from(target.context_window),
                     i64::from(target.max_output_tokens),
                     target.request_timeout_ms as i64,
@@ -349,6 +355,7 @@ impl SqliteSideChatRepository {
                 model: target.model.clone(),
                 base_url: target.base_url.clone(),
                 access_mode: AccessMode::Default,
+                provider_connection: Some(provider_connection.clone()),
             };
             insert_session_in_transaction(&transaction, conversation_session_id, &draft, now_ms)?;
             transaction.execute(
@@ -368,7 +375,7 @@ impl SqliteSideChatRepository {
             transaction.execute(
                 "INSERT INTO side_chat_bindings (
                      id, owner_session_id, conversation_session_id,
-                     base_url, model, provider_metadata_mode, provider_api_mode,
+                     base_url, model, provider_profile,
                      context_window, max_output_tokens,
                      request_timeout_ms, connect_timeout_ms, max_retries,
                      supports_images, supports_tools, supports_reasoning,
@@ -376,8 +383,8 @@ impl SqliteSideChatRepository {
                      delete_requested_at_ms, context_scope,
                      created_at_ms, updated_at_ms
                  ) VALUES (
-                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                     ?13, ?14, ?15, '', 0, 0, NULL, ?16, ?17, ?17
+                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     ?12, ?13, ?14, '', 0, 0, NULL, ?15, ?16, ?16
                  )",
                 params![
                     side_chat_id.to_string(),
@@ -385,8 +392,7 @@ impl SqliteSideChatRepository {
                     conversation_session_id.to_string(),
                     target.base_url.as_str(),
                     target.model.as_str(),
-                    metadata_mode_text(target.provider_metadata_mode),
-                    api_mode_text(target.provider_api_mode),
+                    target.provider_profile.as_str(),
                     i64::from(target.context_window),
                     i64::from(target.max_output_tokens),
                     target.request_timeout_ms as i64,
@@ -909,7 +915,6 @@ type BindingColumns = (
     String,
     String,
     String,
-    String,
     i64,
     i64,
     i64,
@@ -950,12 +955,11 @@ fn binding_columns(row: &Row<'_>) -> rusqlite::Result<BindingColumns> {
         row.get(18)?,
         row.get(19)?,
         row.get(20)?,
-        row.get(21)?,
     ))
 }
 
 const BINDING_SELECT: &str = "SELECT id, owner_session_id, conversation_session_id,
-            base_url, model, provider_metadata_mode, provider_api_mode,
+            base_url, model, provider_profile,
             context_window, max_output_tokens,
             request_timeout_ms, connect_timeout_ms, max_retries,
             supports_images, supports_tools, supports_reasoning,
@@ -998,28 +1002,32 @@ fn decode_binding(raw: BindingColumns) -> Result<SideChatBinding, StorageError> 
         conversation_session_id: parse_session_id(&raw.2, "conversation")?,
         base_url: raw.3,
         model: raw.4,
-        provider_metadata_mode: parse_metadata_mode(&raw.5)?,
-        provider_api_mode: parse_api_mode(&raw.6)?,
-        context_window: parse_positive_u32(raw.7, "context window")?,
-        max_output_tokens: parse_positive_u32(raw.8, "max output tokens")?,
-        request_timeout_ms: parse_positive_u64(raw.9, "request timeout")?,
-        connect_timeout_ms: parse_positive_u64(raw.10, "connect timeout")?,
-        max_retries: u8::try_from(raw.11).map_err(|_| {
+        provider_profile: ProviderProfile::parse(&raw.5).ok_or_else(|| {
             StorageError::Message(format!(
-                "side chat binding has invalid max retries `{}`",
-                raw.11
+                "side chat binding has invalid provider profile `{}`",
+                raw.5
             ))
         })?,
-        supports_images: raw.12,
-        supports_tools: raw.13,
-        supports_reasoning: raw.14,
-        persisted_draft: raw.15,
-        draft_revision: parse_u64(raw.16, "draft revision")?,
-        request_generation: parse_u64(raw.17, "request generation")?,
-        delete_requested_at_ms: parse_optional_timestamp(raw.18, "delete request timestamp")?,
-        context_scope: SideChatContextScope::parse(&raw.19)?,
-        created_at_ms: raw.20,
-        updated_at_ms: raw.21,
+        context_window: parse_positive_u32(raw.6, "context window")?,
+        max_output_tokens: parse_positive_u32(raw.7, "max output tokens")?,
+        request_timeout_ms: parse_positive_u64(raw.8, "request timeout")?,
+        connect_timeout_ms: parse_positive_u64(raw.9, "connect timeout")?,
+        max_retries: u8::try_from(raw.10).map_err(|_| {
+            StorageError::Message(format!(
+                "side chat binding has invalid max retries `{}`",
+                raw.10
+            ))
+        })?,
+        supports_images: raw.11,
+        supports_tools: raw.12,
+        supports_reasoning: raw.13,
+        persisted_draft: raw.14,
+        draft_revision: parse_u64(raw.15, "draft revision")?,
+        request_generation: parse_u64(raw.16, "request generation")?,
+        delete_requested_at_ms: parse_optional_timestamp(raw.17, "delete request timestamp")?,
+        context_scope: SideChatContextScope::parse(&raw.18)?,
+        created_at_ms: raw.19,
+        updated_at_ms: raw.20,
     })
 }
 
@@ -1170,40 +1178,6 @@ fn canonical_terminal_error(
     Ok(Some(terminal.outcome.summary().to_string()))
 }
 
-const fn metadata_mode_text(mode: ProviderMetadataMode) -> &'static str {
-    match mode {
-        ProviderMetadataMode::LmStudioNativeRequired => "lm_studio_native_required",
-        ProviderMetadataMode::OpenAiCompatibleOnly => "openai_compatible_only",
-    }
-}
-
-fn parse_metadata_mode(value: &str) -> Result<ProviderMetadataMode, StorageError> {
-    match value {
-        "lm_studio_native_required" => Ok(ProviderMetadataMode::LmStudioNativeRequired),
-        "openai_compatible_only" => Ok(ProviderMetadataMode::OpenAiCompatibleOnly),
-        _ => Err(StorageError::Message(format!(
-            "side chat binding has invalid provider metadata mode `{value}`"
-        ))),
-    }
-}
-
-const fn api_mode_text(mode: ProviderApiMode) -> &'static str {
-    match mode {
-        ProviderApiMode::ChatCompletions => "chat_completions",
-        ProviderApiMode::Responses => "responses",
-    }
-}
-
-fn parse_api_mode(value: &str) -> Result<ProviderApiMode, StorageError> {
-    match value {
-        "chat_completions" => Ok(ProviderApiMode::ChatCompletions),
-        "responses" => Ok(ProviderApiMode::Responses),
-        _ => Err(StorageError::Message(format!(
-            "side chat binding has invalid provider API mode `{value}`"
-        ))),
-    }
-}
-
 fn validate_timestamp(value: i64) -> Result<(), StorageError> {
     if value < 0 {
         return Err(StorageError::Message(
@@ -1275,6 +1249,7 @@ fn parse_session_id(value: &str, role: &str) -> Result<SessionId, StorageError> 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Barrier};
 
     use crate::protocol::{
@@ -1329,8 +1304,7 @@ mod tests {
         SideChatProviderTarget {
             base_url: "http://localhost:1234/v1/".to_string(),
             model: model.to_string(),
-            provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
-            provider_api_mode: ProviderApiMode::ChatCompletions,
+            provider_profile: ProviderProfile::LmStudioChatCompletions,
             context_window: 65_536,
             max_output_tokens: 8_192,
             request_timeout_ms: 60_000,
@@ -1399,7 +1373,7 @@ mod tests {
         assert_ne!(first.owner_session_id, first.conversation_session_id);
         assert_eq!(first.base_url, "http://localhost:1234/v1");
         let mut replacement = target("gemma-second");
-        replacement.provider_api_mode = ProviderApiMode::Responses;
+        replacement.provider_profile = ProviderProfile::OpenAiResponses;
         let second = repo
             .configure_at(owner, replacement.clone(), 11)
             .expect("reconfigure");
@@ -1412,6 +1386,19 @@ mod tests {
 
         let sessions = store.session_repo();
         let owner_record = sessions.get_session(owner).await.unwrap();
+        assert_eq!(owner_record.provider_connection, None);
+        let hidden_record = sessions
+            .get_session(second.conversation_session_id)
+            .await
+            .expect("hidden canonical session");
+        assert_eq!(
+            hidden_record.provider_connection,
+            Some(SessionProviderConnection {
+                profile: ProviderProfile::OpenAiResponses,
+                api_key_env: None,
+                extra_headers: BTreeMap::new(),
+            })
+        );
         assert_eq!(
             sessions
                 .latest_session(owner_record.project_id)

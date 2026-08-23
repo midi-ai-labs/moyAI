@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use crate::app::App;
 use crate::cli::ReviewDecision;
-use crate::config::{ProviderEndpoint, ProviderMetadataMode, ReasoningSummary, ResolvedConfig};
+use crate::config::{ProviderEndpoint, ProviderProfile, ReasoningSummary, ResolvedConfig};
 use crate::error::AppRunError;
 use crate::llm::{ProviderModelInfo, ProviderModelLoadState, fetch_provider_model_infos};
 use crate::protocol::TurnId;
@@ -1485,6 +1485,7 @@ async fn configure_side_chat(
     owner_session_id: String,
     base_url: String,
     model: String,
+    provider_profile: String,
     expected_config_generation: String,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     let conflict_owner = owner_session_id.clone();
@@ -1498,8 +1499,9 @@ async fn configure_side_chat(
             controller.state.app_state.current_session_id,
             controller.state.provider_config.config_generation,
         )?;
+        let provider_profile = parse_provider_profile_input(&provider_profile)?;
         controller
-            .configure_side_chat(owner_session_id, base_url, model)
+            .configure_side_chat(owner_session_id, base_url, model, provider_profile)
             .map_err(DesktopCommandConflict::new)
     })
     .await
@@ -1509,7 +1511,7 @@ async fn configure_side_chat(
 struct SideChatCatalogRequestTarget {
     owner_session_id: SessionId,
     base_url: String,
-    metadata_mode: ProviderMetadataMode,
+    provider_profile: ProviderProfile,
     config_generation: u64,
 }
 
@@ -1526,7 +1528,7 @@ struct SideChatCatalogModelProjection {
 struct SideChatCatalogProjection {
     owner_session_id: String,
     base_url: String,
-    metadata_mode: ProviderMetadataMode,
+    provider_profile: String,
     config_generation: String,
     models: Vec<SideChatCatalogModelProjection>,
 }
@@ -1536,6 +1538,7 @@ async fn load_side_chat_models(
     controller: State<'_, SharedController>,
     owner_session_id: String,
     base_url: String,
+    provider_profile: String,
     expected_config_generation: String,
 ) -> Result<SideChatCatalogProjection, DesktopCommandError> {
     let owner_session_id = owner_session_id.parse::<SessionId>().map_err(|error| {
@@ -1553,15 +1556,18 @@ async fn load_side_chat_models(
             controller.state.provider_config.config_generation,
         )
         .map_err(read_only_command_conflict_error)?;
+        let provider_profile = parse_provider_profile_input(&provider_profile)
+            .map_err(read_only_command_conflict_error)?;
         let (probe_config, canonical_base_url) = side_chat_catalog_probe_config(
             controller.state.provider_config.effective_config.clone(),
             &base_url,
+            provider_profile,
         )
         .map_err(read_only_command_conflict_error)?;
         let target = SideChatCatalogRequestTarget {
             owner_session_id,
             base_url: canonical_base_url,
-            metadata_mode: probe_config.model.provider_metadata_mode,
+            provider_profile,
             config_generation: controller.state.provider_config.config_generation,
         };
         (target, probe_config)
@@ -1578,12 +1584,6 @@ async fn load_side_chat_models(
             &target,
             controller.state.app_state.current_session_id,
             controller.state.provider_config.config_generation,
-            controller
-                .state
-                .provider_config
-                .effective_config
-                .model
-                .provider_metadata_mode,
         )
         .map_err(read_only_command_conflict_error)?;
     }
@@ -1596,7 +1596,7 @@ async fn load_side_chat_models(
     Ok(SideChatCatalogProjection {
         owner_session_id: target.owner_session_id.to_string(),
         base_url: target.base_url,
-        metadata_mode: target.metadata_mode,
+        provider_profile: target.provider_profile.as_str().to_string(),
         config_generation: target.config_generation.to_string(),
         models,
     })
@@ -1625,7 +1625,6 @@ fn validate_side_chat_catalog_target(
     target: &SideChatCatalogRequestTarget,
     current_owner_session_id: Option<SessionId>,
     current_config_generation: u64,
-    current_metadata_mode: ProviderMetadataMode,
 ) -> Result<(), DesktopCommandConflict> {
     validate_side_chat_config_owner(
         target.owner_session_id,
@@ -1633,17 +1632,22 @@ fn validate_side_chat_catalog_target(
         current_owner_session_id,
         current_config_generation,
     )?;
-    if target.metadata_mode != current_metadata_mode {
-        return Err(DesktopCommandConflict::new(
-            "provider metadata mode changed before the side chat model load completed",
-        ));
-    }
     Ok(())
+}
+
+fn parse_provider_profile_input(value: &str) -> Result<ProviderProfile, DesktopCommandConflict> {
+    ProviderProfile::parse(value).ok_or_else(|| {
+        DesktopCommandConflict::new(format!(
+            "unsupported connection type `{}`",
+            value.trim().to_ascii_lowercase()
+        ))
+    })
 }
 
 fn side_chat_catalog_probe_config(
     mut config: ResolvedConfig,
     base_url: &str,
+    provider_profile: ProviderProfile,
 ) -> Result<(ResolvedConfig, String), DesktopCommandConflict> {
     let canonical_base_url = ProviderEndpoint::parse(base_url)
         .map_err(|error| DesktopCommandConflict::new(error.to_string()))?
@@ -1651,6 +1655,7 @@ fn side_chat_catalog_probe_config(
         .as_str()
         .to_string();
     config.model.base_url = canonical_base_url.clone();
+    config.model.provider_profile = provider_profile;
 
     // Side Chat has no credential surface and must never inherit the main
     // provider's authentication material or generation-body customization.
@@ -3413,7 +3418,8 @@ async fn insert_command(
 #[serde(rename_all = "camelCase")]
 struct DesktopProviderActionInput {
     base_url: String,
-    metadata_mode: String,
+    provider_profile: String,
+    api_key_env: String,
     context_window: String,
     max_output_tokens: String,
     selected_model_id: String,
@@ -3427,12 +3433,24 @@ impl std::fmt::Debug for DesktopProviderActionInput {
                 "base_url",
                 &crate::config::sanitize_provider_endpoint(&self.base_url),
             )
-            .field("metadata_mode", &self.metadata_mode)
+            .field("provider_profile", &self.provider_profile)
+            .field("api_key_env", &self.api_key_env)
             .field("context_window", &self.context_window)
             .field("max_output_tokens", &self.max_output_tokens)
             .field("selected_model_id", &self.selected_model_id)
             .finish()
     }
+}
+
+fn canonical_provider_api_key_env_input(
+    input: &str,
+) -> Result<Option<String>, DesktopCommandConflict> {
+    if input.trim().is_empty() {
+        return Ok(None);
+    }
+    crate::config::canonical_api_key_env_name(Some(input)).map_err(|_| {
+        DesktopCommandConflict::new("the API key environment variable name is invalid")
+    })
 }
 
 fn accept_provider_action_input(
@@ -3449,27 +3467,22 @@ fn accept_provider_action_input(
             ));
         }
     };
-    let metadata_mode = match input.metadata_mode.as_str() {
-        "lm_studio_native_required" | "lm-studio-native-required" | "lm_studio" | "lm-studio" => {
-            crate::config::ProviderMetadataMode::LmStudioNativeRequired
-        }
-        "openai_compatible_only" | "openai-compatible-only" | "openai" => {
-            crate::config::ProviderMetadataMode::OpenAiCompatibleOnly
-        }
-        _ => {
-            controller.state.set_status_message(format!(
-                "unknown provider metadata mode: {}",
-                input.metadata_mode
-            ));
-            return Err(rejected_action(
-                controller,
-                "the provider metadata mode is invalid",
-            ));
-        }
-    };
+    let provider_profile =
+        parse_provider_profile_input(&input.provider_profile).map_err(|error| {
+            controller
+                .state
+                .set_status_message("the provider connection type is invalid");
+            rejected_action(controller, &error.message)
+        })?;
+    let api_key_env =
+        canonical_provider_api_key_env_input(&input.api_key_env).map_err(|error| {
+            controller.state.set_status_message(error.message.clone());
+            error
+        })?;
     controller.accept_provider_action_input(
         input.base_url,
-        metadata_mode,
+        provider_profile,
+        api_key_env.unwrap_or_default(),
         input.context_window,
         input.max_output_tokens,
         input.selected_model_id,
@@ -3639,6 +3652,8 @@ struct DesktopAccessModeMutationTarget {
 struct DesktopSessionSettingsInput {
     base_url: String,
     model: String,
+    provider_profile: String,
+    api_key_env: String,
     access_mode: crate::config::AccessMode,
     context_window: String,
     max_output_tokens: String,
@@ -3993,6 +4008,7 @@ fn session_settings_patch_for_values(
     session: &crate::session::SessionRecord,
     base_url: String,
     model: String,
+    provider_connection: crate::session::SessionProviderConnection,
     access_mode: crate::config::AccessMode,
     context_window: Option<u32>,
     max_output_tokens: Option<u32>,
@@ -4001,13 +4017,43 @@ fn session_settings_patch_for_values(
         session_model_parameter_patch(&session.model_parameters, context_window, max_output_tokens);
     patch.base_url = (base_url != session.base_url).then_some(base_url);
     patch.model = (model != session.model).then_some(model);
+    patch.provider_connection = (session.provider_connection.as_ref()
+        != Some(&provider_connection))
+    .then_some(provider_connection);
     patch.access_mode = (access_mode != session.access_mode).then_some(access_mode);
     let changes_turn_config = patch.base_url.is_some()
         || patch.model.is_some()
+        || patch.provider_connection.is_some()
         || patch.reset_model_parameters
         || patch.context_window.is_some()
         || patch.max_output_tokens.is_some();
     (patch, changes_turn_config)
+}
+
+fn session_settings_extra_headers_for_target(
+    session: &crate::session::SessionRecord,
+    effective_model: &crate::config::ModelConfig,
+    requested_base_url: &str,
+    requested_profile: ProviderProfile,
+) -> std::collections::BTreeMap<String, String> {
+    let current_profile = session
+        .provider_connection
+        .as_ref()
+        .map(|connection| connection.profile)
+        .unwrap_or(effective_model.provider_profile);
+    let current_base_url = crate::config::ProviderEndpoint::parse(&session.base_url)
+        .ok()
+        .map(|endpoint| endpoint.as_str().to_string());
+    if current_base_url.as_deref() != Some(requested_base_url)
+        || current_profile != requested_profile
+    {
+        return Default::default();
+    }
+    session
+        .provider_connection
+        .as_ref()
+        .map(|connection| connection.extra_headers.clone())
+        .unwrap_or_else(|| effective_model.extra_headers.clone())
 }
 
 fn build_session_settings_patch(
@@ -4035,6 +4081,20 @@ fn build_session_settings_patch(
             "session settings model must not be empty",
         ));
     }
+    let provider_profile = parse_provider_profile_input(&input.provider_profile)?;
+    let api_key_env = canonical_provider_api_key_env_input(&input.api_key_env)?;
+    let effective_model = &controller.state.provider_config.effective_config.model;
+    let extra_headers = session_settings_extra_headers_for_target(
+        session,
+        effective_model,
+        &base_url,
+        provider_profile,
+    );
+    let provider_connection = crate::session::SessionProviderConnection {
+        profile: provider_profile,
+        api_key_env,
+        extra_headers,
+    };
     let context_window =
         parse_optional_session_settings_u32("context window", &input.context_window, true)?;
     let max_output_tokens =
@@ -4043,6 +4103,7 @@ fn build_session_settings_patch(
         session,
         base_url,
         model,
+        provider_connection,
         input.access_mode,
         context_window,
         max_output_tokens,
@@ -5063,6 +5124,11 @@ mod tests {
             cwd: camino::Utf8PathBuf::from("C:/workspace"),
             model: "current-model".to_string(),
             base_url: "http://127.0.0.1:1234".to_string(),
+            provider_connection: Some(crate::session::SessionProviderConnection {
+                profile: ProviderProfile::LmStudio,
+                api_key_env: None,
+                extra_headers: Default::default(),
+            }),
             access_mode: crate::config::AccessMode::Default,
             model_parameters: crate::session::SessionModelParameters::default(),
             session_settings_revision: 7,
@@ -5078,6 +5144,10 @@ mod tests {
             &session,
             base_url,
             " current-model ".trim().to_string(),
+            session
+                .provider_connection
+                .clone()
+                .expect("provider snapshot"),
             session.access_mode,
             None,
             None,
@@ -5086,6 +5156,88 @@ mod tests {
         assert!(patch.is_empty());
         assert!(!changes_turn_config);
         assert_eq!(session.session_settings_revision, 7);
+    }
+
+    #[test]
+    fn provider_api_key_environment_input_is_canonical_and_error_safe() {
+        assert_eq!(
+            canonical_provider_api_key_env_input("  OPENAI_API_KEY_1  ")
+                .expect("valid environment name"),
+            Some("OPENAI_API_KEY_1".to_string())
+        );
+        assert_eq!(
+            canonical_provider_api_key_env_input("  ").expect("blank disables API key lookup"),
+            None
+        );
+        let invalid = "must-not-appear-in-errors";
+        let error = canonical_provider_api_key_env_input(invalid)
+            .expect_err("invalid environment variable name");
+        assert_eq!(
+            error.message,
+            "the API key environment variable name is invalid"
+        );
+        assert!(!error.message.contains(invalid));
+    }
+
+    #[test]
+    fn session_settings_clear_hidden_headers_when_connection_target_changes() {
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "must-not-cross-provider-targets".to_string(),
+        );
+        let session = crate::session::SessionRecord {
+            id: SessionId::new(),
+            project_id: crate::session::ProjectId::new(),
+            title: "session".to_string(),
+            status: crate::session::SessionStatus::Completed,
+            cwd: camino::Utf8PathBuf::from("C:/workspace"),
+            model: "current-model".to_string(),
+            base_url: "http://127.0.0.1:1234".to_string(),
+            provider_connection: Some(crate::session::SessionProviderConnection {
+                profile: ProviderProfile::LmStudio,
+                api_key_env: Some("OLD_KEY".to_string()),
+                extra_headers: headers.clone(),
+            }),
+            access_mode: crate::config::AccessMode::Default,
+            model_parameters: crate::session::SessionModelParameters::default(),
+            session_settings_revision: 7,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            completed_at_ms: Some(1),
+        };
+        let effective = ResolvedConfig::default().model;
+
+        assert_eq!(
+            session_settings_extra_headers_for_target(
+                &session,
+                &effective,
+                "http://127.0.0.1:1234",
+                ProviderProfile::LmStudio,
+            ),
+            headers,
+            "same endpoint/profile keeps headers when only model, key, or limits change"
+        );
+        assert!(
+            session_settings_extra_headers_for_target(
+                &session,
+                &effective,
+                "http://127.0.0.1:8119",
+                ProviderProfile::LmStudio,
+            )
+            .is_empty(),
+            "an endpoint change cannot inherit hidden headers"
+        );
+        assert!(
+            session_settings_extra_headers_for_target(
+                &session,
+                &effective,
+                "http://127.0.0.1:1234",
+                ProviderProfile::OpenAiCompatible,
+            )
+            .is_empty(),
+            "a connection-profile change cannot inherit hidden headers"
+        );
     }
 
     #[test]
@@ -6518,7 +6670,7 @@ mod tests {
     }
 
     #[test]
-    fn side_chat_config_owner_and_catalog_target_reject_owner_generation_and_mode_drift() {
+    fn side_chat_config_owner_and_catalog_target_reject_owner_and_generation_drift() {
         let owner = SessionId::new();
         let other_owner = SessionId::new();
         assert!(validate_side_chat_config_owner(owner, "7", Some(owner), 7).is_ok());
@@ -6535,33 +6687,17 @@ mod tests {
         let target = SideChatCatalogRequestTarget {
             owner_session_id: owner,
             base_url: "http://127.0.0.1:1234".to_string(),
-            metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+            provider_profile: ProviderProfile::OpenAiCompatible,
             config_generation: 7,
         };
-        assert!(
-            validate_side_chat_catalog_target(
-                &target,
-                Some(owner),
-                7,
-                ProviderMetadataMode::LmStudioNativeRequired,
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_side_chat_catalog_target(
-                &target,
-                Some(owner),
-                7,
-                ProviderMetadataMode::OpenAiCompatibleOnly,
-            )
-            .is_err()
-        );
+        assert!(validate_side_chat_catalog_target(&target, Some(owner), 7).is_ok());
+        assert!(validate_side_chat_catalog_target(&target, Some(other_owner), 7).is_err());
     }
 
     #[test]
     fn side_chat_catalog_probe_is_canonical_and_credential_free() {
         let mut config = ResolvedConfig::default();
-        let metadata_mode = config.model.provider_metadata_mode;
+        let profile = ProviderProfile::OpenAiCompatible;
         let connect_timeout_ms = config.model.connect_timeout_ms;
         config.model.api_key_env = Some("MAIN_PROVIDER_SECRET".to_string());
         config
@@ -6585,11 +6721,11 @@ mod tests {
         }));
 
         let (probe, canonical) =
-            side_chat_catalog_probe_config(config, " http://127.0.0.1:1234/v1/ ")
+            side_chat_catalog_probe_config(config, " http://127.0.0.1:1234/v1/ ", profile)
                 .expect("valid side chat provider endpoint");
         assert_eq!(canonical, "http://127.0.0.1:1234");
         assert_eq!(probe.model.base_url, canonical);
-        assert_eq!(probe.model.provider_metadata_mode, metadata_mode);
+        assert_eq!(probe.model.provider_profile, profile);
         assert_eq!(probe.model.connect_timeout_ms, connect_timeout_ms);
         assert_eq!(probe.model.api_key_env, None);
         assert!(probe.model.extra_headers.is_empty());
@@ -6608,6 +6744,7 @@ mod tests {
             side_chat_catalog_probe_config(
                 ResolvedConfig::default(),
                 "http://user:password@127.0.0.1:1234",
+                ProviderProfile::OpenAiCompatible,
             )
             .is_err()
         );
@@ -6639,14 +6776,14 @@ mod tests {
         let projection = SideChatCatalogProjection {
             owner_session_id: owner.to_string(),
             base_url: "http://127.0.0.1:1234".to_string(),
-            metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+            provider_profile: ProviderProfile::OpenAiCompatible.as_str().to_string(),
             config_generation: "7".to_string(),
             models: vec![model],
         };
         let json = serde_json::to_value(projection).expect("serialize side chat catalog");
         assert_eq!(json["ownerSessionId"], owner.to_string());
         assert_eq!(json["baseUrl"], "http://127.0.0.1:1234");
-        assert_eq!(json["metadataMode"], "lm_studio_native_required");
+        assert_eq!(json["providerProfile"], "openai_compatible");
         assert_eq!(json["configGeneration"], "7");
         assert_eq!(json["models"][0]["loadState"], "loaded");
     }

@@ -1878,8 +1878,8 @@ mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
     use super::*;
-    use crate::config::model::{ProviderApiMode, ReasoningEffort};
-    use crate::config::{ProviderDeadlines, ProviderMetadataMode, ProviderTarget};
+    use crate::config::model::ReasoningEffort;
+    use crate::config::{ProviderDeadlines, ProviderProfile, ProviderTarget};
     use crate::error::ProviderStreamLimit;
     use crate::llm::contract::{ModelCapabilities, ModelProfile, ModelToolCall, ToolSchema};
 
@@ -1888,7 +1888,7 @@ mod tests {
             name: "gpt-test".to_string(),
             context_window: 128_000,
             max_output_tokens: 4_096,
-            provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+            provider_profile: ProviderProfile::LmStudio,
             capabilities: ModelCapabilities {
                 supports_tools: true,
                 supports_reasoning: true,
@@ -1898,8 +1898,7 @@ mod tests {
         let provider = ProviderTarget::new(
             "https://example.test/v1",
             &model.name,
-            model.provider_metadata_mode,
-            ProviderApiMode::Responses,
+            model.provider_profile,
             ProviderDeadlines {
                 request_timeout_ms: 10_000,
                 connect_timeout_ms: 1_000,

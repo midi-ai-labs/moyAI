@@ -8,13 +8,16 @@ use fs2::FileExt;
 
 use crate::cli::RunArgs;
 use crate::config::ProviderEndpoint;
-use crate::config::merge::{apply_patch, normalize_request_timeout_alias};
+use crate::config::merge::{
+    apply_patch, normalize_provider_profile_alias, normalize_request_timeout_alias,
+};
 use crate::config::model::{
     AccessMode, ChatCompletionsReasoningParameters, PartialDoclingConfig, PartialFileGuardConfig,
     PartialFormatConfig, PartialInspectionConfig, PartialInstructionConfig, PartialLoggingConfig,
     PartialMcpConfig, PartialModelConfig, PartialMultiAgentConfig, PartialPermissionsConfig,
     PartialResolvedConfig, PartialSessionConfig, PartialShellConfig, PartialToolOutputConfig,
-    PartialWorkspaceConfig, ProviderApiMode, ReasoningEffort, ReasoningSummary, ResolvedConfig,
+    PartialWorkspaceConfig, ProviderApiMode, ProviderProfile, ReasoningEffort, ReasoningSummary,
+    ResolvedConfig,
 };
 use crate::error::ConfigError;
 
@@ -139,6 +142,18 @@ impl ConfigLoader {
                     "invalid config loaded from `{config_source}`: {error}"
                 ))
             })?;
+            normalize_provider_profile_alias(
+                &mut global,
+                resolved.model.provider_profile,
+                "model.provider_profile",
+                "model.provider_metadata_mode",
+                "model.provider_api_mode",
+            )
+            .map_err(|error| {
+                ConfigError::Message(format!(
+                    "invalid config loaded from `{config_source}`: {error}"
+                ))
+            })?;
             resolved = apply_patch(resolved, global);
         }
 
@@ -149,14 +164,22 @@ impl ConfigLoader {
                 "MOYAI_STREAM_IDLE_TIMEOUT_MS",
             )
             .map_err(ConfigError::Message)?;
+            normalize_provider_profile_alias(
+                &mut environment,
+                resolved.model.provider_profile,
+                "MOYAI_PROVIDER_PROFILE",
+                "MOYAI_PROVIDER_METADATA_MODE",
+                "MOYAI_PROVIDER_API_MODE",
+            )
+            .map_err(ConfigError::Message)?;
             resolved = apply_patch(resolved, environment);
         }
 
         if let Some(run_args) = cli {
-            let mut patch = PartialResolvedConfig::default();
-            if let Some(base_url) = &run_args.base_url_override {
-                patch.model.get_or_insert_default().base_url = Some(base_url.clone());
-            }
+            let mut patch = run_args
+                .provider_connection_override
+                .config_patch()
+                .unwrap_or_default();
             if let Some(model) = &run_args.model_override {
                 patch.model.get_or_insert_default().model = Some(model.clone());
             }
@@ -305,8 +328,9 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
         model: Some(PartialModelConfig {
             base_url: Some(config.model.base_url.clone()),
             model: Some(config.model.model.clone()),
-            provider_metadata_mode: Some(config.model.provider_metadata_mode),
-            provider_api_mode: Some(config.model.provider_api_mode),
+            provider_profile: Some(config.model.provider_profile),
+            provider_metadata_mode: None,
+            provider_api_mode: None,
             chat_completions_reasoning_parameters: config
                 .model
                 .chat_completions_reasoning_parameters,
@@ -466,6 +490,9 @@ fn validate_env_overrides() -> Result<(), ConfigError> {
     validate_with("MOYAI_MULTI_AGENT_MODE", |value| {
         crate::config::MultiAgentMode::parse(value).is_some()
     })?;
+    validate_with("MOYAI_PROVIDER_PROFILE", |value| {
+        ProviderProfile::parse(value).is_some()
+    })?;
     validate_with("MOYAI_PROVIDER_METADATA_MODE", |value| {
         parse_provider_metadata_mode(value).is_some()
     })?;
@@ -491,15 +518,16 @@ fn validate_env_overrides() -> Result<(), ConfigError> {
         serde_json::from_str::<Vec<crate::config::McpServerConfig>>(value).is_ok()
     })?;
     validate_with("MOYAI_MODEL", |value| !value.trim().is_empty())?;
-    for name in ["MOYAI_API_KEY_ENV", "MOYAI_DOCLING_API_KEY_ENV"] {
-        validate_with(name, |value| {
-            let value = value.trim();
-            !value.is_empty()
-                && value
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
-        })?;
-    }
+    validate_with("MOYAI_API_KEY_ENV", |value| {
+        crate::config::canonical_api_key_env_name(Some(value)).is_ok()
+    })?;
+    validate_with("MOYAI_DOCLING_API_KEY_ENV", |value| {
+        let value = value.trim();
+        !value.is_empty()
+            && value
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    })?;
     // Free-form overrides still reject non-Unicode values rather than silently
     // behaving as if the variable were absent.
     for name in [
@@ -601,6 +629,11 @@ fn env_patch() -> Result<PartialResolvedConfig, ConfigError> {
         if let Ok(parsed) = value.parse() {
             patch.shell.get_or_insert_default().hide_windows = Some(parsed);
         }
+    }
+    if let Ok(value) = env::var("MOYAI_PROVIDER_PROFILE")
+        && let Some(parsed) = ProviderProfile::parse(&value)
+    {
+        patch.model.get_or_insert_default().provider_profile = Some(parsed);
     }
     if let Ok(value) = env::var("MOYAI_PROVIDER_METADATA_MODE") {
         if let Some(parsed) = parse_provider_metadata_mode(&value) {
@@ -926,8 +959,9 @@ mod tests {
         assert!(text.contains("[model]"));
         assert!(text.contains("base_url = \"http://127.0.0.1:1234\""));
         assert!(text.contains("model = \"qwen/qwen3.6-27b\""));
-        assert!(text.contains("provider_metadata_mode = \"lm_studio_native_required\""));
-        assert!(text.contains("provider_api_mode = \"responses\""));
+        assert!(text.contains("provider_profile = \"lm_studio\""));
+        assert!(!text.contains("provider_metadata_mode"));
+        assert!(!text.contains("provider_api_mode"));
         assert!(text.contains("reasoning_summary = \"none\""));
         assert!(!text.contains("chat_completions_reasoning_parameters"));
         assert!(!text.contains("reasoning_effort"));
@@ -963,8 +997,8 @@ mod tests {
         );
         assert_eq!(document["multi_agent"]["enabled"].as_bool(), Some(true));
         assert_eq!(
-            document["model"]["provider_api_mode"].as_str(),
-            Some("responses")
+            document["model"]["provider_profile"].as_str(),
+            Some("lm_studio")
         );
 
         let patch = toml::from_str::<PartialResolvedConfig>(text)
@@ -1407,6 +1441,189 @@ mod tests {
     }
 
     #[test]
+    fn legacy_provider_mode_pairs_normalize_to_all_canonical_profiles() {
+        for (metadata, api, expected) in [
+            (
+                "lm_studio_native_required",
+                "responses",
+                ProviderProfile::LmStudio,
+            ),
+            (
+                "lm_studio_native_required",
+                "chat_completions",
+                ProviderProfile::LmStudioChatCompletions,
+            ),
+            (
+                "openai_compatible_only",
+                "responses",
+                ProviderProfile::OpenAiResponses,
+            ),
+            (
+                "openai_compatible_only",
+                "chat_completions",
+                ProviderProfile::OpenAiCompatible,
+            ),
+        ] {
+            let text = format!(
+                "[model]\nprovider_metadata_mode = \"{metadata}\"\nprovider_api_mode = \"{api}\"\n"
+            );
+            let resolved = ConfigLoader::resolve_global_config_text_without_environment(
+                Utf8Path::new("legacy-provider.toml"),
+                &text,
+            )
+            .expect("legacy provider pair");
+            assert_eq!(resolved.model.provider_profile, expected);
+        }
+    }
+
+    #[test]
+    fn sparse_legacy_provider_override_preserves_the_inherited_profile_axis() {
+        let global = toml::from_str::<PartialResolvedConfig>(
+            "[model]\nprovider_profile = \"openai_compatible\"\n",
+        )
+        .expect("canonical global profile");
+        let environment =
+            toml::from_str::<PartialResolvedConfig>("[model]\nprovider_api_mode = \"responses\"\n")
+                .expect("legacy environment override");
+
+        let resolved = ConfigLoader::resolve_config(
+            Utf8Path::new("layered-provider.toml"),
+            Some(global),
+            Some(environment),
+            None,
+        )
+        .expect("layered compatibility resolution");
+
+        assert_eq!(
+            resolved.model.provider_profile,
+            ProviderProfile::OpenAiResponses
+        );
+    }
+
+    #[test]
+    fn cli_provider_connection_is_one_precedence_layer_over_environment() {
+        let environment = PartialResolvedConfig {
+            model: Some(PartialModelConfig {
+                base_url: Some("https://provider-a.example/v1".to_string()),
+                provider_profile: Some(ProviderProfile::LmStudio),
+                api_key_env: Some(Some("PROVIDER_A_KEY".to_string())),
+                extra_headers: Some(std::collections::BTreeMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer provider-a-secret".to_string(),
+                )])),
+                extra_body_json: Some(serde_json::json!({"provider": "a"})),
+                ..PartialModelConfig::default()
+            }),
+            ..PartialResolvedConfig::default()
+        };
+        let args = RunArgs {
+            prompt: None,
+            session_id: None,
+            continue_last: false,
+            title: None,
+            directory: None,
+            model_override: None,
+            provider_connection_override: crate::cli::ProviderConnectionOverrideArgs {
+                base_url: Some("https://provider-b.example/v1".to_string()),
+                provider_profile: Some(ProviderProfile::OpenAiCompatible),
+                api_key_env: Some("PROVIDER_B_KEY".to_string()),
+            },
+            output_mode: crate::cli::OutputMode::Json,
+            show_reasoning_summary: false,
+            review_uncommitted: false,
+            review_branch: None,
+            active_file: None,
+            open_tabs: Vec::new(),
+            visible_files: Vec::new(),
+            image_paths: Vec::new(),
+        };
+
+        let explicit = ConfigLoader::resolve_config(
+            Utf8Path::new("cli-provider.toml"),
+            None,
+            Some(environment.clone()),
+            Some(&args),
+        )
+        .expect("atomic CLI provider connection");
+
+        assert_eq!(explicit.model.base_url, "https://provider-b.example/v1");
+        assert_eq!(
+            explicit.model.provider_profile,
+            ProviderProfile::OpenAiCompatible
+        );
+        assert_eq!(
+            explicit.model.api_key_env.as_deref(),
+            Some("PROVIDER_B_KEY")
+        );
+        assert!(explicit.model.extra_headers.is_empty());
+        assert_eq!(explicit.model.extra_body_json, None);
+
+        let url_and_key_args = RunArgs {
+            provider_connection_override: crate::cli::ProviderConnectionOverrideArgs {
+                base_url: Some("https://provider-keyed.example/v1".to_string()),
+                api_key_env: Some("PROVIDER_B_KEY".to_string()),
+                ..Default::default()
+            },
+            ..args.clone()
+        };
+        let url_and_key = ConfigLoader::resolve_config(
+            Utf8Path::new("cli-provider.toml"),
+            None,
+            Some(environment.clone()),
+            Some(&url_and_key_args),
+        )
+        .expect("URL and API-key name belong to the same CLI patch");
+
+        assert_eq!(
+            url_and_key.model.base_url,
+            "https://provider-keyed.example/v1"
+        );
+        assert_eq!(
+            url_and_key.model.provider_profile,
+            ProviderProfile::LmStudio
+        );
+        assert_eq!(
+            url_and_key.model.api_key_env.as_deref(),
+            Some("PROVIDER_B_KEY")
+        );
+        assert!(url_and_key.model.extra_headers.is_empty());
+        assert_eq!(url_and_key.model.extra_body_json, None);
+
+        let base_only_args = RunArgs {
+            provider_connection_override: crate::cli::ProviderConnectionOverrideArgs {
+                base_url: Some("https://provider-c.example/v1".to_string()),
+                ..Default::default()
+            },
+            ..args
+        };
+        let base_only = ConfigLoader::resolve_config(
+            Utf8Path::new("cli-provider.toml"),
+            None,
+            Some(environment),
+            Some(&base_only_args),
+        )
+        .expect("base-only CLI override");
+
+        assert_eq!(base_only.model.base_url, "https://provider-c.example/v1");
+        assert_eq!(base_only.model.api_key_env, None);
+        assert!(base_only.model.extra_headers.is_empty());
+        assert_eq!(base_only.model.extra_body_json, None);
+    }
+
+    #[test]
+    fn canonical_provider_profile_rejects_a_conflicting_legacy_field() {
+        let error = ConfigLoader::resolve_global_config_text_without_environment(
+            Utf8Path::new("conflicting-provider.toml"),
+            "[model]\nprovider_profile = \"openai_compatible\"\nprovider_api_mode = \"responses\"\n",
+        )
+        .expect_err("conflicting canonical and legacy profile must fail");
+
+        let message = error.to_string();
+        assert!(message.contains("model.provider_profile"), "{message}");
+        assert!(message.contains("model.provider_api_mode"), "{message}");
+    }
+
+    #[test]
     fn reasoning_environment_overrides_are_typed_and_keep_model_capability_independent() {
         let mut patch = PartialResolvedConfig::default();
         apply_reasoning_env_overrides(
@@ -1419,8 +1636,8 @@ mod tests {
 
         let resolved = apply_patch(ResolvedConfig::default(), patch);
         assert_eq!(
-            resolved.model.provider_api_mode,
-            ProviderApiMode::ChatCompletions
+            resolved.model.provider_profile,
+            ProviderProfile::LmStudioChatCompletions
         );
         assert_eq!(
             resolved.model.chat_completions_reasoning_parameters,

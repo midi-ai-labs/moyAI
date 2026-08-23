@@ -1,29 +1,53 @@
 # moyAI Getting Started
 
-2026-08-03 時点のv1.2.1 release向け最小手順。`qwen/qwen3.6-27b`を既定profileとし、durableな再帰Agent Tree、canonical runtime/storage、structured compaction、3種類のpermission mode、Windows workspace sandbox、Responses transportを含む。正確なversionと機能は利用するrelease packageと製品READMEを確認する。
+2026-08-24 時点のcurrent development source向け最小手順。`qwen/qwen3.6-27b`を既定profileとし、durableな再帰Agent Tree、canonical runtime/storage、structured compaction、3種類のpermission mode、Windows workspace sandbox、provider connection profileを含む。未リリースの開発機能を含むため、release packageを使う場合はそのversionの製品READMEを確認する。
 
 ## 初回起動
 
 1. LM Studio などの OpenAI 互換 LLM サーバを起動するか、既にhostされている外部HTTP endpointへ接続できる状態にする。
-2. release zip を展開する。
-3. Desktop を使う場合は `bin/moyai-desktop.exe` を起動する。
-4. CLI/TUI を使う場合は `bin/moyai.exe` を使う。
+2. current development sourceをbuildする。packaged releaseを使う場合はrelease zipを展開する。
+3. Desktopを使う場合、development buildでは`target/debug/moyai-desktop.exe`、packageでは`bin/moyai-desktop.exe`を起動する。
+4. CLI/TUIを使う場合、development buildでは`target/debug/moyai.exe`、packageでは`bin/moyai.exe`を使う。
 
-release 実行時に npm、Rust toolchain、dev server、外部 download は不要。
+packaged releaseの実行時にnpm、Rust toolchain、dev server、外部downloadは不要。
 
 Desktop は1ユーザーにつき1 instanceだけ起動する。既に起動中に `moyai-desktop.exe` または `moyai.exe desktop` を実行した場合、新しいDesktopは初期化せず、既存windowを復元して終了する。CLI/TUIの実行はこのDesktop排他の対象外。
 
 Desktopのcold startはlocal configの形式だけを確認する。provider catalogの取得、model availability diagnostic、Docling health probeは自動実行せず、起動中のsplashもnetwork応答を待たない。provider discoveryは`モデル読込`を選んだときだけ開始し、Doclingは明示的に利用する操作で初めて接続する。model availability checkは通常runとも分離された明示diagnosticである。
 
-## LM Studio 設定
+## Provider接続設定
 
-Desktop では左 rail の `LLM URL` または topbar の model/base URL 表示を開く。
+DesktopではPreferences、Initial Setup、またはtopbarのmodel/base URLからSession Settingsを開く。
 
-1. `ベースURL` に LM Studio の URL を入れる。
-2. `Provider mode` は LM Studio metadata を使う場合 `LM Studio native` を選ぶ。
-3. `モデル読込` で model catalog を確認する。
-4. 現在の UI session だけに効かせる場合は `UIセッションに適用` を使う。
-5. 次回以降の既定値にする場合は `設定ファイルに保存` を使う。
+1. `Connection type`を選ぶ。LM StudioのResponses APIなら`LM Studio (Responses API)`、oMLX / vLLM / NVIDIA NIMなどの一般的なOpenAI互換serverなら`OpenAI-compatible (Chat Completions)`を選ぶ。
+2. `Base URL`とmodel IDを入力する。
+3. 認証が必要なら`API key environment variable (optional)`へsecretを保持する環境変数名（例`OPENAI_API_KEY`）を入力する。secretそのものは入力・保存しない。
+4. 必要なら`モデル読込`でmodel catalogを確認する。手入力したmodel IDは接続不能時でもlocalにvalidなら保存できる。
+5. Preferencesではglobal設定として保存し、Session Settingsではcurrent root sessionだけへApplyする。
+
+Connection typeはcatalogとgeneration wireをatomicに選ぶ。`openai_compatible`は`/v1/models`と
+`/v1/chat/completions`、`lm_studio`はLM Studio native metadataと`/v1/responses`を使う。上級互換用に
+`openai_responses`と`lm_studio_chat_completions`も選べるが、catalogとgenerationを別々の設定にはしない。
+
+CLIでも接続tupleを同じ形で指定できる。`--api-key-env`はsecretではなく環境変数名を受け取る。
+
+```text
+moyai run --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible "簡単な動作確認をして"
+moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
+moyai session settings <SESSION_ID> --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
+```
+
+認証が必要なserverでは、moyAIを起動するprocess environmentへ例えば`OMLX_API_KEY`を設定した上で、同じcommandへ
+`--api-key-env OMLX_API_KEY`を追加する。変数を指定したのに値が未設定または空なら、接続はfail closedになる。
+
+runとavailabilityではURL、profile、API key環境変数名を一つのoverride patchとして適用する。URLまたはprofileを
+変更した場合、そのpatchで指定していないcredentialと、下位layerのcustom header、custom request bodyは新しい接続へ
+転送しない。session settingsで
+profileを指定する場合はURLも必要で、API key環境変数名を指定する場合はURLとprofileの両方が必要になる。URL単独の
+session更新でendpointが変わる場合は、現在のprofileを維持しつつ以前のAPI key参照とcustom headerを転送しない。同じ
+endpointならsame-target editとしてそれらを維持する。CLIはcustom header/bodyを受け取らないため、完全なCLI session
+接続はcustom headerなしで置き換わる。availabilityの旧`--openai-compatible-only`は互換入力として残るが、canonical
+`--provider-profile`とは同時指定できない。
 
 製品デフォルトのbase URLは`http://127.0.0.1:1234`、modelは`qwen/qwen3.6-27b`。moyAIのprompt、compaction、agent loopはこのmodelを主な最適化・挙動検証対象とする。LM Studioを別端末で動かす場合は`http://your-lm-studio-host:1234`のようにGUIまたはconfigで明示設定する。既存のuser configは製品defaultより優先され、自動的には書き換えない。
 
@@ -56,7 +80,7 @@ model transportの既定値は次の通り。
 
 ```toml
 [model]
-provider_api_mode = "responses"
+provider_profile = "lm_studio"
 reasoning_summary = "none"
 request_timeout_ms = 3600000
 ```
@@ -75,7 +99,7 @@ ImportしたTOML、`MOYAI_REQUEST_TIMEOUT_MS`は同じ値を使う。旧`stream_
 `max_retries`はHTTP responseを受ける前のretry可能な接続/transport失敗だけに適用し、retry待機は1回最大30,000ms。
 response-start timeout、HTTP 429/5xxを含むHTTP error response、SSE開始後の失敗では、同じ生成requestを自動再送しない。
 model availability checkは別操作として1 requestあたり120,000msの専用probe timeoutを使い、通常turnの
-admissionには含まれない。設定した`Provider mode`に対応するmetadata endpointだけを確認し、tool callやvisionの
+admissionには含まれない。設定した`Connection type`に対応するmetadata endpointだけを確認し、tool callやvisionの
 試験生成は行わない。moyAIは設定済みURLを外部HTTP serviceとして扱い、LM Studio processを起動・停止・監督しない。
 providerへの到達、catalogへのmodel登録、model instanceのload状態は別々に確認する。LM Studio native metadataの
 `loaded_instances`が非空なら`loaded`、明示的な空配列なら`not loaded`、fieldがなければ`unknown`である。
@@ -91,10 +115,9 @@ server-side strict tool validationを宣言しないため、core / MCP tool sch
 exact tool name、effect、permissionをlocalに検証してからdispatchする。LM Studio Developer Logの
 `strict=true ... not yet supported`警告はmodel unload/load failureや長時間generationの直接原因ではない。
 
-既定の`responses`は`/v1/responses`を使う。`/v1/chat/completions`が必要なproviderでは
-`provider_api_mode = "chat_completions"`を明示する。retired文字列`auto`はconfig/serde入力境界だけで
-`responses`へ一方向に正規化し、runtime modeとして保持せず、metadata modeからgeneration transportを
-暗黙選択しない。HTTP Responsesではcompaction checkpointを含むcurrent canonical input全体を毎request送信し、
+`lm_studio`と`openai_responses`は`/v1/responses`を、`openai_compatible`と
+`lm_studio_chat_completions`は`/v1/chat/completions`を使う。旧split fieldは互換入力として単一profileへ
+正規化し、新しい保存では書かない。HTTP Responsesではcompaction checkpointを含むcurrent canonical input全体を毎request送信し、
 `previous_response_id`は送らない。raw reasoning textはmodel contextへ
 再送せず、assistant conversation historyにも保存しない。reasoning summaryも非永続のruntime-only表示eventであり、
 再起動後のmodel context ownerにはしない。同じprovider responseのassistant messageと全tool callは
@@ -136,7 +159,7 @@ Desktop:
 - Markdown export: transcript 表示中に export ボタンまたは `F9`。
 - 停止: 実行中に stop button を押すと、表示時のworkspace / root session / run generation / Agent Tree epochが一致するexact current root executionだけを停止する。実行中またはdetachedなchildへcascadeしない。画面更新後の古いStopは新しいrunへ適用されず、tree全体の停止は別名の明示的なtree-stop操作として扱う。
 - Settings: 「設定フォルダーを開く」はglobal `config.toml`の場所を開き、「データフォルダーを開く」はSQLite、履歴、harness等を保存するRoaming data directory（`MOYAI_DATA_DIR`指定時はそのdirectory）を開く。初回起動のInitial Setupでは「設定を保存して開始」を推奨の完了方法として表示し、「この起動中だけ適用」は再起動後へ引き継がない。Initial Setupは保存または一時適用が完了するまで閉じず、TOML設定Importのfile pickerをcancelした場合は設定を変更しない。Importでは、`config(1).toml`や`config_202608.toml`など`.toml` extensionを持つ任意名のfileを選択でき、TOML schemaと設定値を検証してからglobal `config.toml`へ取り込む。
-- LLM URL: 現在のURL・Provider mode・modelを変えずにContext windowまたはMax output tokensだけを編集した場合、モデル一覧を再取得せずにUIセッションへ適用または設定ファイルへ保存できる。URL・mode・modelを変更した場合は、先に「モデル読込」を行う。
+- Provider接続: 現在のURL・Connection type・modelを変えずにContext windowまたはMax output tokensだけを編集した場合、モデル一覧を再取得せずにsessionへ適用または設定ファイルへ保存できる。URL・Connection type・modelを変更してもlocal-validな手入力値は保存でき、catalog rowから選ぶ場合だけ対応する明示「モデル読込」のevidenceを使う。
 - サイドチャット: sessionを開き、左サイドバーの`設定`にある`Side Chat` sectionで専用のLLM URLを入力して`モデル読込`を押し、取得した一覧からmodelを選択する。一覧に現れない互換modelは`一覧にないモデルIDを入力`からIDを直接指定できる。選択後に設定を適用する。右ペインの`サイドチャット`は設定済みmodelと会話を表示し、未設定時はSettingsへの導線だけを表示する。停止中は同じsectionからmodelを更新できるが、実行中・削除中は変更できない。設定・履歴・未送信draft・実行・Stopはowning session単位で保存され、メインtaskのmodel設定・composer・実行・Stopとは分離される。取得したmodel一覧も選択中sessionとURLに紐づけて表示し、別sessionや別URLの結果を混ぜないが、app再起動後は必要に応じて`モデル読込`を再実行する。サイドチャットはtext-onlyかつtool-lessで、workspaceの読取・変更やpermission dialogを行わない。現行のside provider設定は認証不要のendpointを対象とし、main providerのAPI keyやcustom headerを継承・転送しない。ペインを隠す、sessionを移動する、windowを閉じる操作では履歴を削除しない。`サイドチャットを削除`を確認した場合だけ、sideのcanonical conversationと未送信draftを破棄し、メインsessionとworkspaceは残す。
 
 Git repository内のsubdirectoryをworkspaceとして選んだ場合、選択したdirectoryがtoolとsandboxの境界になる。ancestorのGit rootはproject一覧、履歴、Git機能、ancestor instruction探索に使うが、選択directoryのsiblingをworkspace内にはしない。同じsessionを開き直した場合も、保存済みdirectoryからこの境界を復元する。built-in reviewがshell用に提示するGit commandも、末尾の`-- .`で選択directoryへscopeされる。
@@ -339,7 +362,7 @@ Markdown export は通常、対象 workspace の `.moyai/transcript-exports/` �
 
 1. 設定したbase URLへ、このPCからHTTP接続できるか確認する。moyAIはLM Studioを起動・停止・監視しない。
 2. 別端末でhostしている場合は、hostname解決、port、firewall、LM Studioのlisten範囲を確認する。
-3. `Provider mode` が環境と合っているか確認する。
+3. `Connection type` が環境と合っているか確認する。
 4. `モデル読込` で対象 model が見えるか確認する。
 5. provider request IDと失敗phase（attempt開始、request in flight、headers受信、stream progressなど）を「技術詳細」で確認する。phaseはmoyAIのtransport観測であり、provider process起動やmodel loadの判定ではない。
 

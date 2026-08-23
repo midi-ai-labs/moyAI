@@ -340,7 +340,7 @@ mod tests {
     }
 
     use crate::config::model::{ProviderApiMode, ProviderReasoningCapability};
-    use crate::config::{ProviderDeadlines, ProviderMetadataMode, ProviderTarget};
+    use crate::config::{ProviderDeadlines, ProviderMetadataMode, ProviderProfile, ProviderTarget};
     use crate::llm::{
         ChatRequest, ModelCapabilities, ModelContentPart, ModelMessage, ModelProfile,
         ModelToolCall, ToolSchema,
@@ -352,7 +352,7 @@ mod tests {
             name: "test".to_string(),
             context_window: 32,
             max_output_tokens: 16,
-            provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+            provider_profile: ProviderProfile::LmStudioChatCompletions,
             capabilities: ModelCapabilities {
                 supports_tools: true,
                 supports_reasoning: false,
@@ -362,8 +362,7 @@ mod tests {
         let provider = ProviderTarget::new(
             "http://localhost",
             &model.name,
-            model.provider_metadata_mode,
-            ProviderApiMode::ChatCompletions,
+            model.provider_profile,
             ProviderDeadlines {
                 request_timeout_ms: 1,
                 connect_timeout_ms: 1,
@@ -479,7 +478,7 @@ mod tests {
         config.session.overflow_margin_tokens = 1_024;
         let policy = crate::llm::model_policy::ModelPolicy::from_config(&config);
         let mut request = request_with(ProviderApiMode::Responses, Vec::new(), Vec::new());
-        request.model = policy.transport_profile(config.model.provider_metadata_mode);
+        request.model = policy.transport_profile(config.model.provider_profile);
 
         let below_working = super::ContextWindowTokenStatus::from_active_context_tokens(
             &request,
@@ -540,7 +539,10 @@ mod tests {
             name: "test".to_string(),
             context_window: 32_768,
             max_output_tokens: 256,
-            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            provider_profile: ProviderProfile::from_legacy_modes(
+                ProviderMetadataMode::OpenAiCompatibleOnly,
+                api_mode,
+            ),
             capabilities: ModelCapabilities {
                 supports_tools: true,
                 supports_reasoning: false,
@@ -550,8 +552,7 @@ mod tests {
         let provider = ProviderTarget::new(
             "http://localhost",
             &model.name,
-            model.provider_metadata_mode,
-            api_mode,
+            model.provider_profile,
             ProviderDeadlines {
                 request_timeout_ms: 1,
                 connect_timeout_ms: 1,

@@ -20,6 +20,7 @@ import type {
   SideChatDeleteConfirmation,
   UiRecoverableError,
 } from "./ui_state.ts";
+import type { ProviderProfile } from "./types.ts";
 
 /**
  * Local presentation values consumed while producing Desktop markup.
@@ -56,6 +57,7 @@ export interface DesktopRenderLocalPresentation {
   readonly sideChat: {
     readonly draft: string;
     readonly setupBaseUrl: string;
+    readonly setupProviderProfile: ProviderProfile;
     readonly setupModel: string;
     readonly catalog: SideChatCatalogView;
     readonly catalogLoadEnabled: boolean;
@@ -122,6 +124,7 @@ export const DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION: Readonly<DesktopRenderLo
     sideChat: {
       draft: "",
       setupBaseUrl: "",
+      setupProviderProfile: "openai_compatible",
       setupModel: "",
       catalog: {
         status: "idle",
@@ -221,6 +224,7 @@ function snapshotLocalPresentation(
     sideChat: {
       draft: local.sideChat.draft,
       setupBaseUrl: local.sideChat.setupBaseUrl,
+      setupProviderProfile: local.sideChat.setupProviderProfile,
       setupModel: local.sideChat.setupModel,
       catalog: local.sideChat.catalog,
       catalogLoadEnabled: local.sideChat.catalogLoadEnabled,

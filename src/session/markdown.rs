@@ -1349,6 +1349,7 @@ mod tests {
             base_url: "http://local".to_string(),
             access_mode: AccessMode::FullAccess,
             model_parameters: SessionModelParameters::default(),
+            provider_connection: None,
             session_settings_revision: 0,
             created_at_ms: 1,
             updated_at_ms: 2,

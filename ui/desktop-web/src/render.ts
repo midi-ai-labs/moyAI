@@ -80,7 +80,8 @@ const splashLogoUrl = new URL("../../../logo/fabicon/android-chrome-512x512.png"
 const TYPED_CONFIG_KEYS: readonly string[] = Object.freeze([
   "model.base_url",
   "model.model",
-  "model.provider_metadata_mode",
+  "model.provider_profile",
+  "model.api_key_env",
   "model.context_window",
   "model.max_output_tokens",
   "model.request_timeout_ms",
@@ -115,10 +116,17 @@ const TYPED_CONFIG_KEYS: readonly string[] = Object.freeze([
 
 const INITIAL_SETUP_PROVIDER_KEYS = new Set([
   "model.base_url",
-  "model.provider_metadata_mode",
+  "model.provider_profile",
+  "model.api_key_env",
   "model.context_window",
   "model.max_output_tokens",
 ]);
+const PROVIDER_PROFILE_LABELS: Readonly<Record<string, string>> = Object.freeze({
+  lm_studio: "LM Studio (Responses API)",
+  openai_compatible: "OpenAI-compatible (Chat Completions)",
+  openai_responses: "OpenAI Responses API",
+  lm_studio_chat_completions: "LM Studio (Chat Completions)",
+});
 const INITIAL_SETUP_MODEL_PRIMARY_KEYS = new Set([
   "model.model",
   "model.supports_tools",
@@ -443,14 +451,19 @@ function renderInitialSetupProviderStep(state: DesktopViewState): string {
     <section class="initial-setup-section" aria-labelledby="initial-setup-provider-heading">
       <div class="initial-setup-intro">
         <h2 id="initial-setup-provider-heading">ローカルLLMの接続先</h2>
-        <p>URLとProvider metadata modeを設定します。到達できない値も、形式が正しければ保存できます。</p>
+        <p>Connection type、URL、必要に応じてAPI keyの環境変数名を設定します。到達できない値も、形式が正しければ保存できます。</p>
       </div>
       <div class="settings-grid-two initial-setup-form-grid">
         ${renderConfigTextField(state, "model.base_url", "Base URL", "url", "", { initialSetup: true })}
-        ${renderConfigEnumField(state, "model.provider_metadata_mode", "Provider mode", {
-          lm_studio_native_required: "LM Studio metadata API",
-          openai_compatible_only: "OpenAI compatible",
-        }, { initialSetup: true })}
+        ${renderConfigEnumField(state, "model.provider_profile", "Connection type", PROVIDER_PROFILE_LABELS, { initialSetup: true })}
+        ${renderConfigTextField(
+          state,
+          "model.api_key_env",
+          "API key environment variable (optional)",
+          "text",
+          "API keyそのものではなく、環境変数名（例: OPENAI_API_KEY）を入力します。認証不要なら空欄です。",
+          { initialSetup: true },
+        )}
         ${renderConfigTextField(state, "model.context_window", "Context window", "number", "", { initialSetup: true })}
         ${renderConfigTextField(state, "model.max_output_tokens", "Max output tokens", "number", "", { initialSetup: true })}
       </div>
@@ -1715,7 +1728,19 @@ function renderSessionSettingsOverlay(
               <div class="settings-field">
                 <label for="session-settings-base-url">Base URL</label>
                 <input id="session-settings-base-url" class="session-settings-control" data-session-setting="base-url" type="url" value="${escapeHtml(draft.baseUrl)}" autocomplete="off" spellcheck="false" aria-describedby="session-settings-base-url-help session-settings-status" ${fieldInvalid("baseUrl") ? 'aria-invalid="true"' : ""} ${providerDisabled ? "disabled" : ""} />
-                <small id="session-settings-base-url-help" class="settings-field-help">接続先URL。Provider metadata modeはPreferencesの設定を使います。</small>
+                <small id="session-settings-base-url-help" class="settings-field-help">このsession専用の接続先URLです。</small>
+              </div>
+              <div class="settings-field">
+                <label for="session-settings-provider-profile">Connection type</label>
+                <select id="session-settings-provider-profile" class="session-settings-control" data-session-setting="provider-profile" aria-describedby="session-settings-provider-profile-help session-settings-status" ${fieldInvalid("providerProfile") ? 'aria-invalid="true"' : ""} ${providerDisabled ? "disabled" : ""}>
+                  ${Object.entries(PROVIDER_PROFILE_LABELS).map(([value, label]) => `<option value="${escapeHtml(value)}" ${draft.providerProfile === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+                </select>
+                <small id="session-settings-provider-profile-help" class="settings-field-help">モデル一覧と生成APIを一つの接続方式として保存します。</small>
+              </div>
+              <div class="settings-field">
+                <label for="session-settings-api-key-env">API key environment variable (optional)</label>
+                <input id="session-settings-api-key-env" class="session-settings-control" data-session-setting="api-key-env" value="${escapeHtml(draft.apiKeyEnv)}" autocomplete="off" spellcheck="false" placeholder="OPENAI_API_KEY" aria-describedby="session-settings-api-key-env-help session-settings-status" ${fieldInvalid("apiKeyEnv") ? 'aria-invalid="true"' : ""} ${providerDisabled ? "disabled" : ""} />
+                <small id="session-settings-api-key-env-help" class="settings-field-help">秘密値ではなく、moyAI起動時に設定済みの環境変数名を入力します。</small>
               </div>
               <div class="settings-field">
                 <label for="session-settings-model">Model</label>
@@ -1775,10 +1800,6 @@ function renderProviderOverlay(
   const providerFeedback = providerOverlayFeedback(state.provider_base_url, state.provider_status);
   const providerStatus = providerStatusView(providerFeedback.status);
   const setupRequired = startupSetupRequired(state);
-  const providerModeOptions = [
-    ["lm_studio_native_required", "LM Studio native"],
-    ["openai_compatible_only", "OpenAI互換のみ"],
-  ] as const;
   return `
     <div class="modal-backdrop">
       <section class="modal wide ${setupRequired ? "setup-modal" : ""}" data-modal role="dialog" aria-modal="true" aria-labelledby="provider-dialog-title" tabindex="-1">
@@ -1790,17 +1811,14 @@ function renderProviderOverlay(
         <label class="field-label" for="provider-url">ベースURL</label>
         <input id="provider-url" value="${escapeHtml(state.provider_base_url)}" aria-describedby="provider-url-help provider-status" aria-invalid="${!providerFeedback.baseUrl.ok}" />
         <small id="provider-url-help" class="provider-url-help">http:// または https:// の接続先を入力してください。認証情報、query string、fragment は含められません。</small>
-        <span class="field-label" id="provider-mode-label">Provider mode</span>
-        <div class="segmented-control provider-mode-control" role="group" aria-labelledby="provider-mode-label">
-          ${providerModeOptions
-            .map(
-              ([mode, label]) => `
-                <button class="${state.provider_metadata_mode === mode ? "selected" : ""}" data-action="set-provider-mode" data-mode="${mode}" aria-pressed="${state.provider_metadata_mode === mode}">
-                  ${escapeHtml(label)}
-                </button>`
-            )
-            .join("")}
-        </div>
+        <label class="field-label" for="provider-profile">Connection type</label>
+        <select id="provider-profile" aria-describedby="provider-profile-help">
+          ${Object.entries(PROVIDER_PROFILE_LABELS).map(([value, label]) => `<option value="${escapeHtml(value)}" ${state.provider_profile === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+        </select>
+        <small id="provider-profile-help" class="provider-url-help">モデル一覧の取得方式と生成APIを一つの接続方式として選びます。oMLXにはOpenAI-compatible (Chat Completions)を選びます。</small>
+        <label class="field-label" for="provider-api-key-env">API key environment variable (optional)</label>
+        <input id="provider-api-key-env" value="${escapeHtml(state.provider_api_key_env)}" placeholder="OPENAI_API_KEY" autocomplete="off" spellcheck="false" aria-describedby="provider-api-key-env-help" />
+        <small id="provider-api-key-env-help" class="provider-url-help">API keyそのものではなく、起動環境に設定した環境変数名を入力します。認証不要なら空欄です。</small>
         <div class="provider-limit-grid">
           <div>
             <label class="field-label" for="provider-context-window">Context window</label>
@@ -1897,6 +1915,7 @@ function renderSideChatSettings(
     && !local.sideChat.mutationPending;
   const baseUrl = local.sideChat.setupBaseUrl.trim();
   const model = local.sideChat.setupModel.trim();
+  const providerProfile = local.sideChat.setupProviderProfile;
   const settingsValidation = validateSideChatProviderSettings(baseUrl, model);
   const baseUrlInvalid = ownerSessionId !== null && !settingsValidation.baseUrl.ok;
   const modelInvalid = ownerSessionId !== null && !settingsValidation.modelOk;
@@ -1907,7 +1926,8 @@ function renderSideChatSettings(
     : sideChatCatalogStatusText(local.sideChat.catalog);
   const changed = !side.configured
     || baseUrl !== side.base_url.trim()
-    || model !== side.model.trim();
+    || model !== side.model.trim()
+    || providerProfile !== side.provider_profile;
   const canCommit = configurationOpen && settingsValidation.ok && changed;
   const canLoadCatalog = local.sideChat.operationsOpen
     && local.sideChat.catalogLoadEnabled
@@ -1932,8 +1952,8 @@ function renderSideChatSettings(
           : side.configured && !side.can_send
             ? "サイドチャットの実行中は設定を変更できません。停止または完了後に更新してください。"
             : side.configured
-              ? `${side.model} を選択中のチャットで使用します。`
-              : "LLM URLとモデルを入力して、選択中のチャットへ設定してください。";
+              ? `${PROVIDER_PROFILE_LABELS[side.provider_profile] ?? side.provider_profile} / ${side.model} を選択中のチャットで使用します。`
+              : "Connection type、LLM URL、モデルを入力して、選択中のチャットへ設定してください。";
   return `
     <section id="settings-side-chat" class="settings-section" aria-labelledby="settings-side-chat-title" aria-describedby="side-chat-settings-help" data-side-chat-settings-owner="${escapeHtml(ownerSessionId ?? "")}" aria-busy="${!local.sideChat.operationsOpen || local.sideChat.mutationPending || catalogLoading ? "true" : "false"}">
       <div class="settings-section-head">
@@ -1944,6 +1964,13 @@ function renderSideChatSettings(
         <button data-action="load-side-chat-models" aria-controls="side-chat-model side-chat-model-catalog-status" aria-disabled="${canLoadCatalog ? "false" : "true"}" ${canLoadCatalog ? "" : "disabled"}>${catalogLoading ? "読込中…" : "モデル読込"}</button>
       </div>
       <div class="settings-grid-two">
+        <div class="settings-field">
+          <label for="side-chat-provider-profile">Connection type</label>
+          <select id="side-chat-provider-profile" class="side-chat-settings-control" data-side-chat-setting="provider-profile" aria-describedby="side-chat-provider-profile-help side-chat-settings-help side-chat-settings-status" ${controlsDisabled}>
+            ${Object.entries(PROVIDER_PROFILE_LABELS).map(([value, label]) => `<option value="${escapeHtml(value)}" ${providerProfile === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+          </select>
+          <small id="side-chat-provider-profile-help" class="settings-field-help">このSide Chatのモデル一覧と生成APIに使う接続方式です。メインLLMから暗黙継承しません。</small>
+        </div>
         <div class="settings-field">
           <label for="side-chat-base-url">LLM URL</label>
           <input id="side-chat-base-url" class="side-chat-settings-control" data-side-chat-setting="base-url" type="url" value="${escapeHtml(local.sideChat.setupBaseUrl)}" autocomplete="off" spellcheck="false" aria-describedby="side-chat-base-url-help side-chat-settings-help side-chat-settings-status"${baseUrlInvalid ? ' aria-invalid="true"' : ""} ${controlsDisabled} />
@@ -2057,14 +2084,20 @@ function renderConfigOverlay(
                 <button data-action="show-provider" aria-controls="main-provider-model main-provider-model-catalog-status" title="メインLLMのモデル一覧と接続詳細を開く" ${state.config_draft.external_owner_mutation_open ? "" : "disabled"}>モデル読込・詳細設定</button>
               </div>
               <div class="settings-grid-two">
-                ${renderConfigTextField(state, "model.base_url", "LLM URL", "url", "モデル一覧はこのURLとProvider modeに紐付きます。")}
+                ${renderConfigTextField(state, "model.base_url", "LLM URL", "url", "モデル一覧はこのURLとConnection typeに紐付きます。")}
                 ${renderMainProviderModelField(state)}
               </div>
               <p id="main-provider-model-catalog-status" class="side-chat-model-catalog-status" role="status" aria-live="polite">${escapeHtml(mainProviderCatalogStatusText(state))}</p>
-              ${renderConfigEnumField(state, "model.provider_metadata_mode", "Provider mode", {
-                lm_studio_native_required: "LM Studio metadata API",
-                openai_compatible_only: "OpenAI compatible",
-              })}
+              <div class="settings-grid-two">
+                ${renderConfigEnumField(state, "model.provider_profile", "Connection type", PROVIDER_PROFILE_LABELS)}
+                ${renderConfigTextField(
+                  state,
+                  "model.api_key_env",
+                  "API key environment variable (optional)",
+                  "text",
+                  "API keyそのものではなく、moyAI起動時に設定済みの環境変数名（例: OPENAI_API_KEY）を入力します。認証不要なら空欄です。",
+                )}
+              </div>
             </section>
             <section id="settings-model" class="settings-section" aria-labelledby="settings-model-title" aria-describedby="settings-model-help">
               <div>
@@ -2229,7 +2262,7 @@ function configFieldHelpId(key: string): string {
 }
 
 function configFieldSectionHelpId(key: string): string {
-  if (["model.base_url", "model.model", "model.provider_metadata_mode"].includes(key)) {
+  if (["model.base_url", "model.model", "model.provider_profile", "model.api_key_env"].includes(key)) {
     return "main-provider-settings-help";
   }
   if (key.startsWith("model.")) return "settings-model-help";
@@ -2363,10 +2396,12 @@ function renderMainProviderModelField(state: DesktopViewState): string {
 
 function mainProviderCatalogMatchesSettings(state: DesktopViewState): boolean {
   const baseUrl = configField(state, "model.base_url")?.field.value ?? "";
-  const metadataMode = configField(state, "model.provider_metadata_mode")?.field.value ?? "";
+  const providerProfile = configField(state, "model.provider_profile")?.field.value ?? "";
+  const apiKeyEnv = configField(state, "model.api_key_env")?.field.value.trim() || null;
   return state.provider_catalog_base_url !== null
     && normalizeProviderBaseUrl(baseUrl) === normalizeProviderBaseUrl(state.provider_catalog_base_url)
-    && metadataMode === state.provider_catalog_metadata_mode;
+    && providerProfile === state.provider_catalog_profile
+    && apiKeyEnv === state.provider_catalog_api_key_env;
 }
 
 function mainProviderCatalogStatusText(state: DesktopViewState): string {
@@ -2377,7 +2412,7 @@ function mainProviderCatalogStatusText(state: DesktopViewState): string {
   if (mainProviderCatalogMatchesSettings(state) && state.provider_model_ids.length > 0) {
     return `${state.provider_model_ids.length}件のメインLLMモデルから選択できます。`;
   }
-  return "「モデル読込・詳細設定」で現在のLLM URLとProvider modeに対応する候補を取得できます。一覧にないモデルIDは直接入力できます。";
+  return "「モデル読込・詳細設定」で現在のLLM URLとConnection typeに対応する候補を取得できます。一覧にないモデルIDは直接入力できます。";
 }
 
 function renderDoclingReadiness(

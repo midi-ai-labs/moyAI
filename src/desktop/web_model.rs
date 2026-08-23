@@ -8,7 +8,7 @@ use super::query::desktop_run_phase_label;
 use super::startup::{DesktopStartupCheckStatus, DesktopStartupStatus};
 use super::state::{DesktopDoclingReadinessState, DesktopOverlay, DesktopState, DesktopStatusCode};
 use crate::app::AgentActivityRecord;
-use crate::config::{AccessMode, ConfigField, ProviderMetadataMode, ResolvedConfig};
+use crate::config::{AccessMode, ConfigField, ProviderProfile, ResolvedConfig};
 use crate::llm::ProviderModelLoadState;
 use crate::runtime::AgentStatus;
 use crate::session::ActiveTurnExpectation;
@@ -196,6 +196,7 @@ pub struct DesktopSideChatProjection {
     pub owner_session_id: Option<String>,
     pub model: String,
     pub base_url: String,
+    pub provider_profile: String,
     pub status: String,
     pub phase: String,
     pub last_error: String,
@@ -216,6 +217,7 @@ impl Default for DesktopSideChatProjection {
             owner_session_id: None,
             model: String::new(),
             base_url: String::new(),
+            provider_profile: String::new(),
             status: "idle".to_string(),
             phase: String::new(),
             last_error: String::new(),
@@ -384,6 +386,8 @@ pub struct DesktopSessionSettingsProjection {
     pub available: bool,
     pub base_url: String,
     pub model: String,
+    pub provider_profile: String,
+    pub api_key_env: String,
     pub access_mode: AccessMode,
     pub context_window: String,
     pub max_output_tokens: String,
@@ -578,14 +582,17 @@ pub struct DesktopWebState {
     pub local_search_results_text: String,
     pub command_rows: Vec<DesktopCommandRow>,
     pub provider_base_url: String,
-    pub provider_metadata_mode: String,
+    pub provider_profile: String,
+    pub provider_api_key_env: String,
     pub provider_effective_base_url: String,
-    pub provider_effective_metadata_mode: String,
+    pub provider_effective_profile: String,
+    pub provider_effective_api_key_env: String,
     pub provider_effective_context_window: String,
     pub provider_effective_max_output_tokens: String,
     pub provider_effective_model_id: String,
     pub provider_catalog_base_url: Option<String>,
-    pub provider_catalog_metadata_mode: Option<String>,
+    pub provider_catalog_profile: Option<String>,
+    pub provider_catalog_api_key_env: Option<String>,
     pub provider_context_window: String,
     pub provider_max_output_tokens: String,
     pub provider_models: Vec<String>,
@@ -1039,24 +1046,32 @@ pub(crate) fn desktop_web_state_with_permission(
         local_search_results_text: state.local_search_results_text(),
         command_rows: state.snapshot.command_rows.clone(),
         provider_base_url: state.provider_config.provider_base_url_input.clone(),
-        provider_metadata_mode: provider_metadata_mode_key(
-            state.provider_config.provider_metadata_mode_input,
-        )
-        .to_string(),
+        provider_profile: state
+            .provider_config
+            .provider_profile_input
+            .as_str()
+            .to_string(),
+        provider_api_key_env: state.provider_config.provider_api_key_env_input.clone(),
         provider_effective_base_url: state
             .provider_config
             .effective_config
             .model
             .base_url
             .clone(),
-        provider_effective_metadata_mode: provider_metadata_mode_key(
-            state
-                .provider_config
-                .effective_config
-                .model
-                .provider_metadata_mode,
-        )
-        .to_string(),
+        provider_effective_profile: state
+            .provider_config
+            .effective_config
+            .model
+            .provider_profile
+            .as_str()
+            .to_string(),
+        provider_effective_api_key_env: state
+            .provider_config
+            .effective_config
+            .model
+            .api_key_env
+            .clone()
+            .unwrap_or_default(),
         provider_effective_context_window: state
             .provider_config
             .effective_config
@@ -1071,11 +1086,11 @@ pub(crate) fn desktop_web_state_with_permission(
             .to_string(),
         provider_effective_model_id: state.provider_config.effective_config.model.model.clone(),
         provider_catalog_base_url: state.provider_config.provider_loaded_base_url.clone(),
-        provider_catalog_metadata_mode: state
+        provider_catalog_profile: state
             .provider_config
-            .provider_loaded_metadata_mode
-            .map(provider_metadata_mode_key)
-            .map(str::to_string),
+            .provider_loaded_profile
+            .map(|profile| profile.as_str().to_string()),
+        provider_catalog_api_key_env: state.provider_config.provider_loaded_api_key_env.clone(),
         provider_context_window: state.provider_config.provider_context_window_input.clone(),
         provider_max_output_tokens: state
             .provider_config
@@ -1228,6 +1243,20 @@ fn session_settings_projection(
             available: false,
             base_url: String::new(),
             model: String::new(),
+            provider_profile: state
+                .provider_config
+                .effective_config
+                .model
+                .provider_profile
+                .as_str()
+                .to_string(),
+            api_key_env: state
+                .provider_config
+                .effective_config
+                .model
+                .api_key_env
+                .clone()
+                .unwrap_or_default(),
             access_mode: state
                 .provider_config
                 .effective_config
@@ -1248,6 +1277,36 @@ fn session_settings_projection(
         available: true,
         base_url: session.base_url.clone(),
         model: session.model.clone(),
+        provider_profile: session
+            .provider_connection
+            .as_ref()
+            .map(|connection| connection.profile)
+            .unwrap_or(
+                state
+                    .provider_config
+                    .effective_config
+                    .model
+                    .provider_profile,
+            )
+            .as_str()
+            .to_string(),
+        api_key_env: session
+            .provider_connection
+            .as_ref()
+            .and_then(|connection| connection.api_key_env.clone())
+            .or_else(|| {
+                (session.provider_connection.is_none())
+                    .then(|| {
+                        state
+                            .provider_config
+                            .effective_config
+                            .model
+                            .api_key_env
+                            .clone()
+                    })
+                    .flatten()
+            })
+            .unwrap_or_default(),
         access_mode: session.access_mode,
         context_window: session
             .model_parameters
@@ -1418,20 +1477,15 @@ fn provider_model_labels(state: &DesktopState) -> Vec<String> {
         .collect()
 }
 
-fn provider_metadata_mode_key(mode: ProviderMetadataMode) -> &'static str {
-    match mode {
-        ProviderMetadataMode::LmStudioNativeRequired => "lm_studio_native_required",
-        ProviderMetadataMode::OpenAiCompatibleOnly => "openai_compatible_only",
-    }
-}
-
 fn provider_status_details(state: &DesktopState) -> String {
-    let mode = match state.provider_config.provider_metadata_mode_input {
-        ProviderMetadataMode::LmStudioNativeRequired => {
-            "Provider mode: LM Studio native metadata required."
+    let profile = match state.provider_config.provider_profile_input {
+        ProviderProfile::LmStudio => "Connection type: LM Studio (Responses API).",
+        ProviderProfile::OpenAiCompatible => {
+            "Connection type: OpenAI-compatible (Chat Completions)."
         }
-        ProviderMetadataMode::OpenAiCompatibleOnly => {
-            "Provider mode: OpenAI-compatible model catalog only."
+        ProviderProfile::OpenAiResponses => "Connection type: OpenAI Responses API.",
+        ProviderProfile::LmStudioChatCompletions => {
+            "Connection type: LM Studio (Chat Completions)."
         }
     };
     let limits = format!(
@@ -1441,7 +1495,7 @@ fn provider_status_details(state: &DesktopState) -> String {
     );
     [
         state.provider_config.provider_status.details.as_str(),
-        mode,
+        profile,
         limits.as_str(),
     ]
     .into_iter()
@@ -1799,7 +1853,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_metadata_mode_status_does_not_claim_a_hidden_system_policy() {
+    fn provider_profile_status_explains_the_atomic_connection_type() {
         let mut state = DesktopState::new(
             super::super::models::DesktopSnapshot {
                 workspace_path: "C:/workspace".to_string(),
@@ -1815,12 +1869,11 @@ mod tests {
             },
             crate::config::ResolvedConfig::default(),
         );
-        state.provider_config.provider_metadata_mode_input =
-            ProviderMetadataMode::OpenAiCompatibleOnly;
+        state.provider_config.provider_profile_input = ProviderProfile::OpenAiCompatible;
 
         let details = provider_status_details(&state);
 
-        assert!(details.contains("OpenAI-compatible model catalog only"));
+        assert!(details.contains("OpenAI-compatible (Chat Completions)"));
         assert!(!details.contains("language"));
         assert!(!details.contains("no-thinking"));
     }
@@ -2545,6 +2598,7 @@ mod tests {
             base_url: "http://127.0.0.1:1234".to_string(),
             access_mode: crate::config::AccessMode::Default,
             model_parameters: crate::session::SessionModelParameters::default(),
+            provider_connection: None,
             session_settings_revision: 3,
             created_at_ms: 1,
             updated_at_ms: 1,

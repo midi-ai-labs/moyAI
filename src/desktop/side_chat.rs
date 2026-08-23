@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
-use crate::config::model::{ProviderApiMode, ProviderReasoningCapability};
-use crate::config::{AccessMode, ProviderDeadlines, ProviderMetadataMode, ProviderTarget};
+use crate::config::model::ProviderReasoningCapability;
+use crate::config::{AccessMode, ProviderDeadlines, ProviderProfile, ProviderTarget};
 use crate::error::LlmError;
 use crate::llm::{
     ChatRequest, LlmClient, LlmEvent, LlmEventSink, LlmResponseSummary, ModelCapabilities,
@@ -38,8 +38,7 @@ pub(crate) enum SideChatHistoryMessage {
 pub(crate) struct SideChatRequestProfile {
     pub base_url: String,
     pub model: String,
-    pub provider_metadata_mode: ProviderMetadataMode,
-    pub provider_api_mode: ProviderApiMode,
+    pub provider_profile: ProviderProfile,
     pub request_timeout_ms: u64,
     pub connect_timeout_ms: u64,
     pub max_retries: u8,
@@ -55,8 +54,7 @@ impl std::fmt::Debug for SideChatRequestProfile {
             .debug_struct("SideChatRequestProfile")
             .field("base_url", &"<redacted provider endpoint>")
             .field("model", &self.model)
-            .field("provider_metadata_mode", &self.provider_metadata_mode)
-            .field("provider_api_mode", &self.provider_api_mode)
+            .field("provider_profile", &self.provider_profile)
             .field("request_timeout_ms", &self.request_timeout_ms)
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("max_retries", &self.max_retries)
@@ -461,8 +459,7 @@ pub(crate) async fn run_side_chat_request(
     let target = ProviderTarget::new(
         &profile.base_url,
         &profile.model,
-        profile.provider_metadata_mode,
-        profile.provider_api_mode,
+        profile.provider_profile,
         ProviderDeadlines {
             request_timeout_ms: profile.request_timeout_ms,
             connect_timeout_ms: profile.connect_timeout_ms,
@@ -474,7 +471,7 @@ pub(crate) async fn run_side_chat_request(
         name: profile.model,
         context_window: profile.context_window,
         max_output_tokens: profile.max_output_tokens,
-        provider_metadata_mode: profile.provider_metadata_mode,
+        provider_profile: profile.provider_profile,
         capabilities: ModelCapabilities {
             supports_tools: false,
             supports_reasoning: false,
@@ -597,8 +594,7 @@ mod tests {
         SideChatRequestProfile {
             base_url: "http://provider.local:1234".to_string(),
             model: "google/gemma-4-12b-qat".to_string(),
-            provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
-            provider_api_mode: ProviderApiMode::Responses,
+            provider_profile: ProviderProfile::LmStudio,
             request_timeout_ms: 60_000,
             connect_timeout_ms: 10_000,
             max_retries: 0,
@@ -635,6 +631,7 @@ mod tests {
                 model: "google/gemma-4-12b-qat".to_string(),
                 base_url: "http://provider.local:1234".to_string(),
                 access_mode: AccessMode::Default,
+                provider_connection: None,
             })
             .await
             .expect("session");

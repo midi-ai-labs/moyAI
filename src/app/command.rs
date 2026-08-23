@@ -232,6 +232,7 @@ pub struct SessionSettingsUpdateRequest {
     pub cwd: Option<Utf8PathBuf>,
     pub model: Option<String>,
     pub base_url: Option<String>,
+    pub provider_connection: Option<crate::session::SessionProviderConnection>,
     pub access_mode: Option<AccessMode>,
     pub reset_model_parameters: bool,
     pub temperature: Option<f64>,
@@ -293,6 +294,7 @@ impl std::fmt::Debug for SessionSettingsUpdateRequest {
                     .as_ref()
                     .map(|_| "<redacted provider endpoint>"),
             )
+            .field("provider_connection", &self.provider_connection)
             .field("access_mode", &self.access_mode)
             .field("reset_model_parameters", &self.reset_model_parameters)
             .field("temperature", &self.temperature)

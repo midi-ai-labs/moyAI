@@ -27,6 +27,14 @@ export const INITIAL_SETUP_STEPS = Object.freeze([
   "finish",
 ]);
 export const INITIAL_SETUP_RESTART_STABILITY_MS = 500;
+export const INITIAL_SETUP_PROVIDER_PROFILE = "openai_responses";
+export const INITIAL_SETUP_PROVIDER_API_KEY_ENV = "";
+export const INITIAL_SETUP_PROVIDER_PROFILE_OPTIONS = Object.freeze([
+  "lm_studio",
+  "openai_compatible",
+  "openai_responses",
+  "lm_studio_chat_completions",
+]);
 
 const NEXT = Object.freeze({
   selector: '[data-surface="initial-setup"] button[data-action="initial-setup-next"]',
@@ -59,6 +67,13 @@ function configValues(projection) {
     throw new TypeError("Initial Setup command expectation requires projected config fields");
   }
   return projection.config_fields.map((field) => ({ key: field.key, text: field.value }));
+}
+
+function configFieldValue(projection, key) {
+  const matches = Array.isArray(projection?.config_fields)
+    ? projection.config_fields.filter((field) => field?.key === key)
+    : [];
+  return matches.length === 1 ? matches[0].value : null;
 }
 
 export function expectedInitialSetupFinishCommand(surface) {
@@ -107,6 +122,27 @@ export async function observeInitialSetupSurface(cdp) {
           && found.node.getAttribute('aria-disabled') !== 'true',
       };
     };
+    const input = (selector) => {
+      const found = one(selector);
+      return {
+        count: found.count,
+        visible: found.visible,
+        enabled: found.node instanceof HTMLInputElement && !found.node.disabled,
+        value: found.node instanceof HTMLInputElement ? found.node.value : null,
+      };
+    };
+    const select = (selector) => {
+      const found = one(selector);
+      return {
+        count: found.count,
+        visible: found.visible,
+        enabled: found.node instanceof HTMLSelectElement && !found.node.disabled,
+        value: found.node instanceof HTMLSelectElement ? found.node.value : null,
+        options: found.node instanceof HTMLSelectElement
+          ? Array.from(found.node.options).map((option) => option.value)
+          : [],
+      };
+    };
     const wizard = one('[data-surface="initial-setup"]');
     const rect = wizard.node instanceof HTMLElement ? wizard.node.getBoundingClientRect() : null;
     const stepRows = rows('[data-surface="initial-setup"] [data-step]').map((node) => ({
@@ -131,6 +167,10 @@ export async function observeInitialSetupSurface(cdp) {
         back: button('[data-surface="initial-setup"] button[data-action="initial-setup-back"]'),
         finish: button('[data-surface="initial-setup"] button[data-action="finish-initial-setup"]'),
         import_config: button('[data-surface="initial-setup"] button[data-action="import-config-toml"]'),
+        provider: {
+          profile: select('[data-surface="initial-setup"] .settings-control[data-config-key="model.provider_profile"]'),
+          api_key_env: input('[data-surface="initial-setup"] .settings-control[data-config-key="model.api_key_env"]'),
+        },
       },
       viewport: { width: document.documentElement.clientWidth, height: document.documentElement.clientHeight },
       visible_shell_count: rows('.app-frame > .shell').filter(visible).length,
@@ -153,6 +193,19 @@ export function initialSetupStepReady(surface, ledger, expectedStep, expectedWor
   const target = surface?.projection?.startup?.setup_target;
   const rect = surface?.wizard?.rect;
   const viewport = surface?.viewport;
+  const providerFieldsReady = expectedStep !== "provider" || (
+    surface?.wizard?.provider?.profile?.count === 1
+    && surface.wizard.provider.profile.visible === true
+    && surface.wizard.provider.profile.enabled === true
+    && surface.wizard.provider.profile.value === INITIAL_SETUP_PROVIDER_PROFILE
+    && sameValue(surface.wizard.provider.profile.options, INITIAL_SETUP_PROVIDER_PROFILE_OPTIONS)
+    && surface.wizard.provider.api_key_env.count === 1
+    && surface.wizard.provider.api_key_env.visible === true
+    && surface.wizard.provider.api_key_env.enabled === true
+    && surface.wizard.provider.api_key_env.value === INITIAL_SETUP_PROVIDER_API_KEY_ENV
+    && configFieldValue(surface.projection, "model.provider_profile") === INITIAL_SETUP_PROVIDER_PROFILE
+    && configFieldValue(surface.projection, "model.api_key_env") === INITIAL_SETUP_PROVIDER_API_KEY_ENV
+  );
   return INITIAL_SETUP_STEPS.includes(expectedStep)
     && Array.isArray(ledger)
     && ledger.length === 0
@@ -187,7 +240,8 @@ export function initialSetupStepReady(surface, ledger, expectedStep, expectedWor
       ? surface.wizard.finish.count === 1 && surface.wizard.finish.visible && surface.wizard.finish.enabled
       : surface.wizard.next.count === 1 && surface.wizard.next.visible && surface.wizard.next.enabled)
     && (expectedStep !== "start"
-      || (surface.wizard.import_config.count === 1 && surface.wizard.import_config.visible));
+      || (surface.wizard.import_config.count === 1 && surface.wizard.import_config.visible))
+    && providerFieldsReady;
 }
 
 export function createStableInitialSetupClosedDecision({
@@ -299,7 +353,7 @@ export function createSettingsInitialSetupScenario() {
       return {
         MOYAI_BASE_URL: state.provider.baseUrl,
         MOYAI_MODEL: SCRIPTED_PROVIDER_MODEL_ID,
-        MOYAI_PROVIDER_METADATA_MODE: "openai_compatible_only",
+        MOYAI_PROVIDER_PROFILE: INITIAL_SETUP_PROVIDER_PROFILE,
         MOYAI_CONTEXT_WINDOW: "65536",
         MOYAI_MAX_OUTPUT_TOKENS: "1024",
         MOYAI_DOCLING_ENABLED: "true",

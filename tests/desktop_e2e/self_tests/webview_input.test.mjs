@@ -531,6 +531,39 @@ test("trusted event acquisition enforces exact type order, trust, and semantic t
   );
 });
 
+test("native select acquisition binds the exact trusted committed change", () => {
+  const identity = { tag: "SELECT", configKey: "model.provider_profile" };
+  const snapshot = {
+    found: true,
+    probe_id: "input-probe",
+    sequence: 4,
+    dropped_through: 0,
+    active: identity,
+    events: [
+      event(1, "input", identity),
+      event(2, "change", identity),
+      event(3, "focusin", identity),
+      event(4, "keyup", identity, { key: "Enter", code: "Enter" }),
+    ],
+  };
+  const expected = [{ type: "change", identity }];
+
+  assert.deepEqual(
+    assertTrustedProbeSequence(snapshot, { afterSequence: 0, expected }).events,
+    [snapshot.events[1]],
+  );
+  for (const changed of [
+    { events: snapshot.events.filter((row) => row.type !== "change"), code: "event-probe-cardinality" },
+    { events: snapshot.events.map((row) => row.type === "change" ? { ...row, isTrusted: false } : row), code: "event-probe-untrusted" },
+    { events: snapshot.events.map((row) => row.type === "change" ? { ...row, configKey: "model.model" } : row), code: "event-probe-target" },
+  ]) {
+    assert.throws(
+      () => assertTrustedProbeSequence({ ...snapshot, events: changed.events }, { afterSequence: 0, expected }),
+      (error) => error.code === changed.code,
+    );
+  }
+});
+
 test("event probe ownership is injected through CDP and cleanup removes it after releasing input", async () => {
   const cdp = new FakeCdp([
     { installed: true, probe_id: "input-probe", sequence: 0 },

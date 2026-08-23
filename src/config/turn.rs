@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::model::{DEFAULT_MODEL_REQUEST_TIMEOUT_MS, MAX_MODEL_REQUEST_TIMEOUT_MS};
-use super::{ProviderApiMode, ProviderMetadataMode, ResolvedConfig};
+use super::{ProviderApiMode, ProviderMetadataMode, ProviderProfile, ResolvedConfig};
 
 /// Immutable provider timing policy captured together with a turn admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,8 +272,7 @@ fn raw_authority_contains_userinfo(raw: &str) -> bool {
 pub struct ProviderTarget {
     endpoint: ProviderEndpoint,
     model: Arc<str>,
-    metadata_mode: ProviderMetadataMode,
-    api_mode: ProviderApiMode,
+    profile: ProviderProfile,
     deadlines: ProviderDeadlines,
     request_limits: ProviderRequestLimits,
     stream_limits: ProviderStreamLimits,
@@ -283,8 +282,7 @@ impl ProviderTarget {
     pub fn new(
         endpoint: &str,
         model: &str,
-        metadata_mode: ProviderMetadataMode,
-        api_mode: ProviderApiMode,
+        profile: ProviderProfile,
         deadlines: ProviderDeadlines,
     ) -> Result<Self, ResolvedTurnConfigError> {
         let model = model.trim();
@@ -303,8 +301,7 @@ impl ProviderTarget {
         Ok(Self {
             endpoint: ProviderEndpoint::parse(endpoint)?,
             model: Arc::from(model),
-            metadata_mode,
-            api_mode,
+            profile,
             deadlines,
             request_limits: ProviderRequestLimits::product_default(),
             stream_limits: ProviderStreamLimits::for_request_timeout(deadlines.request_timeout_ms),
@@ -315,8 +312,7 @@ impl ProviderTarget {
         Self::new(
             &config.model.base_url,
             &config.model.model,
-            config.model.provider_metadata_mode,
-            config.model.provider_api_mode,
+            config.model.provider_profile,
             ProviderDeadlines {
                 request_timeout_ms: config.model.request_timeout_ms,
                 connect_timeout_ms: config.model.connect_timeout_ms,
@@ -337,12 +333,16 @@ impl ProviderTarget {
         &self.model
     }
 
+    pub fn profile(&self) -> ProviderProfile {
+        self.profile
+    }
+
     pub fn metadata_mode(&self) -> ProviderMetadataMode {
-        self.metadata_mode
+        self.profile.metadata_mode()
     }
 
     pub fn api_mode(&self) -> ProviderApiMode {
-        self.api_mode
+        self.profile.api_mode()
     }
 
     pub fn deadlines(&self) -> ProviderDeadlines {
@@ -375,8 +375,7 @@ impl fmt::Debug for ProviderTarget {
             .debug_struct("ProviderTarget")
             .field("endpoint", &self.endpoint)
             .field("model", &self.model)
-            .field("metadata_mode", &self.metadata_mode)
-            .field("api_mode", &self.api_mode)
+            .field("profile", &self.profile)
             .field("deadlines", &self.deadlines)
             .field("request_limits", &self.request_limits)
             .field("stream_limits", &self.stream_limits)
@@ -649,6 +648,7 @@ mod tests {
         config.model.request_timeout_ms = 91_000;
         config.model.connect_timeout_ms = 3_000;
         config.model.max_retries = 4;
+        config.model.provider_profile = ProviderProfile::OpenAiCompatible;
 
         let turn = ResolvedTurnConfig::capture(config).expect("valid endpoint");
 
@@ -661,6 +661,12 @@ mod tests {
             }
         );
         assert_eq!(turn.provider().stream_limits().max_duration_ms, 91_000);
+        assert_eq!(turn.provider().profile(), ProviderProfile::OpenAiCompatible);
+        assert_eq!(
+            turn.provider().metadata_mode(),
+            ProviderMetadataMode::OpenAiCompatibleOnly
+        );
+        assert_eq!(turn.provider().api_mode(), ProviderApiMode::ChatCompletions);
 
         let mut provider = turn.provider().clone();
         let mut replacement = ProviderStreamLimits::product_default();
@@ -681,8 +687,7 @@ mod tests {
         let blank_model = ProviderTarget::new(
             "http://provider.local",
             " \t ",
-            ProviderMetadataMode::OpenAiCompatibleOnly,
-            ProviderApiMode::Responses,
+            ProviderProfile::OpenAiResponses,
             deadlines,
         )
         .expect_err("blank provider model must fail closed");
@@ -691,8 +696,7 @@ mod tests {
         let zero_deadline = ProviderTarget::new(
             "http://provider.local",
             "configured-model",
-            ProviderMetadataMode::OpenAiCompatibleOnly,
-            ProviderApiMode::Responses,
+            ProviderProfile::OpenAiResponses,
             ProviderDeadlines {
                 request_timeout_ms: 0,
                 ..deadlines
@@ -708,8 +712,7 @@ mod tests {
         let excessive_deadline = ProviderTarget::new(
             "http://provider.local",
             "configured-model",
-            ProviderMetadataMode::OpenAiCompatibleOnly,
-            ProviderApiMode::Responses,
+            ProviderProfile::OpenAiResponses,
             ProviderDeadlines {
                 request_timeout_ms: MAX_MODEL_REQUEST_TIMEOUT_MS + 1,
                 ..deadlines

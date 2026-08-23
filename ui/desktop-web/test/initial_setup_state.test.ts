@@ -35,12 +35,13 @@ const CONFIG_TARGET: ConfigMutationTarget = {
 const FIELDS: ConfigFieldProjection[] = [
   field("model.base_url", "http://127.0.0.1:1234/v1", "string", true),
   field(
-    "model.provider_metadata_mode",
-    "lm_studio_native_required",
+    "model.provider_profile",
+    "lm_studio",
     "enum",
     true,
-    ["lm_studio_native_required", "openai_compatible_only"],
+    ["lm_studio", "openai_compatible", "openai_responses", "lm_studio_chat_completions"],
   ),
+  field("model.api_key_env", "", "string", false),
   field("model.context_window", "32768", "integer", true, [], 1, 4_294_967_295),
   field("model.max_output_tokens", "4096", "integer", true, [], 0, 4_294_967_295),
   field("model.model", "qwen-local", "string", true),

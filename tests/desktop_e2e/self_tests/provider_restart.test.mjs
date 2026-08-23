@@ -75,9 +75,12 @@ function surface(overrides = {}) {
   };
 }
 
-test("provider restart fixture explicitly clears the product default generation body", () => {
+test("provider restart fixture intentionally covers legacy split-mode normalization and clears the default generation body", () => {
   const config = providerRestartFixtureConfig("http://127.0.0.1:19454");
   assert.match(config, /base_url = "http:\/\/127\.0\.0\.1:19454"/);
+  assert.match(config, /provider_metadata_mode = "openai_compatible_only"/);
+  assert.match(config, /provider_api_mode = "responses"/);
+  assert.doesNotMatch(config, /provider_profile\s*=/);
   assert.match(config, /\[model\.extra_body_json\]\r?\n\r?\n\[permissions\]/);
 });
 

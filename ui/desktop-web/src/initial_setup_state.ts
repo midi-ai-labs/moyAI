@@ -50,7 +50,8 @@ export interface InitialSetupFinishSettlement {
 
 const PROVIDER_STEP_KEYS = new Set([
   "model.base_url",
-  "model.provider_metadata_mode",
+  "model.provider_profile",
+  "model.api_key_env",
   "model.context_window",
   "model.max_output_tokens",
 ]);

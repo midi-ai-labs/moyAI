@@ -651,6 +651,7 @@ mod tests {
             base_url: "http://127.0.0.1:1234".to_string(),
             access_mode: crate::config::AccessMode::Default,
             model_parameters: Default::default(),
+            provider_connection: None,
             session_settings_revision: 0,
             created_at_ms: 1,
             updated_at_ms: 2,

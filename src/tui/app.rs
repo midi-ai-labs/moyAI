@@ -843,18 +843,15 @@ impl TuiController {
                     .config_editor
                     .build_resolved_config(&self.effective_config)
                     .map_err(AppRunError::Message)?;
-                let durable_access_ready = self
-                    .persist_current_session_access_mode(candidate.permissions.access_mode)
-                    .await;
-                if !commit_tui_effective_config(
-                    &mut self.effective_config,
-                    candidate,
-                    durable_access_ready,
-                ) {
+                let Some(candidate) = self.persist_current_session_config(candidate).await else {
+                    return Ok(());
+                };
+                if !commit_tui_effective_config(&mut self.effective_config, candidate, true) {
                     return Ok(());
                 }
+                self.config_editor = ConfigEditorState::from_config(&self.effective_config);
                 self.state.status_message = Some(if self.state.current_session_id.is_some() {
-                    "applied session override and remembered access mode for this session; changes apply to turns admitted later"
+                    "applied session override and remembered its provider connection and access mode; changes apply to turns admitted later"
                         .to_string()
                 } else {
                     "applied temporary session override; changes apply to turns admitted later"
@@ -1100,6 +1097,91 @@ impl TuiController {
                     "access mode was not changed because session settings could not be saved: {error}"
                 ));
                 false
+            }
+        }
+    }
+
+    async fn persist_current_session_config(
+        &mut self,
+        candidate: ResolvedConfig,
+    ) -> Option<ResolvedConfig> {
+        let Some(session_id) = self.state.current_session_id else {
+            return Some(candidate);
+        };
+        let current = match self.app.session_service.get_session(session_id).await {
+            Ok(session) => session,
+            Err(error) => {
+                self.state.status_message = Some(format!(
+                    "session override was not applied because the current session could not be read: {error}"
+                ));
+                return None;
+            }
+        };
+        let patch = crate::session::SessionSettingsPatch {
+            model: Some(candidate.model.model.clone()),
+            base_url: Some(candidate.model.base_url.clone()),
+            access_mode: Some(candidate.permissions.access_mode),
+            provider_connection: Some(
+                crate::session::SessionProviderConnection::from_model_config(&candidate.model),
+            ),
+            reset_model_parameters: true,
+            temperature: candidate.model.temperature,
+            top_p: candidate.model.top_p,
+            top_k: candidate.model.top_k,
+            context_window: Some(candidate.model.context_window),
+            max_output_tokens: Some(candidate.model.max_output_tokens),
+            ..Default::default()
+        };
+        match self
+            .app
+            .session_service
+            .compare_and_set_root_session_settings(
+                session_id,
+                current.session_settings_revision,
+                patch,
+            )
+            .await
+        {
+            Ok(Some(update)) => {
+                for session in &mut self.state.sessions {
+                    if session.id == session_id {
+                        *session = update.session.clone();
+                    }
+                }
+                for summary in &mut self.state.loaded_sessions {
+                    if summary.session.id == session_id {
+                        summary.session = update.session.clone();
+                    }
+                }
+                let durable =
+                    crate::session::resolved_config_for_session(&self.base_config, &update.session);
+                let mut applied = candidate;
+                applied.model.base_url = durable.model.base_url;
+                applied.model.model = durable.model.model;
+                applied.model.provider_profile = durable.model.provider_profile;
+                applied.model.api_key_env = durable.model.api_key_env;
+                applied.model.extra_headers = durable.model.extra_headers;
+                applied.model.extra_body_json = durable.model.extra_body_json;
+                applied.model.context_window = durable.model.context_window;
+                applied.model.max_output_tokens = durable.model.max_output_tokens;
+                applied.model.temperature = durable.model.temperature;
+                applied.model.top_p = durable.model.top_p;
+                applied.model.top_k = durable.model.top_k;
+                applied.permissions.access_mode = durable.permissions.access_mode;
+                Some(applied)
+            }
+            Ok(None) => {
+                self.state.status_message = Some(
+                    "session override was not applied because its settings changed concurrently; reopen the config editor and retry"
+                        .to_string(),
+                );
+                None
+            }
+            Err(error) => {
+                self.state.status_message = Some(format!(
+                    "session override was not applied because its provider settings could not be saved: {error}"
+                ));
+                None
             }
         }
     }
@@ -1961,7 +2043,9 @@ impl TuiController {
         let read = session_view(&self.app.session_service, session_id).await?;
         self.cancel_pending_prompt_enhance();
         self.align_workspace_to_session(&read.session).await?;
-        self.apply_access_mode_owner(read.session.access_mode);
+        self.effective_config =
+            crate::session::resolved_config_for_session(&self.base_config, &read.session);
+        self.config_editor = ConfigEditorState::from_config(&self.effective_config);
         self.state.load_canonical_session_read(&read);
         self.state.modal = Modal::None;
         Ok(())
@@ -2080,7 +2164,9 @@ impl TuiController {
             .rejoin_running_session(session_id, 0, 1, 0, 1)
             .await?;
         let read = session_view(&self.app.session_service, session_id).await?;
-        self.apply_access_mode_owner(read.session.access_mode);
+        self.effective_config =
+            crate::session::resolved_config_for_session(&self.base_config, &read.session);
+        self.config_editor = ConfigEditorState::from_config(&self.effective_config);
         self.state.load_canonical_session_read(&read);
         self.state.status_message = Some(format!("rejoined running session {session_id}"));
         self.state.modal = Modal::None;
@@ -3793,6 +3879,11 @@ mod key_tests {
                     model: app.config.model.model.clone(),
                     base_url: app.config.model.base_url.clone(),
                     access_mode: crate::config::AccessMode::Default,
+                    provider_connection: Some(
+                        crate::session::SessionProviderConnection::from_model_config(
+                            &app.config.model,
+                        ),
+                    ),
                 },
                 app.workspace.clone(),
             )
@@ -3811,6 +3902,177 @@ mod key_tests {
         .expect("controller");
         controller.state.current_session_id = Some(session_id);
         (temp, controller, session_id)
+    }
+
+    #[tokio::test]
+    async fn opening_a_tui_session_restores_its_complete_durable_provider_owner() {
+        let (_temp, mut controller, session_id) =
+            tui_controller_with_session("durable-provider-owner").await;
+        controller.base_config.model.base_url = "https://global.example/v1".to_string();
+        controller.base_config.model.model = "global-model".to_string();
+        controller.base_config.model.provider_profile =
+            crate::config::ProviderProfile::OpenAiResponses;
+        controller.base_config.model.api_key_env = Some("GLOBAL_API_KEY".to_string());
+        controller.base_config.model.extra_headers = std::collections::BTreeMap::from([(
+            "Authorization".to_string(),
+            "Bearer global-secret".to_string(),
+        )]);
+        controller.base_config.model.extra_body_json =
+            Some(serde_json::json!({"api_key": "global-body-secret"}));
+        controller.app.config = controller.base_config.clone();
+        controller
+            .app
+            .session_service
+            .update_session_settings(
+                session_id,
+                crate::session::SessionSettingsPatch {
+                    model: Some("session-model".to_string()),
+                    base_url: Some("https://session.example/v1".to_string()),
+                    access_mode: Some(crate::config::AccessMode::FullAccess),
+                    provider_connection: Some(crate::session::SessionProviderConnection {
+                        profile: crate::config::ProviderProfile::OpenAiCompatible,
+                        api_key_env: Some("SESSION_API_KEY".to_string()),
+                        extra_headers: std::collections::BTreeMap::from([(
+                            "X-Session-Key".to_string(),
+                            "session-secret".to_string(),
+                        )]),
+                    }),
+                    context_window: Some(131_072),
+                    max_output_tokens: Some(8_192),
+                    temperature: Some(0.2),
+                    top_p: Some(0.8),
+                    top_k: Some(40),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("durable provider settings");
+
+        controller
+            .open_session(session_id)
+            .await
+            .expect("open durable provider session");
+
+        let effective = &controller.effective_config;
+        assert_eq!(effective.model.base_url, "https://session.example/v1");
+        assert_eq!(effective.model.model, "session-model");
+        assert_eq!(
+            effective.model.provider_profile,
+            crate::config::ProviderProfile::OpenAiCompatible
+        );
+        assert_eq!(
+            effective.model.api_key_env.as_deref(),
+            Some("SESSION_API_KEY")
+        );
+        assert_eq!(
+            effective
+                .model
+                .extra_headers
+                .get("X-Session-Key")
+                .map(String::as_str),
+            Some("session-secret")
+        );
+        assert_eq!(effective.model.extra_body_json, None);
+        assert_eq!(effective.model.context_window, 131_072);
+        assert_eq!(effective.model.max_output_tokens, 8_192);
+        assert_eq!(effective.model.temperature, Some(0.2));
+        assert_eq!(effective.model.top_p, Some(0.8));
+        assert_eq!(effective.model.top_k, Some(40));
+        assert_eq!(
+            effective.permissions.access_mode,
+            crate::config::AccessMode::FullAccess
+        );
+        for (key, expected) in [
+            (
+                crate::config::ConfigField::BaseUrl,
+                "https://session.example/v1",
+            ),
+            (crate::config::ConfigField::Model, "session-model"),
+            (
+                crate::config::ConfigField::ProviderProfile,
+                "openai_compatible",
+            ),
+            (crate::config::ConfigField::ApiKeyEnv, "SESSION_API_KEY"),
+        ] {
+            assert_eq!(
+                controller
+                    .config_editor
+                    .fields
+                    .iter()
+                    .find(|field| field.key == key)
+                    .expect("provider config field")
+                    .value,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn f2_persists_one_complete_provider_snapshot_before_committing_effective_config() {
+        let (_temp, mut controller, session_id) =
+            tui_controller_with_session("f2-provider-snapshot").await;
+        let mut candidate = controller.effective_config.clone();
+        candidate.model.base_url = "http://127.0.0.1:8119/v1".to_string();
+        candidate.model.model = "openai-compatible-model".to_string();
+        candidate.model.provider_profile = crate::config::ProviderProfile::OpenAiCompatible;
+        candidate.model.api_key_env = Some("OMLX_API_KEY".to_string());
+        candidate.model.extra_headers =
+            std::collections::BTreeMap::from([("X-Provider".to_string(), "omlx-test".to_string())]);
+        candidate.model.extra_body_json =
+            Some(serde_json::json!({"api_key": "must-not-be-session-owned"}));
+        candidate.model.context_window = 65_536;
+        candidate.model.max_output_tokens = 4_096;
+        candidate.model.temperature = Some(0.3);
+        candidate.model.top_p = Some(0.7);
+        candidate.model.top_k = Some(32);
+        candidate.permissions.access_mode = crate::config::AccessMode::FullAccess;
+        controller.effective_config = candidate.clone();
+        controller.config_editor = ConfigEditorState::from_config(&candidate);
+
+        controller
+            .handle_config_editor_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .await
+            .expect("F2 provider snapshot apply");
+
+        let durable = controller
+            .app
+            .session_service
+            .get_session(session_id)
+            .await
+            .expect("durable F2 session");
+        assert_eq!(durable.base_url, "http://127.0.0.1:8119/v1");
+        assert_eq!(durable.model, "openai-compatible-model");
+        assert_eq!(durable.access_mode, crate::config::AccessMode::FullAccess);
+        assert_eq!(durable.model_parameters.context_window, Some(65_536));
+        assert_eq!(durable.model_parameters.max_output_tokens, Some(4_096));
+        assert_eq!(durable.model_parameters.temperature, Some(0.3));
+        assert_eq!(durable.model_parameters.top_p, Some(0.7));
+        assert_eq!(durable.model_parameters.top_k, Some(32));
+        let connection = durable
+            .provider_connection
+            .as_ref()
+            .expect("durable provider connection");
+        assert_eq!(
+            connection.profile,
+            crate::config::ProviderProfile::OpenAiCompatible
+        );
+        assert_eq!(connection.api_key_env.as_deref(), Some("OMLX_API_KEY"));
+        assert_eq!(
+            connection
+                .extra_headers
+                .get("X-Provider")
+                .map(String::as_str),
+            Some("omlx-test")
+        );
+        assert_eq!(
+            controller.effective_config.model.provider_profile,
+            crate::config::ProviderProfile::OpenAiCompatible
+        );
+        assert_eq!(
+            controller.effective_config.model.api_key_env.as_deref(),
+            Some("OMLX_API_KEY")
+        );
+        assert_eq!(controller.effective_config.model.extra_body_json, None);
     }
 
     fn set_tui_access_mode_field(controller: &mut TuiController, value: &str) {
@@ -3953,6 +4215,11 @@ mod key_tests {
                 model: controller.app.config.model.model.clone(),
                 base_url: controller.app.config.model.base_url.clone(),
                 access_mode: crate::config::AccessMode::Default,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(
+                        &controller.app.config.model,
+                    ),
+                ),
             })
             .await
             .expect("nested session");
@@ -4623,6 +4890,11 @@ mod key_tests {
                 model: controller.app.config.model.model.clone(),
                 base_url: controller.app.config.model.base_url.clone(),
                 access_mode: crate::config::AccessMode::Default,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(
+                        &controller.app.config.model,
+                    ),
+                ),
             })
             .await
             .expect("child session");
@@ -4793,6 +5065,11 @@ mod key_tests {
                 model: controller.app.config.model.model.clone(),
                 base_url: controller.app.config.model.base_url.clone(),
                 access_mode: crate::config::AccessMode::Default,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(
+                        &controller.app.config.model,
+                    ),
+                ),
             })
             .await
             .expect("child session");
@@ -4857,6 +5134,11 @@ mod key_tests {
                 model: controller.app.config.model.model.clone(),
                 base_url: controller.app.config.model.base_url.clone(),
                 access_mode: crate::config::AccessMode::Default,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(
+                        &controller.app.config.model,
+                    ),
+                ),
             })
             .await
             .expect("child session");
@@ -5281,6 +5563,11 @@ mod key_tests {
                 model: controller.app.config.model.model.clone(),
                 base_url: controller.app.config.model.base_url.clone(),
                 access_mode: AccessMode::Default,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(
+                        &controller.app.config.model,
+                    ),
+                ),
             })
             .await
             .expect("new root session");
@@ -5419,6 +5706,11 @@ mod key_tests {
                     model: nested_app.config.model.model.clone(),
                     base_url: nested_app.config.model.base_url.clone(),
                     access_mode: AccessMode::Default,
+                    provider_connection: Some(
+                        crate::session::SessionProviderConnection::from_model_config(
+                            &nested_app.config.model,
+                        ),
+                    ),
                 },
                 nested_app.workspace.clone(),
             )
@@ -5506,6 +5798,11 @@ mod key_tests {
                     model: first_app.config.model.model.clone(),
                     base_url: first_app.config.model.base_url.clone(),
                     access_mode: AccessMode::Default,
+                    provider_connection: Some(
+                        crate::session::SessionProviderConnection::from_model_config(
+                            &first_app.config.model,
+                        ),
+                    ),
                 },
                 first_app.workspace.clone(),
             )
@@ -5593,6 +5890,11 @@ mod key_tests {
                     model: first_app.config.model.model.clone(),
                     base_url: first_app.config.model.base_url.clone(),
                     access_mode: AccessMode::Default,
+                    provider_connection: Some(
+                        crate::session::SessionProviderConnection::from_model_config(
+                            &first_app.config.model,
+                        ),
+                    ),
                 },
                 first_app.workspace.clone(),
             )
@@ -5795,6 +6097,7 @@ mod key_tests {
                 model: session_a.model,
                 base_url: session_a.base_url,
                 access_mode: session_b_access_mode,
+                provider_connection: session_a.provider_connection,
             })
             .await
             .expect("session B");
@@ -5879,6 +6182,7 @@ mod key_tests {
                 model: root_session.model.clone(),
                 base_url: root_session.base_url.clone(),
                 access_mode: crate::config::AccessMode::Default,
+                provider_connection: root_session.provider_connection.clone(),
             })
             .await
             .expect("child session");

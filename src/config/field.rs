@@ -6,7 +6,7 @@ use super::model::{
     AccessMode, MAX_MODEL_REQUEST_TIMEOUT_MS, McpServerConfig, MultiAgentMode,
     PartialDoclingConfig, PartialFileGuardConfig, PartialInspectionConfig, PartialMcpConfig,
     PartialModelConfig, PartialMultiAgentConfig, PartialPermissionsConfig, PartialResolvedConfig,
-    PartialShellConfig, ProviderMetadataMode, ResolvedConfig, validate_optional_provider_float,
+    PartialShellConfig, ProviderProfile, ResolvedConfig, validate_optional_provider_float,
 };
 use super::turn::ProviderEndpoint;
 
@@ -14,7 +14,8 @@ use super::turn::ProviderEndpoint;
 pub enum ConfigField {
     BaseUrl,
     Model,
-    ProviderMetadataMode,
+    ProviderProfile,
+    ApiKeyEnv,
     AccessMode,
     MultiAgentEnabled,
     MultiAgentMode,
@@ -124,10 +125,11 @@ impl ConfigFieldDescriptor {
 }
 
 impl ConfigField {
-    pub const ALL: [ConfigField; 43] = [
+    pub const ALL: [ConfigField; 44] = [
         ConfigField::BaseUrl,
         ConfigField::Model,
-        ConfigField::ProviderMetadataMode,
+        ConfigField::ProviderProfile,
+        ConfigField::ApiKeyEnv,
         ConfigField::AccessMode,
         ConfigField::MultiAgentEnabled,
         ConfigField::MultiAgentMode,
@@ -174,7 +176,8 @@ impl ConfigField {
         match self {
             ConfigField::BaseUrl => "model.base_url",
             ConfigField::Model => "model.model",
-            ConfigField::ProviderMetadataMode => "model.provider_metadata_mode",
+            ConfigField::ProviderProfile => "model.provider_profile",
+            ConfigField::ApiKeyEnv => "model.api_key_env",
             ConfigField::AccessMode => "permissions.access_mode",
             ConfigField::MultiAgentEnabled => "multi_agent.enabled",
             ConfigField::MultiAgentMode => "multi_agent.mode",
@@ -226,7 +229,8 @@ impl ConfigField {
         match self {
             ConfigField::BaseUrl => Some("MOYAI_BASE_URL"),
             ConfigField::Model => Some("MOYAI_MODEL"),
-            ConfigField::ProviderMetadataMode => Some("MOYAI_PROVIDER_METADATA_MODE"),
+            ConfigField::ProviderProfile => Some("MOYAI_PROVIDER_PROFILE"),
+            ConfigField::ApiKeyEnv => Some("MOYAI_API_KEY_ENV"),
             ConfigField::AccessMode => Some("MOYAI_ACCESS_MODE"),
             ConfigField::MultiAgentEnabled => Some("MOYAI_MULTI_AGENT_ENABLED"),
             ConfigField::MultiAgentMode => Some("MOYAI_MULTI_AGENT_MODE"),
@@ -280,6 +284,8 @@ impl ConfigField {
 
     pub fn display_label(self) -> &'static str {
         match self {
+            ConfigField::ProviderProfile => "Connection type",
+            ConfigField::ApiKeyEnv => "API key environment variable (optional)",
             ConfigField::RequestTimeoutMs => "LLM response timeout",
             _ => self.label(),
         }
@@ -287,6 +293,12 @@ impl ConfigField {
 
     pub fn help(self) -> &'static str {
         match self {
+            ConfigField::ProviderProfile => {
+                "モデル一覧の取得方式と生成APIを一つの接続方式として選びます。oMLX等の一般的なOpenAI互換serverにはOpenAI-compatible (Chat Completions)を選択します。"
+            }
+            ConfigField::ApiKeyEnv => {
+                "API keyそのものではなく、起動環境に設定した環境変数名（例: OPENAI_API_KEY）を入力します。認証不要なら空欄にします。"
+            }
             ConfigField::RequestTimeoutMs => {
                 "最初の送信開始からstream完了までのLLM応答全体に適用する総上限（ms）です。"
             }
@@ -308,13 +320,18 @@ impl ConfigField {
 
     pub(crate) fn descriptor(self) -> ConfigFieldDescriptor {
         const NONE: &[&str] = &[];
-        const PROVIDER_MODES: &[&str] = &["lm_studio_native_required", "openai_compatible_only"];
+        const PROVIDER_PROFILES: &[&str] = &[
+            "lm_studio",
+            "openai_compatible",
+            "openai_responses",
+            "lm_studio_chat_completions",
+        ];
         const ACCESS_MODES: &[&str] = &["default", "auto_review", "full_access"];
         const MULTI_AGENT_MODES: &[&str] = &["explicit_request_only", "proactive"];
 
         let (value_type, integer_min, integer_max, options) = match self {
-            ConfigField::ProviderMetadataMode => {
-                (ConfigFieldValueType::Enum, None, None, PROVIDER_MODES)
+            ConfigField::ProviderProfile => {
+                (ConfigFieldValueType::Enum, None, None, PROVIDER_PROFILES)
             }
             ConfigField::AccessMode => (ConfigFieldValueType::Enum, None, None, ACCESS_MODES),
             ConfigField::MultiAgentMode => {
@@ -376,6 +393,7 @@ impl ConfigField {
             | ConfigField::Seed => (ConfigFieldValueType::Integer, Some(0), None, NONE),
             ConfigField::BaseUrl
             | ConfigField::Model
+            | ConfigField::ApiKeyEnv
             | ConfigField::StopSequences
             | ConfigField::FileGuardBlockedReadExtensions
             | ConfigField::FileGuardStructuredDocumentExtensions
@@ -400,6 +418,7 @@ impl ConfigField {
                 | ConfigField::PresencePenalty
                 | ConfigField::FrequencyPenalty
                 | ConfigField::Seed
+                | ConfigField::ApiKeyEnv
                 | ConfigField::StopSequences
                 | ConfigField::ExtraHeadersJson
                 | ConfigField::ExtraBodyJson
@@ -415,12 +434,8 @@ impl ConfigField {
         match self {
             ConfigField::BaseUrl => config.model.base_url.clone(),
             ConfigField::Model => config.model.model.clone(),
-            ConfigField::ProviderMetadataMode => match config.model.provider_metadata_mode {
-                ProviderMetadataMode::LmStudioNativeRequired => {
-                    "lm_studio_native_required".to_string()
-                }
-                ProviderMetadataMode::OpenAiCompatibleOnly => "openai_compatible_only".to_string(),
-            },
+            ConfigField::ProviderProfile => config.model.provider_profile.as_str().to_string(),
+            ConfigField::ApiKeyEnv => config.model.api_key_env.clone().unwrap_or_default(),
             ConfigField::AccessMode => config.permissions.access_mode.as_str().to_string(),
             ConfigField::MultiAgentEnabled => config.multi_agent.enabled.to_string(),
             ConfigField::MultiAgentMode => config.multi_agent.mode.as_str().to_string(),
@@ -516,6 +531,7 @@ pub(crate) fn build_resolved_config_from_field_values(
             ConfigField::PresencePenalty => config.model.presence_penalty = None,
             ConfigField::FrequencyPenalty => config.model.frequency_penalty = None,
             ConfigField::Seed => config.model.seed = None,
+            ConfigField::ApiKeyEnv => config.model.api_key_env = None,
             ConfigField::ExtraHeadersJson => config.model.extra_headers.clear(),
             ConfigField::ExtraBodyJson => config.model.extra_body_json = None,
             ConfigField::DoclingApiKeyEnv => config.docling.api_key_env = None,
@@ -585,12 +601,13 @@ pub(crate) fn parse_config_field_patch(
                 }
             }
             ConfigField::Model => model.model = parse_string(text),
-            ConfigField::ProviderMetadataMode => {
-                model.provider_metadata_mode = match parse_string(text) {
-                    Some(value) => Some(parse_provider_metadata_mode(&value)?),
+            ConfigField::ProviderProfile => {
+                model.provider_profile = match parse_string(text) {
+                    Some(value) => Some(parse_provider_profile(&value)?),
                     None => None,
                 }
             }
+            ConfigField::ApiKeyEnv => model.api_key_env = Some(parse_string(text)),
             ConfigField::AccessMode => {
                 permissions.access_mode = match parse_string(text) {
                     Some(value) => Some(parse_access_mode(&value)?),
@@ -733,20 +750,13 @@ fn validate_complete_config_field_values(fields: &[(ConfigField, &str)]) -> Resu
     Ok(())
 }
 
-fn parse_provider_metadata_mode(value: &str) -> Result<ProviderMetadataMode, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "lm_studio_native_required"
-        | "lm-studio-native-required"
-        | "lmstudio"
-        | "lm_studio"
-        | "lm-studio" => Ok(ProviderMetadataMode::LmStudioNativeRequired),
-        "openai_compatible_only"
-        | "openai-compatible-only"
-        | "openai"
-        | "openai_compat"
-        | "openai-compatible" => Ok(ProviderMetadataMode::OpenAiCompatibleOnly),
-        other => Err(format!("unsupported provider_metadata_mode `{other}`")),
-    }
+fn parse_provider_profile(value: &str) -> Result<ProviderProfile, String> {
+    ProviderProfile::parse(value).ok_or_else(|| {
+        format!(
+            "unsupported provider_profile `{}`",
+            value.trim().to_ascii_lowercase()
+        )
+    })
 }
 
 fn parse_access_mode(value: &str) -> Result<AccessMode, String> {
@@ -858,7 +868,7 @@ mod tests {
 
     #[test]
     fn descriptor_inventory_has_one_stable_entry_per_field() {
-        assert_eq!(ConfigField::ALL.len(), 43);
+        assert_eq!(ConfigField::ALL.len(), 44);
         let mut keys = HashSet::new();
         for field in ConfigField::ALL {
             let descriptor = field.descriptor();
@@ -893,6 +903,19 @@ mod tests {
         let access = ConfigField::AccessMode.descriptor();
         assert_eq!(access.value_type(), ConfigFieldValueType::Enum);
         assert_eq!(access.options(), &["default", "auto_review", "full_access"]);
+
+        let profile = ConfigField::ProviderProfile.descriptor();
+        assert_eq!(profile.value_type(), ConfigFieldValueType::Enum);
+        assert_eq!(
+            profile.options(),
+            &[
+                "lm_studio",
+                "openai_compatible",
+                "openai_responses",
+                "lm_studio_chat_completions",
+            ]
+        );
+        assert!(!ConfigField::ApiKeyEnv.descriptor().required());
     }
 
     #[test]
@@ -989,6 +1012,29 @@ mod tests {
         )
         .expect("valid stable-key update");
         assert_eq!(changed.model.model, "next-model");
+
+        let openai_compatible = build_resolved_config_from_key_values(
+            &base,
+            vec![
+                (
+                    ConfigField::ProviderProfile.label().to_string(),
+                    "openai_compatible".to_string(),
+                ),
+                (
+                    ConfigField::ApiKeyEnv.label().to_string(),
+                    "OPENAI_API_KEY".to_string(),
+                ),
+            ],
+        )
+        .expect("valid atomic provider profile update");
+        assert_eq!(
+            openai_compatible.model.provider_profile,
+            crate::config::ProviderProfile::OpenAiCompatible
+        );
+        assert_eq!(
+            openai_compatible.model.api_key_env.as_deref(),
+            Some("OPENAI_API_KEY")
+        );
 
         let error = build_resolved_config_from_key_values(
             &base,

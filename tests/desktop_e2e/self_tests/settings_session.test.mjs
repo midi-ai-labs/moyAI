@@ -6,6 +6,9 @@ import {
   SESSION_CONTEXT_BEFORE,
   SESSION_MAX_OUTPUT_AFTER,
   SESSION_MAX_OUTPUT_BEFORE,
+  SESSION_PROVIDER_API_KEY_ENV,
+  SESSION_PROVIDER_PROFILE,
+  SESSION_PROVIDER_PROFILE_OPTIONS,
   SESSION_SETTINGS_MODEL_TRIGGER,
   advancedSessionSettingsTarget,
   completedSessionRootReady,
@@ -58,14 +61,16 @@ const restoredExpected = Object.freeze({
   expectedSettingsRevision: restoredTarget.settingsRevision,
   expectedBaseUrl: "http://127.0.0.1:43111",
   expectedModel: "e2e/scripted-responses",
+  expectedProviderProfile: SESSION_PROVIDER_PROFILE,
+  expectedApiKeyEnv: SESSION_PROVIDER_API_KEY_ENV,
   expectedAccessMode: "default",
   expectedPrompt: "create root alpha",
   expectedResponse: "ALPHA_OK",
   expectedResponseCount: 2,
 });
 
-function panelField(value) {
-  return { count: 1, visible: true, enabled: true, value };
+function panelField(value, options = []) {
+  return { count: 1, visible: true, enabled: true, value, options };
 }
 
 function trigger(triggerName) {
@@ -105,6 +110,8 @@ function surface({
         available: true,
         base_url: "http://127.0.0.1:43111",
         model: "e2e/scripted-responses",
+        provider_profile: SESSION_PROVIDER_PROFILE,
+        api_key_env: SESSION_PROVIDER_API_KEY_ENV,
         access_mode: "default",
         context_window: inherited ? SESSION_CONTEXT_BEFORE : contextWindow,
         max_output_tokens: inherited ? SESSION_MAX_OUTPUT_BEFORE : maxOutputTokens,
@@ -122,6 +129,8 @@ function surface({
       scope_text: "このセッションだけ",
       base_url: panelField("http://127.0.0.1:43111"),
       model: panelField("e2e/scripted-responses"),
+      provider_profile: panelField(SESSION_PROVIDER_PROFILE, [...SESSION_PROVIDER_PROFILE_OPTIONS]),
+      api_key_env: panelField(SESSION_PROVIDER_API_KEY_ENV),
       access_mode: panelField("default"),
       context_window: panelField(contextWindow),
       max_output_tokens: panelField(maxOutputTokens),
@@ -162,6 +171,8 @@ function closedPanel(panel) {
     scope_text: null,
     base_url: { count: 0, visible: false, enabled: false, value: null },
     model: { count: 0, visible: false, enabled: false, value: null },
+    provider_profile: { count: 0, visible: false, enabled: false, value: null, options: [] },
+    api_key_env: { count: 0, visible: false, enabled: false, value: null, options: [] },
     access_mode: { count: 0, visible: false, enabled: false, value: null },
     context_window: { count: 0, visible: false, enabled: false, value: null },
     max_output_tokens: { count: 0, visible: false, enabled: false, value: null },
@@ -475,6 +486,17 @@ test("Session Settings panel predicate binds root target, local badge, fields, a
     contextWindow: SESSION_CONTEXT_BEFORE,
     maxOutputTokens: SESSION_MAX_OUTPUT_BEFORE,
   }), false);
+  assert.equal(sessionSettingsPanelReady(surface({
+    overrides: {
+      panel: {
+        ...surface().panel,
+        provider_profile: { ...surface().panel.provider_profile, options: [SESSION_PROVIDER_PROFILE] },
+      },
+    },
+  }), {
+    contextWindow: SESSION_CONTEXT_BEFORE,
+    maxOutputTokens: SESSION_MAX_OUTPUT_BEFORE,
+  }), false, "Connection type requires the complete four-profile selector");
 });
 
 test("dirty close guard preserves the exact root draft behind one inert panel", () => {
@@ -535,7 +557,7 @@ test("dirty close guard preserves the exact root draft behind one inert panel", 
   }, target), false);
 });
 
-test("Session Settings apply command captures every visible value and exact five-field target", () => {
+test("Session Settings apply command captures the complete seven-field connection and exact target", () => {
   const applyable = surface({
     contextWindow: SESSION_CONTEXT_AFTER,
     maxOutputTokens: SESSION_MAX_OUTPUT_AFTER,
@@ -547,6 +569,8 @@ test("Session Settings apply command captures every visible value and exact five
       input: {
         baseUrl: "http://127.0.0.1:43111",
         model: "e2e/scripted-responses",
+        providerProfile: SESSION_PROVIDER_PROFILE,
+        apiKeyEnv: SESSION_PROVIDER_API_KEY_ENV,
         accessMode: "default",
         contextWindow: SESSION_CONTEXT_AFTER,
         maxOutputTokens: SESSION_MAX_OUTPUT_AFTER,
@@ -758,7 +782,7 @@ test("restored root panel decision exposes every durable owner, value, control, 
   const ledger = acceptedLedger();
   const exact = restoredSessionSettingsPanelDecision({ surface: restored, ledger }, restoredExpected);
   assert.equal(exact.status, "pass");
-  assert.equal(exact.gates.length, 29);
+  assert.equal(exact.gates.length, 33);
   assert.equal(exact.gates.every((gate) => gate.pass), true);
   assert.equal(exact.gates.find((gate) => gate.id === "target-owner").actual.target.configGeneration, "1");
   assert.equal(exact.gates.find((gate) => gate.id === "target-owner").actual.target.runtimeOwnerToken, "idle:0");
@@ -798,6 +822,23 @@ test("restored root panel decision exposes every durable owner, value, control, 
   }, restoredExpected);
   assert.equal(controlDecision.status, "fail");
   assert.ok(controlDecision.terminal_failures.includes("restart-panel-model-mismatch"));
+
+  const incompleteProfiles = {
+    ...restored,
+    panel: {
+      ...restored.panel,
+      provider_profile: {
+        ...restored.panel.provider_profile,
+        options: [SESSION_PROVIDER_PROFILE],
+      },
+    },
+  };
+  const profileDecision = restoredSessionSettingsPanelDecision({
+    surface: incompleteProfiles,
+    ledger,
+  }, restoredExpected);
+  assert.equal(profileDecision.status, "fail");
+  assert.ok(profileDecision.terminal_failures.includes("restart-panel-provider-profile-mismatch"));
 
   const ambiguousBackdrop = restoredSessionSettingsPanelDecision({
     surface: { ...restored, visible_backdrop_count: 2 },

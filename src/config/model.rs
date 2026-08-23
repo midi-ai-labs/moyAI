@@ -100,6 +100,87 @@ pub enum ProviderApiMode {
     Responses,
 }
 
+/// One atomic, user-selectable provider protocol contract.
+///
+/// Catalog discovery and generation remain separate transport concerns, but
+/// resolved configuration owns their pairing here so settings cannot admit a
+/// mismatched combination. The fourth variant preserves the complete legacy
+/// configuration matrix without making split modes canonical again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderProfile {
+    #[default]
+    LmStudio,
+    #[serde(rename = "openai_compatible")]
+    OpenAiCompatible,
+    #[serde(rename = "openai_responses")]
+    OpenAiResponses,
+    LmStudioChatCompletions,
+}
+
+impl ProviderProfile {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LmStudio => "lm_studio",
+            Self::OpenAiCompatible => "openai_compatible",
+            Self::OpenAiResponses => "openai_responses",
+            Self::LmStudioChatCompletions => "lm_studio_chat_completions",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "lm_studio" | "lm-studio" | "lmstudio" => Some(Self::LmStudio),
+            "openai_compatible" | "openai-compatible" | "openai" => Some(Self::OpenAiCompatible),
+            "openai_responses" | "openai-responses" | "responses" => Some(Self::OpenAiResponses),
+            "lm_studio_chat_completions"
+            | "lm-studio-chat-completions"
+            | "lmstudio-chat-completions" => Some(Self::LmStudioChatCompletions),
+            _ => None,
+        }
+    }
+
+    pub const fn metadata_mode(self) -> ProviderMetadataMode {
+        match self {
+            Self::LmStudio | Self::LmStudioChatCompletions => {
+                ProviderMetadataMode::LmStudioNativeRequired
+            }
+            Self::OpenAiCompatible | Self::OpenAiResponses => {
+                ProviderMetadataMode::OpenAiCompatibleOnly
+            }
+        }
+    }
+
+    pub const fn api_mode(self) -> ProviderApiMode {
+        match self {
+            Self::LmStudio | Self::OpenAiResponses => ProviderApiMode::Responses,
+            Self::OpenAiCompatible | Self::LmStudioChatCompletions => {
+                ProviderApiMode::ChatCompletions
+            }
+        }
+    }
+
+    pub const fn from_legacy_modes(
+        metadata_mode: ProviderMetadataMode,
+        api_mode: ProviderApiMode,
+    ) -> Self {
+        match (metadata_mode, api_mode) {
+            (ProviderMetadataMode::LmStudioNativeRequired, ProviderApiMode::Responses) => {
+                Self::LmStudio
+            }
+            (ProviderMetadataMode::LmStudioNativeRequired, ProviderApiMode::ChatCompletions) => {
+                Self::LmStudioChatCompletions
+            }
+            (ProviderMetadataMode::OpenAiCompatibleOnly, ProviderApiMode::Responses) => {
+                Self::OpenAiResponses
+            }
+            (ProviderMetadataMode::OpenAiCompatibleOnly, ProviderApiMode::ChatCompletions) => {
+                Self::OpenAiCompatible
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatCompletionsReasoningParameters {
@@ -254,8 +335,7 @@ pub struct FormatterRule {
 pub struct ModelConfig {
     pub base_url: String,
     pub model: String,
-    pub provider_metadata_mode: ProviderMetadataMode,
-    pub provider_api_mode: ProviderApiMode,
+    pub provider_profile: ProviderProfile,
     pub chat_completions_reasoning_parameters: Option<ChatCompletionsReasoningParameters>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub reasoning_summary: ReasoningSummary,
@@ -287,8 +367,7 @@ impl std::fmt::Debug for ModelConfig {
             .debug_struct("ModelConfig")
             .field("base_url", &"<redacted provider endpoint>")
             .field("model", &self.model)
-            .field("provider_metadata_mode", &self.provider_metadata_mode)
-            .field("provider_api_mode", &self.provider_api_mode)
+            .field("provider_profile", &self.provider_profile)
             .field(
                 "chat_completions_reasoning_parameters",
                 &self.chat_completions_reasoning_parameters,
@@ -463,6 +542,9 @@ impl ResolvedConfig {
         }
         self.model.model = model.to_string();
 
+        self.model.api_key_env = canonical_api_key_env_name(self.model.api_key_env.as_deref())
+            .map_err(|error| format!("config field `model.api_key_env` {error}"))?;
+
         if !(1..=MAX_MODEL_REQUEST_TIMEOUT_MS).contains(&self.model.request_timeout_ms) {
             return Err(format!(
                 "config field `model.request_timeout_ms` must be between 1 and {MAX_MODEL_REQUEST_TIMEOUT_MS} milliseconds inclusive"
@@ -517,6 +599,30 @@ impl ResolvedConfig {
         }
         Ok(())
     }
+}
+
+/// Canonicalizes the optional environment-variable name used to resolve a provider API key.
+///
+/// The grammar intentionally preserves the process-environment subset already accepted at the
+/// request boundary: ASCII letters, digits, and underscores. Leading digits remain valid because
+/// process environment names are not limited to shell-identifier syntax. Values are trimmed once
+/// here so persisted, resumed, and request-scoped provider connections share one identity.
+pub fn canonical_api_key_env_name(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let name = raw.trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Err(
+            "must contain only ASCII letters, digits, or underscores and must not be empty"
+                .to_string(),
+        );
+    }
+    Ok(Some(name.to_string()))
 }
 
 pub(crate) fn canonical_docling_base_url(raw: &str) -> Result<String, String> {
@@ -610,8 +716,7 @@ impl Default for ResolvedConfig {
             model: ModelConfig {
                 base_url: DEFAULT_MODEL_BASE_URL.to_string(),
                 model: DEFAULT_MODEL_NAME.to_string(),
-                provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
-                provider_api_mode: ProviderApiMode::Responses,
+                provider_profile: ProviderProfile::LmStudio,
                 chat_completions_reasoning_parameters: None,
                 reasoning_effort: None,
                 reasoning_summary: ReasoningSummary::None,
@@ -779,8 +884,13 @@ impl PartialResolvedConfig {
 pub struct PartialModelConfig {
     pub base_url: Option<String>,
     pub model: Option<String>,
-    pub provider_metadata_mode: Option<ProviderMetadataMode>,
-    pub provider_api_mode: Option<ProviderApiMode>,
+    pub provider_profile: Option<ProviderProfile>,
+    /// Deserialize-only compatibility input. Normalize it into `provider_profile` before merge.
+    #[serde(skip_serializing)]
+    pub(crate) provider_metadata_mode: Option<ProviderMetadataMode>,
+    /// Deserialize-only compatibility input. Normalize it into `provider_profile` before merge.
+    #[serde(skip_serializing)]
+    pub(crate) provider_api_mode: Option<ProviderApiMode>,
     pub chat_completions_reasoning_parameters: Option<ChatCompletionsReasoningParameters>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub reasoning_summary: Option<ReasoningSummary>,
@@ -821,6 +931,7 @@ impl std::fmt::Debug for PartialModelConfig {
                     .map(|_| "<redacted provider endpoint>"),
             )
             .field("model", &self.model)
+            .field("provider_profile", &self.provider_profile)
             .field("provider_metadata_mode", &self.provider_metadata_mode)
             .field("provider_api_mode", &self.provider_api_mode)
             .field(
@@ -975,6 +1086,7 @@ pub struct PartialLoggingConfig {
 mod config_contract_tests {
     use super::{
         AccessMode, McpServerConfig, PartialModelConfig, PartialResolvedConfig, ResolvedConfig,
+        canonical_api_key_env_name,
     };
     use crate::tool::ToolEffectClass;
 
@@ -1078,6 +1190,41 @@ mod config_contract_tests {
     }
 
     #[test]
+    fn provider_api_key_environment_name_has_one_canonical_grammar() {
+        assert_eq!(
+            canonical_api_key_env_name(Some("  PROVIDER_KEY_1  ")).expect("canonical env name"),
+            Some("PROVIDER_KEY_1".to_string())
+        );
+        assert_eq!(
+            canonical_api_key_env_name(Some("1_PROVIDER_KEY")).expect("process env name"),
+            Some("1_PROVIDER_KEY".to_string())
+        );
+        assert_eq!(
+            canonical_api_key_env_name(None).expect("optional env name"),
+            None
+        );
+        for invalid in ["", "   ", "INVALID-NAME", "KEY.NAME", "KEY NAME"] {
+            assert!(
+                canonical_api_key_env_name(Some(invalid)).is_err(),
+                "{invalid:?}"
+            );
+        }
+
+        let mut config = ResolvedConfig::default();
+        config.model.api_key_env = Some("  PROVIDER_KEY_1  ".to_string());
+        config
+            .normalize_and_validate_provider_runtime()
+            .expect("resolved provider connection");
+        assert_eq!(config.model.api_key_env.as_deref(), Some("PROVIDER_KEY_1"));
+
+        config.model.api_key_env = Some("INVALID-NAME".to_string());
+        let error = config
+            .normalize_and_validate_provider_runtime()
+            .expect_err("invalid provider env name");
+        assert!(error.contains("model.api_key_env"), "{error}");
+    }
+
+    #[test]
     fn provider_config_debug_omits_endpoint_and_header_secrets() {
         let mut config = ResolvedConfig::default();
         config.model.base_url =
@@ -1177,8 +1324,8 @@ headers = {}
 #[cfg(test)]
 mod reasoning_contract_tests {
     use super::{
-        ChatCompletionsReasoningParameters, ProviderApiMode, ProviderReasoningCapability,
-        ReasoningEffort, ReasoningSummary,
+        ChatCompletionsReasoningParameters, ProviderApiMode, ProviderMetadataMode, ProviderProfile,
+        ProviderReasoningCapability, ReasoningEffort, ReasoningSummary,
     };
 
     #[test]
@@ -1219,6 +1366,51 @@ mod reasoning_contract_tests {
             serde_json::to_string(&ProviderApiMode::Responses).expect("explicit wire mode"),
             "\"responses\""
         );
+    }
+
+    #[test]
+    fn provider_profile_owns_the_complete_legacy_transport_matrix() {
+        for (profile, key, metadata, api) in [
+            (
+                ProviderProfile::LmStudio,
+                "lm_studio",
+                ProviderMetadataMode::LmStudioNativeRequired,
+                ProviderApiMode::Responses,
+            ),
+            (
+                ProviderProfile::OpenAiCompatible,
+                "openai_compatible",
+                ProviderMetadataMode::OpenAiCompatibleOnly,
+                ProviderApiMode::ChatCompletions,
+            ),
+            (
+                ProviderProfile::OpenAiResponses,
+                "openai_responses",
+                ProviderMetadataMode::OpenAiCompatibleOnly,
+                ProviderApiMode::Responses,
+            ),
+            (
+                ProviderProfile::LmStudioChatCompletions,
+                "lm_studio_chat_completions",
+                ProviderMetadataMode::LmStudioNativeRequired,
+                ProviderApiMode::ChatCompletions,
+            ),
+        ] {
+            assert_eq!(profile.as_str(), key);
+            assert_eq!(ProviderProfile::parse(key), Some(profile));
+            assert_eq!(profile.metadata_mode(), metadata);
+            assert_eq!(profile.api_mode(), api);
+            assert_eq!(ProviderProfile::from_legacy_modes(metadata, api), profile);
+            assert_eq!(
+                serde_json::to_string(&profile).expect("profile wire serialization"),
+                format!("\"{key}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<ProviderProfile>(&format!("\"{key}\""))
+                    .expect("profile wire key"),
+                profile
+            );
+        }
     }
 
     #[test]
@@ -1265,7 +1457,11 @@ mod reasoning_contract_tests {
     fn model_reasoning_defaults_preserve_provider_defaults_and_output_capability() {
         let model = super::ResolvedConfig::default().model;
 
-        assert_eq!(model.provider_api_mode, ProviderApiMode::Responses);
+        assert_eq!(model.provider_profile, ProviderProfile::LmStudio);
+        assert_eq!(
+            model.provider_profile.api_mode(),
+            ProviderApiMode::Responses
+        );
         assert_eq!(model.chat_completions_reasoning_parameters, None);
         assert_eq!(model.reasoning_effort, None);
         assert_eq!(model.reasoning_summary, ReasoningSummary::None);

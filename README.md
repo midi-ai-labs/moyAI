@@ -155,7 +155,7 @@ Default Windows config path:
 %APPDATA%\midi-ai-labs\moyai\config\config.toml
 ```
 
-The release folder and workspace folders do not need their own config file. Desktop, TUI, and CLI share the user-wide baseline; a Desktop root session may additionally retain its own provider URL, model, context window, maximum output, and access-mode values when reopened. Provider/model/context/output changes affect turns admitted after Apply. A committed access-mode change affects the next permission decision, including one made later by an already-running root or child, while an existing pending decision and an already-admitted effect keep their original policy.
+The release folder and workspace folders do not need their own config file. Desktop, TUI, and CLI share the user-wide baseline; a Desktop root session may additionally retain its own complete provider connection (connection type, URL, model, optional API-key environment-variable name, and custom headers), context window, maximum output, and access-mode values when reopened. Provider/model/context/output changes affect turns admitted after Apply. A committed access-mode change affects the next permission decision, including one made later by an already-running root or child, while an existing pending decision and an already-admitted effect keep their original policy.
 
 Initial Setup TOML import is read-only until Finish: the selected file is strictly parsed into the local wizard draft without materializing environment overrides, and neither the source nor the current global configuration is mutated by choosing it. Only a successful Finish persists the validated draft and clears the first-run setup requirement. Less common typed fields remain editable in the wizard's collapsed Advanced area, which opens when one of those fields needs correction.
 
@@ -167,8 +167,8 @@ Example:
 [model]
 base_url = "http://127.0.0.1:1234"
 model = "qwen/qwen3.6-27b"
-provider_metadata_mode = "lm_studio_native_required"
-provider_api_mode = "responses"
+provider_profile = "lm_studio"
+# api_key_env = "OPENAI_API_KEY" # optional; names an environment variable
 reasoning_summary = "none"
 request_timeout_ms = 3600000
 context_window = 131072
@@ -232,8 +232,8 @@ side effect. Config generation crosses the Rust/TypeScript boundary as an exact 
 never a JavaScript number. Preferences Apply builds one complete temporary `ResolvedConfig`, while
 Global Save merges only dirty fields into the current TOML document.
 
-Session Settings has a separate frontend draft limited to provider URL, model, access mode, context
-window, and maximum output. Apply sends those values together with the exact workspace, root-session
+Session Settings has a separate frontend draft limited to the complete provider connection, access mode,
+context window, and maximum output. Apply sends those values together with the exact workspace, root-session
 ID, durable settings revision, config generation, and runtime owner token. Rust derives the canonical
 patch and performs a root-only revision CAS; blank limits remove that root override and inherit the
 global value. Only a correlated success matching the latest local revision and target clears either
@@ -264,8 +264,8 @@ Common environment variables:
 
 - `MOYAI_BASE_URL`
 - `MOYAI_MODEL`
-- `MOYAI_PROVIDER_METADATA_MODE`
-- `MOYAI_PROVIDER_API_MODE`
+- `MOYAI_PROVIDER_PROFILE`
+- `MOYAI_API_KEY_ENV`
 - `MOYAI_CHAT_COMPLETIONS_REASONING_PARAMETERS`
 - `MOYAI_REASONING_EFFORT`
 - `MOYAI_REASONING_SUMMARY`
@@ -283,15 +283,54 @@ Common environment variables:
 - `MOYAI_DOCLING_ENABLED`
 - `MOYAI_MCP_ENABLED`
 
-Use `provider_metadata_mode = "openai_compatible_only"` or
-`MOYAI_PROVIDER_METADATA_MODE=openai_compatible_only` for OpenAI-compatible servers that do not
-provide LM Studio's native `/api/v1/models` metadata endpoint, such as vLLM/vLLM-MLX.
-Provider metadata mode does not select a model-name-specific prompt profile or inject a hidden
-language / no-thinking prefix. Tool, image, and parallel capability have one owner in `ModelPolicy`;
-provider policy owns only API mode and reasoning transport. Metadata mode selects exactly one
-declared metadata endpoint, while `provider_api_mode` separately selects the generation wire
-encoding. Availability is a metadata-only, explicit diagnostic; it does not run tool/vision
-generations or mutate product capability config.
+`provider_profile` is one atomic connection contract; catalog discovery and generation transport are
+not independently configurable. Use `openai_compatible` for oMLX, vLLM, NVIDIA NIM, and similar
+servers that expose `/v1/models` and `/v1/chat/completions`. The available values are:
+
+| Value | Catalog | Generation |
+| --- | --- | --- |
+| `lm_studio` (default) | LM Studio native metadata | `/v1/responses` |
+| `openai_compatible` | `/v1/models` | `/v1/chat/completions` |
+| `openai_responses` | `/v1/models` | `/v1/responses` |
+| `lm_studio_chat_completions` | LM Studio native metadata | `/v1/chat/completions` |
+
+`api_key_env` is optional and stores the name of an environment variable, not a secret. The variable
+is resolved for each request, so rotating its value does not require rewriting the config. Existing
+`provider_metadata_mode` / `provider_api_mode` TOML fields and their environment variables remain
+accepted only as compatibility input and are normalized to one profile; conflicting old and new values
+are rejected. New saves write only `provider_profile`. moyAI does not try another generation endpoint
+after a failure because doing so could duplicate a generation or tool call.
+
+The same connection can be supplied as one CLI override layer for a run, an availability check, or
+durable session settings:
+
+```text
+moyai run --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible "Summarize this project"
+moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
+moyai session settings <SESSION_ID> --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
+```
+
+For an authenticated server, set (for example) `OMLX_API_KEY` in the environment of the process that
+launches moyAI, then add `--api-key-env OMLX_API_KEY` to the same command. Naming an unset or empty
+variable fails closed.
+
+`--api-key-env` names an environment variable; it never accepts the secret itself. Run and
+availability overrides apply URL, profile, and API-key environment name as one precedence patch. A
+URL or profile change deliberately drops any credential reference not named by that same patch and
+always drops inherited custom headers and custom request body instead of forwarding them to a new
+connection. For durable
+`session settings`, `--provider-profile` therefore requires `--base-url`, and `--api-key-env`
+requires both. A `--base-url`-only change to a different endpoint keeps the current profile but
+stores that endpoint without the prior API-key reference or custom headers; specifying the same
+endpoint is a same-target edit and preserves them. The CLI does not accept custom headers or a custom
+body, so a complete CLI session connection stores no custom headers. `model availability
+--openai-compatible-only` remains a legacy compatibility flag and cannot be combined with
+`--provider-profile`.
+
+The provider profile does not select a model-name-specific prompt profile or inject a hidden language /
+no-thinking prefix. Tool, image, and parallel capability have one owner in `ModelPolicy`. Availability
+is an explicit catalog/metadata diagnostic; it does not run tool/vision generations or mutate product
+capability config.
 The current provider contract does not claim server-side strict tool-schema validation. Core and MCP
 tool-schema Rust types and both Chat Completions and Responses wire formats have no `strict` field, while raw
 arguments are still committed canonically and validated locally against the advertised schema, exact
@@ -307,18 +346,16 @@ to `not loaded`, and an absent load field to `unknown`; OpenAI-compatible catalo
 A saved LM Studio lab-profile example lives under `docs/testing/provider-profiles/`. It is not a
 product default: copy it to an isolated config, update the endpoint/model for the current environment,
 and select it with `MOYAI_CONFIG_PATH` without overwriting the user-wide config.
-The Tauri Desktop `LLM URL` overlay exposes the same mode switch beside the provider URL and model list.
+The Tauri Desktop provider surfaces expose one **Connection type** selector, the base URL, optional
+API-key environment-variable name, and model. They do not expose a second Responses/Chat switch.
 It also owns `context_window` and `max_output_tokens` inputs so vLLM/vLLM-MLX limits can be managed
 inside moyAI instead of relying on shell environment variables. Current vLLM-MLX `/health` and
 `/v1/status` responses expose the hosted model name, but not the server startup `--max-tokens` /
 `--max-request-tokens` values, so moyAI auto-detects the model and keeps request limits as managed
 config unless a provider exposes those fields in `/v1/models`.
 
-`provider_api_mode = "responses"` is the default generation transport and posts to `/v1/responses`.
-Choose `provider_api_mode = "chat_completions"` explicitly for a provider that requires
-`/v1/chat/completions`. The retired string `auto` is accepted only at the config/serde input boundary
-and normalized one way to `responses`; it is not a runtime mode and metadata mode no longer changes
-the generation transport implicitly. The HTTP Responses transport sends the complete current
+The `lm_studio` and `openai_responses` profiles use the Responses transport; the
+`openai_compatible` and `lm_studio_chat_completions` profiles use Chat Completions. The HTTP Responses transport sends the complete current
 canonical input on every request, including any compaction checkpoint, and does not send
 `previous_response_id`. Raw reasoning text is neither replayed nor stored as assistant context. A
 requested typed reasoning summary is a runtime-only client event, not a durable conversation or

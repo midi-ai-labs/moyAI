@@ -232,7 +232,7 @@ impl OpenAiCompatClient {
     fn request_headers(&self, request: &ChatRequest) -> Result<HeaderMap, LlmError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if let Some(api_key) = &self.api_key {
+        if let Some(api_key) = request.api_key().or(self.api_key.as_deref()) {
             let value = HeaderValue::from_str(&format!("Bearer {api_key}"))
                 .map_err(|error| LlmError::Message(format!("invalid API key header: {error}")))?;
             headers.insert(AUTHORIZATION, value);
@@ -1954,7 +1954,7 @@ mod tests {
         ReasoningEffort, ReasoningSummary,
     };
     use crate::config::{
-        ProviderDeadlines, ProviderMetadataMode, ProviderRequestLimits, ProviderStreamLimits,
+        ProviderDeadlines, ProviderProfile, ProviderRequestLimits, ProviderStreamLimits,
         ProviderTarget, ResolvedConfig, ResolvedTurnConfig,
     };
     use crate::error::{LlmError, ProviderRequestLimit, ProviderStreamLimit};
@@ -1969,12 +1969,10 @@ mod tests {
     fn provider_target(
         endpoint: &str,
         model: &str,
-        metadata_mode: ProviderMetadataMode,
-        api_mode: ProviderApiMode,
+        profile: ProviderProfile,
         deadlines: ProviderDeadlines,
     ) -> ProviderTarget {
-        ProviderTarget::new(endpoint, model, metadata_mode, api_mode, deadlines)
-            .expect("provider target")
+        ProviderTarget::new(endpoint, model, profile, deadlines).expect("provider target")
     }
 
     fn fresh_stream_budget(limits: ProviderStreamLimits) -> ProviderStreamBudget {
@@ -1983,30 +1981,16 @@ mod tests {
 
     fn replace_provider_endpoint(request: &mut ChatRequest, endpoint: &str) {
         let model = request.provider_target().model().to_string();
-        let metadata_mode = request.provider_target().metadata_mode();
-        let api_mode = request.provider_target().api_mode();
+        let profile = request.provider_target().profile();
         let deadlines = request.provider_target().deadlines();
-        request.replace_provider_target(provider_target(
-            endpoint,
-            &model,
-            metadata_mode,
-            api_mode,
-            deadlines,
-        ));
+        request.replace_provider_target(provider_target(endpoint, &model, profile, deadlines));
     }
 
     fn replace_provider_deadlines(request: &mut ChatRequest, deadlines: ProviderDeadlines) {
         let endpoint = request.provider_target().sanitized_endpoint().to_string();
         let model = request.provider_target().model().to_string();
-        let metadata_mode = request.provider_target().metadata_mode();
-        let api_mode = request.provider_target().api_mode();
-        request.replace_provider_target(provider_target(
-            &endpoint,
-            &model,
-            metadata_mode,
-            api_mode,
-            deadlines,
-        ));
+        let profile = request.provider_target().profile();
+        request.replace_provider_target(provider_target(&endpoint, &model, profile, deadlines));
     }
 
     #[test]
@@ -2015,7 +1999,7 @@ mod tests {
             name: "openai-compatible-fixture-model".to_string(),
             context_window: 131_072,
             max_output_tokens: 8_192,
-            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            provider_profile: ProviderProfile::OpenAiCompatible,
             capabilities: ModelCapabilities {
                 supports_tools: true,
                 supports_reasoning: false,
@@ -2025,8 +2009,7 @@ mod tests {
         let provider = provider_target(
             "http://openai-compatible.fixture.invalid",
             &model.name,
-            model.provider_metadata_mode,
-            ProviderApiMode::ChatCompletions,
+            model.provider_profile,
             ProviderDeadlines {
                 request_timeout_ms: 30_000,
                 connect_timeout_ms: 1_000,
@@ -2056,7 +2039,7 @@ mod tests {
             name: "openai-compatible-fixture-model".to_string(),
             context_window: 131_072,
             max_output_tokens: 8_192,
-            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            provider_profile: ProviderProfile::OpenAiCompatible,
             capabilities: ModelCapabilities {
                 supports_tools: true,
                 supports_reasoning: false,
@@ -2066,8 +2049,7 @@ mod tests {
         let provider = provider_target(
             "http://openai-compatible.fixture.invalid",
             &model.name,
-            model.provider_metadata_mode,
-            ProviderApiMode::ChatCompletions,
+            model.provider_profile,
             ProviderDeadlines {
                 request_timeout_ms: 30_000,
                 connect_timeout_ms: 1_000,
@@ -2157,10 +2139,10 @@ mod tests {
     fn canonical_turn_model_identity_reaches_chat_wire_unchanged() {
         let mut config = ResolvedConfig::default();
         config.model.model = "  canonical-wire-model  ".to_string();
-        config.model.provider_api_mode = ProviderApiMode::ChatCompletions;
+        config.model.provider_profile = ProviderProfile::LmStudioChatCompletions;
         let turn = ResolvedTurnConfig::capture(config).expect("canonical turn config");
         let profile = crate::llm::model_policy::ModelPolicy::from_config(turn.runtime_config())
-            .transport_profile(turn.provider().metadata_mode());
+            .transport_profile(turn.provider().profile());
         let request = ChatRequest::new(
             turn.provider().clone(),
             profile,
@@ -2186,7 +2168,7 @@ mod tests {
             name: "openai-compatible-fixture-model".to_string(),
             context_window: 131_072,
             max_output_tokens: 131_072,
-            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            provider_profile: ProviderProfile::OpenAiCompatible,
             capabilities: ModelCapabilities {
                 supports_tools: true,
                 supports_reasoning: false,
@@ -2196,8 +2178,7 @@ mod tests {
         let provider = provider_target(
             "http://openai-compatible.fixture.invalid",
             &model.name,
-            model.provider_metadata_mode,
-            ProviderApiMode::ChatCompletions,
+            model.provider_profile,
             ProviderDeadlines {
                 request_timeout_ms: 30_000,
                 connect_timeout_ms: 1_000,
@@ -2729,6 +2710,27 @@ mod tests {
 
         assert!(!debug.contains("provider-api-key-secret"));
         assert!(debug.contains("redacted"));
+    }
+
+    #[test]
+    fn admitted_request_api_key_overrides_the_client_fallback() {
+        let mut request = responses_fixture_request(
+            "http://provider.fixture.invalid/v1",
+            vec![ModelMessage::User {
+                content: "request-scoped auth".to_string(),
+            }],
+        );
+        request.replace_api_key(Some("admitted-turn-key".to_string()));
+        let client = OpenAiCompatClient::new(Some("stale-process-key".to_string()));
+
+        let headers = client.request_headers(&request).expect("request headers");
+        let authorization = headers
+            .get("authorization")
+            .expect("authorization header")
+            .to_str()
+            .expect("header text");
+
+        assert_eq!(authorization, "Bearer admitted-turn-key");
     }
 
     #[test]
@@ -5073,7 +5075,7 @@ mod tests {
             name: "responses-fixture-model".to_string(),
             context_window: 128_000,
             max_output_tokens: 4_096,
-            provider_metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+            provider_profile: ProviderProfile::LmStudio,
             capabilities: ModelCapabilities {
                 supports_tools: true,
                 supports_reasoning: true,
@@ -5083,8 +5085,7 @@ mod tests {
         let provider = provider_target(
             base_url,
             &model.name,
-            model.provider_metadata_mode,
-            ProviderApiMode::Responses,
+            model.provider_profile,
             ProviderDeadlines {
                 request_timeout_ms: 5_000,
                 connect_timeout_ms: 1_000,
@@ -5110,7 +5111,7 @@ mod tests {
             name: "reasoning-chat-completions-fixture-model".to_string(),
             context_window: 131_072,
             max_output_tokens: 8_192,
-            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            provider_profile: ProviderProfile::OpenAiCompatible,
             capabilities: ModelCapabilities {
                 supports_tools: true,
                 supports_reasoning: true,
@@ -5120,8 +5121,7 @@ mod tests {
         let provider = provider_target(
             "http://openai-compatible.fixture.invalid",
             &model.name,
-            model.provider_metadata_mode,
-            ProviderApiMode::ChatCompletions,
+            model.provider_profile,
             ProviderDeadlines {
                 request_timeout_ms: 30_000,
                 connect_timeout_ms: 1_000,

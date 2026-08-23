@@ -4,6 +4,9 @@ import test from "node:test";
 import {
   PROVIDER_CONTEXT_AFTER,
   PROVIDER_CONTEXT_BEFORE,
+  PROVIDER_PROFILE_OPTIONS,
+  SETTINGS_PROVIDER_API_KEY_ENV,
+  SETTINGS_PROVIDER_PROFILE,
   createSettingsPreferencesScenario,
   createStablePreferencesDecision,
   dirtyCloseGuardReady,
@@ -33,13 +36,16 @@ function projection(overrides = {}) {
     config_fields: [
       { key: "model.base_url", value: "http://127.0.0.1:43111" },
       { key: "model.model", value: "moyai-e2e-scripted" },
+      { key: "model.provider_profile", value: SETTINGS_PROVIDER_PROFILE },
+      { key: "model.api_key_env", value: SETTINGS_PROVIDER_API_KEY_ENV },
       { key: "model.context_window", value: PROVIDER_CONTEXT_AFTER },
       { key: "model.max_output_tokens", value: "1024" },
       { key: "docling.enabled", value: "false" },
       { key: "docling.base_url", value: "http://127.0.0.1:43111" },
     ],
     provider_base_url: "http://127.0.0.1:43111",
-    provider_metadata_mode: "openai_compatible_only",
+    provider_profile: SETTINGS_PROVIDER_PROFILE,
+    provider_api_key_env: SETTINGS_PROVIDER_API_KEY_ENV,
     provider_context_window: PROVIDER_CONTEXT_BEFORE,
     provider_max_output_tokens: "1024",
     provider_model_ids: ["moyai-e2e-scripted"],
@@ -54,6 +60,8 @@ function cleanSurface(overrides = {}) {
     settings: {
       dialog_count: 1,
       dialog_visible: true,
+      profile: { count: 1, visible: true, enabled: true, value: SETTINGS_PROVIDER_PROFILE, options: [...PROVIDER_PROFILE_OPTIONS] },
+      api_key_env: { count: 1, visible: true, enabled: true, value: SETTINGS_PROVIDER_API_KEY_ENV },
       context: { count: 1, value: PROVIDER_CONTEXT_AFTER },
       docling: { count: 1, checked: false },
       docling_label: { count: 1, visible: false, text: "Docling を有効化" },
@@ -102,6 +110,8 @@ test("fixture binds provider and Docling to one loopback zero-request ledger", (
   const config = settingsPreferencesFixtureConfig("http://127.0.0.1:43111");
   assert.equal((config.match(/base_url = "http:\/\/127\.0\.0\.1:43111"/g) ?? []).length, 2);
   assert.match(config, /context_window = 65536/);
+  assert.match(config, /provider_profile = "openai_responses"/);
+  assert.doesNotMatch(config, /provider_(?:metadata|api)_mode/);
   assert.match(config, /\[docling\]\nenabled = false/);
   assert.match(config, /timeout_ms = 1000/);
 });
@@ -134,6 +144,8 @@ test("shell, provider, and clean Preferences predicates reject network and visib
     provider: {
       dialog_count: 1,
       dialog_visible: true,
+      profile: { count: 1, visible: true, enabled: true, value: SETTINGS_PROVIDER_PROFILE, options: [...PROVIDER_PROFILE_OPTIONS] },
+      api_key_env: { count: 1, visible: true, enabled: true, value: SETTINGS_PROVIDER_API_KEY_ENV },
       context: { count: 1, visible: true, enabled: true, value: PROVIDER_CONTEXT_BEFORE },
       save: { count: 1, visible: true, enabled: true },
       load_models: { count: 1, visible: true, enabled: true },
@@ -141,6 +153,10 @@ test("shell, provider, and clean Preferences predicates reject network and visib
     },
   });
   assert.equal(providerEditorReady(provider, []), true);
+  assert.equal(providerEditorReady({
+    ...provider,
+    provider: { ...provider.provider, profile: { ...provider.provider.profile, options: ["openai_responses"] } },
+  }, []), false);
   assert.equal(providerEditorReady({ ...provider, visible_recoverable_error_count: 1 }, []), false);
 
   const settings = cleanSurface();
@@ -189,6 +205,9 @@ test("command expectations preserve complete ordered values and exact config tar
   const providerCommand = expectedProviderGlobalSave(providerSurface);
   assert.equal(providerCommand.command, "save_provider_global");
   assert.equal(providerCommand.args.input.contextWindow, PROVIDER_CONTEXT_AFTER);
+  assert.equal(providerCommand.args.input.providerProfile, SETTINGS_PROVIDER_PROFILE);
+  assert.equal(providerCommand.args.input.apiKeyEnv, SETTINGS_PROVIDER_API_KEY_ENV);
+  assert.equal(Object.hasOwn(providerCommand.args.input, "metadataMode"), false);
   assert.deepEqual(providerCommand.args.expectedTarget, target);
   assert.equal(providerCommand.args.draftValues.find((row) => row.key === "docling.enabled").text, "false");
 

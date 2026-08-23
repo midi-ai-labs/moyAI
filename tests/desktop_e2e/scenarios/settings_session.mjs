@@ -32,6 +32,14 @@ export const SESSION_CONTEXT_AFTER = "65537";
 export const SESSION_MAX_OUTPUT_BEFORE = "";
 export const SESSION_MAX_OUTPUT_AFTER = "1025";
 export const SESSION_RESTART_STABILITY_MS = 500;
+export const SESSION_PROVIDER_PROFILE = "openai_responses";
+export const SESSION_PROVIDER_API_KEY_ENV = "";
+export const SESSION_PROVIDER_PROFILE_OPTIONS = Object.freeze([
+  "lm_studio",
+  "openai_compatible",
+  "openai_responses",
+  "lm_studio_chat_completions",
+]);
 
 const PROMPT = Object.freeze({ selector: "textarea#prompt", identity: { tag: "TEXTAREA", id: "prompt" } });
 const SEND = Object.freeze({
@@ -681,6 +689,7 @@ function validateRestoredSessionSettingsExpected(expected) {
     ["settings revision", expected?.expectedSettingsRevision],
     ["base URL", expected?.expectedBaseUrl],
     ["model", expected?.expectedModel],
+    ["provider profile", expected?.expectedProviderProfile],
     ["access mode", expected?.expectedAccessMode],
     ["prompt", expected?.expectedPrompt],
     ["response", expected?.expectedResponse],
@@ -691,6 +700,9 @@ function validateRestoredSessionSettingsExpected(expected) {
   }
   if (!/^\d+$/.test(expected.expectedSettingsRevision)) {
     throw new TypeError("restart restored panel settings revision must be decimal digits");
+  }
+  if (typeof expected?.expectedApiKeyEnv !== "string") {
+    throw new TypeError("restart restored panel API-key env must be a string");
   }
   if (!Number.isInteger(expected?.expectedResponseCount) || expected.expectedResponseCount < 0) {
     throw new TypeError("restart restored panel response count must be non-negative");
@@ -709,6 +721,7 @@ function panelFieldActual(field) {
     visible: field?.visible ?? null,
     enabled: field?.enabled ?? null,
     value: field?.value ?? null,
+    options: Array.isArray(field?.options) ? field.options : [],
   };
 }
 
@@ -737,6 +750,8 @@ export function restoredSessionSettingsPanelDecision(sample, expected) {
   const expectedFields = [
     ["base-url", "restart-panel-base-url-mismatch", panel?.base_url, required.expectedBaseUrl, sessionSettings?.base_url],
     ["model", "restart-panel-model-mismatch", panel?.model, required.expectedModel, sessionSettings?.model],
+    ["provider-profile", "restart-panel-provider-profile-mismatch", panel?.provider_profile, required.expectedProviderProfile, sessionSettings?.provider_profile, SESSION_PROVIDER_PROFILE_OPTIONS],
+    ["api-key-env", "restart-panel-api-key-env-mismatch", panel?.api_key_env, required.expectedApiKeyEnv, sessionSettings?.api_key_env],
     ["access-mode", "restart-panel-access-mode-mismatch", panel?.access_mode, required.expectedAccessMode, sessionSettings?.access_mode],
     ["context-window", "restart-panel-context-window-mismatch", panel?.context_window, SESSION_CONTEXT_AFTER, sessionSettings?.context_window],
     ["max-output-tokens", "restart-panel-max-output-tokens-mismatch", panel?.max_output_tokens, SESSION_MAX_OUTPUT_AFTER, sessionSettings?.max_output_tokens],
@@ -808,6 +823,8 @@ export function restoredSessionSettingsPanelDecision(sample, expected) {
     }, { available: sessionSettings?.available ?? null, target }),
     settingsGate("base-url-projection", "restart-restored-base-url-mismatch", sessionSettings?.base_url === required.expectedBaseUrl, required.expectedBaseUrl, sessionSettings?.base_url ?? null),
     settingsGate("model-projection", "restart-restored-model-mismatch", sessionSettings?.model === required.expectedModel, required.expectedModel, sessionSettings?.model ?? null),
+    settingsGate("provider-profile-projection", "restart-restored-provider-profile-mismatch", sessionSettings?.provider_profile === required.expectedProviderProfile, required.expectedProviderProfile, sessionSettings?.provider_profile ?? null),
+    settingsGate("api-key-env-projection", "restart-restored-api-key-env-mismatch", sessionSettings?.api_key_env === required.expectedApiKeyEnv, required.expectedApiKeyEnv, sessionSettings?.api_key_env ?? null),
     settingsGate("access-mode-projection", "restart-restored-access-mode-mismatch", sessionSettings?.access_mode === required.expectedAccessMode, required.expectedAccessMode, sessionSettings?.access_mode ?? null),
     settingsGate("context-window-projection", "restart-restored-context-window-mismatch", sessionSettings?.context_window === SESSION_CONTEXT_AFTER, SESSION_CONTEXT_AFTER, sessionSettings?.context_window ?? null),
     settingsGate("max-output-tokens-projection", "restart-restored-max-output-tokens-mismatch", sessionSettings?.max_output_tokens === SESSION_MAX_OUTPUT_AFTER, SESSION_MAX_OUTPUT_AFTER, sessionSettings?.max_output_tokens ?? null),
@@ -830,15 +847,22 @@ export function restoredSessionSettingsPanelDecision(sample, expected) {
       visible: panel?.scope_visible ?? null,
       text: panel?.scope_text ?? null,
     }),
-    ...expectedFields.map(([id, failure, field, expectedValue, projectionValue]) => settingsGate(
+    ...expectedFields.map(([id, failure, field, expectedValue, projectionValue, expectedOptions]) => settingsGate(
       `field-${id}`,
       failure,
       field?.count === 1
         && field.visible === true
         && field.enabled === true
         && field.value === expectedValue
+        && (expectedOptions === undefined || sameValue(field.options, expectedOptions))
         && projectionValue === expectedValue,
-      { count: 1, visible: true, enabled: true, value: expectedValue },
+      {
+        count: 1,
+        visible: true,
+        enabled: true,
+        value: expectedValue,
+        ...(expectedOptions === undefined ? {} : { options: expectedOptions }),
+      },
       { ...panelFieldActual(field), projection_value: projectionValue ?? null },
     )),
     settingsGate("apply-action", "restart-panel-apply-action-invalid", panel?.apply?.count === 1
@@ -934,6 +958,8 @@ export function completedSessionRootReady(surface, ledger, { prompt, response, r
     && exactSessionSettingsTriggersReady(surface)
     && projection.session_settings.base_url.length > 0
     && projection.session_settings.model.length > 0
+    && projection.session_settings.provider_profile === SESSION_PROVIDER_PROFILE
+    && projection.session_settings.api_key_env === SESSION_PROVIDER_API_KEY_ENV
     && sameValue(transcriptValues(projection, "user"), [prompt])
     && sameValue(transcriptValues(projection, "assistant"), [response])
     && surface?.visible_dialog_count === 0
@@ -971,6 +997,9 @@ export async function observeSessionSettingsSurface(cdp) {
           && !node.disabled
           && !node.readOnly,
         value: node instanceof HTMLInputElement || node instanceof HTMLSelectElement ? node.value : null,
+        options: node instanceof HTMLSelectElement
+          ? Array.from(node.options).map((option) => option.value)
+          : [],
       };
     };
     const button = (selector) => {
@@ -1026,6 +1055,8 @@ export async function observeSessionSettingsSurface(cdp) {
         scope_text: scope.node instanceof HTMLElement ? scope.node.innerText.trim() : null,
         base_url: field('base-url'),
         model: field('model'),
+        provider_profile: field('provider-profile'),
+        api_key_env: field('api-key-env'),
         access_mode: field('access-mode'),
         context_window: field('context-window'),
         max_output_tokens: field('max-output-tokens'),
@@ -1094,6 +1125,17 @@ export function sessionSettingsPanelReady(surface, {
     && surface.panel.model.count === 1
     && surface.panel.model.visible === true
     && surface.panel.model.value === projection.model
+    && projection.provider_profile === SESSION_PROVIDER_PROFILE
+    && surface.panel.provider_profile.count === 1
+    && surface.panel.provider_profile.visible === true
+    && surface.panel.provider_profile.enabled === true
+    && surface.panel.provider_profile.value === projection.provider_profile
+    && sameValue(surface.panel.provider_profile.options, SESSION_PROVIDER_PROFILE_OPTIONS)
+    && projection.api_key_env === SESSION_PROVIDER_API_KEY_ENV
+    && surface.panel.api_key_env.count === 1
+    && surface.panel.api_key_env.visible === true
+    && surface.panel.api_key_env.enabled === true
+    && surface.panel.api_key_env.value === projection.api_key_env
     && surface.panel.access_mode.count === 1
     && surface.panel.access_mode.visible === true
     && surface.panel.access_mode.value === projection.access_mode
@@ -1131,6 +1173,9 @@ export function sessionSettingsDirtyGuardReady(surface, expectedTarget) {
     && surface?.panel?.count === 1
     && surface.panel.visible === true
     && surface.panel.inert === true
+    && surface.panel.provider_profile.value === SESSION_PROVIDER_PROFILE
+    && sameValue(surface.panel.provider_profile.options, SESSION_PROVIDER_PROFILE_OPTIONS)
+    && surface.panel.api_key_env.value === SESSION_PROVIDER_API_KEY_ENV
     && surface.panel.context_window.value === SESSION_CONTEXT_BEFORE
     && surface.panel.max_output_tokens.value === SESSION_MAX_OUTPUT_AFTER
     && surface.panel.apply.enabled === true
@@ -1156,6 +1201,8 @@ export function expectedSessionSettingsApplyCommand(surface) {
       input: {
         baseUrl: panel.base_url.value,
         model: panel.model.value,
+        providerProfile: panel.provider_profile.value,
+        apiKeyEnv: panel.api_key_env.value,
         accessMode: panel.access_mode.value,
         contextWindow: panel.context_window.value,
         maxOutputTokens: panel.max_output_tokens.value,
@@ -1549,6 +1596,8 @@ export function restartedSessionSettingsCloseDecision(
     }, { available: projection?.session_settings?.available ?? null, target }),
     settingsGate("restored-values", "restart-close-restored-values-drift", projection?.session_settings?.base_url === required.expectedBaseUrl
       && projection?.session_settings?.model === required.expectedModel
+      && projection?.session_settings?.provider_profile === required.expectedProviderProfile
+      && projection?.session_settings?.api_key_env === required.expectedApiKeyEnv
       && projection?.session_settings?.access_mode === required.expectedAccessMode
       && projection?.session_settings?.context_window === SESSION_CONTEXT_AFTER
       && projection?.session_settings?.max_output_tokens === SESSION_MAX_OUTPUT_AFTER
@@ -1556,6 +1605,8 @@ export function restartedSessionSettingsCloseDecision(
       && projection?.session_settings?.max_output_tokens_inherited === false, {
       base_url: required.expectedBaseUrl,
       model: required.expectedModel,
+      provider_profile: required.expectedProviderProfile,
+      api_key_env: required.expectedApiKeyEnv,
       access_mode: required.expectedAccessMode,
       context_window: SESSION_CONTEXT_AFTER,
       max_output_tokens: SESSION_MAX_OUTPUT_AFTER,
@@ -2053,6 +2104,8 @@ export function createSettingsSessionScenario() {
           expectedSettingsRevision: alphaAppliedTarget.settingsRevision,
           expectedBaseUrl: provider.baseUrl,
           expectedModel: SCRIPTED_PROVIDER_MODEL_ID,
+          expectedProviderProfile: SESSION_PROVIDER_PROFILE,
+          expectedApiKeyEnv: SESSION_PROVIDER_API_KEY_ENV,
           expectedAccessMode: "default",
           expectedPrompt: SESSION_ROOT_ALPHA_PROMPT,
           expectedResponse: SESSION_ROOT_ALPHA_RESPONSE,

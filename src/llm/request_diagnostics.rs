@@ -214,7 +214,7 @@ mod tests {
 
     use super::*;
     use crate::config::model::{ProviderApiMode, ProviderReasoningCapability};
-    use crate::config::{ProviderDeadlines, ProviderMetadataMode, ProviderTarget};
+    use crate::config::{ProviderDeadlines, ProviderProfile, ProviderTarget};
     use crate::llm::{ModelCapabilities, ModelMessage, ModelProfile, ModelToolCall};
 
     #[test]
@@ -382,11 +382,15 @@ mod tests {
     }
 
     fn request(api_mode: ProviderApiMode, messages: Vec<ModelMessage>) -> ChatRequest {
+        let provider_profile = match api_mode {
+            ProviderApiMode::ChatCompletions => ProviderProfile::OpenAiCompatible,
+            ProviderApiMode::Responses => ProviderProfile::OpenAiResponses,
+        };
         let model = ModelProfile {
             name: "wire-diagnostics-model".to_string(),
             context_window: 131_072,
             max_output_tokens: 8_192,
-            provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+            provider_profile,
             capabilities: ModelCapabilities {
                 supports_tools: true,
                 supports_reasoning: true,
@@ -396,8 +400,7 @@ mod tests {
         let provider = ProviderTarget::new(
             "http://provider.fixture.invalid/v1",
             &model.name,
-            model.provider_metadata_mode,
-            api_mode,
+            model.provider_profile,
             ProviderDeadlines {
                 request_timeout_ms: 30_000,
                 connect_timeout_ms: 1_000,

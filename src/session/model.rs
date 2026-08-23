@@ -4,7 +4,9 @@ use std::fmt;
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{AccessMode, ShellFamily};
+use crate::config::{
+    AccessMode, ModelConfig, ProviderEndpoint, ProviderProfile, ResolvedConfig, ShellFamily,
+};
 use crate::protocol::{
     HistoryItem, ModelResponseId, TurnId, TurnInterruptionCause, TurnItem, TurnTerminalOutcome,
 };
@@ -105,6 +107,10 @@ pub struct SessionRecord {
     pub access_mode: AccessMode,
     #[serde(default)]
     pub model_parameters: SessionModelParameters,
+    // The durable connection can contain custom-header credentials. Public
+    // SessionRecord serialization must never project that storage-only value.
+    #[serde(default, skip_serializing)]
+    pub provider_connection: Option<SessionProviderConnection>,
     #[serde(default)]
     pub session_settings_revision: u64,
     pub created_at_ms: i64,
@@ -125,6 +131,7 @@ impl fmt::Debug for SessionRecord {
             .field("base_url", &"<redacted provider endpoint>")
             .field("access_mode", &self.access_mode)
             .field("model_parameters", &self.model_parameters)
+            .field("provider_connection", &self.provider_connection)
             .field("session_settings_revision", &self.session_settings_revision)
             .field("created_at_ms", &self.created_at_ms)
             .field("updated_at_ms", &self.updated_at_ms)
@@ -158,6 +165,125 @@ pub struct SessionModelParameters {
     pub max_output_tokens: Option<u32>,
 }
 
+/// The credential-safe provider connection identity captured by a durable session.
+///
+/// `api_key_env` stores only an environment-variable name. Header values are persisted because
+/// they are part of the provider request contract, but Debug output never renders them.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionProviderConnection {
+    pub profile: ProviderProfile,
+    pub api_key_env: Option<String>,
+    pub extra_headers: BTreeMap<String, String>,
+}
+
+impl SessionProviderConnection {
+    pub fn from_model_config(model: &ModelConfig) -> Self {
+        Self {
+            profile: model.provider_profile,
+            api_key_env: model
+                .api_key_env
+                .as_deref()
+                .map(str::trim)
+                .map(ToString::to_string),
+            extra_headers: model.extra_headers.clone(),
+        }
+    }
+
+    pub fn apply_to_model_config(&self, model: &mut ModelConfig) {
+        model.provider_profile = self.profile;
+        model.api_key_env.clone_from(&self.api_key_env);
+        model.extra_headers.clone_from(&self.extra_headers);
+    }
+
+    pub(crate) fn without_credentials(&self) -> Self {
+        Self {
+            profile: self.profile,
+            api_key_env: None,
+            extra_headers: BTreeMap::new(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let canonical_api_key_env =
+            crate::config::canonical_api_key_env_name(self.api_key_env.as_deref())?;
+        if canonical_api_key_env != self.api_key_env {
+            return Err(
+                "provider connection API-key environment variable name is not canonical"
+                    .to_string(),
+            );
+        }
+        for (name, value) in &self.extra_headers {
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                format!("provider connection contains invalid header name `{name}`")
+            })?;
+            reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+                format!("provider connection contains an invalid value for header `{name}`")
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for SessionProviderConnection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionProviderConnection")
+            .field("profile", &self.profile)
+            .field("api_key_env", &self.api_key_env)
+            .field("extra_header_count", &self.extra_headers.len())
+            .finish()
+    }
+}
+
+/// Resolves one durable session over the current global baseline without
+/// forwarding credentials to an unbound legacy endpoint.
+pub fn resolved_config_for_session(
+    global: &ResolvedConfig,
+    session: &SessionRecord,
+) -> ResolvedConfig {
+    let mut effective = global.clone();
+    let endpoint_changed = match (
+        ProviderEndpoint::parse(&effective.model.base_url),
+        ProviderEndpoint::parse(&session.base_url),
+    ) {
+        (Ok(global), Ok(session)) => global != session,
+        _ => effective.model.base_url.trim() != session.base_url.trim(),
+    };
+    effective.model.base_url = session.base_url.clone();
+    effective.model.model = session.model.clone();
+    if let Some(provider_connection) = &session.provider_connection {
+        let baseline_connection = SessionProviderConnection::from_model_config(&global.model);
+        if endpoint_changed || provider_connection != &baseline_connection {
+            effective.model.extra_body_json = None;
+        }
+        provider_connection.apply_to_model_config(&mut effective.model);
+    } else {
+        // A migrated NULL snapshot has no durable claim over any credential-bearing
+        // provider state, even if its historical URL happens to match today's default.
+        effective.model.api_key_env = None;
+        effective.model.extra_headers.clear();
+        effective.model.extra_body_json = None;
+    }
+    effective.permissions.access_mode = session.access_mode;
+    if let Some(value) = session.model_parameters.context_window {
+        effective.model.context_window = value;
+    }
+    if let Some(value) = session.model_parameters.max_output_tokens {
+        effective.model.max_output_tokens = value;
+    }
+    if let Some(value) = session.model_parameters.temperature {
+        effective.model.temperature = Some(value);
+    }
+    if let Some(value) = session.model_parameters.top_p {
+        effective.model.top_p = Some(value);
+    }
+    if let Some(value) = session.model_parameters.top_k {
+        effective.model.top_k = Some(value);
+    }
+    effective
+}
+
 impl SessionModelParameters {
     pub fn is_empty(&self) -> bool {
         self.temperature.is_none()
@@ -178,6 +304,8 @@ pub struct SessionSettingsPatch {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_mode: Option<AccessMode>,
+    #[serde(default, skip_serializing)]
+    pub provider_connection: Option<SessionProviderConnection>,
     #[serde(default)]
     pub reset_model_parameters: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -206,6 +334,7 @@ impl fmt::Debug for SessionSettingsPatch {
                     .map(|_| "<redacted provider endpoint>"),
             )
             .field("access_mode", &self.access_mode)
+            .field("provider_connection", &self.provider_connection)
             .field("reset_model_parameters", &self.reset_model_parameters)
             .field("temperature", &self.temperature)
             .field("top_p", &self.top_p)
@@ -222,6 +351,7 @@ impl SessionSettingsPatch {
             && self.model.is_none()
             && self.base_url.is_none()
             && self.access_mode.is_none()
+            && self.provider_connection.is_none()
             && !self.reset_model_parameters
             && self.temperature.is_none()
             && self.top_p.is_none()
@@ -760,6 +890,8 @@ pub struct NewSession {
     pub model: String,
     pub base_url: String,
     pub access_mode: AccessMode,
+    #[serde(default, skip_serializing)]
+    pub provider_connection: Option<SessionProviderConnection>,
 }
 
 impl fmt::Debug for NewSession {
@@ -772,6 +904,7 @@ impl fmt::Debug for NewSession {
             .field("model", &self.model)
             .field("base_url", &"<redacted provider endpoint>")
             .field("access_mode", &self.access_mode)
+            .field("provider_connection", &self.provider_connection)
             .finish()
     }
 }
@@ -791,6 +924,8 @@ pub struct SessionStartRequest {
     pub model: String,
     pub base_url: String,
     pub access_mode: AccessMode,
+    #[serde(default, skip_serializing)]
+    pub provider_connection: Option<SessionProviderConnection>,
 }
 
 impl fmt::Debug for SessionStartRequest {
@@ -803,6 +938,7 @@ impl fmt::Debug for SessionStartRequest {
             .field("model", &self.model)
             .field("base_url", &"<redacted provider endpoint>")
             .field("access_mode", &self.access_mode)
+            .field("provider_connection", &self.provider_connection)
             .finish()
     }
 }
@@ -1296,6 +1432,142 @@ mod tests {
 
         assert_eq!(decoded, parameters);
         assert_eq!(decoded.context_window, Some(131_072));
+    }
+
+    #[test]
+    fn public_session_serialization_never_projects_provider_credentials() {
+        let secret = "Bearer session-provider-super-secret";
+        let session = SessionRecord {
+            id: SessionId::new(),
+            project_id: ProjectId::new(),
+            title: "credential-safe projection".to_string(),
+            status: SessionStatus::Idle,
+            cwd: Utf8PathBuf::from("C:/workspace"),
+            model: "model".to_string(),
+            base_url: "https://provider.example/v1".to_string(),
+            access_mode: AccessMode::Default,
+            model_parameters: SessionModelParameters::default(),
+            provider_connection: Some(SessionProviderConnection {
+                profile: ProviderProfile::OpenAiCompatible,
+                api_key_env: Some("PROVIDER_API_KEY".to_string()),
+                extra_headers: BTreeMap::from([("Authorization".to_string(), secret.to_string())]),
+            }),
+            session_settings_revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            completed_at_ms: None,
+        };
+
+        let value = serde_json::to_value(&session).expect("public session JSON");
+        let text = serde_json::to_string(&value).expect("public session text");
+        assert!(value.get("provider_connection").is_none());
+        assert!(!text.contains(secret));
+        assert!(!text.contains("PROVIDER_API_KEY"));
+    }
+
+    #[test]
+    fn durable_session_resolution_uses_its_exact_provider_snapshot_and_model_settings() {
+        let mut global = ResolvedConfig::default();
+        global.model.base_url = "https://global.example/v1".to_string();
+        global.model.model = "global-model".to_string();
+        global.model.provider_profile = ProviderProfile::OpenAiResponses;
+        global.model.api_key_env = Some("GLOBAL_API_KEY".to_string());
+        global.model.extra_headers = BTreeMap::from([(
+            "Authorization".to_string(),
+            "Bearer global-secret".to_string(),
+        )]);
+        let session = SessionRecord {
+            id: SessionId::new(),
+            project_id: ProjectId::new(),
+            title: "bound provider".to_string(),
+            status: SessionStatus::Idle,
+            cwd: Utf8PathBuf::from("C:/workspace"),
+            model: "session-model".to_string(),
+            base_url: "https://session.example/v1".to_string(),
+            access_mode: AccessMode::FullAccess,
+            model_parameters: SessionModelParameters {
+                temperature: Some(0.2),
+                top_p: Some(0.8),
+                top_k: Some(40),
+                context_window: Some(131_072),
+                max_output_tokens: Some(8_192),
+            },
+            provider_connection: Some(SessionProviderConnection {
+                profile: ProviderProfile::OpenAiCompatible,
+                api_key_env: Some("SESSION_API_KEY".to_string()),
+                extra_headers: BTreeMap::from([(
+                    "X-Session-Key".to_string(),
+                    "session-secret".to_string(),
+                )]),
+            }),
+            session_settings_revision: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            completed_at_ms: None,
+        };
+
+        let effective = resolved_config_for_session(&global, &session);
+
+        assert_eq!(effective.model.base_url, session.base_url);
+        assert_eq!(effective.model.model, session.model);
+        assert_eq!(
+            effective.model.provider_profile,
+            ProviderProfile::OpenAiCompatible
+        );
+        assert_eq!(
+            effective.model.api_key_env.as_deref(),
+            Some("SESSION_API_KEY")
+        );
+        assert_eq!(
+            effective
+                .model
+                .extra_headers
+                .get("X-Session-Key")
+                .map(String::as_str),
+            Some("session-secret")
+        );
+        assert_eq!(effective.model.context_window, 131_072);
+        assert_eq!(effective.model.max_output_tokens, 8_192);
+        assert_eq!(effective.permissions.access_mode, AccessMode::FullAccess);
+    }
+
+    #[test]
+    fn migrated_unbound_session_never_inherits_credentials_for_another_endpoint() {
+        let mut global = ResolvedConfig::default();
+        global.model.base_url = "https://global.example/v1".to_string();
+        global.model.provider_profile = ProviderProfile::OpenAiResponses;
+        global.model.api_key_env = Some("GLOBAL_API_KEY".to_string());
+        global.model.extra_headers = BTreeMap::from([(
+            "Authorization".to_string(),
+            "Bearer global-secret".to_string(),
+        )]);
+        let session = SessionRecord {
+            id: SessionId::new(),
+            project_id: ProjectId::new(),
+            title: "migrated session".to_string(),
+            status: SessionStatus::Idle,
+            cwd: Utf8PathBuf::from("C:/workspace"),
+            model: "legacy-model".to_string(),
+            base_url: "https://legacy.example/v1".to_string(),
+            access_mode: AccessMode::Default,
+            model_parameters: SessionModelParameters::default(),
+            provider_connection: None,
+            session_settings_revision: 0,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            completed_at_ms: None,
+        };
+
+        let effective = resolved_config_for_session(&global, &session);
+
+        assert_eq!(effective.model.base_url, session.base_url);
+        assert_eq!(
+            effective.model.provider_profile,
+            ProviderProfile::OpenAiResponses
+        );
+        assert_eq!(effective.model.api_key_env, None);
+        assert!(effective.model.extra_headers.is_empty());
+        assert_eq!(effective.model.extra_body_json, None);
     }
 
     #[test]

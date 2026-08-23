@@ -29,7 +29,8 @@ use crate::app::{
 use crate::cli::{ConfirmationPrompt, EventRenderer};
 use crate::config::model::PartialResolvedConfig;
 use crate::config::{
-    ModelConfig, ResolvedConfig, ResolvedTurnConfig, merge::apply_patch as apply_config_patch,
+    ModelConfig, ProviderEndpoint, ResolvedConfig, ResolvedTurnConfig,
+    merge::apply_patch as apply_config_patch,
 };
 use crate::error::{AgentError, AppRunError, RuntimeError};
 use crate::harness::{HarnessRecordingSink, NativeHarnessRecorder};
@@ -48,7 +49,7 @@ use crate::runtime::{
 use crate::session::{
     ActiveTurnExpectation, AdmissionId, DispatchTransformKind,
     ExactExecutionInterruptRequestOutcome, ExactRootExecutionValidation, ImagePart,
-    PromptDispatchPart, RunSummary, SessionModelParameters, SessionRecord, SessionRepository,
+    PromptDispatchPart, RunSummary, SessionProviderConnection, SessionRecord, SessionRepository,
     SessionSelector, SessionSettingsPatch, SessionStartRequest, SessionStatus,
     ThreadGoalClearResult, ThreadGoalGetResult, ThreadGoalSetResult, ThreadGoalStatus,
     validate_thread_goal_objective,
@@ -1206,6 +1207,9 @@ impl RunService {
                     model: effective_config.model.model.clone(),
                     base_url: effective_config.model.base_url.clone(),
                     access_mode: effective_config.permissions.access_mode,
+                    provider_connection: Some(SessionProviderConnection::from_model_config(
+                        &effective_config.model,
+                    )),
                 },
                 self.workspace.clone(),
             )
@@ -2078,6 +2082,7 @@ impl RunService {
                         model: request.model,
                         base_url: request.base_url,
                         access_mode: request.access_mode,
+                        provider_connection: request.provider_connection,
                         reset_model_parameters: request.reset_model_parameters,
                         temperature: request.temperature,
                         top_p: request.top_p,
@@ -2323,6 +2328,7 @@ fn session_settings_request_is_access_only(request: &SessionSettingsUpdateReques
         && request.cwd.is_none()
         && request.model.is_none()
         && request.base_url.is_none()
+        && request.provider_connection.is_none()
         && !request.reset_model_parameters
         && request.temperature.is_none()
         && request.top_p.is_none()
@@ -2876,7 +2882,11 @@ async fn durable_run_summary_for_turn(
     Ok(terminal.map(|terminal| RunSummary::from_terminal(session_id, protocol_turn_id, terminal)))
 }
 
-fn apply_session_model_parameters(model: &mut ModelConfig, parameters: &SessionModelParameters) {
+#[cfg(test)]
+fn apply_session_model_parameters(
+    model: &mut ModelConfig,
+    parameters: &crate::session::SessionModelParameters,
+) {
     if let Some(value) = parameters.temperature {
         model.temperature = Some(value);
     }
@@ -2908,24 +2918,41 @@ fn compose_run_effective_config(
 ) -> ResolvedConfig {
     let mut effective_config = base_config;
     if let Some(session_settings) = session_settings {
-        effective_config.model.model = session_settings.model.clone();
-        effective_config.model.base_url = session_settings.base_url.clone();
-        apply_session_model_parameters(
-            &mut effective_config.model,
-            &session_settings.model_parameters,
-        );
-        effective_config.permissions.access_mode = session_settings.access_mode;
+        effective_config =
+            crate::session::resolved_config_for_session(&effective_config, session_settings);
     }
     if let Some(patch) = config_override {
         effective_config = apply_config_patch(effective_config, patch);
     }
     if !request_base_url.trim().is_empty() {
+        clear_inherited_provider_credentials_for_endpoint_change(
+            &mut effective_config.model,
+            request_base_url,
+        );
         effective_config.model.base_url = request_base_url.to_string();
     }
     if !request_model.trim().is_empty() {
         effective_config.model.model = request_model.to_string();
     }
     effective_config
+}
+
+fn clear_inherited_provider_credentials_for_endpoint_change(
+    model: &mut ModelConfig,
+    next_base_url: &str,
+) {
+    let same_endpoint = match (
+        ProviderEndpoint::parse(&model.base_url),
+        ProviderEndpoint::parse(next_base_url),
+    ) {
+        (Ok(current), Ok(next)) => current == next,
+        _ => model.base_url.trim() == next_base_url.trim(),
+    };
+    if !same_endpoint {
+        model.api_key_env = None;
+        model.extra_headers.clear();
+        model.extra_body_json = None;
+    }
 }
 
 fn materialize_run_config(
@@ -2960,7 +2987,7 @@ fn app_session_model_parameters_override_runtime_config_fixture_passes() -> bool
     };
     apply_session_model_parameters(
         &mut model,
-        &SessionModelParameters {
+        &crate::session::SessionModelParameters {
             temperature: Some(0.2),
             top_p: Some(0.8),
             top_k: Some(40),
@@ -2991,7 +3018,8 @@ fn app_config_override_wins_over_session_settings_fixture_passes() -> bool {
         model: "session-model".to_string(),
         base_url: "http://session:1234".to_string(),
         access_mode: crate::config::AccessMode::FullAccess,
-        model_parameters: SessionModelParameters {
+        provider_connection: None,
+        model_parameters: crate::session::SessionModelParameters {
             temperature: Some(0.2),
             top_p: Some(0.8),
             top_k: Some(40),
@@ -3042,7 +3070,8 @@ fn app_session_settings_remain_when_request_override_is_empty_fixture_passes() -
         model: "session-model".to_string(),
         base_url: "http://session:1234".to_string(),
         access_mode: crate::config::AccessMode::FullAccess,
-        model_parameters: SessionModelParameters::default(),
+        provider_connection: None,
+        model_parameters: crate::session::SessionModelParameters::default(),
         session_settings_revision: 0,
         created_at_ms: 1,
         updated_at_ms: 1,
@@ -3629,11 +3658,12 @@ mod tests {
     use base64::Engine as _;
     use camino::Utf8PathBuf;
 
-    use crate::config::model::{ProviderApiMode, ReasoningEffort};
-    use crate::config::{ProviderMetadataMode, ResolvedConfig, ResolvedTurnConfig};
+    use crate::config::model::ReasoningEffort;
+    use crate::config::{ProviderProfile, ResolvedConfig, ResolvedTurnConfig};
     use crate::protocol::{ModeKind, ProtocolEventStore};
     use crate::session::{
-        AdmissionId, NewSession, ProjectId, ProjectRepository, SessionRepository, ThreadGoalStatus,
+        AdmissionId, NewSession, ProjectId, ProjectRepository, SessionProviderConnection,
+        SessionRepository, ThreadGoalStatus,
     };
     use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
 
@@ -3664,6 +3694,7 @@ mod tests {
             cwd: None,
             model: None,
             base_url: None,
+            provider_connection: None,
             access_mode: Some(crate::config::AccessMode::AutoReview),
             reset_model_parameters: false,
             temperature: None,
@@ -3678,6 +3709,19 @@ mod tests {
             ..access_only.clone()
         };
         assert!(!super::session_settings_request_is_access_only(&combined));
+
+        let provider_update = super::SessionSettingsUpdateRequest {
+            base_url: Some("https://provider.example/v1".to_string()),
+            provider_connection: Some(SessionProviderConnection {
+                profile: ProviderProfile::OpenAiCompatible,
+                api_key_env: Some("PROVIDER_KEY".to_string()),
+                extra_headers: Default::default(),
+            }),
+            ..access_only.clone()
+        };
+        assert!(!super::session_settings_request_is_access_only(
+            &provider_update
+        ));
 
         let no_access = super::SessionSettingsUpdateRequest {
             access_mode: None,
@@ -3987,6 +4031,141 @@ mod tests {
     }
 
     #[test]
+    fn layered_endpoint_changes_never_forward_unowned_provider_credentials() {
+        let mut base = ResolvedConfig::default();
+        base.model.base_url = "https://provider-a.example/v1".to_string();
+        base.model.provider_profile = ProviderProfile::OpenAiCompatible;
+        base.model.api_key_env = Some("PROVIDER_A_KEY".to_string());
+        base.model.extra_headers = std::collections::BTreeMap::from([(
+            "Authorization".to_string(),
+            "Bearer provider-a-secret".to_string(),
+        )]);
+        base.model.extra_body_json = Some(serde_json::json!({"api_key": "provider-a-body-secret"}));
+        let legacy_session = crate::session::SessionRecord {
+            id: crate::session::SessionId::new(),
+            project_id: crate::session::ProjectId::new(),
+            title: "legacy".to_string(),
+            status: crate::session::SessionStatus::Idle,
+            cwd: Utf8PathBuf::from("C:/workspace"),
+            model: "legacy-model".to_string(),
+            base_url: "https://provider-b.example/v1".to_string(),
+            access_mode: crate::config::AccessMode::Default,
+            model_parameters: Default::default(),
+            provider_connection: None,
+            session_settings_revision: 0,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            completed_at_ms: None,
+        };
+
+        let legacy =
+            super::compose_run_effective_config(base.clone(), Some(&legacy_session), None, "", "");
+        assert_eq!(
+            legacy.model.provider_profile,
+            ProviderProfile::OpenAiCompatible
+        );
+        assert_eq!(legacy.model.api_key_env, None);
+        assert!(legacy.model.extra_headers.is_empty());
+        assert_eq!(legacy.model.extra_body_json, None);
+
+        let partial_override = super::compose_run_effective_config(
+            base.clone(),
+            None,
+            Some(crate::config::model::PartialResolvedConfig {
+                model: Some(crate::config::model::PartialModelConfig {
+                    base_url: Some("https://provider-c.example/v1".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            "",
+            "",
+        );
+        assert_eq!(partial_override.model.api_key_env, None);
+        assert!(partial_override.model.extra_headers.is_empty());
+        assert_eq!(partial_override.model.extra_body_json, None);
+
+        let atomic_override = super::compose_run_effective_config(
+            base.clone(),
+            None,
+            Some(
+                crate::cli::ProviderConnectionOverrideArgs {
+                    base_url: Some("https://provider-c.example/v1".to_string()),
+                    provider_profile: Some(ProviderProfile::OpenAiResponses),
+                    api_key_env: Some("PROVIDER_C_KEY".to_string()),
+                }
+                .config_patch()
+                .expect("atomic provider patch"),
+            ),
+            "",
+            "",
+        );
+        assert_eq!(
+            atomic_override.model.provider_profile,
+            ProviderProfile::OpenAiResponses
+        );
+        assert_eq!(
+            atomic_override.model.api_key_env.as_deref(),
+            Some("PROVIDER_C_KEY")
+        );
+        assert!(atomic_override.model.extra_headers.is_empty());
+        assert_eq!(atomic_override.model.extra_body_json, None);
+
+        let request_override = super::compose_run_effective_config(
+            base,
+            None,
+            None,
+            "",
+            "https://provider-d.example/v1",
+        );
+        assert_eq!(request_override.model.api_key_env, None);
+        assert!(request_override.model.extra_headers.is_empty());
+        assert_eq!(request_override.model.extra_body_json, None);
+    }
+
+    #[test]
+    fn explicit_session_connection_remains_bound_to_its_session_endpoint() {
+        let mut base = ResolvedConfig::default();
+        base.model.base_url = "https://provider-a.example/v1".to_string();
+        base.model.api_key_env = Some("PROVIDER_A_KEY".to_string());
+        base.model.extra_body_json = Some(serde_json::json!({"api_key": "provider-a-body-secret"}));
+        let session_connection = SessionProviderConnection {
+            profile: ProviderProfile::OpenAiResponses,
+            api_key_env: Some("PROVIDER_B_KEY".to_string()),
+            extra_headers: std::collections::BTreeMap::from([(
+                "X-Provider".to_string(),
+                "provider-b".to_string(),
+            )]),
+        };
+        let session = crate::session::SessionRecord {
+            id: crate::session::SessionId::new(),
+            project_id: crate::session::ProjectId::new(),
+            title: "bound".to_string(),
+            status: crate::session::SessionStatus::Idle,
+            cwd: Utf8PathBuf::from("C:/workspace"),
+            model: "bound-model".to_string(),
+            base_url: "https://provider-b.example/v1".to_string(),
+            access_mode: crate::config::AccessMode::Default,
+            model_parameters: Default::default(),
+            provider_connection: Some(session_connection.clone()),
+            session_settings_revision: 0,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            completed_at_ms: None,
+        };
+
+        let effective = super::compose_run_effective_config(base, Some(&session), None, "", "");
+        assert_eq!(effective.model.base_url, session.base_url);
+        assert_eq!(effective.model.provider_profile, session_connection.profile);
+        assert_eq!(effective.model.api_key_env, session_connection.api_key_env);
+        assert_eq!(
+            effective.model.extra_headers,
+            session_connection.extra_headers
+        );
+        assert_eq!(effective.model.extra_body_json, None);
+    }
+
+    #[test]
     fn review_prompt_bounds_file_inventory_and_requires_scoped_git_commands() {
         let scope = crate::workspace::ReviewScope {
             mode: crate::workspace::ReviewScopeMode::Uncommitted,
@@ -4142,6 +4321,9 @@ mod tests {
             model: config.model.model.clone(),
             base_url: config.model.base_url.clone(),
             access_mode: config.permissions.access_mode,
+            provider_connection: Some(
+                crate::session::SessionProviderConnection::from_model_config(&config.model),
+            ),
         };
         let root = run_service
             .session_service
@@ -4228,6 +4410,7 @@ mod tests {
                 model: "model".to_string(),
                 base_url: "http://localhost:1234".to_string(),
                 access_mode: crate::config::AccessMode::Default,
+                provider_connection: None,
             })
             .await
             .expect("session");
@@ -4256,6 +4439,9 @@ mod tests {
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(SessionProviderConnection::from_model_config(
+                    &config.model,
+                )),
             })
             .await
             .expect("session");
@@ -4402,6 +4588,7 @@ mod tests {
                     model: "model".to_string(),
                     base_url: "http://localhost:1234".to_string(),
                     access_mode: crate::config::AccessMode::Default,
+                    provider_connection: None,
                 })
                 .await
                 .expect("session");
@@ -4590,6 +4777,7 @@ mod tests {
                 model: "model".to_string(),
                 base_url: "http://localhost:1234".to_string(),
                 access_mode: crate::config::AccessMode::Default,
+                provider_connection: None,
             })
             .await
             .expect("session")
@@ -4664,8 +4852,7 @@ mod tests {
         let mut config = ResolvedConfig::default();
         config.model.model = "policy-error-model".to_string();
         config.model.base_url = "http://local".to_string();
-        config.model.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
-        config.model.provider_api_mode = ProviderApiMode::ChatCompletions;
+        config.model.provider_profile = ProviderProfile::OpenAiCompatible;
         config.model.chat_completions_reasoning_parameters = None;
         config.model.reasoning_effort = Some(ReasoningEffort::Medium);
         config.model.supports_reasoning = true;
@@ -4753,6 +4940,9 @@ mod tests {
                     model: config.model.model.clone(),
                     base_url: config.model.base_url.clone(),
                     access_mode: config.permissions.access_mode,
+                    provider_connection: Some(SessionProviderConnection::from_model_config(
+                        &config.model,
+                    )),
                 },
                 workspace.clone(),
             )
@@ -4768,6 +4958,9 @@ mod tests {
                     model: config.model.model.clone(),
                     base_url: config.model.base_url.clone(),
                     access_mode: config.permissions.access_mode,
+                    provider_connection: Some(SessionProviderConnection::from_model_config(
+                        &config.model,
+                    )),
                 },
                 workspace.clone(),
             )
@@ -5178,6 +5371,9 @@ mod tests {
                     model: config.model.model.clone(),
                     base_url: config.model.base_url.clone(),
                     access_mode: config.permissions.access_mode,
+                    provider_connection: Some(SessionProviderConnection::from_model_config(
+                        &config.model,
+                    )),
                 },
                 workspace.clone(),
             )
@@ -5240,6 +5436,9 @@ mod tests {
                     model: config.model.model.clone(),
                     base_url: config.model.base_url.clone(),
                     access_mode: config.permissions.access_mode,
+                    provider_connection: Some(SessionProviderConnection::from_model_config(
+                        &config.model,
+                    )),
                 },
                 workspace.clone(),
             )
@@ -5417,6 +5616,9 @@ mod tests {
                     model: config.model.model.clone(),
                     base_url: config.model.base_url.clone(),
                     access_mode: config.permissions.access_mode,
+                    provider_connection: Some(SessionProviderConnection::from_model_config(
+                        &config.model,
+                    )),
                 },
                 workspace.clone(),
             )
@@ -5816,6 +6018,7 @@ mod tests {
                     model: "model".to_string(),
                     base_url: "http://localhost:1234".to_string(),
                     access_mode: crate::config::AccessMode::Default,
+                    provider_connection: None,
                 })
                 .await
                 .expect("session");
@@ -6239,6 +6442,7 @@ mod tests {
                 model: "model".to_string(),
                 base_url: "http://localhost:1234".to_string(),
                 access_mode: crate::config::AccessMode::Default,
+                provider_connection: None,
             })
             .await
             .expect("session");

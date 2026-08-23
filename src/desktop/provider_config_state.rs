@@ -1,4 +1,4 @@
-use crate::config::{AccessMode, ProviderMetadataMode, ResolvedConfig};
+use crate::config::{AccessMode, ProviderProfile, ResolvedConfig};
 use crate::llm::{ProviderModelInfo, normalize_provider_base_url};
 
 use super::state::{
@@ -54,12 +54,14 @@ pub struct DesktopProviderConfigState {
     pub provider_models: Vec<String>,
     pub provider_model_infos: Vec<ProviderModelInfo>,
     pub provider_selected_index: i32,
-    pub provider_metadata_mode_input: ProviderMetadataMode,
+    pub provider_profile_input: ProviderProfile,
+    pub provider_api_key_env_input: String,
     pub provider_context_window_input: String,
     pub provider_max_output_tokens_input: String,
     pub provider_selected_model_id_input: String,
     pub provider_loaded_base_url: Option<String>,
-    pub provider_loaded_metadata_mode: Option<ProviderMetadataMode>,
+    pub provider_loaded_profile: Option<ProviderProfile>,
+    pub provider_loaded_api_key_env: Option<String>,
     pub provider_status: DesktopProviderStatus,
     pub provider_loading: bool,
 }
@@ -73,13 +75,18 @@ impl DesktopProviderConfigState {
             .map(|index| index as i32)
             .unwrap_or(-1);
         let provider_model_infos = initial_provider_model_infos(&effective_config);
-        let provider_metadata_mode_input = effective_config.model.provider_metadata_mode;
+        let provider_profile_input = effective_config.model.provider_profile;
+        let provider_api_key_env_input = effective_config
+            .model
+            .api_key_env
+            .clone()
+            .unwrap_or_default();
         let provider_context_window_input = effective_config.model.context_window.to_string();
         let provider_max_output_tokens_input = effective_config.model.max_output_tokens.to_string();
         let provider_selected_model_id_input = effective_config.model.model.clone();
         let provider_status = DesktopProviderStatus::idle(
             "Provider 設定を確認できます",
-            "Base URL、mode、model を選択してセッションへ適用できます。",
+            "Connection type、Base URL、credential reference、model を選択して適用できます。",
         );
         Self {
             effective_config,
@@ -88,12 +95,14 @@ impl DesktopProviderConfigState {
             provider_models,
             provider_model_infos,
             provider_selected_index,
-            provider_metadata_mode_input,
+            provider_profile_input,
+            provider_api_key_env_input,
             provider_context_window_input,
             provider_max_output_tokens_input,
             provider_selected_model_id_input,
             provider_loaded_base_url: None,
-            provider_loaded_metadata_mode: None,
+            provider_loaded_profile: None,
+            provider_loaded_api_key_env: None,
             provider_status,
             provider_loading: false,
         }
@@ -103,7 +112,8 @@ impl DesktopProviderConfigState {
         let normalized_base_url = normalize_provider_base_url(&config.model.base_url);
         let preserve_loaded_catalog = !self.provider_loading
             && self.provider_loaded_base_url.as_deref() == Some(normalized_base_url.as_str())
-            && self.provider_loaded_metadata_mode == Some(config.model.provider_metadata_mode);
+            && self.provider_loaded_profile == Some(config.model.provider_profile)
+            && self.provider_loaded_api_key_env == config.model.api_key_env;
         let retained_models = preserve_loaded_catalog.then(|| self.provider_models.clone());
         let retained_model_infos =
             preserve_loaded_catalog.then(|| self.provider_model_infos.clone());
@@ -123,18 +133,22 @@ impl DesktopProviderConfigState {
             .position(|model| model == &config.model.model)
             .map(|index| index as i32)
             .unwrap_or(-1);
-        self.provider_metadata_mode_input = config.model.provider_metadata_mode;
+        self.provider_profile_input = config.model.provider_profile;
+        self.provider_api_key_env_input = config.model.api_key_env.clone().unwrap_or_default();
         self.provider_context_window_input = config.model.context_window.to_string();
         self.provider_max_output_tokens_input = config.model.max_output_tokens.to_string();
         self.provider_selected_model_id_input = config.model.model.clone();
         self.provider_loaded_base_url = preserve_loaded_catalog.then_some(normalized_base_url);
-        self.provider_loaded_metadata_mode =
-            preserve_loaded_catalog.then_some(config.model.provider_metadata_mode);
+        self.provider_loaded_profile =
+            preserve_loaded_catalog.then_some(config.model.provider_profile);
+        self.provider_loaded_api_key_env = preserve_loaded_catalog
+            .then(|| config.model.api_key_env.clone())
+            .flatten();
         self.provider_loading = false;
         self.provider_status = retained_status.unwrap_or_else(|| {
             DesktopProviderStatus::idle(
                 "Provider 設定を確認できます",
-                "Base URL、mode、model を選択してセッションへ適用できます。",
+                "Connection type、Base URL、credential reference、model を選択して適用できます。",
             )
         });
     }
@@ -172,8 +186,8 @@ mod tests {
         state.provider_base_url_input = state.effective_config.model.base_url.clone();
         state.provider_loaded_base_url =
             Some(normalize_provider_base_url(&state.provider_base_url_input));
-        state.provider_loaded_metadata_mode =
-            Some(state.effective_config.model.provider_metadata_mode);
+        state.provider_loaded_profile = Some(state.effective_config.model.provider_profile);
+        state.provider_loaded_api_key_env = state.effective_config.model.api_key_env.clone();
         state.set_status(
             DesktopProviderStatusKind::Success,
             "catalog loaded",
@@ -182,7 +196,8 @@ mod tests {
         );
         let generation = state.config_generation;
         let loaded_base_url = state.provider_loaded_base_url.clone();
-        let loaded_metadata_mode = state.provider_loaded_metadata_mode;
+        let loaded_profile = state.provider_loaded_profile;
+        let loaded_api_key_env = state.provider_loaded_api_key_env.clone();
         let provider_status = state.provider_status.clone();
         let model_ids = state
             .provider_model_infos
@@ -193,7 +208,8 @@ mod tests {
 
         assert_eq!(state.config_generation, generation);
         assert_eq!(state.provider_loaded_base_url, loaded_base_url);
-        assert_eq!(state.provider_loaded_metadata_mode, loaded_metadata_mode);
+        assert_eq!(state.provider_loaded_profile, loaded_profile);
+        assert_eq!(state.provider_loaded_api_key_env, loaded_api_key_env);
         assert_eq!(state.provider_status, provider_status);
         assert_eq!(
             state

@@ -1,7 +1,8 @@
 use camino::Utf8PathBuf;
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 
-use crate::config::AccessMode;
+use crate::config::model::{PartialModelConfig, PartialResolvedConfig};
+use crate::config::{AccessMode, ProviderProfile, canonical_api_key_env_name};
 use crate::error::CliUsageError;
 use crate::session::{SessionId, ThreadGoalStatus};
 
@@ -34,7 +35,7 @@ pub struct RunArgs {
     pub title: Option<String>,
     pub directory: Option<Utf8PathBuf>,
     pub model_override: Option<String>,
-    pub base_url_override: Option<String>,
+    pub provider_connection_override: ProviderConnectionOverrideArgs,
     pub output_mode: OutputMode,
     pub show_reasoning_summary: bool,
     pub review_uncommitted: bool,
@@ -43,6 +44,31 @@ pub struct RunArgs {
     pub open_tabs: Vec<Utf8PathBuf>,
     pub visible_files: Vec<Utf8PathBuf>,
     pub image_paths: Vec<Utf8PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderConnectionOverrideArgs {
+    pub base_url: Option<String>,
+    pub provider_profile: Option<ProviderProfile>,
+    pub api_key_env: Option<String>,
+}
+
+impl ProviderConnectionOverrideArgs {
+    pub fn is_empty(&self) -> bool {
+        self.base_url.is_none() && self.provider_profile.is_none() && self.api_key_env.is_none()
+    }
+
+    pub fn config_patch(&self) -> Option<PartialResolvedConfig> {
+        (!self.is_empty()).then(|| PartialResolvedConfig {
+            model: Some(PartialModelConfig {
+                base_url: self.base_url.clone(),
+                provider_profile: self.provider_profile,
+                api_key_env: self.api_key_env.clone().map(Some),
+                ..PartialModelConfig::default()
+            }),
+            ..PartialResolvedConfig::default()
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +107,7 @@ pub struct SessionSettingsArgs {
     pub session_id: SessionId,
     pub cwd: Option<Utf8PathBuf>,
     pub model: Option<String>,
-    pub base_url: Option<String>,
+    pub provider_connection_override: ProviderConnectionOverrideArgs,
     pub access_mode: Option<AccessMode>,
     pub reset_model_parameters: bool,
     pub temperature: Option<f64>,
@@ -242,7 +268,7 @@ pub struct ReplayReportArgs {
 pub struct ModelAvailabilityArgs {
     pub directory: Option<Utf8PathBuf>,
     pub model_override: Option<String>,
-    pub base_url_override: Option<String>,
+    pub provider_connection_override: ProviderConnectionOverrideArgs,
     pub output: Option<Utf8PathBuf>,
     pub require_vision: bool,
     pub openai_compatible_only: bool,
@@ -331,7 +357,11 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                 title: args.title,
                 directory: args.directory,
                 model_override: args.model_override,
-                base_url_override: args.base_url_override,
+                provider_connection_override: ProviderConnectionOverrideArgs {
+                    base_url: args.base_url_override,
+                    provider_profile: args.provider_profile,
+                    api_key_env: args.api_key_env,
+                },
                 output_mode: args.output_mode,
                 show_reasoning_summary: args.show_reasoning_summary,
                 review_uncommitted: args.review_uncommitted,
@@ -420,9 +450,15 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                 output_mode: args.output_mode,
             })),
             SessionCommand::Settings(args) => {
+                let provider_connection_override = ProviderConnectionOverrideArgs {
+                    base_url: args.base_url,
+                    provider_profile: args.provider_profile,
+                    api_key_env: args.api_key_env,
+                };
+                validate_session_provider_connection_override(&provider_connection_override)?;
                 if args.cwd.is_none()
                     && args.model.is_none()
-                    && args.base_url.is_none()
+                    && provider_connection_override.is_empty()
                     && args.access_mode.is_none()
                     && !args.reset_model_parameters
                     && args.temperature.is_none()
@@ -457,7 +493,7 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                     })?,
                     cwd: args.cwd,
                     model: args.model,
-                    base_url: args.base_url,
+                    provider_connection_override,
                     access_mode: args
                         .access_mode
                         .as_deref()
@@ -673,7 +709,11 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                 Ok(CliCommand::ModelAvailability(ModelAvailabilityArgs {
                     directory: args.directory,
                     model_override: args.model_override,
-                    base_url_override: args.base_url_override,
+                    provider_connection_override: ProviderConnectionOverrideArgs {
+                        base_url: args.base_url_override,
+                        provider_profile: args.provider_profile,
+                        api_key_env: args.api_key_env,
+                    },
                     output: args.output,
                     require_vision: args.require_vision,
                     openai_compatible_only: args.openai_compatible_only,
@@ -703,6 +743,41 @@ fn parse_cli_access_mode(value: &str) -> Result<AccessMode, CliUsageError> {
             "invalid access mode `{value}`; expected default, auto_review, or full_access"
         ))
     })
+}
+
+fn parse_cli_provider_profile(value: &str) -> Result<ProviderProfile, String> {
+    match value {
+        "lm_studio" => Ok(ProviderProfile::LmStudio),
+        "openai_compatible" => Ok(ProviderProfile::OpenAiCompatible),
+        "openai_responses" => Ok(ProviderProfile::OpenAiResponses),
+        "lm_studio_chat_completions" => Ok(ProviderProfile::LmStudioChatCompletions),
+        _ => Err(format!(
+            "invalid provider profile `{value}`; expected lm_studio, openai_compatible, openai_responses, or lm_studio_chat_completions"
+        )),
+    }
+}
+
+fn parse_cli_api_key_env(value: &str) -> Result<String, String> {
+    canonical_api_key_env_name(Some(value))?
+        .ok_or_else(|| "API-key environment-variable name must not be empty".to_string())
+}
+
+fn validate_session_provider_connection_override(
+    provider: &ProviderConnectionOverrideArgs,
+) -> Result<(), CliUsageError> {
+    if provider.provider_profile.is_some() && provider.base_url.is_none() {
+        return Err(CliUsageError::Message(
+            "session settings --provider-profile requires --base-url so the durable provider connection is atomic"
+                .to_string(),
+        ));
+    }
+    if provider.api_key_env.is_some() && provider.provider_profile.is_none() {
+        return Err(CliUsageError::Message(
+            "session settings --api-key-env requires --base-url and --provider-profile so the durable provider connection is atomic"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_cli_goal_status(value: &str) -> Result<ThreadGoalStatus, CliUsageError> {
@@ -792,6 +867,10 @@ struct RunCommand {
     model_override: Option<String>,
     #[arg(long = "base-url")]
     base_url_override: Option<String>,
+    #[arg(long = "provider-profile", value_parser = parse_cli_provider_profile)]
+    provider_profile: Option<ProviderProfile>,
+    #[arg(long = "api-key-env", value_parser = parse_cli_api_key_env)]
+    api_key_env: Option<String>,
     #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
     output_mode: OutputMode,
     #[arg(long = "show-reasoning-summary")]
@@ -941,6 +1020,10 @@ struct SessionSettingsCommand {
     model: Option<String>,
     #[arg(long = "base-url")]
     base_url: Option<String>,
+    #[arg(long = "provider-profile", value_parser = parse_cli_provider_profile)]
+    provider_profile: Option<ProviderProfile>,
+    #[arg(long = "api-key-env", value_parser = parse_cli_api_key_env)]
+    api_key_env: Option<String>,
     #[arg(long = "access-mode")]
     access_mode: Option<String>,
     #[arg(long = "reset-model-parameters")]
@@ -1132,11 +1215,19 @@ struct ModelAvailabilityCommand {
     model_override: Option<String>,
     #[arg(long = "base-url")]
     base_url_override: Option<String>,
+    #[arg(
+        long = "provider-profile",
+        value_parser = parse_cli_provider_profile,
+        conflicts_with = "openai_compatible_only"
+    )]
+    provider_profile: Option<ProviderProfile>,
+    #[arg(long = "api-key-env", value_parser = parse_cli_api_key_env)]
+    api_key_env: Option<String>,
     #[arg(long = "output")]
     output: Option<Utf8PathBuf>,
     #[arg(long = "require-vision")]
     require_vision: bool,
-    #[arg(long = "openai-compatible-only")]
+    #[arg(long = "openai-compatible-only", conflicts_with = "provider_profile")]
     openai_compatible_only: bool,
 }
 
@@ -1171,8 +1262,14 @@ impl clap::ValueEnum for OutputMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bounded_session_page_limit, parse_cli_access_mode};
-    use crate::config::AccessMode;
+    use super::{
+        ProviderConnectionOverrideArgs, RootCli, parse_bounded_session_page_limit,
+        parse_cli_access_mode, parse_cli_api_key_env, parse_cli_provider_profile,
+        validate_session_provider_connection_override,
+    };
+    use crate::config::merge::apply_patch;
+    use crate::config::{AccessMode, ProviderProfile, ResolvedConfig};
+    use clap::Parser;
 
     #[test]
     fn cli_access_mode_parser_accepts_canonical_keys_and_legacy_aliases() {
@@ -1211,5 +1308,173 @@ mod tests {
             .is_err()
         );
         assert!(parse_bounded_session_page_limit(&usize::MAX.to_string()).is_err());
+    }
+
+    #[test]
+    fn provider_connection_cli_accepts_only_canonical_profiles_and_env_names() {
+        for (value, expected) in [
+            ("lm_studio", ProviderProfile::LmStudio),
+            ("openai_compatible", ProviderProfile::OpenAiCompatible),
+            ("openai_responses", ProviderProfile::OpenAiResponses),
+            (
+                "lm_studio_chat_completions",
+                ProviderProfile::LmStudioChatCompletions,
+            ),
+        ] {
+            assert_eq!(parse_cli_provider_profile(value), Ok(expected));
+        }
+        for alias in ["openai", "responses", "lm-studio"] {
+            assert!(parse_cli_provider_profile(alias).is_err(), "{alias}");
+        }
+        assert_eq!(
+            parse_cli_api_key_env("  PROVIDER_KEY  "),
+            Ok("PROVIDER_KEY".to_string())
+        );
+        assert!(parse_cli_api_key_env("").is_err());
+        assert!(parse_cli_api_key_env("INVALID-NAME").is_err());
+    }
+
+    #[test]
+    fn provider_connection_flags_parse_on_run_session_and_availability() {
+        let run = RootCli::try_parse_from([
+            "moyai",
+            "run",
+            "--base-url",
+            "https://provider.example/v1",
+            "--provider-profile",
+            "openai_compatible",
+            "--api-key-env",
+            "PROVIDER_KEY",
+            "prompt",
+        ])
+        .expect("run provider flags");
+        let super::RootCommand::Run(run) = run.command else {
+            panic!("run command");
+        };
+        assert_eq!(
+            run.provider_profile,
+            Some(ProviderProfile::OpenAiCompatible)
+        );
+        assert_eq!(run.api_key_env.as_deref(), Some("PROVIDER_KEY"));
+
+        let session = RootCli::try_parse_from([
+            "moyai",
+            "session",
+            "settings",
+            "session-id",
+            "--base-url",
+            "https://provider.example/v1",
+            "--provider-profile",
+            "openai_responses",
+            "--api-key-env",
+            "PROVIDER_KEY",
+        ])
+        .expect("session provider flags");
+        let super::RootCommand::Session {
+            command: super::SessionCommand::Settings(session),
+        } = session.command
+        else {
+            panic!("session settings command");
+        };
+        assert_eq!(
+            session.provider_profile,
+            Some(ProviderProfile::OpenAiResponses)
+        );
+        assert_eq!(session.api_key_env.as_deref(), Some("PROVIDER_KEY"));
+
+        let availability = RootCli::try_parse_from([
+            "moyai",
+            "model",
+            "availability",
+            "--base-url",
+            "https://provider.example/v1",
+            "--provider-profile",
+            "lm_studio_chat_completions",
+            "--api-key-env",
+            "PROVIDER_KEY",
+        ])
+        .expect("availability provider flags");
+        let super::RootCommand::Model {
+            command: super::ModelCommand::Availability(availability),
+        } = availability.command
+        else {
+            panic!("model availability command");
+        };
+        assert_eq!(
+            availability.provider_profile,
+            Some(ProviderProfile::LmStudioChatCompletions)
+        );
+        assert_eq!(availability.api_key_env.as_deref(), Some("PROVIDER_KEY"));
+    }
+
+    #[test]
+    fn provider_connection_cli_builds_one_atomic_config_patch() {
+        let mut base = ResolvedConfig::default();
+        base.model.base_url = "https://provider-a.example/v1".to_string();
+        base.model.api_key_env = Some("PROVIDER_A_KEY".to_string());
+        base.model.extra_headers.insert(
+            "Authorization".to_string(),
+            "Bearer provider-a-secret".to_string(),
+        );
+        let connection = ProviderConnectionOverrideArgs {
+            base_url: Some("https://provider-b.example/v1".to_string()),
+            provider_profile: Some(ProviderProfile::OpenAiCompatible),
+            api_key_env: Some("PROVIDER_B_KEY".to_string()),
+        };
+
+        let effective = apply_patch(base, connection.config_patch().expect("connection patch"));
+
+        assert_eq!(effective.model.base_url, "https://provider-b.example/v1");
+        assert_eq!(
+            effective.model.provider_profile,
+            ProviderProfile::OpenAiCompatible
+        );
+        assert_eq!(
+            effective.model.api_key_env.as_deref(),
+            Some("PROVIDER_B_KEY")
+        );
+        assert!(effective.model.extra_headers.is_empty());
+    }
+
+    #[test]
+    fn session_provider_cli_requires_a_complete_durable_connection_tuple() {
+        let base_only = ProviderConnectionOverrideArgs {
+            base_url: Some("https://provider.example/v1".to_string()),
+            ..ProviderConnectionOverrideArgs::default()
+        };
+        assert!(validate_session_provider_connection_override(&base_only).is_ok());
+
+        let profile_only = ProviderConnectionOverrideArgs {
+            provider_profile: Some(ProviderProfile::OpenAiCompatible),
+            ..ProviderConnectionOverrideArgs::default()
+        };
+        assert!(validate_session_provider_connection_override(&profile_only).is_err());
+
+        let key_without_profile = ProviderConnectionOverrideArgs {
+            base_url: Some("https://provider.example/v1".to_string()),
+            api_key_env: Some("PROVIDER_KEY".to_string()),
+            ..ProviderConnectionOverrideArgs::default()
+        };
+        assert!(validate_session_provider_connection_override(&key_without_profile).is_err());
+
+        let complete = ProviderConnectionOverrideArgs {
+            base_url: Some("https://provider.example/v1".to_string()),
+            provider_profile: Some(ProviderProfile::OpenAiCompatible),
+            api_key_env: Some("PROVIDER_KEY".to_string()),
+        };
+        assert!(validate_session_provider_connection_override(&complete).is_ok());
+    }
+
+    #[test]
+    fn canonical_availability_profile_conflicts_with_the_legacy_flag() {
+        let conflict = RootCli::try_parse_from([
+            "moyai",
+            "model",
+            "availability",
+            "--provider-profile",
+            "openai_compatible",
+            "--openai-compatible-only",
+        ]);
+        assert!(conflict.is_err());
     }
 }

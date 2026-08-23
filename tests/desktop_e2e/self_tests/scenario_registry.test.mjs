@@ -12,6 +12,10 @@ const case52Options = Object.freeze({
   expected_main_variant: "example/main@q6",
   expected_side_variant: "example/side@q4",
 });
+const liveProviderOptions = Object.freeze({
+  provider_base_url: "http://192.0.2.10:8119/v1",
+  model: "example/Qwen-27B",
+});
 
 test("one registry binds every reusable scenario to the common runner contract", () => {
   assert.deepEqual(scenarioIds, [
@@ -19,6 +23,7 @@ test("one registry binds every reusable scenario to the common runner contract",
     "agent.interrupt",
     "input.pointer-keyboard",
     "manual.case5_2",
+    "manual.provider-openai-compatible",
     "native-dialog.cancel",
     "prompt-review.cancel",
     "provider.restart",
@@ -29,7 +34,12 @@ test("one registry binds every reusable scenario to the common runner contract",
     "run.stop",
   ]);
   for (const id of scenarioIds) {
-    const scenario = createScenario(id, id === "manual.case5_2" ? case52Options : {});
+    const options = id === "manual.case5_2"
+      ? case52Options
+      : id === "manual.provider-openai-compatible"
+        ? liveProviderOptions
+        : {};
+    const scenario = createScenario(id, options);
     assert.equal(scenario.id, id);
     for (const method of ["prepare", "execute", "requestGracefulExit", "quiesce", "cleanup"]) {
       assert.equal(typeof scenario[method], "function", `${id}.${method}`);
@@ -44,6 +54,14 @@ test("one registry binds every reusable scenario to the common runner contract",
   assert.notEqual(createScenario("run.stop"), createScenario("run.stop"));
   assert.notEqual(createScenario("agent.interrupt"), createScenario("agent.interrupt"));
   assert.notEqual(createScenario("manual.case5_2", case52Options), createScenario("manual.case5_2", case52Options));
+  assert.notEqual(
+    createScenario("manual.provider-openai-compatible", liveProviderOptions),
+    createScenario("manual.provider-openai-compatible", liveProviderOptions),
+  );
+  assert.throws(
+    () => createScenario("manual.provider-openai-compatible"),
+    /provider_base_url must be a non-empty string/,
+  );
   assert.throws(() => createScenario("run-95"), /unknown Desktop E2E scenario/);
   assert.throws(
     () => createScenario("shell.baseline", { ignored: true }),

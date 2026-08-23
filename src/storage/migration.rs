@@ -120,6 +120,8 @@ const V58_EXACT_EXECUTION_INTERRUPT_REQUESTS: &str =
     include_str!("../../migrations/V58__exact_execution_interrupt_requests.sql");
 const V59_SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW: &str =
     include_str!("../../migrations/V59__session_settings_revision_and_context_window.sql");
+const V60_PROVIDER_CONNECTION_PROFILES: &str =
+    include_str!("../../migrations/V60__provider_connection_profiles.sql");
 const LEGACY_PLANNER_CUTOVER_VERSION: i64 = 32;
 const CANONICAL_PROTOCOL_STORAGE_VERSION: i64 = 33;
 const DROP_SESSIONS_MEMORY_MODE_VERSION: i64 = 34;
@@ -148,6 +150,7 @@ const ROLLBACK_HARNESS_ORPHAN_RECOVERY_VERSION: i64 = 56;
 const SESSION_ADMISSION_REVISIONS_VERSION: i64 = 57;
 const EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION: i64 = 58;
 const SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION: i64 = 59;
+const PROVIDER_CONNECTION_PROFILES_VERSION: i64 = 60;
 const CODEX_COMPACTION_CHECKPOINT_NAME: &str = "codex_compaction_checkpoint";
 const RECURSIVE_SESSION_SPAWN_EDGES_NAME: &str = "recursive_session_spawn_edges";
 const AGENT_OWNER_RESUME_REQUESTS_NAME: &str = "agent_owner_resume_requests";
@@ -163,6 +166,7 @@ const SESSION_ADMISSION_REVISIONS_NAME: &str = "session_admission_revisions";
 const EXACT_EXECUTION_INTERRUPT_REQUESTS_NAME: &str = "exact_execution_interrupt_requests";
 const SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_NAME: &str =
     "session_settings_revision_and_context_window";
+const PROVIDER_CONNECTION_PROFILES_NAME: &str = "provider_connection_profiles";
 const COMPACTION_CHECKPOINT_MIGRATION_PAGE_SIZE: usize = 200;
 const SESSION_STATUS_DOMAIN: &[&str] = &["idle", "running", "completed", "cancelled", "failed"];
 const SESSION_ACCESS_MODE_DOMAIN: &[&str] = &["default", "auto_review", "full_access"];
@@ -184,6 +188,27 @@ const TOOL_CALL_STATUS_DOMAIN: &[&str] = &[
 ];
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
+    if schema_migration_applied(connection, PROVIDER_CONNECTION_PROFILES_VERSION)? {
+        validate_canonical_protocol_schema(connection)?;
+        validate_durable_agent_mailbox_data(connection)?;
+        validate_durable_turn_input_queue_data(connection)?;
+        validate_harness_turn_identity_schema(connection)?;
+        validate_harness_turn_identity_data(connection)?;
+        validate_agent_trigger_turn_claims_schema(connection)?;
+        validate_agent_trigger_turn_claims_data(connection)?;
+        validate_permission_retry_fences_schema(connection)?;
+        validate_permission_retry_fences_data(connection)?;
+        validate_provider_connection_profiles_schema(connection)?;
+        validate_provider_connection_profiles_data(connection)?;
+        validate_rollback_harness_orphan_recovery_marker(connection)?;
+        validate_session_admission_revisions_schema(connection)?;
+        validate_session_admission_revisions_data(connection)?;
+        validate_exact_execution_interrupt_requests_schema(connection)?;
+        validate_exact_execution_interrupt_requests_data(connection)?;
+        validate_session_settings_revision_and_context_window_schema(connection)?;
+        validate_session_settings_revision_and_context_window_data(connection)?;
+        return Ok(());
+    }
     if schema_migration_applied(
         connection,
         SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION,
@@ -206,7 +231,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         validate_exact_execution_interrupt_requests_data(connection)?;
         validate_session_settings_revision_and_context_window_schema(connection)?;
         validate_session_settings_revision_and_context_window_data(connection)?;
-        return Ok(());
+        return run_provider_connection_profiles(connection);
     }
     if schema_migration_applied(connection, EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION)? {
         validate_canonical_protocol_schema(connection)?;
@@ -547,17 +572,14 @@ pub(crate) fn run_to_current(connection: &Connection) -> Result<(), StorageError
     // Recent migrations deliberately validate and commit one authority boundary at a time.
     // A product startup is nevertheless one user-visible migration attempt, so keep advancing
     // until the current endpoint is present instead of requiring one app restart per version.
-    for _ in 0..=SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION {
+    for _ in 0..=PROVIDER_CONNECTION_PROFILES_VERSION {
         run(connection)?;
-        if schema_migration_applied(
-            connection,
-            SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION,
-        )? {
+        if schema_migration_applied(connection, PROVIDER_CONNECTION_PROFILES_VERSION)? {
             return Ok(());
         }
     }
     Err(StorageError::Message(format!(
-        "storage migration did not reach current endpoint V{SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION}"
+        "storage migration did not reach current endpoint V{PROVIDER_CONNECTION_PROFILES_VERSION}"
     )))
 }
 
@@ -1703,6 +1725,51 @@ fn run_exact_execution_interrupt_requests(connection: &Connection) -> Result<(),
     }
 }
 
+fn run_provider_connection_profiles(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        validate_canonical_protocol_schema(connection)?;
+        validate_durable_side_chats_schema(connection)?;
+        validate_durable_side_chats_data(connection)?;
+        validate_session_settings_revision_and_context_window_schema(connection)?;
+        validate_session_settings_revision_and_context_window_data(connection)?;
+        if !schema_migration_applied(connection, PROVIDER_CONNECTION_PROFILES_VERSION)? {
+            connection.execute_batch(V60_PROVIDER_CONNECTION_PROFILES)?;
+        }
+        if !schema_migration_has_exact_name(
+            connection,
+            PROVIDER_CONNECTION_PROFILES_VERSION,
+            PROVIDER_CONNECTION_PROFILES_NAME,
+        )? {
+            return Err(StorageError::Message(
+                "V60 provider connection profile migration did not record its exact schema marker"
+                    .to_string(),
+            ));
+        }
+        validate_provider_connection_profiles_schema(connection)?;
+        validate_provider_connection_profiles_data(connection)?;
+        let foreign_key_errors =
+            connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        if foreign_key_errors != 0 {
+            return Err(StorageError::Message(format!(
+                "V60 provider connection profile migration produced {foreign_key_errors} foreign-key violation(s)"
+            )));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(StorageError::from),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 fn run_session_settings_revision_and_context_window(
     connection: &Connection,
 ) -> Result<(), StorageError> {
@@ -1750,7 +1817,8 @@ fn run_session_settings_revision_and_context_window(
             let _ = connection.execute_batch("ROLLBACK");
             Err(error)
         }
-    }
+    }?;
+    run_provider_connection_profiles(connection)
 }
 
 fn validate_rollback_harness_orphan_recovery_marker(
@@ -2145,6 +2213,7 @@ fn validate_session_settings_revision_and_context_window_schema(
                 .to_string(),
         ));
     }
+
     Ok(())
 }
 
@@ -2201,6 +2270,300 @@ fn validate_session_settings_revision_and_context_window_data(
         return Err(StorageError::Message(format!(
             "V59 marker exists but {invalid_rows} session setting row(s) have an invalid revision or context window"
         )));
+    }
+    Ok(())
+}
+
+fn validate_provider_connection_profiles_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    if !schema_migration_has_exact_name(
+        connection,
+        DURABLE_SIDE_CHATS_VERSION,
+        DURABLE_SIDE_CHATS_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V60 storage has a V55 side-chat marker other than `{DURABLE_SIDE_CHATS_NAME}`"
+        )));
+    }
+    if !schema_migration_has_exact_name(
+        connection,
+        PROVIDER_CONNECTION_PROFILES_VERSION,
+        PROVIDER_CONNECTION_PROFILES_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V60 provider connection profile marker has a name other than `{PROVIDER_CONNECTION_PROFILES_NAME}`"
+        )));
+    }
+    let column = connection
+        .query_row(
+            "SELECT type, \"notnull\", dflt_value, pk
+             FROM pragma_table_info('sessions')
+             WHERE name = 'provider_connection_json'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    if column != Some(("TEXT".to_string(), 0, None, 0)) {
+        return Err(StorageError::Message(
+            "V60 marker exists but sessions.provider_connection_json has stale schema".to_string(),
+        ));
+    }
+
+    let expected_connection = canonical_provider_connection_profiles_connection()?;
+    let expected_clause =
+        canonical_provider_connection_profiles_schema_clause(&expected_connection)?;
+    let observed_tables = normalized_named_schema_objects(connection, "table", "sessions")?;
+    if !observed_tables
+        .get("sessions")
+        .is_some_and(|sql| sql.contains(&expected_clause))
+    {
+        return Err(StorageError::Message(
+            "V60 marker exists but sessions.provider_connection_json has stale CHECK constraints"
+                .to_string(),
+        ));
+    }
+
+    let expected_session_triggers = normalized_named_schema_objects(
+        &expected_connection,
+        "trigger",
+        "validate_session_provider_connection_%",
+    )?;
+    let observed_session_triggers = normalized_named_schema_objects(
+        connection,
+        "trigger",
+        "validate_session_provider_connection_%",
+    )?;
+    if observed_session_triggers != expected_session_triggers {
+        return Err(StorageError::Message(
+            "V60 marker exists but session provider-connection validation triggers have stale SQL"
+                .to_string(),
+        ));
+    }
+
+    let expected_side_chats =
+        normalized_schema_objects_for_table(&expected_connection, "side_chat_bindings")?;
+    let observed_side_chats =
+        normalized_schema_objects_for_table(connection, "side_chat_bindings")?;
+    if observed_side_chats != expected_side_chats {
+        return Err(StorageError::Message(
+            "V60 marker exists but side_chat_bindings does not own the canonical provider-profile schema"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_provider_connection_profiles_connection() -> Result<Connection, StorageError> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE sessions (
+             id TEXT PRIMARY KEY,
+             project_id TEXT NOT NULL,
+             status TEXT NOT NULL,
+             model_name TEXT NOT NULL,
+             base_url TEXT NOT NULL,
+             active_run_id TEXT,
+             active_turn_id TEXT,
+             active_run_lease_expires_at_ms INTEGER
+         );
+         CREATE TABLE session_spawn_edges (
+             root_session_id TEXT NOT NULL,
+             parent_session_id TEXT NOT NULL,
+             child_session_id TEXT NOT NULL
+         );
+         CREATE TABLE protocol_history_items (
+             id TEXT PRIMARY KEY,
+             session_id TEXT NOT NULL,
+             turn_id TEXT,
+             payload_json TEXT NOT NULL
+         );
+         CREATE TABLE protocol_item_append_order (
+             append_position INTEGER PRIMARY KEY,
+             session_id TEXT NOT NULL,
+             source_kind TEXT NOT NULL,
+             source_id TEXT NOT NULL
+         );
+         CREATE TABLE moyai_schema_migrations (
+             version INTEGER PRIMARY KEY NOT NULL,
+             name TEXT NOT NULL
+         );",
+    )?;
+    connection.execute_batch(V55_DURABLE_SIDE_CHATS)?;
+    connection.execute_batch(V60_PROVIDER_CONNECTION_PROFILES)?;
+    Ok(connection)
+}
+
+fn canonical_provider_connection_profiles_schema_clause(
+    connection: &Connection,
+) -> Result<String, StorageError> {
+    let tables = normalized_named_schema_objects(connection, "table", "sessions")?;
+    let sql = tables.get("sessions").ok_or_else(|| {
+        StorageError::Message("canonical V60 sessions table was not created".to_string())
+    })?;
+    let start = sql.find("provider_connection_json").ok_or_else(|| {
+        StorageError::Message(
+            "canonical V60 sessions table lacks provider_connection_json".to_string(),
+        )
+    })?;
+    sql[start..]
+        .strip_suffix(')')
+        .map(str::trim_end)
+        .map(ToString::to_string)
+        .ok_or_else(|| StorageError::Message("canonical V60 sessions table has stale SQL".into()))
+}
+
+fn validate_provider_connection_profiles_data(connection: &Connection) -> Result<(), StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id, provider_connection_json
+         FROM sessions
+         WHERE provider_connection_json IS NOT NULL
+         ORDER BY id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (session_id, json) = row?;
+        let value = serde_json::from_str::<serde_json::Value>(&json).map_err(|_| {
+            StorageError::Message(format!(
+                "V60 session `{session_id}` has malformed provider connection JSON"
+            ))
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            StorageError::Message(format!(
+                "V60 session `{session_id}` provider connection must be a JSON object"
+            ))
+        })?;
+        if object.len() != 3
+            || !object.contains_key("profile")
+            || !object.contains_key("api_key_env")
+            || !object.contains_key("extra_headers")
+        {
+            return Err(StorageError::Message(format!(
+                "V60 session `{session_id}` provider connection has missing or unknown fields"
+            )));
+        }
+        let provider_connection =
+            serde_json::from_value::<crate::session::SessionProviderConnection>(value).map_err(
+                |error| {
+                    StorageError::Message(format!(
+                        "V60 session `{session_id}` provider connection does not match the typed contract: {error}"
+                    ))
+                },
+            )?;
+        provider_connection.validate().map_err(|message| {
+            StorageError::Message(format!(
+                "V60 session `{session_id}` has an invalid provider connection: {message}"
+            ))
+        })?;
+    }
+
+    let invalid_side_chats = connection.query_row(
+        "SELECT COUNT(*)
+         FROM side_chat_bindings AS binding
+         LEFT JOIN sessions AS owner ON owner.id = binding.owner_session_id
+         LEFT JOIN sessions AS conversation
+           ON conversation.id = binding.conversation_session_id
+         WHERE owner.id IS NULL
+            OR conversation.id IS NULL
+            OR binding.owner_session_id = binding.conversation_session_id
+            OR owner.project_id <> conversation.project_id
+            OR conversation.model_name <> binding.model
+            OR conversation.base_url <> binding.base_url
+            OR json_extract(conversation.provider_connection_json, '$.profile')
+                 IS NOT binding.provider_profile
+            OR json_type(conversation.provider_connection_json, '$.api_key_env') <> 'null'
+            OR json_type(conversation.provider_connection_json, '$.extra_headers') <> 'object'
+            OR EXISTS (
+                SELECT 1
+                FROM json_each(conversation.provider_connection_json, '$.extra_headers')
+            )
+            OR EXISTS (
+                SELECT 1 FROM side_chat_bindings AS parent_binding
+                WHERE parent_binding.conversation_session_id = binding.owner_session_id
+            )
+            OR EXISTS (
+                SELECT 1 FROM session_spawn_edges AS edge
+                WHERE edge.root_session_id = binding.conversation_session_id
+                   OR edge.parent_session_id = binding.conversation_session_id
+                   OR edge.child_session_id = binding.conversation_session_id
+            )
+            OR binding.context_scope <> 'general'
+            OR binding.context_window <= 0
+            OR binding.context_window > 4294967295
+            OR binding.max_output_tokens <= 0
+            OR binding.max_output_tokens > 4294967295
+            OR binding.request_timeout_ms <= 0
+            OR binding.connect_timeout_ms <= 0
+            OR binding.max_retries < 0
+            OR binding.max_retries > 255
+            OR binding.supports_images NOT IN (0, 1)
+            OR binding.supports_tools NOT IN (0, 1)
+            OR binding.supports_reasoning NOT IN (0, 1)
+            OR length(CAST(binding.persisted_draft AS BLOB)) > 1048576
+            OR binding.draft_revision < 0
+            OR binding.request_generation < 0
+            OR binding.delete_requested_at_ms < 0
+            OR binding.created_at_ms < 0
+            OR binding.updated_at_ms < binding.created_at_ms",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_side_chats != 0 {
+        return Err(StorageError::Message(format!(
+            "V60 marker exists but {invalid_side_chats} side chat binding row(s) violate canonical ownership, provider-profile, or revision constraints"
+        )));
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT id, owner_session_id, conversation_session_id, provider_profile
+         FROM side_chat_bindings",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, owner_session_id, conversation_session_id, profile) = row?;
+        id.parse::<crate::storage::SideChatId>().map_err(|error| {
+            StorageError::Message(format!(
+                "V60 side chat binding has invalid id `{id}`: {error}"
+            ))
+        })?;
+        owner_session_id
+            .parse::<crate::session::SessionId>()
+            .map_err(|error| {
+                StorageError::Message(format!(
+                    "V60 side chat binding has invalid owner session id `{owner_session_id}`: {error}"
+                ))
+            })?;
+        conversation_session_id
+            .parse::<crate::session::SessionId>()
+            .map_err(|error| {
+                StorageError::Message(format!(
+                    "V60 side chat binding has invalid conversation session id `{conversation_session_id}`: {error}"
+                ))
+            })?;
+        if crate::config::ProviderProfile::parse(&profile)
+            .is_none_or(|parsed| parsed.as_str() != profile)
+        {
+            return Err(StorageError::Message(format!(
+                "V60 side chat binding `{id}` has invalid provider profile `{profile}`"
+            )));
+        }
     }
     Ok(())
 }
@@ -14182,6 +14545,16 @@ mod tests {
             .expect("V57 endpoint");
     }
 
+    fn run_through_exact_v59_endpoint(connection: &Connection) {
+        run_through_exact_v57_endpoint(connection);
+        connection
+            .execute_batch(V58_EXACT_EXECUTION_INTERRUPT_REQUESTS)
+            .expect("V58 endpoint");
+        connection
+            .execute_batch(V59_SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW)
+            .expect("V59 endpoint");
+    }
+
     fn insert_v56_session(connection: &Connection) -> String {
         let session_id = crate::session::SessionId::new().to_string();
         insert_v56_session_with_id(connection, &session_id);
@@ -14208,6 +14581,63 @@ mod tests {
                 params![session_id, project_id],
             )
             .expect("V56 session");
+    }
+
+    fn insert_v59_side_chat(
+        connection: &Connection,
+        provider_metadata_mode: &str,
+        provider_api_mode: &str,
+    ) -> (String, String, String) {
+        let project_id = crate::session::ProjectId::new().to_string();
+        let owner_id = crate::session::SessionId::new().to_string();
+        let conversation_id = crate::session::SessionId::new().to_string();
+        let binding_id = crate::storage::SideChatId::new().to_string();
+        connection
+            .execute(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'v60', 'none', 1, 1)",
+                params![project_id, format!("C:/v60/{project_id}")],
+            )
+            .expect("V60 fixture project");
+        for session_id in [&owner_id, &conversation_id] {
+            connection
+                .execute(
+                    "INSERT INTO sessions
+                     (id, project_id, title, status, cwd_path, model_name, base_url,
+                      access_mode, model_parameters_json,
+                      created_at_ms, updated_at_ms, completed_at_ms)
+                     VALUES (?1, ?2, 'session', 'idle', 'C:/v60', 'qwen',
+                             'http://localhost:8119/v1', 'default', '{}', 1, 1, NULL)",
+                    params![session_id, project_id],
+                )
+                .expect("V60 fixture session");
+        }
+        connection
+            .execute(
+                "INSERT INTO side_chat_bindings (
+                     id, owner_session_id, conversation_session_id,
+                     base_url, model, provider_metadata_mode, provider_api_mode,
+                     context_window, max_output_tokens,
+                     request_timeout_ms, connect_timeout_ms, max_retries,
+                     supports_images, supports_tools, supports_reasoning,
+                     persisted_draft, draft_revision, request_generation, context_scope,
+                     created_at_ms, updated_at_ms
+                 ) VALUES (
+                     ?1, ?2, ?3, 'http://localhost:8119/v1', 'qwen', ?4, ?5,
+                     65536, 8192, 60000, 5000, 1,
+                     0, 1, 1, '', 0, 0, 'general', 2, 2
+                 )",
+                params![
+                    binding_id,
+                    owner_id,
+                    conversation_id,
+                    provider_metadata_mode,
+                    provider_api_mode,
+                ],
+            )
+            .expect("V59 side chat fixture");
+        (owner_id, conversation_id, binding_id)
     }
 
     fn insert_v58_running_root(connection: &Connection) -> (String, String, String, i64) {
@@ -15757,8 +16187,8 @@ mod tests {
             )
             .expect("V55 marker")
         );
-        validate_durable_side_chats_schema(&connection).expect("exact V55 schema");
-        validate_durable_side_chats_data(&connection).expect("valid V55 data");
+        validate_provider_connection_profiles_schema(&connection).expect("exact current schema");
+        validate_provider_connection_profiles_data(&connection).expect("valid current data");
         assert!(foreign_key_violations(&connection).is_empty());
     }
 
@@ -15898,8 +16328,8 @@ mod tests {
             )
             .expect("V55 marker")
         );
-        validate_durable_side_chats_schema(&connection).expect("exact V55 schema");
-        validate_durable_side_chats_data(&connection).expect("valid V55 data");
+        validate_provider_connection_profiles_schema(&connection).expect("exact current schema");
+        validate_provider_connection_profiles_data(&connection).expect("valid current data");
         assert!(foreign_key_violations(&connection).is_empty());
     }
 
@@ -16952,6 +17382,262 @@ mod tests {
         assert!(
             error.to_string().contains("stale CHECK constraints"),
             "unexpected V59 schema error: {error}"
+        );
+    }
+
+    #[test]
+    fn v60_maps_all_legacy_side_chat_provider_pairs_and_preserves_unbound_roots() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v59_endpoint(&connection);
+        let cases = [
+            ("lm_studio_native_required", "responses", "lm_studio"),
+            (
+                "openai_compatible_only",
+                "chat_completions",
+                "openai_compatible",
+            ),
+            ("openai_compatible_only", "responses", "openai_responses"),
+            (
+                "lm_studio_native_required",
+                "chat_completions",
+                "lm_studio_chat_completions",
+            ),
+        ];
+        let mut fixtures = Vec::new();
+        for (metadata_mode, api_mode, expected_profile) in cases {
+            let (owner_id, conversation_id, binding_id) =
+                insert_v59_side_chat(&connection, metadata_mode, api_mode);
+            fixtures.push((owner_id, conversation_id, binding_id, expected_profile));
+        }
+
+        run(&connection).expect("V59 to V60 migration");
+        run(&connection).expect("idempotent V60 reopen");
+
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                PROVIDER_CONNECTION_PROFILES_VERSION,
+                PROVIDER_CONNECTION_PROFILES_NAME,
+            )
+            .expect("V60 marker")
+        );
+        for (owner_id, conversation_id, binding_id, expected_profile) in fixtures {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT provider_profile FROM side_chat_bindings WHERE id = ?1",
+                        [&binding_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .expect("migrated binding profile"),
+                expected_profile
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT json_extract(provider_connection_json, '$.profile'),
+                                json_type(provider_connection_json, '$.api_key_env'),
+                                (SELECT COUNT(*)
+                                 FROM json_each(provider_connection_json, '$.extra_headers'))
+                         FROM sessions WHERE id = ?1",
+                        [&conversation_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        },
+                    )
+                    .expect("migrated hidden connection"),
+                (expected_profile.to_string(), "null".to_string(), 0)
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT provider_connection_json IS NULL FROM sessions WHERE id = ?1",
+                        [&owner_id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .expect("legacy owner connection"),
+                true,
+                "ordinary pre-V60 roots must remain explicitly unbound"
+            );
+        }
+        validate_provider_connection_profiles_schema(&connection).expect("canonical V60 schema");
+        validate_provider_connection_profiles_data(&connection).expect("canonical V60 data");
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v60_reopen_rejects_malformed_unknown_and_invalid_provider_snapshots() {
+        let corruptions = [
+            "{",
+            r#"{"profile":"openai_compatible","api_key_env":null,"extra_headers":{},"future":true}"#,
+            r#"{"profile":"openai_compatible","api_key_env":"INVALID-NAME","extra_headers":{}}"#,
+            r#"{"profile":"openai_compatible","api_key_env":null,"extra_headers":{"bad header":"value"}}"#,
+        ];
+        for corruption in corruptions {
+            let connection = Connection::open_in_memory().expect("database");
+            connection
+                .pragma_update(None, "foreign_keys", "ON")
+                .expect("foreign keys");
+            run_to_current(&connection).expect("fresh V60 schema");
+            let session_id = insert_v56_session(&connection);
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = ON")
+                .expect("enable corruption fixture");
+            connection
+                .execute(
+                    "UPDATE sessions SET provider_connection_json = ?2 WHERE id = ?1",
+                    params![session_id, corruption],
+                )
+                .expect("inject invalid provider snapshot");
+            connection
+                .execute_batch("PRAGMA ignore_check_constraints = OFF")
+                .expect("restore constraints");
+
+            let error = run(&connection).expect_err("invalid provider snapshot must fail closed");
+            assert!(
+                error.to_string().contains("provider connection"),
+                "unexpected V60 data audit error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn v60_write_boundary_rejects_non_text_custom_header_values() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_to_current(&connection).expect("fresh V60 schema");
+        let session_id = insert_v56_session(&connection);
+
+        let error = connection
+            .execute(
+                "UPDATE sessions SET provider_connection_json = ?2 WHERE id = ?1",
+                params![
+                    &session_id,
+                    r#"{"profile":"openai_compatible","api_key_env":null,"extra_headers":{"Authorization":7}}"#
+                ],
+            )
+            .expect_err("numeric custom-header value must fail with constraints enabled");
+
+        assert!(
+            error
+                .to_string()
+                .contains("custom-header values must be JSON strings")
+        );
+        assert!(
+            connection
+                .query_row(
+                    "SELECT provider_connection_json IS NULL FROM sessions WHERE id = ?1",
+                    [session_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .expect("preserved provider snapshot")
+        );
+    }
+
+    #[test]
+    fn v60_reopen_rejects_provider_profile_trigger_tampering() {
+        let connection = Connection::open_in_memory().expect("database");
+        run_to_current(&connection).expect("fresh V60 schema");
+        connection
+            .execute_batch("DROP TRIGGER validate_side_chat_binding_before_update")
+            .expect("tamper V60 provider transition trigger");
+
+        let error = run(&connection).expect_err("stale V60 schema must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("canonical provider-profile schema"),
+            "unexpected V60 schema audit error: {error}"
+        );
+
+        let session_trigger_connection = Connection::open_in_memory().expect("database");
+        run_to_current(&session_trigger_connection).expect("fresh V60 schema");
+        session_trigger_connection
+            .execute_batch(
+                "DROP TRIGGER validate_session_provider_connection_headers_before_update",
+            )
+            .expect("tamper V60 session provider trigger");
+
+        let session_trigger_error = run(&session_trigger_connection)
+            .expect_err("stale V60 session provider trigger must fail closed");
+        assert!(
+            session_trigger_error
+                .to_string()
+                .contains("provider-connection validation triggers"),
+            "unexpected V60 session trigger schema error: {session_trigger_error}"
+        );
+    }
+
+    #[test]
+    fn v60_invalid_legacy_provider_pair_rolls_back_atomically() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v59_endpoint(&connection);
+        let (_, _, binding_id) =
+            insert_v59_side_chat(&connection, "lm_studio_native_required", "responses");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("enable legacy corruption fixture");
+        connection
+            .execute(
+                "UPDATE side_chat_bindings
+                 SET provider_metadata_mode = 'unknown_catalog'
+                 WHERE id = ?1",
+                [&binding_id],
+            )
+            .expect("inject unmappable legacy provider pair");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore constraints");
+
+        run(&connection).expect_err("unmappable legacy pair must roll back V60");
+        assert!(
+            !schema_migration_applied(&connection, PROVIDER_CONNECTION_PROFILES_VERSION)
+                .expect("V60 marker absence")
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('sessions')
+                     WHERE name = 'provider_connection_json'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("rolled-back connection column"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('side_chat_bindings')
+                     WHERE name = 'provider_metadata_mode'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("legacy side-chat column retained"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('side_chat_bindings')
+                     WHERE name = 'provider_profile'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("new side-chat column absent"),
+            0
         );
     }
 }

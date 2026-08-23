@@ -14,9 +14,7 @@ use tokio_util::sync::CancellationToken;
 use super::*;
 use crate::agent::{AgentLoop, PromptBuilder};
 use crate::cli::{ConfirmationPrompt, OutputMode, ReviewDecision};
-use crate::config::{
-    AccessMode, MultiAgentMode, ProviderApiMode, ProviderMetadataMode, ResolvedConfig,
-};
+use crate::config::{AccessMode, MultiAgentMode, ProviderProfile, ResolvedConfig};
 use crate::error::{CliPromptError, LlmError};
 use crate::llm::{
     ChatRequest, LlmClient, LlmEvent, LlmEventSink, LlmResponseSummary, ModelMessage,
@@ -528,6 +526,9 @@ async fn direct_runtime_fixture(
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             workspace,
         )
@@ -866,6 +867,9 @@ async fn retained_agent_session(
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             root_session.workspace.clone(),
         )
@@ -2074,6 +2078,9 @@ async fn child_finish_fixture_with_capacity(
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             root_session.workspace.clone(),
         )
@@ -3028,6 +3035,7 @@ async fn nested_completion_handoff_targets_only_the_immediate_parent_without_res
                 model: child.session.model.clone(),
                 base_url: child.session.base_url.clone(),
                 access_mode: child.session.access_mode,
+                provider_connection: child.session.provider_connection.clone(),
             },
             child.workspace.clone(),
         )
@@ -3452,6 +3460,7 @@ async fn rehydrated_child_followup_uses_current_root_config_and_workspace() {
             model: "persisted-old-child-model".to_string(),
             base_url: config.model.base_url.clone(),
             access_mode: AccessMode::Default,
+            provider_connection: None,
         })
         .await
         .expect("child session");
@@ -3591,6 +3600,9 @@ async fn root_broker_is_per_execution_and_quiescent_tree_keeps_immutable_limits(
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             workspace,
         )
@@ -3860,6 +3872,9 @@ async fn process_host_survives_app_swap_across_running_pending_and_awaiting_stat
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             first.workspace.clone(),
         )
@@ -3894,6 +3909,9 @@ async fn process_host_survives_app_swap_across_running_pending_and_awaiting_stat
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             first.workspace.clone(),
         )
@@ -3948,6 +3966,9 @@ async fn process_host_survives_app_swap_across_running_pending_and_awaiting_stat
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             first.workspace.clone(),
         )
@@ -4069,6 +4090,9 @@ async fn process_host_survives_app_swap_across_running_pending_and_awaiting_stat
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             rebuilt.workspace.clone(),
         )
@@ -4123,6 +4147,9 @@ async fn process_restart_rehydrates_unclaimed_initial_task_as_one_pending_execut
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             root_session.workspace.clone(),
         )
@@ -4221,6 +4248,9 @@ async fn process_restart_runs_nested_pending_target_without_resuming_parent() {
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             root_session.workspace.clone(),
         )
@@ -4236,6 +4266,9 @@ async fn process_restart_runs_nested_pending_target_without_resuming_parent() {
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             root_session.workspace.clone(),
         )
@@ -4349,6 +4382,9 @@ async fn process_restart_rehydrates_durable_child_for_listing_followup_and_name_
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             root_session.workspace.clone(),
         )
@@ -4376,6 +4412,9 @@ async fn process_restart_rehydrates_durable_child_for_listing_followup_and_name_
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             root_session.workspace.clone(),
         )
@@ -4688,6 +4727,9 @@ async fn durable_activity_projection_restores_three_completed_paths_tasks_and_re
                     model: config.model.model.clone(),
                     base_url: config.model.base_url.clone(),
                     access_mode: config.permissions.access_mode,
+                    provider_connection: Some(
+                        crate::session::SessionProviderConnection::from_model_config(&config.model),
+                    ),
                 },
                 root_session.workspace.clone(),
             )
@@ -4835,6 +4877,9 @@ async fn durable_cancelled_projection_uses_the_canonical_typed_cause() {
                     model: config.model.model.clone(),
                     base_url: config.model.base_url.clone(),
                     access_mode: config.permissions.access_mode,
+                    provider_connection: Some(
+                        crate::session::SessionProviderConnection::from_model_config(&config.model),
+                    ),
                 },
                 root_session.workspace.clone(),
             )
@@ -4891,6 +4936,9 @@ async fn durable_running_projection_carries_the_exact_active_turn_from_its_statu
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             root_session.workspace.clone(),
         )
@@ -4956,6 +5004,9 @@ async fn nested_unbound_launch_retains_one_atomically_settled_failed_grandchild(
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             session.workspace.clone(),
         )
@@ -5389,9 +5440,12 @@ async fn commit_atomic_child_trigger_without_launch(
         project_id: caller.workspace.project_id,
         title: task_name.to_string(),
         cwd: caller.workspace.cwd.clone(),
-        model: child_config.model.model,
-        base_url: child_config.model.base_url,
+        model: child_config.model.model.clone(),
+        base_url: child_config.model.base_url.clone(),
         access_mode: child_config.permissions.access_mode,
+        provider_connection: Some(
+            crate::session::SessionProviderConnection::from_model_config(&child_config.model),
+        ),
     };
     let initial_task = InterAgentCommunication {
         author: caller.path.to_string(),
@@ -5923,6 +5977,9 @@ async fn pending_init_child_accepts_mail_before_durable_admission() {
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             root_session.workspace.clone(),
         )
@@ -6158,6 +6215,9 @@ async fn completed_root_exact_stop_is_rejected_before_explicit_tree_stop() {
                 model: config.model.model.clone(),
                 base_url: config.model.base_url.clone(),
                 access_mode: config.permissions.access_mode,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             workspace,
         )
@@ -7477,8 +7537,7 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
     let mut config = ResolvedConfig::default();
     config.model.model = "scripted".to_string();
     config.model.base_url = base_url.clone();
-    config.model.provider_api_mode = ProviderApiMode::ChatCompletions;
-    config.model.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+    config.model.provider_profile = ProviderProfile::OpenAiCompatible;
     config.model.supports_tools = true;
     config.model.connect_timeout_ms = 2_000;
     config.model.request_timeout_ms = 5_000;
@@ -7537,6 +7596,9 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
                 model: "scripted".to_string(),
                 base_url: base_url.clone(),
                 access_mode: AccessMode::FullAccess,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             workspace.clone(),
         )
@@ -7596,6 +7658,9 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
                 model: "scripted".to_string(),
                 base_url: base_url.clone(),
                 access_mode: AccessMode::FullAccess,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             workspace,
         )
@@ -7683,8 +7748,7 @@ async fn goal_less_root_terminal_does_not_implicitly_resume_for_detached_child()
     let mut config = ResolvedConfig::default();
     config.model.model = "scripted".to_string();
     config.model.base_url = base_url.clone();
-    config.model.provider_api_mode = ProviderApiMode::ChatCompletions;
-    config.model.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+    config.model.provider_profile = ProviderProfile::OpenAiCompatible;
     config.model.supports_tools = true;
     config.model.connect_timeout_ms = 2_000;
     config.model.request_timeout_ms = 5_000;
@@ -7715,6 +7779,9 @@ async fn goal_less_root_terminal_does_not_implicitly_resume_for_detached_child()
                 model: config.model.model.clone(),
                 base_url: base_url.clone(),
                 access_mode: AccessMode::FullAccess,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             workspace.clone(),
         )
@@ -7895,8 +7962,7 @@ async fn root_terminal_is_not_recalled_or_rewritten_by_late_child_interrupt() {
     let mut config = ResolvedConfig::default();
     config.model.model = "scripted".to_string();
     config.model.base_url = base_url.clone();
-    config.model.provider_api_mode = ProviderApiMode::ChatCompletions;
-    config.model.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+    config.model.provider_profile = ProviderProfile::OpenAiCompatible;
     config.model.supports_tools = true;
     config.model.connect_timeout_ms = 2_000;
     config.model.request_timeout_ms = 5_000;
@@ -7927,6 +7993,9 @@ async fn root_terminal_is_not_recalled_or_rewritten_by_late_child_interrupt() {
                 model: config.model.model.clone(),
                 base_url: base_url.clone(),
                 access_mode: AccessMode::FullAccess,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             workspace.clone(),
         )
@@ -8071,8 +8140,7 @@ async fn idle_goal_continuation_uses_explicit_wait_agent_for_detached_child() {
     let mut config = ResolvedConfig::default();
     config.model.model = "scripted".to_string();
     config.model.base_url = base_url.clone();
-    config.model.provider_api_mode = ProviderApiMode::ChatCompletions;
-    config.model.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+    config.model.provider_profile = ProviderProfile::OpenAiCompatible;
     config.model.supports_tools = true;
     config.model.connect_timeout_ms = 2_000;
     config.model.request_timeout_ms = 5_000;
@@ -8103,6 +8171,9 @@ async fn idle_goal_continuation_uses_explicit_wait_agent_for_detached_child() {
                 model: config.model.model.clone(),
                 base_url: base_url.clone(),
                 access_mode: AccessMode::FullAccess,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             workspace.clone(),
         )
@@ -8267,8 +8338,7 @@ async fn proactive_nested_owner_explicitly_waits_and_keeps_tool_parity() {
     let mut config = ResolvedConfig::default();
     config.model.model = "scripted".to_string();
     config.model.base_url = base_url.clone();
-    config.model.provider_api_mode = ProviderApiMode::ChatCompletions;
-    config.model.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+    config.model.provider_profile = ProviderProfile::OpenAiCompatible;
     config.model.supports_tools = true;
     config.model.supports_reasoning = true;
     config.model.supports_images = false;
@@ -8303,6 +8373,9 @@ async fn proactive_nested_owner_explicitly_waits_and_keeps_tool_parity() {
                 model: "scripted".to_string(),
                 base_url: base_url.clone(),
                 access_mode: AccessMode::FullAccess,
+                provider_connection: Some(
+                    crate::session::SessionProviderConnection::from_model_config(&config.model),
+                ),
             },
             workspace.clone(),
         )

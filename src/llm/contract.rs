@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::model::ProviderApiMode;
 use crate::config::model::{ProviderReasoningCapability, ReasoningEffort, ReasoningSummary};
-use crate::config::{ProviderMetadataMode, ProviderTarget};
+use crate::config::{ProviderProfile, ProviderTarget};
 use crate::error::{LlmError, ProviderRequestLimit};
 use crate::session::{FinishReason, TokenUsage};
 
@@ -29,7 +29,7 @@ pub struct ModelProfile {
     pub context_window: u32,
     pub max_output_tokens: u32,
     #[serde(default)]
-    pub provider_metadata_mode: ProviderMetadataMode,
+    pub provider_profile: ProviderProfile,
     pub capabilities: ModelCapabilities,
 }
 
@@ -128,6 +128,7 @@ pub struct ChatRequest {
     pub(crate) reasoning_capability: ProviderReasoningCapability,
     pub(crate) tool_choice: Option<ProviderToolChoice>,
     pub(crate) parallel_tool_calls: bool,
+    api_key: Option<String>,
     extra_headers: BTreeMap<String, String>,
     pub(crate) temperature: Option<f64>,
     pub(crate) top_p: Option<f64>,
@@ -152,6 +153,7 @@ impl fmt::Debug for ChatRequest {
             .field("reasoning_capability", &self.reasoning_capability)
             .field("tool_choice", &self.tool_choice)
             .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("extra_headers", &"<redacted>")
             .field("temperature", &self.temperature)
             .field("top_p", &self.top_p)
@@ -279,6 +281,7 @@ impl ChatRequest {
             reasoning_capability,
             tool_choice: None,
             parallel_tool_calls: false,
+            api_key: None,
             extra_headers,
             temperature: None,
             top_p: None,
@@ -297,6 +300,14 @@ impl ChatRequest {
 
     pub(crate) fn extra_headers(&self) -> &BTreeMap<String, String> {
         &self.extra_headers
+    }
+
+    pub(crate) fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    pub(crate) fn replace_api_key(&mut self, api_key: Option<String>) {
+        self.api_key = api_key;
     }
 
     #[cfg(test)]
@@ -330,11 +341,11 @@ impl ChatRequest {
                 self.provider.model()
             )));
         }
-        if self.model.provider_metadata_mode != self.provider.metadata_mode() {
+        if self.model.provider_profile != self.provider.profile() {
             return Err(LlmError::Message(format!(
-                "ChatRequest model profile metadata mode {:?} does not match canonical provider target mode {:?}",
-                self.model.provider_metadata_mode,
-                self.provider.metadata_mode()
+                "ChatRequest model provider profile {:?} does not match canonical provider target profile {:?}",
+                self.model.provider_profile,
+                self.provider.profile()
             )));
         }
         self.validate_request_envelope_shape()?;
@@ -754,11 +765,11 @@ mod tests {
         validate_responses_reasoning_request, validate_toolless_text_response,
     };
     use crate::config::model::{
-        ChatCompletionsReasoningParameters, ProviderApiMode, ProviderReasoningCapability,
-        ReasoningEffort, ReasoningSummary,
+        ChatCompletionsReasoningParameters, ProviderReasoningCapability, ReasoningEffort,
+        ReasoningSummary,
     };
     use crate::config::{
-        ProviderDeadlines, ProviderMetadataMode, ProviderRequestLimits, ProviderTarget,
+        ProviderDeadlines, ProviderProfile, ProviderRequestLimits, ProviderTarget,
     };
     use crate::error::{LlmError, ProviderRequestLimit};
     use crate::session::FinishReason;
@@ -768,8 +779,7 @@ mod tests {
         let provider = ProviderTarget::new(
             "http://lm-studio.local:1234/v1",
             "fixture-model",
-            ProviderMetadataMode::OpenAiCompatibleOnly,
-            ProviderApiMode::Responses,
+            ProviderProfile::OpenAiResponses,
             ProviderDeadlines {
                 request_timeout_ms: 10_000,
                 connect_timeout_ms: 1_000,
@@ -783,7 +793,7 @@ mod tests {
                 name: "fixture-model".to_string(),
                 context_window: 16_384,
                 max_output_tokens: 1_024,
-                provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+                provider_profile: ProviderProfile::OpenAiResponses,
                 capabilities: ModelCapabilities {
                     supports_tools: true,
                     supports_reasoning: true,
@@ -804,6 +814,7 @@ mod tests {
                 "Bearer header-super-secret".to_string(),
             )]),
         );
+        request.replace_api_key(Some("request-api-key-super-secret".to_string()));
         request.extra_body = Some(serde_json::json!({"api_key": "body-super-secret"}));
 
         let debug = format!("{request:?}");
@@ -814,6 +825,7 @@ mod tests {
             "system-super-secret",
             "message-super-secret",
             "header-super-secret",
+            "request-api-key-super-secret",
             "body-super-secret",
         ] {
             assert!(!debug.contains(secret));
@@ -825,8 +837,7 @@ mod tests {
         let mut provider = ProviderTarget::new(
             "http://lm-studio.local:1234/v1",
             "fixture-model",
-            ProviderMetadataMode::OpenAiCompatibleOnly,
-            ProviderApiMode::ChatCompletions,
+            ProviderProfile::OpenAiCompatible,
             ProviderDeadlines {
                 request_timeout_ms: 10_000,
                 connect_timeout_ms: 1_000,
@@ -844,7 +855,7 @@ mod tests {
                 name: "fixture-model".to_string(),
                 context_window: 16_384,
                 max_output_tokens: 1_024,
-                provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+                provider_profile: ProviderProfile::OpenAiCompatible,
                 capabilities: ModelCapabilities {
                     supports_tools: true,
                     supports_reasoning: false,
@@ -889,8 +900,7 @@ mod tests {
         let mut provider = ProviderTarget::new(
             "http://lm-studio.local:1234/v1",
             "fixture-model",
-            ProviderMetadataMode::OpenAiCompatibleOnly,
-            ProviderApiMode::ChatCompletions,
+            ProviderProfile::OpenAiCompatible,
             ProviderDeadlines {
                 request_timeout_ms: 10_000,
                 connect_timeout_ms: 1_000,
@@ -907,7 +917,7 @@ mod tests {
                 name: "fixture-model".to_string(),
                 context_window: 16_384,
                 max_output_tokens: 1_024,
-                provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+                provider_profile: ProviderProfile::OpenAiCompatible,
                 capabilities: ModelCapabilities {
                     supports_tools: true,
                     supports_reasoning: false,
@@ -951,8 +961,7 @@ mod tests {
         let provider = ProviderTarget::new(
             "http://lm-studio.local:1234/v1",
             "canonical-model",
-            ProviderMetadataMode::OpenAiCompatibleOnly,
-            ProviderApiMode::Responses,
+            ProviderProfile::OpenAiResponses,
             ProviderDeadlines {
                 request_timeout_ms: 10_000,
                 connect_timeout_ms: 1_000,
@@ -966,7 +975,7 @@ mod tests {
                 name: "stale-model".to_string(),
                 context_window: 16_384,
                 max_output_tokens: 1_024,
-                provider_metadata_mode: ProviderMetadataMode::OpenAiCompatibleOnly,
+                provider_profile: ProviderProfile::OpenAiResponses,
                 capabilities: ModelCapabilities {
                     supports_tools: true,
                     supports_reasoning: false,
@@ -997,6 +1006,13 @@ mod tests {
             .validate_provider_lifecycle()
             .expect_err("blank model profile must fail closed");
         assert!(blank.to_string().contains("must not be empty"));
+
+        request.model.name = "canonical-model".to_string();
+        request.model.provider_profile = ProviderProfile::OpenAiCompatible;
+        let mismatched_profile = request
+            .validate_provider_lifecycle()
+            .expect_err("stale provider profile must fail closed");
+        assert!(mismatched_profile.to_string().contains("provider profile"));
     }
 
     #[test]

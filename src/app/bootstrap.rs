@@ -8,7 +8,7 @@ use crate::cli::{CliCommand, RunArgs};
 use crate::config::{ConfigLoader, ResolvedConfig};
 use crate::edit::{ChangeTracker, EditSafety, Formatter};
 use crate::error::AppBootstrapError;
-use crate::llm::{OpenAiCompatClient, resolve_api_key_from_env};
+use crate::llm::OpenAiCompatClient;
 use crate::runtime::SessionRuntimeEventHub;
 use crate::session::{ProjectRepository, SessionId, SessionRecord, SessionRepository};
 use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
@@ -248,8 +248,7 @@ impl AppBootstrap {
             skills: crate::skill::SkillsService::new(),
         };
         let registry = ToolRegistry::core_agent_for_config(&config);
-        let api_key = resolve_api_key_from_env(config.model.api_key_env.as_deref())?;
-        let llm = Arc::new(OpenAiCompatClient::new(api_key));
+        let llm = Arc::new(OpenAiCompatClient::new(None));
         let agent_loop = AgentLoop::new(llm, registry, store.clone(), PromptBuilder, tool_services);
         let run_service = RunService::new(
             store.clone(),
@@ -399,8 +398,8 @@ mod tests {
         TurnTerminalOutcome,
     };
     use crate::session::{
-        DurableTurnTerminal, NewSession, RunEvent, SessionSelector, SessionStartRequest,
-        SessionStatus,
+        DurableTurnTerminal, NewSession, RunEvent, SessionProviderConnection, SessionSelector,
+        SessionStartRequest, SessionStatus,
     };
 
     #[tokio::test]
@@ -436,6 +435,7 @@ mod tests {
                 model: "test-model".to_string(),
                 base_url: "http://127.0.0.1:1234/v1".to_string(),
                 access_mode: crate::config::AccessMode::Default,
+                provider_connection: None,
             })
             .await
             .expect("session");
@@ -446,7 +446,7 @@ mod tests {
             title: None,
             directory: Some(project_root.clone()),
             model_override: None,
-            base_url_override: None,
+            provider_connection_override: Default::default(),
             output_mode: crate::cli::OutputMode::Human,
             show_reasoning_summary: false,
             review_uncommitted: false,
@@ -506,6 +506,7 @@ mod tests {
                 model: "test-model".to_string(),
                 base_url: "http://127.0.0.1:1234/v1".to_string(),
                 access_mode: crate::config::AccessMode::Default,
+                provider_connection: None,
             })
             .await
             .expect("first session");
@@ -518,6 +519,7 @@ mod tests {
                 model: "test-model".to_string(),
                 base_url: "http://127.0.0.1:1234/v1".to_string(),
                 access_mode: crate::config::AccessMode::Default,
+                provider_connection: None,
             })
             .await
             .expect("latest session");
@@ -539,7 +541,7 @@ mod tests {
             title: None,
             directory: Some(project_root.clone()),
             model_override: None,
-            base_url_override: None,
+            provider_connection_override: Default::default(),
             output_mode: crate::cli::OutputMode::Human,
             show_reasoning_summary: false,
             review_uncommitted: false,
@@ -597,6 +599,7 @@ mod tests {
                 model: "test-model".to_string(),
                 base_url: "http://127.0.0.1:1234/v1".to_string(),
                 access_mode: crate::config::AccessMode::Default,
+                provider_connection: None,
             })
             .await
             .expect("legacy invalid session");
@@ -609,6 +612,7 @@ mod tests {
                 model: "test-model".to_string(),
                 base_url: "http://127.0.0.1:1234/v1".to_string(),
                 access_mode: crate::config::AccessMode::Default,
+                provider_connection: None,
             })
             .await
             .expect("second project session");
@@ -619,7 +623,7 @@ mod tests {
             title: None,
             directory: Some(first_root.clone()),
             model_override: None,
-            base_url_override: None,
+            provider_connection_override: Default::default(),
             output_mode: crate::cli::OutputMode::Human,
             show_reasoning_summary: false,
             review_uncommitted: false,
@@ -673,6 +677,9 @@ mod tests {
                     model: app.config.model.model.clone(),
                     base_url: app.config.model.base_url.clone(),
                     access_mode: crate::config::AccessMode::Default,
+                    provider_connection: Some(SessionProviderConnection::from_model_config(
+                        &app.config.model,
+                    )),
                 },
                 app.workspace.clone(),
             )
@@ -734,6 +741,9 @@ mod tests {
                     model: first.config.model.model.clone(),
                     base_url: first.config.model.base_url.clone(),
                     access_mode: first.config.permissions.access_mode,
+                    provider_connection: Some(SessionProviderConnection::from_model_config(
+                        &first.config.model,
+                    )),
                 },
                 first.workspace.clone(),
             )
@@ -830,6 +840,9 @@ mod tests {
                     model: first.config.model.model.clone(),
                     base_url: first.config.model.base_url.clone(),
                     access_mode: first.config.permissions.access_mode,
+                    provider_connection: Some(SessionProviderConnection::from_model_config(
+                        &first.config.model,
+                    )),
                 },
                 first.workspace.clone(),
             )
@@ -897,6 +910,9 @@ mod tests {
                     model: first.config.model.model.clone(),
                     base_url: first.config.model.base_url.clone(),
                     access_mode: first.config.permissions.access_mode,
+                    provider_connection: Some(SessionProviderConnection::from_model_config(
+                        &first.config.model,
+                    )),
                 },
                 first.workspace.clone(),
             )

@@ -58,6 +58,7 @@ import type {
   ConfigMutationTarget,
   DesktopViewState,
   DesktopWebState,
+  ProviderProfile,
 } from "./types.ts";
 import {
   sideChatConfigurationOpen,
@@ -454,6 +455,25 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
     context.uiState.drafts.providerRevision += 1;
     updateProviderActionButtons(context);
   });
+  document.querySelector<HTMLSelectElement>("#provider-profile")?.addEventListener("change", (event) => {
+    const next = (event.currentTarget as HTMLSelectElement).value;
+    if (!isProviderProfile(next)) return;
+    if (context.uiState.drafts.provider.providerProfile !== next) {
+      context.uiState.drafts.providerCatalogIdentityRevision += 1;
+    }
+    context.uiState.drafts.provider.providerProfile = next;
+    context.uiState.drafts.providerRevision += 1;
+    updateProviderActionButtons(context);
+  });
+  document.querySelector<HTMLInputElement>("#provider-api-key-env")?.addEventListener("input", (event) => {
+    const next = (event.currentTarget as HTMLInputElement).value;
+    if (next.trim() !== context.uiState.drafts.provider.apiKeyEnv.trim()) {
+      context.uiState.drafts.providerCatalogIdentityRevision += 1;
+    }
+    context.uiState.drafts.provider.apiKeyEnv = next;
+    context.uiState.drafts.providerRevision += 1;
+    updateProviderActionButtons(context);
+  });
   document.querySelector<HTMLInputElement>("#provider-context-window")?.addEventListener("input", (event) => {
     context.uiState.drafts.provider.contextWindow = (event.currentTarget as HTMLInputElement).value;
     context.uiState.drafts.providerRevision += 1;
@@ -630,6 +650,13 @@ function installDelegatedActionEvents(context: ActionContext): void {
       } else if (setting === "model" && draft.setupModel !== nextValue) {
         draft.setupModel = nextValue;
         draft.setupRevision += 1;
+      } else if (
+        setting === "provider-profile"
+        && isProviderProfile(nextValue)
+        && draft.setupProviderProfile !== nextValue
+      ) {
+        draft.setupProviderProfile = nextValue;
+        draft.setupRevision += 1;
       }
       updateSideChatActionButtons(currentState, context);
       return;
@@ -680,7 +707,11 @@ function installDelegatedActionEvents(context: ActionContext): void {
       action,
     );
     const index = Number(node.dataset.index ?? "-1");
-    const value = node.dataset.agentPath ?? node.dataset.historyTarget ?? node.dataset.mode ?? "";
+    const value = node.dataset.agentPath
+      ?? node.dataset.historyTarget
+      ?? node.dataset.providerProfile
+      ?? node.dataset.mode
+      ?? "";
     void dispatchAction(action, context, { index, value }).catch((error) => context.reportError(error));
   });
   document.addEventListener("keydown", (event) => {
@@ -1165,10 +1196,19 @@ function updateDirtyBadges(context: ActionContext, _validationOk: boolean): void
 function sessionSettingsDraftField(value: string): SessionSettingsDraftField | null {
   if (value === "base-url") return "baseUrl";
   if (value === "model") return "model";
+  if (value === "provider-profile") return "providerProfile";
+  if (value === "api-key-env") return "apiKeyEnv";
   if (value === "context-window") return "contextWindow";
   if (value === "max-output-tokens") return "maxOutputTokens";
   if (value === "access-mode") return "accessMode";
   return null;
+}
+
+function isProviderProfile(value: string): value is ProviderProfile {
+  return value === "lm_studio"
+    || value === "openai_compatible"
+    || value === "openai_responses"
+    || value === "lm_studio_chat_completions";
 }
 
 function updateSessionSettingsControls(

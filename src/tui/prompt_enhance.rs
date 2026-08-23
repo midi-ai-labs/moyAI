@@ -165,6 +165,8 @@ mod tests {
             .await
             .expect("project");
         let service = SessionService::new(store.clone());
+        let provider_connection =
+            crate::session::SessionProviderConnection::from_model_config(&config.model);
         let session = service
             .start_or_resume(
                 SessionStartRequest {
@@ -174,6 +176,7 @@ mod tests {
                     model: config.model.model,
                     base_url: config.model.base_url,
                     access_mode: config.permissions.access_mode,
+                    provider_connection: Some(provider_connection),
                 },
                 workspace,
             )

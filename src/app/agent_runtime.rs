@@ -27,9 +27,9 @@ use crate::session::SessionRepository;
 use crate::session::{
     AdmissionId, CanonicalHistoryPage, CanonicalRuntimeEventPage, CanonicalSessionRead,
     CanonicalTurnPage, IdleTurnAdmission, LoadedSessionList, NewSession, RunEvent, RunSummary,
-    RunningSessionRejoin, SessionContext, SessionId, SessionRecord, SessionSettingsPatch,
-    SessionSpawnEdge, SessionStatus, ThreadGoalClearResult, ThreadGoalGetResult,
-    ThreadGoalSetResult,
+    RunningSessionRejoin, SessionContext, SessionId, SessionProviderConnection, SessionRecord,
+    SessionSettingsPatch, SessionSpawnEdge, SessionStatus, ThreadGoalClearResult,
+    ThreadGoalGetResult, ThreadGoalSetResult,
 };
 use crate::storage::{
     StoreBundle,
@@ -1788,6 +1788,9 @@ impl AgentRuntime {
             model: child_config.model.model.clone(),
             base_url: child_config.model.base_url.clone(),
             access_mode: child_config.permissions.access_mode,
+            provider_connection: Some(SessionProviderConnection::from_model_config(
+                &child_config.model,
+            )),
         };
 
         let initial_task = InterAgentCommunication {

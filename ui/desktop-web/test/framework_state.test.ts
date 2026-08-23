@@ -115,14 +115,24 @@ test("Initial Setup catalog evidence is invalidated by A to B to A config-draft 
       options: [],
     },
     {
-      key: "model.provider_metadata_mode",
-      value: "openai_compatible_only",
+      key: "model.provider_profile",
+      value: "openai_compatible",
       env_override: null,
       value_type: "enum",
       required: true,
       min_value: null,
       max_value: null,
-      options: ["openai_compatible_only", "lm_studio_native_required"],
+      options: ["lm_studio", "openai_compatible", "openai_responses", "lm_studio_chat_completions"],
+    },
+    {
+      key: "model.api_key_env",
+      value: "",
+      env_override: null,
+      value_type: "string",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
     },
     {
       key: "model.context_window",
@@ -175,11 +185,13 @@ test("Initial Setup catalog evidence is invalidated by A to B to A config-draft 
       checks: [],
     },
     provider_base_url: "http://provider-a.test/v1",
-    provider_metadata_mode: "openai_compatible_only",
+    provider_profile: "openai_compatible",
+    provider_api_key_env: "",
     provider_context_window: "65536",
     provider_max_output_tokens: "1024",
     provider_catalog_base_url: "http://provider-a.test",
-    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_catalog_profile: "openai_compatible",
+    provider_catalog_api_key_env: null,
     provider_model_ids: ["model-a", "model-a-alt"],
     provider_models: ["Model A", "Model A alt"],
     provider_selected_index: 0,
@@ -316,6 +328,22 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
       accessMode: "default",
       runtimeOwnerToken: "idle:0",
     },
+    session_settings: {
+      available: false,
+      base_url: "http://127.0.0.1:1234",
+      model: "model-a",
+      provider_profile: "openai_compatible",
+      api_key_env: "",
+      access_mode: "default",
+      context_window: "",
+      max_output_tokens: "",
+      context_window_inherited: true,
+      max_output_tokens_inherited: true,
+      provider_mutation_enabled: false,
+      access_mutation_enabled: false,
+      unavailable_reason: "root sessionを選択すると変更できます。",
+      target: null,
+    },
     config_draft_capabilities: {
       clean: {
         dirty: false,
@@ -381,6 +409,7 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
       owner_session_id: SESSION_A,
       model: "",
       base_url: "",
+      provider_profile: "",
       status: "idle",
       phase: "idle",
       last_error: "",
@@ -425,14 +454,17 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
     send_enhanced_enabled: true,
     send_raw_enabled: true,
     provider_base_url: "http://127.0.0.1:1234",
-    provider_metadata_mode: "openai_compatible_only",
+    provider_profile: "openai_compatible",
+    provider_api_key_env: "",
     provider_effective_base_url: "http://127.0.0.1:1234",
-    provider_effective_metadata_mode: "openai_compatible_only",
+    provider_effective_profile: "openai_compatible",
+    provider_effective_api_key_env: "",
     provider_effective_context_window: "131072",
     provider_effective_max_output_tokens: "8192",
     provider_effective_model_id: "model-a",
     provider_catalog_base_url: "http://127.0.0.1:1234",
-    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_catalog_profile: "openai_compatible",
+    provider_catalog_api_key_env: null,
     provider_context_window: "131072",
     provider_max_output_tokens: "8192",
     provider_model_ids: ["model-a"],
@@ -3688,7 +3720,8 @@ test("provider overlay consumes typed status and exposes control selection seman
   assert.match(html, /id="provider-url"[^>]*aria-describedby="provider-url-help provider-status"[^>]*aria-invalid="false"/);
   assert.match(html, /id="provider-url-help"/);
   assert.match(html, /id="provider-status"[^>]*role="status"[^>]*aria-live="polite"/);
-  assert.match(html, /data-mode="openai_compatible_only" aria-pressed="true"/);
+  assert.match(html, /id="provider-profile"[^>]*aria-describedby="provider-profile-help"/);
+  assert.match(html, /<option value="openai_compatible" selected>OpenAI-compatible \(Chat Completions\)<\/option>/);
   assert.match(html, /data-focus-key="provider-model:model-a" aria-pressed="true"/);
   assert.match(html, /Typed idle/);
   assert.doesNotMatch(html, /処理に失敗しました/);
@@ -3801,18 +3834,18 @@ test("provider URL typing updates accessible feedback and restores the current t
   }
 });
 
-test("provider limit-only edits can be committed without reloading the current catalog", () => {
+test("provider manual target and limit edits can be committed without loading a catalog", () => {
   const currentWithoutCatalog = projection({
     provider_apply_enabled: true,
     provider_catalog_base_url: null,
-    provider_catalog_metadata_mode: null,
+    provider_catalog_profile: null,
   });
   const ui = createUiLocalState();
   reconcileUiDrafts(ui, null, currentWithoutCatalog, null);
   assert.equal(
     projectViewState(currentWithoutCatalog, ui).provider_apply_enabled,
-    false,
-    "an unchanged current provider is not a commit action",
+    true,
+    "a complete hand-entered connection remains independently applicable",
   );
 
   ui.drafts.provider.contextWindow = "65536";
@@ -3820,8 +3853,8 @@ test("provider limit-only edits can be committed without reloading the current c
   ui.drafts.provider.contextWindow = currentWithoutCatalog.provider_context_window;
   assert.equal(
     projectViewState(currentWithoutCatalog, ui).provider_apply_enabled,
-    false,
-    "reverting the local limit disables the no-op commit",
+    true,
+    "catalog diagnostics do not own a complete connection",
   );
 
   ui.drafts.provider.maxOutputTokens = "4096";
@@ -3830,11 +3863,14 @@ test("provider limit-only edits can be committed without reloading the current c
   assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, false);
   ui.drafts.provider.maxOutputTokens = "4096";
   ui.drafts.provider.baseUrl = "http://127.0.0.1:4321";
-  assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, false);
+  assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, true);
   ui.drafts.provider.baseUrl = currentWithoutCatalog.provider_base_url;
-  ui.drafts.provider.metadataMode = "lm_studio_native_required";
-  assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, false);
-  ui.drafts.provider.metadataMode = currentWithoutCatalog.provider_metadata_mode;
+  ui.drafts.provider.providerProfile = "lm_studio";
+  assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, true);
+  ui.drafts.provider.apiKeyEnv = "OPENAI_API_KEY";
+  assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, true);
+  ui.drafts.provider.apiKeyEnv = currentWithoutCatalog.provider_api_key_env;
+  ui.drafts.provider.providerProfile = currentWithoutCatalog.provider_profile;
   ui.drafts.provider.selectedModelId = "model-b";
   assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, false);
 
@@ -3843,7 +3879,7 @@ test("provider limit-only edits can be committed without reloading the current c
     provider_max_output_tokens: "4096",
     provider_apply_enabled: true,
     provider_catalog_base_url: null,
-    provider_catalog_metadata_mode: null,
+    provider_catalog_profile: null,
   });
   const failedSaveUi = createUiLocalState();
   reconcileUiDrafts(failedSaveUi, null, failedSave, null);
@@ -3858,7 +3894,7 @@ test("provider limit-only edits can be committed without reloading the current c
     provider_context_window: "65536",
     provider_apply_enabled: false,
     provider_catalog_base_url: null,
-    provider_catalog_metadata_mode: null,
+    provider_catalog_profile: null,
   });
   const failedCatalogSwitchUi = createUiLocalState();
   reconcileUiDrafts(failedCatalogSwitchUi, null, failedCatalogSwitch, null);
@@ -3873,7 +3909,7 @@ test("provider limit-only edits can be committed without reloading the current c
   const rustRejected = projection({
     provider_apply_enabled: false,
     provider_catalog_base_url: null,
-    provider_catalog_metadata_mode: null,
+    provider_catalog_profile: null,
   });
   const rustRejectedUi = createUiLocalState();
   reconcileUiDrafts(rustRejectedUi, null, rustRejected, null);
@@ -3886,11 +3922,66 @@ test("provider limit-only edits can be committed without reloading the current c
   );
 });
 
-test("provider catalog evidence remains bound to the local URL and mode", () => {
+test("provider Apply and Save submit a complete hand-entered connection without catalog evidence", async () => {
+  const projected = projection({
+    overlay: "provider",
+    provider_apply_enabled: true,
+    provider_catalog_base_url: null,
+    provider_catalog_profile: null,
+    provider_catalog_api_key_env: null,
+  });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, projected, null);
+  ui.drafts.provider.baseUrl = "http://provider.example:8119/v1";
+  ui.drafts.provider.providerProfile = "openai_compatible";
+  ui.drafts.provider.apiKeyEnv = "OPENAI_API_KEY";
+  ui.drafts.provider.contextWindow = "65536";
+  ui.drafts.provider.maxOutputTokens = "4096";
+  ui.drafts.provider.selectedModelId = "model-a";
+  const view = projectViewState(projected, ui);
+  assert.equal(view.provider_apply_enabled, true);
+  for (const id of ["apply-provider-session", "save-provider-global"]) {
+    assert.equal(actionById(id)?.enabled?.(view, { index: -1, value: "" }), true, id);
+  }
+
+  const invocations: Array<{ name: string; args?: Record<string, unknown> }> = [];
+  const context = {
+    uiState: ui,
+    mutate: async (name: string, args?: Record<string, unknown>) => {
+      invocations.push({ name, args });
+    },
+    prepareConfigSnapshot: () => projected.config_fields.map((field) => ({
+      key: field.key,
+      text: field.value,
+    })),
+  } as unknown as ActionContext;
+
+  await actionById("apply-provider-session")?.run(view, context, { index: -1, value: "" });
+  await actionById("save-provider-global")?.run(view, context, { index: -1, value: "" });
+
+  const expectedArgs = {
+    input: {
+      baseUrl: "http://provider.example:8119/v1",
+      providerProfile: "openai_compatible",
+      apiKeyEnv: "OPENAI_API_KEY",
+      contextWindow: "65536",
+      maxOutputTokens: "4096",
+      selectedModelId: "model-a",
+    },
+    expectedTarget: projected.config_target,
+    draftValues: [{ key: "model.model", text: "model-a" }],
+  };
+  assert.deepEqual(invocations, [
+    { name: "apply_provider_session", args: expectedArgs },
+    { name: "save_provider_global", args: expectedArgs },
+  ]);
+});
+
+test("provider catalog evidence remains bound to the local URL and connection profile", () => {
   const loaded = projection({
     provider_apply_enabled: true,
     provider_catalog_base_url: "http://127.0.0.1:1234",
-    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_catalog_profile: "openai_compatible",
   });
   const ui = createUiLocalState();
   reconcileUiDrafts(ui, null, loaded, null);
@@ -3904,10 +3995,10 @@ test("provider catalog evidence remains bound to the local URL and mode", () => 
     "normalized /v1 URLs and local limit changes keep ownership of the loaded catalog",
   );
   ui.drafts.provider.baseUrl = "http://127.0.0.1:4321";
-  assert.equal(projectViewState(loaded, ui).provider_apply_enabled, false);
+  assert.equal(projectViewState(loaded, ui).provider_apply_enabled, true);
   ui.drafts.provider.baseUrl = "http://127.0.0.1:1234";
-  ui.drafts.provider.metadataMode = "lm_studio_native_required";
-  assert.equal(projectViewState(loaded, ui).provider_apply_enabled, false);
+  ui.drafts.provider.providerProfile = "lm_studio";
+  assert.equal(projectViewState(loaded, ui).provider_apply_enabled, true);
 });
 
 test("provider catalog completion is rejected after a mid-flight URL edit", () => {
@@ -3915,7 +4006,7 @@ test("provider catalog completion is rejected after a mid-flight URL edit", () =
     overlay: "provider",
     provider_base_url: "http://127.0.0.1:9763/slow",
     provider_catalog_base_url: null,
-    provider_catalog_metadata_mode: null,
+    provider_catalog_profile: null,
     provider_model_ids: ["model-a"],
     provider_models: ["Model A"],
     provider_selected_index: 0,
@@ -3941,7 +4032,8 @@ test("provider catalog completion is rejected after a mid-flight URL edit", () =
     ...initial,
     projection_revision: "3",
     provider_catalog_base_url: "http://127.0.0.1:9763/slow",
-    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_catalog_profile: "openai_compatible",
+    provider_catalog_api_key_env: null,
     provider_model_ids: ["uat/fast-model", "model-a"],
     provider_models: ["uat/fast-model", "Model A"],
     provider_selected_index: 1,
@@ -3957,7 +4049,7 @@ test("provider catalog completion is rejected after a mid-flight URL edit", () =
   assert.deepEqual(view.provider_models, []);
   assert.equal(view.provider_selected_index, -1);
   assert.equal(view.provider_catalog_base_url, null);
-  assert.equal(view.provider_apply_enabled, false);
+  assert.equal(view.provider_apply_enabled, true);
   assert.equal(view.provider_status.kind, "warning");
   assert.equal(ui.drafts.provider.baseUrl, "http://192.168.10.101:1234");
 });
@@ -3967,7 +4059,7 @@ test("provider catalog completion is rejected after an ABA draft edit", () => {
     overlay: "provider",
     provider_base_url: "http://127.0.0.1:9763/slow",
     provider_catalog_base_url: null,
-    provider_catalog_metadata_mode: null,
+    provider_catalog_profile: null,
     provider_model_ids: ["configured-model"],
     provider_models: ["Configured model"],
     provider_selected_index: 0,
@@ -4004,7 +4096,7 @@ test("provider catalog completion is rejected after an ABA draft edit", () => {
     ...initial,
     projection_revision: "3",
     provider_catalog_base_url: "http://127.0.0.1:9763/slow",
-    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_catalog_profile: "openai_compatible",
     provider_model_ids: ["configured-model", "stale-model"],
     provider_models: ["Configured model", "Stale model"],
     provider_selected_index: 0,
@@ -4021,16 +4113,16 @@ test("provider catalog completion is rejected after an ABA draft edit", () => {
   assert.equal(ui.rejectedProviderCatalogRequest, request);
   assert.equal(ui.drafts.provider.baseUrl, "http://127.0.0.1:9763/slow");
   assert.equal(ui.drafts.provider.selectedModelId, "configured-model");
-  assert.equal(deriveUiCapabilities(completion, ui).canApplyProvider, false);
-  assert.equal(view.provider_apply_enabled, false);
+  assert.equal(deriveUiCapabilities(completion, ui).canApplyProvider, true);
+  assert.equal(view.provider_apply_enabled, true);
   const rejectedHtml = renderOverlay(view);
   assert.match(
     rejectedHtml,
-    /data-action="apply-provider-session" disabled>UIセッションに適用/,
+    /data-action="apply-provider-session" >UIセッションに適用/,
   );
   assert.match(
     rejectedHtml,
-    /data-action="save-provider-global" disabled>設定ファイルに保存/,
+    /data-action="save-provider-global" >設定ファイルに保存/,
   );
 
   const reloadRequest = beginProviderCatalogRequest(ui, completion);
@@ -4040,7 +4132,7 @@ test("provider catalog completion is rejected after an ABA draft edit", () => {
     ...completion,
     projection_revision: "4",
     provider_catalog_base_url: null,
-    provider_catalog_metadata_mode: null,
+    provider_catalog_profile: null,
     provider_loading: true,
     provider_apply_enabled: false,
     provider_status: { kind: "loading", title: "Loading", hint: "Waiting", details: "" },
@@ -4087,7 +4179,7 @@ test("provider catalog rapid double dispatch preserves one owner through ABA set
     overlay: "provider",
     provider_base_url: "http://127.0.0.1:9763/slow",
     provider_catalog_base_url: null,
-    provider_catalog_metadata_mode: null,
+    provider_catalog_profile: null,
     provider_model_ids: [],
     provider_models: [],
     provider_selected_index: -1,
@@ -4168,7 +4260,7 @@ test("provider catalog rapid double dispatch preserves one owner through ABA set
     ...initial,
     projection_revision: "3",
     provider_catalog_base_url: "http://127.0.0.1:9763/slow",
-    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_catalog_profile: "openai_compatible",
     provider_model_ids: ["stale-model"],
     provider_models: ["Stale model"],
     provider_selected_index: 0,
@@ -4191,7 +4283,7 @@ test("provider catalog completion is accepted for the exact dispatched draft tar
     overlay: "provider",
     provider_base_url: "http://127.0.0.1:9763/slow",
     provider_catalog_base_url: null,
-    provider_catalog_metadata_mode: null,
+    provider_catalog_profile: null,
     provider_model_ids: ["model-a"],
     provider_models: ["Model A"],
     provider_selected_index: 0,
@@ -4215,7 +4307,7 @@ test("provider catalog completion is accepted for the exact dispatched draft tar
     ...initial,
     projection_revision: "3",
     provider_catalog_base_url: "http://127.0.0.1:9763/slow",
-    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_catalog_profile: "openai_compatible",
     provider_model_ids: ["uat/fast-model", "model-a"],
     provider_models: ["uat/fast-model", "Model A"],
     provider_selected_index: 1,
@@ -4230,13 +4322,13 @@ test("provider catalog completion is accepted for the exact dispatched draft tar
   assert.equal(ui.rejectedProviderCatalogRequest, null);
 });
 
-test("provider catalog completion is rejected after a mid-flight mode edit", () => {
+test("provider catalog completion is rejected after a mid-flight profile edit", () => {
   const initial = projection({
     overlay: "provider",
     provider_base_url: "http://127.0.0.1:9763/slow",
-    provider_metadata_mode: "openai_compatible_only",
+    provider_profile: "openai_compatible",
     provider_catalog_base_url: null,
-    provider_catalog_metadata_mode: null,
+    provider_catalog_profile: null,
     provider_model_ids: [],
     provider_models: [],
     provider_selected_index: -1,
@@ -4255,14 +4347,14 @@ test("provider catalog completion is rejected after a mid-flight mode edit", () 
   acknowledgeDraftMutation(ui, loading, "load_provider_models", dispatched);
   reconcileUiDrafts(ui, initial, loading, dispatched);
 
-  ui.drafts.provider.metadataMode = "lm_studio_native_required";
+  ui.drafts.provider.providerProfile = "lm_studio";
   ui.drafts.providerRevision += 1;
   ui.drafts.providerCatalogIdentityRevision += 1;
   const completion = projection({
     ...initial,
     projection_revision: "3",
     provider_catalog_base_url: "http://127.0.0.1:9763/slow",
-    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_catalog_profile: "openai_compatible",
     provider_model_ids: ["uat/fast-model"],
     provider_models: ["uat/fast-model"],
     provider_selected_index: 0,
@@ -4273,14 +4365,14 @@ test("provider catalog completion is rejected after a mid-flight mode edit", () 
   reconcileUiDrafts(ui, loading, completion, null);
   const view = projectViewState(completion, ui);
 
-  assert.equal(view.provider_metadata_mode, "lm_studio_native_required");
+  assert.equal(view.provider_profile, "lm_studio");
   assert.deepEqual(view.provider_model_ids, []);
   assert.deepEqual(view.provider_models, []);
   assert.equal(view.provider_selected_index, -1);
-  assert.equal(view.provider_catalog_metadata_mode, null);
+  assert.equal(view.provider_catalog_profile, null);
   assert.equal(view.provider_apply_enabled, false);
   assert.equal(view.provider_status.kind, "warning");
-  assert.equal(ui.drafts.provider.metadataMode, "lm_studio_native_required");
+  assert.equal(ui.drafts.provider.providerProfile, "lm_studio");
 });
 
 test("provider catalog completion is rejected after its config target changes", () => {
@@ -4288,7 +4380,7 @@ test("provider catalog completion is rejected after its config target changes", 
     overlay: "provider",
     provider_base_url: "http://127.0.0.1:9763/slow",
     provider_catalog_base_url: null,
-    provider_catalog_metadata_mode: null,
+    provider_catalog_profile: null,
     provider_model_ids: [],
     provider_models: [],
     provider_selected_index: -1,
@@ -4315,7 +4407,7 @@ test("provider catalog completion is rejected after its config target changes", 
       configGeneration: "2",
     },
     provider_catalog_base_url: "http://127.0.0.1:9763/slow",
-    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_catalog_profile: "openai_compatible",
     provider_model_ids: ["uat/fast-model"],
     provider_models: ["uat/fast-model"],
     provider_selected_index: 0,
@@ -4818,14 +4910,24 @@ test("every Preferences field has unique connected help, validation, and explici
       options: [],
     },
     {
-      key: "model.provider_metadata_mode",
-      value: "openai_compatible_only",
-      env_override: "MOYAI_PROVIDER_METADATA_MODE",
+      key: "model.provider_profile",
+      value: "openai_compatible",
+      env_override: "MOYAI_PROVIDER_PROFILE",
       value_type: "enum",
       required: false,
       min_value: null,
       max_value: null,
-      options: ["lm_studio_native_required", "openai_compatible_only"],
+      options: ["lm_studio", "openai_compatible", "openai_responses", "lm_studio_chat_completions"],
+    },
+    {
+      key: "model.api_key_env",
+      value: "OPENAI_API_KEY",
+      env_override: "MOYAI_API_KEY_ENV",
+      value_type: "string",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
     },
     {
       key: "model.context_window",
@@ -4928,7 +5030,7 @@ test("every Preferences field has unique connected help, validation, and explici
     html.matchAll(/<(?:input|select|textarea)\b[^>]*class="[^"]*(?:settings-control|side-chat-settings-control)[^"]*"[^>]*>/g),
     (match) => match[0],
   );
-  assert.equal(controls.length, 13, "nine fields, duplicate Main model controls, and three Side controls");
+  assert.equal(controls.length, 15, "ten fields, duplicate Main model controls, and four Side controls");
   for (const control of controls) {
     const id = /\bid="([^"]+)"/.exec(control)?.[1];
     const describedBy = /\baria-describedby="([^"]+)"/.exec(control)?.[1];
@@ -4941,7 +5043,7 @@ test("every Preferences field has unique connected help, validation, and explici
   }
 
   const mainControls = controls.filter((control) => control.includes("data-config-key="));
-  assert.equal(mainControls.length, 10);
+  assert.equal(mainControls.length, 11);
   for (const control of mainControls) assert.match(control, /aria-describedby="[^"]*settings-validation/);
   const modelHelpReferences = mainControls
     .filter((control) => control.includes('data-config-key="model.model"'))

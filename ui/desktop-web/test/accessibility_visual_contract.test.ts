@@ -109,16 +109,21 @@ test("view opacity and workspace path controls are bound to visible labels", () 
   assert.match(workspace, /<input id="workspace-input"/);
 });
 
-test("provider mode and prompt review controls expose accessible group and field names", () => {
+test("provider connection profile and prompt review controls expose accessible field names", () => {
   const provider = renderOverlay(viewState({
     overlay: "provider",
     provider_selected_model_summary: [],
     provider_status: { kind: "idle", title: "待機中", hint: "", details: "" },
     startup: { initial_setup_required: false, action_overlay: "none" },
     provider_base_url: "http://127.0.0.1:1234",
-    provider_metadata_mode: "openai_compatible_only",
+    provider_profile: "openai_compatible",
+    provider_api_key_env: "",
+    provider_effective_base_url: "http://127.0.0.1:1234",
+    provider_effective_profile: "openai_compatible",
+    provider_effective_api_key_env: "",
     provider_catalog_base_url: null,
-    provider_catalog_metadata_mode: null,
+    provider_catalog_profile: null,
+    provider_catalog_api_key_env: null,
     provider_context_window: "32768",
     provider_max_output_tokens: "4096",
     provider_loading: false,
@@ -137,8 +142,9 @@ test("provider mode and prompt review controls expose accessible group and field
     send_enhanced_enabled: true,
   }));
 
-  assert.match(provider, /id="provider-mode-label">Provider mode<\/span>/);
-  assert.match(provider, /class="segmented-control provider-mode-control" role="group" aria-labelledby="provider-mode-label"/);
+  assert.match(provider, /<label class="field-label" for="provider-profile">Connection type<\/label>/);
+  assert.match(provider, /<select id="provider-profile" aria-describedby="provider-profile-help">/);
+  assert.match(provider, /<label class="field-label" for="provider-api-key-env">API key environment variable \(optional\)<\/label>/);
   assert.match(review, /<label class="sr-only" for="review-draft">推敲文<\/label>/);
   assert.match(review, /<textarea id="review-draft">推敲文<\/textarea>/);
 });

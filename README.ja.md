@@ -156,7 +156,7 @@ Windows の既定 config path:
 %APPDATA%\midi-ai-labs\moyai\config\config.toml
 ```
 
-Desktop、TUI、CLIは同じuser-wide baselineを参照します。Desktopのroot sessionにはprovider URL、model、context window、max output、access modeを別途保存でき、sessionを開き直した場合も復元されます。provider / model / context / outputの変更はApply後にadmitされるturnから反映します。commit済みaccess modeは、既に実行中のroot / childを含む次のpermission decisionから反映しますが、表示中のpending decisionとadmit済みeffectは元のpolicyを維持します。
+Desktop、TUI、CLIは同じuser-wide baselineを参照します。Desktopのroot sessionには完全なprovider接続（接続方式、URL、model、任意のAPI key環境変数名、custom header）、context window、max output、access modeを別途保存でき、sessionを開き直した場合も復元されます。provider / model / context / outputの変更はApply後にadmitされるturnから反映します。commit済みaccess modeは、既に実行中のroot / childを含む次のpermission decisionから反映しますが、表示中のpending decisionとadmit済みeffectは元のpolicyを維持します。
 
 Initial SetupのTOML ImportはFinishまでread-onlyです。選択したfileをenvironment override適用前の値としてstrictにparseし、wizardのlocal draftへ取り込みますが、source fileとcurrent global configは変更しません。validation済みdraftをFinishで正常に保存した場合だけ、初回setup requirementを解除します。通常stepに出ないtyped fieldはcollapsed Advancedから編集でき、該当fieldの修正が必要な場合はその導線を開きます。
 
@@ -168,8 +168,8 @@ Session Settingsの **Context window** または **Maximum output** を空欄に
 [model]
 base_url = "http://127.0.0.1:1234"
 model = "qwen/qwen3.6-27b"
-provider_metadata_mode = "lm_studio_native_required"
-provider_api_mode = "responses"
+provider_profile = "lm_studio"
+# api_key_env = "OPENAI_API_KEY" # 任意。環境変数の名前を指定
 reasoning_summary = "none"
 request_timeout_ms = 3600000
 context_window = 131072
@@ -226,7 +226,7 @@ config targetを同一commandで送り、remembered Access / Provider Apply・Sa
 config generationはRust/TypeScript間を正確な`u64` decimal stringで往復し、JavaScript numberにしません。Preferences Applyは
 一時的な完全`ResolvedConfig`を作り、global Saveはdirty fieldだけをcurrent TOMLへmergeします。
 
-Session Settingsはprovider URL、model、access mode、context window、max outputだけの別frontend draftを持ちます。Applyは値と
+Session Settingsは完全なprovider接続、access mode、context window、max outputだけの別frontend draftを持ちます。Applyは値と
 workspace、root session ID、durable settings revision、config generation、runtime owner tokenを同一commandで送り、Rustが
 canonical patchを作ってroot-only revision CASします。limitの空欄はroot override解除とglobal継承を意味します。latest local
 revision/targetと一致するcorrelated successだけが各draftをclearし、古いasync応答は別ownerのdraftを収束させません。
@@ -256,8 +256,8 @@ effect = "read"
 
 - `MOYAI_BASE_URL`
 - `MOYAI_MODEL`
-- `MOYAI_PROVIDER_METADATA_MODE`
-- `MOYAI_PROVIDER_API_MODE`
+- `MOYAI_PROVIDER_PROFILE`
+- `MOYAI_API_KEY_ENV`
 - `MOYAI_CHAT_COMPLETIONS_REASONING_PARAMETERS`
 - `MOYAI_REASONING_EFFORT`
 - `MOYAI_REASONING_SUMMARY`
@@ -275,14 +275,45 @@ effect = "read"
 - `MOYAI_DOCLING_ENABLED`
 - `MOYAI_MCP_ENABLED`
 
-vLLM / vLLM-MLX のように OpenAI-compatible `/v1/models` だけを提供し、LM Studio native
-`/api/v1/models` metadata endpoint を提供しない server では
-`provider_metadata_mode = "openai_compatible_only"` または
-`MOYAI_PROVIDER_METADATA_MODE=openai_compatible_only` を設定します。
-provider metadata modeはmodel名固有のprompt profileを選択せず、hiddenなlanguage / no-thinking prefixも
-注入しません。tool / image / parallel capabilityは`ModelPolicy`だけが所有し、provider policyはAPI modeと
-reasoning transportだけを所有します。availabilityはmetadata endpointだけを使う明示diagnosticであり、tool/visionの
-試験generationやcapability configのmutationを行いません。
+`provider_profile`はcatalog取得方式とgeneration transportを一体にした単一の接続契約です。oMLX、vLLM、
+NVIDIA NIMなど、`/v1/models`と`/v1/chat/completions`を提供するserverには`openai_compatible`を使います。
+
+| 値 | catalog | generation |
+| --- | --- | --- |
+| `lm_studio`（既定） | LM Studio native metadata | `/v1/responses` |
+| `openai_compatible` | `/v1/models` | `/v1/chat/completions` |
+| `openai_responses` | `/v1/models` | `/v1/responses` |
+| `lm_studio_chat_completions` | LM Studio native metadata | `/v1/chat/completions` |
+
+`api_key_env`は任意で、secretそのものではなくAPI keyを保持する環境変数名を保存します。値はrequestごとに
+解決するため、configを書き換えずにkeyをrotateできます。旧`provider_metadata_mode` / `provider_api_mode`と
+対応するenvironment variableは互換入力としてだけ受理し、単一profileへ正規化します。新旧指定が矛盾する
+場合はerrorにし、新しい保存結果には`provider_profile`だけを書きます。失敗後に別generation endpointへfallback
+するとgenerationやtool callを重複させ得るため、runtime fallbackは行いません。
+
+同じ接続をrun、model availability、永続session設定の単一CLI override layerとして指定できます。
+
+```text
+moyai run --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible "このprojectを要約して"
+moyai model availability --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
+moyai session settings <SESSION_ID> --base-url http://omlx-host:8119/v1 --provider-profile openai_compatible
+```
+
+認証が必要なserverでは、moyAIを起動するprocess environmentへ例えば`OMLX_API_KEY`を設定した上で、同じcommandへ
+`--api-key-env OMLX_API_KEY`を追加します。指定した変数が未設定または空ならfail closedになります。
+
+`--api-key-env`へ渡すのは環境変数名であり、secretそのものではありません。runとavailabilityではURL、profile、
+API key環境変数名を同じprecedence patchとして適用します。URLまたはprofileを変更した場合、そのpatchで指定して
+いないcredentialと、下位layerのcustom header、custom request bodyを新しい接続へ継承・転送せずに削除します。永続
+`session settings`では、`--provider-profile`に`--base-url`が必要で、`--api-key-env`には両方が必要です。
+異なるendpointへの`--base-url`単独変更は現在のprofileを維持しますが、以前のAPI key参照とcustom headerを転送せずに
+保存します。同じendpointの指定はsame-target editとしてそれらを維持します。CLIにはcustom header/bodyの入力を追加して
+いないため、完全なCLI session接続はcustom headerなしで保存されます。`model availability
+--openai-compatible-only`はlegacy互換flagとして残りますが、`--provider-profile`とは同時指定できません。
+
+provider profileはmodel名固有のprompt profileを選択せず、hiddenなlanguage / no-thinking prefixも注入しません。
+tool / image / parallel capabilityは`ModelPolicy`だけが所有します。availabilityはmetadata endpointだけを使う
+明示diagnosticであり、tool/visionの試験generationやcapability configのmutationを行いません。
 current provider contractはserver-side strict tool-schema validationを宣言しません。core / MCP tool schemaのRust型にも
 Chat Completions / Responsesの両wireにも`strict` field自体を持たず、raw argumentsをcanonicalにcommitした後、
 advertise済みschema、exact router name、effect、permission境界をlocalに検証してからdispatchします。LM Studioの
@@ -291,17 +322,16 @@ moyAIは設定済みURLを外部HTTP serviceとして扱い、LM Studio process�
 providerへの到達、catalogへのmodel登録、model instanceのload状態は別の事実です。LM Studio native metadataの
 `loaded_instances`が非空なら`loaded`、明示的な空配列なら`not loaded`、field自体がなければ`unknown`として扱います。
 OpenAI-compatible catalogだけからload状態を推測せず`unknown`とし、catalog登録をon-demand load済みとはみなしません。
-Tauri Desktop の `LLM URL` overlay でも、provider URL と model list の横で同じ mode を切り替えられます。
+Tauri Desktopのprovider設定では単一の **Connection type**、base URL、任意のAPI key環境変数名、modelを
+まとめて設定します。別のResponses / Chat selectorは表示しません。
 同じ overlay で `context_window` と `max_output_tokens` も管理できます。vLLM / vLLM-MLX の
 request limit を PowerShell の `$env:` ではなく moyAI の設定として保存・適用できます。
 現在の vLLM-MLX は `/health` と `/v1/status` から hosted model name は取得できますが、server 起動時の
 `--max-tokens` / `--max-request-tokens` は API に出ていません。そのため moyAI は model name を自動取得し、
 provider が `/v1/models` に limit field を出す場合だけ自動反映し、それ以外は moyAI 管理の明示設定を使います。
 
-`provider_api_mode = "responses"` が既定のgeneration transportで、`/v1/responses`を使います。
-`/v1/chat/completions`が必要なproviderでは`provider_api_mode = "chat_completions"`を明示します。
-retired文字列`auto`はconfig/serde入力境界だけで`responses`へ一方向に正規化し、metadata modeからtransportを暗黙選択しません。
-HTTP Responses transportはcompaction checkpointを含むcurrent canonical input全体を毎request送信し、
+`lm_studio`と`openai_responses`はResponses transportを、`openai_compatible`と
+`lm_studio_chat_completions`はChat Completionsを使います。HTTP Responses transportはcompaction checkpointを含むcurrent canonical input全体を毎request送信し、
 `previous_response_id`は送りません。raw reasoning textはassistant contextとして再送・保存せず、
 summaryを要求した場合だけ非永続のruntime-only typed reasoning-summary eventを公開します。
 

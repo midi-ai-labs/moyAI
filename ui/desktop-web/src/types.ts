@@ -186,6 +186,8 @@ export interface SessionSettingsProjection {
   available: boolean;
   base_url: string;
   model: string;
+  provider_profile: ProviderProfile;
+  api_key_env: string;
   access_mode: "default" | "auto_review" | "full_access";
   context_window: string;
   max_output_tokens: string;
@@ -332,7 +334,11 @@ export interface SideChatMessageProjection {
   content: string;
 }
 
-export type ProviderMetadataMode = "lm_studio_native_required" | "openai_compatible_only";
+export type ProviderProfile =
+  | "lm_studio"
+  | "openai_compatible"
+  | "openai_responses"
+  | "lm_studio_chat_completions";
 
 export interface SideChatCatalogModel {
   id: string;
@@ -343,7 +349,7 @@ export interface SideChatCatalogModel {
 export interface SideChatCatalogResult {
   ownerSessionId: string;
   baseUrl: string;
-  metadataMode: ProviderMetadataMode;
+  providerProfile: ProviderProfile;
   configGeneration: string;
   models: SideChatCatalogModel[];
 }
@@ -355,6 +361,7 @@ export interface SideChatProjection {
   owner_session_id: string | null;
   model: string;
   base_url: string;
+  provider_profile: ProviderProfile | "";
   status: SideChatStatus;
   phase: string;
   last_error: string;
@@ -448,14 +455,17 @@ export interface DesktopWebState {
   local_search_results_text: string;
   command_rows: Array<{ name: string; label: string; path: string }>;
   provider_base_url: string;
-  provider_metadata_mode: ProviderMetadataMode;
+  provider_profile: ProviderProfile;
+  provider_api_key_env: string;
   provider_effective_base_url: string;
-  provider_effective_metadata_mode: ProviderMetadataMode;
+  provider_effective_profile: ProviderProfile;
+  provider_effective_api_key_env: string;
   provider_effective_context_window: string;
   provider_effective_max_output_tokens: string;
   provider_effective_model_id: string;
   provider_catalog_base_url: string | null;
-  provider_catalog_metadata_mode: ProviderMetadataMode | null;
+  provider_catalog_profile: ProviderProfile | null;
+  provider_catalog_api_key_env: string | null;
   provider_context_window: string;
   provider_max_output_tokens: string;
   provider_models: string[];

@@ -23,7 +23,7 @@ use crate::config::loader::{
 use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::model::{PartialModelConfig, PartialResolvedConfig};
 use crate::config::{
-    ConfigField, ConfigLoader, ProviderMetadataMode, ResolvedConfig, ShellFamily,
+    ConfigField, ConfigLoader, ProviderProfile, ResolvedConfig, ShellFamily,
     sanitize_provider_endpoint,
 };
 use crate::error::{AppRunError, CliPromptError, CliRenderError, SessionError, StorageError};
@@ -494,7 +494,8 @@ struct HistoryExportRequestTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProviderCatalogRequestTarget {
     base_url: String,
-    metadata_mode: ProviderMetadataMode,
+    profile: ProviderProfile,
+    api_key_env: Option<String>,
     config_generation: u64,
     selected_model_id: String,
 }
@@ -1352,6 +1353,7 @@ mod command_projection_owner_tests {
                 model: "session-saved-model".to_string(),
                 base_url: "http://127.0.0.1:4555/v1".to_string(),
                 access_mode: app.config.permissions.access_mode,
+                provider_connection: None,
             })
             .await
             .expect("session");
@@ -1526,6 +1528,7 @@ mod command_projection_owner_tests {
                 model: controller.app.config.model.model.clone(),
                 base_url: controller.app.config.model.base_url.clone(),
                 access_mode: controller.app.config.permissions.access_mode,
+                provider_connection: None,
             })
             .await
             .expect("session");
@@ -2679,6 +2682,7 @@ mod command_projection_owner_tests {
             model: controller.app.config.model.model.clone(),
             base_url: controller.app.config.model.base_url.clone(),
             access_mode: initial_access_mode,
+            provider_connection: None,
         };
         let repository = controller.app.store.session_repo();
         let root_session = repository
@@ -2853,6 +2857,7 @@ mod command_projection_owner_tests {
                 model: controller.app.config.model.model.clone(),
                 base_url: controller.app.config.model.base_url.clone(),
                 access_mode: controller.app.config.permissions.access_mode,
+                provider_connection: None,
             })
             .await
             .expect("root session");
@@ -2939,6 +2944,7 @@ mod command_projection_owner_tests {
                 model: controller.app.config.model.model.clone(),
                 base_url: controller.app.config.model.base_url.clone(),
                 access_mode: initial_access_mode,
+                provider_connection: None,
             })
             .await
             .expect("session");
@@ -3100,6 +3106,7 @@ mod command_projection_owner_tests {
                 model: controller.app.config.model.model.clone(),
                 base_url: controller.app.config.model.base_url.clone(),
                 access_mode: initial_access_mode,
+                provider_connection: None,
             })
             .await
             .expect("session");
@@ -3248,6 +3255,7 @@ mod command_projection_owner_tests {
                 model: "initial-model".to_string(),
                 base_url: controller.app.config.model.base_url.clone(),
                 access_mode: controller.app.config.permissions.access_mode,
+                provider_connection: None,
             })
             .await
             .expect("root session");
@@ -3397,6 +3405,7 @@ mod command_projection_owner_tests {
                 model: controller.app.config.model.model.clone(),
                 base_url: controller.app.config.model.base_url.clone(),
                 access_mode: controller.app.config.permissions.access_mode,
+                provider_connection: None,
             })
             .await
             .expect("side chat owner session");
@@ -3427,6 +3436,7 @@ mod command_projection_owner_tests {
                 owner_session_id,
                 endpoint,
                 "google/gemma-4-12b-qat".to_string(),
+                ProviderProfile::OpenAiCompatible,
             )
             .expect("configure side chat");
         let binding = controller
@@ -3558,6 +3568,7 @@ mod command_projection_owner_tests {
                 owner_session_id,
                 endpoint,
                 "google/gemma-4-12b-qat".to_string(),
+                ProviderProfile::OpenAiCompatible,
             )
             .expect("configure side chat");
         let initial = controller
@@ -3620,6 +3631,7 @@ mod command_projection_owner_tests {
                 model: controller.app.config.model.model.clone(),
                 base_url: controller.app.config.model.base_url.clone(),
                 access_mode: controller.app.config.permissions.access_mode,
+                provider_connection: None,
             })
             .await
             .expect("other main session");
@@ -3733,6 +3745,7 @@ mod command_projection_owner_tests {
                 owner_session_id,
                 "http://127.0.0.1:1234".to_string(),
                 "google/gemma-4-12b-qat".to_string(),
+                ProviderProfile::OpenAiCompatible,
             )
             .expect("configure side chat");
         let repository = controller.app.store.side_chat_repo();
@@ -3791,6 +3804,7 @@ mod command_projection_owner_tests {
                 owner_session_id,
                 "http://127.0.0.1:1234".to_string(),
                 "google/gemma-4-12b-qat".to_string(),
+                ProviderProfile::OpenAiCompatible,
             )
             .expect("configure side chat");
         let repository = controller.app.store.side_chat_repo();
@@ -3837,6 +3851,7 @@ mod command_projection_owner_tests {
                 owner_session_id,
                 "http://127.0.0.1:1234".to_string(),
                 "google/gemma-4-12b-qat".to_string(),
+                ProviderProfile::OpenAiCompatible,
             )
             .expect("configure side chat");
         let side_chat_repository = controller.app.store.side_chat_repo();
@@ -3931,6 +3946,7 @@ mod command_projection_owner_tests {
                 owner_session_id,
                 "http://127.0.0.1:1234".to_string(),
                 "google/gemma-4-12b-qat".to_string(),
+                ProviderProfile::OpenAiCompatible,
             )
             .expect("configure side chat");
         let side_chat_repository = controller.app.store.side_chat_repo();
@@ -4023,7 +4039,8 @@ mod command_projection_owner_tests {
 
         controller.accept_provider_action_input(
             baseline.base_url.clone(),
-            baseline.provider_metadata_mode,
+            baseline.provider_profile,
+            baseline.api_key_env.clone().unwrap_or_default(),
             next_context_window.to_string(),
             next_max_output_tokens.to_string(),
             baseline.model.clone(),
@@ -4049,6 +4066,131 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
+    async fn provider_manual_target_apply_clears_headers_without_catalog_evidence() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .extra_headers
+            .insert(
+                "Authorization".to_string(),
+                "must-not-cross-hosts".to_string(),
+            );
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .extra_body_json = Some(serde_json::json!({
+            "api_key": "must-not-cross-hosts-in-body",
+            "num_ctx": 4096
+        }));
+        let baseline = controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .clone();
+
+        controller.accept_provider_action_input(
+            "http://127.0.0.1:8119".to_string(),
+            ProviderProfile::OpenAiCompatible,
+            String::new(),
+            baseline.context_window.to_string(),
+            baseline.max_output_tokens.to_string(),
+            baseline.model,
+        );
+
+        assert!(!controller.state.provider_catalog_owns_current_target());
+        assert!(controller.state.can_apply_provider_selection());
+        assert!(controller.apply_provider_session());
+        let applied = &controller.state.provider_config.effective_config.model;
+        assert_eq!(applied.base_url, "http://127.0.0.1:8119");
+        assert_eq!(applied.provider_profile, ProviderProfile::OpenAiCompatible);
+        assert!(applied.extra_headers.is_empty());
+        assert!(
+            applied
+                .extra_body_json
+                .as_ref()
+                .is_some_and(|body| body.get("api_key").is_none())
+        );
+        assert!(
+            applied
+                .extra_body_json
+                .as_ref()
+                .is_some_and(|body| body.get("num_ctx").is_some())
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_same_target_key_and_limit_edits_preserve_headers() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .extra_headers
+            .insert("X-Provider-Tenant".to_string(), "tenant-a".to_string());
+        let baseline = controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .clone();
+
+        controller.accept_provider_action_input(
+            baseline.base_url,
+            baseline.provider_profile,
+            "OPENAI_API_KEY".to_string(),
+            baseline.context_window.saturating_add(1).to_string(),
+            baseline.max_output_tokens.to_string(),
+            baseline.model,
+        );
+
+        assert!(controller.apply_provider_session());
+        let applied = &controller.state.provider_config.effective_config.model;
+        assert_eq!(
+            applied
+                .extra_headers
+                .get("X-Provider-Tenant")
+                .map(String::as_str),
+            Some("tenant-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_global_persistence_candidate_explicitly_clears_old_headers() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let mut global = controller.state.global_config().clone();
+        global
+            .model
+            .extra_headers
+            .insert("Authorization".to_string(), "old-host-secret".to_string());
+        controller.state.replace_global_config(global.clone());
+        let mut next = global;
+        next.model.base_url = "http://127.0.0.1:8119/v1".to_string();
+        next.model.provider_profile = ProviderProfile::OpenAiCompatible;
+        next.model.extra_headers.clear();
+
+        let candidate = controller
+            .provider_config_persistence_candidate(&next)
+            .expect("provider persistence candidate");
+        let headers = candidate
+            .fields
+            .iter()
+            .find(|field| field.key == ConfigField::ExtraHeadersJson)
+            .expect("explicit extra headers field");
+        assert_eq!(headers.value, "{}");
+        assert!(
+            headers.dirty,
+            "the old header owner must be cleared on disk"
+        );
+    }
+
+    #[tokio::test]
     async fn provider_limit_only_apply_does_not_consume_stale_catalog_metadata() {
         let (_temp, _root, mut controller) = empty_access_test_controller().await;
         let baseline = controller
@@ -4060,7 +4202,8 @@ mod command_projection_owner_tests {
         let stale_url = "http://127.0.0.1:4321".to_string();
         controller.accept_provider_action_input(
             stale_url.clone(),
-            baseline.provider_metadata_mode,
+            baseline.provider_profile,
+            baseline.api_key_env.clone().unwrap_or_default(),
             baseline.context_window.to_string(),
             baseline.max_output_tokens.to_string(),
             baseline.model.clone(),
@@ -4088,7 +4231,8 @@ mod command_projection_owner_tests {
         assert!(!controller.state.provider_catalog_owns_current_target());
         controller.accept_provider_action_input(
             baseline.base_url.clone(),
-            baseline.provider_metadata_mode,
+            baseline.provider_profile,
+            baseline.api_key_env.clone().unwrap_or_default(),
             baseline.context_window.saturating_add(1).to_string(),
             baseline.max_output_tokens.saturating_add(1).to_string(),
             baseline.model.clone(),
@@ -4134,7 +4278,8 @@ mod command_projection_owner_tests {
         assert!(controller.state.provider_catalog_owns_current_target());
         controller.accept_provider_action_input(
             baseline.base_url.clone(),
-            baseline.provider_metadata_mode,
+            baseline.provider_profile,
+            baseline.api_key_env.clone().unwrap_or_default(),
             baseline.context_window.saturating_add(1).to_string(),
             baseline.max_output_tokens.saturating_add(1).to_string(),
             baseline.model.clone(),
@@ -4232,6 +4377,7 @@ mod command_projection_owner_tests {
                 model: app.config.model.model.clone(),
                 base_url: app.config.model.base_url.clone(),
                 access_mode: app.config.permissions.access_mode,
+                provider_connection: None,
             })
             .await
             .expect("session");
@@ -4448,6 +4594,7 @@ mod command_projection_owner_tests {
             base_url: controller.app.config.model.base_url.clone(),
             access_mode: controller.app.config.permissions.access_mode,
             model_parameters: crate::session::SessionModelParameters::default(),
+            provider_connection: None,
             session_settings_revision: 0,
             created_at_ms: 1,
             updated_at_ms: 2,
@@ -5797,6 +5944,11 @@ mod command_projection_owner_tests {
                     model: controller.app.config.model.model.clone(),
                     base_url: controller.app.config.model.base_url.clone(),
                     access_mode: controller.app.config.permissions.access_mode,
+                    provider_connection: Some(
+                        crate::session::SessionProviderConnection::from_model_config(
+                            &controller.app.config.model,
+                        ),
+                    ),
                 },
                 controller.app.workspace.clone(),
             )
@@ -6071,6 +6223,7 @@ mod command_projection_owner_tests {
             model: controller.app.config.model.model.clone(),
             base_url: controller.app.config.model.base_url.clone(),
             access_mode: crate::config::AccessMode::Default,
+            provider_connection: None,
         };
         let root = repository
             .create_session(new_session("durable root"))
@@ -6297,6 +6450,7 @@ mod command_projection_owner_tests {
                 model: controller.app.config.model.model.clone(),
                 base_url: controller.app.config.model.base_url.clone(),
                 access_mode: initial_access_mode,
+                provider_connection: None,
             })
             .await
             .expect("session");
@@ -6423,6 +6577,7 @@ mod command_projection_owner_tests {
                 model: app.config.model.model.clone(),
                 base_url: app.config.model.base_url.clone(),
                 access_mode: session_access_mode,
+                provider_connection: None,
             })
             .await
             .expect("session");
@@ -6514,6 +6669,7 @@ mod command_projection_owner_tests {
                 model: app.config.model.model.clone(),
                 base_url: app.config.model.base_url.clone(),
                 access_mode: session_access_mode,
+                provider_connection: None,
             })
             .await
             .expect("session");
@@ -7203,6 +7359,7 @@ mod command_projection_owner_tests {
             model: controller.app.config.model.model.clone(),
             base_url: controller.app.config.model.base_url.clone(),
             access_mode: controller.app.config.permissions.access_mode,
+            provider_connection: None,
         };
         let session_a = repo.create_session(create("session A")).await.expect("A");
         let session_b = repo.create_session(create("session B")).await.expect("B");
@@ -8435,8 +8592,7 @@ fn side_chat_request_profile(binding: &SideChatBinding) -> SideChatRequestProfil
     SideChatRequestProfile {
         base_url: binding.base_url.clone(),
         model: binding.model.clone(),
-        provider_metadata_mode: binding.provider_metadata_mode,
-        provider_api_mode: binding.provider_api_mode,
+        provider_profile: binding.provider_profile,
         request_timeout_ms: binding.request_timeout_ms,
         connect_timeout_ms: binding.connect_timeout_ms,
         max_retries: binding.max_retries,
@@ -8808,6 +8964,14 @@ impl DesktopController {
             .model
             .base_url
             .clone();
+        let default_profile = self
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .provider_profile
+            .as_str()
+            .to_string();
         let durable = match self
             .app
             .store
@@ -8819,6 +8983,7 @@ impl DesktopController {
                 return DesktopSideChatProjection {
                     owner_session_id: Some(owner_session_id.to_string()),
                     base_url: default_base_url,
+                    provider_profile: default_profile,
                     status: "failed".to_string(),
                     phase: "storage read failed".to_string(),
                     last_error: error.to_string(),
@@ -8830,6 +8995,7 @@ impl DesktopController {
             return DesktopSideChatProjection {
                 owner_session_id: Some(owner_session_id.to_string()),
                 base_url: default_base_url,
+                provider_profile: default_profile,
                 status: "idle".to_string(),
                 last_error: self
                     .side_chat_errors
@@ -8881,6 +9047,7 @@ impl DesktopController {
             owner_session_id: Some(owner_session_id.to_string()),
             model: binding.model,
             base_url: binding.base_url,
+            provider_profile: binding.provider_profile.as_str().to_string(),
             status: active
                 .map(|_| "running".to_string())
                 .unwrap_or_else(|| durable.status.key().to_string()),
@@ -8914,6 +9081,7 @@ impl DesktopController {
         owner_session_id: SessionId,
         base_url: String,
         model: String,
+        provider_profile: ProviderProfile,
     ) -> Result<(), String> {
         self.ensure_current_side_chat_owner(owner_session_id)?;
         if self.side_chat_runs.contains_key(&owner_session_id) {
@@ -8922,6 +9090,9 @@ impl DesktopController {
         let mut model_config = self.state.provider_config.effective_config.model.clone();
         model_config.base_url = base_url;
         model_config.model = model;
+        model_config.provider_profile = provider_profile;
+        model_config.api_key_env = None;
+        model_config.extra_headers.clear();
         model_config.supports_tools = false;
         model_config.supports_reasoning = false;
         model_config.supports_images = false;
@@ -11052,7 +11223,10 @@ impl DesktopController {
         }
         let target = ProviderCatalogRequestTarget {
             base_url: normalized.clone(),
-            metadata_mode: self.state.provider_config.provider_metadata_mode_input,
+            profile: self.state.provider_config.provider_profile_input,
+            api_key_env: non_empty_trimmed_owned(
+                &self.state.provider_config.provider_api_key_env_input,
+            ),
             config_generation: self.state.provider_config.config_generation,
             selected_model_id: self
                 .state
@@ -11066,7 +11240,8 @@ impl DesktopController {
         let config = provider_catalog_probe_config(
             self.state.provider_config.effective_config.clone(),
             normalized.clone(),
-            target.metadata_mode,
+            target.profile,
+            target.api_key_env.clone(),
         );
         std::thread::spawn(move || {
             let request_base_url = normalized.clone();
@@ -11169,14 +11344,16 @@ impl DesktopController {
     pub(crate) fn accept_provider_action_input(
         &mut self,
         base_url: String,
-        metadata_mode: ProviderMetadataMode,
+        profile: ProviderProfile,
+        api_key_env: String,
         context_window: String,
         max_output_tokens: String,
         selected_model_id: String,
     ) {
         let target_changed = self.state.accept_provider_action_input(
             base_url,
-            metadata_mode,
+            profile,
+            api_key_env,
             context_window,
             max_output_tokens,
             selected_model_id,
@@ -11223,7 +11400,7 @@ impl DesktopController {
     pub(crate) fn apply_provider_session(&mut self) -> bool {
         if !self.state.can_apply_provider_selection() {
             self.state.set_status_message(
-                "keep the current provider URL, mode, and model, or load the target model list before applying",
+                "enter a valid provider URL, connection type, limits, and model before applying",
             );
             return false;
         }
@@ -11243,7 +11420,7 @@ impl DesktopController {
     pub(crate) fn save_provider_global(&mut self) -> bool {
         if !self.state.can_save_provider_selection_global() {
             self.state.set_status_message(
-                "keep the current provider URL, mode, and model, or load the target model list before saving",
+                "enter a valid provider URL, connection type, limits, and model before saving",
             );
             return false;
         }
@@ -12233,14 +12410,22 @@ impl DesktopController {
             }
         };
         let baseline_model = &baseline.model;
+        let connection_target_changed = normalize_provider_base_url(&baseline_model.base_url)
+            != base_url
+            || baseline_model.provider_profile != self.state.provider_config.provider_profile_input;
         let limit_only_update = input_matches_baseline
             && (context_window != baseline_model.context_window
                 || max_output_tokens != baseline_model.max_output_tokens);
         let mut hydrated_model_config = baseline_model.clone();
         hydrated_model_config.base_url = base_url.clone();
         hydrated_model_config.model = model.clone();
-        hydrated_model_config.provider_metadata_mode =
-            self.state.provider_config.provider_metadata_mode_input;
+        hydrated_model_config.provider_profile = self.state.provider_config.provider_profile_input;
+        hydrated_model_config.api_key_env =
+            non_empty_trimmed_owned(&self.state.provider_config.provider_api_key_env_input);
+        if connection_target_changed {
+            hydrated_model_config.extra_headers.clear();
+            hydrated_model_config.extra_body_json = None;
+        }
         if self.state.provider_catalog_owns_current_target()
             && !limit_only_update
             && let Some(info) = self.state.selected_provider_model_info()
@@ -12257,7 +12442,9 @@ impl DesktopController {
             model: Some(PartialModelConfig {
                 base_url: Some(base_url),
                 model: Some(model),
-                provider_metadata_mode: Some(hydrated_model_config.provider_metadata_mode),
+                provider_profile: Some(hydrated_model_config.provider_profile),
+                api_key_env: Some(hydrated_model_config.api_key_env.clone()),
+                extra_headers: Some(hydrated_model_config.extra_headers.clone()),
                 context_window: Some(hydrated_model_config.context_window),
                 max_output_tokens: Some(hydrated_model_config.max_output_tokens),
                 supports_tools: Some(hydrated_model_config.supports_tools),
@@ -12290,10 +12477,6 @@ impl DesktopController {
         &self,
         config: &ResolvedConfig,
     ) -> Result<ConfigEditorState, String> {
-        let metadata_mode = match config.model.provider_metadata_mode {
-            ProviderMetadataMode::LmStudioNativeRequired => "lm_studio_native_required",
-            ProviderMetadataMode::OpenAiCompatibleOnly => "openai_compatible_only",
-        };
         ConfigEditorState::from_config_values(
             self.state.global_config(),
             vec![
@@ -12306,8 +12489,16 @@ impl DesktopController {
                     config.model.model.clone(),
                 ),
                 (
-                    ConfigField::ProviderMetadataMode.label().to_string(),
-                    metadata_mode.to_string(),
+                    ConfigField::ProviderProfile.label().to_string(),
+                    config.model.provider_profile.as_str().to_string(),
+                ),
+                (
+                    ConfigField::ApiKeyEnv.label().to_string(),
+                    config.model.api_key_env.clone().unwrap_or_default(),
+                ),
+                (
+                    ConfigField::ExtraHeadersJson.label().to_string(),
+                    ConfigField::ExtraHeadersJson.value(config),
                 ),
                 (
                     ConfigField::ContextWindow.label().to_string(),
@@ -13196,7 +13387,9 @@ impl DesktopController {
     fn provider_catalog_target_is_current(&self, target: &ProviderCatalogRequestTarget) -> bool {
         normalize_provider_base_url(&self.state.provider_config.provider_base_url_input)
             == target.base_url
-            && self.state.provider_config.provider_metadata_mode_input == target.metadata_mode
+            && self.state.provider_config.provider_profile_input == target.profile
+            && non_empty_trimmed_owned(&self.state.provider_config.provider_api_key_env_input)
+                == target.api_key_env
             && self.state.provider_config.config_generation == target.config_generation
             && self.state.provider_config.provider_selected_model_id_input
                 == target.selected_model_id
@@ -15079,11 +15272,25 @@ unsafe fn shell_execute_hidden(file: &str, parameters: &str) -> bool {
 fn provider_catalog_probe_config(
     mut config: ResolvedConfig,
     base_url: String,
-    provider_metadata_mode: crate::config::ProviderMetadataMode,
+    provider_profile: crate::config::ProviderProfile,
+    api_key_env: Option<String>,
 ) -> ResolvedConfig {
+    let connection_target_changed = normalize_provider_base_url(&config.model.base_url)
+        != normalize_provider_base_url(&base_url)
+        || config.model.provider_profile != provider_profile;
+    if connection_target_changed {
+        config.model.extra_headers.clear();
+        config.model.extra_body_json = None;
+    }
     config.model.base_url = base_url;
-    config.model.provider_metadata_mode = provider_metadata_mode;
+    config.model.provider_profile = provider_profile;
+    config.model.api_key_env = api_key_env;
     config
+}
+
+fn non_empty_trimmed_owned(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 #[cfg(test)]
@@ -15103,7 +15310,7 @@ mod tests {
         transcript_markdown_file_name, unique_background_request_admission_open,
     };
     use crate::cli::{EventRenderer as _, ReviewDecision};
-    use crate::config::{ProviderMetadataMode, ResolvedConfig};
+    use crate::config::{ProviderProfile, ResolvedConfig};
     use crate::desktop::async_ops::LatestRequestTracker;
     use crate::desktop::models::DesktopTranscriptRowKind;
     use crate::desktop::models::{DesktopFileChangeRow, DesktopSnapshot, DesktopTranscriptRow};
@@ -15271,7 +15478,8 @@ mod tests {
     fn runtime_message_async_contract_classifies_representative_backflow_sources() {
         let provider_target = ProviderCatalogRequestTarget {
             base_url: "http://127.0.0.1:1234".to_string(),
-            metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+            profile: ProviderProfile::LmStudio,
+            api_key_env: None,
             config_generation: 1,
             selected_model_id: "selected-model".to_string(),
         };
@@ -15463,22 +15671,70 @@ mod tests {
     }
 
     #[test]
-    fn provider_catalog_probe_uses_current_provider_mode_input() {
+    fn provider_catalog_probe_uses_the_complete_connection_profile_input() {
         let mut config = ResolvedConfig::default();
         config.model.base_url = "http://old-provider:1234".to_string();
-        config.model.provider_metadata_mode = ProviderMetadataMode::OpenAiCompatibleOnly;
+        config.model.provider_profile = ProviderProfile::OpenAiResponses;
+        config.model.api_key_env = Some("OLD_PROVIDER_KEY".to_string());
+        config.model.extra_headers.insert(
+            "Authorization".to_string(),
+            "Bearer must-not-cross-provider-targets".to_string(),
+        );
+        config.model.extra_body_json = Some(serde_json::json!({
+            "api_key": "must-not-cross-provider-targets"
+        }));
 
         let probe_config = provider_catalog_probe_config(
             config,
             "http://127.0.0.1:8110".to_string(),
-            ProviderMetadataMode::LmStudioNativeRequired,
+            ProviderProfile::OpenAiCompatible,
+            Some("OMLX_API_KEY".to_string()),
         );
 
         assert_eq!(probe_config.model.base_url, "http://127.0.0.1:8110");
         assert_eq!(
-            probe_config.model.provider_metadata_mode,
-            ProviderMetadataMode::LmStudioNativeRequired
+            probe_config.model.provider_profile,
+            ProviderProfile::OpenAiCompatible
         );
+        assert_eq!(
+            probe_config.model.api_key_env.as_deref(),
+            Some("OMLX_API_KEY")
+        );
+        assert!(probe_config.model.extra_headers.is_empty());
+        assert_eq!(probe_config.model.extra_body_json, None);
+    }
+
+    #[test]
+    fn provider_catalog_probe_preserves_hidden_headers_only_for_the_same_target() {
+        let mut config = ResolvedConfig::default();
+        config.model.base_url = "http://127.0.0.1:8110/v1/".to_string();
+        config.model.provider_profile = ProviderProfile::OpenAiCompatible;
+        config.model.extra_headers.insert(
+            "X-Provider-Route".to_string(),
+            "same-target-route".to_string(),
+        );
+        config.model.extra_body_json = Some(serde_json::json!({"num_ctx": 8192}));
+
+        let same_target = provider_catalog_probe_config(
+            config.clone(),
+            "http://127.0.0.1:8110".to_string(),
+            ProviderProfile::OpenAiCompatible,
+            None,
+        );
+        assert_eq!(same_target.model.extra_headers, config.model.extra_headers);
+        assert_eq!(
+            same_target.model.extra_body_json,
+            config.model.extra_body_json
+        );
+
+        let changed_profile = provider_catalog_probe_config(
+            config,
+            "http://127.0.0.1:8110".to_string(),
+            ProviderProfile::OpenAiResponses,
+            None,
+        );
+        assert!(changed_profile.model.extra_headers.is_empty());
+        assert_eq!(changed_profile.model.extra_body_json, None);
     }
 
     #[test]

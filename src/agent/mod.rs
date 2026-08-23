@@ -63,6 +63,10 @@ const PERMISSION_GUARDIAN_TOTAL_DEADLINE: Duration = Duration::from_secs(90);
 const COMPACTION_ACCURACY_WARNING: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
 const AUTOMATIC_COMPACTION_MAX_OUTPUT_TOKENS: u32 = 8_192;
 
+#[cfg(test)]
+type ProviderApiKeyResolver =
+    dyn Fn(Option<&str>) -> Result<Option<String>, crate::error::LlmError> + Send + Sync;
+
 async fn await_tool_cancellation_cleanup<T>(
     cleanup: impl Future<Output = T>,
     grace: Duration,
@@ -162,7 +166,7 @@ impl AgentRunRequest {
         self.turn
             .policy
             .model
-            .transport_profile(self.turn.provider_target().metadata_mode())
+            .transport_profile(self.turn.provider_target().profile())
     }
 
     fn model_name(&self) -> &str {
@@ -192,6 +196,8 @@ pub struct AgentLoop {
     tool_services: ToolServices,
     model_request_gate: Option<Arc<tokio::sync::Semaphore>>,
     #[cfg(test)]
+    provider_api_key_resolver: Option<Arc<ProviderApiKeyResolver>>,
+    #[cfg(test)]
     before_success_terminal_commit: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -211,8 +217,37 @@ impl AgentLoop {
             tool_services,
             model_request_gate: None,
             #[cfg(test)]
+            provider_api_key_resolver: None,
+            #[cfg(test)]
             before_success_terminal_commit: None,
         }
+    }
+
+    fn resolve_provider_api_key(
+        &self,
+        env_name: Option<&str>,
+    ) -> Result<Option<String>, crate::error::LlmError> {
+        #[cfg(test)]
+        if let Some(resolver) = &self.provider_api_key_resolver {
+            return resolver(env_name);
+        }
+        crate::llm::resolve_api_key_from_env(env_name)
+    }
+
+    fn attach_provider_api_key(
+        &self,
+        request: &AgentRunRequest,
+        chat_request: &mut ChatRequest,
+    ) -> Result<(), crate::error::LlmError> {
+        let model = &request.turn.resolved_config().runtime_config().model;
+        chat_request.replace_api_key(self.resolve_provider_api_key(model.api_key_env.as_deref())?);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn with_provider_api_key_resolver(mut self, resolver: Arc<ProviderApiKeyResolver>) -> Self {
+        self.provider_api_key_resolver = Some(resolver);
+        self
     }
 
     #[cfg(test)]
@@ -1083,7 +1118,7 @@ impl AgentLoop {
     async fn execute_model_request(
         &self,
         request: &AgentRunRequest,
-        chat_request: ChatRequest,
+        mut chat_request: ChatRequest,
         response_id: ModelResponseId,
         sink: &mut dyn RunEventSink,
     ) -> Result<
@@ -1115,6 +1150,7 @@ impl AgentLoop {
         if request.run_control.is_cancelled() {
             return Ok(None);
         }
+        self.attach_provider_api_key(request, &mut chat_request)?;
 
         let mut collector = StreamingResponseCollector::new(response_id, sink);
         let response = {
@@ -1335,7 +1371,7 @@ impl AgentLoop {
     async fn run_compaction_request(
         &self,
         request: &AgentRunRequest,
-        compaction_request: ChatRequest,
+        mut compaction_request: ChatRequest,
         model_request_count: &mut usize,
         sink: &mut dyn RunEventSink,
     ) -> Result<String, AgentError> {
@@ -1376,6 +1412,7 @@ impl AgentLoop {
             }
             None => None,
         };
+        self.attach_provider_api_key(request, &mut compaction_request)?;
 
         let mut collector = CompactionResponseCollector::new(ModelResponseId::new(), sink);
         let response = self
@@ -2672,7 +2709,7 @@ impl AgentPermissionGuardian<'_> {
             effort: Some(crate::config::ReasoningEffort::None),
             summary: crate::config::ReasoningSummary::None,
         };
-        let guardian_reasoning_capability = match resolved_model.provider_api_mode {
+        let guardian_reasoning_capability = match resolved_model.provider_profile.api_mode() {
             crate::config::ProviderApiMode::Responses => {
                 crate::config::ProviderReasoningCapability::Responses {
                     supports_summary: false,
@@ -2753,6 +2790,9 @@ impl AgentPermissionGuardian<'_> {
             }
             None => None,
         };
+        self.agent_loop
+            .attach_provider_api_key(self.request, &mut guardian_request)
+            .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
 
         let response_id = ModelResponseId::new();
         let guardian_store = self.agent_loop.store.clone();
@@ -2995,9 +3035,7 @@ enum GuardianIsolationTransport {
 
 fn resolved_guardian_isolation_transport(request: &AgentRunRequest) -> GuardianIsolationTransport {
     let model = &request.turn.resolved_config().runtime_config().model;
-    if model.provider_metadata_mode == crate::config::ProviderMetadataMode::LmStudioNativeRequired
-        && model.provider_api_mode == crate::config::ProviderApiMode::Responses
-    {
+    if model.provider_profile == crate::config::ProviderProfile::LmStudio {
         GuardianIsolationTransport::LmStudioResponses
     } else {
         GuardianIsolationTransport::Unsupported
@@ -4569,7 +4607,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             name: "test".to_string(),
             context_window: 1,
             max_output_tokens: 32,
-            provider_metadata_mode: crate::config::ProviderMetadataMode::OpenAiCompatibleOnly,
+            provider_profile: crate::config::ProviderProfile::OpenAiCompatible,
             capabilities: crate::llm::ModelCapabilities {
                 supports_tools: true,
                 supports_reasoning: false,
@@ -4579,8 +4617,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         let provider = crate::config::ProviderTarget::new(
             "http://localhost",
             &model.name,
-            model.provider_metadata_mode,
-            crate::config::model::ProviderApiMode::ChatCompletions,
+            model.provider_profile,
             crate::config::ProviderDeadlines {
                 request_timeout_ms: 1,
                 connect_timeout_ms: 1,
@@ -6583,6 +6620,82 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         );
     }
 
+    #[tokio::test]
+    async fn provider_api_key_env_is_resolved_for_each_task_and_guardian_request_without_leak() {
+        const ENV_NAME: &str = "MOYAI_ROTATING_PROVIDER_KEY";
+        const REQUEST_KEYS: [&str; 3] = [
+            "first-task-request-secret",
+            "guardian-request-secret",
+            "second-task-request-secret",
+        ];
+        let resolver_call_count = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&resolver_call_count);
+        let resolver: Arc<ProviderApiKeyResolver> = Arc::new(move |env_name| {
+            assert_eq!(env_name, Some(ENV_NAME));
+            let index = resolver_calls.fetch_add(1, Ordering::SeqCst);
+            REQUEST_KEYS
+                .get(index)
+                .map(|value| Some((*value).to_string()))
+                .ok_or_else(|| LlmError::Message("unexpected provider-key resolution".to_string()))
+        });
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::AutoReview;
+        config.model.api_key_env = Some(ENV_NAME.to_string());
+
+        let run = run_scripted_with_api_key_resolver(
+            config,
+            vec![
+                scripted_escalated_shell_call("rotating_key_shell", "echo provider-key-check"),
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        r#"{"decision":"allow","rationale":"scoped command"}"#.to_string(),
+                    )],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            resolver,
+        )
+        .await
+        .expect("run with request-scoped provider keys");
+        let summary = run.summary.as_ref().expect("completed run");
+
+        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_eq!(
+            resolver_call_count.load(Ordering::SeqCst),
+            REQUEST_KEYS.len()
+        );
+        assert_eq!(run.requests.len(), REQUEST_KEYS.len());
+        for (request, expected_key) in run.requests.iter().zip(REQUEST_KEYS) {
+            assert_eq!(request.api_key(), Some(expected_key));
+            let debug = format!("{request:?}");
+            assert!(!debug.contains(expected_key));
+        }
+
+        let persisted = run
+            .store
+            .session_repo()
+            .get_session(run.session_id)
+            .await
+            .expect("persisted session");
+        assert_eq!(
+            persisted
+                .provider_connection
+                .as_ref()
+                .and_then(|connection| connection.api_key_env.as_deref()),
+            Some(ENV_NAME)
+        );
+        let public_session = serde_json::to_string(&persisted).expect("public session JSON");
+        let public_events = serde_json::to_string(&run.events).expect("public run-event JSON");
+        for secret in REQUEST_KEYS {
+            assert!(!public_session.contains(secret));
+            assert!(!public_events.contains(secret));
+        }
+    }
+
     #[test]
     fn permission_guardian_extra_body_only_preserves_context_size() {
         assert_eq!(permission_guardian_context_extra_body(None), None);
@@ -7176,7 +7289,10 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         ] {
             let mut config = ResolvedConfig::default();
             config.permissions.access_mode = AccessMode::AutoReview;
-            config.model.provider_api_mode = api_mode;
+            config.model.provider_profile = crate::config::ProviderProfile::from_legacy_modes(
+                crate::config::ProviderMetadataMode::LmStudioNativeRequired,
+                api_mode,
+            );
             let run = run_scripted(
                 config,
                 vec![
@@ -7273,7 +7389,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     async fn auto_review_unverified_transport_is_fenced_without_a_guardian_provider_request() {
         let mut config = ResolvedConfig::default();
         config.permissions.access_mode = AccessMode::AutoReview;
-        config.model.provider_api_mode = crate::config::ProviderApiMode::ChatCompletions;
+        config.model.provider_profile = crate::config::ProviderProfile::LmStudioChatCompletions;
         let run = run_scripted(
             config,
             vec![
@@ -8606,6 +8722,9 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                     model: "scripted".to_string(),
                     base_url: "http://local".to_string(),
                     access_mode: config.permissions.access_mode,
+                    provider_connection: Some(
+                        crate::session::SessionProviderConnection::from_model_config(&config.model),
+                    ),
                 },
                 workspace,
             )
@@ -9635,6 +9754,30 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         run_scripted_with_goal(config, responses, None).await
     }
 
+    async fn run_scripted_with_api_key_resolver(
+        config: ResolvedConfig,
+        responses: Vec<ScriptedResponse>,
+        resolver: Arc<ProviderApiKeyResolver>,
+    ) -> Result<ScriptedRun, AgentError> {
+        run_scripted_internal_with_prior_user_and_api_key_resolver(
+            config,
+            responses
+                .into_iter()
+                .map(ScriptedOutcome::Response)
+                .collect(),
+            None,
+            Vec::new(),
+            crate::cli::ReviewDecision::Approved,
+            RunControl::new(),
+            None,
+            false,
+            None,
+            None,
+            Some(resolver),
+        )
+        .await
+    }
+
     async fn run_scripted_with_goal(
         config: ResolvedConfig,
         responses: Vec<ScriptedResponse>,
@@ -9764,6 +9907,36 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         prior_user_text: Option<String>,
         success_commit_interrupt: Option<TurnInterruptionCause>,
     ) -> Result<ScriptedRun, AgentError> {
+        run_scripted_internal_with_prior_user_and_api_key_resolver(
+            config,
+            outcomes,
+            goal,
+            pending_steers,
+            review_decision,
+            run_control,
+            replacement_tool,
+            fail_committed_terminal_delivery,
+            prior_user_text,
+            success_commit_interrupt,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_scripted_internal_with_prior_user_and_api_key_resolver(
+        config: ResolvedConfig,
+        outcomes: Vec<ScriptedOutcome>,
+        goal: Option<(&str, ThreadGoalStatus, Option<i64>)>,
+        pending_steers: Vec<SteerTurn>,
+        review_decision: crate::cli::ReviewDecision,
+        run_control: RunControl,
+        replacement_tool: Option<Arc<dyn crate::tool::registry::Tool>>,
+        fail_committed_terminal_delivery: bool,
+        prior_user_text: Option<String>,
+        success_commit_interrupt: Option<TurnInterruptionCause>,
+        provider_api_key_resolver: Option<Arc<ProviderApiKeyResolver>>,
+    ) -> Result<ScriptedRun, AgentError> {
         let run_control_observer = run_control.clone();
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.keep()).expect("utf8 temp");
@@ -9791,6 +9964,9 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                     model: "scripted".to_string(),
                     base_url: "http://local".to_string(),
                     access_mode: config.permissions.access_mode,
+                    provider_connection: Some(
+                        crate::session::SessionProviderConnection::from_model_config(&config.model),
+                    ),
                 },
                 workspace.clone(),
             )
@@ -9807,6 +9983,11 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                         model: "scripted".to_string(),
                         base_url: "http://local".to_string(),
                         access_mode: config.permissions.access_mode,
+                        provider_connection: Some(
+                            crate::session::SessionProviderConnection::from_model_config(
+                                &config.model,
+                            ),
+                        ),
                     },
                     workspace,
                 )
@@ -9932,6 +10113,11 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             requests: Arc::clone(&requests),
         });
         let agent = AgentLoop::new(llm, registry, store.clone(), PromptBuilder, tool_services);
+        let agent = if let Some(resolver) = provider_api_key_resolver {
+            agent.with_provider_api_key_resolver(resolver)
+        } else {
+            agent
+        };
         let agent = if let Some(cause) = success_commit_interrupt {
             agent.with_before_success_terminal_commit(Arc::new(move || {
                 let request_paths = interrupt_request_paths.clone();

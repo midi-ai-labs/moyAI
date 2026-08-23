@@ -15,6 +15,7 @@ import type {
   DesktopViewState,
   DraftActionTarget,
   PromptReviewMutationTarget,
+  ProviderProfile,
   RunExpectedState,
   SessionSearchTarget,
 } from "./types.ts";
@@ -151,9 +152,11 @@ export function providerCapabilities(
     DesktopViewState,
     | "provider_loading"
     | "provider_base_url"
-    | "provider_metadata_mode"
+    | "provider_profile"
+    | "provider_api_key_env"
     | "provider_catalog_base_url"
-    | "provider_catalog_metadata_mode"
+    | "provider_catalog_profile"
+    | "provider_catalog_api_key_env"
     | "provider_context_window"
     | "provider_max_output_tokens"
     | "provider_selected_index"
@@ -162,27 +165,19 @@ export function providerCapabilities(
   >,
   options: {
     currentProviderLimitDraftDirty?: boolean;
-    providerCatalogReloadRequired?: boolean;
   } = {},
 ): Pick<UiCapabilities, "canLoadProviderModels" | "canApplyProvider"> {
   const urlValid = validateProviderBaseUrl(state.provider_base_url).ok;
   const limitsValid = positiveInteger(state.provider_context_window)
     && positiveInteger(state.provider_max_output_tokens);
-  const catalogOwnerMatches = state.provider_catalog_base_url !== null
-    && normalizeProviderBaseUrl(state.provider_base_url) === state.provider_catalog_base_url
-    && state.provider_metadata_mode === state.provider_catalog_metadata_mode;
   return {
     canLoadProviderModels: !state.provider_loading && urlValid && limitsValid,
-    canApplyProvider: options.providerCatalogReloadRequired !== true
-      && state.config_draft.external_owner_mutation_open
+    canApplyProvider: state.config_draft.external_owner_mutation_open
       && !state.provider_loading
       && urlValid
       && limitsValid
       && state.provider_selected_index >= 0
-      && (
-        (state.provider_apply_enabled && catalogOwnerMatches)
-        || options.currentProviderLimitDraftDirty === true
-      ),
+      && (state.provider_apply_enabled || options.currentProviderLimitDraftDirty === true),
   };
 }
 
@@ -191,6 +186,18 @@ export function normalizeProviderBaseUrl(input: string): string {
   return canonical.endsWith("/v1") && canonical.length > 3
     ? canonical.slice(0, -3)
     : canonical;
+}
+
+function normalizeApiKeyEnv(input: string): string | null {
+  const value = input.trim();
+  return value.length > 0 ? value : null;
+}
+
+function isProviderProfile(value: string | undefined): value is ProviderProfile {
+  return value === "lm_studio"
+    || value === "openai_compatible"
+    || value === "openai_responses"
+    || value === "lm_studio_chat_completions";
 }
 
 export interface DraftMutationSnapshot {
@@ -381,7 +388,8 @@ export function beginProviderCatalogRequest(
     providerOwner: providerOwner(state),
     providerRevision: uiState.drafts.providerCatalogIdentityRevision,
     baseUrl: normalizeProviderBaseUrl(uiState.drafts.provider.baseUrl),
-    metadataMode: uiState.drafts.provider.metadataMode,
+    providerProfile: uiState.drafts.provider.providerProfile,
+    apiKeyEnv: normalizeApiKeyEnv(uiState.drafts.provider.apiKeyEnv),
   } satisfies ProviderCatalogTarget, "single-flight", (token, target) => ({
     token,
     ...target,
@@ -420,7 +428,8 @@ export function providerDraftPayload(
   const payload: Record<string, unknown> = {
     input: {
       baseUrl: draft.baseUrl,
-      metadataMode: draft.metadataMode,
+      providerProfile: draft.providerProfile,
+      apiKeyEnv: draft.apiKeyEnv,
       contextWindow: draft.contextWindow,
       maxOutputTokens: draft.maxOutputTokens,
       selectedModelId: draft.selectedModelId,
@@ -626,9 +635,11 @@ export function deriveUiCapabilities(state: DesktopWebState, uiState: UiLocalSta
   const providerActions = providerCapabilities({
     provider_loading: state.provider_loading || uiState.providerCatalogTransaction.active !== null,
     provider_base_url: provider.baseUrl,
-    provider_metadata_mode: provider.metadataMode,
+    provider_profile: provider.providerProfile,
+    provider_api_key_env: provider.apiKeyEnv,
     provider_catalog_base_url: state.provider_catalog_base_url,
-    provider_catalog_metadata_mode: state.provider_catalog_metadata_mode,
+    provider_catalog_profile: state.provider_catalog_profile,
+    provider_catalog_api_key_env: state.provider_catalog_api_key_env,
     provider_context_window: provider.contextWindow,
     provider_max_output_tokens: provider.maxOutputTokens,
     provider_selected_index: selectedModelIndex,
@@ -636,7 +647,6 @@ export function deriveUiCapabilities(state: DesktopWebState, uiState: UiLocalSta
     config_draft: configDraft,
   }, {
     currentProviderLimitDraftDirty,
-    providerCatalogReloadRequired: uiState.rejectedProviderCatalogRequest !== null,
   });
   return {
     ...composer,
@@ -670,7 +680,7 @@ export function projectViewState(state: DesktopWebState, uiState: UiLocalState):
     ? {
       kind: "warning" as const,
       title: "モデル一覧の対象が変更されました",
-      hint: "現在のBase URLとProvider modeで、もう一度モデル一覧を読み込んでください。",
+      hint: "現在のBase URLとConnection typeで、もう一度モデル一覧を読み込んでください。",
       details: "編集中の接続先と一致しないモデル一覧は表示・適用されません。",
     }
     : state.provider_status;
@@ -684,12 +694,16 @@ export function projectViewState(state: DesktopWebState, uiState: UiLocalState):
     local_search_text: uiState.drafts.localSearch,
     session_search_text: uiState.drafts.sessionSearch,
     provider_base_url: providerDraft.baseUrl,
-    provider_metadata_mode: providerDraft.metadataMode,
+    provider_profile: providerDraft.providerProfile,
+    provider_api_key_env: providerDraft.apiKeyEnv,
     provider_context_window: providerDraft.contextWindow,
     provider_max_output_tokens: providerDraft.maxOutputTokens,
     provider_loading: providerLoading,
     provider_catalog_base_url: providerCatalogAccepted ? state.provider_catalog_base_url : null,
-    provider_catalog_metadata_mode: providerCatalogAccepted ? state.provider_catalog_metadata_mode : null,
+    provider_catalog_profile: providerCatalogAccepted ? state.provider_catalog_profile : null,
+    provider_catalog_api_key_env: providerCatalogAccepted
+      ? state.provider_catalog_api_key_env
+      : null,
     provider_models: providerModels,
     provider_model_ids: providerModelIds,
     provider_selected_index: providerCatalogAccepted && providerIndex >= 0 ? providerIndex : -1,
@@ -724,7 +738,8 @@ function providerCatalogRequestTargetsCurrentDraft(
   return request.providerOwner === providerOwner(state)
     && request.providerRevision === uiState.drafts.providerCatalogIdentityRevision
     && request.baseUrl === normalizeProviderBaseUrl(draft.baseUrl)
-    && request.metadataMode === draft.metadataMode;
+    && request.providerProfile === draft.providerProfile
+    && request.apiKeyEnv === normalizeApiKeyEnv(draft.apiKeyEnv);
 }
 
 function providerCatalogResultTargetsRequest(
@@ -734,7 +749,8 @@ function providerCatalogResultTargetsRequest(
   return state.provider_catalog_base_url === null
     || (
       normalizeProviderBaseUrl(state.provider_catalog_base_url) === request.baseUrl
-      && state.provider_catalog_metadata_mode === request.metadataMode
+      && state.provider_catalog_profile === request.providerProfile
+      && state.provider_catalog_api_key_env === request.apiKeyEnv
     );
 }
 
@@ -771,7 +787,8 @@ function providerCatalogOwnsCurrentDraft(
     && state.provider_catalog_base_url !== null
     && normalizeProviderBaseUrl(state.provider_catalog_base_url)
       === normalizeProviderBaseUrl(draft.baseUrl)
-    && state.provider_catalog_metadata_mode === draft.metadataMode;
+    && state.provider_catalog_profile === draft.providerProfile
+    && state.provider_catalog_api_key_env === normalizeApiKeyEnv(draft.apiKeyEnv);
 }
 
 function providerDraftForCurrentSurface(
@@ -789,13 +806,13 @@ function providerDraftFromConfigFields(
   fallback: ProviderDraft,
 ): ProviderDraft {
   const values = new Map(fields.map((field) => [field.key, field.value]));
-  const metadataMode = values.get("model.provider_metadata_mode");
+  const providerProfile = values.get("model.provider_profile");
   return {
     baseUrl: values.get("model.base_url") ?? fallback.baseUrl,
-    metadataMode: metadataMode === "lm_studio_native_required"
-      || metadataMode === "openai_compatible_only"
-        ? metadataMode
-        : fallback.metadataMode,
+    providerProfile: isProviderProfile(providerProfile)
+      ? providerProfile
+      : fallback.providerProfile,
+    apiKeyEnv: values.get("model.api_key_env") ?? fallback.apiKeyEnv,
     contextWindow: values.get("model.context_window") ?? fallback.contextWindow,
     maxOutputTokens: values.get("model.max_output_tokens") ?? fallback.maxOutputTokens,
     selectedModelId: values.get("model.model") ?? fallback.selectedModelId,
@@ -804,7 +821,8 @@ function providerDraftFromConfigFields(
 
 function sameProviderDraft(left: ProviderDraft, right: ProviderDraft): boolean {
   return left.baseUrl === right.baseUrl
-    && left.metadataMode === right.metadataMode
+    && left.providerProfile === right.providerProfile
+    && left.apiKeyEnv === right.apiKeyEnv
     && left.contextWindow === right.contextWindow
     && left.maxOutputTokens === right.maxOutputTokens
     && left.selectedModelId === right.selectedModelId;
@@ -812,7 +830,8 @@ function sameProviderDraft(left: ProviderDraft, right: ProviderDraft): boolean {
 
 function sameProviderCatalogIdentity(left: ProviderDraft, right: ProviderDraft): boolean {
   return normalizeProviderBaseUrl(left.baseUrl) === normalizeProviderBaseUrl(right.baseUrl)
-    && left.metadataMode === right.metadataMode;
+    && left.providerProfile === right.providerProfile
+    && normalizeApiKeyEnv(left.apiKeyEnv) === normalizeApiKeyEnv(right.apiKeyEnv);
 }
 
 export function activeConfigDraftProjection(
@@ -855,7 +874,8 @@ export function operationInvalidatesComposer(name: string | null): boolean {
 
 function hydrateProviderDraft(draft: ProviderDraft, state: DesktopWebState): void {
   draft.baseUrl = state.provider_base_url;
-  draft.metadataMode = state.provider_metadata_mode;
+  draft.providerProfile = state.provider_profile;
+  draft.apiKeyEnv = state.provider_api_key_env;
   draft.contextWindow = state.provider_context_window;
   draft.maxOutputTokens = state.provider_max_output_tokens;
   draft.selectedModelId = selectedProviderModelId(state);
@@ -867,7 +887,9 @@ function providerLimitDraftTargetsEffectiveProvider(
 ): boolean {
   const targetMatches = normalizeProviderBaseUrl(draft.baseUrl)
       === normalizeProviderBaseUrl(state.provider_effective_base_url)
-    && draft.metadataMode === state.provider_effective_metadata_mode
+    && draft.providerProfile === state.provider_effective_profile
+    && normalizeApiKeyEnv(draft.apiKeyEnv)
+      === normalizeApiKeyEnv(state.provider_effective_api_key_env)
     && draft.selectedModelId === state.provider_effective_model_id;
   if (!targetMatches) return false;
   return draft.contextWindow.trim() !== state.provider_effective_context_window.trim()

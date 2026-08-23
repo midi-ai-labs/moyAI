@@ -1,4 +1,8 @@
-import type { ConfigFieldProjection, SessionSettingsMutationTarget } from "./types.ts";
+import type {
+  ConfigFieldProjection,
+  ProviderProfile,
+  SessionSettingsMutationTarget,
+} from "./types.ts";
 import { validateConfigInput } from "./utils.ts";
 
 export type SessionAccessMode = "default" | "auto_review" | "full_access";
@@ -8,6 +12,8 @@ export type SessionSettingsTarget = SessionSettingsMutationTarget;
 export interface SessionSettingsDraft {
   baseUrl: string;
   model: string;
+  providerProfile: ProviderProfile;
+  apiKeyEnv: string;
   contextWindow: string;
   maxOutputTokens: string;
   accessMode: SessionAccessMode;
@@ -56,6 +62,15 @@ const U32_MAX = 4_294_967_295;
 const SESSION_FIELD_DESCRIPTORS: Readonly<Record<SessionSettingsDraftField, ConfigFieldProjection>> = {
   baseUrl: configField("model.base_url", "string", true, null, null, []),
   model: configField("model.model", "string", true, null, null, []),
+  providerProfile: configField(
+    "model.provider_profile",
+    "enum",
+    true,
+    null,
+    null,
+    ["lm_studio", "openai_compatible", "openai_responses", "lm_studio_chat_completions"],
+  ),
+  apiKeyEnv: configField("model.api_key_env", "string", false, null, null, []),
   contextWindow: configField("model.context_window", "integer", false, 1, U32_MAX, []),
   maxOutputTokens: configField("model.max_output_tokens", "integer", false, 0, U32_MAX, []),
   accessMode: configField(
@@ -183,6 +198,11 @@ export function validateSessionSettingsDraft(
   const validations: Record<SessionSettingsDraftField, SessionSettingsFieldValidation> = {
     baseUrl: validateConfigInput(SESSION_FIELD_DESCRIPTORS.baseUrl, draft.baseUrl),
     model: validateConfigInput(SESSION_FIELD_DESCRIPTORS.model, draft.model),
+    providerProfile: validateConfigInput(
+      SESSION_FIELD_DESCRIPTORS.providerProfile,
+      draft.providerProfile,
+    ),
+    apiKeyEnv: validateConfigInput(SESSION_FIELD_DESCRIPTORS.apiKeyEnv, draft.apiKeyEnv),
     contextWindow: validateConfigInput(
       SESSION_FIELD_DESCRIPTORS.contextWindow,
       draft.contextWindow,
@@ -195,6 +215,8 @@ export function validateSessionSettingsDraft(
   };
   const orderedFields: readonly SessionSettingsDraftField[] = [
     "baseUrl",
+    "providerProfile",
+    "apiKeyEnv",
     "model",
     "contextWindow",
     "maxOutputTokens",
@@ -293,6 +315,8 @@ function sameSessionSettingsDraft(
 ): boolean {
   return expected.baseUrl === actual.baseUrl
     && expected.model === actual.model
+    && expected.providerProfile === actual.providerProfile
+    && expected.apiKeyEnv === actual.apiKeyEnv
     && expected.contextWindow === actual.contextWindow
     && expected.maxOutputTokens === actual.maxOutputTokens
     && expected.accessMode === actual.accessMode;

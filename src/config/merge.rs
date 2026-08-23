@@ -4,6 +4,47 @@ use super::model::{
     PartialMultiAgentConfig, PartialPermissionsConfig, PartialResolvedConfig, PartialSessionConfig,
     PartialShellConfig, PartialToolOutputConfig, PartialWorkspaceConfig, ResolvedConfig,
 };
+use super::turn::ProviderEndpoint;
+
+pub(crate) fn normalize_provider_profile_alias(
+    patch: &mut PartialResolvedConfig,
+    inherited_profile: crate::config::ProviderProfile,
+    canonical_name: &str,
+    legacy_metadata_name: &str,
+    legacy_api_name: &str,
+) -> Result<(), String> {
+    let Some(model) = patch.model.as_mut() else {
+        return Ok(());
+    };
+    let canonical = model.provider_profile;
+    let legacy_metadata = model.provider_metadata_mode;
+    let legacy_api = model.provider_api_mode;
+
+    if let Some(canonical) = canonical {
+        if let Some(legacy_metadata) = legacy_metadata
+            && legacy_metadata != canonical.metadata_mode()
+        {
+            return Err(format!(
+                "`{canonical_name}` conflicts with legacy `{legacy_metadata_name}`; remove the legacy field or choose values that describe one provider profile"
+            ));
+        }
+        if let Some(legacy_api) = legacy_api
+            && legacy_api != canonical.api_mode()
+        {
+            return Err(format!(
+                "`{canonical_name}` conflicts with legacy `{legacy_api_name}`; remove the legacy field or choose values that describe one provider profile"
+            ));
+        }
+    } else if legacy_metadata.is_some() || legacy_api.is_some() {
+        model.provider_profile = Some(crate::config::ProviderProfile::from_legacy_modes(
+            legacy_metadata.unwrap_or_else(|| inherited_profile.metadata_mode()),
+            legacy_api.unwrap_or_else(|| inherited_profile.api_mode()),
+        ));
+    }
+    model.provider_metadata_mode = None;
+    model.provider_api_mode = None;
+    Ok(())
+}
 
 pub(crate) fn normalize_request_timeout_alias(
     patch: &mut PartialResolvedConfig,
@@ -28,17 +69,52 @@ pub(crate) fn normalize_request_timeout_alias(
 }
 
 fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfig) {
+    let next_profile = patch.provider_profile.or_else(|| {
+        (patch.provider_metadata_mode.is_some() || patch.provider_api_mode.is_some()).then(|| {
+            crate::config::ProviderProfile::from_legacy_modes(
+                patch
+                    .provider_metadata_mode
+                    .unwrap_or_else(|| target.provider_profile.metadata_mode()),
+                patch
+                    .provider_api_mode
+                    .unwrap_or_else(|| target.provider_profile.api_mode()),
+            )
+        })
+    });
+    let connection_target_changed = patch
+        .base_url
+        .as_deref()
+        .is_some_and(|base_url| !same_provider_endpoint(&target.base_url, base_url))
+        || next_profile.is_some_and(|profile| profile != target.provider_profile);
+    if connection_target_changed {
+        if patch.api_key_env.is_none() {
+            target.api_key_env = None;
+        }
+        if patch.extra_headers.is_none() {
+            target.extra_headers.clear();
+        }
+        if patch.extra_body_json.is_none() {
+            target.extra_body_json = None;
+        }
+    }
     if let Some(value) = patch.base_url {
         target.base_url = value;
     }
     if let Some(value) = patch.model {
         target.model = value;
     }
-    if let Some(value) = patch.provider_metadata_mode {
-        target.provider_metadata_mode = value;
+    if let Some(value) = patch.provider_profile {
+        target.provider_profile = value;
     }
-    if let Some(value) = patch.provider_api_mode {
-        target.provider_api_mode = value;
+    if patch.provider_metadata_mode.is_some() || patch.provider_api_mode.is_some() {
+        target.provider_profile = crate::config::ProviderProfile::from_legacy_modes(
+            patch
+                .provider_metadata_mode
+                .unwrap_or_else(|| target.provider_profile.metadata_mode()),
+            patch
+                .provider_api_mode
+                .unwrap_or_else(|| target.provider_profile.api_mode()),
+        );
     }
     if let Some(value) = patch.chat_completions_reasoning_parameters {
         target.chat_completions_reasoning_parameters = Some(value);
@@ -108,6 +184,16 @@ fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfi
     }
     if let Some(value) = patch.extra_body_json {
         target.extra_body_json = Some(value);
+    }
+}
+
+fn same_provider_endpoint(left: &str, right: &str) -> bool {
+    match (
+        ProviderEndpoint::parse(left),
+        ProviderEndpoint::parse(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left.trim() == right.trim(),
     }
 }
 
@@ -330,10 +416,11 @@ pub fn apply_patch(mut target: ResolvedConfig, patch: PartialResolvedConfig) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_patch, normalize_request_timeout_alias};
+    use super::{apply_patch, normalize_provider_profile_alias, normalize_request_timeout_alias};
     use crate::config::model::{
         ChatCompletionsReasoningParameters, PartialModelConfig, PartialResolvedConfig,
-        ProviderApiMode, ReasoningEffort, ReasoningSummary, ResolvedConfig,
+        ProviderApiMode, ProviderMetadataMode, ProviderProfile, ReasoningEffort, ReasoningSummary,
+        ResolvedConfig,
     };
 
     #[test]
@@ -358,8 +445,8 @@ mod tests {
         );
 
         assert_eq!(
-            resolved.model.provider_api_mode,
-            ProviderApiMode::ChatCompletions
+            resolved.model.provider_profile,
+            ProviderProfile::LmStudioChatCompletions
         );
         assert_eq!(
             resolved.model.chat_completions_reasoning_parameters,
@@ -388,6 +475,112 @@ mod tests {
         );
 
         assert_eq!(resolved.model.request_timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn provider_profile_alias_normalization_is_atomic_and_layer_aware() {
+        let mut patch = PartialResolvedConfig {
+            model: Some(PartialModelConfig {
+                provider_metadata_mode: Some(ProviderMetadataMode::OpenAiCompatibleOnly),
+                ..PartialModelConfig::default()
+            }),
+            ..PartialResolvedConfig::default()
+        };
+
+        normalize_provider_profile_alias(
+            &mut patch,
+            ProviderProfile::LmStudioChatCompletions,
+            "model.provider_profile",
+            "model.provider_metadata_mode",
+            "model.provider_api_mode",
+        )
+        .expect("sparse legacy profile");
+
+        let model = patch.model.expect("model patch");
+        assert_eq!(
+            model.provider_profile,
+            Some(ProviderProfile::OpenAiCompatible)
+        );
+        assert_eq!(model.provider_metadata_mode, None);
+        assert_eq!(model.provider_api_mode, None);
+    }
+
+    #[test]
+    fn provider_target_layer_clears_only_credentials_it_does_not_explicitly_own() {
+        let mut base = ResolvedConfig::default();
+        base.model.base_url = "https://provider-a.example/v1".to_string();
+        base.model.provider_profile = ProviderProfile::LmStudio;
+        base.model.api_key_env = Some("PROVIDER_A_KEY".to_string());
+        base.model.extra_headers = std::collections::BTreeMap::from([(
+            "X-Provider-Secret".to_string(),
+            "provider-a-secret".to_string(),
+        )]);
+        base.model.extra_body_json = Some(serde_json::json!({
+            "api_key": "provider-a-body-secret"
+        }));
+
+        let changed_url = apply_patch(
+            base.clone(),
+            PartialResolvedConfig {
+                model: Some(PartialModelConfig {
+                    base_url: Some("https://provider-b.example/v1".to_string()),
+                    ..PartialModelConfig::default()
+                }),
+                ..PartialResolvedConfig::default()
+            },
+        );
+        assert_eq!(changed_url.model.api_key_env, None);
+        assert!(changed_url.model.extra_headers.is_empty());
+        assert_eq!(changed_url.model.extra_body_json, None);
+
+        let same_canonical_url = apply_patch(
+            base.clone(),
+            PartialResolvedConfig {
+                model: Some(PartialModelConfig {
+                    base_url: Some("https://provider-a.example/v1/".to_string()),
+                    ..PartialModelConfig::default()
+                }),
+                ..PartialResolvedConfig::default()
+            },
+        );
+        assert_eq!(
+            same_canonical_url.model.api_key_env.as_deref(),
+            Some("PROVIDER_A_KEY")
+        );
+        assert_eq!(same_canonical_url.model.extra_headers.len(), 1);
+        assert_eq!(
+            same_canonical_url.model.extra_body_json,
+            base.model.extra_body_json
+        );
+
+        let changed_profile_with_explicit_key = apply_patch(
+            base,
+            PartialResolvedConfig {
+                model: Some(PartialModelConfig {
+                    provider_profile: Some(ProviderProfile::OpenAiCompatible),
+                    api_key_env: Some(Some("PROVIDER_B_KEY".to_string())),
+                    ..PartialModelConfig::default()
+                }),
+                ..PartialResolvedConfig::default()
+            },
+        );
+        assert_eq!(
+            changed_profile_with_explicit_key
+                .model
+                .api_key_env
+                .as_deref(),
+            Some("PROVIDER_B_KEY")
+        );
+        assert!(
+            changed_profile_with_explicit_key
+                .model
+                .extra_headers
+                .is_empty()
+        );
+        assert_eq!(
+            changed_profile_with_explicit_key.model.extra_body_json,
+            None
+        );
     }
 
     #[test]

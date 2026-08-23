@@ -916,6 +916,7 @@ function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
     sideChat: {
       draft: sideChatDraft?.text ?? "",
       setupBaseUrl: sideChatDraft?.setupBaseUrl ?? "",
+      setupProviderProfile: sideChatDraft?.setupProviderProfile ?? state.provider_effective_profile,
       setupModel: sideChatDraft?.setupModel ?? "",
       catalog: sideChatCatalogViewForState(uiState, state),
       catalogLoadEnabled: sideChatCatalogLoadOpen(uiState, state),

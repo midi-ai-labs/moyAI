@@ -16,7 +16,7 @@ use super::provider_config_state::{DesktopProviderConfigState, DesktopProviderSt
 use super::query::build_session_detail_from_app_state_with_session;
 use super::startup::DesktopStartupState;
 use super::view_state::DesktopViewState;
-use crate::config::ProviderMetadataMode;
+use crate::config::ProviderProfile;
 use crate::config::ResolvedConfig;
 use crate::docling::DoclingReadinessResult;
 use crate::llm::{ProviderModelInfo, ProviderModelLoadState, normalize_provider_base_url};
@@ -931,7 +931,8 @@ impl DesktopState {
     pub fn accept_provider_action_input(
         &mut self,
         base_url: String,
-        metadata_mode: ProviderMetadataMode,
+        profile: ProviderProfile,
+        api_key_env: String,
         context_window: String,
         max_output_tokens: String,
         selected_model_id: String,
@@ -945,9 +946,11 @@ impl DesktopState {
             self.provider_config.provider_loaded_base_url.clone()
         };
         let target_changed = current_target_base_url.as_deref() != Some(normalized.as_str())
-            || self.provider_config.provider_metadata_mode_input != metadata_mode;
+            || self.provider_config.provider_profile_input != profile
+            || self.provider_config.provider_api_key_env_input.trim() != api_key_env.trim();
         self.provider_config.provider_base_url_input = base_url;
-        self.provider_config.provider_metadata_mode_input = metadata_mode;
+        self.provider_config.provider_profile_input = profile;
+        self.provider_config.provider_api_key_env_input = api_key_env;
         self.provider_config.provider_context_window_input = context_window;
         self.provider_config.provider_max_output_tokens_input = max_output_tokens;
         self.provider_config.provider_selected_model_id_input = selected_model_id.clone();
@@ -964,7 +967,8 @@ impl DesktopState {
         if target_changed {
             self.provider_config.provider_loading = false;
             self.provider_config.provider_loaded_base_url = None;
-            self.provider_config.provider_loaded_metadata_mode = None;
+            self.provider_config.provider_loaded_profile = None;
+            self.provider_config.provider_loaded_api_key_env = None;
             self.view
                 .async_operations
                 .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
@@ -1559,6 +1563,9 @@ impl DesktopState {
         if let Some(base_url) = &patch.base_url {
             next.base_url.clone_from(base_url);
         }
+        if let Some(provider_connection) = &patch.provider_connection {
+            next.provider_connection = Some(provider_connection.clone());
+        }
         if let Some(access_mode) = patch.access_mode {
             next.access_mode = access_mode;
         }
@@ -1630,8 +1637,9 @@ impl DesktopState {
         }
         let global_config = self.global_config.clone();
         self.provider_config.provider_base_url_input = global_config.model.base_url.clone();
-        self.provider_config.provider_metadata_mode_input =
-            global_config.model.provider_metadata_mode;
+        self.provider_config.provider_profile_input = global_config.model.provider_profile;
+        self.provider_config.provider_api_key_env_input =
+            global_config.model.api_key_env.clone().unwrap_or_default();
         self.provider_config.provider_context_window_input =
             self.global_config.model.context_window.to_string();
         self.provider_config.provider_max_output_tokens_input =
@@ -1748,7 +1756,8 @@ impl DesktopState {
             .async_operations
             .begin_unique(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
         self.provider_config.provider_loaded_base_url = None;
-        self.provider_config.provider_loaded_metadata_mode = None;
+        self.provider_config.provider_loaded_profile = None;
+        self.provider_config.provider_loaded_api_key_env = None;
         self.provider_config.set_status(
             DesktopProviderStatusKind::Loading,
             "Provider 状態",
@@ -1835,8 +1844,19 @@ impl DesktopState {
             .map(|index| index as i32)
             .unwrap_or(-1);
         self.provider_config.provider_loaded_base_url = Some(normalized_base_url);
-        self.provider_config.provider_loaded_metadata_mode =
-            Some(self.provider_config.provider_metadata_mode_input);
+        self.provider_config.provider_loaded_profile =
+            Some(self.provider_config.provider_profile_input);
+        self.provider_config.provider_loaded_api_key_env = (!self
+            .provider_config
+            .provider_api_key_env_input
+            .trim()
+            .is_empty())
+        .then(|| {
+            self.provider_config
+                .provider_api_key_env_input
+                .trim()
+                .to_string()
+        });
         self.provider_config.provider_loading = false;
         self.view
             .async_operations
@@ -1865,7 +1885,8 @@ impl DesktopState {
             .async_operations
             .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
         self.provider_config.provider_loaded_base_url = None;
-        self.provider_config.provider_loaded_metadata_mode = None;
+        self.provider_config.provider_loaded_profile = None;
+        self.provider_config.provider_loaded_api_key_env = None;
         let message = message.into();
         self.provider_config.set_status(
             DesktopProviderStatusKind::Error,
@@ -1887,7 +1908,8 @@ impl DesktopState {
     pub fn cancel_provider_model_load(&mut self) {
         self.provider_config.provider_loading = false;
         self.provider_config.provider_loaded_base_url = None;
-        self.provider_config.provider_loaded_metadata_mode = None;
+        self.provider_config.provider_loaded_profile = None;
+        self.provider_config.provider_loaded_api_key_env = None;
         self.view
             .async_operations
             .finish_kind(DesktopAsyncOperationKind::ProviderModelCatalogLoad);
@@ -2059,15 +2081,10 @@ impl DesktopState {
 
     pub fn can_apply_provider_selection(&self) -> bool {
         self.provider_selection_input_is_complete()
-            && (self.provider_catalog_owns_current_target()
-                || self.provider_input_matches_effective_target()
-                || self.provider_input_matches_global_target())
     }
 
     pub(crate) fn can_save_provider_selection_global(&self) -> bool {
         self.provider_selection_input_is_complete()
-            && (self.provider_catalog_owns_current_target()
-                || self.provider_input_matches_global_target())
     }
 
     fn provider_selection_input_is_complete(&self) -> bool {
@@ -2086,16 +2103,19 @@ impl DesktopState {
     pub fn provider_catalog_owns_current_target(&self) -> bool {
         let normalized = normalize_provider_base_url(&self.provider_config.provider_base_url_input);
         self.provider_config.provider_loaded_base_url.as_deref() == Some(normalized.as_str())
-            && self.provider_config.provider_loaded_metadata_mode
-                == Some(self.provider_config.provider_metadata_mode_input)
+            && self.provider_config.provider_loaded_profile
+                == Some(self.provider_config.provider_profile_input)
+            && self.provider_config.provider_loaded_api_key_env.as_deref()
+                == non_empty_trimmed(&self.provider_config.provider_api_key_env_input)
     }
 
     pub(crate) fn provider_input_matches_effective_target(&self) -> bool {
         let current_model = &self.provider_config.effective_config.model;
         normalize_provider_base_url(&current_model.base_url)
             == normalize_provider_base_url(&self.provider_config.provider_base_url_input)
-            && self.provider_config.provider_metadata_mode_input
-                == current_model.provider_metadata_mode
+            && self.provider_config.provider_profile_input == current_model.provider_profile
+            && non_empty_trimmed(&self.provider_config.provider_api_key_env_input)
+                == current_model.api_key_env.as_deref()
             && self.selected_provider_model() == Some(current_model.model.as_str())
     }
 
@@ -2103,19 +2123,24 @@ impl DesktopState {
         let current_model = &self.global_config.model;
         normalize_provider_base_url(&current_model.base_url)
             == normalize_provider_base_url(&self.provider_config.provider_base_url_input)
-            && self.provider_config.provider_metadata_mode_input
-                == current_model.provider_metadata_mode
+            && self.provider_config.provider_profile_input == current_model.provider_profile
+            && non_empty_trimmed(&self.provider_config.provider_api_key_env_input)
+                == current_model.api_key_env.as_deref()
             && self.selected_provider_model() == Some(current_model.model.as_str())
     }
 
     fn with_provider_fields(mut self) -> Self {
         self.provider_config.provider_base_url_input =
             self.provider_config.effective_config.model.base_url.clone();
-        self.provider_config.provider_metadata_mode_input = self
+        self.provider_config.provider_profile_input =
+            self.provider_config.effective_config.model.provider_profile;
+        self.provider_config.provider_api_key_env_input = self
             .provider_config
             .effective_config
             .model
-            .provider_metadata_mode;
+            .api_key_env
+            .clone()
+            .unwrap_or_default();
         self.provider_config.provider_context_window_input = self
             .provider_config
             .effective_config
@@ -2129,7 +2154,8 @@ impl DesktopState {
             .max_output_tokens
             .to_string();
         self.provider_config.provider_loaded_base_url = None;
-        self.provider_config.provider_loaded_metadata_mode = None;
+        self.provider_config.provider_loaded_profile = None;
+        self.provider_config.provider_loaded_api_key_env = None;
         self
     }
 
@@ -2162,31 +2188,20 @@ pub(crate) fn resolved_config_for_root_session(
     global: &ResolvedConfig,
     session: &crate::session::SessionRecord,
 ) -> ResolvedConfig {
-    let mut effective = global.clone();
-    effective.model.base_url = session.base_url.clone();
-    effective.model.model = session.model.clone();
-    effective.permissions.access_mode = session.access_mode;
-    if let Some(value) = session.model_parameters.context_window {
-        effective.model.context_window = value;
-    }
-    if let Some(value) = session.model_parameters.max_output_tokens {
-        effective.model.max_output_tokens = value;
-    }
-    if let Some(value) = session.model_parameters.temperature {
-        effective.model.temperature = Some(value);
-    }
-    if let Some(value) = session.model_parameters.top_p {
-        effective.model.top_p = Some(value);
-    }
-    if let Some(value) = session.model_parameters.top_k {
-        effective.model.top_k = Some(value);
-    }
-    effective
+    crate::session::resolved_config_for_session(global, session)
+}
+
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 fn session_provider_settings_match(current: &ResolvedConfig, next: &ResolvedConfig) -> bool {
     current.model.base_url == next.model.base_url
         && current.model.model == next.model.model
+        && current.model.provider_profile == next.model.provider_profile
+        && current.model.api_key_env == next.model.api_key_env
+        && current.model.extra_headers == next.model.extra_headers
         && current.model.context_window == next.model.context_window
         && current.model.max_output_tokens == next.model.max_output_tokens
         && current.model.temperature == next.model.temperature
@@ -2349,6 +2364,7 @@ mod tests {
             base_url: "http://local".to_string(),
             access_mode: AccessMode::FullAccess,
             model_parameters: SessionModelParameters::default(),
+            provider_connection: None,
             session_settings_revision: 0,
             created_at_ms: 1,
             updated_at_ms: 2,
@@ -3155,7 +3171,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_apply_accepts_the_current_target_without_reloading_catalog() {
+    fn provider_apply_accepts_local_valid_manual_targets_without_reloading_catalog() {
         let mut config = ResolvedConfig::default();
         config.model.base_url = "http://127.0.0.1:1234".to_string();
         config.model.model = "catalog-model".to_string();
@@ -3170,19 +3186,13 @@ mod tests {
         );
 
         state.provider_config.provider_base_url_input = "http://127.0.0.1:5678".to_string();
-        assert!(!state.can_apply_provider_selection());
+        assert!(state.can_apply_provider_selection());
+        assert!(state.can_save_provider_selection_global());
         state.provider_config.provider_base_url_input = config.model.base_url.clone();
-        state.provider_config.provider_metadata_mode_input =
-            match config.model.provider_metadata_mode {
-                ProviderMetadataMode::LmStudioNativeRequired => {
-                    ProviderMetadataMode::OpenAiCompatibleOnly
-                }
-                ProviderMetadataMode::OpenAiCompatibleOnly => {
-                    ProviderMetadataMode::LmStudioNativeRequired
-                }
-            };
-        assert!(!state.can_apply_provider_selection());
-        state.provider_config.provider_metadata_mode_input = config.model.provider_metadata_mode;
+        state.provider_config.provider_profile_input = ProviderProfile::OpenAiCompatible;
+        assert!(state.can_apply_provider_selection());
+        assert!(state.can_save_provider_selection_global());
+        state.provider_config.provider_profile_input = config.model.provider_profile;
         state.provider_config.provider_selected_model_id_input = "other-model".to_string();
         state
             .provider_config
@@ -3190,7 +3200,8 @@ mod tests {
             .push("other-model".to_string());
         state.provider_config.provider_selected_index =
             (state.provider_config.provider_models.len() - 1) as i32;
-        assert!(!state.can_apply_provider_selection());
+        assert!(state.can_apply_provider_selection());
+        assert!(state.can_save_provider_selection_global());
 
         let mut catalog_info = provider_info_from_config(&config);
         catalog_info.context_window = Some(262_144);
@@ -3201,20 +3212,12 @@ mod tests {
         assert!(state.can_apply_provider_selection());
         assert!(state.provider_catalog_owns_current_target());
         assert_eq!(
-            state.provider_config.provider_loaded_metadata_mode,
-            Some(config.model.provider_metadata_mode)
+            state.provider_config.provider_loaded_profile,
+            Some(config.model.provider_profile)
         );
-        state.provider_config.provider_metadata_mode_input =
-            match config.model.provider_metadata_mode {
-                ProviderMetadataMode::LmStudioNativeRequired => {
-                    ProviderMetadataMode::OpenAiCompatibleOnly
-                }
-                ProviderMetadataMode::OpenAiCompatibleOnly => {
-                    ProviderMetadataMode::LmStudioNativeRequired
-                }
-            };
+        state.provider_config.provider_profile_input = ProviderProfile::OpenAiCompatible;
         assert!(!state.provider_catalog_owns_current_target());
-        state.provider_config.provider_metadata_mode_input = config.model.provider_metadata_mode;
+        state.provider_config.provider_profile_input = config.model.provider_profile;
 
         let mut same_target = config.clone();
         same_target.model.context_window = 65_536;
@@ -4261,7 +4264,8 @@ mod tests {
 
         assert!(!state.accept_provider_action_input(
             config.model.base_url.clone(),
-            config.model.provider_metadata_mode,
+            config.model.provider_profile,
+            config.model.api_key_env.clone().unwrap_or_default(),
             config.model.context_window.to_string(),
             config.model.max_output_tokens.to_string(),
             config.model.model.clone(),
@@ -4270,7 +4274,8 @@ mod tests {
 
         assert!(state.accept_provider_action_input(
             "http://127.0.0.1:5678".to_string(),
-            config.model.provider_metadata_mode,
+            config.model.provider_profile,
+            config.model.api_key_env.clone().unwrap_or_default(),
             config.model.context_window.to_string(),
             config.model.max_output_tokens.to_string(),
             config.model.model,

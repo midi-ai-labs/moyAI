@@ -330,7 +330,7 @@ function installProbeExpression(probeId, maxEvents) {
         state.droppedThrough = removed.at(-1)?.sequence ?? state.droppedThrough;
       }
     };
-    for (const type of ['pointermove', 'pointerdown', 'pointerup', 'click', 'keydown', 'keyup', 'input', 'focusin']) {
+    for (const type of ['pointermove', 'pointerdown', 'pointerup', 'click', 'keydown', 'keyup', 'input', 'change', 'focusin']) {
       document.addEventListener(type, record, { capture: true, signal: controller.signal });
     }
     registry.set(probeId, state);

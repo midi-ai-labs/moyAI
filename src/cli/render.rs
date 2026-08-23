@@ -713,6 +713,7 @@ fn renderer_fixture_session_record(title: &str) -> SessionRecord {
         completed_at_ms: Some(3),
         access_mode: crate::config::AccessMode::Default,
         model_parameters: crate::session::SessionModelParameters::default(),
+        provider_connection: None,
         session_settings_revision: 0,
     }
 }

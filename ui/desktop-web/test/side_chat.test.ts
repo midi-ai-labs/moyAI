@@ -48,6 +48,7 @@ function sideChat(overrides: Partial<SideChatProjection> = {}): SideChatProjecti
     owner_session_id: "session-a",
     model: "gemma-test",
     base_url: "http://127.0.0.1:1234/v1",
+    provider_profile: "openai_compatible",
     status: "idle",
     phase: "idle",
     last_error: "",
@@ -73,11 +74,14 @@ function state(
       ownerGeneration: "1",
     },
     provider_base_url: "http://127.0.0.1:1234/v1",
-    provider_metadata_mode: "openai_compatible_only",
+    provider_profile: "openai_compatible",
+    provider_api_key_env: "",
     provider_effective_base_url: "http://127.0.0.1:1234/v1",
-    provider_effective_metadata_mode: "openai_compatible_only",
+    provider_effective_profile: "openai_compatible",
+    provider_effective_api_key_env: "",
     provider_catalog_base_url: null,
-    provider_catalog_metadata_mode: null,
+    provider_catalog_profile: null,
+    provider_catalog_api_key_env: null,
     provider_model_ids: [],
     provider_models: [],
     config_target: {
@@ -113,6 +117,7 @@ function state(
 function useSidePane(overrides: {
   draft?: string;
   baseUrl?: string;
+  providerProfile?: "lm_studio" | "openai_compatible" | "openai_responses" | "lm_studio_chat_completions";
   model?: string;
   pending?: boolean;
   confirmingDelete?: boolean;
@@ -139,6 +144,7 @@ function useSidePane(overrides: {
       ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.sideChat,
       draft: overrides.draft ?? "",
       setupBaseUrl: overrides.baseUrl ?? "",
+      setupProviderProfile: overrides.providerProfile ?? "openai_compatible",
       setupModel: overrides.model ?? "",
       catalog: overrides.catalog ?? DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.sideChat.catalog,
       catalogLoadEnabled: overrides.catalogLoadEnabled ?? false,
@@ -236,7 +242,8 @@ test("Settings presents Main and Side LLM URL and native model selection consist
     ...state(),
     overlay: "config",
     provider_catalog_base_url: "http://main.test",
-    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_catalog_profile: "openai_compatible",
+    provider_catalog_api_key_env: null,
     provider_model_ids: ["qwen-main", "qwen-main-alt"],
     provider_models: ["Qwen Main（ロード済み）", "Qwen Main Alt（未ロード）"],
     config_fields: [
@@ -261,14 +268,24 @@ test("Settings presents Main and Side LLM URL and native model selection consist
         options: [],
       },
       {
-        key: "model.provider_metadata_mode",
-        value: "openai_compatible_only",
+        key: "model.provider_profile",
+        value: "openai_compatible",
         env_override: null,
         value_type: "enum",
         required: true,
         min_value: null,
         max_value: null,
-        options: ["lm_studio_native_required", "openai_compatible_only"],
+        options: ["lm_studio", "openai_compatible", "openai_responses", "lm_studio_chat_completions"],
+      },
+      {
+        key: "model.api_key_env",
+        value: "",
+        env_override: null,
+        value_type: "string",
+        required: false,
+        min_value: null,
+        max_value: null,
+        options: [],
       },
     ],
   });
@@ -302,7 +319,8 @@ test("Main Settings never offers model rows from a catalog owned by another URL"
     ...state(),
     overlay: "config",
     provider_catalog_base_url: "http://stale-main.test",
-    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_catalog_profile: "openai_compatible",
+    provider_catalog_api_key_env: null,
     provider_model_ids: ["stale-model"],
     provider_models: ["Stale model"],
     config_fields: [
@@ -327,14 +345,24 @@ test("Main Settings never offers model rows from a catalog owned by another URL"
         options: [],
       },
       {
-        key: "model.provider_metadata_mode",
-        value: "openai_compatible_only",
+        key: "model.provider_profile",
+        value: "openai_compatible",
         env_override: null,
         value_type: "enum",
         required: true,
         min_value: null,
         max_value: null,
-        options: ["openai_compatible_only"],
+        options: ["openai_compatible"],
+      },
+      {
+        key: "model.api_key_env",
+        value: "",
+        env_override: null,
+        value_type: "string",
+        required: false,
+        min_value: null,
+        max_value: null,
+        options: [],
       },
     ],
   });
@@ -345,7 +373,7 @@ test("Main Settings never offers model rows from a catalog owned by another URL"
 
   assert.match(main, /<option value="current-model" selected>current-model（現在の設定）<\/option>/);
   assert.doesNotMatch(main, /stale-model|Stale model/);
-  assert.match(main, /現在のLLM URLとProvider modeに対応する候補を取得/);
+  assert.match(main, /現在のLLM URLとConnection typeに対応する候補を取得/);
 });
 
 test("Settings model dropdown exposes loaded options and retains a current model outside the catalog", () => {
@@ -461,7 +489,7 @@ test("Side Chat model catalog load is explicit, canonical, and session scoped", 
       return {
         ownerSessionId: "session-a",
         baseUrl: "http://side.test",
-        metadataMode: "openai_compatible_only" as const,
+        providerProfile: "openai_compatible" as const,
         configGeneration: "7",
         models: [{
           id: "google/gemma-4-12b-qat",
@@ -481,6 +509,7 @@ test("Side Chat model catalog load is explicit, canonical, and session scoped", 
   assert.deepEqual(args, {
     ownerSessionId: "session-a",
     baseUrl: "http://side.test",
+    providerProfile: "openai_compatible",
     expectedConfigGeneration: "7",
   });
   assert.equal(rerenders, 2);
@@ -517,7 +546,7 @@ test("Side Chat catalog ABA settlement rerenders reload guidance and only a fres
       return {
         ownerSessionId: "session-a",
         baseUrl: "http://first.test",
-        metadataMode: "openai_compatible_only" as const,
+        providerProfile: "openai_compatible" as const,
         configGeneration: "7",
         models: [{ id: "fresh-model", label: "Fresh", loadState: "loaded" as const }],
       };
@@ -539,7 +568,7 @@ test("Side Chat catalog ABA settlement rerenders reload guidance and only a fres
   releaseOld({
     ownerSessionId: "session-a",
     baseUrl: "http://first.test",
-    metadataMode: "openai_compatible_only",
+    providerProfile: "openai_compatible",
     configGeneration: "7",
     models: [{ id: "stale-model", label: "Stale", loadState: "loaded" }],
   });
@@ -656,7 +685,7 @@ test("Side Chat catalog loading keeps native Select All owned by the connected S
     assert.deepEqual(finishSideChatCatalogLoad(ui, current, request, {
       ownerSessionId: "session-a",
       baseUrl: request.baseUrl,
-      metadataMode: "openai_compatible_only",
+      providerProfile: "openai_compatible",
       configGeneration: "7",
       models: [{ id: "model-ready", label: "Ready", loadState: "loaded" }],
     }), { catalogAccepted: true, localStateChanged: true });
@@ -726,14 +755,14 @@ test("Side Chat catalog drops stale URL completions and never borrows a mismatch
   assert.deepEqual(finishSideChatCatalogLoad(ui, current, firstRequest, {
     ownerSessionId: "session-a",
     baseUrl: "http://first.test",
-    metadataMode: "openai_compatible_only",
+    providerProfile: "openai_compatible",
     configGeneration: "7",
     models: [{ id: "stale-model", label: "Stale", loadState: "unknown" }],
   }), { catalogAccepted: false, localStateChanged: false });
   assert.deepEqual(finishSideChatCatalogLoad(ui, current, latestRequest, {
     ownerSessionId: "session-a",
     baseUrl: "http://second.test",
-    metadataMode: "openai_compatible_only",
+    providerProfile: "openai_compatible",
     configGeneration: "7",
     models: [{ id: "latest-model", label: "Latest", loadState: "loaded" }],
   }), { catalogAccepted: true, localStateChanged: true });
@@ -745,14 +774,14 @@ test("Side Chat catalog drops stale URL completions and never borrows a mismatch
   assert.ok(seedDraft);
   seedDraft.setupBaseUrl = "http://second.test/v1";
   seedState.provider_catalog_base_url = "http://first.test";
-  seedState.provider_catalog_metadata_mode = "openai_compatible_only";
+  seedState.provider_catalog_profile = "openai_compatible";
   seedState.provider_model_ids = ["wrong-server-model"];
   seedState.provider_models = ["Wrong server model"];
   assert.deepEqual(sideChatCatalogViewForState(seedUi, seedState).models, []);
 
   seedState.provider_catalog_base_url = "http://second.test";
   assert.equal(sideChatCatalogViewForState(seedUi, seedState).source, "main");
-  seedState.provider_catalog_metadata_mode = "lm_studio_native_required";
+  seedState.provider_catalog_profile = "lm_studio";
   assert.equal(sideChatCatalogViewForState(seedUi, seedState).source, "none");
 });
 
@@ -779,7 +808,7 @@ test("Side Chat catalog drops an ABA setup completion", () => {
   assert.deepEqual(finishSideChatCatalogLoad(ui, current, request, {
     ownerSessionId: "session-a",
     baseUrl: "http://first.test",
-    metadataMode: "openai_compatible_only",
+    providerProfile: "openai_compatible",
     configGeneration: "7",
     models: [{ id: "stale-model", label: "Stale", loadState: "loaded" }],
   }), { catalogAccepted: false, localStateChanged: true });
@@ -806,7 +835,7 @@ test("an admitted Side Chat catalog result is dropped when Main Settings settlem
   assert.deepEqual(finishSideChatCatalogLoad(ui, current, request, {
     ownerSessionId: "session-a",
     baseUrl: "http://side.test",
-    metadataMode: "openai_compatible_only",
+    providerProfile: "openai_compatible",
     configGeneration: "7",
     models: [{ id: "must-not-settle", label: "Stale", loadState: "loaded" }],
   }), { catalogAccepted: false, localStateChanged: true });
@@ -830,7 +859,7 @@ test("Side Chat catalog response must match the admitted owner and config genera
     assert.deepEqual(finishSideChatCatalogLoad(ui, current, request, {
       ownerSessionId: mismatch.ownerSessionId,
       baseUrl: "http://side.test",
-      metadataMode: "openai_compatible_only",
+      providerProfile: "openai_compatible",
       configGeneration: mismatch.configGeneration,
       models: [{ id: "wrong-owner", label: "Wrong owner", loadState: "loaded" }],
     }), { catalogAccepted: false, localStateChanged: true });
@@ -849,6 +878,7 @@ test("idle side configuration can update the selected durable owner with its exp
   assert.ok(draft);
   draft.setupBaseUrl = "http://side.test/v1";
   draft.setupModel = "gemma-explicit";
+  draft.setupProviderProfile = "openai_responses";
   const calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
   const context = {
     uiState: ui,
@@ -868,6 +898,7 @@ test("idle side configuration can update the selected durable owner with its exp
       ownerSessionId: "session-a",
       baseUrl: "http://side.test/v1",
       model: "gemma-explicit",
+      providerProfile: "openai_responses",
       expectedConfigGeneration: "7",
     },
   }]);
@@ -914,6 +945,7 @@ test("accepted side configuration rebases the local setup and draft CAS owner fr
   assert.ok(draft);
   draft.setupBaseUrl = " HTTP://SIDE.TEST:80/v1/ ";
   draft.setupModel = " gemma-explicit ";
+  draft.setupProviderProfile = "lm_studio_chat_completions";
   draft.text = "local unsaved question";
   draft.revision += 1;
   const calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
@@ -926,6 +958,7 @@ test("accepted side configuration rebases the local setup and draft CAS owner fr
       current = state({
         base_url: "http://side.test/v1",
         model: "gemma-explicit",
+        provider_profile: "lm_studio_chat_completions",
         draft_text: "durable after configure",
         draft_revision: "9",
       });
@@ -943,6 +976,7 @@ test("accepted side configuration rebases the local setup and draft CAS owner fr
       ownerSessionId: "session-a",
       baseUrl: "HTTP://SIDE.TEST:80/v1/",
       model: "gemma-explicit",
+      providerProfile: "lm_studio_chat_completions",
       expectedConfigGeneration: "7",
     },
   }]);
@@ -950,6 +984,7 @@ test("accepted side configuration rebases the local setup and draft CAS owner fr
   assert.ok(settled);
   assert.equal(settled.setupBaseUrl, "http://side.test/v1");
   assert.equal(settled.setupModel, "gemma-explicit");
+  assert.equal(settled.setupProviderProfile, "lm_studio_chat_completions");
   assert.equal(settled.persistedText, "durable after configure");
   assert.equal(settled.persistedRevision, "9");
   assert.equal(settled.text, "local unsaved question");
@@ -1130,6 +1165,7 @@ test("a dirty or invalid Main draft leaves the independent Side provider owner o
       ownerSessionId: "session-a",
       baseUrl: "http://replacement.test/v1",
       model: "gemma-replacement",
+      providerProfile: "openai_compatible",
       expectedConfigGeneration: "7",
     },
   }]);

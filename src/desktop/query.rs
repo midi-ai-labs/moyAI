@@ -1641,6 +1641,7 @@ mod tests {
             base_url: "http://127.0.0.1:1234".to_string(),
             access_mode: crate::config::AccessMode::Default,
             model_parameters: crate::session::SessionModelParameters::default(),
+            provider_connection: None,
             session_settings_revision: 0,
             created_at_ms: 1_000,
             updated_at_ms: 6_000,
@@ -2114,6 +2115,11 @@ mod tests {
                         model: app.config.model.model.clone(),
                         base_url: app.config.model.base_url.clone(),
                         access_mode: app.config.permissions.access_mode,
+                        provider_connection: Some(
+                            crate::session::SessionProviderConnection::from_model_config(
+                                &app.config.model,
+                            ),
+                        ),
                     },
                     app.workspace.clone(),
                 )

@@ -13,8 +13,9 @@ pub use model::{
     DoclingConfig, FormatConfig, FormatterRule, InstructionConfig, LogVerbosity, LoggingConfig,
     McpConfig, McpServerConfig, McpToolRouteConfig, McpTransportKind, ModelConfig,
     MultiAgentConfig, MultiAgentMode, NewlineStyle, PermissionsConfig, ProviderApiMode,
-    ProviderMetadataMode, ProviderReasoningCapability, ReasoningEffort, ReasoningSummary,
-    ResolvedConfig, SessionConfig, ShellConfig, ShellFamily, ToolOutputConfig, WorkspaceConfig,
+    ProviderMetadataMode, ProviderProfile, ProviderReasoningCapability, ReasoningEffort,
+    ReasoningSummary, ResolvedConfig, SessionConfig, ShellConfig, ShellFamily, ToolOutputConfig,
+    WorkspaceConfig, canonical_api_key_env_name,
 };
 pub use permission_profile_catalog::{
     PermissionProfileCatalog, PermissionProfileEntry, builtin_permission_profiles,
