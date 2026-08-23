@@ -2,8 +2,20 @@ import type { PermissionDecisionState } from "./decision_state.ts";
 import type { LocalConfirmation } from "./render_overlays.ts";
 import type { DesktopViewState } from "./types.ts";
 import type {
+  InitialSetupAuxiliaryKind,
+} from "./initial_setup_auxiliary_state.ts";
+import type {
+  InitialSetupDiffEntry,
+  InitialSetupStep,
+} from "./initial_setup_state.ts";
+import type {
+  SessionSettingsDraft,
+  SessionSettingsValidation,
+} from "./session_settings_state.ts";
+import type {
   AgentExecutionCacheEntry,
   ArtifactPaneMode,
+  SessionSettingsMutationAvailability,
   SideChatCatalogView,
   SideChatDeleteConfirmation,
   UiRecoverableError,
@@ -25,6 +37,22 @@ export interface DesktopRenderLocalPresentation {
   };
   readonly attachmentTrayOpen: boolean;
   readonly configMutationPending: boolean;
+  readonly doclingReadinessRequestPending: boolean;
+  readonly initialSetup: {
+    readonly step: InitialSetupStep;
+    readonly finishPending: boolean;
+    readonly auxiliaryPendingKind: InitialSetupAuxiliaryKind | null;
+    readonly importedSourcePath: string | null;
+    readonly doclingReadinessVisible: boolean;
+    readonly differences: readonly InitialSetupDiffEntry[];
+  };
+  readonly sessionSettings: {
+    readonly draft: SessionSettingsDraft | null;
+    readonly dirty: boolean;
+    readonly validation: SessionSettingsValidation | null;
+    readonly mutationPending: boolean;
+    readonly availability: SessionSettingsMutationAvailability;
+  };
   readonly sideChat: {
     readonly draft: string;
     readonly setupBaseUrl: string;
@@ -69,6 +97,28 @@ export const DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION: Readonly<DesktopRenderLo
     },
     attachmentTrayOpen: false,
     configMutationPending: false,
+    doclingReadinessRequestPending: false,
+    initialSetup: {
+      step: "start",
+      finishPending: false,
+      auxiliaryPendingKind: null,
+      importedSourcePath: null,
+      doclingReadinessVisible: false,
+      differences: [],
+    },
+    sessionSettings: {
+      draft: null,
+      dirty: false,
+      validation: null,
+      mutationPending: false,
+      availability: {
+        enabled: false,
+        staleTarget: false,
+        providerChanged: false,
+        accessChanged: false,
+        reason: "root sessionを選択すると変更できます。",
+      },
+    },
     sideChat: {
       draft: "",
       setupBaseUrl: "",
@@ -140,6 +190,9 @@ export function desktopRenderRequired(
 function snapshotLocalPresentation(
   local: DesktopRenderLocalPresentation,
 ): Readonly<DesktopRenderLocalPresentation> {
+  const initialSetup = local.initialSetup ?? DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.initialSetup;
+  const sessionSettings = local.sessionSettings
+    ?? DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.sessionSettings;
   const snapshot: DesktopRenderLocalPresentation = {
     artifactPane: {
       collapsed: local.artifactPane.collapsed,
@@ -149,6 +202,22 @@ function snapshotLocalPresentation(
     },
     attachmentTrayOpen: local.attachmentTrayOpen,
     configMutationPending: local.configMutationPending,
+    doclingReadinessRequestPending: local.doclingReadinessRequestPending ?? false,
+    initialSetup: {
+      step: initialSetup.step,
+      finishPending: initialSetup.finishPending,
+      auxiliaryPendingKind: initialSetup.auxiliaryPendingKind ?? null,
+      importedSourcePath: initialSetup.importedSourcePath ?? null,
+      doclingReadinessVisible: initialSetup.doclingReadinessVisible ?? false,
+      differences: initialSetup.differences,
+    },
+    sessionSettings: {
+      draft: sessionSettings.draft,
+      dirty: sessionSettings.dirty,
+      validation: sessionSettings.validation,
+      mutationPending: sessionSettings.mutationPending,
+      availability: sessionSettings.availability,
+    },
     sideChat: {
       draft: local.sideChat.draft,
       setupBaseUrl: local.sideChat.setupBaseUrl,

@@ -28,6 +28,21 @@ import type { AgentExecutionPrependContinuation } from "./agent_execution_prepen
 import type { RefreshPromptFocusContinuation } from "./main_prompt_continuity.ts";
 import type { NewSessionMutationRequest } from "./new_session_mutation.ts";
 import type { TaskActivityAnimationEpoch } from "./task_activity_indicator.ts";
+import {
+  createInitialSetupState,
+  type InitialSetupState,
+} from "./initial_setup_state.ts";
+import {
+  createInitialSetupAuxiliaryState,
+  type InitialSetupAuxiliaryState,
+} from "./initial_setup_auxiliary_state.ts";
+import {
+  createSessionSettingsState,
+  sameSessionSettingsTarget,
+  sessionSettingsApplyEnabled,
+  type SessionSettingsDraft,
+  type SessionSettingsState,
+} from "./session_settings_state.ts";
 import { validateProviderBaseUrl } from "./utils.ts";
 
 export interface ProviderDraft {
@@ -48,6 +63,11 @@ export interface ProviderCatalogTarget {
 export interface ProviderCatalogRequest extends ProviderCatalogTarget {
   readonly token: number;
   admitted: boolean;
+}
+
+export interface DoclingReadinessRequest {
+  readonly token: number;
+  readonly expectedTarget: Readonly<ConfigMutationTarget>;
 }
 
 export interface UiDraftState {
@@ -71,6 +91,7 @@ export interface UiDraftState {
   reviewRevision: number;
   reviewSyncedRevision: number;
   providerRevision: number;
+  providerCatalogIdentityRevision: number;
   pendingRunSubmission: {
     owner: string;
     workspacePath: string;
@@ -202,6 +223,9 @@ export interface AgentExecutionRequest extends AgentExecutionTarget {
 
 export interface UiLocalState {
   drafts: UiDraftState;
+  initialSetup: InitialSetupState;
+  initialSetupAuxiliary: InitialSetupAuxiliaryState;
+  sessionSettings: SessionSettingsState;
   mainComposerDrafts: Map<string, MainComposerLocalDraft>;
   sessionInteractionSnapshots: Map<string, SessionInteractionSnapshot>;
   runStartMutationPending: boolean;
@@ -242,6 +266,8 @@ export interface UiLocalState {
   sideChatCatalogs: Map<string, SideChatCatalogEntry>;
   sideChatCatalogTransaction: AsyncTransactionSlot<SideChatCatalogRequest>;
   providerCatalogTransaction: AsyncTransactionSlot<ProviderCatalogRequest>;
+  providerCatalogRevision: number | null;
+  doclingReadinessTransaction: AsyncTransactionSlot<DoclingReadinessRequest>;
   rejectedProviderCatalogRequest: ProviderCatalogRequest | null;
   sideChatDeleteConfirmation: SideChatDeleteConfirmation | null;
   attachmentTrayOpen: boolean;
@@ -251,6 +277,7 @@ export interface UiLocalState {
   localConfirmationDecisionPending: boolean;
   localConfirmationDecisionError: string;
   recoverableError: UiRecoverableError | null;
+  recoverableErrorOwner: string | null;
   windowMaximized: boolean;
 }
 
@@ -283,8 +310,12 @@ export function createUiLocalState(): UiLocalState {
       reviewRevision: 0,
       reviewSyncedRevision: 0,
       providerRevision: 0,
+      providerCatalogIdentityRevision: 0,
       pendingRunSubmission: null,
     },
+    initialSetup: createInitialSetupState(),
+    initialSetupAuxiliary: createInitialSetupAuxiliaryState(),
+    sessionSettings: createSessionSettingsState(),
     mainComposerDrafts: new Map(),
     sessionInteractionSnapshots: new Map(),
     runStartMutationPending: false,
@@ -326,6 +357,8 @@ export function createUiLocalState(): UiLocalState {
     sideChatCatalogs: new Map(),
     sideChatCatalogTransaction: createAsyncTransactionSlot(),
     providerCatalogTransaction: createAsyncTransactionSlot(),
+    providerCatalogRevision: null,
+    doclingReadinessTransaction: createAsyncTransactionSlot(),
     rejectedProviderCatalogRequest: null,
     sideChatDeleteConfirmation: null,
     attachmentTrayOpen: false,
@@ -335,8 +368,34 @@ export function createUiLocalState(): UiLocalState {
     localConfirmationDecisionPending: false,
     localConfirmationDecisionError: "",
     recoverableError: null,
+    recoverableErrorOwner: null,
     windowMaximized: false,
   };
+}
+
+export function doclingReadinessRequestPending(
+  uiState: Pick<UiLocalState, "doclingReadinessTransaction">,
+): boolean {
+  return uiState.doclingReadinessTransaction.active !== null;
+}
+
+export function beginDoclingReadinessRequest(
+  uiState: UiLocalState,
+  expectedTarget: ConfigMutationTarget,
+): DoclingReadinessRequest | null {
+  return beginAsyncTransaction(
+    uiState.doclingReadinessTransaction,
+    expectedTarget,
+    "single-flight",
+    (token, target) => ({ token, expectedTarget: target }),
+  );
+}
+
+export function finishDoclingReadinessRequest(
+  uiState: UiLocalState,
+  request: DoclingReadinessRequest,
+): boolean {
+  return clearAsyncTransaction(uiState.doclingReadinessTransaction, request);
 }
 
 export function setArtifactPaneCollapsed(uiState: UiLocalState, collapsed: boolean): void {
@@ -524,6 +583,114 @@ export function sideChatCatalogViewForState(
     ...emptySideChatCatalogView(),
     ownerSessionId,
     baseUrl,
+  };
+}
+
+export function sessionSettingsDraftFromProjection(
+  projection: DesktopWebState["session_settings"],
+): SessionSettingsDraft {
+  return {
+    baseUrl: projection.base_url,
+    model: projection.model,
+    contextWindow: projection.context_window,
+    maxOutputTokens: projection.max_output_tokens,
+    accessMode: projection.access_mode,
+  };
+}
+
+export interface SessionSettingsMutationAvailability {
+  readonly enabled: boolean;
+  readonly staleTarget: boolean;
+  readonly providerChanged: boolean;
+  readonly accessChanged: boolean;
+  readonly reason: string;
+}
+
+/**
+ * Combines the browser-owned draft with Rust's semantic mutation lanes.
+ * During an active tree, Rust may deliberately keep only the access lane open;
+ * provider/model/limit edits must remain visible but cannot be submitted.
+ */
+export function sessionSettingsMutationAvailability(
+  local: SessionSettingsState,
+  projection: DesktopWebState["session_settings"],
+): SessionSettingsMutationAvailability {
+  const draft = local.draft;
+  const baseline = local.baseline;
+  if (!projection.available || projection.target === null || !draft || !baseline) {
+    return {
+      enabled: false,
+      staleTarget: false,
+      providerChanged: false,
+      accessChanged: false,
+      reason: projection.unavailable_reason || "root sessionを選択すると変更できます。",
+    };
+  }
+  if (!sameSessionSettingsTarget(local.owner, projection.target)) {
+    return {
+      enabled: false,
+      staleTarget: true,
+      providerChanged: false,
+      accessChanged: false,
+      reason: "保存済みSession Settingsが別の操作で更新されました。変更を破棄するか、panelを開き直してください。",
+    };
+  }
+  const providerChanged = draft.baseUrl !== baseline.baseUrl
+    || draft.model !== baseline.model
+    || draft.contextWindow !== baseline.contextWindow
+    || draft.maxOutputTokens !== baseline.maxOutputTokens;
+  const accessChanged = draft.accessMode !== baseline.accessMode;
+  if (providerChanged && !projection.provider_mutation_enabled) {
+    return {
+      enabled: false,
+      staleTarget: false,
+      providerChanged,
+      accessChanged,
+      reason: "実行中はProvider・Model・Context・出力量を変更できません。Access modeだけを適用できます。",
+    };
+  }
+  if (accessChanged && !projection.access_mutation_enabled) {
+    return {
+      enabled: false,
+      staleTarget: false,
+      providerChanged,
+      accessChanged,
+      reason: "現在のruntime ownerではAccess modeを変更できません。",
+    };
+  }
+  if (!local.dirty) {
+    return {
+      enabled: false,
+      staleTarget: false,
+      providerChanged,
+      accessChanged,
+      reason: "未適用の変更はありません。",
+    };
+  }
+  if (local.validation?.ok !== true) {
+    return {
+      enabled: false,
+      staleTarget: false,
+      providerChanged,
+      accessChanged,
+      reason: local.validation?.message || "入力内容を確認してください。",
+    };
+  }
+  if (!sessionSettingsApplyEnabled(local)) {
+    return {
+      enabled: false,
+      staleTarget: false,
+      providerChanged,
+      accessChanged,
+      reason: local.activeMutation ? "Session Settingsを適用しています…" : "現在は適用できません。",
+    };
+  }
+  return {
+    enabled: true,
+    staleTarget: false,
+    providerChanged,
+    accessChanged,
+    reason: "このroot sessionへ適用できます。",
   };
 }
 

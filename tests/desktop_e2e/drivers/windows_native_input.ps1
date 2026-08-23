@@ -1,13 +1,17 @@
 #Requires -Version 7.4
 param(
   [Parameter(Mandatory)]
-  [ValidateSet("Snapshot", "ProbeWindow", "SendEscape", "CloseDialog", "CapturePng", "CloseCleanup")]
+  [ValidateSet("Snapshot", "ProbeWindow", "SendEscape", "DragWindow", "CloseDialog", "CapturePng", "CloseCleanup")]
   [string]$Action,
   [string]$ExecutionRoot,
   [string]$OwnerPath,
   [string]$WindowHandle,
   [int]$ExpectedThreadId = 0,
-  [string]$ExpectedClassName
+  [string]$ExpectedClassName,
+  [int]$ClientOffsetX = -1,
+  [int]$ClientOffsetY = -1,
+  [int]$DragDeltaX = 0,
+  [int]$DragDeltaY = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -52,8 +56,12 @@ namespace Moyai.DesktopE2e {
         public const uint GA_ROOT = 2;
         public const uint GW_OWNER = 4;
         public const uint WM_CLOSE = 0x0010;
+        public const uint INPUT_MOUSE = 0;
         public const uint INPUT_KEYBOARD = 1;
+        public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+        public const uint MOUSEEVENTF_LEFTUP = 0x0004;
         public const uint KEYEVENTF_KEYUP = 0x0002;
+        public const int VK_LBUTTON = 0x01;
         public const ushort VK_ESCAPE = 0x001B;
         public const uint PW_RENDERFULLCONTENT = 0x00000002;
         public const uint PM_NOREMOVE = 0x0000;
@@ -187,6 +195,39 @@ namespace Moyai.DesktopE2e {
         public static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
 
         [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetClientRect(IntPtr hwnd, out Rect rect);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool ClientToScreen(IntPtr hwnd, ref Point point);
+
+        [DllImport("user32.dll")]
+        public static extern uint GetDpiForWindow(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsIconic(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsZoomed(IntPtr hwnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetCursorPos(out Point point);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetCursorPos(int x, int y);
+
+        [DllImport("user32.dll")]
+        private static extern short GetAsyncKeyState(int virtualKey);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+
+        [DllImport("user32.dll", SetLastError = true)]
         private static extern uint SendInput(uint count, Input[] inputs, int size);
 
         [DllImport("user32.dll", SetLastError = true)]
@@ -234,6 +275,17 @@ namespace Moyai.DesktopE2e {
             inputs[1].data.keyboard.wVk = VK_ESCAPE;
             inputs[1].data.keyboard.dwFlags = KEYEVENTF_KEYUP;
             return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Input>());
+        }
+
+        public static uint SendLeftButton(bool pressed) {
+            var inputs = new Input[1];
+            inputs[0].type = INPUT_MOUSE;
+            inputs[0].data.mouse.dwFlags = pressed ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+            return SendInput(1, inputs, Marshal.SizeOf<Input>());
+        }
+
+        public static bool LeftButtonPressed() {
+            return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
         }
 
         private static IntPtr ForegroundRoot() {
@@ -623,6 +675,11 @@ function Write-Result {
   ConvertTo-Json -InputObject $Value -Compress -Depth 10
 }
 
+$previousDpiContext = [Moyai.DesktopE2e.NativeWindowInterop]::SetThreadDpiAwarenessContext([IntPtr]::new(-4))
+if ($previousDpiContext -eq [IntPtr]::Zero) {
+  $lastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+  throw "SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2) failed (Win32 error $lastError)"
+}
 $validatedOwner = Get-ValidatedOwner
 
 switch ($Action) {
@@ -748,6 +805,208 @@ switch ($Action) {
       input_error = $inputError
       cleanup_only = $false
       representative_input = $sent -gt 0
+    })
+  }
+  "DragWindow" {
+    if ($ClientOffsetX -lt 0 -or $ClientOffsetY -lt 0) {
+      throw "DragWindow requires non-negative ClientOffsetX and ClientOffsetY"
+    }
+    if ($DragDeltaX -eq 0 -and $DragDeltaY -eq 0) {
+      throw "DragWindow requires a non-zero drag delta"
+    }
+    $candidate = Resolve-ExactCandidate -Owner $validatedOwner
+    if ([Moyai.DesktopE2e.NativeWindowInterop]::IsIconic($candidate.handle)) {
+      throw "Exact candidate window is minimized"
+    }
+    if ([Moyai.DesktopE2e.NativeWindowInterop]::IsZoomed($candidate.handle)) {
+      throw "Exact candidate window is maximized"
+    }
+    $foregroundBeforeRoot = Get-ForegroundRootHandle
+    $activationAttempted = $foregroundBeforeRoot -ne $candidate.handle
+    if ($activationAttempted) {
+      $focusOutcome = [Moyai.DesktopE2e.NativeWindowInterop]::FocusExactWindow($candidate.handle)
+      $activation = Convert-FocusOutcome -Outcome $focusOutcome -Attempted $true
+    } else {
+      $activation = [ordered]@{
+        attempted = $false
+        verified = $true
+        failure = $null
+        attempts = 0
+        message_queue_created = $false
+        message_queue_probe_returned = $false
+        current_thread_id = 0
+        foreground_thread_id = [int]$candidate.row.thread_id
+        candidate_thread_id = [int]$candidate.row.thread_id
+        foreground_attach = [ordered]@{ required = $false; attempted = $false; succeeded = $true; win32_error = 0 }
+        candidate_attach = [ordered]@{ required = $false; attempted = $false; succeeded = $true; win32_error = 0 }
+        candidate_detach = [ordered]@{ succeeded = $true; win32_error = 0 }
+        foreground_detach = [ordered]@{ succeeded = $true; win32_error = 0 }
+        bring_window_returned = $false
+        set_foreground_returned = $false
+        foreground_root_before_hwnd = Format-WindowHandle $foregroundBeforeRoot
+        foreground_root_after_hwnd = Format-WindowHandle $foregroundBeforeRoot
+      }
+    }
+
+    # Re-resolve the exact PID/start/executable/HWND/thread/class identity immediately before input.
+    $candidate = Resolve-ExactCandidate -Owner $validatedOwner
+    $foregroundBeforeInputRoot = Get-ForegroundRootHandle
+    $preInputVerified = [bool]$activation.verified -and $foregroundBeforeInputRoot -eq $candidate.handle
+    $clientRect = [Moyai.DesktopE2e.NativeWindowInterop+Rect]::new()
+    if (-not [Moyai.DesktopE2e.NativeWindowInterop]::GetClientRect($candidate.handle, [ref]$clientRect)) {
+      throw "GetClientRect failed for the exact drag candidate"
+    }
+    $clientOrigin = [Moyai.DesktopE2e.NativeWindowInterop+Point]::new()
+    if (-not [Moyai.DesktopE2e.NativeWindowInterop]::ClientToScreen($candidate.handle, [ref]$clientOrigin)) {
+      throw "ClientToScreen failed for the exact drag candidate"
+    }
+    $dpi = [int][Moyai.DesktopE2e.NativeWindowInterop]::GetDpiForWindow($candidate.handle)
+    if ($dpi -le 0) { throw "GetDpiForWindow returned no DPI for the exact drag candidate" }
+    $scale = [double]$dpi / 96.0
+    $offsetX = [int][Math]::Round([double]$ClientOffsetX * $scale, [MidpointRounding]::AwayFromZero)
+    $offsetY = [int][Math]::Round([double]$ClientOffsetY * $scale, [MidpointRounding]::AwayFromZero)
+    $deltaX = [int][Math]::Round([double]$DragDeltaX * $scale, [MidpointRounding]::AwayFromZero)
+    $deltaY = [int][Math]::Round([double]$DragDeltaY * $scale, [MidpointRounding]::AwayFromZero)
+    $clientWidth = [int]($clientRect.Right - $clientRect.Left)
+    $clientHeight = [int]($clientRect.Bottom - $clientRect.Top)
+    if ($offsetX -lt 1 -or $offsetY -lt 1 -or $offsetX -ge ($clientWidth - 1) -or $offsetY -ge ($clientHeight - 1)) {
+      throw "DragWindow client offset is outside the exact window client area"
+    }
+    $startX = [int]$clientOrigin.X + $offsetX
+    $startY = [int]$clientOrigin.Y + $offsetY
+    $originalCursor = [Moyai.DesktopE2e.NativeWindowInterop+Point]::new()
+    if (-not [Moyai.DesktopE2e.NativeWindowInterop]::GetCursorPos([ref]$originalCursor)) {
+      throw "GetCursorPos failed before exact window drag"
+    }
+
+    $mouseDownCount = 0
+    $mouseUpCount = 0
+    $mouseUpAttempted = $false
+    $buttonInitiallyUp = $null
+    $mouseDownError = $null
+    $mouseUpError = $null
+    $movementPath = [Collections.Generic.List[object]]::new()
+    $cursorMovedByDriver = $false
+    $cursorRestoreAttempted = $false
+    $cursorRestoreSucceeded = $false
+    try {
+      if ($preInputVerified) {
+        $buttonInitiallyUp = -not [Moyai.DesktopE2e.NativeWindowInterop]::LeftButtonPressed()
+        if (-not $buttonInitiallyUp) {
+          throw "Physical left button is already pressed before exact titlebar input"
+        }
+        if (-not [Moyai.DesktopE2e.NativeWindowInterop]::SetCursorPos($startX, $startY)) {
+          throw "SetCursorPos failed for the exact titlebar start point"
+        }
+        $cursorMovedByDriver = $true
+        [Threading.Thread]::Sleep(50)
+        $buttonInitiallyUp = -not [Moyai.DesktopE2e.NativeWindowInterop]::LeftButtonPressed()
+        if (-not $buttonInitiallyUp) {
+          throw "Physical left button became pressed before exact titlebar pointer-down"
+        }
+        $mouseDownCount = [int][Moyai.DesktopE2e.NativeWindowInterop]::SendLeftButton($true)
+        if ($mouseDownCount -ne 1) {
+          $mouseDownError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        } else {
+          foreach ($step in 1..6) {
+            $x = $startX + [int][Math]::Round([double]$deltaX * $step / 6.0, [MidpointRounding]::AwayFromZero)
+            $y = $startY + [int][Math]::Round([double]$deltaY * $step / 6.0, [MidpointRounding]::AwayFromZero)
+            $moved = [Moyai.DesktopE2e.NativeWindowInterop]::SetCursorPos($x, $y)
+            $movementPath.Add([ordered]@{ step = $step; x = $x; y = $y; succeeded = [bool]$moved })
+            if (-not $moved) { break }
+            [Threading.Thread]::Sleep(75)
+          }
+        }
+      }
+    } catch {
+      $mouseDownError = [ordered]@{
+        type = $_.Exception.GetType().FullName
+        message = $_.Exception.Message
+      }
+    } finally {
+      try {
+        # A global LEFTUP is safe only after this driver delivered the matching LEFTDOWN.
+        if ($mouseDownCount -gt 0) {
+          $mouseUpAttempted = $true
+          $mouseUpCount = [int][Moyai.DesktopE2e.NativeWindowInterop]::SendLeftButton($false)
+          if ($mouseUpCount -ne 1) { $mouseUpError = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+          [Threading.Thread]::Sleep(250)
+        }
+      } finally {
+        if ($cursorMovedByDriver) {
+          $cursorRestoreAttempted = $true
+          $cursorRestoreSucceeded = [Moyai.DesktopE2e.NativeWindowInterop]::SetCursorPos($originalCursor.X, $originalCursor.Y)
+        }
+      }
+    }
+
+    $buttonReleaseVerified = -not [Moyai.DesktopE2e.NativeWindowInterop]::LeftButtonPressed()
+    $candidateAfter = Resolve-ExactCandidate -Owner $validatedOwner
+    $foregroundAfterInputRoot = Get-ForegroundRootHandle
+    $postInputVerified = $foregroundAfterInputRoot -eq $candidateAfter.handle
+    $allMovesSucceeded = $movementPath.Count -eq 6 -and @($movementPath | Where-Object { -not $_.succeeded }).Count -eq 0
+    $deliveryVerified = (
+      $preInputVerified -and
+      $buttonInitiallyUp -eq $true -and
+      $mouseDownCount -eq 1 -and
+      $mouseUpCount -eq 1 -and
+      $allMovesSucceeded -and
+      $buttonReleaseVerified -and
+      $postInputVerified
+    )
+    Write-Result ([ordered]@{
+      window_before = $candidate.row
+      window_after = $candidateAfter.row
+      activation = $activation
+      dpi = $dpi
+      css_to_device_scale = $scale
+      client_rect = [ordered]@{
+        left = [int]$clientRect.Left
+        top = [int]$clientRect.Top
+        right = [int]$clientRect.Right
+        bottom = [int]$clientRect.Bottom
+        width = $clientWidth
+        height = $clientHeight
+      }
+      client_origin_screen = [ordered]@{ x = [int]$clientOrigin.X; y = [int]$clientOrigin.Y }
+      requested_css = [ordered]@{
+        client_offset_x = $ClientOffsetX
+        client_offset_y = $ClientOffsetY
+        delta_x = $DragDeltaX
+        delta_y = $DragDeltaY
+      }
+      delivered_device = [ordered]@{
+        start_x = $startX
+        start_y = $startY
+        delta_x = $deltaX
+        delta_y = $deltaY
+        path = @($movementPath)
+      }
+      foreground_before_input_root_hwnd = Format-WindowHandle $foregroundBeforeInputRoot
+      foreground_after_input_root_hwnd = Format-WindowHandle $foregroundAfterInputRoot
+      foreground_activation_attempted = [bool]$activationAttempted
+      foreground_activation_verified = [bool]$activation.verified
+      foreground_pre_input_verified = [bool]$preInputVerified
+      foreground_post_input_verified = [bool]$postInputVerified
+      delivery_verified = [bool]$deliveryVerified
+      delivery_status = if ($deliveryVerified) { "verified" } elseif (-not $preInputVerified) { "not-sent-foreground-unverified" } elseif ($buttonInitiallyUp -ne $true) { "not-sent-physical-button-down" } elseif ($mouseDownCount -ne 1) { "pointer-down-partial" } elseif ($mouseUpCount -ne 1 -or -not $buttonReleaseVerified) { "pointer-release-unverified" } elseif (-not $allMovesSucceeded) { "pointer-move-partial" } else { "post-input-foreground-drift" }
+      mouse_down_count = $mouseDownCount
+      mouse_up_count = $mouseUpCount
+      mouse_up_attempted = [bool]$mouseUpAttempted
+      button_initially_up = $buttonInitiallyUp
+      mouse_down_error = $mouseDownError
+      mouse_up_error = $mouseUpError
+      button_release_verified = [bool]$buttonReleaseVerified
+      cursor_moved_by_driver = [bool]$cursorMovedByDriver
+      cursor_restore_attempted = [bool]$cursorRestoreAttempted
+      cursor_restore_succeeded = [bool]$cursorRestoreSucceeded
+      position_delta = [ordered]@{
+        x = [int]$candidateAfter.row.rect.left - [int]$candidate.row.rect.left
+        y = [int]$candidateAfter.row.rect.top - [int]$candidate.row.rect.top
+      }
+      size_unchanged = [int]$candidateAfter.row.rect.width -eq [int]$candidate.row.rect.width -and [int]$candidateAfter.row.rect.height -eq [int]$candidate.row.rect.height
+      cleanup_only = $false
+      representative_input = $mouseDownCount -gt 0
     })
   }
   "CloseDialog" {

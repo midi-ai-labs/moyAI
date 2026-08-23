@@ -27,18 +27,27 @@ export async function prepareDesktopFixture({
   owner,
   configSourcePath = null,
   configText = null,
+  configMode = "present",
   sentinelName = "E2E_FIXTURE.txt",
   sentinelText = "moyAI Desktop E2E fixture.\n",
 }) {
-  if ((configSourcePath === null) === (configText === null)) {
-    throw new TypeError("exactly one fixture config source is required");
+  if (configMode !== "present" && configMode !== "absent") {
+    throw new TypeError(`unsupported fixture config mode: ${configMode}`);
+  }
+  if (configMode === "present" && (configSourcePath === null) === (configText === null)) {
+    throw new TypeError("present fixture requires exactly one config source");
+  }
+  if (configMode === "absent" && (configSourcePath !== null || configText !== null)) {
+    throw new TypeError("absent fixture cannot provide a config source");
   }
   if (!validFixtureSentinelName(sentinelName)) {
     throw new TypeError(`invalid fixture sentinel name: ${sentinelName}`);
   }
   const sentinel = path.join(context.paths.workspace, sentinelName);
   await writeFile(sentinel, sentinelText, { flag: "wx" });
-  if (configSourcePath !== null) {
+  if (configMode === "absent") {
+    // The missing path is the product input. Do not create a placeholder.
+  } else if (configSourcePath !== null) {
     await copyFile(configSourcePath, context.paths.config_file, constants.COPYFILE_EXCL);
   } else {
     await writeFile(context.paths.config_file, configText, { flag: "wx" });
@@ -56,8 +65,9 @@ export async function prepareDesktopFixture({
     webview: context.paths.webview,
     identities: {
       sentinel: await fileIdentity(sentinel),
-      config: await fileIdentity(context.paths.config_file),
+      config: configMode === "present" ? await fileIdentity(context.paths.config_file) : null,
       preferences: await fileIdentity(context.paths.prefs_file),
     },
+    config_mode: configMode,
   }, { phase, owner });
 }

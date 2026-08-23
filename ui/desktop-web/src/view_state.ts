@@ -379,7 +379,7 @@ export function beginProviderCatalogRequest(
 ): ProviderCatalogRequest | null {
   return beginAsyncTransaction(uiState.providerCatalogTransaction, {
     providerOwner: providerOwner(state),
-    providerRevision: uiState.drafts.providerRevision,
+    providerRevision: uiState.drafts.providerCatalogIdentityRevision,
     baseUrl: normalizeProviderBaseUrl(uiState.drafts.provider.baseUrl),
     metadataMode: uiState.drafts.provider.metadataMode,
   } satisfies ProviderCatalogTarget, "single-flight", (token, target) => ({
@@ -387,6 +387,25 @@ export function beginProviderCatalogRequest(
     ...target,
     admitted: false,
   }));
+}
+
+/**
+ * Adopts the complete Initial Setup config draft as the provider-catalog owner.
+ * The local revision is advanced for every identity change so an A -> B -> A
+ * edit cannot accidentally accept a response started for the first A.
+ */
+export function synchronizeInitialSetupProviderDraft(
+  state: DesktopWebState,
+  uiState: UiLocalState,
+): boolean {
+  if (!state.startup.initial_setup_required || state.overlay !== "initial_setup") return false;
+  const next = providerDraftFromConfigFields(state.config_fields, uiState.drafts.provider);
+  if (sameProviderDraft(next, uiState.drafts.provider)) return false;
+  const catalogIdentityChanged = !sameProviderCatalogIdentity(next, uiState.drafts.provider);
+  uiState.drafts.provider = next;
+  uiState.drafts.providerRevision += 1;
+  if (catalogIdentityChanged) uiState.drafts.providerCatalogIdentityRevision += 1;
+  return true;
 }
 
 export function draftMutationTarget(state: DesktopWebState): DraftActionTarget {
@@ -533,6 +552,11 @@ export function reconcileUiDrafts(
   } else if (mutationSnapshot?.providerRevision === drafts.providerRevision) {
     hydrateProviderDraft(drafts.provider, state);
   }
+  if (firstProjection || providerOwnerChanged) {
+    uiState.providerCatalogRevision = state.provider_catalog_base_url === null
+      ? null
+      : drafts.providerCatalogIdentityRevision;
+  }
   rememberCurrentComposerDraft(uiState);
   reconcileProviderCatalogRequest(uiState, state);
   if (
@@ -633,11 +657,12 @@ export function projectViewState(state: DesktopWebState, uiState: UiLocalState):
   const configDraft = activeConfigDraftProjection(state, uiState);
   const runStartPending = uiState.runStartMutationPending;
   const newSessionPending = uiState.activeNewSessionMutation !== null;
+  const providerDraft = providerDraftForCurrentSurface(state, uiState);
   const providerCatalogAccepted = providerCatalogOwnsCurrentDraft(state, uiState);
   const providerLoading = state.provider_loading || uiState.providerCatalogTransaction.active !== null;
   const providerModelIds = providerCatalogAccepted ? state.provider_model_ids : [];
   const providerModels = providerCatalogAccepted ? state.provider_models : [];
-  const providerIndex = providerModelIds.indexOf(uiState.drafts.provider.selectedModelId);
+  const providerIndex = providerModelIds.indexOf(providerDraft.selectedModelId);
   const providerTargetChangedDuringLoad = providerCatalogTargetChangedDuringLoad(state, uiState);
   const providerCompletionRejected = uiState.rejectedProviderCatalogRequest !== null;
   const providerCatalogMismatch = state.provider_catalog_base_url !== null && !providerCatalogAccepted;
@@ -658,10 +683,10 @@ export function projectViewState(state: DesktopWebState, uiState: UiLocalState):
     review_draft_text: uiState.drafts.reviewDraft,
     local_search_text: uiState.drafts.localSearch,
     session_search_text: uiState.drafts.sessionSearch,
-    provider_base_url: uiState.drafts.provider.baseUrl,
-    provider_metadata_mode: uiState.drafts.provider.metadataMode,
-    provider_context_window: uiState.drafts.provider.contextWindow,
-    provider_max_output_tokens: uiState.drafts.provider.maxOutputTokens,
+    provider_base_url: providerDraft.baseUrl,
+    provider_metadata_mode: providerDraft.metadataMode,
+    provider_context_window: providerDraft.contextWindow,
+    provider_max_output_tokens: providerDraft.maxOutputTokens,
     provider_loading: providerLoading,
     provider_catalog_base_url: providerCatalogAccepted ? state.provider_catalog_base_url : null,
     provider_catalog_metadata_mode: providerCatalogAccepted ? state.provider_catalog_metadata_mode : null,
@@ -695,10 +720,11 @@ function providerCatalogRequestTargetsCurrentDraft(
   state: DesktopWebState,
   uiState: UiLocalState,
 ): boolean {
+  const draft = providerDraftForCurrentSurface(state, uiState);
   return request.providerOwner === providerOwner(state)
-    && request.providerRevision === uiState.drafts.providerRevision
-    && request.baseUrl === normalizeProviderBaseUrl(uiState.drafts.provider.baseUrl)
-    && request.metadataMode === uiState.drafts.provider.metadataMode;
+    && request.providerRevision === uiState.drafts.providerCatalogIdentityRevision
+    && request.baseUrl === normalizeProviderBaseUrl(draft.baseUrl)
+    && request.metadataMode === draft.metadataMode;
 }
 
 function providerCatalogResultTargetsRequest(
@@ -717,6 +743,7 @@ function reconcileProviderCatalogRequest(uiState: UiLocalState, state: DesktopWe
   if (!request?.admitted || state.provider_loading) return;
   const completionAccepted = providerCatalogRequestTargetsCurrentDraft(request, state, uiState)
     && providerCatalogResultTargetsRequest(request, state);
+  uiState.providerCatalogRevision = completionAccepted ? request.providerRevision : null;
   uiState.rejectedProviderCatalogRequest = completionAccepted ? null : request;
   clearAsyncTransaction(uiState.providerCatalogTransaction, request);
 }
@@ -737,13 +764,55 @@ function providerCatalogOwnsCurrentDraft(
   state: DesktopWebState,
   uiState: UiLocalState,
 ): boolean {
-  const draft = uiState.drafts.provider;
+  const draft = providerDraftForCurrentSurface(state, uiState);
   return uiState.drafts.providerOwner === providerOwner(state)
+    && uiState.providerCatalogRevision === uiState.drafts.providerCatalogIdentityRevision
     && uiState.rejectedProviderCatalogRequest === null
     && state.provider_catalog_base_url !== null
     && normalizeProviderBaseUrl(state.provider_catalog_base_url)
       === normalizeProviderBaseUrl(draft.baseUrl)
     && state.provider_catalog_metadata_mode === draft.metadataMode;
+}
+
+function providerDraftForCurrentSurface(
+  state: DesktopWebState,
+  uiState: UiLocalState,
+): ProviderDraft {
+  if (!state.startup.initial_setup_required || state.overlay !== "initial_setup") {
+    return uiState.drafts.provider;
+  }
+  return providerDraftFromConfigFields(activeConfigFields(state, uiState), uiState.drafts.provider);
+}
+
+function providerDraftFromConfigFields(
+  fields: ReadonlyArray<DesktopWebState["config_fields"][number]>,
+  fallback: ProviderDraft,
+): ProviderDraft {
+  const values = new Map(fields.map((field) => [field.key, field.value]));
+  const metadataMode = values.get("model.provider_metadata_mode");
+  return {
+    baseUrl: values.get("model.base_url") ?? fallback.baseUrl,
+    metadataMode: metadataMode === "lm_studio_native_required"
+      || metadataMode === "openai_compatible_only"
+        ? metadataMode
+        : fallback.metadataMode,
+    contextWindow: values.get("model.context_window") ?? fallback.contextWindow,
+    maxOutputTokens: values.get("model.max_output_tokens") ?? fallback.maxOutputTokens,
+    selectedModelId: values.get("model.model") ?? fallback.selectedModelId,
+  };
+}
+
+function sameProviderDraft(left: ProviderDraft, right: ProviderDraft): boolean {
+  return left.baseUrl === right.baseUrl
+    && left.metadataMode === right.metadataMode
+    && left.contextWindow === right.contextWindow
+    && left.maxOutputTokens === right.maxOutputTokens
+    && left.selectedModelId === right.selectedModelId;
+}
+
+function sameProviderCatalogIdentity(left: ProviderDraft, right: ProviderDraft): boolean {
+  return normalizeProviderBaseUrl(left.baseUrl) === normalizeProviderBaseUrl(right.baseUrl)
+    && left.metadataMode === right.metadataMode;
 }
 
 export function activeConfigDraftProjection(

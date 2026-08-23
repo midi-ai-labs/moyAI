@@ -12,6 +12,10 @@ test("one registry binds every reusable scenario to the common runner contract",
     "native-dialog.cancel",
     "prompt-review.cancel",
     "provider.restart",
+    "settings.docling-readiness",
+    "settings.initial-setup",
+    "settings.preferences",
+    "settings.session",
     "run.stop",
   ]);
   for (const id of scenarioIds) {
@@ -22,6 +26,10 @@ test("one registry binds every reusable scenario to the common runner contract",
     }
   }
   assert.notEqual(createScenario("provider.restart"), createScenario("provider.restart"));
+  assert.notEqual(createScenario("settings.docling-readiness"), createScenario("settings.docling-readiness"));
+  assert.notEqual(createScenario("settings.initial-setup"), createScenario("settings.initial-setup"));
+  assert.notEqual(createScenario("settings.preferences"), createScenario("settings.preferences"));
+  assert.notEqual(createScenario("settings.session"), createScenario("settings.session"));
   assert.notEqual(createScenario("prompt-review.cancel"), createScenario("prompt-review.cancel"));
   assert.notEqual(createScenario("run.stop"), createScenario("run.stop"));
   assert.notEqual(createScenario("agent.interrupt"), createScenario("agent.interrupt"));

@@ -21,6 +21,10 @@ import {
 import type { DesktopViewState } from "../src/types.ts";
 import { createUiLocalState } from "../src/ui_state.ts";
 import {
+  initialSetupDoclingReadinessVisible,
+  initialSetupImportedSourcePath,
+} from "../src/initial_setup_auxiliary_state.ts";
+import {
   createDesktopRenderModel,
   DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
 } from "../src/render_projection.ts";
@@ -125,6 +129,13 @@ function state(overrides: Partial<DesktopViewState> = {}): DesktopViewState {
     },
     provider_apply_enabled: false,
     provider_model_ids: [],
+    docling_readiness: {
+      status: "idle",
+      endpoint: "",
+      httpStatus: null,
+      message: "Docling readiness has not been checked.",
+    },
+    config_fields: [],
     agent_activity_rows: [],
     ...overrides,
   } as DesktopViewState;
@@ -149,8 +160,20 @@ function context(
         selectedAgentExecution: null,
       },
       attachmentTrayOpen: uiState.attachmentTrayOpen,
-      configMutationPending: uiState.activeConfigMutation !== null
-        || uiState.externalConfigMutationPending,
+      configMutationPending: uiState.activeConfigMutationGeneration !== null
+        || uiState.externalConfigMutationPending
+        || (
+          current.overlay === "config"
+          && uiState.localConfirmationDecisionPending
+          && uiState.pendingLocalConfirmation === null
+        ),
+      doclingReadinessRequestPending: uiState.doclingReadinessTransaction.active !== null,
+      initialSetup: {
+        ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.initialSetup,
+        step: uiState.initialSetup.step,
+        finishPending: uiState.initialSetup.activeFinish !== null,
+        auxiliaryPendingKind: uiState.initialSetupAuxiliary.active?.kind ?? null,
+      },
       modal: {
         localConfirmation: uiState.pendingLocalConfirmation,
         localDecisionPending: uiState.localConfirmationDecisionPending,
@@ -187,6 +210,7 @@ function context(
     recoverCommandConflict: () => false,
     reportError: () => {},
     acceptProjection: () => {},
+    waitForInteractionIdle: async () => {},
     submitPermissionDecision: async () => {},
     submitRunStop: async (state) => {
       calls.push({
@@ -239,14 +263,15 @@ const EXACT_DELIVERY_ACTION_IDS = [
     "show-view-menu",
     "show-help-menu",
     "close-overlay",
+    "check-docling-readiness",
     "import-config-toml",
     "insert-command",
   ] as const;
 
-test("the single GUI action registry owns all 88 actions without duplicates", () => {
+test("the single GUI action registry owns all 98 actions without duplicates", () => {
   const actionIds = ACTIONS.map((action) => action.id);
 
-  assert.equal(actionIds.length, 88);
+  assert.equal(actionIds.length, 98);
   assert.deepEqual(ACTION_IDS, actionIds);
   assert.equal(new Set(actionIds).size, actionIds.length);
   assert.equal(ACTION_BY_ID.size, actionIds.length);
@@ -389,6 +414,26 @@ test("delivery-sensitive GUI actions preserve their exact native boundaries", as
     { id: "show-view-menu", expectedMutation: { name: "show_view_menu", args: undefined } },
     { id: "show-help-menu", expectedMutation: { name: "show_help_menu", args: undefined } },
     { id: "close-overlay", expectedMutation: { name: "close_overlay", args: undefined } },
+    {
+      id: "check-docling-readiness",
+      state: () => state({
+        overlay: "config",
+        config_fields: [{
+          key: "docling.enabled",
+          value: "true",
+          env_override: null,
+          value_type: "boolean",
+          required: false,
+          min_value: null,
+          max_value: null,
+          options: [],
+        }],
+      }),
+      expectedMutation: {
+        name: "check_docling_readiness",
+        args: { expectedTarget: state().config_target },
+      },
+    },
     {
       id: "import-config-toml",
       state: () => {
@@ -956,4 +1001,480 @@ test("destructive actions create an owner-bound confirmation before mutation", a
   assert.equal(await dispatchGuiAction("delete-project", 0, "", blocked, blockedContext), true);
   assert.equal(blockedContext.uiState.pendingLocalConfirmation, null);
   assert.deepEqual(calls, []);
+});
+
+test("Docling readiness admits only one invoke across rapid double activation", async () => {
+  const ready = state({
+    overlay: "config",
+    config_fields: [{
+      key: "docling.enabled",
+      value: "true",
+      env_override: null,
+      value_type: "boolean",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    }],
+  });
+  const calls: MutationCall[] = [];
+  let rerenders = 0;
+  let release!: () => void;
+  const inFlight = new Promise<void>((resolve) => { release = resolve; });
+  const actionContext = context(ready, calls, () => { rerenders += 1; });
+  actionContext.mutate = async (name, args) => {
+    calls.push({ name, args });
+    await inFlight;
+  };
+
+  const first = dispatchGuiAction("check-docling-readiness", -1, "", ready, actionContext);
+  assert.notEqual(actionContext.uiState.doclingReadinessTransaction.active, null);
+  await dispatchGuiAction("check-docling-readiness", -1, "", ready, actionContext);
+  assert.deepEqual(calls, [{
+    name: "check_docling_readiness",
+    args: { expectedTarget: ready.config_target },
+  }]);
+  assert.equal(rerenders, 1, "the local pending owner is rendered before invoke settlement");
+
+  release();
+  await first;
+  assert.equal(actionContext.uiState.doclingReadinessTransaction.active, null);
+  assert.equal(rerenders, 2, "exact settlement releases and rerenders the local pending owner");
+
+  const readinessFailure = new Error("readiness invoke failed");
+  actionContext.mutate = async (name, args) => {
+    calls.push({ name, args });
+    throw readinessFailure;
+  };
+  await assert.rejects(
+    dispatchGuiAction("check-docling-readiness", -1, "", ready, actionContext),
+    readinessFailure,
+  );
+  assert.equal(actionContext.uiState.doclingReadinessTransaction.active, null);
+  assert.equal(rerenders, 4, "error settlement also releases and rerenders the local pending owner");
+  assert.equal(calls.length, 2);
+});
+
+test("Initial Setup Import is read-only, exact-targeted, complete, and single-flight", async () => {
+  const setupTarget = {
+    workspacePath: "C:/workspace",
+    globalConfigPath: "C:/config/config.toml",
+    setupGeneration: "3",
+  };
+  const wizard = state({
+    overlay: "initial_setup",
+    startup: {
+      ...state().startup,
+      action_overlay: "initial_setup",
+      initial_setup_required: true,
+      initial_setup_reason: "config_missing",
+      global_config_path: setupTarget.globalConfigPath,
+      setup_target: setupTarget,
+    },
+    config_fields: [
+      {
+        key: "model.model",
+        value: "model-a",
+        env_override: null,
+        value_type: "string",
+        required: true,
+        min_value: null,
+        max_value: null,
+        options: [],
+      },
+      {
+        key: "docling.enabled",
+        value: "false",
+        env_override: null,
+        value_type: "boolean",
+        required: false,
+        min_value: null,
+        max_value: null,
+        options: [],
+      },
+    ],
+  });
+  const actionContext = context(wizard, []);
+  const nativeCalls: MutationCall[] = [];
+  let release!: (result: unknown) => void;
+  const blockedResult = new Promise((resolve) => { release = resolve; });
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    writable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: async (name: string, args?: Record<string, unknown>) => {
+          nativeCalls.push({ name, args });
+          return blockedResult;
+        },
+      },
+    },
+  });
+
+  try {
+    const first = dispatchGuiAction("import-config-toml", -1, "", wizard, actionContext);
+    assert.equal(actionContext.uiState.initialSetupAuxiliary.active?.kind, "import");
+    await dispatchGuiAction("import-config-toml", -1, "", wizard, actionContext);
+    assert.equal(nativeCalls.length, 1, "the file picker is owned by one local request");
+    assert.deepEqual(nativeCalls[0], {
+      name: "load_initial_setup_config_toml",
+      args: {
+        expectedConfigTarget: wizard.config_target,
+        expectedSetupTarget: setupTarget,
+      },
+    });
+    release({
+      sourcePath: "C:/existing/config.toml",
+      values: [
+        { key: "model.model", text: "model-b" },
+        { key: "docling.enabled", text: "true" },
+      ],
+    });
+    await first;
+
+    assert.equal(actionContext.uiState.configDirty, true);
+    assert.deepEqual(Array.from(actionContext.uiState.configDraftValues), [
+      ["model.model", "model-b"],
+      ["docling.enabled", "true"],
+    ]);
+    assert.equal(
+      initialSetupImportedSourcePath(
+        actionContext.uiState.initialSetupAuxiliary,
+        setupTarget,
+        wizard.config_target,
+      ),
+      "C:/existing/config.toml",
+    );
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+    else delete (globalThis as Record<string, unknown>).window;
+  }
+});
+
+test("Initial Setup Docling check sends the complete draft and admits only its endpoint result", async () => {
+  const setupTarget = {
+    workspacePath: "C:/workspace",
+    globalConfigPath: "C:/config/config.toml",
+    setupGeneration: "4",
+  };
+  const fields = [
+    {
+      key: "docling.enabled",
+      value: "true",
+      env_override: null,
+      value_type: "boolean" as const,
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "docling.base_url",
+      value: "http://127.0.0.1:5001/",
+      env_override: null,
+      value_type: "string" as const,
+      required: true,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+  ];
+  const wizard = state({
+    overlay: "initial_setup",
+    startup: {
+      ...state().startup,
+      action_overlay: "initial_setup",
+      initial_setup_required: true,
+      initial_setup_reason: "optional_tool_invalid",
+      global_config_path: setupTarget.globalConfigPath,
+      setup_target: setupTarget,
+    },
+    config_fields: fields,
+  });
+  const actionContext = context(wizard, []);
+  actionContext.uiState.initialSetup.step = "tools";
+  const pending = state({
+    ...wizard,
+    docling_readiness: {
+      status: "checking",
+      endpoint: "http://127.0.0.1:5001/ready",
+      httpStatus: null,
+      message: "Checking Docling readiness.",
+    },
+  });
+  const nativeCalls: MutationCall[] = [];
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    writable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: async (name: string, args?: Record<string, unknown>) => {
+          nativeCalls.push({ name, args });
+          return pending;
+        },
+      },
+    },
+  });
+
+  try {
+    await dispatchGuiAction("check-docling-readiness", -1, "", wizard, actionContext);
+    assert.deepEqual(nativeCalls, [{
+      name: "check_initial_setup_docling_readiness",
+      args: {
+        values: fields.map((field) => ({ key: field.key, text: field.value })),
+        expectedConfigTarget: wizard.config_target,
+        expectedSetupTarget: setupTarget,
+      },
+    }]);
+    assert.equal(actionContext.uiState.initialSetupAuxiliary.active, null);
+    assert.equal(initialSetupDoclingReadinessVisible(
+      actionContext.uiState.initialSetupAuxiliary,
+      setupTarget,
+      wizard.config_target,
+      actionContext.uiState.configDraftRevision,
+      pending.docling_readiness.endpoint,
+    ), true);
+    assert.equal(initialSetupDoclingReadinessVisible(
+      actionContext.uiState.initialSetupAuxiliary,
+      setupTarget,
+      wizard.config_target,
+      actionContext.uiState.configDraftRevision,
+      "http://127.0.0.1:5002/ready",
+    ), false);
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+    else delete (globalThis as Record<string, unknown>).window;
+  }
+});
+
+test("dirty Settings X or Escape route requests one exact-target confirmation and Cancel restores X focus", async () => {
+  const clean = state();
+  const dirty = state({
+    overlay: "config",
+    config_draft: {
+      ...clean.config_draft,
+      dirty: true,
+      discard_enabled: true,
+      commit_enabled: true,
+      external_owner_mutation_open: false,
+    },
+  });
+  const calls: MutationCall[] = [];
+  let rerenders = 0;
+  const actionContext = context(dirty, calls, () => { rerenders += 1; });
+
+  assert.equal(overlayDismissAction("config"), "close-overlay");
+  assert.equal(await dispatchGuiAction("close-overlay", -1, "", dirty, actionContext), true);
+  assert.deepEqual(actionContext.uiState.pendingLocalConfirmation, {
+    kind: "settings_close",
+    expectedTarget: dirty.config_target,
+  });
+  assert.deepEqual(calls, [], "dirty close must not reach close_overlay before a decision");
+  assert.equal(rerenders, 1);
+
+  assert.equal(await dispatchGuiAction("cancel-local-confirm", -1, "", dirty, actionContext), true);
+  assert.equal(actionContext.uiState.pendingLocalConfirmation, null);
+  assert.deepEqual(actionContext.uiState.settingsActionFocusContinuation, {
+    target: dirty.config_target,
+    primaryAction: "close-overlay",
+    fallbackAction: null,
+  });
+  assert.deepEqual(calls, []);
+  assert.equal(rerenders, 2);
+});
+
+test("discard-and-close validates the exact config owner with its Rust baseline before issuing close_overlay", async () => {
+  const clean = state();
+  const dirty = state({
+    overlay: "config",
+    config_fields: [{
+      key: "model.model",
+      value: "draft-model",
+      env_override: null,
+      value_type: "string",
+      required: true,
+      min_value: null,
+      max_value: null,
+      options: [],
+    }],
+    config_draft: {
+      ...clean.config_draft,
+      dirty: true,
+      discard_enabled: true,
+      commit_enabled: true,
+      external_owner_mutation_open: false,
+    },
+  });
+  const calls: MutationCall[] = [];
+  const actionContext = context(dirty, calls);
+  actionContext.uiState.configDirty = true;
+  actionContext.uiState.configDraftTarget = { ...dirty.config_target };
+  actionContext.uiState.configDraftValues.set("model.model", "draft-model");
+  actionContext.uiState.configDraftBaselineValues.set("model.model", "saved-model");
+  actionContext.uiState.configDraftRevision = 1n;
+  const baseline = state({
+    overlay: "config",
+    config_target: dirty.config_target,
+    config_fields: [{ ...dirty.config_fields[0], value: "saved-model" }],
+  });
+  actionContext.getProjection = () => baseline;
+  const values = [{ key: "model.model", text: "saved-model" }];
+  let currentView = dirty;
+  actionContext.getViewState = () => currentView;
+  const accepted: Array<{
+    overlay: DesktopViewState["overlay"];
+    localConfirmationOpen: boolean;
+    settingsPending: boolean;
+  }> = [];
+  const sequence: string[] = [];
+  let markInteractionBarrierReached!: () => void;
+  const interactionBarrierReached = new Promise<void>((resolve) => {
+    markInteractionBarrierReached = resolve;
+  });
+  let releaseInteraction!: () => void;
+  const interactionIdle = new Promise<void>((resolve) => {
+    releaseInteraction = resolve;
+  });
+  actionContext.waitForInteractionIdle = async () => {
+    sequence.push("wait:interaction-idle");
+    markInteractionBarrierReached();
+    await interactionIdle;
+    sequence.push("settled:interaction-idle");
+  };
+  actionContext.acceptProjection = (next) => {
+    currentView = next as DesktopViewState;
+    accepted.push({
+      overlay: currentView.overlay,
+      localConfirmationOpen: actionContext.uiState.pendingLocalConfirmation !== null,
+      settingsPending: actionContext.getRenderModel()?.local.configMutationPending ?? false,
+    });
+    sequence.push(`accept:${currentView.overlay}`);
+  };
+  const nativeCalls: MutationCall[] = [];
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    writable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: async (name: string, args?: Record<string, unknown>) => {
+          nativeCalls.push({ name, args });
+          sequence.push(`invoke:${name}`);
+          return name === "close_overlay" ? state({ overlay: "none" }) : baseline;
+        },
+      },
+    },
+  });
+
+  try {
+    await dispatchGuiAction("close-overlay", -1, "", dirty, actionContext);
+    const confirmation = dispatchGuiAction(
+      "confirm-settings-discard-close",
+      -1,
+      "",
+      dirty,
+      actionContext,
+    );
+    await interactionBarrierReached;
+    assert.deepEqual(nativeCalls.map((call) => call.name), ["reset_config_draft"]);
+    assert.deepEqual(accepted, [
+      { overlay: "config", localConfirmationOpen: false, settingsPending: true },
+    ], "close_overlay waits until the alertdialog-close render has committed");
+    releaseInteraction();
+    await confirmation;
+
+    assert.deepEqual(nativeCalls, [
+      {
+        name: "reset_config_draft",
+        args: { values, expectedTarget: dirty.config_target },
+      },
+      { name: "close_overlay", args: {} },
+    ]);
+    assert.deepEqual(calls, []);
+    assert.equal(actionContext.uiState.configDirty, false);
+    assert.equal(actionContext.uiState.pendingLocalConfirmation, null);
+    assert.deepEqual(accepted, [
+      { overlay: "config", localConfirmationOpen: false, settingsPending: true },
+      { overlay: "none", localConfirmationOpen: false, settingsPending: false },
+    ]);
+    assert.deepEqual(sequence, [
+      "invoke:reset_config_draft",
+      "accept:config",
+      "wait:interaction-idle",
+      "settled:interaction-idle",
+      "invoke:close_overlay",
+      "accept:none",
+    ], "the local modal and Settings overlay settle in separate renders");
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+    else delete (globalThis as Record<string, unknown>).window;
+  }
+});
+
+test("discard-and-close never crosses a config target change that wins the reset settlement race", async () => {
+  const clean = state();
+  const dirty = state({
+    overlay: "config",
+    config_fields: [{
+      key: "model.model",
+      value: "draft-model",
+      env_override: null,
+      value_type: "string",
+      required: true,
+      min_value: null,
+      max_value: null,
+      options: [],
+    }],
+    config_draft: {
+      ...clean.config_draft,
+      dirty: true,
+      discard_enabled: true,
+      commit_enabled: true,
+      external_owner_mutation_open: false,
+    },
+  });
+  let currentView = dirty;
+  const actionContext = context(dirty, []);
+  actionContext.getViewState = () => currentView;
+  actionContext.getProjection = () => state({
+    overlay: "config",
+    config_target: dirty.config_target,
+    config_fields: [{ ...dirty.config_fields[0], value: "saved-model" }],
+  });
+  actionContext.uiState.configDirty = true;
+  actionContext.uiState.configDraftTarget = { ...dirty.config_target };
+  actionContext.uiState.configDraftValues.set("model.model", "draft-model");
+  actionContext.uiState.configDraftBaselineValues.set("model.model", "saved-model");
+  const nativeCalls: MutationCall[] = [];
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    writable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: async (name: string, args?: Record<string, unknown>) => {
+          nativeCalls.push({ name, args });
+          currentView = state({
+            overlay: "config",
+            config_target: { ...dirty.config_target, configGeneration: "8" },
+          });
+          return currentView;
+        },
+      },
+    },
+  });
+
+  try {
+    await dispatchGuiAction("close-overlay", -1, "", dirty, actionContext);
+    await dispatchGuiAction("confirm-settings-discard-close", -1, "", dirty, actionContext);
+    assert.deepEqual(nativeCalls.map((call) => call.name), ["reset_config_draft"]);
+    assert.equal(actionContext.uiState.configDirty, true);
+    assert.equal(actionContext.uiState.localConfirmationDecisionPending, false);
+    assert.match(actionContext.uiState.localConfirmationDecisionError, /設定対象が変更/);
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+    else delete (globalThis as Record<string, unknown>).window;
+  }
 });

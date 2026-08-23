@@ -6,7 +6,7 @@ use super::models::{
 };
 use super::query::desktop_run_phase_label;
 use super::startup::{DesktopStartupCheckStatus, DesktopStartupStatus};
-use super::state::{DesktopOverlay, DesktopState, DesktopStatusCode};
+use super::state::{DesktopDoclingReadinessState, DesktopOverlay, DesktopState, DesktopStatusCode};
 use crate::app::AgentActivityRecord;
 use crate::config::{AccessMode, ConfigField, ProviderMetadataMode, ResolvedConfig};
 use crate::llm::ProviderModelLoadState;
@@ -62,7 +62,18 @@ pub struct DesktopStartupProjection {
     pub detail: String,
     pub action_overlay: String,
     pub initial_setup_required: bool,
+    pub initial_setup_reason: Option<String>,
+    pub global_config_path: Option<String>,
+    pub setup_target: Option<DesktopInitialSetupMutationTargetProjection>,
     pub checks: Vec<DesktopStartupCheckProjection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopInitialSetupMutationTargetProjection {
+    pub workspace_path: String,
+    pub global_config_path: String,
+    pub setup_generation: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +265,27 @@ pub(crate) fn access_runtime_owner_token(
     }
 }
 
+pub(crate) fn access_runtime_owner_terminal_settlement_matches(
+    expected: &str,
+    current: &str,
+) -> bool {
+    let parse = |value: &str| {
+        let (kind, generation) = value.split_once(':')?;
+        let kind = match kind {
+            "root" => 0,
+            "tree" => 1,
+            "idle" => 2,
+            _ => return None,
+        };
+        Some((kind, generation.parse::<u64>().ok()?))
+    };
+    match (parse(expected), parse(current)) {
+        (Some((0, expected)), Some((1 | 2, current))) => expected == current,
+        (Some((1, expected)), Some((0 | 2, current))) => expected == current,
+        _ => false,
+    }
+}
+
 pub(crate) fn navigation_admission_blocker(
     busy: bool,
     background_mutation_pending: bool,
@@ -335,6 +367,32 @@ pub struct DesktopAccessModeMutationTargetProjection {
     pub config_generation: String,
     pub access_mode: AccessMode,
     pub runtime_owner_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopSessionSettingsMutationTargetProjection {
+    pub workspace_path: String,
+    pub root_session_id: String,
+    pub settings_revision: String,
+    pub config_generation: String,
+    pub runtime_owner_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopSessionSettingsProjection {
+    pub available: bool,
+    pub base_url: String,
+    pub model: String,
+    pub access_mode: AccessMode,
+    pub context_window: String,
+    pub max_output_tokens: String,
+    pub context_window_inherited: bool,
+    pub max_output_tokens_inherited: bool,
+    pub provider_mutation_enabled: bool,
+    pub access_mutation_enabled: bool,
+    pub unavailable_reason: String,
+    pub target: Option<DesktopSessionSettingsMutationTargetProjection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -448,6 +506,7 @@ pub struct DesktopWebState {
     pub model_label: String,
     pub access_label: String,
     pub access_target: DesktopAccessModeMutationTargetProjection,
+    pub session_settings: DesktopSessionSettingsProjection,
     pub config_draft_capabilities: DesktopConfigDraftCapabilitiesProjection,
     pub current_session_label: String,
     pub selected_session_title: String,
@@ -536,6 +595,7 @@ pub struct DesktopWebState {
     pub provider_selected_model_summary: Vec<String>,
     pub provider_loading: bool,
     pub provider_apply_enabled: bool,
+    pub docling_readiness: DesktopDoclingReadinessState,
     pub config_fields: Vec<DesktopConfigFieldProjection>,
     pub config_target: DesktopConfigMutationTargetProjection,
     pub workspace_input: String,
@@ -786,6 +846,12 @@ pub(crate) fn desktop_web_state_with_permission(
             access_mode_mutation_open,
         ),
     };
+    let session_settings = session_settings_projection(
+        state,
+        runtime,
+        config_draft_commit_open && !runtime.agent_tree_active,
+        access_mode_mutation_open,
+    );
     DesktopWebState {
         projection_revision: "0".to_string(),
         workspace_path: state.snapshot.workspace_path.clone(),
@@ -822,6 +888,7 @@ pub(crate) fn desktop_web_state_with_permission(
                 runtime.last_root_run_epoch,
             ),
         },
+        session_settings,
         config_draft_capabilities,
         current_session_label: state.current_session_label(),
         selected_session_title: state.selected_session_title(),
@@ -1026,9 +1093,10 @@ pub(crate) fn desktop_web_state_with_permission(
         provider_selected_model_summary: provider_selected_model_summary(state),
         provider_loading: state.provider_config.provider_loading,
         provider_apply_enabled: state.can_apply_provider_selection(),
+        docling_readiness: state.docling_readiness.clone(),
         config_fields: ConfigField::ALL
             .into_iter()
-            .map(|field| config_field_projection(field, &state.provider_config.effective_config))
+            .map(|field| config_field_projection(field, state.global_config()))
             .collect(),
         config_target: DesktopConfigMutationTargetProjection {
             workspace_path: state.snapshot.workspace_path.clone(),
@@ -1144,7 +1212,85 @@ fn desktop_image_input_delegates_capability_to_runtime(state: &DesktopState) -> 
     !state.is_busy() && !state.navigation_loading()
 }
 
+fn session_settings_projection(
+    state: &DesktopState,
+    runtime: &DesktopRuntimeProjection,
+    provider_mutation_enabled: bool,
+    access_mutation_enabled: bool,
+) -> DesktopSessionSettingsProjection {
+    let session = state
+        .open_session
+        .as_ref()
+        .map(|open_session| open_session.session());
+    let session = session.filter(|session| Some(session.id) == state.app_state.current_session_id);
+    let Some(session) = session else {
+        return DesktopSessionSettingsProjection {
+            available: false,
+            base_url: String::new(),
+            model: String::new(),
+            access_mode: state
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode,
+            context_window: String::new(),
+            max_output_tokens: String::new(),
+            context_window_inherited: true,
+            max_output_tokens_inherited: true,
+            provider_mutation_enabled: false,
+            access_mutation_enabled: false,
+            unavailable_reason:
+                "root sessionを選択すると、このセッションだけの設定を変更できます。".to_string(),
+            target: None,
+        };
+    };
+    DesktopSessionSettingsProjection {
+        available: true,
+        base_url: session.base_url.clone(),
+        model: session.model.clone(),
+        access_mode: session.access_mode,
+        context_window: session
+            .model_parameters
+            .context_window
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        max_output_tokens: session
+            .model_parameters
+            .max_output_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        context_window_inherited: session.model_parameters.context_window.is_none(),
+        max_output_tokens_inherited: session.model_parameters.max_output_tokens.is_none(),
+        provider_mutation_enabled,
+        access_mutation_enabled,
+        unavailable_reason: String::new(),
+        target: Some(DesktopSessionSettingsMutationTargetProjection {
+            workspace_path: state.snapshot.workspace_path.clone(),
+            root_session_id: session.id.to_string(),
+            settings_revision: session.session_settings_revision.to_string(),
+            config_generation: state.provider_config.config_generation.to_string(),
+            runtime_owner_token: access_runtime_owner_token(
+                runtime.root_run_generation,
+                runtime.agent_tree_active,
+                runtime.last_root_run_epoch,
+            ),
+        }),
+    }
+}
+
 fn startup_projection(state: &DesktopState) -> DesktopStartupProjection {
+    let setup_target = state.startup.requires_initial_setup().then(|| {
+        DesktopInitialSetupMutationTargetProjection {
+            workspace_path: state.snapshot.workspace_path.clone(),
+            global_config_path: state
+                .startup
+                .global_config_path
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            setup_generation: state.startup.setup_generation.to_string(),
+        }
+    });
     DesktopStartupProjection {
         status: startup_status_key(state.startup.status).to_string(),
         title: state.startup.title.clone(),
@@ -1157,6 +1303,16 @@ fn startup_projection(state: &DesktopState) -> DesktopStartupProjection {
             .unwrap_or("none")
             .to_string(),
         initial_setup_required: state.startup.requires_initial_setup(),
+        initial_setup_reason: state
+            .startup
+            .initial_setup_reason
+            .map(|reason| reason.key().to_string()),
+        global_config_path: state
+            .startup
+            .global_config_path
+            .as_ref()
+            .map(ToString::to_string),
+        setup_target,
         checks: state
             .startup
             .checks
@@ -1208,12 +1364,14 @@ fn access_mode_key(access: AccessMode) -> &'static str {
 fn overlay_key(overlay: DesktopOverlay) -> &'static str {
     match overlay {
         DesktopOverlay::None => "none",
+        DesktopOverlay::InitialSetup => "initial_setup",
         DesktopOverlay::FileMenu => "file_menu",
         DesktopOverlay::EditMenu => "edit_menu",
         DesktopOverlay::ViewMenu => "view_menu",
         DesktopOverlay::HelpMenu => "help_menu",
         DesktopOverlay::ProjectMenu => "project_menu",
         DesktopOverlay::ConfigEditor => "config",
+        DesktopOverlay::SessionSettings => "session_settings",
         DesktopOverlay::ProviderEditor => "provider",
         DesktopOverlay::WorkspacePicker => "workspace",
         DesktopOverlay::PromptReview => "prompt_review",
@@ -1706,6 +1864,44 @@ mod tests {
         assert_eq!(access.value_type().as_str(), "enum");
         assert_eq!(access.options(), &["default", "auto_review", "full_access"]);
         assert_eq!(access_mode_key(AccessMode::AutoReview), "auto_review");
+    }
+
+    #[test]
+    fn docling_readiness_projects_typed_status_and_pending_operation() {
+        let mut state = DesktopState::new(
+            super::super::models::DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            ResolvedConfig::default(),
+        );
+        state.begin_docling_readiness_check("https://docling.example.test/ready".to_string());
+
+        let projection = desktop_web_state(&state, &DesktopRuntimeProjection::default());
+        let json = serde_json::to_value(&projection).expect("serialize Desktop projection");
+
+        assert_eq!(json["docling_readiness"]["status"], "checking");
+        assert_eq!(
+            json["docling_readiness"]["endpoint"],
+            "https://docling.example.test/ready"
+        );
+        assert_eq!(
+            json["docling_readiness"]["httpStatus"],
+            serde_json::Value::Null
+        );
+        assert!(
+            projection
+                .pending_async_operations
+                .contains(&"docling_readiness_check".to_string())
+        );
     }
 
     #[test]
@@ -2291,6 +2487,119 @@ mod tests {
             projection.config_target.session_id,
             Some(session_id.to_string())
         );
+    }
+
+    #[test]
+    fn preferences_config_fields_project_global_values_not_root_effective_overrides() {
+        let mut global = crate::config::ResolvedConfig::default();
+        global.model.model = "global-model".to_string();
+        global.model.context_window = 32_768;
+        let mut state = DesktopState::new(
+            super::super::models::DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            global.clone(),
+        );
+        let mut root_effective = global.clone();
+        root_effective.model.model = "root-model".to_string();
+        root_effective.model.context_window = 131_072;
+        state.reset_effective_config(root_effective);
+
+        let projection = desktop_web_state(&state, &DesktopRuntimeProjection::default());
+        let model = projection
+            .config_fields
+            .iter()
+            .find(|field| field.key == ConfigField::Model.descriptor().key())
+            .expect("model config field");
+        let context_window = projection
+            .config_fields
+            .iter()
+            .find(|field| field.key == ConfigField::ContextWindow.descriptor().key())
+            .expect("context-window config field");
+
+        assert_eq!(model.value, "global-model");
+        assert_eq!(context_window.value, "32768");
+    }
+
+    #[test]
+    fn inherited_session_limits_project_as_blank_optional_overrides() {
+        let mut global = crate::config::ResolvedConfig::default();
+        global.model.context_window = 32_768;
+        global.model.max_output_tokens = 2_048;
+        let session = crate::session::SessionRecord {
+            id: crate::session::SessionId::new(),
+            project_id: crate::session::ProjectId::new(),
+            title: "session".to_string(),
+            status: crate::session::SessionStatus::Running,
+            cwd: camino::Utf8PathBuf::from("C:/workspace"),
+            model: "session-model".to_string(),
+            base_url: "http://127.0.0.1:1234".to_string(),
+            access_mode: crate::config::AccessMode::Default,
+            model_parameters: crate::session::SessionModelParameters::default(),
+            session_settings_revision: 3,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            completed_at_ms: None,
+        };
+        let read = crate::session::CanonicalSessionRead {
+            session: session.clone(),
+            history: crate::session::CanonicalHistoryPage {
+                session: session.clone(),
+                offset: 0,
+                limit: 1,
+                total: 0,
+                has_more: false,
+                items: Vec::new(),
+            },
+            turns: crate::session::CanonicalTurnPage {
+                session: session.clone(),
+                offset: 0,
+                limit: 1,
+                total: 0,
+                has_more: false,
+                items: Vec::new(),
+            },
+            pending_turn_inputs: Vec::new(),
+            turn_elapsed_ms: std::collections::HashMap::new(),
+            latest_turn_id: None,
+            active_turn_id: None,
+            active_turn_sequence_no: None,
+            admission_revision: 0,
+        };
+        let mut state = DesktopState::new(
+            super::super::models::DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            global,
+        );
+        state.app_state.current_session_id = Some(session.id);
+        state.load_open_session_preserving_history(&read);
+
+        let projection =
+            session_settings_projection(&state, &DesktopRuntimeProjection::default(), true, true);
+
+        assert!(projection.context_window_inherited);
+        assert!(projection.max_output_tokens_inherited);
+        assert_eq!(projection.context_window, "");
+        assert_eq!(projection.max_output_tokens, "");
     }
 
     #[test]

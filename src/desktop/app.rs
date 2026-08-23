@@ -26,7 +26,7 @@ use crate::config::{
     ConfigField, ConfigLoader, ProviderMetadataMode, ResolvedConfig, ShellFamily,
     sanitize_provider_endpoint,
 };
-use crate::error::{AppRunError, CliPromptError, CliRenderError};
+use crate::error::{AppRunError, CliPromptError, CliRenderError, SessionError, StorageError};
 use crate::llm::{
     ProviderModelInfo, apply_provider_model_info_to_config, extra_body_with_num_ctx,
     fetch_provider_model_infos, normalize_provider_base_url,
@@ -47,12 +47,12 @@ use crate::session::markdown::{
 };
 use crate::session::{
     ActiveTurnExpectation, EditorContext, LoadedSessionStatus, ProjectId, ProjectRecord, RunEvent,
-    RunEventDurability, RunSummary, SessionId, SessionRecord, SessionStatus,
+    RunEventDurability, RunSummary, SessionId, SessionRecord, SessionSettingsPatch, SessionStatus,
     canonical_session_read_to_markdown, history_markdown_file_name,
 };
 use crate::storage::{SideChatBinding, SideChatId, SideChatProviderTarget};
 use crate::tool::PermissionRequest;
-use crate::tui::config_editor::ConfigEditorState;
+use crate::tui::config_editor::{ConfigEditorState, GlobalConfigAdoptionPolicy};
 use crate::workspace::project::normalize_path;
 use tauri::Manager;
 use tempfile::NamedTempFile;
@@ -80,8 +80,8 @@ use super::state::{DesktopState, DesktopStatusCode};
 use super::web_model::desktop_web_state;
 use super::web_model::{
     DesktopRuntimeProjection, DesktopSideChatMessageProjection, DesktopSideChatProjection,
-    DesktopWebState, access_runtime_owner_token, agent_activity_projection,
-    desktop_web_state_with_permission, navigation_admission_blocker,
+    DesktopWebState, access_runtime_owner_terminal_settlement_matches, access_runtime_owner_token,
+    agent_activity_projection, desktop_web_state_with_permission, navigation_admission_blocker,
 };
 
 const DESKTOP_RUNTIME_DRAIN_BUDGET: usize = 256;
@@ -187,6 +187,11 @@ enum RuntimeMessage {
         target: ProviderCatalogRequestTarget,
         result: Result<Vec<ProviderModelInfo>, String>,
     },
+    DoclingReadinessChecked {
+        request_id: LatestRequestId,
+        target: DoclingReadinessRequestTarget,
+        result: Result<crate::docling::DoclingReadinessResult, String>,
+    },
     HistoryExported {
         request_id: LatestRequestId,
         target: HistoryExportRequestTarget,
@@ -205,7 +210,7 @@ enum RuntimeMessage {
         target: AccessModePersistenceTarget,
         phase: AccessModePersistencePhase,
         worker: Arc<AccessModePersistenceWorker>,
-        result: Result<Utf8PathBuf, String>,
+        result: Result<AccessModePersistenceCommit, String>,
     },
     SideChatDelta {
         owner_session_id: SessionId,
@@ -279,6 +284,12 @@ enum AccessModePersistencePhase {
     AdoptedSession { session_id: SessionId },
 }
 
+#[derive(Debug, Clone)]
+struct AccessModePersistenceCommit {
+    remembered_path: Utf8PathBuf,
+    session: Option<SessionRecord>,
+}
+
 struct PendingAccessModeAdoption {
     request_id: LatestRequestId,
     target: AccessModePersistenceTarget,
@@ -293,8 +304,10 @@ type CompareAndSetGlobalAccessMode = Box<
         ) -> Result<Option<Utf8PathBuf>, String>
         + Send,
 >;
-type PersistRootSessionAccessMode =
-    Box<dyn FnOnce(SessionId, crate::config::AccessMode) -> Result<(), String> + Send>;
+type PersistRootSessionAccessMode = Box<
+    dyn FnOnce(SessionId, crate::config::AccessMode) -> Result<Option<SessionRecord>, String>
+        + Send,
+>;
 
 struct AccessModePersistenceWorker {
     compare_and_set_global: Mutex<CompareAndSetGlobalAccessMode>,
@@ -313,8 +326,9 @@ impl AccessModePersistenceWorker {
             ) -> Result<Option<Utf8PathBuf>, String>
             + Send
             + 'static,
-        PersistSession:
-            FnOnce(SessionId, crate::config::AccessMode) -> Result<(), String> + Send + 'static,
+        PersistSession: FnOnce(SessionId, crate::config::AccessMode) -> Result<Option<SessionRecord>, String>
+            + Send
+            + 'static,
     {
         Self {
             compare_and_set_global: Mutex::new(Box::new(compare_and_set_global)),
@@ -325,8 +339,8 @@ impl AccessModePersistenceWorker {
     fn persist_initial_owners(
         &self,
         target: &AccessModePersistenceTarget,
-    ) -> Result<Utf8PathBuf, String> {
-        persist_desktop_access_mode_owners(
+    ) -> Result<AccessModePersistenceCommit, String> {
+        persist_desktop_access_mode_owners_canonical(
             target.old_global_access_mode,
             target.access_mode,
             target.session_id,
@@ -340,23 +354,29 @@ impl AccessModePersistenceWorker {
         target: &AccessModePersistenceTarget,
         session_id: SessionId,
         remembered_path: Utf8PathBuf,
-    ) -> Result<Utf8PathBuf, String> {
-        if let Err(session_error) = self.persist_session(session_id, target.access_mode) {
-            return match self
-                .compare_and_set_global(target.access_mode, target.old_global_access_mode)
-            {
-                Ok(Some(_)) => Err(format!(
-                    "adopted session access mode update failed and the global field was restored: {session_error}"
-                )),
-                Ok(None) => Err(format!(
-                    "adopted session access mode update failed; the global field changed again and was not overwritten: {session_error}"
-                )),
-                Err(rollback_error) => Err(format!(
-                    "adopted session access mode update failed and global compensation failed: {session_error}; {rollback_error}"
-                )),
-            };
-        }
-        Ok(remembered_path)
+    ) -> Result<AccessModePersistenceCommit, String> {
+        let session = match self.persist_session(session_id, target.access_mode) {
+            Ok(session) => session,
+            Err(session_error) => {
+                return match self
+                    .compare_and_set_global(target.access_mode, target.old_global_access_mode)
+                {
+                    Ok(Some(_)) => Err(format!(
+                        "adopted session access mode update failed and the global field was restored: {session_error}"
+                    )),
+                    Ok(None) => Err(format!(
+                        "adopted session access mode update failed; the global field changed again and was not overwritten: {session_error}"
+                    )),
+                    Err(rollback_error) => Err(format!(
+                        "adopted session access mode update failed and global compensation failed: {session_error}; {rollback_error}"
+                    )),
+                };
+            }
+        };
+        Ok(AccessModePersistenceCommit {
+            remembered_path,
+            session,
+        })
     }
 
     fn compare_and_set_global(
@@ -375,7 +395,7 @@ impl AccessModePersistenceWorker {
         &self,
         session_id: SessionId,
         access_mode: crate::config::AccessMode,
-    ) -> Result<(), String> {
+    ) -> Result<Option<SessionRecord>, String> {
         let persist_session = self
             .persist_session
             .lock()
@@ -479,6 +499,129 @@ struct ProviderCatalogRequestTarget {
     selected_model_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoclingReadinessRequestTarget {
+    owner: DoclingReadinessConfigOwner,
+    base_url: String,
+    config_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoclingReadinessConfigOwner {
+    EffectiveConfig,
+    InitialSetupDraft,
+}
+
+#[derive(Debug)]
+pub(crate) enum RootSessionSettingsApplyError {
+    ActiveTree(String),
+    Internal(String),
+}
+
+impl RootSessionSettingsApplyError {
+    fn from_session_error(error: SessionError) -> Self {
+        match error {
+            matched @ SessionError::Storage(StorageError::SessionSettingsActiveTree { .. }) => {
+                Self::ActiveTree(matched.to_string())
+            }
+            other => Self::Internal(other.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for RootSessionSettingsApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ActiveTree(message) | Self::Internal(message) => formatter.write_str(message),
+        }
+    }
+}
+
+pub(crate) struct RootSessionSettingsPersistence {
+    app: App,
+    session_id: SessionId,
+    expected_settings_revision: u64,
+    current_access_mode: crate::config::AccessMode,
+    patch: SessionSettingsPatch,
+    access_only: bool,
+    config_generation_delta: u64,
+}
+
+pub(crate) struct RootSessionSettingsPersistenceResult {
+    pub(crate) update: crate::session::SessionSettingsUpdate,
+    pub(crate) access_only: bool,
+    pub(crate) config_generation_delta: u64,
+}
+
+pub(crate) enum RootSessionSettingsPersistenceOutcome {
+    Applied(RootSessionSettingsPersistenceResult),
+    Conflict { session: SessionRecord },
+}
+
+impl RootSessionSettingsPersistenceOutcome {
+    pub(crate) fn canonical_session(&self) -> &SessionRecord {
+        match self {
+            Self::Applied(result) => &result.update.session,
+            Self::Conflict { session, .. } => session,
+        }
+    }
+}
+
+impl RootSessionSettingsPersistence {
+    pub(crate) fn access_only(&self) -> bool {
+        self.access_only
+    }
+
+    pub(crate) fn execute_blocking(
+        self,
+    ) -> Result<RootSessionSettingsPersistenceOutcome, RootSessionSettingsApplyError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| RootSessionSettingsApplyError::Internal(error.to_string()))?;
+        let access_only = self.access_only;
+        let config_generation_delta = self.config_generation_delta;
+        runtime.block_on(async move {
+            let service = self.app.session_service.clone();
+            let update = if access_only {
+                service
+                    .compare_and_set_root_session_access_mode_at_revision(
+                        self.session_id,
+                        self.expected_settings_revision,
+                        self.current_access_mode,
+                        self.patch
+                            .access_mode
+                            .expect("access-only patch retains the next mode"),
+                    )
+                    .await
+            } else {
+                service
+                    .compare_and_set_root_session_settings(
+                        self.session_id,
+                        self.expected_settings_revision,
+                        self.patch,
+                    )
+                    .await
+            }
+            .map_err(RootSessionSettingsApplyError::from_session_error)?;
+            match update {
+                Some(update) => Ok(RootSessionSettingsPersistenceOutcome::Applied(
+                    RootSessionSettingsPersistenceResult {
+                        update,
+                        access_only,
+                        config_generation_delta,
+                    },
+                )),
+                None => service
+                    .get_session(self.session_id)
+                    .await
+                    .map(|session| RootSessionSettingsPersistenceOutcome::Conflict { session })
+                    .map_err(RootSessionSettingsApplyError::from_session_error),
+            }
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeMessageAsyncContract {
     RunStream,
@@ -545,6 +688,9 @@ impl RuntimeMessage {
                 RuntimeMessageAsyncContract::BackgroundOperation
             }
             RuntimeMessage::ModelCatalogLoaded { .. } => {
+                RuntimeMessageAsyncContract::ProviderOperation
+            }
+            RuntimeMessage::DoclingReadinessChecked { .. } => {
                 RuntimeMessageAsyncContract::ProviderOperation
             }
             RuntimeMessage::HistoryExported { .. } => {
@@ -642,6 +788,7 @@ fn commit_effective_config(state: &mut DesktopState, config: ResolvedConfig) {
     state.reset_effective_config(config);
 }
 
+#[cfg(test)]
 fn persist_desktop_access_mode_owners<CompareAndSetGlobal, PersistSession>(
     old_global_access_mode: crate::config::AccessMode,
     access_mode: crate::config::AccessMode,
@@ -683,6 +830,59 @@ where
         };
     }
     Ok(remembered_path)
+}
+
+fn persist_desktop_access_mode_owners_canonical<CompareAndSetGlobal, PersistSession>(
+    old_global_access_mode: crate::config::AccessMode,
+    access_mode: crate::config::AccessMode,
+    current_root_session_id: Option<SessionId>,
+    mut compare_and_set_global: CompareAndSetGlobal,
+    persist_session: PersistSession,
+) -> Result<AccessModePersistenceCommit, String>
+where
+    CompareAndSetGlobal: FnMut(
+        crate::config::AccessMode,
+        crate::config::AccessMode,
+    ) -> Result<Option<Utf8PathBuf>, String>,
+    PersistSession:
+        FnOnce(SessionId, crate::config::AccessMode) -> Result<Option<SessionRecord>, String>,
+{
+    let remembered_path = match compare_and_set_global(old_global_access_mode, access_mode) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            return Err(
+                "global access mode changed before this update; reload configuration and try again"
+                    .to_string(),
+            );
+        }
+        Err(error) => return Err(format!("global access mode update failed: {error}")),
+    };
+    let Some(session_id) = current_root_session_id else {
+        return Ok(AccessModePersistenceCommit {
+            remembered_path,
+            session: None,
+        });
+    };
+    let session = match persist_session(session_id, access_mode) {
+        Ok(session) => session,
+        Err(session_error) => {
+            return match compare_and_set_global(access_mode, old_global_access_mode) {
+                Ok(Some(_)) => Err(format!(
+                    "session access mode update failed and the global field was restored: {session_error}"
+                )),
+                Ok(None) => Err(format!(
+                    "session access mode update failed; the global field changed again and was not overwritten: {session_error}"
+                )),
+                Err(rollback_error) => Err(format!(
+                    "session access mode update failed and global compensation failed: {session_error}; {rollback_error}"
+                )),
+            };
+        }
+    };
+    Ok(AccessModePersistenceCommit {
+        remembered_path,
+        session,
+    })
 }
 
 fn access_mode_display_label(access_mode: crate::config::AccessMode) -> &'static str {
@@ -1029,9 +1229,14 @@ fn access_mode_persistence_target_relation(
     config_generation: u64,
     runtime_owner_token: &str,
 ) -> AccessModePersistenceTargetRelation {
+    let runtime_owner_matches = target.runtime_owner_token == runtime_owner_token
+        || access_runtime_owner_terminal_settlement_matches(
+            &target.runtime_owner_token,
+            runtime_owner_token,
+        );
     if target.workspace_root != workspace_root
         || target.config_generation != config_generation
-        || target.runtime_owner_token != runtime_owner_token
+        || !runtime_owner_matches
     {
         return AccessModePersistenceTargetRelation::Stale;
     }
@@ -1525,6 +1730,100 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
+    async fn initial_setup_latch_rejects_direct_and_async_workspace_owner_replacement() {
+        let (temp, project_root, mut controller) = empty_access_test_controller().await;
+        let replacement_root =
+            Utf8PathBuf::from_path_buf(temp.path().join("replacement-workspace"))
+                .expect("utf8 replacement root");
+        std::fs::create_dir_all(replacement_root.join(".git")).expect("replacement workspace");
+        let replacement_app = AppBootstrap::rebuild_for_directory_with_process_runtime(
+            &replacement_root,
+            controller.app.process_runtime.clone(),
+        )
+        .await
+        .expect("replacement app");
+        let replacement_snapshot = load_snapshot_for_selection(&replacement_app, None)
+            .await
+            .expect("replacement snapshot");
+        let original_workspace_root = controller.app.workspace.root.clone();
+        let original_workspace_cwd = controller.app.workspace.cwd.clone();
+        let original_project_id = controller.app.workspace.project_id;
+        let original_snapshot_workspace = controller.state.snapshot.workspace_path.clone();
+        let original_workspace_input = controller.state.workspace_input.clone();
+
+        controller.state.begin_startup(false, None, &project_root);
+        let setup_generation = controller.state.startup.setup_generation;
+        let setup_reason = controller.state.startup.initial_setup_reason;
+        assert!(controller.state.startup.requires_initial_setup());
+        assert!(controller.state.view.startup_overlay_forced);
+
+        assert!(!controller.switch_workspace_to(replacement_root.to_string()));
+        assert_eq!(controller.state.workspace_input, original_workspace_input);
+        assert!(!controller.select_project_and_open(0));
+        assert!(!controller.start_project_session(0));
+        assert!(!controller.delete_project(original_project_id));
+        assert!(!controller.select_session_and_open(0));
+        assert!(!controller.start_quick_chat());
+        assert!(!controller.create_project_from_picker());
+        assert!(!controller.state.navigation_loading());
+        assert!(!controller.state.background_mutation_pending());
+
+        let request_id = controller
+            .state
+            .begin_workspace_load(replacement_root.clone(), None);
+        controller.apply_workspace_switched_message(
+            request_id,
+            Ok(WorkspaceLoadResult {
+                app: replacement_app.clone(),
+                snapshot: replacement_snapshot.clone(),
+            }),
+        );
+        assert!(
+            !controller.state.navigation_loading(),
+            "a rejected completion must settle its stale navigation operation"
+        );
+
+        let operation_id = controller.state.begin_project_delete_mutation();
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::ProjectDeleted {
+                target: ProjectDeleteRequestTarget {
+                    workspace_root: original_workspace_root.clone(),
+                    owner_project_id: original_project_id,
+                    project_id: original_project_id,
+                    project_root: original_workspace_root.clone(),
+                    operation_id,
+                },
+                result: Ok(WorkspaceLoadResult {
+                    app: replacement_app,
+                    snapshot: replacement_snapshot,
+                }),
+            })
+            .expect("project completion");
+        controller.drain_runtime_messages();
+
+        assert_eq!(controller.app.workspace.root, original_workspace_root);
+        assert_eq!(controller.app.workspace.cwd, original_workspace_cwd);
+        assert_eq!(controller.app.workspace.project_id, original_project_id);
+        assert_eq!(
+            controller.state.snapshot.workspace_path,
+            original_snapshot_workspace
+        );
+        assert_eq!(controller.state.startup.setup_generation, setup_generation);
+        assert_eq!(controller.state.startup.initial_setup_reason, setup_reason);
+        assert!(controller.state.startup.requires_initial_setup());
+        assert!(controller.state.view.startup_overlay_forced);
+        assert!(!controller.state.navigation_loading());
+        assert!(!controller.state.background_mutation_pending());
+        assert!(
+            !controller
+                .preferences
+                .is_project_deleted(&original_workspace_root),
+            "a rejected current-project completion must not mutate remembered owners"
+        );
+    }
+
+    #[tokio::test]
     async fn desktop_cold_start_sends_no_provider_or_docling_requests() {
         use std::io::{Read as _, Write as _};
         use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -1744,6 +2043,255 @@ mod command_projection_owner_tests {
         }
     }
 
+    #[tokio::test]
+    async fn failed_global_save_result_keeps_disk_commit_consumers_unchanged() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let original_app_model = controller.app.config.model.model.clone();
+        let original_effective_model = controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .model
+            .clone();
+        let original_generation = controller.state.provider_config.config_generation;
+
+        let error = controller
+            .commit_global_config_save_result(Err("simulated preflight failure".to_string()))
+            .expect_err("failed persistence must not commit runtime owners");
+
+        assert_eq!(error, "simulated preflight failure");
+        assert_eq!(controller.app.config.model.model, original_app_model);
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .model
+                .model,
+            original_effective_model
+        );
+        assert_eq!(
+            controller.state.provider_config.config_generation,
+            original_generation
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_docling_readiness_completion_wins_across_config_generation() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let mut config = controller.state.provider_config.effective_config.clone();
+        config.docling.enabled = true;
+        config.docling.base_url = "http://127.0.0.1:8123".to_string();
+        controller.reset_effective_config_without_network(config.clone());
+        let stale_target = DoclingReadinessRequestTarget {
+            owner: DoclingReadinessConfigOwner::EffectiveConfig,
+            base_url: config.docling.base_url.clone(),
+            config_generation: controller.state.provider_config.config_generation,
+        };
+        let stale_request_id = controller
+            .docling_readiness_requests
+            .begin(stale_target.clone());
+        controller
+            .state
+            .begin_docling_readiness_check(format!("{}/ready", stale_target.base_url));
+
+        config.docling.base_url = "http://127.0.0.1:8124".to_string();
+        controller.reset_effective_config_without_network(config);
+        let latest_target = DoclingReadinessRequestTarget {
+            owner: DoclingReadinessConfigOwner::EffectiveConfig,
+            base_url: controller
+                .state
+                .provider_config
+                .effective_config
+                .docling
+                .base_url
+                .clone(),
+            config_generation: controller.state.provider_config.config_generation,
+        };
+        let latest_request_id = controller
+            .docling_readiness_requests
+            .begin(latest_target.clone());
+        controller
+            .state
+            .begin_docling_readiness_check(format!("{}/ready", latest_target.base_url));
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::DoclingReadinessChecked {
+                request_id: stale_request_id,
+                target: stale_target,
+                result: Ok(crate::docling::DoclingReadinessResult {
+                    endpoint: "http://127.0.0.1:8123/ready".to_string(),
+                    http_status: 503,
+                    ready: false,
+                }),
+            })
+            .expect("stale readiness completion");
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::DoclingReadinessChecked {
+                request_id: latest_request_id,
+                target: latest_target,
+                result: Ok(crate::docling::DoclingReadinessResult {
+                    endpoint: "http://127.0.0.1:8124/ready".to_string(),
+                    http_status: 204,
+                    ready: true,
+                }),
+            })
+            .expect("latest readiness completion");
+        controller.drain_runtime_messages();
+
+        assert_eq!(
+            controller.state.docling_readiness.status,
+            super::super::state::DesktopDoclingReadinessStatus::Ready
+        );
+        assert_eq!(
+            controller.state.docling_readiness.endpoint,
+            "http://127.0.0.1:8124/ready"
+        );
+        assert_eq!(controller.state.docling_readiness.http_status, Some(204));
+        assert!(!controller.state.docling_readiness_check_pending());
+    }
+
+    #[tokio::test]
+    async fn initial_setup_draft_docling_completion_does_not_require_an_effective_endpoint_match() {
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let mut effective = controller.state.provider_config.effective_config.clone();
+        effective.docling.enabled = false;
+        effective.docling.base_url = "http://127.0.0.1:8123".to_string();
+        controller.reset_effective_config_without_network(effective.clone());
+        controller.state.begin_startup(false, None, &root);
+        assert!(controller.state.startup.requires_initial_setup());
+
+        let target = DoclingReadinessRequestTarget {
+            owner: DoclingReadinessConfigOwner::InitialSetupDraft,
+            base_url: "http://127.0.0.1:8124".to_string(),
+            config_generation: controller.state.provider_config.config_generation,
+        };
+        let request_id = controller.docling_readiness_requests.begin(target.clone());
+        controller
+            .state
+            .begin_docling_readiness_check("http://127.0.0.1:8124/ready".to_string());
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::DoclingReadinessChecked {
+                request_id,
+                target,
+                result: Ok(crate::docling::DoclingReadinessResult {
+                    endpoint: "http://127.0.0.1:8124/ready".to_string(),
+                    http_status: 204,
+                    ready: true,
+                }),
+            })
+            .expect("draft readiness completion");
+        controller.drain_runtime_messages();
+
+        assert_eq!(
+            controller.state.docling_readiness.status,
+            super::super::state::DesktopDoclingReadinessStatus::Ready
+        );
+        assert_eq!(
+            controller.state.docling_readiness.endpoint,
+            "http://127.0.0.1:8124/ready"
+        );
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .docling
+                .enabled,
+            effective.docling.enabled
+        );
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .docling
+                .base_url,
+            effective.docling.base_url
+        );
+    }
+
+    #[tokio::test]
+    async fn global_provider_candidate_does_not_mix_root_effective_overrides() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let mut global = controller.state.global_config().clone();
+        global.model.base_url = "http://127.0.0.1:1234".to_string();
+        global.model.model = "global-model".to_string();
+        global.model.context_window = 32_768;
+        global.model.max_output_tokens = 2_048;
+        global.model.supports_tools = false;
+        global.model.temperature = Some(0.2);
+        global.permissions.access_mode = crate::config::AccessMode::Default;
+        controller.app.config = global.clone();
+        controller.state.replace_global_config(global.clone());
+
+        let mut root_effective = global.clone();
+        root_effective.model.base_url = "http://127.0.0.1:5678".to_string();
+        root_effective.model.model = "root-model".to_string();
+        root_effective.model.context_window = 131_072;
+        root_effective.model.max_output_tokens = 8_192;
+        root_effective.model.supports_tools = true;
+        root_effective.model.temperature = Some(0.9);
+        root_effective.permissions.access_mode = crate::config::AccessMode::FullAccess;
+        controller.reset_effective_config_without_network(root_effective);
+        assert!(controller.state.show_provider_editor());
+
+        let candidate = controller
+            .apply_provider_selection_to_global_config()
+            .expect("global provider candidate");
+
+        assert_eq!(candidate.model.base_url, global.model.base_url);
+        assert_eq!(candidate.model.model, global.model.model);
+        assert_eq!(candidate.model.context_window, global.model.context_window);
+        assert_eq!(
+            candidate.model.max_output_tokens,
+            global.model.max_output_tokens
+        );
+        assert_eq!(candidate.model.supports_tools, global.model.supports_tools);
+        assert_eq!(candidate.model.temperature, global.model.temperature);
+        assert_eq!(
+            candidate.permissions.access_mode,
+            global.permissions.access_mode
+        );
+    }
+
+    #[test]
+    fn initial_setup_import_loads_a_complete_validated_draft_without_a_state_owner() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path =
+            Utf8PathBuf::from_path_buf(temp.path().join("import.toml")).expect("UTF-8 import path");
+        std::fs::write(
+            path.as_std_path(),
+            "[model]\nmodel = \"imported-model\"\nbase_url = \"http://127.0.0.1:1234\"\n",
+        )
+        .expect("write valid import");
+
+        let values = DesktopController::load_initial_setup_config_toml_path(&path)
+            .expect("validated initial-setup draft");
+
+        assert_eq!(values.len(), ConfigField::ALL.len());
+        for field in ConfigField::ALL {
+            assert!(
+                values.iter().any(|(key, _)| key == field.label()),
+                "all current ConfigField values must be projected: {}",
+                field.label()
+            );
+        }
+
+        std::fs::write(
+            path.as_std_path(),
+            "[model]\nmodel = \"imported-model\"\n\n[unknown]\nflag = true\n",
+        )
+        .expect("write invalid import");
+        assert!(
+            DesktopController::load_initial_setup_config_toml_path(&path).is_err(),
+            "unknown current-schema sections must fail closed"
+        );
+    }
+
     #[test]
     fn only_typed_interruptions_suppress_desktop_failure_notifications() {
         let interruption = RunCancellationCause::Interruption(TurnInterruptionCause::UserStop);
@@ -1826,7 +2374,7 @@ mod command_projection_owner_tests {
     }
 
     #[test]
-    fn access_persistence_completion_requires_the_same_full_owner_target() {
+    fn access_persistence_completion_accepts_only_the_same_owner_and_runtime_epoch() {
         let session_id = SessionId::new();
         let target = AccessModePersistenceTarget {
             operation_id: DesktopAsyncOperationId::from_test_value(1),
@@ -1843,6 +2391,25 @@ mod command_projection_owner_tests {
         assert!(access_mode_persistence_target_matches(
             &target,
             Utf8Path::new("C:/workspace"),
+            Some(session_id),
+            7,
+            "root:4",
+        ));
+        for current in ["tree:4", "idle:4"] {
+            assert!(
+                access_mode_persistence_target_matches(
+                    &target,
+                    Utf8Path::new("C:/workspace"),
+                    Some(session_id),
+                    7,
+                    current,
+                ),
+                "root-owned access persistence may settle after the same epoch crosses to {current}"
+            );
+        }
+        assert!(!access_mode_persistence_target_matches(
+            &target,
+            Utf8Path::new("C:/other"),
             Some(session_id),
             7,
             "root:4",
@@ -1869,6 +2436,59 @@ mod command_projection_owner_tests {
             "root:5",
         ));
 
+        let tree_target = AccessModePersistenceTarget {
+            runtime_owner_token: "tree:4".to_string(),
+            ..target.clone()
+        };
+        for current in ["tree:4", "root:4", "idle:4"] {
+            assert!(
+                access_mode_persistence_target_matches(
+                    &tree_target,
+                    Utf8Path::new("C:/workspace"),
+                    Some(session_id),
+                    7,
+                    current,
+                ),
+                "tree-owned access persistence may settle exactly or after the same child tree returns to {current}"
+            );
+        }
+        for current in ["root:5", "tree:5", "idle:5"] {
+            assert!(
+                !access_mode_persistence_target_matches(
+                    &tree_target,
+                    Utf8Path::new("C:/workspace"),
+                    Some(session_id),
+                    7,
+                    current,
+                ),
+                "a different runtime epoch must be rejected: {current}"
+            );
+        }
+
+        let idle_target = AccessModePersistenceTarget {
+            runtime_owner_token: "idle:4".to_string(),
+            ..target.clone()
+        };
+        assert!(access_mode_persistence_target_matches(
+            &idle_target,
+            Utf8Path::new("C:/workspace"),
+            Some(session_id),
+            7,
+            "idle:4",
+        ));
+        for current in ["root:4", "tree:4"] {
+            assert!(
+                !access_mode_persistence_target_matches(
+                    &idle_target,
+                    Utf8Path::new("C:/workspace"),
+                    Some(session_id),
+                    7,
+                    current,
+                ),
+                "an idle capture cannot adopt a later active phase: {current}"
+            );
+        }
+
         let pre_admission_target = AccessModePersistenceTarget {
             session_id: None,
             ..target
@@ -1880,6 +2500,16 @@ mod command_projection_owner_tests {
                 Some(session_id),
                 7,
                 "root:4",
+            ),
+            AccessModePersistenceTargetRelation::AdoptedSession(session_id)
+        );
+        assert_eq!(
+            access_mode_persistence_target_relation(
+                &pre_admission_target,
+                Utf8Path::new("C:/workspace"),
+                Some(session_id),
+                7,
+                "tree:4",
             ),
             AccessModePersistenceTargetRelation::AdoptedSession(session_id)
         );
@@ -1987,11 +2617,11 @@ mod command_projection_owner_tests {
             access_mode: crate::config::AccessMode::FullAccess,
         };
 
-        let path = worker
+        let commit = worker
             .persist_initial_owners(&target)
             .expect("global-only first phase");
         let error = worker
-            .persist_adopted_session(&target, SessionId::new(), path)
+            .persist_adopted_session(&target, SessionId::new(), commit.remembered_path)
             .expect_err("adopted session failure");
 
         assert!(error.contains("global field was restored"));
@@ -2096,7 +2726,7 @@ mod command_projection_owner_tests {
                         persisted_service
                             .update_root_session_access_mode(session_id, access_mode)
                             .await
-                            .map(|_| ())
+                            .map(|update| Some(update.session))
                             .map_err(|error| error.to_string())
                     })
                 })
@@ -2348,7 +2978,7 @@ mod command_projection_owner_tests {
                     persisted_service
                         .update_root_session_access_mode(session_id, access_mode)
                         .await
-                        .map(|_| ())
+                        .map(|update| Some(update.session))
                         .map_err(|error| error.to_string())
                 })
             },
@@ -2505,7 +3135,7 @@ mod command_projection_owner_tests {
                     persisted_service
                         .update_root_session_access_mode(session_id, access_mode)
                         .await
-                        .map(|_| ())
+                        .map(|update| Some(update.session))
                         .map_err(|error| error.to_string())
                 })
             },
@@ -2603,7 +3233,107 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
-    async fn initial_setup_session_apply_completes_only_the_forced_startup_review() {
+    async fn session_settings_cas_loser_returns_canonical_record_for_conflict_rebase() {
+        use crate::session::{NewSession, SessionRepository as _};
+
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let initial = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "root".to_string(),
+                cwd: root,
+                model: "initial-model".to_string(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: controller.app.config.permissions.access_mode,
+            })
+            .await
+            .expect("root session");
+        let loaded = load_latest_session_detail(&controller.app, initial.id)
+            .await
+            .expect("canonical root detail");
+        controller.state.load_open_session(&loaded.read);
+
+        let persistence = controller
+            .prepare_root_session_settings_persistence(
+                initial.session_settings_revision,
+                SessionSettingsPatch {
+                    model: Some("losing-model".to_string()),
+                    ..SessionSettingsPatch::default()
+                },
+            )
+            .expect("persistence request")
+            .expect("matching in-memory revision");
+        let winner = controller
+            .app
+            .session_service
+            .compare_and_set_root_session_settings(
+                initial.id,
+                initial.session_settings_revision,
+                SessionSettingsPatch {
+                    model: Some("winning-model".to_string()),
+                    ..SessionSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("winning settings write")
+            .expect("winning CAS update");
+        let access_only = persistence.access_only();
+
+        let outcome = tokio::task::spawn_blocking(move || persistence.execute_blocking())
+            .await
+            .expect("persistence worker")
+            .expect("canonical conflict outcome");
+        let RootSessionSettingsPersistenceOutcome::Conflict { session: canonical } = outcome else {
+            panic!("the stale writer must return the canonical conflict owner");
+        };
+        assert!(!access_only);
+        assert_eq!(canonical.id, initial.id);
+        assert_eq!(canonical.model, "winning-model");
+        assert_eq!(
+            canonical.session_settings_revision,
+            winner.session.session_settings_revision
+        );
+
+        assert!(
+            controller
+                .state
+                .apply_persisted_root_session_record(canonical.clone())
+        );
+        let open = controller
+            .state
+            .open_session
+            .as_ref()
+            .expect("rebased open session")
+            .session();
+        assert_eq!(open.model, "winning-model");
+        assert_eq!(
+            open.session_settings_revision,
+            winner.session.session_settings_revision
+        );
+
+        assert!(
+            !controller
+                .state
+                .apply_persisted_root_session_record(initial),
+            "a superseded persistence completion must not downgrade a newer canonical revision"
+        );
+        assert_eq!(
+            controller
+                .state
+                .open_session
+                .as_ref()
+                .expect("newer open session remains")
+                .session()
+                .session_settings_revision,
+            winner.session.session_settings_revision
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_setup_session_apply_keeps_the_finish_only_startup_latch() {
         let (_temp, root, mut controller) = empty_access_test_controller().await;
         let persisted_model = controller.app.config.model.model.clone();
         controller.state.begin_startup(false, None, &root);
@@ -2611,7 +3341,7 @@ mod command_projection_owner_tests {
         assert!(controller.state.view.startup_overlay_forced);
         assert_eq!(
             controller.state.view.overlay,
-            super::super::state::DesktopOverlay::ConfigEditor
+            super::super::state::DesktopOverlay::InitialSetup
         );
 
         let temporary_model = "temporary-initial-setup-model";
@@ -2630,11 +3360,11 @@ mod command_projection_owner_tests {
                 .collect();
 
         assert!(controller.apply_session_config(values));
-        assert!(!controller.state.startup.requires_initial_setup());
-        assert!(!controller.state.view.startup_overlay_forced);
+        assert!(controller.state.startup.requires_initial_setup());
+        assert!(controller.state.view.startup_overlay_forced);
         assert_eq!(
             controller.state.view.overlay,
-            super::super::state::DesktopOverlay::None
+            super::super::state::DesktopOverlay::InitialSetup
         );
         assert_eq!(
             controller
@@ -2648,21 +3378,6 @@ mod command_projection_owner_tests {
         assert_eq!(
             controller.app.config.model.model, persisted_model,
             "session Apply must not replace the persisted global config owner"
-        );
-
-        controller.state.show_config_editor();
-        assert!(!controller.state.view.startup_overlay_forced);
-        let normal_values =
-            ConfigEditorState::from_config(&controller.state.provider_config.effective_config)
-                .fields
-                .into_iter()
-                .map(|field| (field.key.label().to_string(), field.value))
-                .collect();
-        assert!(controller.apply_session_config(normal_values));
-        assert_eq!(
-            controller.state.view.overlay,
-            super::super::state::DesktopOverlay::ConfigEditor,
-            "ordinary Preferences Apply keeps the existing Settings workflow"
         );
     }
 
@@ -3733,6 +4448,7 @@ mod command_projection_owner_tests {
             base_url: controller.app.config.model.base_url.clone(),
             access_mode: controller.app.config.permissions.access_mode,
             model_parameters: crate::session::SessionModelParameters::default(),
+            session_settings_revision: 0,
             created_at_ms: 1,
             updated_at_ms: 2,
             completed_at_ms: matches!(
@@ -4999,7 +5715,7 @@ mod command_projection_owner_tests {
                 assert_eq!(access_mode, crate::config::AccessMode::AutoReview);
                 Ok(Some(Utf8PathBuf::from("C:/config.toml")))
             },
-            |_, _| Ok(()),
+            |_, _| Ok(None),
         ));
         for _ in 0..200 {
             controller.drain_runtime_messages();
@@ -5508,7 +6224,7 @@ mod command_projection_owner_tests {
                 let session_calls = session_calls.clone();
                 move |_, _| {
                     session_calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    Ok(None)
                 }
             },
         ));
@@ -5601,7 +6317,7 @@ mod command_projection_owner_tests {
                 assert_eq!(access_mode, expected_access_mode);
                 adopted_started_tx.send(()).expect("adopted worker started");
                 release_adopted_rx.recv().expect("release adopted worker");
-                Ok(())
+                Ok(None)
             },
         ));
         for _ in 0..200 {
@@ -5911,7 +6627,7 @@ mod command_projection_owner_tests {
                 release_rx.recv().expect("release blocked persistence");
                 Err("simulated blocked global writer".to_string())
             },
-            |_, _| Ok(()),
+            |_, _| Ok(None),
         ));
         started_rx
             .recv_timeout(std::time::Duration::from_secs(1))
@@ -5973,7 +6689,7 @@ mod command_projection_owner_tests {
                 release_rx.recv().expect("release blocked persistence");
                 Ok(Some(Utf8PathBuf::from("C:/config.toml")))
             },
-            |_, _| Ok(()),
+            |_, _| Ok(None),
         ));
         started_rx
             .recv_timeout(std::time::Duration::from_secs(1))
@@ -7763,6 +8479,7 @@ pub(crate) struct DesktopController {
     durable_agent_activity_refresh_requests: LatestRequestTracker<SessionRefreshRequestTarget>,
     history_export_requests: LatestRequestTracker<HistoryExportRequestTarget>,
     provider_catalog_requests: LatestRequestTracker<ProviderCatalogRequestTarget>,
+    docling_readiness_requests: LatestRequestTracker<DoclingReadinessRequestTarget>,
     access_mode_persistence_requests: LatestRequestTracker<AccessModePersistenceTarget>,
     pending_access_mode_adoption: Option<PendingAccessModeAdoption>,
     projection_revision: u64,
@@ -7956,6 +8673,7 @@ impl DesktopController {
             durable_agent_activity_refresh_requests: LatestRequestTracker::default(),
             history_export_requests: LatestRequestTracker::default(),
             provider_catalog_requests: LatestRequestTracker::default(),
+            docling_readiness_requests: LatestRequestTracker::default(),
             access_mode_persistence_requests: LatestRequestTracker::default(),
             pending_access_mode_adoption: None,
             projection_revision: 0,
@@ -8759,6 +9477,9 @@ impl DesktopController {
     }
 
     fn ensure_navigation_admission(&mut self, target: &str) -> bool {
+        if !self.ensure_initial_setup_owner_replacement_admission(target) {
+            return false;
+        }
         if !self.ensure_unscoped_prompt_review_action(target) {
             return false;
         }
@@ -8772,6 +9493,16 @@ impl DesktopController {
         };
         self.state
             .set_status_message(format!("{target} cannot change while {reason}"));
+        false
+    }
+
+    fn ensure_initial_setup_owner_replacement_admission(&mut self, target: &str) -> bool {
+        if !self.state.startup.requires_initial_setup() {
+            return true;
+        }
+        self.state.set_status_message(format!(
+            "{target} cannot replace the initial-setup owner; complete initial setup with Finish first"
+        ));
         false
     }
 
@@ -10108,9 +10839,9 @@ impl DesktopController {
         true
     }
 
-    pub(crate) fn create_project_from_picker(&mut self) {
+    pub(crate) fn create_project_from_picker(&mut self) -> bool {
         if !self.ensure_navigation_admission("project") {
-            return;
+            return false;
         }
         let start_dir = (!self.is_quick_chat_workspace()).then_some(&self.app.workspace.cwd);
         match pick_workspace_directory(start_dir) {
@@ -10127,6 +10858,7 @@ impl DesktopController {
                 .state
                 .set_status_message(format!("project creation failed: {error}")),
         }
+        true
     }
 
     pub(crate) fn start_review_uncommitted_at(
@@ -10356,6 +11088,77 @@ impl DesktopController {
         true
     }
 
+    pub(crate) fn check_docling_readiness(&mut self) -> bool {
+        self.start_docling_readiness_check(
+            self.state.provider_config.effective_config.clone(),
+            DoclingReadinessConfigOwner::EffectiveConfig,
+        )
+    }
+
+    pub(crate) fn check_initial_setup_docling_readiness(
+        &mut self,
+        values: Vec<(String, String)>,
+    ) -> bool {
+        let config = match build_resolved_config_from_key_values(self.state.global_config(), values)
+        {
+            Ok(config) => config,
+            Err(error) => {
+                self.state
+                    .fail_docling_readiness_check(format!("initial setup config error: {error}"));
+                return false;
+            }
+        };
+        self.start_docling_readiness_check(config, DoclingReadinessConfigOwner::InitialSetupDraft)
+    }
+
+    fn start_docling_readiness_check(
+        &mut self,
+        mut config: ResolvedConfig,
+        owner: DoclingReadinessConfigOwner,
+    ) -> bool {
+        if self.docling_readiness_requests.is_pending()
+            || self.state.docling_readiness_check_pending()
+        {
+            self.state
+                .set_status_message("Docling readiness check is already in progress");
+            return false;
+        }
+        if let Err(error) = config.normalize_and_validate_docling_runtime() {
+            self.state.fail_docling_readiness_check(error);
+            return false;
+        }
+        if !config.docling.enabled {
+            self.state.fail_docling_readiness_check(
+                "Docling readiness check requires docling.enabled=true",
+            );
+            return false;
+        }
+        let target = DoclingReadinessRequestTarget {
+            owner,
+            base_url: config.docling.base_url.clone(),
+            config_generation: self.state.provider_config.config_generation,
+        };
+        let request_id = self.docling_readiness_requests.begin(target.clone());
+        self.state
+            .begin_docling_readiness_check(crate::docling::endpoint(&target.base_url, "/ready"));
+        let runtime_tx = self.runtime_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop Docling readiness runtime");
+            let result = runtime
+                .block_on(crate::docling::DoclingClient::new(config.docling).check_readiness())
+                .map_err(|error| error.to_string());
+            let _ = runtime_tx.send(RuntimeMessage::DoclingReadinessChecked {
+                request_id,
+                target,
+                result,
+            });
+        });
+        true
+    }
+
     pub(crate) fn provider_model_load_pending(&self) -> bool {
         !unique_background_request_admission_open(
             self.provider_catalog_requests.is_pending(),
@@ -10390,7 +11193,22 @@ impl DesktopController {
         if catalog_was_pending {
             self.state.cancel_provider_model_load();
         }
+        self.docling_readiness_requests.clear();
+        self.state.cancel_docling_readiness_check();
         commit_effective_config(&mut self.state, config);
+        self.state.refresh_startup_config_status();
+    }
+
+    fn adopt_global_config_without_network(&mut self, config: ResolvedConfig) {
+        let catalog_was_pending =
+            self.provider_catalog_requests.is_pending() || self.state.provider_model_load_pending();
+        self.provider_catalog_requests.clear();
+        if catalog_was_pending {
+            self.state.cancel_provider_model_load();
+        }
+        self.docling_readiness_requests.clear();
+        self.state.cancel_docling_readiness_check();
+        self.state.replace_global_config(config);
         self.state.refresh_startup_config_status();
     }
 
@@ -10414,7 +11232,6 @@ impl DesktopController {
             return false;
         };
         self.reset_effective_config_without_network(config);
-        self.state.mark_startup_config_reviewed();
         self.state
             .set_status_message("applied provider selection to this UI session");
         if !setup_overlay {
@@ -10424,13 +11241,13 @@ impl DesktopController {
     }
 
     pub(crate) fn save_provider_global(&mut self) -> bool {
-        if !self.state.can_apply_provider_selection() {
+        if !self.state.can_save_provider_selection_global() {
             self.state.set_status_message(
                 "keep the current provider URL, mode, and model, or load the target model list before saving",
             );
             return false;
         }
-        let Some(config) = self.apply_provider_selection_to_effective_config() else {
+        let Some(config) = self.apply_provider_selection_to_global_config() else {
             return false;
         };
         let candidate = match self.provider_config_persistence_candidate(&config) {
@@ -10441,16 +11258,12 @@ impl DesktopController {
                 return false;
             }
         };
-        match candidate.save_scope(
+        let save_result = candidate.save_global(
             &self.app.workspace.root,
-            crate::tui::config_editor::ConfigSaveScope::Global,
-        ) {
+            GlobalConfigAdoptionPolicy::StrictCurrentSchema,
+        );
+        match self.commit_global_config_save_result(save_result) {
             Ok(message) => {
-                self.app.config = config.clone();
-                if !self.reload_config() {
-                    return false;
-                }
-                self.state.mark_startup_config_reviewed();
                 self.state.set_status_message(message);
                 true
             }
@@ -10463,16 +11276,12 @@ impl DesktopController {
     }
 
     pub(crate) fn apply_session_config(&mut self, values: Vec<(String, String)>) -> bool {
-        let startup_overlay_forced = self.state.view.startup_overlay_forced;
         match build_resolved_config_from_key_values(
             &self.state.provider_config.effective_config,
             values,
         ) {
             Ok(config) => {
                 self.reset_effective_config_without_network(config);
-                if startup_overlay_forced {
-                    self.state.mark_startup_config_reviewed();
-                }
                 self.state
                     .set_status_message("applied config to this UI session");
                 true
@@ -10483,6 +11292,16 @@ impl DesktopController {
                 false
             }
         }
+    }
+
+    fn commit_global_config_save_result(
+        &mut self,
+        result: Result<crate::tui::config_editor::GlobalConfigSaveResult, String>,
+    ) -> Result<String, String> {
+        let saved = result?;
+        self.app.config = saved.resolved_config.clone();
+        self.adopt_global_config_without_network(saved.resolved_config);
+        Ok(saved.message)
     }
 
     pub(crate) fn root_run_generation(&self) -> Option<u64> {
@@ -10524,6 +11343,10 @@ impl DesktopController {
 
     pub(crate) fn access_mode_mutation_admission_open(&self) -> bool {
         self.access_mode_mutation_runtime_contract().1
+    }
+
+    pub(crate) fn session_settings_turn_config_mutation_admission_open(&self) -> bool {
+        self.config_draft_mutation_admission_open() && !self.current_agent_tree_active()
     }
 
     fn access_mode_persistence_target_relation(
@@ -10619,7 +11442,7 @@ impl DesktopController {
                         )
                         .await
                         .and_then(|updated| {
-                            updated.map(|_| ()).ok_or_else(|| {
+                            updated.map(|update| Some(update.session)).ok_or_else(|| {
                                 crate::error::SessionError::Message(format!(
                                     "session {session_id} access mode changed before this update"
                                 ))
@@ -10643,8 +11466,9 @@ impl DesktopController {
             ) -> Result<Option<Utf8PathBuf>, String>
             + Send
             + 'static,
-        PersistSession:
-            FnOnce(SessionId, crate::config::AccessMode) -> Result<(), String> + Send + 'static,
+        PersistSession: FnOnce(SessionId, crate::config::AccessMode) -> Result<Option<SessionRecord>, String>
+            + Send
+            + 'static,
     {
         if !self.access_mode_mutation_admission_open() {
             self.state.set_status_message(
@@ -10784,10 +11608,10 @@ impl DesktopController {
             let _ = self.reload_config();
             return;
         }
-        self.app.config.permissions.access_mode = pending.target.access_mode;
-        self.state
-            .provider_config
-            .update_access_mode(pending.target.access_mode);
+        let mut global_config = self.state.global_config().clone();
+        global_config.permissions.access_mode = pending.target.access_mode;
+        self.app.config = global_config.clone();
+        self.state.replace_global_config(global_config);
         self.state.set_status_message(format!(
             "global config access mode set to {} and remembered in {}; it applies to the next permission decision; an already displayed confirmation is unchanged",
             access_mode_display_label(pending.target.access_mode),
@@ -10828,7 +11652,7 @@ impl DesktopController {
             access_mode,
             current_root_session_id,
             compare_and_set_global,
-            persist_session,
+            |session_id, access_mode| persist_session(session_id, access_mode),
         ) {
             Ok(path) => path,
             Err(error) => {
@@ -10874,26 +11698,21 @@ impl DesktopController {
     }
 
     pub(crate) fn save_global_config(&mut self, values: Vec<(String, String)>) -> bool {
-        let candidate = match ConfigEditorState::from_config_values(
-            &self.state.provider_config.effective_config,
-            values,
-        ) {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                self.state
-                    .set_status_message(format!("config save failed: {error}"));
-                return false;
-            }
-        };
-        match candidate.save_scope(
-            &self.app.workspace.root,
-            crate::tui::config_editor::ConfigSaveScope::Global,
-        ) {
-            Ok(message) => {
-                if !self.reload_config() {
+        let candidate =
+            match ConfigEditorState::from_config_values(self.state.global_config(), values) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    self.state
+                        .set_status_message(format!("config save failed: {error}"));
                     return false;
                 }
-                self.state.mark_startup_config_reviewed();
+            };
+        let save_result = candidate.save_global(
+            &self.app.workspace.root,
+            GlobalConfigAdoptionPolicy::StrictCurrentSchema,
+        );
+        match self.commit_global_config_save_result(save_result) {
+            Ok(message) => {
                 self.state.set_status_message(message);
                 true
             }
@@ -10903,6 +11722,113 @@ impl DesktopController {
                 false
             }
         }
+    }
+
+    pub(crate) fn finish_initial_setup(&mut self, values: Vec<(String, String)>) -> bool {
+        let candidate =
+            match ConfigEditorState::from_config_values(self.state.global_config(), values) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    self.state
+                        .set_status_message(format!("initial setup could not finish: {error}"));
+                    return false;
+                }
+            };
+        let save_result = candidate.save_global(
+            &self.app.workspace.root,
+            GlobalConfigAdoptionPolicy::StrictCurrentSchema,
+        );
+        let message = match self.commit_global_config_save_result(save_result) {
+            Ok(message) => message,
+            Err(error) => {
+                self.state
+                    .set_status_message(format!("initial setup could not finish: {error}"));
+                return false;
+            }
+        };
+        self.state.complete_initial_setup_after_persist();
+        if self.state.startup.requires_initial_setup() {
+            self.state.set_status_message(
+                "initial setup still has a local validation error; review the highlighted step",
+            );
+            return false;
+        }
+        self.state
+            .set_status_message(format!("initial setup completed; {message}"));
+        true
+    }
+
+    pub(crate) fn prepare_root_session_settings_persistence(
+        &mut self,
+        expected_settings_revision: u64,
+        patch: SessionSettingsPatch,
+    ) -> Result<Option<RootSessionSettingsPersistence>, RootSessionSettingsApplyError> {
+        let session_id = self.state.app_state.current_session_id.ok_or_else(|| {
+            RootSessionSettingsApplyError::Internal(
+                "session settings require a current root session".to_string(),
+            )
+        })?;
+        let current = self
+            .state
+            .open_session
+            .as_ref()
+            .filter(|open_session| open_session.session_id() == session_id)
+            .map(|open_session| open_session.session().clone())
+            .ok_or_else(|| {
+                RootSessionSettingsApplyError::Internal(
+                    "session settings owner is no longer loaded".to_string(),
+                )
+            })?;
+        if current.session_settings_revision != expected_settings_revision {
+            return Ok(None);
+        }
+
+        let access_only = patch.access_mode.is_some()
+            && patch.cwd.is_none()
+            && patch.model.is_none()
+            && patch.base_url.is_none()
+            && !patch.reset_model_parameters
+            && patch.temperature.is_none()
+            && patch.top_p.is_none()
+            && patch.top_k.is_none()
+            && patch.context_window.is_none()
+            && patch.max_output_tokens.is_none();
+        let config_generation_delta = self
+            .state
+            .root_session_settings_config_generation_delta(&current, &patch);
+        Ok(Some(RootSessionSettingsPersistence {
+            app: self.app.clone(),
+            session_id,
+            expected_settings_revision,
+            current_access_mode: current.access_mode,
+            patch,
+            access_only,
+            config_generation_delta,
+        }))
+    }
+
+    pub(crate) fn settle_root_session_settings_persistence(
+        &mut self,
+        result: RootSessionSettingsPersistenceResult,
+    ) -> bool {
+        let update = result.update;
+        if !self
+            .state
+            .apply_persisted_root_session_record(update.session.clone())
+        {
+            return false;
+        }
+        self.state.view.overlay = super::state::DesktopOverlay::SessionSettings;
+        self.state.set_status_message(if update.changed {
+            if result.access_only {
+                "saved access mode for this root session; it applies to the next permission decision and does not rewrite an already pending request"
+            } else {
+                "saved settings for this root session; provider and model values apply to the next admitted turn"
+            }
+        } else {
+            "session settings already match the saved root-session values"
+        });
+        true
     }
 
     pub(crate) fn pick_global_config_toml_dialog(&mut self) -> Option<Utf8PathBuf> {
@@ -10918,13 +11844,29 @@ impl DesktopController {
         }
     }
 
+    pub(crate) fn pick_initial_setup_config_toml_dialog() -> Result<Option<Utf8PathBuf>, String> {
+        pick_config_toml_file()
+    }
+
+    pub(crate) fn load_initial_setup_config_toml_path(
+        path: &Utf8Path,
+    ) -> Result<Vec<(String, String)>, String> {
+        validate_import_config_extension(path)?;
+        let text = read_toml_utf8_bounded(path).map_err(|error| error.to_string())?;
+        let config = ConfigLoader::resolve_global_config_text_without_environment(path, &text)
+            .map_err(|error| error.to_string())?;
+        Ok(ConfigField::ALL
+            .into_iter()
+            .map(|field| (field.label().to_string(), field.value(&config)))
+            .collect())
+    }
+
     pub(crate) fn import_global_config_toml_path(&mut self, path: &Utf8Path) -> bool {
         match import_global_config_toml(path) {
             Ok(message) => {
                 if !self.reload_config_with_status_code(DesktopStatusCode::ConfigImportFailed) {
                     return false;
                 }
-                self.state.mark_startup_config_reviewed();
                 self.state.set_status_message(message);
                 true
             }
@@ -10946,7 +11888,7 @@ impl DesktopController {
         match ConfigLoader::load(&self.app.workspace.root, None) {
             Ok(config) => {
                 self.app.config = config.clone();
-                self.reset_effective_config_without_network(config);
+                self.adopt_global_config_without_network(config);
                 true
             }
             Err(error) => {
@@ -10959,10 +11901,15 @@ impl DesktopController {
         }
     }
 
-    pub(crate) fn switch_workspace(&mut self) -> bool {
+    pub(crate) fn switch_workspace_to(&mut self, text: String) -> bool {
         if !self.ensure_navigation_admission("workspace") {
             return false;
         }
+        self.state.set_workspace_input(text);
+        self.begin_workspace_switch_from_input()
+    }
+
+    fn begin_workspace_switch_from_input(&mut self) -> bool {
         let Some(requested) = self.resolve_workspace_input() else {
             return false;
         };
@@ -11248,7 +12195,11 @@ impl DesktopController {
         }
     }
 
-    fn provider_selection_patch(&mut self) -> Option<PartialResolvedConfig> {
+    fn provider_selection_patch(
+        &mut self,
+        baseline: &ResolvedConfig,
+        input_matches_baseline: bool,
+    ) -> Option<PartialResolvedConfig> {
         let base_url =
             normalize_provider_base_url(&self.state.provider_config.provider_base_url_input);
         if base_url.is_empty() {
@@ -11281,11 +12232,11 @@ impl DesktopController {
                 return None;
             }
         };
-        let effective_model = &self.state.provider_config.effective_config.model;
-        let limit_only_update = self.state.provider_input_matches_effective_target()
-            && (context_window != effective_model.context_window
-                || max_output_tokens != effective_model.max_output_tokens);
-        let mut hydrated_model_config = effective_model.clone();
+        let baseline_model = &baseline.model;
+        let limit_only_update = input_matches_baseline
+            && (context_window != baseline_model.context_window
+                || max_output_tokens != baseline_model.max_output_tokens);
+        let mut hydrated_model_config = baseline_model.clone();
         hydrated_model_config.base_url = base_url.clone();
         hydrated_model_config.model = model.clone();
         hydrated_model_config.provider_metadata_mode =
@@ -11322,11 +12273,17 @@ impl DesktopController {
     }
 
     fn apply_provider_selection_to_effective_config(&mut self) -> Option<ResolvedConfig> {
-        let patch = self.provider_selection_patch()?;
-        Some(apply_config_patch(
-            self.state.provider_config.effective_config.clone(),
-            patch,
-        ))
+        let baseline = self.state.provider_config.effective_config.clone();
+        let input_matches_baseline = self.state.provider_input_matches_effective_target();
+        let patch = self.provider_selection_patch(&baseline, input_matches_baseline)?;
+        Some(apply_config_patch(baseline, patch))
+    }
+
+    fn apply_provider_selection_to_global_config(&mut self) -> Option<ResolvedConfig> {
+        let baseline = self.state.global_config().clone();
+        let input_matches_baseline = self.state.provider_input_matches_global_target();
+        let patch = self.provider_selection_patch(&baseline, input_matches_baseline)?;
+        Some(apply_config_patch(baseline, patch))
     }
 
     fn provider_config_persistence_candidate(
@@ -11338,7 +12295,7 @@ impl DesktopController {
             ProviderMetadataMode::OpenAiCompatibleOnly => "openai_compatible_only",
         };
         ConfigEditorState::from_config_values(
-            &self.state.provider_config.effective_config,
+            self.state.global_config(),
             vec![
                 (
                     ConfigField::BaseUrl.label().to_string(),
@@ -11966,8 +12923,10 @@ impl DesktopController {
                     return;
                 }
                 self.state.finish_navigation(request_id);
-                if let Some(workspace) = result.workspace {
-                    self.replace_workspace_from_load(workspace);
+                if let Some(workspace) = result.workspace
+                    && !self.replace_workspace_from_load(workspace)
+                {
+                    return;
                 }
                 let loaded = result.loaded;
                 let loaded_status = loaded.read.session.status;
@@ -12137,7 +13096,9 @@ impl DesktopController {
                 if !self.state.is_current_navigation(request_id) {
                     return;
                 }
-                self.replace_workspace_from_load(loaded);
+                if !self.replace_workspace_from_load(loaded) {
+                    return;
+                }
                 if let Some(session_id) = self.state.selected_session_id() {
                     self.state
                         .set_status_message(format!("opening session {session_id}..."));
@@ -12168,7 +13129,9 @@ impl DesktopController {
                 if !self.state.is_current_navigation(request_id) {
                     return;
                 }
-                self.replace_workspace_from_load(loaded);
+                if !self.replace_workspace_from_load(loaded) {
+                    return;
+                }
                 self.start_new_chat_with_global_access();
                 self.state.set_status_message("new development chat ready");
             }
@@ -12178,11 +13141,16 @@ impl DesktopController {
         }
     }
 
-    fn replace_workspace_from_load(&mut self, loaded: WorkspaceLoadResult) {
+    fn replace_workspace_from_load(&mut self, loaded: WorkspaceLoadResult) -> bool {
+        if !self.ensure_initial_setup_owner_replacement_admission("workspace completion") {
+            self.state.clear_navigation();
+            return false;
+        }
         let next_config_generation =
             next_config_generation(self.state.provider_config.config_generation);
         self.invalidate_session_target_requests();
         self.provider_catalog_requests.clear();
+        self.docling_readiness_requests.clear();
         self.app = loaded.app.clone();
         if !self.is_quick_chat_workspace() {
             self.preferences
@@ -12202,6 +13170,7 @@ impl DesktopController {
             self.state.set_window_opacity_percent(opacity);
         }
         self.persist_preferences();
+        true
     }
 
     fn snapshot_target_is_current(&self, target: &SnapshotRequestTarget) -> bool {
@@ -12231,6 +13200,24 @@ impl DesktopController {
             && self.state.provider_config.config_generation == target.config_generation
             && self.state.provider_config.provider_selected_model_id_input
                 == target.selected_model_id
+    }
+
+    fn docling_readiness_target_is_current(&self, target: &DoclingReadinessRequestTarget) -> bool {
+        if self.state.provider_config.config_generation != target.config_generation {
+            return false;
+        }
+        match target.owner {
+            DoclingReadinessConfigOwner::EffectiveConfig => {
+                self.state.provider_config.effective_config.docling.enabled
+                    && crate::config::model::canonical_docling_base_url(
+                        &self.state.provider_config.effective_config.docling.base_url,
+                    )
+                    .is_ok_and(|base_url| base_url == target.base_url)
+            }
+            DoclingReadinessConfigOwner::InitialSetupDraft => {
+                self.state.startup.requires_initial_setup()
+            }
+        }
     }
 
     fn settle_root_finished(&mut self, run_generation: u64, result: Result<RunSummary, String>) {
@@ -12871,40 +13858,18 @@ impl DesktopController {
                     match result {
                         Ok(loaded) => {
                             let deleted_was_current = self.app.workspace.project_id == project_id;
+                            if deleted_was_current
+                                && !self.ensure_initial_setup_owner_replacement_admission(
+                                    "project deletion completion",
+                                )
+                            {
+                                continue;
+                            }
                             self.preferences.mark_project_deleted(&project_root);
                             if deleted_was_current {
-                                self.app = loaded.app.clone();
-                            }
-                            if !self.is_quick_chat_workspace() {
-                                self.preferences
-                                    .unmark_project_deleted(&self.app.workspace.root);
-                            }
-                            if deleted_was_current {
-                                let next_config_generation = next_config_generation(
-                                    self.state.provider_config.config_generation,
-                                );
-                                self.session_search_requests.clear();
-                                self.snapshot_requests.clear();
-                                self.turn_page_requests.clear();
-                                self.session_projection_refresh_requests.clear();
-                                self.durable_agent_activity_refresh_requests.clear();
-                                self.history_export_requests.clear();
-                                self.provider_catalog_requests.clear();
-                                self.state =
-                                    DesktopState::new(loaded.snapshot, self.app.config.clone());
-                                self.state.set_file_change_display_roots(
-                                    &self.app.workspace.root,
-                                    self.app.workspace.authority_root(),
-                                );
-                                self.state.provider_config.config_generation =
-                                    next_config_generation;
-                                self.loaded_agent_activity_records = None;
-                                self.durable_agent_activity_refresh_failures = 0;
-                                self.state.workspace_input = self.app.workspace.cwd.to_string();
-                                if let Some(opacity) = self.preferences.window_opacity_percent {
-                                    self.state.set_window_opacity_percent(opacity);
+                                if !self.replace_workspace_from_load(loaded) {
+                                    continue;
                                 }
-                                self.persist_preferences();
                             } else {
                                 self.state
                                     .replace_snapshot_preserving_current_owner(loaded.snapshot);
@@ -12959,6 +13924,26 @@ impl DesktopController {
                         Err(error) => self.state.fail_provider_model_load(error),
                     }
                 }
+                RuntimeMessage::DoclingReadinessChecked {
+                    request_id,
+                    target,
+                    result,
+                } => {
+                    if !self
+                        .docling_readiness_requests
+                        .finish_if_current(request_id, &target)
+                    {
+                        continue;
+                    }
+                    if !self.docling_readiness_target_is_current(&target) {
+                        self.state.cancel_docling_readiness_check();
+                        continue;
+                    }
+                    match result {
+                        Ok(result) => self.state.finish_docling_readiness_check(result),
+                        Err(error) => self.state.fail_docling_readiness_check(error),
+                    }
+                }
                 RuntimeMessage::HistoryExported {
                     request_id,
                     target,
@@ -13004,7 +13989,7 @@ impl DesktopController {
                     let target_relation = self.access_mode_persistence_target_relation(&target);
                     if let (
                         AccessModePersistencePhase::InitialOwners,
-                        Ok(path),
+                        Ok(commit),
                         AccessModePersistenceTargetRelation::AdoptedSession(session_id),
                     ) = (&phase, &result, target_relation)
                     {
@@ -13012,7 +13997,7 @@ impl DesktopController {
                             request_id,
                             target.clone(),
                             session_id,
-                            path.clone(),
+                            commit.remembered_path.clone(),
                             worker,
                         );
                         self.state.set_status_message(
@@ -13026,11 +14011,11 @@ impl DesktopController {
                         && target.root_run_generation.is_some()
                         && target.root_run_generation == self.root_run_generation()
                     {
-                        if let Ok(path) = &result {
+                        if let Ok(commit) = &result {
                             self.pending_access_mode_adoption = Some(PendingAccessModeAdoption {
                                 request_id,
                                 target,
-                                remembered_path: path.clone(),
+                                remembered_path: commit.remembered_path.clone(),
                                 worker,
                             });
                             self.state.set_status_message(
@@ -13063,22 +14048,25 @@ impl DesktopController {
                         continue;
                     }
                     match result {
-                        Ok(path) => {
-                            self.app.config.permissions.access_mode = target.access_mode;
-                            self.state
-                                .provider_config
-                                .update_access_mode(target.access_mode);
-                            if let Some(session_id) = committed_session_id {
-                                for session in &mut self.state.app_state.sessions {
-                                    if session.id == session_id {
-                                        session.access_mode = target.access_mode;
-                                    }
+                        Ok(commit) => {
+                            let mut global_config = self.state.global_config().clone();
+                            global_config.permissions.access_mode = target.access_mode;
+                            self.app.config = global_config.clone();
+                            self.state.replace_global_config(global_config);
+                            if let Some(session) = commit.session {
+                                if Some(session.id) != committed_session_id
+                                    || !self.state.apply_persisted_root_session_record(session)
+                                {
+                                    self.state.set_status_message(
+                                        "access mode was saved, but the current root-session owner changed; reopen the chat to refresh settings",
+                                    );
+                                    continue;
                                 }
-                                for summary in &mut self.state.app_state.loaded_sessions {
-                                    if summary.session.id == session_id {
-                                        summary.session.access_mode = target.access_mode;
-                                    }
-                                }
+                            } else if committed_session_id.is_some() {
+                                self.state.set_status_message(
+                                    "access mode persistence did not return the canonical root-session record; reopen the chat to refresh settings",
+                                );
+                                continue;
                             }
                             let scope = if committed_session_id.is_some() {
                                 "global config and current root session"
@@ -13088,7 +14076,7 @@ impl DesktopController {
                             let config_message = format!(
                                 "{scope} access mode set to {} and remembered in {}; it applies to the next permission decision; an already displayed confirmation is unchanged",
                                 access_mode_display_label(target.access_mode),
-                                path
+                                commit.remembered_path
                             );
                             self.state.set_status_message(config_message);
                         }

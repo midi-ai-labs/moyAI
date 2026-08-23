@@ -140,7 +140,16 @@ export interface StartupProjection {
   detail: string;
   action_overlay: string;
   initial_setup_required: boolean;
+  initial_setup_reason: "config_missing" | "provider_invalid" | "optional_tool_invalid" | null;
+  global_config_path: string | null;
+  setup_target: InitialSetupMutationTarget | null;
   checks: StartupCheckProjection[];
+}
+
+export interface InitialSetupMutationTarget {
+  workspacePath: string;
+  globalConfigPath: string;
+  setupGeneration: string;
 }
 
 export interface ConfigFieldProjection {
@@ -163,6 +172,29 @@ export interface ConfigMutationTarget {
 export interface AccessModeMutationTarget extends ConfigMutationTarget {
   accessMode: "default" | "auto_review" | "full_access";
   runtimeOwnerToken: string;
+}
+
+export interface SessionSettingsMutationTarget {
+  workspacePath: string;
+  rootSessionId: string;
+  settingsRevision: string;
+  configGeneration: string;
+  runtimeOwnerToken: string;
+}
+
+export interface SessionSettingsProjection {
+  available: boolean;
+  base_url: string;
+  model: string;
+  access_mode: "default" | "auto_review" | "full_access";
+  context_window: string;
+  max_output_tokens: string;
+  context_window_inherited: boolean;
+  max_output_tokens_inherited: boolean;
+  provider_mutation_enabled: boolean;
+  access_mutation_enabled: boolean;
+  unavailable_reason: string;
+  target: SessionSettingsMutationTarget | null;
 }
 
 export interface ConfigDraftCapabilityProjection {
@@ -241,6 +273,15 @@ export interface ProviderStatusProjection {
   title: string;
   hint: string;
   details: string;
+}
+
+export type DoclingReadinessStatus = "idle" | "checking" | "ready" | "unavailable";
+
+export interface DoclingReadinessProjection {
+  status: DoclingReadinessStatus;
+  endpoint: string;
+  httpStatus: number | null;
+  message: string;
 }
 
 export type DesktopStatusCode =
@@ -335,6 +376,7 @@ export interface DesktopWebState {
   model_label: string;
   access_label: string;
   access_target: AccessModeMutationTarget;
+  session_settings: SessionSettingsProjection;
   config_draft_capabilities: ConfigDraftCapabilitiesProjection;
   current_session_label: string;
   selected_session_title: string;
@@ -423,6 +465,7 @@ export interface DesktopWebState {
   provider_selected_model_summary: string[];
   provider_loading: boolean;
   provider_apply_enabled: boolean;
+  docling_readiness: DoclingReadinessProjection;
   config_fields: ConfigFieldProjection[];
   config_target: ConfigMutationTarget;
   workspace_input: string;

@@ -15,14 +15,14 @@ function sha256(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
-function responsesRequest() {
+function responsesRequest(prompt = SCRIPTED_PROVIDER_PROMPT) {
   return {
     model: SCRIPTED_PROVIDER_MODEL_ID,
     instructions: "Deterministic fixture instructions.",
     input: [{
       type: "message",
       role: "user",
-      content: [{ type: "input_text", text: SCRIPTED_PROVIDER_PROMPT }],
+      content: [{ type: "input_text", text: prompt }],
     }],
     max_output_tokens: SCRIPTED_PROVIDER_MAX_OUTPUT_TOKENS,
     store: false,
@@ -62,6 +62,52 @@ test("scripted provider never publishes a Fetch-forbidden loopback port", async 
   assert.equal(scriptedProviderPortIsFetchSafe(provider.resourceObservation().address.port), true);
   const response = await fetch(`${provider.baseUrl}/v1/models`);
   assert.equal(response.status, 200);
+});
+
+test("scripted provider holds one exact Docling readiness GET until explicit release", async (context) => {
+  const provider = await startScriptedProvider({ doclingReadinessStatus: 204 });
+  context.after(() => provider.close());
+  assert.deepEqual(provider.requestLedger, []);
+
+  const responsePromise = fetch(`${provider.baseUrl}/ready`);
+  await waitFor(() => {
+    const [row] = provider.requestLedger;
+    const resource = provider.resourceObservation();
+    return row?.method === "GET"
+      && row.pathname === "/ready"
+      && row.route === "docling_readiness"
+      && row.contract?.pass === true
+      && row.response_phase === "held"
+      && row.response_status === null
+      && resource.active_request_count === 1
+      && resource.docling_readiness_request_count === 1
+      && resource.docling_readiness_released === false;
+  });
+
+  const release = provider.releaseDoclingReadiness();
+  assert.equal(release.released, true);
+  assert.equal(release.response_status, 204);
+  const response = await responsePromise;
+  assert.equal(response.status, 204);
+  await waitFor(() => {
+    const [row] = provider.requestLedger;
+    return row?.response_phase === "completed"
+      && row.response_status === 204
+      && provider.resourceObservation().active_request_count === 0;
+  });
+  assert.deepEqual(provider.requestLedger.map((row) => [
+    row.method,
+    row.pathname,
+    row.query_present,
+    row.response_phase,
+    row.response_status,
+  ]), [["GET", "/ready", false, "completed", 204]]);
+  assert.throws(() => provider.releaseDoclingReadiness(), /already released/);
+
+  const close = await provider.close();
+  assert.equal(close.pass, true);
+  assert.equal(close.after.docling_readiness_released, true);
+  assert.equal(close.after.docling_readiness_released_by_cleanup, false);
 });
 
 test("scripted provider serves one exact Responses turn without retaining request secrets", async (context) => {
@@ -155,6 +201,38 @@ test("scripted provider serves one exact Responses turn without retaining reques
   assert.equal(close.after.open_connection_count, 0);
   assert.equal(close.after.successful_response_count, 1);
   assert.deepEqual(await provider.close(), close, "close is an idempotent observation of the same resource settlement");
+});
+
+test("scripted provider serves a bounded ordered multi-root turn script", async (context) => {
+  const turns = [
+    { prompt: "create root alpha", responseText: "ALPHA_OK" },
+    { prompt: "create root beta", responseText: "BETA_OK" },
+  ];
+  const provider = await startScriptedProvider({ turns });
+  context.after(() => provider.close());
+  assert.equal(provider.resourceObservation().script_kind, "ordered_turns");
+  assert.equal(provider.resourceObservation().scripted_responses_maximum, 2);
+
+  for (const turn of turns) {
+    const response = await fetch(`${provider.baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(responsesRequest(turn.prompt)),
+    });
+    assert.equal(response.status, 200);
+    const events = parseSse(await response.text());
+    assert.equal(events[0].delta, turn.responseText);
+  }
+  assert.deepEqual(provider.requestLedger.map((row) => [
+    row.sequence,
+    row.contract?.pass,
+    row.response_phase,
+    row.response_status,
+  ]), [
+    [1, true, "completed", 200],
+    [2, true, "completed", 200],
+  ]);
+  assert.equal(provider.resourceObservation().successful_response_count, 2);
 });
 
 test("scripted provider rejects omitted, drifted, and forbidden fixed-config request fields", async (context) => {
@@ -279,5 +357,17 @@ test("scripted provider rejects unknown response behavior before binding a liste
   await assert.rejects(
     startScriptedProvider({ responseBehavior: "run-number-95" }),
     /unknown scripted provider response behavior/,
+  );
+  await assert.rejects(
+    startScriptedProvider({ doclingReadinessStatus: 199 }),
+    /HTTP status from 200 through 599/,
+  );
+  await assert.rejects(
+    startScriptedProvider({ turns: [] }),
+    /must contain 1 through 8 entries/,
+  );
+  await assert.rejects(
+    startScriptedProvider({ turns: [{ prompt: "one", responseText: "ONE", extra: true }] }),
+    /must use its exact schema/,
   );
 });

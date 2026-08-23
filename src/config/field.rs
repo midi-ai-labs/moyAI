@@ -526,6 +526,7 @@ pub(crate) fn build_resolved_config_from_field_values(
     }
 
     config.normalize_and_validate_provider_runtime()?;
+    config.normalize_and_validate_docling_runtime()?;
     Ok(config)
 }
 
@@ -1012,5 +1013,66 @@ mod tests {
         )
         .expect_err("unknown stable keys must remain invalid");
         assert_eq!(unknown, "unknown config field key: model.unknown");
+    }
+
+    #[test]
+    fn enabled_docling_uses_the_neutral_http_endpoint_validator() {
+        let base = ResolvedConfig::default();
+        let resolved = build_resolved_config_from_key_values(
+            &base,
+            vec![
+                (
+                    ConfigField::DoclingEnabled.label().to_string(),
+                    "true".to_string(),
+                ),
+                (
+                    ConfigField::DoclingBaseUrl.label().to_string(),
+                    " https://docling.example.test/api/ ".to_string(),
+                ),
+            ],
+        )
+        .expect("valid Docling endpoint");
+        assert_eq!(
+            resolved.docling.base_url,
+            "https://docling.example.test/api"
+        );
+
+        for invalid in [
+            "not-an-absolute-url",
+            "file:///tmp/docling.sock",
+            "https://user:super-secret@docling.example.test",
+            "https://docling.example.test?api_key=hidden",
+            "https://docling.example.test#hidden",
+        ] {
+            let error = build_resolved_config_from_key_values(
+                &base,
+                vec![
+                    (
+                        ConfigField::DoclingEnabled.label().to_string(),
+                        "true".to_string(),
+                    ),
+                    (
+                        ConfigField::DoclingBaseUrl.label().to_string(),
+                        invalid.to_string(),
+                    ),
+                ],
+            )
+            .expect_err("invalid enabled Docling endpoint");
+            assert!(error.contains("docling.base_url"), "{error}");
+            assert!(!error.contains("super-secret"));
+            assert!(!error.contains("hidden"));
+            assert!(!error.contains(invalid));
+        }
+
+        let disabled = build_resolved_config_from_key_values(
+            &base,
+            vec![(
+                ConfigField::DoclingBaseUrl.label().to_string(),
+                "not-used-while-disabled".to_string(),
+            )],
+        )
+        .expect("disabled Docling preserves an inactive draft value");
+        assert!(!disabled.docling.enabled);
+        assert_eq!(disabled.docling.base_url, "not-used-while-disabled");
     }
 }

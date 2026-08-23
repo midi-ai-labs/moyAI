@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const bridge = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "windows_native_input.ps1");
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+export const TAURI_MAIN_WINDOW_CLASS = "Tauri Window";
 
 function collect(stream) {
   let value = "";
@@ -217,6 +218,41 @@ export function selectFreshOwnedRootWindow(
   return structuredClone(candidate);
 }
 
+export function selectSingleOwnedRootWindow(
+  observed,
+  expectedOwner = observed?.owner,
+  { expectedClassName } = {},
+) {
+  expectedOwner = requireOwner(expectedOwner, "expectedOwner");
+  if (typeof expectedClassName !== "string" || expectedClassName.length === 0) {
+    throw new TypeError("expectedClassName must be a non-empty current native class fingerprint");
+  }
+  requireSnapshot(observed, "observed", expectedOwner);
+  const allCurrentRoots = observed.windows.filter((window) => {
+    const hwnd = requireHwnd(window.hwnd, "observed.windows[].hwnd");
+    const root = requireHwnd(window.root_hwnd, "observed.windows[].root_hwnd");
+    return window.visible === true
+      && window.enabled === true
+      && window.is_root === true
+      && hwnd === root;
+  });
+  const roots = allCurrentRoots.filter((window) => window.class_name === expectedClassName);
+  if (roots.length !== 1) {
+    throw new NativeInputError(
+      "native-window-cardinality",
+      `expected exactly one current exact-owner root candidate, found ${roots.length}`,
+      {
+        expected_class_name: expectedClassName,
+        candidate_windows: roots,
+        auxiliary_current_windows: allCurrentRoots.filter((window) => !roots.includes(window)),
+        observed_windows: observed.windows,
+      },
+    );
+  }
+  requireInteractiveCandidate(roots[0]);
+  return structuredClone(roots[0]);
+}
+
 export async function snapshotOwnedTopLevelWindows(
   { executionRoot, ownerPath, expectedOwner = null },
   { invoke = invokeWindowsNativeInput } = {},
@@ -288,6 +324,125 @@ export async function sendEscapeToOwnedForegroundWindow(
     || result?.representative_input !== true
   ) {
     throw new NativeInputError("native-escape-delivery-invalid", "SendInput Escape did not satisfy the exact delivery contract", result);
+  }
+  return result;
+}
+
+function requireDragInteger(value, label, { minimum = null, nonZero = false } = {}) {
+  if (!Number.isInteger(value) || (minimum !== null && value < minimum) || (nonZero && value === 0)) {
+    throw new TypeError(`${label} is invalid`);
+  }
+  return value;
+}
+
+function sameExactWindow(left, right, candidate) {
+  return requireHwnd(left?.hwnd, "drag.window_before.hwnd") === requireHwnd(candidate.hwnd, "candidate.hwnd")
+    && requireHwnd(right?.hwnd, "drag.window_after.hwnd") === requireHwnd(candidate.hwnd, "candidate.hwnd")
+    && left?.process_id === candidate.process_id
+    && right?.process_id === candidate.process_id
+    && left?.thread_id === candidate.thread_id
+    && right?.thread_id === candidate.thread_id
+    && left?.class_name === candidate.class_name
+    && right?.class_name === candidate.class_name
+    && left?.is_root === true
+    && right?.is_root === true
+    && left?.visible === true
+    && right?.visible === true
+    && left?.enabled === true
+    && right?.enabled === true;
+}
+
+export function exactOwnedWindowDragObserved(result, { minimumDistance = 8 } = {}) {
+  requireDragInteger(minimumDistance, "minimumDistance", { minimum: 1 });
+  const before = result?.window_before?.rect;
+  const after = result?.window_after?.rect;
+  const delta = result?.position_delta;
+  if (![before?.left, before?.top, before?.width, before?.height, after?.left, after?.top, after?.width, after?.height, delta?.x, delta?.y]
+    .every(Number.isInteger)) return false;
+  const measuredX = after.left - before.left;
+  const measuredY = after.top - before.top;
+  return delta.x === measuredX
+    && delta.y === measuredY
+    && Math.max(Math.abs(measuredX), Math.abs(measuredY)) >= minimumDistance
+    && before.width === after.width
+    && before.height === after.height
+    && result?.size_unchanged === true;
+}
+
+export async function dragExactOwnedWindow(
+  {
+    executionRoot,
+    ownerPath,
+    candidate,
+    clientOffsetX,
+    clientOffsetY,
+    deltaX,
+    deltaY,
+  },
+  { invoke = invokeWindowsNativeInput } = {},
+) {
+  const fingerprint = requireInteractiveCandidate(candidate);
+  requireDragInteger(clientOffsetX, "clientOffsetX", { minimum: 0 });
+  requireDragInteger(clientOffsetY, "clientOffsetY", { minimum: 0 });
+  requireDragInteger(deltaX, "deltaX");
+  requireDragInteger(deltaY, "deltaY");
+  if (deltaX === 0 && deltaY === 0) throw new TypeError("window drag delta must be non-zero");
+  const result = await invoke("DragWindow", {
+    ExecutionRoot: executionRoot,
+    OwnerPath: ownerPath,
+    WindowHandle: fingerprint.hwnd,
+    ExpectedThreadId: fingerprint.threadId,
+    ExpectedClassName: fingerprint.className,
+    ClientOffsetX: clientOffsetX,
+    ClientOffsetY: clientOffsetY,
+    DragDeltaX: deltaX,
+    DragDeltaY: deltaY,
+  });
+  const requested = result?.requested_css;
+  const pathRows = result?.delivered_device?.path;
+  const clientRect = result?.client_rect;
+  const delivered = result?.delivered_device;
+  if (
+    result?.foreground_activation_verified !== true
+    || result?.foreground_pre_input_verified !== true
+    || result?.foreground_post_input_verified !== true
+    || result?.delivery_verified !== true
+    || result?.button_initially_up !== true
+    || result?.mouse_down_count !== 1
+    || result?.mouse_up_count !== 1
+    || result?.mouse_up_attempted !== true
+    || result?.button_release_verified !== true
+    || result?.cursor_moved_by_driver !== true
+    || result?.cursor_restore_attempted !== true
+    || result?.cursor_restore_succeeded !== true
+    || result?.cleanup_only !== false
+    || result?.representative_input !== true
+    || !Number.isInteger(result?.dpi)
+    || result.dpi <= 0
+    || !Number.isFinite(result?.css_to_device_scale)
+    || result.css_to_device_scale <= 0
+    || !Number.isInteger(clientRect?.width)
+    || !Number.isInteger(clientRect?.height)
+    || clientRect.width <= 0
+    || clientRect.height <= 0
+    || !Number.isInteger(delivered?.start_x)
+    || !Number.isInteger(delivered?.start_y)
+    || !Number.isInteger(delivered?.delta_x)
+    || !Number.isInteger(delivered?.delta_y)
+    || !Array.isArray(pathRows)
+    || pathRows.length < 2
+    || pathRows.some((row) => row?.succeeded !== true || !Number.isInteger(row?.x) || !Number.isInteger(row?.y))
+    || requested?.client_offset_x !== clientOffsetX
+    || requested?.client_offset_y !== clientOffsetY
+    || requested?.delta_x !== deltaX
+    || requested?.delta_y !== deltaY
+    || !sameExactWindow(result?.window_before, result?.window_after, candidate)
+  ) {
+    throw new NativeInputError(
+      "native-window-drag-delivery-invalid",
+      "native titlebar pointer drag did not satisfy the exact delivery contract",
+      result,
+    );
   }
   return result;
 }

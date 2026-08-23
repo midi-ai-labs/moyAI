@@ -1077,10 +1077,53 @@ impl SessionService {
             session.project_id,
             &project.vcs_kind,
         )?;
-        Ok(self
-            .store
-            .session_repo()
+        Ok(repository
             .update_session_settings(session_id, &normalized)
+            .await?)
+    }
+
+    pub async fn compare_and_set_root_session_settings(
+        &self,
+        session_id: SessionId,
+        expected_session_settings_revision: u64,
+        patch: SessionSettingsPatch,
+    ) -> Result<Option<SessionSettingsUpdate>, SessionError> {
+        if patch.is_empty() {
+            return Err(SessionError::Message(
+                "session settings update requires at least one setting".to_string(),
+            ));
+        }
+        let repository = self.store.session_repo();
+        let session = repository.get_session(session_id).await?;
+        if repository
+            .session_spawn_edge_for_child(session_id)
+            .await?
+            .is_some()
+        {
+            return Err(SessionError::Message(format!(
+                "session {session_id} is a child agent session; root settings ownership was rejected"
+            )));
+        }
+        if session.session_settings_revision != expected_session_settings_revision {
+            return Ok(None);
+        }
+        let project = self
+            .store
+            .project_repo()
+            .get_project(session.project_id)
+            .await?;
+        let normalized = normalize_session_settings_patch(
+            patch,
+            &project.root_path,
+            session.project_id,
+            &project.vcs_kind,
+        )?;
+        Ok(repository
+            .compare_and_set_root_session_settings(
+                session_id,
+                expected_session_settings_revision,
+                &normalized,
+            )
             .await?)
     }
 
@@ -1092,8 +1135,9 @@ impl SessionService {
         for _ in 0..8 {
             let current = self.store.session_repo().get_session(session_id).await?;
             if let Some(update) = self
-                .compare_and_set_root_session_access_mode(
+                .compare_and_set_root_session_access_mode_at_revision(
                     session_id,
+                    current.session_settings_revision,
                     current.access_mode,
                     access_mode,
                 )
@@ -1113,9 +1157,32 @@ impl SessionService {
         expected_access_mode: crate::config::AccessMode,
         access_mode: crate::config::AccessMode,
     ) -> Result<Option<SessionSettingsUpdate>, SessionError> {
-        let repository = self.store.session_repo();
-        Ok(repository
-            .compare_and_set_root_session_access_mode(session_id, expected_access_mode, access_mode)
+        let current = self.store.session_repo().get_session(session_id).await?;
+        self.compare_and_set_root_session_access_mode_at_revision(
+            session_id,
+            current.session_settings_revision,
+            expected_access_mode,
+            access_mode,
+        )
+        .await
+    }
+
+    pub async fn compare_and_set_root_session_access_mode_at_revision(
+        &self,
+        session_id: SessionId,
+        expected_session_settings_revision: u64,
+        expected_access_mode: crate::config::AccessMode,
+        access_mode: crate::config::AccessMode,
+    ) -> Result<Option<SessionSettingsUpdate>, SessionError> {
+        Ok(self
+            .store
+            .session_repo()
+            .compare_and_set_root_session_access_mode_at_revision(
+                session_id,
+                expected_session_settings_revision,
+                expected_access_mode,
+                access_mode,
+            )
             .await?)
     }
 
@@ -1723,11 +1790,11 @@ fn normalize_session_settings_patch(
             "session settings top_k must be greater than zero".to_string(),
         ));
     }
-    if let Some(value) = patch.max_output_tokens
+    if let Some(value) = patch.context_window
         && value == 0
     {
         return Err(SessionError::Message(
-            "session settings max_output_tokens must be greater than zero".to_string(),
+            "session settings context_window must be greater than zero".to_string(),
         ));
     }
     Ok(SessionSettingsPatch {
@@ -1739,6 +1806,7 @@ fn normalize_session_settings_patch(
         temperature: patch.temperature,
         top_p: patch.top_p,
         top_k: patch.top_k,
+        context_window: patch.context_window,
         max_output_tokens: patch.max_output_tokens,
     })
 }
@@ -2329,6 +2397,170 @@ mod tests {
                 .expect("preserved session")
                 .cwd,
             workspace.root
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_root_settings_cas_validates_context_and_rejects_a_stale_revision() {
+        let (service, workspace, _) = service_fixture().await;
+        let session = create_session(&service, &workspace).await;
+        let revision = session.session.session_settings_revision;
+
+        let error = service
+            .compare_and_set_root_session_settings(
+                session.session.id,
+                revision,
+                SessionSettingsPatch {
+                    context_window: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("zero context window must be rejected");
+        assert!(error.to_string().contains("greater than zero"));
+
+        let updated = service
+            .compare_and_set_root_session_settings(
+                session.session.id,
+                revision,
+                SessionSettingsPatch {
+                    context_window: Some(131_072),
+                    max_output_tokens: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("settings CAS")
+            .expect("matching revision");
+        assert!(updated.changed);
+        assert_eq!(
+            updated.session.model_parameters.context_window,
+            Some(131_072)
+        );
+        assert_eq!(updated.session.model_parameters.max_output_tokens, Some(0));
+        assert_eq!(updated.session.session_settings_revision, revision + 1);
+
+        let stale = service
+            .compare_and_set_root_session_settings(
+                session.session.id,
+                revision,
+                SessionSettingsPatch {
+                    model: Some("stale-model".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stale CAS is a typed target change");
+        assert!(stale.is_none());
+        assert_eq!(
+            service
+                .get_session(session.session.id)
+                .await
+                .expect("preserved session")
+                .model,
+            "model"
+        );
+
+        let stale_access = service
+            .compare_and_set_root_session_access_mode_at_revision(
+                session.session.id,
+                revision,
+                AccessMode::Default,
+                AccessMode::FullAccess,
+            )
+            .await
+            .expect("stale access target");
+        assert!(stale_access.is_none());
+        service
+            .store
+            .session_repo()
+            .admit_session_turn(session.session.id, TurnId::new())
+            .await
+            .expect("active root admission")
+            .expect("root admitted");
+        let access = service
+            .compare_and_set_root_session_access_mode_at_revision(
+                session.session.id,
+                updated.session.session_settings_revision,
+                AccessMode::Default,
+                AccessMode::FullAccess,
+            )
+            .await
+            .expect("active exact access CAS")
+            .expect("matching active target");
+        assert!(access.changed);
+        assert_eq!(access.session.access_mode, AccessMode::FullAccess);
+        assert_eq!(
+            access.session.session_settings_revision,
+            updated.session.session_settings_revision + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_child_settings_sync_is_distinct_from_root_only_exact_cas() {
+        let (service, workspace, _) = service_fixture().await;
+        let root = create_session(&service, &workspace).await;
+        let repository = service.store.session_repo();
+        let child = repository
+            .create_session(crate::session::NewSession {
+                project_id: workspace.project_id,
+                title: "child".to_string(),
+                cwd: workspace.cwd.clone(),
+                model: "child-model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+                access_mode: AccessMode::Default,
+            })
+            .await
+            .expect("child session");
+        repository
+            .insert_session_spawn_edge(
+                root.session.id,
+                root.session.id,
+                child.id,
+                "/root/child",
+                "child",
+            )
+            .await
+            .expect("child edge");
+
+        let synced = service
+            .update_session_settings(
+                child.id,
+                SessionSettingsPatch {
+                    access_mode: Some(AccessMode::FullAccess),
+                    context_window: Some(65_536),
+                    ..SessionSettingsPatch::default()
+                },
+            )
+            .await
+            .expect("generic runtime-owned child sync");
+        assert!(synced.changed);
+        assert_eq!(synced.session.access_mode, AccessMode::FullAccess);
+        assert_eq!(synced.session.model_parameters.context_window, Some(65_536));
+        assert_eq!(
+            synced.session.session_settings_revision,
+            child.session_settings_revision + 1
+        );
+
+        let error = service
+            .compare_and_set_root_session_settings(
+                child.id,
+                synced.session.session_settings_revision,
+                SessionSettingsPatch {
+                    model: Some("forbidden-root-owner-model".to_string()),
+                    ..SessionSettingsPatch::default()
+                },
+            )
+            .await
+            .expect_err("Desktop root-only CAS must reject a child session");
+        assert!(error.to_string().contains("child agent session"));
+        assert_eq!(
+            service
+                .get_session(child.id)
+                .await
+                .expect("preserved generic child settings")
+                .model,
+            "child-model"
         );
     }
 

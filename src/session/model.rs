@@ -105,6 +105,8 @@ pub struct SessionRecord {
     pub access_mode: AccessMode,
     #[serde(default)]
     pub model_parameters: SessionModelParameters,
+    #[serde(default)]
+    pub session_settings_revision: u64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub completed_at_ms: Option<i64>,
@@ -123,6 +125,7 @@ impl fmt::Debug for SessionRecord {
             .field("base_url", &"<redacted provider endpoint>")
             .field("access_mode", &self.access_mode)
             .field("model_parameters", &self.model_parameters)
+            .field("session_settings_revision", &self.session_settings_revision)
             .field("created_at_ms", &self.created_at_ms)
             .field("updated_at_ms", &self.updated_at_ms)
             .field("completed_at_ms", &self.completed_at_ms)
@@ -150,6 +153,8 @@ pub struct SessionModelParameters {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
 }
 
@@ -158,6 +163,7 @@ impl SessionModelParameters {
         self.temperature.is_none()
             && self.top_p.is_none()
             && self.top_k.is_none()
+            && self.context_window.is_none()
             && self.max_output_tokens.is_none()
     }
 }
@@ -181,6 +187,8 @@ pub struct SessionSettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
 }
 
@@ -202,6 +210,7 @@ impl fmt::Debug for SessionSettingsPatch {
             .field("temperature", &self.temperature)
             .field("top_p", &self.top_p)
             .field("top_k", &self.top_k)
+            .field("context_window", &self.context_window)
             .field("max_output_tokens", &self.max_output_tokens)
             .finish()
     }
@@ -217,6 +226,7 @@ impl SessionSettingsPatch {
             && self.temperature.is_none()
             && self.top_p.is_none()
             && self.top_k.is_none()
+            && self.context_window.is_none()
             && self.max_output_tokens.is_none()
     }
 
@@ -237,6 +247,9 @@ impl SessionSettingsPatch {
         }
         if let Some(value) = self.top_k {
             next.top_k = Some(value);
+        }
+        if let Some(value) = self.context_window {
+            next.context_window = Some(value);
         }
         if let Some(value) = self.max_output_tokens {
             next.max_output_tokens = Some(value);
@@ -1267,5 +1280,42 @@ mod tests {
             serde_json::from_value::<RequestWireDiagnostic>(value).expect("deserialize wire facts"),
             wire
         );
+    }
+
+    #[test]
+    fn session_model_parameters_round_trip_optional_context_window() {
+        let parameters = SessionModelParameters {
+            context_window: Some(131_072),
+            max_output_tokens: Some(8_192),
+            ..SessionModelParameters::default()
+        };
+
+        let encoded = serde_json::to_string(&parameters).expect("serialize session parameters");
+        let decoded: SessionModelParameters =
+            serde_json::from_str(&encoded).expect("deserialize session parameters");
+
+        assert_eq!(decoded, parameters);
+        assert_eq!(decoded.context_window, Some(131_072));
+    }
+
+    #[test]
+    fn session_settings_patch_resets_and_replaces_context_window() {
+        let current = SessionModelParameters {
+            temperature: Some(0.4),
+            context_window: Some(32_768),
+            max_output_tokens: Some(4_096),
+            ..SessionModelParameters::default()
+        };
+        let patch = SessionSettingsPatch {
+            reset_model_parameters: true,
+            context_window: Some(65_536),
+            ..SessionSettingsPatch::default()
+        };
+
+        let next = patch.apply_to_model_parameters(&current);
+
+        assert_eq!(next.context_window, Some(65_536));
+        assert_eq!(next.temperature, None);
+        assert_eq!(next.max_output_tokens, None);
     }
 }

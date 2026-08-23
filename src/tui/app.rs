@@ -27,7 +27,7 @@ use crate::cli::{
     ConfirmationOutcome, ConfirmationPrompt, EventRenderer, OutputMode, ReviewDecision,
     SharedConfirmationPrompt, TuiArgs,
 };
-use crate::config::{AccessMode, ConfigLoader, ResolvedConfig, ShellFamily};
+use crate::config::{AccessMode, ResolvedConfig, ShellFamily};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
 #[cfg(test)]
 use crate::protocol::TurnInterruptionCause;
@@ -49,7 +49,7 @@ use crate::session::{
 use crate::tool::PermissionRequest;
 use crate::workspace::project::normalize_path;
 
-use super::config_editor::{ConfigEditorState, ConfigSaveScope};
+use super::config_editor::{ConfigEditorState, GlobalConfigAdoptionPolicy, GlobalConfigSaveResult};
 use super::prompt_enhance::enhance_prompt;
 use super::query::{latest_session, recent_sessions, search_sessions, session_view};
 use super::reducer::reduce_run_event;
@@ -164,6 +164,22 @@ fn commit_tui_effective_config(
     }
     *effective_config = candidate;
     true
+}
+
+fn commit_tui_global_config_save_result(
+    app_config: &mut ResolvedConfig,
+    base_config: &mut ResolvedConfig,
+    effective_config: &mut ResolvedConfig,
+    config_editor: &mut ConfigEditorState,
+    result: Result<GlobalConfigSaveResult, String>,
+) -> Result<String, String> {
+    let saved = result?;
+    let next_editor = ConfigEditorState::from_config(&saved.resolved_config);
+    *app_config = saved.resolved_config.clone();
+    *base_config = saved.resolved_config.clone();
+    *effective_config = saved.resolved_config;
+    *config_editor = next_editor;
+    Ok(saved.message)
 }
 
 pub async fn run(app: App, args: TuiArgs) -> Result<(), AppRunError> {
@@ -846,11 +862,18 @@ impl TuiController {
                 });
             }
             KeyCode::F(3) => {
-                let message = self
-                    .config_editor
-                    .save_scope(&self.app.workspace.root, ConfigSaveScope::Global)
-                    .map_err(AppRunError::Message)?;
-                self.reload_config().await?;
+                let save_result = self.config_editor.save_global(
+                    &self.app.workspace.root,
+                    GlobalConfigAdoptionPolicy::PreserveUnknownTopLevelSections,
+                );
+                let message = commit_tui_global_config_save_result(
+                    &mut self.app.config,
+                    &mut self.base_config,
+                    &mut self.effective_config,
+                    &mut self.config_editor,
+                    save_result,
+                )
+                .map_err(AppRunError::Message)?;
                 self.state.status_message = Some(message);
             }
             KeyCode::Char(value) => self.config_editor.insert_char(value),
@@ -2268,14 +2291,6 @@ impl TuiController {
             .preview_turn_offset
             .saturating_add(self.preview_turn_limit);
         self.refresh_preview().await
-    }
-
-    async fn reload_config(&mut self) -> Result<(), AppRunError> {
-        self.base_config = ConfigLoader::load(&self.app.workspace.root, None)
-            .map_err(|error| AppRunError::Message(format!("failed to reload config: {error}")))?;
-        self.effective_config = self.base_config.clone();
-        self.config_editor = ConfigEditorState::from_config(&self.effective_config);
-        Ok(())
     }
 
     fn render(&self, frame: &mut Frame<'_>) {
@@ -5956,6 +5971,82 @@ mod key_tests {
             effective.permissions.access_mode,
             crate::config::AccessMode::Default
         );
+    }
+
+    #[test]
+    fn failed_tui_global_save_result_keeps_every_runtime_owner_and_draft_unchanged() {
+        let mut app_config = ResolvedConfig::default();
+        app_config.model.model = "app-owner".to_string();
+        let mut base_config = ResolvedConfig::default();
+        base_config.model.model = "base-owner".to_string();
+        let mut effective_config = ResolvedConfig::default();
+        effective_config.model.model = "effective-owner".to_string();
+        let mut editor = ConfigEditorState::from_config(&effective_config);
+        let model = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == crate::config::ConfigField::Model)
+            .expect("model field");
+        model.value = "unsaved-draft".to_string();
+        model.dirty = true;
+
+        let error = commit_tui_global_config_save_result(
+            &mut app_config,
+            &mut base_config,
+            &mut effective_config,
+            &mut editor,
+            Err("simulated preflight failure".to_string()),
+        )
+        .expect_err("failed persistence must not commit TUI owners");
+
+        assert_eq!(error, "simulated preflight failure");
+        assert_eq!(app_config.model.model, "app-owner");
+        assert_eq!(base_config.model.model, "base-owner");
+        assert_eq!(effective_config.model.model, "effective-owner");
+        let model = editor
+            .fields
+            .iter()
+            .find(|field| field.key == crate::config::ConfigField::Model)
+            .expect("model field");
+        assert_eq!(model.value, "unsaved-draft");
+        assert!(model.dirty);
+    }
+
+    #[test]
+    fn successful_tui_global_save_result_commits_one_resolved_owner_without_reload() {
+        let mut app_config = ResolvedConfig::default();
+        let mut base_config = ResolvedConfig::default();
+        let mut effective_config = ResolvedConfig::default();
+        let mut editor = ConfigEditorState::from_config(&effective_config);
+        let mut adopted = ResolvedConfig::default();
+        adopted.model.model = "adopted-model".to_string();
+        adopted.permissions.access_mode = AccessMode::FullAccess;
+
+        let message = commit_tui_global_config_save_result(
+            &mut app_config,
+            &mut base_config,
+            &mut effective_config,
+            &mut editor,
+            Ok(GlobalConfigSaveResult {
+                message: "saved global config".to_string(),
+                resolved_config: adopted,
+                preserved_unknown_top_level_sections: Vec::new(),
+            }),
+        )
+        .expect("commit resolved save result");
+
+        assert_eq!(message, "saved global config");
+        for owner in [&app_config, &base_config, &effective_config] {
+            assert_eq!(owner.model.model, "adopted-model");
+            assert_eq!(owner.permissions.access_mode, AccessMode::FullAccess);
+        }
+        let model = editor
+            .fields
+            .iter()
+            .find(|field| field.key == crate::config::ConfigField::Model)
+            .expect("model field");
+        assert_eq!(model.value, "adopted-model");
+        assert!(!model.dirty);
     }
 
     #[test]

@@ -5,9 +5,19 @@ const SEMANTIC_IDENTITY_FIELDS = Object.freeze([
   "focusKey",
   "configKey",
   "sideSetting",
+  "sessionSetting",
+  "sessionSettingsTrigger",
+  "surface",
+  "modal",
+  "step",
+  "field",
+  "href",
 ]);
 const STABLE_IDENTITY_FIELDS = Object.freeze(SEMANTIC_IDENTITY_FIELDS.filter((field) => field !== "tag"));
 const PROBE_ID = /^[a-z0-9][a-z0-9._-]{2,127}$/;
+const DEFAULT_TARGET_ACQUISITION_TIMEOUT_MS = 1_500;
+const DEFAULT_TARGET_ACQUISITION_POLL_MS = 16;
+const EXISTING_SCROLL_STABLE_HIT_SAMPLES = 3;
 
 const MODIFIER_BITS = Object.freeze({
   Alt: 1,
@@ -30,10 +40,10 @@ const NAMED_KEYS = Object.freeze({
 const PAGE_IDENTITY_SOURCE = `
   const semanticIdentity = (value) => {
     if (!(value instanceof Element)) {
-      return { tag: "", id: null, action: null, focusKey: null, configKey: null, sideSetting: null };
+      return { tag: "", id: null, action: null, focusKey: null, configKey: null, sideSetting: null, sessionSetting: null, sessionSettingsTrigger: null, surface: null, modal: null, step: null, field: null, href: null };
     }
     const owner = value.closest(
-      '[data-action], [data-focus-key], [data-config-key], [data-side-chat-setting], button, input, textarea, select, a[href], [tabindex], [role]'
+      '[data-action], [data-focus-key], [data-config-key], [data-side-chat-setting], [data-session-setting], [data-session-settings-trigger], [data-surface], [data-modal], [data-step], [data-field], button, input, textarea, select, a[href], [tabindex], [role]'
     ) ?? value;
     return {
       tag: owner.tagName.toUpperCase(),
@@ -42,6 +52,13 @@ const PAGE_IDENTITY_SOURCE = `
       focusKey: owner instanceof HTMLElement ? (owner.dataset.focusKey ?? null) : null,
       configKey: owner instanceof HTMLElement ? (owner.dataset.configKey ?? null) : null,
       sideSetting: owner instanceof HTMLElement ? (owner.dataset.sideChatSetting ?? null) : null,
+      sessionSetting: owner instanceof HTMLElement ? (owner.dataset.sessionSetting ?? null) : null,
+      sessionSettingsTrigger: owner instanceof HTMLElement ? (owner.dataset.sessionSettingsTrigger ?? null) : null,
+      surface: owner instanceof HTMLElement ? (owner.dataset.surface ?? null) : null,
+      modal: owner instanceof HTMLElement ? (owner.dataset.modal ?? null) : null,
+      step: owner instanceof HTMLElement ? (owner.dataset.step ?? null) : null,
+      field: owner instanceof HTMLElement ? (owner.dataset.field ?? null) : null,
+      href: owner instanceof HTMLAnchorElement ? owner.getAttribute('href') : null,
     };
   };
 `;
@@ -60,6 +77,10 @@ function errorMessage(error) {
 
 function finiteNumber(value) {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function nullableIdentityValue(value, field) {
@@ -105,7 +126,7 @@ export function normalizeSemanticLocator(value) {
   const identity = normalizeSemanticIdentity(value.identity, { partial: true });
   invariant(
     STABLE_IDENTITY_FIELDS.some((field) => Object.hasOwn(identity, field) && identity[field] !== null),
-    "semantic locator requires id, action, focusKey, configKey, or sideSetting identity",
+    "semantic locator requires id, action, focusKey, configKey, sideSetting, sessionSetting, sessionSettingsTrigger, surface, modal, step, field, or href identity",
   );
   invariant(value.requireVisible === undefined || typeof value.requireVisible === "boolean", "requireVisible must be boolean");
   invariant(value.requireEnabled === undefined || typeof value.requireEnabled === "boolean", "requireEnabled must be boolean");
@@ -160,6 +181,28 @@ export function assertExactSemanticTarget(observation, locatorValue) {
   };
 }
 
+function targetCanSettleThroughExistingScroll(error) {
+  return error instanceof WebviewInputError
+    && error.code === "semantic-target-hit-test"
+    && (
+      error.evidence?.observation?.center_in_viewport === false
+      || error.evidence?.observation?.center_in_scroll_clip === false
+    );
+}
+
+function sameTargetGeometry(left, right) {
+  return left !== null
+    && right !== null
+    && left.center.x === right.center.x
+    && left.center.y === right.center.y
+    && left.rect?.left === right.rect?.left
+    && left.rect?.top === right.rect?.top
+    && left.rect?.right === right.rect?.right
+    && left.rect?.bottom === right.rect?.bottom
+    && left.rect?.width === right.rect?.width
+    && left.rect?.height === right.rect?.height;
+}
+
 function exactTargetExpression(locator) {
   return `(() => {
     ${PAGE_IDENTITY_SOURCE}
@@ -183,7 +226,35 @@ function exactTargetExpression(locator) {
       && target.closest('[inert]') === null
       && style?.pointerEvents !== 'none';
     const center = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-    const hit = visible ? document.elementFromPoint(center.x, center.y) : null;
+    const viewport = {
+      width: document.documentElement.clientWidth,
+      height: document.documentElement.clientHeight,
+    };
+    const centerInViewport = center.x >= 0 && center.x < viewport.width
+      && center.y >= 0 && center.y < viewport.height;
+    const scrollClip = { left: 0, top: 0, right: viewport.width, bottom: viewport.height };
+    const clippingValues = new Set(['auto', 'scroll', 'hidden', 'clip']);
+    for (let ancestor = target.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      const ancestorStyle = getComputedStyle(ancestor);
+      const ancestorRect = ancestor.getBoundingClientRect();
+      const clientLeft = ancestorRect.left + ancestor.clientLeft;
+      const clientTop = ancestorRect.top + ancestor.clientTop;
+      const clientRight = clientLeft + ancestor.clientWidth;
+      const clientBottom = clientTop + ancestor.clientHeight;
+      if (clippingValues.has(ancestorStyle.overflowX)) {
+        scrollClip.left = Math.max(scrollClip.left, clientLeft);
+        scrollClip.right = Math.min(scrollClip.right, clientRight);
+      }
+      if (clippingValues.has(ancestorStyle.overflowY)) {
+        scrollClip.top = Math.max(scrollClip.top, clientTop);
+        scrollClip.bottom = Math.min(scrollClip.bottom, clientBottom);
+      }
+    }
+    const centerInScrollClip = center.x >= scrollClip.left && center.x < scrollClip.right
+      && center.y >= scrollClip.top && center.y < scrollClip.bottom;
+    const hit = visible && centerInViewport && centerInScrollClip
+      ? document.elementFromPoint(center.x, center.y)
+      : null;
     return {
       count: 1,
       connected: target.isConnected,
@@ -192,7 +263,11 @@ function exactTargetExpression(locator) {
       identity: semanticIdentity(target),
       hit_identity: semanticIdentity(hit),
       center_hit: hit instanceof Element && (hit === target || target.contains(hit)),
+      center_in_viewport: centerInViewport,
+      center_in_scroll_clip: centerInScrollClip,
       center,
+      viewport,
+      scroll_clip: scrollClip,
       rect: {
         left: rect.left,
         top: rect.top,
@@ -253,7 +328,7 @@ function installProbeExpression(probeId, maxEvents) {
         state.droppedThrough = removed.at(-1)?.sequence ?? state.droppedThrough;
       }
     };
-    for (const type of ['pointerdown', 'pointerup', 'click', 'keydown', 'keyup', 'input', 'focusin']) {
+    for (const type of ['pointermove', 'pointerdown', 'pointerup', 'click', 'keydown', 'keyup', 'input', 'focusin']) {
       document.addEventListener(type, record, { capture: true, signal: controller.signal });
     }
     registry.set(probeId, state);
@@ -383,11 +458,39 @@ export class WebviewInput {
   #pressedPointer = null;
   #probeInstalled = false;
 
-  constructor(cdp, { probeId = "webview-input", maxProbeEvents = 4096 } = {}) {
+  constructor(
+    cdp,
+    {
+      probeId = "webview-input",
+      maxProbeEvents = 4096,
+      targetAcquisitionTimeoutMs = DEFAULT_TARGET_ACQUISITION_TIMEOUT_MS,
+      targetAcquisitionPollMs = DEFAULT_TARGET_ACQUISITION_POLL_MS,
+      now = Date.now,
+      wait = delay,
+    } = {},
+  ) {
     this.#cdp = validateCdp(cdp);
     this.probeId = normalizeProbeId(probeId);
     invariant(Number.isInteger(maxProbeEvents) && maxProbeEvents >= 32 && maxProbeEvents <= 65_536, "maxProbeEvents is invalid");
+    invariant(
+      Number.isInteger(targetAcquisitionTimeoutMs)
+        && targetAcquisitionTimeoutMs >= 1
+        && targetAcquisitionTimeoutMs <= 10_000,
+      "targetAcquisitionTimeoutMs is invalid",
+    );
+    invariant(
+      Number.isInteger(targetAcquisitionPollMs)
+        && targetAcquisitionPollMs >= 0
+        && targetAcquisitionPollMs <= targetAcquisitionTimeoutMs,
+      "targetAcquisitionPollMs is invalid",
+    );
+    invariant(typeof now === "function", "WebView input clock is invalid");
+    invariant(typeof wait === "function", "WebView input wait owner is invalid");
     this.maxProbeEvents = maxProbeEvents;
+    this.targetAcquisitionTimeoutMs = targetAcquisitionTimeoutMs;
+    this.targetAcquisitionPollMs = targetAcquisitionPollMs;
+    this.now = now;
+    this.wait = wait;
   }
 
   get pressedKeys() {
@@ -406,6 +509,14 @@ export class WebviewInput {
     return this.#probeInstalled;
   }
 
+  async observeExactTarget(locatorValue) {
+    const locator = normalizeSemanticLocator(locatorValue);
+    return {
+      locator,
+      observation: clone(await this.#cdp.evaluate(exactTargetExpression(locator))),
+    };
+  }
+
   #currentModifiers(extra = 0) {
     let modifiers = extra;
     for (const key of this.#pressedKeys.values()) modifiers |= key.modifierBit;
@@ -414,8 +525,79 @@ export class WebviewInput {
 
   async resolveExactTarget(locatorValue) {
     const locator = normalizeSemanticLocator(locatorValue);
-    const observation = await this.#cdp.evaluate(exactTargetExpression(locator));
-    return assertExactSemanticTarget(observation, locator);
+    const started = this.now();
+    invariant(Number.isFinite(started), "WebView input clock returned an invalid value");
+    const deadline = started + this.targetAcquisitionTimeoutMs;
+    let attempts = 0;
+    let initialObservation = null;
+    let lastObservation = null;
+    let existingScrollObserved = false;
+    let stableTarget = null;
+    let stableHitSamples = 0;
+    while (true) {
+      const observation = await this.#cdp.evaluate(exactTargetExpression(locator));
+      attempts += 1;
+      initialObservation ??= clone(observation);
+      lastObservation = clone(observation);
+      try {
+        const acquired = assertExactSemanticTarget(observation, locator);
+        if (!existingScrollObserved) {
+          return {
+            ...acquired,
+            acquisition: {
+              kind: "immediate",
+              attempts,
+              elapsed_ms: this.now() - started,
+              stable_hit_samples: 1,
+              initial_observation: initialObservation,
+              final_observation: clone(observation),
+            },
+          };
+        }
+        if (sameTargetGeometry(stableTarget, acquired)) stableHitSamples += 1;
+        else {
+          stableTarget = clone(acquired);
+          stableHitSamples = 1;
+        }
+        if (stableHitSamples >= EXISTING_SCROLL_STABLE_HIT_SAMPLES) {
+          return {
+            ...acquired,
+            acquisition: {
+              kind: "existing-scroll-settled",
+              attempts,
+              elapsed_ms: this.now() - started,
+              stable_hit_samples: stableHitSamples,
+              initial_observation: initialObservation,
+              final_observation: clone(observation),
+            },
+          };
+        }
+      } catch (error) {
+        if (!targetCanSettleThroughExistingScroll(error)) throw error;
+        existingScrollObserved = true;
+        stableTarget = null;
+        stableHitSamples = 0;
+      }
+      {
+        const now = this.now();
+        invariant(Number.isFinite(now), "WebView input clock returned an invalid value");
+        if (now >= deadline) {
+          throw new WebviewInputError(
+            "semantic-target-viewport-timeout",
+            "semantic target did not enter the viewport through the existing product scroll",
+            {
+              locator,
+              attempts,
+              elapsed_ms: now - started,
+              stable_hit_samples: stableHitSamples,
+              initial_observation: initialObservation,
+              last_observation: lastObservation,
+            },
+          );
+        }
+        await this.wait(Math.min(this.targetAcquisitionPollMs, deadline - now));
+      }
+    }
   }
 
   async pointerDown(locatorValue) {
@@ -448,6 +630,22 @@ export class WebviewInput {
       this.#pressedPointer.delivery = "ambiguous";
       throw error;
     }
+    return clone(target);
+  }
+
+  async hover(locatorValue) {
+    if (this.#pressedPointer !== null) {
+      throw new WebviewInputError("pointer-already-pressed", "a WebView pointer press is already active", this.#pressedPointer);
+    }
+    const target = await this.resolveExactTarget(locatorValue);
+    await this.#cdp.call("Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: target.center.x,
+      y: target.center.y,
+      button: "none",
+      buttons: 0,
+      modifiers: this.#currentModifiers(),
+    });
     return clone(target);
   }
 

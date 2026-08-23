@@ -15,6 +15,7 @@ import {
 import {
   permissionDecisionForEscape,
 } from "./decision_state.ts";
+import { validateInitialSetupStep } from "./initial_setup_state.ts";
 import {
   confirmationFocusIsMeaningful,
   confirmationFocusSelectors,
@@ -37,6 +38,11 @@ import {
   abandonQuickChatDeleteFocusContinuation,
 } from "./quick_chat_delete_focus_continuation.ts";
 import { composerSendTitle, sideChatCatalogStatusText } from "./render.ts";
+import {
+  sameSessionSettingsTarget,
+  updateSessionSettingsDraft,
+  type SessionSettingsDraftField,
+} from "./session_settings_state.ts";
 import {
   applyTitlebarMenuRovingTabIndex,
   TitlebarDragGesture,
@@ -63,6 +69,7 @@ import {
   sideChatMutationPending,
   sideChatOperationsOpen,
   sideChatOwnerSessionId,
+  sessionSettingsMutationAvailability,
   type UiLocalState,
 } from "./ui_state.ts";
 import {
@@ -95,8 +102,10 @@ import {
   configDraftEditOpen,
   draftMutationTarget,
   localSearchOwner,
+  normalizeProviderBaseUrl,
   sessionSearchMutationTarget,
   sessionSearchOwner,
+  synchronizeInitialSetupProviderDraft,
 } from "./view_state.ts";
 
 let pendingOpacityPreviewPercent: number | null = null;
@@ -199,6 +208,8 @@ export function installGlobalKeyboardShortcuts(context: ActionContext): void {
         event.preventDefault();
         void dispatchAction("cancel-local-confirm", context, { index: -1, value: "" })
           .catch((error) => context.reportError(error));
+      } else if (event.key === "Escape" && currentState.overlay === "initial_setup") {
+        event.preventDefault();
       } else if (event.key === "Escape" && isRegularModalOverlay(currentState.overlay)) {
         event.preventDefault();
         if (!startupSetupRequired(currentState)) dismissOverlayForState(currentState, context);
@@ -342,13 +353,16 @@ export function handleSettingsSelectAllShortcut(
   activeElement: Element | null = document.activeElement,
 ): boolean {
   if (
-    state.overlay !== "config"
+    !["config", "session_settings", "initial_setup"].includes(state.overlay)
     || state.confirmation_visible
     || !(sample.ctrlKey || sample.metaKey)
     || sample.altKey
     || sample.key.toLowerCase() !== "a"
     || !activeElement?.isConnected
-    || activeElement.closest(".settings-modal") === null
+    || (
+      activeElement.closest(".settings-modal") === null
+      && activeElement.closest(".initial-setup-shell") === null
+    )
   ) return false;
 
   if (activeElement instanceof HTMLTextAreaElement) {
@@ -431,7 +445,12 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
     context.uiState.drafts.imageRevision += 1;
   });
   document.querySelector<HTMLInputElement>("#provider-url")?.addEventListener("input", (event) => {
-    context.uiState.drafts.provider.baseUrl = (event.currentTarget as HTMLInputElement).value;
+    const next = (event.currentTarget as HTMLInputElement).value;
+    if (
+      normalizeProviderBaseUrl(next)
+      !== normalizeProviderBaseUrl(context.uiState.drafts.provider.baseUrl)
+    ) context.uiState.drafts.providerCatalogIdentityRevision += 1;
+    context.uiState.drafts.provider.baseUrl = next;
     context.uiState.drafts.providerRevision += 1;
     updateProviderActionButtons(context);
   });
@@ -449,6 +468,7 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
   if (settingsControls.length > 0) {
     validateSettingsForm(context, state.config_fields, false);
   }
+  if (state.overlay === "session_settings") updateSessionSettingsControls(state, context);
   updateSideChatActionButtons(state, context);
   document.querySelector<HTMLInputElement>("#workspace-input")?.addEventListener("input", (event) => {
     context.uiState.drafts.workspaceInput = (event.currentTarget as HTMLInputElement).value;
@@ -567,6 +587,29 @@ function installDelegatedActionEvents(context: ActionContext): void {
     ) {
       return;
     }
+    if (target.matches(".session-settings-control")) {
+      const currentState = context.getViewState();
+      const currentTarget = currentState?.session_settings.target ?? null;
+      if (
+        !currentState
+        || currentState.overlay !== "session_settings"
+        || currentTarget === null
+        || !sameSessionSettingsTarget(context.uiState.sessionSettings.owner, currentTarget)
+      ) return;
+      const field = sessionSettingsDraftField(target.dataset.sessionSetting ?? "");
+      if (
+        field !== null
+        && updateSessionSettingsDraft(
+          context.uiState.sessionSettings,
+          currentTarget,
+          field,
+          target.value,
+        )
+      ) {
+        updateSessionSettingsControls(currentState, context);
+      }
+      return;
+    }
     if (target.matches(".side-chat-settings-control")) {
       const currentState = context.getViewState();
       const ownerSessionId = currentState ? sideChatOwnerSessionId(currentState) : null;
@@ -594,7 +637,13 @@ function installDelegatedActionEvents(context: ActionContext): void {
     if (!target.matches(".settings-control") || !updateSettingsControlDraft(target, context)) return;
     synchronizeMainProviderModelControls(target);
     const currentState = context.getViewState();
-    if (currentState) validateSettingsForm(context, currentState.config_fields, false);
+    if (currentState) {
+      synchronizeInitialSetupProviderDraft(currentState, context.uiState);
+      validateSettingsForm(context, currentState.config_fields, false);
+    }
+    if (event.type === "change" && target.dataset.configKey === "docling.enabled") {
+      context.rerender();
+    }
   };
   document.addEventListener("input", updateSettingsControl);
   document.addEventListener("change", updateSettingsControl);
@@ -764,7 +813,9 @@ function titlebarPointerSample(event: PointerEvent, target: Element) {
 }
 
 function trapDialogFocus(event: KeyboardEvent): void {
-  const dialog = document.querySelector<HTMLElement>(".modal[role='dialog'], .modal[role='alertdialog']");
+  const dialog = Array.from(document.querySelectorAll<HTMLElement>(
+    ".modal[role='dialog'], .modal[role='alertdialog'], .initial-setup-shell",
+  )).reverse().find((candidate) => candidate.closest("[inert], [aria-hidden='true']") === null) ?? null;
   if (!dialog) return;
   event.preventDefault();
   containDialogFocus(dialog, document.activeElement, event.shiftKey);
@@ -1040,29 +1091,43 @@ function validateSettingsForm(
     return key ? [{ key, text: settingsControlValue(control) }] : [];
   });
   const formValidation = validateConfigFieldValues(fields, values);
+  const initialSetup = document.querySelector("[data-surface='initial-setup']") !== null;
+  const currentValues = context.getViewState()?.config_fields.map((field) => ({
+    key: field.key,
+    text: field.value,
+  })) ?? values;
+  const visibleValidation = initialSetup
+    ? validateInitialSetupStep(
+      context.uiState.initialSetup.step,
+      fields,
+      currentValues,
+    )
+    : formValidation;
   for (const control of controls) {
     const key = control.dataset.configKey ?? "";
     if (!key) continue;
     const field = fields.find((candidate) => candidate.key === key);
     if (!field) continue;
-    const result = validateConfigInput(field, settingsControlValue(control));
+    const result = validateConfigInput(field, settingsControlValue(control), currentValues);
     if (result.ok) control.removeAttribute("aria-invalid");
     else control.setAttribute("aria-invalid", "true");
   }
   if (validation) {
-    validation.textContent = formValidation.ok
-      ? context.uiState.configDirty
-        ? "未保存の設定があります。Apply、保存、または変更を破棄するまで別画面からの設定変更は停止します。"
-        : "入力形式は問題ありません。"
-      : `${formValidation.invalidKey}: ${formValidation.message}`;
-    validation.classList.toggle("ok", formValidation.ok);
-    validation.classList.toggle("error", !formValidation.ok);
+    validation.textContent = visibleValidation.ok
+      ? initialSetup
+        ? "入力形式は問題ありません。"
+        : context.uiState.configDirty
+          ? "未保存の設定があります。Apply、保存、または変更を破棄するまで別画面からの設定変更は停止します。"
+          : "入力形式は問題ありません。"
+      : `${visibleValidation.invalidKey}: ${visibleValidation.message}`;
+    validation.classList.toggle("ok", visibleValidation.ok);
+    validation.classList.toggle("error", !visibleValidation.ok);
   }
-  updateDirtyBadges(context, formValidation.ok);
-  if (focusInvalid && !formValidation.ok) {
-    controls.find((control) => control.dataset.configKey === formValidation.invalidKey)?.focus();
+  updateDirtyBadges(context, visibleValidation.ok);
+  if (focusInvalid && !visibleValidation.ok) {
+    controls.find((control) => control.dataset.configKey === visibleValidation.invalidKey)?.focus();
   }
-  return formValidation.ok;
+  return visibleValidation.ok;
 }
 
 function validateConfigValues(
@@ -1088,16 +1153,63 @@ function updateDirtyBadges(context: ActionContext, _validationOk: boolean): void
     .querySelectorAll<HTMLButtonElement>(".settings-modal [data-action='discard-config-draft']")
     .forEach((button) => {
       button.hidden = !uiState.configDirty;
-      synchronizeActionButtonAvailability(button, context);
     });
   document
-    .querySelectorAll<HTMLButtonElement>(
-      ".settings-modal [data-action='apply-session-config'], .settings-modal [data-action='save-global-config']",
-    )
+    .querySelectorAll<HTMLButtonElement>(".settings-modal button[data-action]")
     .forEach((button) => synchronizeActionButtonAvailability(button, context));
   document
-    .querySelectorAll<HTMLButtonElement>(".settings-modal [data-action='import-config-toml']")
+    .querySelectorAll<HTMLButtonElement>(".initial-setup-shell button[data-action]")
     .forEach((button) => synchronizeActionButtonAvailability(button, context));
+}
+
+function sessionSettingsDraftField(value: string): SessionSettingsDraftField | null {
+  if (value === "base-url") return "baseUrl";
+  if (value === "model") return "model";
+  if (value === "context-window") return "contextWindow";
+  if (value === "max-output-tokens") return "maxOutputTokens";
+  if (value === "access-mode") return "accessMode";
+  return null;
+}
+
+function updateSessionSettingsControls(
+  state: DesktopViewState,
+  context: ActionContext,
+): void {
+  const local = context.uiState.sessionSettings;
+  const validation = local.validation;
+  const availability = sessionSettingsMutationAvailability(local, state.session_settings);
+  document.querySelectorAll<SettingsControl>(".session-settings-control").forEach((control) => {
+    const field = sessionSettingsDraftField(control.dataset.sessionSetting ?? "");
+    if (field !== null && validation?.fields[field].ok === false) {
+      control.setAttribute("aria-invalid", "true");
+    } else {
+      control.removeAttribute("aria-invalid");
+    }
+  });
+  document.querySelectorAll<HTMLElement>(".session-settings-dirty").forEach((badge) => {
+    badge.classList.toggle("visible", local.dirty);
+  });
+  const status = document.querySelector<HTMLElement>("#session-settings-status");
+  if (status) {
+    status.textContent = local.activeMutation
+      ? "Session Settingsを適用しています…"
+      : availability.reason;
+    status.classList.toggle("ok", validation?.ok !== false && (availability.enabled || !local.dirty));
+    status.classList.toggle("error", validation?.ok === false);
+    status.classList.toggle(
+      "warning",
+      validation?.ok !== false && local.dirty && !availability.enabled,
+    );
+  }
+  document
+    .querySelectorAll<HTMLButtonElement>(".session-settings-modal button[data-action]")
+    .forEach((button) => {
+      if (button.dataset.action === "discard-session-settings") button.hidden = !local.dirty;
+      if (button.dataset.action === "close-overlay") {
+        button.setAttribute("aria-haspopup", local.dirty ? "alertdialog" : "false");
+      }
+      synchronizeActionButtonAvailability(button, context);
+    });
 }
 
 export function shortcutActionForComposer(
@@ -1293,8 +1405,8 @@ export function focusOverlayPrimary(
     : activeLocalModalIdentity
       ? activeLocalModalIdentity
       : state.overlay;
-  const focusOwnerKey = overlayKey === "config"
-    ? `config:${settingsSurfaceIdentity(state) ?? "unavailable"}`
+  const focusOwnerKey = overlayKey === "config" || overlayKey === "session_settings"
+    ? `${overlayKey}:${settingsSurfaceIdentity(state) ?? "unavailable"}`
     : overlayKey;
   const confirmationOverlay = overlayKey.startsWith("permission:") || activeLocalModalIdentity !== null;
   const confirmationPending = overlayKey.startsWith("permission:")
@@ -1304,14 +1416,16 @@ export function focusOverlayPrimary(
       : sideChatDeleteTarget !== null
         && sideChatMutationPending(uiState, sideChatDeleteTarget.ownerSessionId);
   const active = document.activeElement;
-  const activeModal = document.querySelector<HTMLElement>(
-    ".modal[role='dialog'], .modal[role='alertdialog'], .modal[data-modal], .titlebar-popover[data-modal]",
-  );
+  const activeModal = active instanceof Element
+    ? active.closest<HTMLElement>(
+      ".modal[role='dialog'], .modal[role='alertdialog'], .modal[data-modal], .titlebar-popover[data-modal], .initial-setup-shell",
+    )
+    : null;
   const hasMeaningfulActiveElement = Boolean(
     active instanceof HTMLElement &&
     active !== document.body &&
     active !== document.documentElement &&
-    (overlayKey === "none" || activeModal?.contains(active)) &&
+    (overlayKey === "none" || (activeModal !== null && activeModal.closest("[inert], [aria-hidden='true']") === null)) &&
     (!confirmationOverlay || confirmationFocusIsMeaningful(
       confirmationPending,
       active.matches(".permission-decision-status"),

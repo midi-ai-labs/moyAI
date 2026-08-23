@@ -79,6 +79,13 @@ pub enum StorageError {
         session_id: crate::session::SessionId,
         capacity: usize,
     },
+    #[error(
+        "root session {root_session_id} settings are blocked by active or pending agent-tree session {active_session_id}"
+    )]
+    SessionSettingsActiveTree {
+        root_session_id: crate::session::SessionId,
+        active_session_id: crate::session::SessionId,
+    },
     #[error("{0}")]
     Message(String),
 }

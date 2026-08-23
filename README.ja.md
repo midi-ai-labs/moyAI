@@ -105,10 +105,10 @@ GitHub Releaseでは、zipとあわせて外部manifestとzip SHA256 sidecarも�
 
 ## Quick Start
 
-1. LM Studio などで OpenAI 互換の LLM server を起動するか、既にhostされているendpointへ接続できる状態にします。
+1. LM Studio などで OpenAI 互換の LLM server を起動するか、設定予定のendpointへ接続できる状態にします。
 2. release zip をダウンロードして展開します。
 3. `bin/moyai-desktop.exe` を起動します。
-4. `LLM URL` で base URL と model を設定し、model discovery の結果を確認します。
+4. 初回起動ではfullscreenのInitial Setupを進めます。provider、model、permission、optional toolを入力またはTOMLから取り込み、local validationを確認してから **Finish and open moyAI** を選びます。model読込とprovider / Docling diagnosticは明示操作時だけ実行され、endpointへ到達できない場合もwarningとして表示するだけで、localにvalidなsetup完了を妨げません。
 5. まずは Quick Chat を試します。コードを扱わせる場合は、project workspace を選択し、開発チャットを開始します。
 
 CLI から使う場合は、次のように実行します。
@@ -148,7 +148,7 @@ publish可能な再buildはそのtagが指すcommitだけを許可し、後続so
 
 ## 設定
 
-moyAI は、config file を 読みます。その上に environment variables と CLI overrides を重ねて適用します。
+moyAI はuser-wide config fileをbaselineとして読み、必要に応じてenvironment variable、durableなroot-session override、CLI/run overrideを重ねます。Desktopの **Preferences** はuser-wide baselineを編集します。topbarのmodelまたはaccess chipから開く小さな **Session Settings** panelはcurrent root sessionだけを編集し、global Saveを表示しません。
 
 Windows の既定 config path:
 
@@ -156,7 +156,11 @@ Windows の既定 config path:
 %APPDATA%\midi-ai-labs\moyai\config\config.toml
 ```
 
-Desktop、TUI、CLI ともに、同じ設定を共通で参照します。
+Desktop、TUI、CLIは同じuser-wide baselineを参照します。Desktopのroot sessionにはprovider URL、model、context window、max output、access modeを別途保存でき、sessionを開き直した場合も復元されます。provider / model / context / outputの変更はApply後にadmitされるturnから反映します。commit済みaccess modeは、既に実行中のroot / childを含む次のpermission decisionから反映しますが、表示中のpending decisionとadmit済みeffectは元のpolicyを維持します。
+
+Initial SetupのTOML ImportはFinishまでread-onlyです。選択したfileをenvironment override適用前の値としてstrictにparseし、wizardのlocal draftへ取り込みますが、source fileとcurrent global configは変更しません。validation済みdraftをFinishで正常に保存した場合だけ、初回setup requirementを解除します。通常stepに出ないtyped fieldはcollapsed Advancedから編集でき、該当fieldの修正が必要な場合はその導線を開きます。
+
+Session Settingsの **Context window** または **Maximum output** を空欄にすると、そのroot-session overrideを解除してglobal値を継承します。空欄は、そのfieldが許可する明示的な`0`とは区別します。片方のlimitを解除しても、sessionの他のmodel parameterは削除しません。
 
 設定例:
 
@@ -215,15 +219,17 @@ configは全nested sectionでstrictにparseします。未知keyや`stream_max_r
 黙って保持せず、修正が必要なconfig errorとして報告します。
 errorにはparseに失敗したconfig fileの正確なpathを含めます。既存のuser-wide configは黙って書き換えないため、
 報告されたfileからretiredな`stream_max_retries`、`[model_providers.*]`、`session.auto_compact_*`を削除または置換してから再起動します。
-DesktopのSettingsでは入力途中の値、baseline、dirty状態、monotonic revisionをfrontend local draftだけに保ち、
-Rustへfield-value / dirty / revision mirrorを作りません。Rustはclean/dirty双方のtyped semantic capability variantを投影し、
-frontendはlocal dirtyに対応するvariantを選びlocal single-flightだけを追加gateします。Apply / Save / Resetはcomplete stable
-key/value draftとworkspace/session/config generation targetを同一commandで送り、Access / Provider Apply・Save / Importも同じ
-complete draftと各owner targetを送ります。Rustはcurrent effective baselineとの比較、draft completeness、target/admissionを
-副作用前にstatelessに検証します。config generationはRust/TypeScript間を正確な`u64` decimal stringで往復し、JavaScript
-numberにしません。Apply時は一時的な完全`ResolvedConfig`を一度だけ作り、optionalの空欄を`None` / emptyとして確定するため、
-古いglobal/base値を再継承しません。global Saveはdirty fieldだけをcurrent TOMLへmergeします。latest local revision/targetと
-一致するcorrelated successだけがfrontend draftをclearし、古いasync応答は別workspace/sessionのdraftを収束させません。
+Desktop Preferencesでは入力途中のcomplete config値、baseline、dirty状態、monotonic revisionをfrontend local draftだけに保ち、
+Rustへfield-value / dirty / revision mirrorを作りません。PreferencesのApply / Save / Resetはcomplete stable key/value draftと
+config targetを同一commandで送り、remembered Access / Provider Apply・Save / Importも同じglobal-config draftと各owner targetを
+使います。Rustはcurrent global/effective baselineとの比較、draft completeness、target/admissionを副作用前に検証します。
+config generationはRust/TypeScript間を正確な`u64` decimal stringで往復し、JavaScript numberにしません。Preferences Applyは
+一時的な完全`ResolvedConfig`を作り、global Saveはdirty fieldだけをcurrent TOMLへmergeします。
+
+Session Settingsはprovider URL、model、access mode、context window、max outputだけの別frontend draftを持ちます。Applyは値と
+workspace、root session ID、durable settings revision、config generation、runtime owner tokenを同一commandで送り、Rustが
+canonical patchを作ってroot-only revision CASします。limitの空欄はroot override解除とglobal継承を意味します。latest local
+revision/targetと一致するcorrelated successだけが各draftをclearし、古いasync応答は別ownerのdraftを収束させません。
 
 MCPを有効にする場合、呼び出し可能なserver toolごとにeffect routeを明示します。未設定routeは
 fail closedとなり、内部Plan modeでは`read`と明示したrouteだけを実行できます。
@@ -351,8 +357,9 @@ source URL、effective format/OCR/image/page options、credential presenceを保
 historyからbounded samplingしたtask context、current exact committed response/call、同じresponse内のbounded prior tool resultsを含みます。
 tools / reasoning / continuationを持たず、task generationのsampling / stop / arbitrary extra bodyを継承せず、90秒total deadlineを使います。
 
-Desktopでroot turn完了後にchildだけがactiveな場合、mode更新はcurrent root sessionとexact `tree:N` ownerへ束ね、同じtreeの
-`tree:N`→`idle:N` completionだけを受理します。TUIの新規root sessionでは`RunSessionAccessModeAdoption`がpre-admission F8の
+Desktopのaccess更新はcurrent root sessionとexact runtime epochへ束ねます。同じepochのnatural settlementとして
+`root:N`→`tree:N` / `idle:N`と`tree:N`→`root:N` / `idle:N`を受理し、idleからactiveへの遷移、新しいepoch、別session / workspace /
+config ownerは拒否します。TUIの新規root sessionでは`RunSessionAccessModeAdoption`がpre-admission F8の
 最新値をdurable sessionへCASしてから`SessionStarted`とagent loopへ進みます。human promptがすでにpendingならmode切替は
 そのpromptを変更・清算せず、次のpermission decisionだけへ適用します。
 

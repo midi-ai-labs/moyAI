@@ -104,10 +104,10 @@ On the target Windows machine, you do not need npm, the Rust toolchain, internet
 
 ## Quick Start
 
-1. Start, or connect to, an OpenAI-compatible LLM server reachable at the configured HTTP URL.
+1. Start, or connect to, an OpenAI-compatible LLM server reachable at the URL you plan to configure.
 2. Download and extract the latest release zip.
 3. Launch `bin/moyai-desktop.exe`.
-4. Open `LLM URL`, set the base URL and model, then confirm model discovery.
+4. On first launch, complete the fullscreen Initial Setup flow. Enter or import the provider, model, permission, and optional-tool settings, review the local validation result, then choose **Finish and open moyAI**. Model loading and provider/Docling diagnostics run only when you explicitly request them; an unavailable endpoint is reported as a warning and does not block a locally valid setup.
 5. Use Quick Chat, or select a project workspace and start a development chat.
 
 CLI examples:
@@ -147,7 +147,7 @@ By default, release artifacts are written outside the repository under `project_
 
 ## Configuration
 
-moyAI uses one user-wide config file, then applies environment variables and CLI overrides on top.
+moyAI uses one user-wide config file, then layers environment variables, a durable root-session override, and CLI/run overrides where applicable. Desktop **Preferences** edits the user-wide baseline. The smaller **Session Settings** panel, opened from the model or access chip in the top bar, edits only the current root session and never exposes a global-save action.
 
 Default Windows config path:
 
@@ -155,7 +155,11 @@ Default Windows config path:
 %APPDATA%\midi-ai-labs\moyai\config\config.toml
 ```
 
-The release folder and workspace folders do not need their own config file. Desktop, TUI, and CLI all read the same user-wide settings.
+The release folder and workspace folders do not need their own config file. Desktop, TUI, and CLI share the user-wide baseline; a Desktop root session may additionally retain its own provider URL, model, context window, maximum output, and access-mode values when reopened. Provider/model/context/output changes affect turns admitted after Apply. A committed access-mode change affects the next permission decision, including one made later by an already-running root or child, while an existing pending decision and an already-admitted effect keep their original policy.
+
+Initial Setup TOML import is read-only until Finish: the selected file is strictly parsed into the local wizard draft without materializing environment overrides, and neither the source nor the current global configuration is mutated by choosing it. Only a successful Finish persists the validated draft and clears the first-run setup requirement. Less common typed fields remain editable in the wizard's collapsed Advanced area, which opens when one of those fields needs correction.
+
+In Session Settings, leaving **Context window** or **Maximum output** blank removes that root-session override and inherits the global value. Blank is distinct from an explicit `0` where that field permits zero; clearing one limit does not erase the session's other model parameters.
 
 Example:
 
@@ -219,18 +223,21 @@ Configuration parsing is strict at every nested section. Unknown or retired keys
 The error names the exact config file that failed. Existing user-wide files are not silently rewritten:
 remove or replace retired `stream_max_retries`, `[model_providers.*]`, and
 `session.auto_compact_*` entries in the reported file before restarting.
-Desktop keeps in-progress Settings values, their baseline, dirty state, and monotonic revision in one
-frontend-local draft owner; Rust keeps no field-value, dirty, or revision mirror. Rust projects typed
-clean and dirty semantic-capability variants, and the frontend selects the variant matching its local
-dirty state while adding only local single-flight gates. Apply, Save, and Reset send a complete stable
-key/value draft with the workspace/session/config-generation target. Access, Provider Apply/Save, and
-Import send the same complete draft with their owner target. Rust statelessly validates draft
-completeness, the current effective baseline, and admission before any side effect. Config generation
-crosses the Rust/TypeScript boundary as an exact `u64` decimal string, never a JavaScript number.
-Apply builds one complete temporary `ResolvedConfig`, so a cleared optional field remains absent
-instead of inheriting a stale global/base value. Global Save separately merges only dirty fields into
-the current TOML document. Only a correlated success matching the latest local revision and target
-clears the frontend draft; a stale async response cannot mutate or clear a different draft.
+Desktop Preferences keeps its in-progress complete config values, baseline, dirty state, and monotonic
+revision in one frontend-local draft owner; Rust keeps no field-value, dirty, or revision mirror.
+Preferences Apply, Save, and Reset send the complete stable key/value draft with the config target;
+remembered Access, Provider Apply/Save, and Import use that same global-config draft with their own
+target. Rust validates completeness, the current global/effective baseline, and admission before any
+side effect. Config generation crosses the Rust/TypeScript boundary as an exact `u64` decimal string,
+never a JavaScript number. Preferences Apply builds one complete temporary `ResolvedConfig`, while
+Global Save merges only dirty fields into the current TOML document.
+
+Session Settings has a separate frontend draft limited to provider URL, model, access mode, context
+window, and maximum output. Apply sends those values together with the exact workspace, root-session
+ID, durable settings revision, config generation, and runtime owner token. Rust derives the canonical
+patch and performs a root-only revision CAS; blank limits remove that root override and inherit the
+global value. Only a correlated success matching the latest local revision and target clears either
+draft, and a stale async response cannot mutate or clear a different draft.
 
 When MCP is enabled, each callable server tool needs an explicit effect route. Unlisted routes fail
 closed; in the internal Plan mode, only routes explicitly classified as `read` are callable.
@@ -380,8 +387,9 @@ active canonical task context, the current exact committed response/call, and bo
 tools in that same response. It has no tools, reasoning, or continuation, does not inherit task-generation
 sampling/stop/arbitrary-extra-body controls, and has a 90-second total deadline.
 
-Desktop binds a mode update made while only child agents remain active to the current root session and
-the exact `tree:N` owner; only the matching completion from `tree:N` to `idle:N` is accepted. For a new
+Desktop binds an access update to the current root session and exact runtime epoch. Within the same
+epoch, natural `root:N` to `tree:N`/`idle:N` and `tree:N` to `root:N`/`idle:N` settlements are accepted;
+an idle-to-active transition, a new epoch, or another session/workspace/config owner is rejected. For a new
 TUI root session, `RunSessionAccessModeAdoption` commits the latest pre-admission F8 selection to the
 durable session before `SessionStarted` or the agent loop. Switching with a human prompt already pending
 does not alter or settle that prompt; it affects only the next permission decision.

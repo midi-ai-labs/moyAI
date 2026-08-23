@@ -25,8 +25,10 @@ import {
   DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
   type DesktopRenderLocalPresentation,
 } from "../src/render_projection.ts";
+import { validateSessionSettingsDraft } from "../src/session_settings_state.ts";
 import type {
   AgentActivityRow,
+  ConfigFieldProjection,
   DesktopViewState,
   SessionRow,
 } from "../src/types.ts";
@@ -131,6 +133,20 @@ function representativeState(overrides: Partial<DesktopViewState> = {}): Desktop
       accessMode: "default",
       runtimeOwnerToken: "tree:5",
     },
+    session_settings: {
+      available: false,
+      base_url: "http://127.0.0.1:1234/v1",
+      model: "model-a",
+      access_mode: "default",
+      context_window: "131072",
+      max_output_tokens: "8192",
+      context_window_inherited: true,
+      max_output_tokens_inherited: true,
+      provider_mutation_enabled: false,
+      access_mutation_enabled: false,
+      unavailable_reason: "root sessionを選択すると変更できます。",
+      target: null,
+    },
     config_draft_capabilities: {
       clean: {
         dirty: false,
@@ -195,6 +211,9 @@ function representativeState(overrides: Partial<DesktopViewState> = {}): Desktop
       detail: "",
       action_overlay: "none",
       initial_setup_required: false,
+      initial_setup_reason: null,
+      global_config_path: null,
+      setup_target: null,
       checks: [{ status: "pass", label: "Storage", message: "Ready" }],
     },
     composer_commit_generation: "4",
@@ -362,6 +381,12 @@ function representativeState(overrides: Partial<DesktopViewState> = {}): Desktop
       sessionId: SESSION_IDLE,
       configGeneration: "9",
     },
+    docling_readiness: {
+      status: "idle",
+      endpoint: "",
+      httpStatus: null,
+      message: "Docling readiness has not been checked.",
+    },
     workspace_input: "C:/workspace",
     review_raw_text: "Raw prompt",
     review_draft_text: "Improved prompt",
@@ -387,6 +412,9 @@ function defaultRenderLocal(overrides: {
   artifactPane?: Partial<DesktopRenderLocalPresentation["artifactPane"]>;
   attachmentTrayOpen?: boolean;
   configMutationPending?: boolean;
+  initialSetup?: Partial<DesktopRenderLocalPresentation["initialSetup"]>;
+  modal?: Partial<DesktopRenderLocalPresentation["modal"]>;
+  sessionSettings?: Partial<DesktopRenderLocalPresentation["sessionSettings"]>;
   sideChat?: Partial<DesktopRenderLocalPresentation["sideChat"]>;
 } = {}): DesktopRenderLocalPresentation {
   return {
@@ -399,6 +427,18 @@ function defaultRenderLocal(overrides: {
     },
     attachmentTrayOpen: overrides.attachmentTrayOpen ?? true,
     configMutationPending: overrides.configMutationPending ?? false,
+    initialSetup: {
+      ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.initialSetup,
+      ...overrides.initialSetup,
+    },
+    modal: {
+      ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.modal,
+      ...overrides.modal,
+    },
+    sessionSettings: {
+      ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.sessionSettings,
+      ...overrides.sessionSettings,
+    },
     sideChat: {
       ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.sideChat,
       draft: "Side question",
@@ -466,6 +506,105 @@ function representativeSurfaces(): RenderedSurface[] {
   });
   surfaces.push({ name: "overlay-initial-setup", html: renderOverlay(setup, local) });
 
+  const initialSetupState = representativeState({
+    confirmation_visible: false,
+    overlay: "initial_setup",
+    startup: {
+      ...base.startup,
+      action_overlay: "initial_setup",
+      initial_setup_required: true,
+      initial_setup_reason: "config_missing",
+      global_config_path: "C:/config/config.toml",
+      setup_target: {
+        workspacePath: "C:/workspace",
+        globalConfigPath: "C:/config/config.toml",
+        setupGeneration: "3",
+      },
+    },
+  });
+  surfaces.push({
+    name: "initial-setup-start",
+    html: renderDesktopMarkup(
+      createDesktopRenderModel(initialSetupState, defaultRenderLocal()),
+      { backgroundInert: false, taskActivityDelay: "0ms" },
+    ),
+  });
+  surfaces.push({
+    name: "initial-setup-finish",
+    html: renderDesktopMarkup(
+      createDesktopRenderModel(
+        initialSetupState,
+        defaultRenderLocal({ initialSetup: { step: "finish" } }),
+      ),
+      { backgroundInert: false, taskActivityDelay: "0ms" },
+    ),
+  });
+  surfaces.push({
+    name: "initial-setup-tools",
+    html: renderDesktopMarkup(
+      createDesktopRenderModel(
+        initialSetupState,
+        defaultRenderLocal({ initialSetup: { step: "tools" } }),
+      ),
+      { backgroundInert: false, taskActivityDelay: "0ms" },
+    ),
+  });
+
+  const sessionDraft = {
+    baseUrl: "http://127.0.0.1:1234/v1",
+    model: "model-a",
+    accessMode: "default" as const,
+    contextWindow: "131072",
+    maxOutputTokens: "8192",
+  };
+  const sessionTarget = {
+    workspacePath: "C:/workspace",
+    rootSessionId: SESSION_IDLE,
+    settingsRevision: "4",
+    configGeneration: "9",
+    runtimeOwnerToken: "tree:5",
+  };
+  const sessionSettingsState = representativeState({
+    confirmation_visible: false,
+    overlay: "session_settings",
+    session_settings: {
+      available: true,
+      base_url: sessionDraft.baseUrl,
+      model: sessionDraft.model,
+      access_mode: sessionDraft.accessMode,
+      context_window: sessionDraft.contextWindow,
+      max_output_tokens: sessionDraft.maxOutputTokens,
+      context_window_inherited: true,
+      max_output_tokens_inherited: true,
+      provider_mutation_enabled: true,
+      access_mutation_enabled: true,
+      unavailable_reason: "",
+      target: sessionTarget,
+    },
+  });
+  const sessionSettingsLocal = defaultRenderLocal({
+    sessionSettings: {
+      draft: sessionDraft,
+      dirty: false,
+      validation: validateSessionSettingsDraft(sessionDraft),
+      mutationPending: false,
+      availability: {
+        enabled: false,
+        providerChanged: false,
+        accessChanged: false,
+        reason: "未適用の変更はありません。",
+      },
+    },
+  });
+  surfaces.push({
+    name: "topbar-session-settings",
+    html: renderTopbar(sessionSettingsState, sessionSettingsLocal),
+  });
+  surfaces.push({
+    name: "overlay-session_settings",
+    html: renderOverlay(sessionSettingsState, sessionSettingsLocal),
+  });
+
   for (const kind of ["session", "archive_session", "rollback_session"] as const) {
     const confirmation: LocalConfirmation = {
       kind,
@@ -481,6 +620,20 @@ function representativeSurfaces(): RenderedSurface[] {
     };
     surfaces.push({ name: `local-confirm-${kind}`, html: renderLocalConfirmation(confirmation) });
   }
+  surfaces.push({
+    name: "local-confirm-settings-close",
+    html: renderLocalConfirmation({
+      kind: "settings_close",
+      expectedTarget: base.config_target,
+    }),
+  });
+  surfaces.push({
+    name: "local-confirm-session-settings-close",
+    html: renderLocalConfirmation({
+      kind: "session_settings_close",
+      expectedTarget: sessionTarget,
+    }),
+  });
 
   const agentListLocal = defaultRenderLocal({ artifactPane: { mode: "agents" } });
   surfaces.push({ name: "artifact-agent-list", html: renderArtifactPane(base, agentListLocal) });
@@ -596,6 +749,363 @@ test("every rendered button has one non-empty GUI action owner", () => {
   assert.deepEqual(unwired, []);
 });
 
+test("initial setup is a six-step blocking shell and session settings exposes stable root-only locators", () => {
+  const surfaces = new Map(representativeSurfaces().map((surface) => [surface.name, surface.html]));
+  const setup = surfaces.get("initial-setup-start") ?? "";
+  assert.match(setup, /data-surface="initial-setup" data-current-step="start"/);
+  assert.equal(Array.from(setup.matchAll(/\bdata-step="(?:start|provider|model|permissions|tools|finish)"/g)).length, 6);
+  assert.equal(
+    Array.from(setup.matchAll(/<li data-step="(?:start|provider|model|permissions|tools|finish)"[^>]*aria-label="[1-6]\. [^"]+"/g)).length,
+    6,
+  );
+  assert.doesNotMatch(setup, /<div class="shell"/);
+  assert.doesNotMatch(setup, /class="modal-backdrop"/);
+  assert.match(setup, /data-action="import-config-toml"(?![^>]*\sdisabled(?:\s|>))[^>]*>/);
+  assert.match(setup, /ディスクへの保存とruntime reloadはFinishまで行いません/);
+  assert.match(surfaces.get("initial-setup-tools") ?? "", /data-action="check-docling-readiness"/);
+  assert.match(surfaces.get("initial-setup-finish") ?? "", /data-action="finish-initial-setup"/);
+
+  const session = surfaces.get("overlay-session_settings") ?? "";
+  assert.match(session, /class="modal settings-modal session-settings-modal" data-modal="session-settings" data-surface="session-settings"/);
+  assert.match(session, /data-session-scope="root-only">このセッションだけ/);
+  assert.equal(Array.from(session.matchAll(/placeholder="Preferencesを継承"/g)).length, 2);
+  assert.match(session, /保存後の次のpermission decisionからrootと子Agentへ反映/);
+  for (const field of [
+    "base-url",
+    "model",
+    "access-mode",
+    "context-window",
+    "max-output-tokens",
+  ]) {
+    assert.match(session, new RegExp(`data-session-setting="${field}"`));
+  }
+  assert.doesNotMatch(session, /class="modal-backdrop"[^>]*data-action/);
+
+  const triggers = surfaces.get("topbar-session-settings") ?? "";
+  assert.equal(Array.from(triggers.matchAll(/data-action="show-session-settings"/g)).length, 2);
+  assert.match(triggers, /data-session-settings-trigger="model"/);
+  assert.match(triggers, /data-session-settings-trigger="access"/);
+  assert.match(
+    surfaces.get("local-confirm-session-settings-close") ?? "",
+    /data-modal="session-settings-close-confirmation"/,
+  );
+});
+
+test("initial setup owns a retained dismissible live error inside its blocking shell", () => {
+  const base = representativeState();
+  const state = representativeState({
+    confirmation_visible: false,
+    overlay: "initial_setup",
+    startup: {
+      ...base.startup,
+      action_overlay: "initial_setup",
+      initial_setup_required: true,
+      initial_setup_reason: "config_missing",
+      global_config_path: "C:/config/config.toml",
+      setup_target: {
+        workspacePath: "C:/workspace",
+        globalConfigPath: "C:/config/config.toml",
+        setupGeneration: "3",
+      },
+    },
+  });
+  const error = {
+    title: "設定を読み込めませんでした",
+    hint: "TOMLのschemaを確認して、もう一度Importしてください。",
+    details: "invalid complete draft",
+  };
+  const errorHtml = renderDesktopMarkup(
+    createDesktopRenderModel(state, { ...defaultRenderLocal(), recoverableError: error }),
+    { backgroundInert: true, taskActivityDelay: "0ms" },
+  );
+  assert.equal(
+    Array.from(errorHtml.matchAll(/data-settings-passive="initial-setup-recoverable-error"/g)).length,
+    1,
+  );
+  assert.match(errorHtml, /id="initial-setup-recoverable-error"[^>]*role="alert"[^>]*aria-live="assertive"/);
+  assert.match(errorHtml, /設定を読み込めませんでした/);
+  assert.match(errorHtml, /TOMLのschemaを確認して、もう一度Importしてください/);
+  assert.match(errorHtml, /invalid complete draft/);
+  assert.match(errorHtml, /data-action="dismiss-ui-error"(?![^>]*\sdisabled(?:\s|>))[^>]*>/);
+  assert.doesNotMatch(errorHtml, /<div class="shell"/);
+
+  const cleanHtml = renderDesktopMarkup(
+    createDesktopRenderModel(state, defaultRenderLocal()),
+    { backgroundInert: true, taskActivityDelay: "0ms" },
+  );
+  assert.match(
+    cleanHtml,
+    /id="initial-setup-recoverable-error"[^>]*hidden aria-hidden="true"/,
+  );
+  assert.doesNotMatch(cleanHtml, /設定を読み込めませんでした/);
+});
+
+test("Session Settings keeps an Apply failure visible inside the exact dirty panel", () => {
+  const target = {
+    workspacePath: "C:/workspace",
+    rootSessionId: SESSION_IDLE,
+    settingsRevision: "4",
+    configGeneration: "9",
+    runtimeOwnerToken: "tree:5",
+  };
+  const draft = {
+    baseUrl: "http://127.0.0.1:1234/v1",
+    model: "locally-edited-model",
+    accessMode: "default" as const,
+    contextWindow: "",
+    maxOutputTokens: "",
+  };
+  const state = representativeState({
+    confirmation_visible: false,
+    overlay: "session_settings",
+    session_settings: {
+      available: true,
+      base_url: "http://127.0.0.1:1234/v1",
+      model: "model-a",
+      access_mode: "default",
+      context_window: "",
+      max_output_tokens: "",
+      context_window_inherited: true,
+      max_output_tokens_inherited: true,
+      provider_mutation_enabled: true,
+      access_mutation_enabled: true,
+      unavailable_reason: "",
+      target,
+    },
+  });
+  const local = {
+    ...defaultRenderLocal({
+      sessionSettings: {
+        draft,
+        dirty: true,
+        validation: validateSessionSettingsDraft(draft),
+        availability: {
+          enabled: true,
+          providerChanged: true,
+          accessChanged: false,
+          reason: "適用できます。",
+        },
+      },
+    }),
+    recoverableError: {
+      title: "Session Settingsを適用できませんでした",
+      hint: "入力内容を保持したまま、もう一度お試しください。",
+      details: "storage transaction failed",
+    },
+  };
+  const html = renderDesktopMarkup(
+    createDesktopRenderModel(state, local),
+    { backgroundInert: true, taskActivityDelay: "0ms" },
+  );
+
+  assert.match(html, /data-settings-passive="session-settings-recoverable-error"/);
+  assert.match(html, /Session Settingsを適用できませんでした/);
+  assert.match(html, /storage transaction failed/);
+  assert.match(html, /data-session-setting="model"[^>]*value="locally-edited-model"/);
+  assert.match(html, /data-action="apply-session-settings"(?![^>]*\sdisabled(?:\s|>))[^>]*>/);
+  assert.match(html, /data-action="dismiss-ui-error"(?![^>]*\sdisabled(?:\s|>))[^>]*>/);
+});
+
+test("Wizard Advanced sections enumerate typed hidden fields and open at the repair owner", () => {
+  const field = (
+    key: string,
+    value: string,
+    valueType: ConfigFieldProjection["value_type"],
+    required = true,
+    options: string[] = [],
+  ): ConfigFieldProjection => ({
+    key,
+    value,
+    env_override: null,
+    value_type: valueType,
+    required,
+    min_value: valueType === "integer" || valueType === "number" ? 0 : null,
+    max_value: null,
+    options,
+  });
+  const base = representativeState();
+  const state = representativeState({
+    confirmation_visible: false,
+    overlay: "initial_setup",
+    startup: {
+      ...base.startup,
+      action_overlay: "initial_setup",
+      initial_setup_required: true,
+      initial_setup_reason: "config_missing",
+      global_config_path: "C:/config/config.toml",
+      setup_target: {
+        workspacePath: "C:/workspace",
+        globalConfigPath: "C:/config/config.toml",
+        setupGeneration: "3",
+      },
+    },
+    config_fields: [
+      field("model.base_url", "http://127.0.0.1:1234/v1", "string"),
+      field("model.provider_metadata_mode", "openai_compatible_only", "enum", true, ["openai_compatible_only"]),
+      field("model.context_window", "65536", "integer"),
+      field("model.max_output_tokens", "1024", "integer"),
+      field("model.model", "model-a", "string"),
+      field("model.supports_tools", "true", "boolean"),
+      field("model.supports_reasoning", "true", "boolean"),
+      field("model.supports_images", "false", "boolean"),
+      field("model.parallel_tool_calls", "false", "boolean"),
+      field("model.request_timeout_ms", "120000", "integer"),
+      field("model.temperature", "0.2", "number"),
+      field("model.top_p", "0.9", "number"),
+      field("permissions.access_mode", "default", "enum", true, ["default"]),
+      field("docling.enabled", "true", "boolean"),
+      field("docling.base_url", "http://127.0.0.1:5001", "string"),
+      field("docling.timeout_ms", "30000", "integer"),
+      field("docling.api_key_env", "", "string", false),
+      field("docling.headers_json", "{}", "json", false),
+      field("mcp.enabled", "false", "boolean"),
+      field("mcp.servers_json", "", "json", false),
+      field("shell.hide_windows", "true", "boolean"),
+      field("inspection.default_max_depth", "", "integer"),
+    ],
+  });
+  const renderStep = (step: "model" | "tools" | "finish") => renderDesktopMarkup(
+    createDesktopRenderModel(state, defaultRenderLocal({ initialSetup: { step } })),
+    { backgroundInert: true, taskActivityDelay: "0ms" },
+  );
+  const model = renderStep("model");
+  const tools = renderStep("tools");
+  const finish = renderStep("finish");
+
+  for (const key of ["model.request_timeout_ms", "model.temperature", "model.top_p"]) {
+    assert.match(model, new RegExp(`data-config-key="${key.replace(".", "\\.")}"`));
+  }
+  assert.match(tools, /data-config-key="docling\.headers_json"/);
+  assert.match(
+    finish,
+    /<details class="initial-setup-advanced" data-details-key="initial-setup-finish-advanced" open>/,
+  );
+  assert.match(finish, /inspection\.default_max_depth: 値を入力してください/);
+  assert.match(finish, /data-config-key="inspection\.default_max_depth"[^>]*aria-invalid="true"/);
+  assert.match(finish, /data-config-key="shell\.hide_windows"[^>]*type="checkbox"/);
+  assert.doesNotMatch(`${model}${tools}${finish}`, /settings-raw-value/);
+  assert.doesNotMatch(
+    `${model}${tools}${finish}`,
+    /aria-describedby="[^"]*(?:main-provider-settings-help|settings-model-help|settings-permissions-help|settings-tools-help|settings-files-help)/,
+  );
+});
+
+test("a stale session-settings owner disables editors while keeping Discard and Close available", () => {
+  const target = {
+    workspacePath: "C:/workspace",
+    rootSessionId: SESSION_IDLE,
+    settingsRevision: "8",
+    configGeneration: "10",
+    runtimeOwnerToken: "tree:6",
+  };
+  const draft = {
+    baseUrl: "http://127.0.0.1:1234/v1",
+    model: "locally-edited-model",
+    accessMode: "default" as const,
+    contextWindow: "131072",
+    maxOutputTokens: "8192",
+  };
+  const state = representativeState({
+    confirmation_visible: false,
+    overlay: "session_settings",
+    session_settings: {
+      available: true,
+      base_url: "http://127.0.0.1:1234/v1",
+      model: "canonical-model",
+      access_mode: "default",
+      context_window: "131072",
+      max_output_tokens: "8192",
+      context_window_inherited: true,
+      max_output_tokens_inherited: true,
+      provider_mutation_enabled: true,
+      access_mutation_enabled: true,
+      unavailable_reason: "",
+      target,
+    },
+  });
+  const local = defaultRenderLocal({
+    sessionSettings: {
+      draft,
+      dirty: true,
+      validation: validateSessionSettingsDraft(draft),
+      availability: {
+        enabled: false,
+        staleTarget: true,
+        providerChanged: false,
+        accessChanged: false,
+        reason: "保存済みSession Settingsが別の操作で更新されました。",
+      },
+    },
+  });
+  const html = renderDesktopMarkup(
+    createDesktopRenderModel(state, local),
+    { backgroundInert: true, taskActivityDelay: "0ms" },
+  );
+  for (const field of [
+    "base-url",
+    "model",
+    "access-mode",
+    "context-window",
+    "max-output-tokens",
+  ]) {
+    assert.match(html, new RegExp(`data-session-setting="${field}"[^>]*disabled`));
+  }
+  assert.match(html, /data-action="apply-session-settings"[^>]*disabled/);
+  assert.match(html, /data-action="discard-session-settings"(?![^>]*\sdisabled(?:\s|>))[^>]*>/);
+  assert.match(html, /data-action="close-overlay"(?![^>]*\sdisabled(?:\s|>))[^>]*>/);
+});
+
+test("an unavailable Session Settings underlay becomes inert below its dirty-close confirmation", () => {
+  const owner = {
+    workspacePath: "C:/workspace",
+    rootSessionId: SESSION_IDLE,
+    settingsRevision: "7",
+    configGeneration: "9",
+    runtimeOwnerToken: "tree:5",
+  };
+  const draft = {
+    baseUrl: "http://127.0.0.1:1234/v1",
+    model: "locally-edited-model",
+    accessMode: "default" as const,
+    contextWindow: "131072",
+    maxOutputTokens: "8192",
+  };
+  const state = representativeState({
+    confirmation_visible: false,
+    overlay: "session_settings",
+  });
+  const local = defaultRenderLocal({
+    modal: {
+      localConfirmation: {
+        kind: "session_settings_close",
+        expectedTarget: owner,
+      },
+    },
+    sessionSettings: {
+      draft,
+      dirty: true,
+      validation: validateSessionSettingsDraft(draft),
+      availability: {
+        enabled: false,
+        staleTarget: true,
+        providerChanged: false,
+        accessChanged: false,
+        reason: "root sessionを選択すると変更できます。",
+      },
+    },
+  });
+
+  const html = renderDesktopMarkup(
+    createDesktopRenderModel(state, local),
+    { backgroundInert: true, taskActivityDelay: "0ms" },
+  );
+  assert.match(
+    html,
+    /<div class="modal-backdrop" inert aria-hidden="true">\s*<section class="modal settings-modal session-settings-modal"/,
+  );
+  assert.match(html, /data-modal="session-settings-close-confirmation"/);
+});
+
 test("each primary GUI surface retains its required action routes", () => {
   const requiredActionsBySurface = {
     titlebar: [
@@ -651,6 +1161,24 @@ test("each primary GUI surface retains its required action routes", () => {
     "local-confirm-session": ["cancel-local-confirm", "confirm-local-delete"],
     "local-confirm-archive_session": ["cancel-local-confirm", "confirm-local-archive-state"],
     "local-confirm-rollback_session": ["cancel-local-confirm", "confirm-local-rollback"],
+    "local-confirm-settings-close": ["cancel-local-confirm", "confirm-settings-discard-close"],
+    "local-confirm-session-settings-close": [
+      "cancel-local-confirm",
+      "confirm-session-settings-discard-close",
+    ],
+    "initial-setup-start": [
+      "initial-setup-next",
+      "initial-setup-back",
+      "import-config-toml",
+    ],
+    "initial-setup-finish": ["initial-setup-back", "finish-initial-setup"],
+    "topbar-session-settings": ["show-session-settings"],
+    "overlay-session_settings": [
+      "close-overlay",
+      "discard-session-settings",
+      "apply-session-settings",
+      "open-preferences-from-session-settings",
+    ],
     "overlay-provider": [
       "close-overlay",
       "set-provider-mode",
@@ -717,6 +1245,25 @@ test("each primary GUI surface retains its required action routes", () => {
   assert.deepEqual(missing, []);
 });
 
+test("Initial Setup Finish and Session Settings Apply render as text-sized primary actions", () => {
+  const surfaces = new Map(
+    representativeSurfaces().map((surface) => [surface.name, surface.html]),
+  );
+  const finish = surfaces.get("initial-setup-finish");
+  const sessionSettings = surfaces.get("overlay-session_settings");
+
+  assert.ok(finish);
+  assert.match(
+    finish,
+    /<button id="initial-setup-primary" class="send wide-send" data-action="finish-initial-setup"[^>]*>設定を保存してmoyAIを開く<\/button>/,
+  );
+  assert.ok(sessionSettings);
+  assert.match(
+    sessionSettings,
+    /<button class="send wide-send" data-action="apply-session-settings"[^>]*>このセッションに適用<\/button>/,
+  );
+});
+
 test("every action rendered by public GUI surfaces resolves through the single registry", () => {
   const unresolved: Array<{ surface: string; action: string }> = [];
   for (const surface of representativeSurfaces()) {
@@ -729,7 +1276,6 @@ test("every action rendered by public GUI surfaces resolves through the single r
 
 test("every registry action is render-reachable or has one explicit host contract", () => {
   const hostOwnedExceptions = {
-    "dismiss-ui-error": "the transient recoverable-error host is outside the public render-function surface",
     "load-next-turn-page": "the inline history UI intentionally exposes prepend-only paging and no page-replacement control",
   } as const;
   const rendered = new Set(representativeSurfaces().flatMap((surface) => actionIds(surface.html)));
@@ -779,6 +1325,53 @@ test("production render button availability matches the shared action resolver",
     }
   }
   assert.ok(checked > 100, `expected broad render coverage, checked ${checked} action buttons`);
+});
+
+test("dirty Settings close layers an inert retained dialog below the alertdialog", () => {
+  const state = representativeState({
+    overlay: "config",
+    confirmation_visible: false,
+    confirmation_id: null,
+    confirmation: null,
+    config_draft: {
+      dirty: true,
+      edit_enabled: true,
+      discard_enabled: true,
+      commit_enabled: true,
+      external_owner_mutation_open: false,
+      access_mode_mutation_enabled: false,
+    },
+  });
+  const local: DesktopRenderLocalPresentation = {
+    ...defaultRenderLocal(),
+    modal: {
+      ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.modal,
+      localConfirmation: {
+        kind: "settings_close",
+        expectedTarget: state.config_target,
+      },
+    },
+  };
+  const html = renderDesktopMarkup(
+    createDesktopRenderModel(state, local),
+    { backgroundInert: false, taskActivityDelay: "0ms" },
+  );
+
+  const settingsIndex = html.indexOf('class="modal settings-modal');
+  const confirmationIndex = html.indexOf(
+    'class="modal confirmation settings-close-confirmation" role="alertdialog"',
+  );
+  assert.ok(settingsIndex >= 0, "the underlying Settings dialog remains rendered");
+  assert.ok(confirmationIndex > settingsIndex, "the close alertdialog is layered after Settings");
+
+  const backdropTags = Array.from(
+    html.matchAll(/<div class="modal-backdrop"[^>]*>/g),
+    (match) => match[0],
+  );
+  assert.equal(backdropTags.length, 2);
+  assert.match(backdropTags[0], /\binert\b/);
+  assert.match(backdropTags[0], /aria-hidden="true"/);
+  for (const backdrop of backdropTags) assert.doesNotMatch(backdrop, /data-action=/);
 });
 
 test("activity remains visible while Stop is neither rendered nor activatable without its exact Rust target", () => {

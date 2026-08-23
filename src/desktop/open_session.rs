@@ -93,6 +93,22 @@ impl OpenSessionView {
         &self.read.pending_turn_inputs
     }
 
+    pub fn replace_session_record(&mut self, session: SessionRecord) -> bool {
+        if self.session_id() != session.id {
+            return false;
+        }
+        self.read.session = session.clone();
+        self.read.history.session = session.clone();
+        self.read.turns.session = session;
+        self.stored_detail = build_session_detail_with_roots(
+            &self.read,
+            None,
+            self.file_change_storage_root.as_deref(),
+            self.file_change_display_root.as_deref(),
+        );
+        true
+    }
+
     pub fn merge_contiguous(&mut self, incoming: &CanonicalSessionRead) -> bool {
         if self.session_id() != incoming.session.id
             || incoming.session.id != incoming.turns.session.id
@@ -635,6 +651,7 @@ mod tests {
             base_url: "http://127.0.0.1:1234".to_string(),
             access_mode: crate::config::AccessMode::Default,
             model_parameters: Default::default(),
+            session_settings_revision: 0,
             created_at_ms: 1,
             updated_at_ms: 2,
             completed_at_ms: Some(2),

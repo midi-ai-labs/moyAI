@@ -118,6 +118,8 @@ const V57_SESSION_ADMISSION_REVISIONS: &str =
     include_str!("../../migrations/V57__session_admission_revisions.sql");
 const V58_EXACT_EXECUTION_INTERRUPT_REQUESTS: &str =
     include_str!("../../migrations/V58__exact_execution_interrupt_requests.sql");
+const V59_SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW: &str =
+    include_str!("../../migrations/V59__session_settings_revision_and_context_window.sql");
 const LEGACY_PLANNER_CUTOVER_VERSION: i64 = 32;
 const CANONICAL_PROTOCOL_STORAGE_VERSION: i64 = 33;
 const DROP_SESSIONS_MEMORY_MODE_VERSION: i64 = 34;
@@ -145,6 +147,7 @@ const DURABLE_SIDE_CHATS_VERSION: i64 = 55;
 const ROLLBACK_HARNESS_ORPHAN_RECOVERY_VERSION: i64 = 56;
 const SESSION_ADMISSION_REVISIONS_VERSION: i64 = 57;
 const EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION: i64 = 58;
+const SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION: i64 = 59;
 const CODEX_COMPACTION_CHECKPOINT_NAME: &str = "codex_compaction_checkpoint";
 const RECURSIVE_SESSION_SPAWN_EDGES_NAME: &str = "recursive_session_spawn_edges";
 const AGENT_OWNER_RESUME_REQUESTS_NAME: &str = "agent_owner_resume_requests";
@@ -158,6 +161,8 @@ const DURABLE_SIDE_CHATS_NAME: &str = "durable_side_chats";
 const ROLLBACK_HARNESS_ORPHAN_RECOVERY_NAME: &str = "rollback_harness_orphan_recovery";
 const SESSION_ADMISSION_REVISIONS_NAME: &str = "session_admission_revisions";
 const EXACT_EXECUTION_INTERRUPT_REQUESTS_NAME: &str = "exact_execution_interrupt_requests";
+const SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_NAME: &str =
+    "session_settings_revision_and_context_window";
 const COMPACTION_CHECKPOINT_MIGRATION_PAGE_SIZE: usize = 200;
 const SESSION_STATUS_DOMAIN: &[&str] = &["idle", "running", "completed", "cancelled", "failed"];
 const SESSION_ACCESS_MODE_DOMAIN: &[&str] = &["default", "auto_review", "full_access"];
@@ -179,6 +184,30 @@ const TOOL_CALL_STATUS_DOMAIN: &[&str] = &[
 ];
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
+    if schema_migration_applied(
+        connection,
+        SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION,
+    )? {
+        validate_canonical_protocol_schema(connection)?;
+        validate_durable_agent_mailbox_data(connection)?;
+        validate_durable_turn_input_queue_data(connection)?;
+        validate_harness_turn_identity_schema(connection)?;
+        validate_harness_turn_identity_data(connection)?;
+        validate_agent_trigger_turn_claims_schema(connection)?;
+        validate_agent_trigger_turn_claims_data(connection)?;
+        validate_permission_retry_fences_schema(connection)?;
+        validate_permission_retry_fences_data(connection)?;
+        validate_durable_side_chats_schema(connection)?;
+        validate_durable_side_chats_data(connection)?;
+        validate_rollback_harness_orphan_recovery_marker(connection)?;
+        validate_session_admission_revisions_schema(connection)?;
+        validate_session_admission_revisions_data(connection)?;
+        validate_exact_execution_interrupt_requests_schema(connection)?;
+        validate_exact_execution_interrupt_requests_data(connection)?;
+        validate_session_settings_revision_and_context_window_schema(connection)?;
+        validate_session_settings_revision_and_context_window_data(connection)?;
+        return Ok(());
+    }
     if schema_migration_applied(connection, EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION)? {
         validate_canonical_protocol_schema(connection)?;
         validate_durable_agent_mailbox_data(connection)?;
@@ -196,7 +225,7 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
         validate_session_admission_revisions_data(connection)?;
         validate_exact_execution_interrupt_requests_schema(connection)?;
         validate_exact_execution_interrupt_requests_data(connection)?;
-        return Ok(());
+        return run_session_settings_revision_and_context_window(connection);
     }
     if schema_migration_applied(connection, SESSION_ADMISSION_REVISIONS_VERSION)? {
         validate_canonical_protocol_schema(connection)?;
@@ -518,14 +547,17 @@ pub(crate) fn run_to_current(connection: &Connection) -> Result<(), StorageError
     // Recent migrations deliberately validate and commit one authority boundary at a time.
     // A product startup is nevertheless one user-visible migration attempt, so keep advancing
     // until the current endpoint is present instead of requiring one app restart per version.
-    for _ in 0..=EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION {
+    for _ in 0..=SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION {
         run(connection)?;
-        if schema_migration_applied(connection, EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION)? {
+        if schema_migration_applied(
+            connection,
+            SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION,
+        )? {
             return Ok(());
         }
     }
     Err(StorageError::Message(format!(
-        "storage migration did not reach current endpoint V{EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION}"
+        "storage migration did not reach current endpoint V{SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION}"
     )))
 }
 
@@ -1671,6 +1703,56 @@ fn run_exact_execution_interrupt_requests(connection: &Connection) -> Result<(),
     }
 }
 
+fn run_session_settings_revision_and_context_window(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        validate_canonical_protocol_schema(connection)?;
+        validate_session_admission_revisions_schema(connection)?;
+        validate_session_admission_revisions_data(connection)?;
+        validate_exact_execution_interrupt_requests_schema(connection)?;
+        validate_exact_execution_interrupt_requests_data(connection)?;
+        if !schema_migration_applied(
+            connection,
+            SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION,
+        )? {
+            connection.execute_batch(V59_SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW)?;
+        }
+        if !schema_migration_has_exact_name(
+            connection,
+            SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION,
+            SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_NAME,
+        )? {
+            return Err(StorageError::Message(
+                "V59 session-settings revision migration did not record its exact schema marker"
+                    .to_string(),
+            ));
+        }
+        validate_session_settings_revision_and_context_window_schema(connection)?;
+        validate_session_settings_revision_and_context_window_data(connection)?;
+        let foreign_key_errors =
+            connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        if foreign_key_errors != 0 {
+            return Err(StorageError::Message(format!(
+                "V59 session-settings revision migration produced {foreign_key_errors} foreign-key violation(s)"
+            )));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(StorageError::from),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 fn validate_rollback_harness_orphan_recovery_marker(
     connection: &Connection,
 ) -> Result<(), StorageError> {
@@ -2014,6 +2096,110 @@ fn validate_exact_execution_interrupt_requests_data(
     if invalid_rows != 0 || invalid_identities != 0 {
         return Err(StorageError::Message(format!(
             "V58 marker exists but {invalid_rows} exact execution interrupt request row(s) have stale ownership and {invalid_identities} row(s) have invalid typed identities"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_session_settings_revision_and_context_window_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    if !schema_migration_has_exact_name(
+        connection,
+        SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION,
+        SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V59 session-settings revision marker has a name other than `{SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_NAME}`"
+        )));
+    }
+    let column = connection
+        .query_row(
+            "SELECT type, \"notnull\", dflt_value, pk
+             FROM pragma_table_info('sessions')
+             WHERE name = 'session_settings_revision'",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    if column != Some(("INTEGER".to_string(), 1, Some("0".to_string()), 0)) {
+        return Err(StorageError::Message(
+            "V59 marker exists but sessions.session_settings_revision has stale schema".to_string(),
+        ));
+    }
+    let expected_clause = canonical_session_settings_revision_schema_clause()?;
+    let observed_tables = normalized_named_schema_objects(connection, "table", "sessions")?;
+    if !observed_tables
+        .get("sessions")
+        .is_some_and(|sql| sql.contains(&expected_clause))
+    {
+        return Err(StorageError::Message(
+            "V59 marker exists but sessions.session_settings_revision has stale CHECK constraints"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_session_settings_revision_schema_clause() -> Result<String, StorageError> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY);
+         CREATE TABLE moyai_schema_migrations (
+             version INTEGER PRIMARY KEY NOT NULL,
+             name TEXT NOT NULL
+         );",
+    )?;
+    connection.execute_batch(V59_SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW)?;
+    let tables = normalized_named_schema_objects(&connection, "table", "sessions")?;
+    let sql = tables.get("sessions").ok_or_else(|| {
+        StorageError::Message("canonical V59 sessions table was not created".to_string())
+    })?;
+    let start = sql.find("session_settings_revision").ok_or_else(|| {
+        StorageError::Message(
+            "canonical V59 sessions table lacks session_settings_revision".to_string(),
+        )
+    })?;
+    sql[start..]
+        .strip_suffix(')')
+        .map(str::trim_end)
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            StorageError::Message("canonical V59 sessions table has stale SQL".to_string())
+        })
+}
+
+fn validate_session_settings_revision_and_context_window_data(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let invalid_rows = connection.query_row(
+        "SELECT COUNT(*)
+         FROM sessions
+         WHERE typeof(session_settings_revision) <> 'integer'
+            OR session_settings_revision < 0
+            OR CASE
+                 WHEN json_valid(model_parameters_json) = 0 THEN 1
+                 WHEN json_type(model_parameters_json, '$') <> 'object' THEN 1
+                 WHEN json_type(model_parameters_json, '$.context_window') IS NULL THEN 0
+                 WHEN json_type(model_parameters_json, '$.context_window') = 'null' THEN 0
+                 WHEN json_type(model_parameters_json, '$.context_window') <> 'integer' THEN 1
+                 WHEN json_extract(model_parameters_json, '$.context_window') <= 0 THEN 1
+                 WHEN json_extract(model_parameters_json, '$.context_window') > 4294967295 THEN 1
+                 ELSE 0
+               END = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_rows != 0 {
+        return Err(StorageError::Message(format!(
+            "V59 marker exists but {invalid_rows} session setting row(s) have an invalid revision or context window"
         )));
     }
     Ok(())
@@ -16599,6 +16785,173 @@ mod tests {
                 .to_string()
                 .contains("validate_agent_mailbox_message_before_update"),
             "unexpected V50 schema error: {error}"
+        );
+    }
+
+    #[test]
+    fn v59_upgrades_v58_with_zero_revision_and_preserves_context_window_json() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v57_endpoint(&connection);
+        run_exact_execution_interrupt_requests(&connection).expect("V58 endpoint");
+        let session_id = insert_v56_session(&connection);
+        connection
+            .execute(
+                "UPDATE sessions
+                 SET model_parameters_json = '{\"context_window\":131072,\"max_output_tokens\":8192}'
+                 WHERE id = ?1",
+                [&session_id],
+            )
+            .expect("V58 context-window-compatible JSON");
+
+        run_to_current(&connection).expect("V58 to V59 current-endpoint upgrade");
+
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION,
+                SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_NAME,
+            )
+            .expect("V59 marker")
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT session_settings_revision,
+                            json_extract(model_parameters_json, '$.context_window')
+                     FROM sessions WHERE id = ?1",
+                    [&session_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .expect("migrated session settings"),
+            (0, 131_072)
+        );
+        run(&connection).expect("V59 idempotent reopen");
+    }
+
+    #[test]
+    fn v59_invalid_context_window_rolls_back_column_and_marker_atomically() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v57_endpoint(&connection);
+        run_exact_execution_interrupt_requests(&connection).expect("V58 endpoint");
+        let session_id = insert_v56_session(&connection);
+        connection
+            .execute(
+                "UPDATE sessions
+                 SET model_parameters_json = '{\"context_window\":0}'
+                 WHERE id = ?1",
+                [&session_id],
+            )
+            .expect("invalid legacy context window fixture");
+
+        let error = run_to_current(&connection)
+            .expect_err("invalid context window must roll back the forward migration");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid revision or context window")
+        );
+        assert!(
+            !schema_migration_applied(
+                &connection,
+                SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION,
+            )
+            .expect("V59 marker absence")
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('sessions')
+                     WHERE name = 'session_settings_revision'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("rolled-back column count"),
+            0
+        );
+
+        connection
+            .execute(
+                "UPDATE sessions SET model_parameters_json = '{}' WHERE id = ?1",
+                [&session_id],
+            )
+            .expect("repair legacy context window");
+        run_to_current(&connection).expect("repaired V59 migration");
+    }
+
+    #[test]
+    fn v59_fast_path_rejects_a_regressed_settings_revision() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_to_current(&connection).expect("fresh current schema");
+        let session_id = insert_v56_session(&connection);
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("enable corruption fixture");
+        connection
+            .execute(
+                "UPDATE sessions SET session_settings_revision = -1 WHERE id = ?1",
+                [&session_id],
+            )
+            .expect("regress settings revision");
+        connection
+            .execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("restore constraints");
+
+        let error = run(&connection).expect_err("regressed revision must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid revision or context window")
+        );
+    }
+
+    #[test]
+    fn v59_fast_path_rejects_a_revision_column_without_its_canonical_check() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v57_endpoint(&connection);
+        run_exact_execution_interrupt_requests(&connection).expect("V58 endpoint");
+        let session_id = insert_v56_session(&connection);
+        connection
+            .execute_batch(
+                "ALTER TABLE sessions
+                 ADD COLUMN session_settings_revision INTEGER NOT NULL DEFAULT 0;",
+            )
+            .expect("non-canonical V59 column fixture");
+        connection
+            .execute(
+                "INSERT INTO moyai_schema_migrations(version, name) VALUES (?1, ?2)",
+                (
+                    SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_VERSION,
+                    SESSION_SETTINGS_REVISION_AND_CONTEXT_WINDOW_NAME,
+                ),
+            )
+            .expect("forged V59 marker");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT session_settings_revision FROM sessions WHERE id = ?1",
+                    [&session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("valid forged V59 row"),
+            0
+        );
+
+        let error = run(&connection).expect_err("missing V59 CHECK must fail closed on reopen");
+        assert!(
+            error.to_string().contains("stale CHECK constraints"),
+            "unexpected V59 schema error: {error}"
         );
     }
 }

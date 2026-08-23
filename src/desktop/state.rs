@@ -18,6 +18,7 @@ use super::startup::DesktopStartupState;
 use super::view_state::DesktopViewState;
 use crate::config::ProviderMetadataMode;
 use crate::config::ResolvedConfig;
+use crate::docling::DoclingReadinessResult;
 use crate::llm::{ProviderModelInfo, ProviderModelLoadState, normalize_provider_base_url};
 use tokio_util::sync::CancellationToken;
 
@@ -41,6 +42,35 @@ pub enum DesktopStatusCode {
     TreeStopped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopDoclingReadinessStatus {
+    Idle,
+    Checking,
+    Ready,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopDoclingReadinessState {
+    pub status: DesktopDoclingReadinessStatus,
+    pub endpoint: String,
+    pub http_status: Option<u16>,
+    pub message: String,
+}
+
+impl Default for DesktopDoclingReadinessState {
+    fn default() -> Self {
+        Self {
+            status: DesktopDoclingReadinessStatus::Idle,
+            endpoint: String::new(),
+            http_status: None,
+            message: "Docling readiness has not been checked.".to_string(),
+        }
+    }
+}
+
 impl DesktopStatusCode {
     pub fn from_interruption(cause: TurnInterruptionCause) -> Self {
         match cause {
@@ -62,12 +92,14 @@ impl DesktopStatusCode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopOverlay {
     None,
+    InitialSetup,
     FileMenu,
     EditMenu,
     ViewMenu,
     HelpMenu,
     ProjectMenu,
     ConfigEditor,
+    SessionSettings,
     ProviderEditor,
     WorkspacePicker,
     PromptReview,
@@ -91,18 +123,58 @@ pub struct DesktopState {
     pub composer: DesktopComposerState,
     pub workspace_input: String,
     pub provider_config: DesktopProviderConfigState,
+    pub docling_readiness: DesktopDoclingReadinessState,
     pub navigation: DesktopNavigationState,
     pub view: DesktopViewState,
     pub startup: DesktopStartupState,
     pub status_code: DesktopStatusCode,
+    global_config: ResolvedConfig,
     file_change_storage_root: Option<camino::Utf8PathBuf>,
     file_change_display_root: Option<camino::Utf8PathBuf>,
     prompt_review_owner: Option<PromptReviewDesktopOwner>,
 }
 
+fn root_session_settings_match(
+    current: &crate::session::SessionRecord,
+    persisted: &crate::session::SessionRecord,
+) -> bool {
+    current.id == persisted.id
+        && current.project_id == persisted.project_id
+        && current.cwd == persisted.cwd
+        && current.model == persisted.model
+        && current.base_url == persisted.base_url
+        && current.access_mode == persisted.access_mode
+        && current.model_parameters == persisted.model_parameters
+        && current.session_settings_revision == persisted.session_settings_revision
+}
+
+fn merge_root_session_settings(
+    current: &crate::session::SessionRecord,
+    persisted: &crate::session::SessionRecord,
+) -> Option<crate::session::SessionRecord> {
+    if current.id != persisted.id
+        || current.project_id != persisted.project_id
+        || current.cwd != persisted.cwd
+        || current.session_settings_revision > persisted.session_settings_revision
+    {
+        return None;
+    }
+    let mut merged = current.clone();
+    merged.model.clone_from(&persisted.model);
+    merged.base_url.clone_from(&persisted.base_url);
+    merged.access_mode = persisted.access_mode;
+    merged
+        .model_parameters
+        .clone_from(&persisted.model_parameters);
+    merged.session_settings_revision = persisted.session_settings_revision;
+    merged.updated_at_ms = merged.updated_at_ms.max(persisted.updated_at_ms);
+    Some(merged)
+}
+
 impl DesktopState {
     pub fn new(snapshot: DesktopSnapshot, effective_config: ResolvedConfig) -> Self {
         let composer = DesktopComposerState::for_owner(snapshot.workspace_path.clone(), None);
+        let global_config = effective_config.clone();
         Self {
             snapshot,
             app_state: AppState::default(),
@@ -110,10 +182,12 @@ impl DesktopState {
             composer,
             workspace_input: String::new(),
             provider_config: DesktopProviderConfigState::new(effective_config),
+            docling_readiness: DesktopDoclingReadinessState::default(),
             navigation: DesktopNavigationState::default(),
             view: DesktopViewState::default(),
             startup: DesktopStartupState::ready(),
             status_code: DesktopStatusCode::Plain,
+            global_config,
             file_change_storage_root: None,
             file_change_display_root: None,
             prompt_review_owner: None,
@@ -513,6 +587,12 @@ impl DesktopState {
             .begin_unique(DesktopAsyncOperationKind::AccessModePersistence)
     }
 
+    pub fn begin_session_settings_persistence(&mut self) -> DesktopAsyncOperationId {
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::SessionSettingsPersistence)
+    }
+
     pub fn begin_steer_submission(&mut self) -> DesktopAsyncOperationId {
         self.view
             .async_operations
@@ -541,6 +621,13 @@ impl DesktopState {
         operation_id: DesktopAsyncOperationId,
     ) -> bool {
         self.view.async_operations.contains(operation_id)
+    }
+
+    pub fn finish_session_settings_persistence(
+        &mut self,
+        operation_id: DesktopAsyncOperationId,
+    ) -> bool {
+        self.view.async_operations.finish(operation_id)
     }
 
     pub fn finish_session_maintenance_mutation(
@@ -597,6 +684,10 @@ impl DesktopState {
                 .view
                 .async_operations
                 .is_pending(DesktopAsyncOperationKind::AccessModePersistence)
+            || self
+                .view
+                .async_operations
+                .is_pending(DesktopAsyncOperationKind::SessionSettingsPersistence)
             || self
                 .view
                 .async_operations
@@ -883,7 +974,7 @@ impl DesktopState {
 
     pub fn load_open_session(&mut self, read: &CanonicalSessionRead) {
         let session = &read.session;
-        self.provider_config.update_access_mode(session.access_mode);
+        self.apply_root_session_config(session);
         self.bind_composer_to_loaded_session(session.id);
         let open_session = match (
             self.file_change_storage_root.as_deref(),
@@ -914,6 +1005,7 @@ impl DesktopState {
             self.snapshot.selected_session_index = index;
         }
         self.view.overlay = DesktopOverlay::None;
+        self.apply_startup_overlay();
         self.view.artifact_selected_index = 0;
     }
 
@@ -924,32 +1016,35 @@ impl DesktopState {
     }
 
     pub fn merge_open_session_history(&mut self, read: &CanonicalSessionRead) -> bool {
-        let Some(open_session) = self
-            .open_session
-            .as_mut()
-            .filter(|open_session| open_session.session_id() == read.session.id)
-        else {
-            return false;
+        let (session, turn_items, detail, active_turn_id, active_turn_expectation) = {
+            let Some(open_session) = self
+                .open_session
+                .as_mut()
+                .filter(|open_session| open_session.session_id() == read.session.id)
+            else {
+                return false;
+            };
+            if !open_session.merge_contiguous(read) {
+                return false;
+            }
+            (
+                open_session.session().clone(),
+                open_session.turn_items().to_vec(),
+                open_session.stored_detail().clone(),
+                open_session.active_turn_id(),
+                open_session.active_turn_expectation(),
+            )
         };
-        if !open_session.merge_contiguous(read) {
-            return false;
-        }
-        let session = open_session.session().clone();
-        let turn_items = open_session.turn_items().to_vec();
-        let detail = open_session.stored_detail().clone();
 
-        self.provider_config.update_access_mode(session.access_mode);
+        self.apply_root_session_config(&session);
         let preserve_current_projection = self.app_state.current_session_id == Some(session.id);
         if preserve_current_projection {
             self.app_state.refresh_plan_from_turn_items(&turn_items);
         } else {
-            self.app_state.load_turn_items_with_active_turn(
-                &session,
-                &turn_items,
-                open_session.active_turn_id(),
-            );
+            self.app_state
+                .load_turn_items_with_active_turn(&session, &turn_items, active_turn_id);
         }
-        self.app_state.active_turn_expectation = open_session.active_turn_expectation();
+        self.app_state.active_turn_expectation = active_turn_expectation;
         self.status_code = self
             .app_state
             .interruption_cause
@@ -992,7 +1087,7 @@ impl DesktopState {
             .expect("preserved open session remains available");
         let session = open_session.session().clone();
         let detail = open_session.stored_detail().clone();
-        self.provider_config.update_access_mode(session.access_mode);
+        self.apply_root_session_config(&session);
         if let Some(context_window) = latest_context_window_from_history_items(&read.history.items)
         {
             self.app_state.latest_context_window = Some(context_window);
@@ -1090,6 +1185,7 @@ impl DesktopState {
         let session = open_session.session().clone();
         let turn_items = open_session.turn_items();
         let detail = open_session.stored_detail().clone();
+        self.apply_root_session_config(&session);
         self.app_state.refresh_plan_from_turn_items(turn_items);
         if let Some(context_window) = latest_context_window_from_history_items(&read.history.items)
         {
@@ -1314,6 +1410,8 @@ impl DesktopState {
             .reset_owner(&self.snapshot.workspace_path, None);
         self.reset_app_state_preserving_file_change_display_roots();
         self.open_session = None;
+        self.provider_config
+            .replace_effective_config(self.global_config.clone());
         self.view.artifact_selected_index = 0;
         self.view.overlay = DesktopOverlay::None;
         self.set_status_message("new chat ready");
@@ -1341,6 +1439,151 @@ impl DesktopState {
         self.provider_config.replace_effective_config(config);
     }
 
+    pub fn replace_global_config(&mut self, config: ResolvedConfig) {
+        self.global_config = config;
+        let effective = if self.startup.requires_initial_setup() {
+            self.global_config.clone()
+        } else {
+            self.open_session
+                .as_ref()
+                .filter(|open_session| {
+                    Some(open_session.session_id()) == self.app_state.current_session_id
+                })
+                .map(|open_session| {
+                    resolved_config_for_root_session(&self.global_config, open_session.session())
+                })
+                .unwrap_or_else(|| self.global_config.clone())
+        };
+        self.provider_config.replace_effective_config(effective);
+    }
+
+    pub fn global_config(&self) -> &ResolvedConfig {
+        &self.global_config
+    }
+
+    pub(crate) fn apply_persisted_root_session_record(
+        &mut self,
+        session: crate::session::SessionRecord,
+    ) -> bool {
+        let Some(open_session) = self.open_session.as_ref() else {
+            return false;
+        };
+        if self.app_state.current_session_id != Some(session.id)
+            || open_session.session_id() != session.id
+            || open_session.session().project_id != session.project_id
+            || open_session.session().cwd != session.cwd
+            || open_session.session().session_settings_revision > session.session_settings_revision
+            || self.app_state.sessions.iter().any(|current| {
+                current.id == session.id
+                    && (current.project_id != session.project_id
+                        || current.cwd != session.cwd
+                        || current.session_settings_revision > session.session_settings_revision)
+            })
+            || self.app_state.loaded_sessions.iter().any(|summary| {
+                summary.session.id == session.id
+                    && (summary.session.project_id != session.project_id
+                        || summary.session.cwd != session.cwd
+                        || summary.session.session_settings_revision
+                            > session.session_settings_revision)
+            })
+        {
+            return false;
+        }
+        let Some(merged_open_session) =
+            merge_root_session_settings(open_session.session(), &session)
+        else {
+            return false;
+        };
+        if !self.open_session.as_mut().is_some_and(|open_session| {
+            open_session.replace_session_record(merged_open_session.clone())
+        }) {
+            return false;
+        }
+        for current in &mut self.app_state.sessions {
+            if let Some(merged) = merge_root_session_settings(current, &session) {
+                *current = merged;
+            }
+        }
+        for summary in &mut self.app_state.loaded_sessions {
+            if let Some(merged) = merge_root_session_settings(&summary.session, &session) {
+                summary.session = merged;
+            }
+        }
+        self.apply_root_session_config(&merged_open_session);
+        true
+    }
+
+    pub(crate) fn persisted_root_session_settings_are_projected(
+        &self,
+        session: &crate::session::SessionRecord,
+    ) -> bool {
+        self.app_state.current_session_id == Some(session.id)
+            && self
+                .open_session
+                .as_ref()
+                .filter(|open_session| open_session.session_id() == session.id)
+                .is_some_and(|open_session| {
+                    root_session_settings_match(open_session.session(), session)
+                })
+    }
+
+    pub(crate) fn persisted_root_session_settings_and_effective_config_are_projected(
+        &self,
+        session: &crate::session::SessionRecord,
+    ) -> bool {
+        if !self.persisted_root_session_settings_are_projected(session) {
+            return false;
+        }
+        let expected = resolved_config_for_root_session(&self.global_config, session);
+        session_provider_settings_match(&self.provider_config.effective_config, &expected)
+            && self
+                .provider_config
+                .effective_config
+                .permissions
+                .access_mode
+                == expected.permissions.access_mode
+    }
+
+    pub(crate) fn root_session_settings_config_generation_delta(
+        &self,
+        current: &crate::session::SessionRecord,
+        patch: &crate::session::SessionSettingsPatch,
+    ) -> u64 {
+        let mut next = current.clone();
+        if let Some(cwd) = &patch.cwd {
+            next.cwd.clone_from(cwd);
+        }
+        if let Some(model) = &patch.model {
+            next.model.clone_from(model);
+        }
+        if let Some(base_url) = &patch.base_url {
+            next.base_url.clone_from(base_url);
+        }
+        if let Some(access_mode) = patch.access_mode {
+            next.access_mode = access_mode;
+        }
+        next.model_parameters = patch.apply_to_model_parameters(&current.model_parameters);
+        let expected = resolved_config_for_root_session(&self.global_config, &next);
+        u64::from(!session_provider_settings_match(
+            &self.provider_config.effective_config,
+            &expected,
+        ))
+    }
+
+    fn apply_root_session_config(&mut self, session: &crate::session::SessionRecord) {
+        if self.startup.requires_initial_setup() {
+            self.provider_config
+                .replace_effective_config(self.global_config.clone());
+            return;
+        }
+        let effective = resolved_config_for_root_session(&self.global_config, session);
+        if session_provider_settings_match(&self.provider_config.effective_config, &effective) {
+            self.provider_config.update_access_mode(session.access_mode);
+        } else {
+            self.provider_config.replace_effective_config(effective);
+        }
+    }
+
     fn prompt_review_owns_overlay(&self) -> bool {
         self.app_state.prompt_review.is_some() || self.prompt_review_owner.is_some()
     }
@@ -1348,6 +1591,11 @@ impl DesktopState {
     fn begin_unscoped_overlay_transition(&mut self) -> bool {
         if self.prompt_review_owns_overlay() {
             self.view.overlay = DesktopOverlay::PromptReview;
+            return false;
+        }
+        if self.startup.requires_initial_setup() {
+            self.view.overlay = DesktopOverlay::InitialSetup;
+            self.view.startup_overlay_forced = true;
             return false;
         }
         true
@@ -1362,44 +1610,46 @@ impl DesktopState {
         true
     }
 
+    pub fn show_session_settings(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition()
+            || self.app_state.current_session_id.is_none()
+            || self.open_session.as_ref().is_none_or(|open_session| {
+                Some(open_session.session_id()) != self.app_state.current_session_id
+            })
+        {
+            return false;
+        }
+        self.view.startup_overlay_forced = false;
+        self.view.overlay = DesktopOverlay::SessionSettings;
+        true
+    }
+
     pub fn show_provider_editor(&mut self) -> bool {
         if !self.begin_unscoped_overlay_transition() {
             return false;
         }
-        self.provider_config.provider_base_url_input =
-            self.provider_config.effective_config.model.base_url.clone();
-        self.provider_config.provider_metadata_mode_input = self
-            .provider_config
-            .effective_config
-            .model
-            .provider_metadata_mode;
-        self.provider_config.provider_context_window_input = self
-            .provider_config
-            .effective_config
-            .model
-            .context_window
-            .to_string();
-        self.provider_config.provider_max_output_tokens_input = self
-            .provider_config
-            .effective_config
-            .model
-            .max_output_tokens
-            .to_string();
-        self.provider_config.provider_selected_model_id_input =
-            self.provider_config.effective_config.model.model.clone();
+        let global_config = self.global_config.clone();
+        self.provider_config.provider_base_url_input = global_config.model.base_url.clone();
+        self.provider_config.provider_metadata_mode_input =
+            global_config.model.provider_metadata_mode;
+        self.provider_config.provider_context_window_input =
+            self.global_config.model.context_window.to_string();
+        self.provider_config.provider_max_output_tokens_input =
+            self.global_config.model.max_output_tokens.to_string();
+        self.provider_config.provider_selected_model_id_input = global_config.model.model.clone();
         self.provider_config.provider_models = ensure_current_model(
             self.provider_config.provider_models.clone(),
-            &self.provider_config.effective_config.model.model,
+            &global_config.model.model,
         );
         self.provider_config.provider_model_infos = ensure_current_model_info(
             self.provider_config.provider_model_infos.clone(),
-            &self.provider_config.effective_config,
+            &global_config,
         );
         self.provider_config.provider_selected_index = self
             .provider_config
             .provider_models
             .iter()
-            .position(|model| model == &self.provider_config.effective_config.model.model)
+            .position(|model| model == &global_config.model.model)
             .map(|index| index as i32)
             .unwrap_or(-1);
         self.view.startup_overlay_forced = false;
@@ -1466,12 +1716,11 @@ impl DesktopState {
 
     pub fn hide_overlay(&mut self) -> bool {
         if !self.begin_unscoped_overlay_transition() {
-            return false;
-        }
-        if self.startup_requires_overlay(self.view.overlay) {
-            self.set_status_message(
-                "初期設定が必要です。設定ファイルへの保存、UIセッションへの適用、または config.toml Import で設定を完了してください。",
-            );
+            if self.startup.requires_initial_setup() {
+                self.set_status_message(
+                    "初期設定が必要です。各ステップを確認し、Finish で設定を保存してください。",
+                );
+            }
             return false;
         }
         self.view.startup_overlay_forced = false;
@@ -1479,13 +1728,17 @@ impl DesktopState {
         true
     }
 
-    pub fn mark_startup_config_reviewed(&mut self) {
-        self.startup.mark_config_reviewed();
+    pub(crate) fn complete_initial_setup_after_persist(&mut self) {
+        self.startup.complete_after_persist();
+        if !self.startup.requires_initial_setup()
+            && let Some(session) = self
+                .open_session
+                .as_ref()
+                .map(|open| open.session().clone())
+        {
+            self.apply_root_session_config(&session);
+        }
         self.apply_startup_overlay();
-    }
-
-    fn startup_requires_overlay(&self, overlay: DesktopOverlay) -> bool {
-        self.startup.requires_initial_setup() && self.startup.action_overlay == Some(overlay)
     }
 
     pub fn begin_provider_model_load(&mut self, normalized_base_url: String) {
@@ -1502,6 +1755,58 @@ impl DesktopState {
             "詳細は必要な場合だけ展開してください。",
             "Loading models in the background...",
         );
+    }
+
+    pub fn begin_docling_readiness_check(&mut self, endpoint: String) {
+        self.docling_readiness = DesktopDoclingReadinessState {
+            status: DesktopDoclingReadinessStatus::Checking,
+            endpoint,
+            http_status: None,
+            message: "Checking Docling /ready...".to_string(),
+        };
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::DoclingReadinessCheck);
+    }
+
+    pub fn finish_docling_readiness_check(&mut self, result: DoclingReadinessResult) {
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::DoclingReadinessCheck);
+        self.docling_readiness = DesktopDoclingReadinessState {
+            status: if result.ready {
+                DesktopDoclingReadinessStatus::Ready
+            } else {
+                DesktopDoclingReadinessStatus::Unavailable
+            },
+            endpoint: result.endpoint,
+            http_status: Some(result.http_status),
+            message: format!("Docling /ready returned HTTP {}.", result.http_status),
+        };
+    }
+
+    pub fn fail_docling_readiness_check(&mut self, message: impl Into<String>) {
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::DoclingReadinessCheck);
+        self.docling_readiness.status = DesktopDoclingReadinessStatus::Unavailable;
+        self.docling_readiness.http_status = None;
+        self.docling_readiness.message = message.into();
+    }
+
+    pub fn cancel_docling_readiness_check(&mut self) {
+        self.view
+            .async_operations
+            .finish_kind(DesktopAsyncOperationKind::DoclingReadinessCheck);
+        self.docling_readiness = DesktopDoclingReadinessState::default();
+    }
+
+    pub fn docling_readiness_check_pending(&self) -> bool {
+        self.docling_readiness.status == DesktopDoclingReadinessStatus::Checking
+            || self
+                .view
+                .async_operations
+                .is_pending(DesktopAsyncOperationKind::DoclingReadinessCheck)
     }
 
     pub fn finish_provider_model_load(&mut self, infos: Vec<ProviderModelInfo>) {
@@ -1753,6 +2058,19 @@ impl DesktopState {
     }
 
     pub fn can_apply_provider_selection(&self) -> bool {
+        self.provider_selection_input_is_complete()
+            && (self.provider_catalog_owns_current_target()
+                || self.provider_input_matches_effective_target()
+                || self.provider_input_matches_global_target())
+    }
+
+    pub(crate) fn can_save_provider_selection_global(&self) -> bool {
+        self.provider_selection_input_is_complete()
+            && (self.provider_catalog_owns_current_target()
+                || self.provider_input_matches_global_target())
+    }
+
+    fn provider_selection_input_is_complete(&self) -> bool {
         let normalized = normalize_provider_base_url(&self.provider_config.provider_base_url_input);
         let selected_model = self.selected_provider_model();
         !self.provider_config.provider_loading
@@ -1763,8 +2081,6 @@ impl DesktopState {
                 .is_empty()
             && selected_model.is_some()
             && !normalized.is_empty()
-            && (self.provider_catalog_owns_current_target()
-                || self.provider_input_matches_effective_target())
     }
 
     pub fn provider_catalog_owns_current_target(&self) -> bool {
@@ -1776,6 +2092,15 @@ impl DesktopState {
 
     pub(crate) fn provider_input_matches_effective_target(&self) -> bool {
         let current_model = &self.provider_config.effective_config.model;
+        normalize_provider_base_url(&current_model.base_url)
+            == normalize_provider_base_url(&self.provider_config.provider_base_url_input)
+            && self.provider_config.provider_metadata_mode_input
+                == current_model.provider_metadata_mode
+            && self.selected_provider_model() == Some(current_model.model.as_str())
+    }
+
+    pub(crate) fn provider_input_matches_global_target(&self) -> bool {
+        let current_model = &self.global_config.model;
         normalize_provider_base_url(&current_model.base_url)
             == normalize_provider_base_url(&self.provider_config.provider_base_url_input)
             && self.provider_config.provider_metadata_mode_input
@@ -1823,11 +2148,6 @@ impl DesktopState {
         }
         if let Some(overlay) = self.startup.action_overlay {
             self.view.overlay = overlay;
-            if overlay == DesktopOverlay::ProviderEditor {
-                self.show_provider_editor();
-            } else if overlay == DesktopOverlay::ConfigEditor {
-                self.show_config_editor();
-            }
             self.view.startup_overlay_forced = true;
         } else if self.startup.status == super::startup::DesktopStartupStatus::Ready
             && self.view.startup_overlay_forced
@@ -1836,6 +2156,42 @@ impl DesktopState {
             self.view.overlay = DesktopOverlay::None;
         }
     }
+}
+
+pub(crate) fn resolved_config_for_root_session(
+    global: &ResolvedConfig,
+    session: &crate::session::SessionRecord,
+) -> ResolvedConfig {
+    let mut effective = global.clone();
+    effective.model.base_url = session.base_url.clone();
+    effective.model.model = session.model.clone();
+    effective.permissions.access_mode = session.access_mode;
+    if let Some(value) = session.model_parameters.context_window {
+        effective.model.context_window = value;
+    }
+    if let Some(value) = session.model_parameters.max_output_tokens {
+        effective.model.max_output_tokens = value;
+    }
+    if let Some(value) = session.model_parameters.temperature {
+        effective.model.temperature = Some(value);
+    }
+    if let Some(value) = session.model_parameters.top_p {
+        effective.model.top_p = Some(value);
+    }
+    if let Some(value) = session.model_parameters.top_k {
+        effective.model.top_k = Some(value);
+    }
+    effective
+}
+
+fn session_provider_settings_match(current: &ResolvedConfig, next: &ResolvedConfig) -> bool {
+    current.model.base_url == next.model.base_url
+        && current.model.model == next.model.model
+        && current.model.context_window == next.model.context_window
+        && current.model.max_output_tokens == next.model.max_output_tokens
+        && current.model.temperature == next.model.temperature
+        && current.model.top_p == next.model.top_p
+        && current.model.top_k == next.model.top_k
 }
 
 const fn session_status_from_run_status(status: RunStatus) -> SessionStatus {
@@ -1993,6 +2349,7 @@ mod tests {
             base_url: "http://local".to_string(),
             access_mode: AccessMode::FullAccess,
             model_parameters: SessionModelParameters::default(),
+            session_settings_revision: 0,
             created_at_ms: 1,
             updated_at_ms: 2,
             completed_at_ms: Some(2),
@@ -2880,6 +3237,292 @@ mod tests {
     }
 
     #[test]
+    fn provider_editor_projects_the_global_owner_when_root_effective_settings_differ() {
+        let mut global = ResolvedConfig::default();
+        global.model.base_url = "http://127.0.0.1:1234".to_string();
+        global.model.model = "global-model".to_string();
+        global.model.context_window = 32_768;
+        global.model.max_output_tokens = 2_048;
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), global.clone());
+        let mut root_effective = global.clone();
+        root_effective.model.base_url = "http://127.0.0.1:5678".to_string();
+        root_effective.model.model = "root-model".to_string();
+        root_effective.model.context_window = 131_072;
+        root_effective.model.max_output_tokens = 8_192;
+        state.reset_effective_config(root_effective);
+
+        assert!(state.show_provider_editor());
+
+        assert_eq!(
+            state.provider_config.provider_base_url_input,
+            global.model.base_url
+        );
+        assert_eq!(
+            state.provider_config.provider_selected_model_id_input,
+            global.model.model
+        );
+        assert_eq!(
+            state.provider_config.provider_context_window_input,
+            global.model.context_window.to_string()
+        );
+        assert_eq!(
+            state.provider_config.provider_max_output_tokens_input,
+            global.model.max_output_tokens.to_string()
+        );
+        assert!(state.provider_input_matches_global_target());
+        assert!(!state.provider_input_matches_effective_target());
+        assert!(state.can_save_provider_selection_global());
+        assert!(state.can_apply_provider_selection());
+    }
+
+    #[test]
+    fn persisted_root_settings_merge_preserves_newer_non_settings_metadata() {
+        let session_id = SessionId::new();
+        let mut current = session_record(session_id);
+        current.title = "newer runtime title".to_string();
+        current.status = SessionStatus::Running;
+        current.cwd = Utf8PathBuf::from("C:/workspace/current-root");
+        current.model = "old-model".to_string();
+        current.base_url = "http://old-provider".to_string();
+        current.access_mode = AccessMode::Default;
+        current.model_parameters.context_window = Some(32_768);
+        current.session_settings_revision = 7;
+        current.created_at_ms = 10;
+        current.updated_at_ms = 90;
+        current.completed_at_ms = None;
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(session_id, &current.title, current.status)],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&canonical_read(&current, Vec::new(), Vec::new()));
+
+        let mut persisted = current.clone();
+        persisted.project_id = ProjectId::new();
+        persisted.title = "stale persisted title".to_string();
+        persisted.status = SessionStatus::Completed;
+        persisted.cwd = Utf8PathBuf::from("C:/workspace/stale-root");
+        persisted.model = "saved-model".to_string();
+        persisted.base_url = "http://saved-provider".to_string();
+        persisted.access_mode = AccessMode::FullAccess;
+        persisted.model_parameters.context_window = Some(65_536);
+        persisted.session_settings_revision = 8;
+        persisted.created_at_ms = 1;
+        persisted.updated_at_ms = 120;
+        persisted.completed_at_ms = Some(20);
+
+        assert!(
+            !state.persisted_root_session_settings_are_projected(&persisted),
+            "a canonical cwd or project owner change is not this GUI write's projection"
+        );
+        assert!(
+            !state.apply_persisted_root_session_record(persisted.clone()),
+            "a cwd/project authority conflict requires a full reload and must not advance settings state"
+        );
+        let unchanged = state
+            .open_session
+            .as_ref()
+            .expect("open session remains loaded")
+            .session();
+        assert_eq!(unchanged.cwd, current.cwd);
+        assert_eq!(unchanged.model, current.model);
+        assert_eq!(unchanged.session_settings_revision, 7);
+
+        persisted.project_id = current.project_id;
+        persisted.cwd = current.cwd.clone();
+        assert!(state.apply_persisted_root_session_record(persisted.clone()));
+        let projected = state
+            .open_session
+            .as_ref()
+            .expect("open session remains loaded")
+            .session();
+        assert_eq!(projected.project_id, current.project_id);
+        assert_eq!(projected.title, current.title);
+        assert_eq!(projected.status, current.status);
+        assert_eq!(projected.cwd, current.cwd);
+        assert_eq!(projected.created_at_ms, current.created_at_ms);
+        assert_eq!(projected.updated_at_ms, 120);
+        assert_eq!(projected.completed_at_ms, current.completed_at_ms);
+        assert_eq!(projected.model, persisted.model);
+        assert_eq!(projected.base_url, persisted.base_url);
+        assert_eq!(projected.access_mode, persisted.access_mode);
+        assert_eq!(projected.model_parameters, persisted.model_parameters);
+        assert_eq!(projected.session_settings_revision, 8);
+        assert!(state.persisted_root_session_settings_are_projected(&persisted));
+
+        let mut runtime_newer = projected.clone();
+        runtime_newer.title = "runtime title after settings CAS".to_string();
+        runtime_newer.status = SessionStatus::Completed;
+        runtime_newer.updated_at_ms = 200;
+        runtime_newer.completed_at_ms = Some(200);
+        assert!(
+            state
+                .open_session
+                .as_mut()
+                .expect("open session remains loaded")
+                .replace_session_record(runtime_newer.clone())
+        );
+        for current_projection in &mut state.app_state.sessions {
+            if current_projection.id == session_id {
+                *current_projection = runtime_newer.clone();
+            }
+        }
+
+        let mut same_revision_conflict = persisted.clone();
+        same_revision_conflict.cwd = current.cwd.clone();
+        same_revision_conflict.model = "canonical-conflict-model".to_string();
+        same_revision_conflict.title = "still stale".to_string();
+        same_revision_conflict.updated_at_ms = 130;
+        assert!(state.apply_persisted_root_session_record(same_revision_conflict.clone()));
+        let projected = state
+            .open_session
+            .as_ref()
+            .expect("open session remains loaded")
+            .session();
+        assert_eq!(projected.title, runtime_newer.title);
+        assert_eq!(projected.status, runtime_newer.status);
+        assert_eq!(projected.updated_at_ms, runtime_newer.updated_at_ms);
+        assert_eq!(projected.completed_at_ms, runtime_newer.completed_at_ms);
+        assert_eq!(projected.model, same_revision_conflict.model);
+        assert!(state.persisted_root_session_settings_are_projected(&same_revision_conflict));
+
+        let mut lower_revision = same_revision_conflict;
+        lower_revision.session_settings_revision = 7;
+        lower_revision.model = "older-model".to_string();
+        assert!(!state.apply_persisted_root_session_record(lower_revision));
+        assert_eq!(
+            state
+                .open_session
+                .as_ref()
+                .expect("open session remains loaded")
+                .session()
+                .model,
+            "canonical-conflict-model"
+        );
+    }
+
+    #[test]
+    fn already_projected_settings_write_still_synchronizes_every_session_projection() {
+        let session_id = SessionId::new();
+        let mut current = session_record(session_id);
+        current.model = "model-before-save".to_string();
+        current.session_settings_revision = 11;
+        current.updated_at_ms = 40;
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(session_id, &current.title, current.status)],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&canonical_read(&current, Vec::new(), Vec::new()));
+
+        let mut listed = current.clone();
+        listed.title = "newer list title".to_string();
+        listed.updated_at_ms = 70;
+        state.app_state.sessions = vec![listed.clone()];
+        let mut loaded = current.clone();
+        loaded.title = "newer loaded title".to_string();
+        loaded.updated_at_ms = 80;
+        state.app_state.loaded_sessions = vec![crate::session::LoadedSessionSummary {
+            session: loaded.clone(),
+            loaded_status: crate::session::LoadedSessionStatus::Idle,
+            archived: false,
+            active_turn_id: None,
+            active_turn_sequence_no: None,
+            admission_revision: 0,
+            pending_permission_requests: 0,
+            pending_user_input_requests: 0,
+        }];
+
+        let mut applied = current;
+        applied.model = "model-after-save".to_string();
+        applied.access_mode = AccessMode::Default;
+        applied.model_parameters.max_output_tokens = Some(8_192);
+        applied.session_settings_revision = 12;
+        applied.updated_at_ms = 60;
+        assert!(
+            state
+                .open_session
+                .as_mut()
+                .expect("open session remains loaded")
+                .replace_session_record(applied.clone())
+        );
+        assert!(state.persisted_root_session_settings_are_projected(&applied));
+        assert_eq!(state.app_state.sessions[0].session_settings_revision, 11);
+        assert_eq!(
+            state.app_state.loaded_sessions[0]
+                .session
+                .session_settings_revision,
+            11
+        );
+
+        assert!(state.apply_persisted_root_session_record(applied));
+        let listed = &state.app_state.sessions[0];
+        assert_eq!(listed.model, "model-after-save");
+        assert_eq!(listed.model_parameters.max_output_tokens, Some(8_192));
+        assert_eq!(listed.session_settings_revision, 12);
+        assert_eq!(listed.title, "newer list title");
+        assert_eq!(listed.updated_at_ms, 70);
+        let loaded = &state.app_state.loaded_sessions[0].session;
+        assert_eq!(loaded.model, "model-after-save");
+        assert_eq!(loaded.model_parameters.max_output_tokens, Some(8_192));
+        assert_eq!(loaded.session_settings_revision, 12);
+        assert_eq!(loaded.title, "newer loaded title");
+        assert_eq!(loaded.updated_at_ms, 80);
+    }
+
+    #[test]
+    fn settings_config_generation_delta_uses_effective_values_not_patch_presence() {
+        let session_id = SessionId::new();
+        let current = session_record(session_id);
+        let mut global = ResolvedConfig::default();
+        global.model.context_window = 32_768;
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(session_id, &current.title, current.status)],
+                0,
+            ),
+            global,
+        );
+        state.load_open_session(&canonical_read(&current, Vec::new(), Vec::new()));
+
+        let explicit_inherited_value = crate::session::SessionSettingsPatch {
+            context_window: Some(32_768),
+            ..crate::session::SessionSettingsPatch::default()
+        };
+        assert_eq!(
+            state.root_session_settings_config_generation_delta(
+                &current,
+                &explicit_inherited_value,
+            ),
+            0,
+            "None to explicit-global-equal changes durable ownership without replacing effective config"
+        );
+
+        let effective_change = crate::session::SessionSettingsPatch {
+            context_window: Some(65_536),
+            ..crate::session::SessionSettingsPatch::default()
+        };
+        assert_eq!(
+            state.root_session_settings_config_generation_delta(&current, &effective_change),
+            1
+        );
+
+        let access_only = crate::session::SessionSettingsPatch {
+            access_mode: Some(AccessMode::Default),
+            ..crate::session::SessionSettingsPatch::default()
+        };
+        assert_eq!(
+            state.root_session_settings_config_generation_delta(&current, &access_only),
+            0,
+            "access mode updates the dedicated effective owner without replacing provider config"
+        );
+    }
+
+    #[test]
     fn typed_terminal_outcome_matches_between_live_event_and_rehydrate() {
         for cause in [
             crate::protocol::TurnInterruptionCause::ApprovalAborted,
@@ -2972,7 +3615,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_config_refresh_is_local_and_never_creates_async_work() {
+    fn startup_config_refresh_is_local_and_keeps_the_finish_only_latch() {
         let mut config = ResolvedConfig::default();
         config.model.base_url = String::new();
         config.model.model = "model-a".to_string();
@@ -2992,9 +3635,15 @@ mod tests {
         assert!(!state.provider_model_load_pending());
         assert_eq!(
             state.startup.status,
-            super::super::startup::DesktopStartupStatus::Ready
+            super::super::startup::DesktopStartupStatus::RequiresProvider
         );
         assert!(!state.async_polling_required());
+
+        state.complete_initial_setup_after_persist();
+        assert_eq!(
+            state.startup.status,
+            super::super::startup::DesktopStartupStatus::Ready
+        );
     }
 
     #[test]
@@ -3049,7 +3698,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_provider_startup_overlay_can_be_closed() {
+    fn invalid_provider_startup_uses_the_blocking_initial_setup_owner() {
         let mut config = ResolvedConfig::default();
         config.model.base_url = String::new();
         config.model.model = "configured-model".to_string();
@@ -3058,13 +3707,20 @@ mod tests {
 
         state.begin_startup(true, None, camino::Utf8Path::new("C:/workspace"));
 
-        assert_eq!(state.view.overlay, DesktopOverlay::ProviderEditor);
-        assert!(!state.startup.requires_initial_setup());
+        assert_eq!(state.view.overlay, DesktopOverlay::InitialSetup);
+        assert!(state.startup.requires_initial_setup());
 
         state.hide_overlay();
 
-        assert_eq!(state.view.overlay, DesktopOverlay::None);
-        assert!(!state.view.startup_overlay_forced);
+        assert_eq!(state.view.overlay, DesktopOverlay::InitialSetup);
+        assert!(state.view.startup_overlay_forced);
+        assert!(
+            state
+                .app_state
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("Finish"))
+        );
     }
 
     #[test]
@@ -3081,19 +3737,19 @@ mod tests {
             state.startup.status,
             super::super::startup::DesktopStartupStatus::RequiresConfig
         );
-        assert_eq!(state.view.overlay, DesktopOverlay::ConfigEditor);
+        assert_eq!(state.view.overlay, DesktopOverlay::InitialSetup);
         assert!(state.startup.requires_initial_setup());
 
         state.hide_overlay();
 
-        assert_eq!(state.view.overlay, DesktopOverlay::ConfigEditor);
+        assert_eq!(state.view.overlay, DesktopOverlay::InitialSetup);
         assert!(state.view.startup_overlay_forced);
         assert!(
             state
                 .app_state
                 .status_message
                 .as_deref()
-                .is_some_and(|message| message.contains("UIセッションへの適用"))
+                .is_some_and(|message| message.contains("Finish"))
         );
     }
 
@@ -3319,6 +3975,12 @@ mod tests {
         assert!(state.background_mutation_pending());
         assert!(state.finish_steer_submission(steer_id));
         assert!(!state.steer_submission_pending());
+        assert!(!state.background_mutation_pending());
+
+        let settings_id = state.begin_session_settings_persistence();
+        assert!(state.background_mutation_pending());
+        assert!(!state.can_begin_navigation());
+        assert!(state.finish_session_settings_persistence(settings_id));
         assert!(!state.background_mutation_pending());
     }
 

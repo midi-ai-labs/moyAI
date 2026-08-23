@@ -74,12 +74,15 @@ import {
   beginAgentExecutionLoad,
   beginPreviousAgentExecutionPageLoad,
   createUiLocalState,
+  doclingReadinessRequestPending,
   agentExecutionRequestNeedsRefresh,
   agentExecutionSnapshotOwnerIdentity,
   failAgentExecutionLoad,
   finishAgentExecutionLoad,
   reconcileAgentPaneState,
   selectedAgentExecution,
+  sessionSettingsDraftFromProjection,
+  sessionSettingsMutationAvailability,
   sideChatCatalogLoadOpen,
   sideChatCatalogViewForState,
   sideChatDeleteConfirmationStillTargets,
@@ -90,6 +93,24 @@ import {
   shouldPreserveAgentExecutionSnapshots,
   type SessionInteractionSnapshot,
 } from "./ui_state";
+import {
+  initialSetupDiffSummary,
+  initialSetupFinishPending,
+  reconcileInitialSetupOwner,
+} from "./initial_setup_state";
+import {
+  initialSetupAuxiliaryPendingKind,
+  initialSetupDoclingReadinessVisible,
+  initialSetupImportedSourcePath,
+  reconcileInitialSetupAuxiliaryState,
+} from "./initial_setup_auxiliary_state";
+import {
+  clearSessionSettings,
+  reconcileSessionSettings,
+  sameSessionSettingsRootOwner,
+  sameSessionSettingsTarget,
+  sessionSettingsMutationPending,
+} from "./session_settings_state";
 import {
   InteractionLifecycle,
   type InteractionRelease,
@@ -146,8 +167,12 @@ import {
 import {
   settingsActionFocusCandidates,
   settingsActionFocusStillTargets,
+  settingsCloseTargetStillMatches,
+  settingsRecoverableErrorOwnerIdentity,
   sameSettingsSurface,
   settingsSurfaceIdentity,
+  shouldRetainConnectedSettingsSurface,
+  synchronizeRetainedSettingsSurface,
 } from "./settings_surface";
 import {
   mainRunFocusSurface,
@@ -269,6 +294,7 @@ const eventContext: ActionContext = {
     ? buildDesktopRenderModel(projectViewState(currentState, uiState))
     : null,
   acceptProjection: (state: DesktopWebState, forceRender = true) => acceptState(state, forceRender),
+  waitForInteractionIdle: () => interactionLifecycle.whenIdle(),
   rerender: () => {
     if (currentState) acceptState(currentState, true);
   },
@@ -794,8 +820,10 @@ function applyStateUpdate(update: StateUpdate): void {
   ) return;
   const previousProjection = currentState;
   reconcileUiDrafts(uiState, previousProjection, update.state, update.draftSnapshot);
+  reconcileSettingsFlowState(update.state);
   reconcileAgentPaneState(uiState, update.state);
   const viewState = projectViewState(update.state, uiState);
+  reconcileRecoverableErrorOwner(viewState);
   const attachmentFocusDecision = reconcileUiLocalState(
     lastRenderedState,
     viewState,
@@ -828,6 +856,14 @@ function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
     uiState.sideChatDeleteConfirmation,
     state,
   ) ? uiState.sideChatDeleteConfirmation : null;
+  const configDraftValues = state.config_fields.map((field) => ({
+    key: field.key,
+    text: field.value,
+  }));
+  const configBaselineValues = state.config_fields.map((field) => ({
+    key: field.key,
+    text: uiState.configDraftBaselineValues.get(field.key) ?? field.value,
+  }));
   return createDesktopRenderModel(state, {
     artifactPane: {
       collapsed: uiState.artifactPaneCollapsed,
@@ -836,7 +872,47 @@ function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
       selectedAgentExecution: selectedAgentExecution(uiState, state),
     },
     attachmentTrayOpen: uiState.attachmentTrayOpen,
-    configMutationPending: configMutationPending(uiState),
+    configMutationPending: configMutationPending(uiState)
+      || (
+        state.overlay === "config"
+        && uiState.localConfirmationDecisionPending
+        && uiState.pendingLocalConfirmation === null
+      ),
+    doclingReadinessRequestPending: doclingReadinessRequestPending(uiState),
+    initialSetup: {
+      step: uiState.initialSetup.step,
+      finishPending: initialSetupFinishPending(uiState.initialSetup),
+      auxiliaryPendingKind: initialSetupAuxiliaryPendingKind(
+        uiState.initialSetupAuxiliary,
+      ),
+      importedSourcePath: initialSetupImportedSourcePath(
+        uiState.initialSetupAuxiliary,
+        state.startup.setup_target,
+        state.config_target,
+      ),
+      doclingReadinessVisible: initialSetupDoclingReadinessVisible(
+        uiState.initialSetupAuxiliary,
+        state.startup.setup_target,
+        state.config_target,
+        uiState.configDraftRevision,
+        state.docling_readiness.endpoint,
+      ),
+      differences: initialSetupDiffSummary(
+        state.config_fields,
+        configBaselineValues,
+        configDraftValues,
+      ),
+    },
+    sessionSettings: {
+      draft: uiState.sessionSettings.draft,
+      dirty: uiState.sessionSettings.dirty,
+      validation: uiState.sessionSettings.validation,
+      mutationPending: sessionSettingsMutationPending(uiState.sessionSettings),
+      availability: sessionSettingsMutationAvailability(
+        uiState.sessionSettings,
+        state.session_settings,
+      ),
+    },
     sideChat: {
       draft: sideChatDraft?.text ?? "",
       setupBaseUrl: sideChatDraft?.setupBaseUrl ?? "",
@@ -853,9 +929,60 @@ function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
       localDecisionError: uiState.localConfirmationDecisionError,
       permissionDecision: uiState.permissionDecision,
     },
-    recoverableError: uiState.recoverableError,
+    recoverableError: uiState.recoverableErrorOwner === settingsRecoverableErrorOwnerIdentity(
+      state,
+      uiState.initialSetup.step,
+    ) ? uiState.recoverableError : null,
     windowMaximized: uiState.windowMaximized,
   });
+}
+
+function reconcileSettingsFlowState(state: DesktopWebState): void {
+  const setupTarget = state.startup.setup_target;
+  reconcileInitialSetupAuxiliaryState(
+    uiState.initialSetupAuxiliary,
+    setupTarget,
+    state.config_target,
+  );
+  if (state.startup.initial_setup_required && setupTarget !== null) {
+    reconcileInitialSetupOwner(uiState.initialSetup, setupTarget);
+  }
+
+  const sessionProjection = state.session_settings;
+  if (
+    state.overlay === "session_settings"
+    && sessionProjection.available
+    && sessionProjection.target !== null
+  ) {
+    reconcileSessionSettings(
+      uiState.sessionSettings,
+      sessionProjection.target,
+      sessionSettingsDraftFromProjection(sessionProjection),
+    );
+  } else if (
+    state.overlay !== "session_settings"
+    && (
+      uiState.sessionSettings.owner !== null
+      || uiState.sessionSettings.draft !== null
+      || uiState.sessionSettings.activeMutation !== null
+    )
+  ) {
+    clearSessionSettings(uiState.sessionSettings);
+  }
+
+}
+
+function reconcileRecoverableErrorOwner(state: DesktopViewState): void {
+  if (
+    uiState.recoverableError !== null
+    && uiState.recoverableErrorOwner !== settingsRecoverableErrorOwnerIdentity(
+      state,
+      uiState.initialSetup.step,
+    )
+  ) {
+    uiState.recoverableError = null;
+    uiState.recoverableErrorOwner = null;
+  }
 }
 
 function renderCommitted(
@@ -962,8 +1089,10 @@ function renderCommitted(
     && uiState.titlebarMenuFocusContinuation?.overlay === previous.overlay
       ? uiState.titlebarMenuFocusContinuation.action
       : null;
-  const previousSettingsOwner = settingsSurfaceIdentity(previous);
-  const nextSettingsOwner = settingsSurfaceIdentity(state);
+  const previousInitialSetupStep = lastRenderedModel?.local.initialSetup.step;
+  const nextInitialSetupStep = model.local.initialSetup.step;
+  const previousSettingsOwner = settingsSurfaceIdentity(previous, previousInitialSetupStep);
+  const nextSettingsOwner = settingsSurfaceIdentity(state, nextInitialSetupStep);
   if (modalOpening) {
     modalScrollReturnStack.push(captureSelectorScrollSnapshots(
       MODAL_SCROLL_SELECTORS,
@@ -1139,11 +1268,19 @@ function renderCommitted(
       || agentActivityAdvanced
       || runCompleted,
   });
-  const preserveConnectedSettings = !localModalPending && sameSettingsSurface(previous, state);
+  const preserveConnectedSettings = shouldRetainConnectedSettingsSurface(
+    previous,
+    state,
+    lastRenderedLocalModalIdentity,
+    renderedLocalModalIdentity,
+    previousInitialSetupStep,
+    nextInitialSetupStep,
+  );
   const currentSettingsModal = preserveConnectedSettings
-    ? document.querySelector<HTMLElement>(".settings-modal")
+    ? document.querySelector<HTMLElement>(".settings-modal, .initial-setup-shell")
     : null;
-  const currentFrame = preserveConnectedSettings
+  const retainingInitialSetup = currentSettingsModal?.matches(".initial-setup-shell") === true;
+  const currentFrame = preserveConnectedSettings && !retainingInitialSetup
     ? appRoot.querySelector<HTMLElement>(".app-frame")
     : null;
   const preservedTitlebar = document.querySelector<HTMLElement>(".app-titlebar");
@@ -1153,6 +1290,22 @@ function renderCommitted(
   });
   let retainedConnectedSettings = false;
   let retainedConnectedPrompt = false;
+  if (currentSettingsModal && retainingInitialSetup) {
+    const template = document.createElement("template");
+    template.innerHTML = renderedMarkup;
+    const nextSettingsModal = template.content.querySelector<HTMLElement>(".initial-setup-shell");
+    if (nextSettingsModal) {
+      synchronizeRetainedSettingsSurface(
+        currentSettingsModal,
+        nextSettingsModal,
+        model.local.configMutationPending
+          || model.local.initialSetup.finishPending
+          || model.local.initialSetup.auxiliaryPendingKind !== null,
+        !uiState.configDirty,
+      );
+      retainedConnectedSettings = true;
+    }
+  }
   if (currentSettingsModal && currentFrame) {
     const template = document.createElement("template");
     template.innerHTML = renderedMarkup;
@@ -1173,6 +1326,14 @@ function renderCommitted(
       if (currentStatus && nextStatus && !currentStatus.contains(document.activeElement)) {
         currentStatus.replaceWith(nextStatus);
       }
+      synchronizeRetainedSettingsSurface(
+        currentSettingsModal,
+        nextSettingsModal,
+        model.local.configMutationPending || model.local.sessionSettings.mutationPending,
+        state.overlay === "session_settings"
+          ? !model.local.sessionSettings.dirty
+          : !uiState.configDirty,
+      );
       retainedConnectedSettings = true;
     }
   }
@@ -1254,6 +1415,10 @@ function renderCommitted(
   if (focusSnapshotIntent) postRenderFocusIntents.push(focusSnapshotIntent);
   const settingsActionFocusContinuation = uiState.settingsActionFocusContinuation;
   uiState.settingsActionFocusContinuation = null;
+  const settingsActionModal = settingsActionFocusContinuation
+    && settingsActionFocusStillTargets(settingsActionFocusContinuation, state)
+    ? document.querySelector<HTMLElement>(".settings-modal")
+    : null;
   if (settingsActionFocusContinuation) {
     postRenderFocusIntents.push({
       source: "settings-action",
@@ -1261,7 +1426,9 @@ function renderCommitted(
       claim: { kind: "unowned" },
       candidates: settingsActionFocusCandidates(
         settingsActionFocusContinuation,
-        (selector) => document.querySelector<HTMLElement>(selector),
+        (selector) => selector === ".settings-modal"
+          ? settingsActionModal
+          : settingsActionModal?.querySelector<HTMLElement>(selector) ?? null,
       ),
       isCurrent: () => settingsActionFocusStillTargets(
         settingsActionFocusContinuation,
@@ -1299,7 +1466,12 @@ function renderCommitted(
   const titlebarMenuFocusReserved = titlebarMenuFocusIntent !== null;
   if (titlebarMenuFocusIntent) postRenderFocusIntents.push(titlebarMenuFocusIntent);
   wireEvents(state, eventContext);
-  const overlayPrimaryFocusIntent = focusOverlayPrimary(state, uiState);
+  // A current Settings continuation is already constrained to the exact modal owner and ends
+  // with that dialog as its fallback. Do not let the generic modal-primary intent replace the
+  // requested return target with the first Settings field after a nested dialog is rebuilt.
+  const overlayPrimaryFocusIntent = settingsActionModal
+    ? null
+    : focusOverlayPrimary(state, uiState);
   if (overlayPrimaryFocusIntent) postRenderFocusIntents.push(overlayPrimaryFocusIntent);
   if (
     historyPrependTransition.focusContinuation
@@ -1667,7 +1839,7 @@ function reconcileUiLocalState(
   if (attachmentFocusDecision.trayOpen !== null) {
     uiState.attachmentTrayOpen = attachmentFocusDecision.trayOpen;
   }
-  if (uiState.pendingLocalConfirmation && !localConfirmationStillTargetsRow(uiState.pendingLocalConfirmation, state)) {
+  if (uiState.pendingLocalConfirmation && !localConfirmationStillTargetsOwner(uiState.pendingLocalConfirmation, state)) {
     uiState.pendingLocalConfirmation = null;
     finishLocalDecision(uiState);
   }
@@ -1800,7 +1972,10 @@ function captureFocusSnapshot(previous: DesktopViewState | null, state: DesktopV
   if (
     !previous
     || modalIdentity(previous) !== modalIdentity(state)
-    || (previous.overlay === "config" && !sameSettingsSurface(previous, state))
+    || (
+      (previous.overlay === "config" || previous.overlay === "session_settings")
+      && !sameSettingsSurface(previous, state)
+    )
   ) {
     return null;
   }
@@ -1995,7 +2170,10 @@ function captureDetailSnapshots(
     !previous ||
     selectedSessionIdentity(previous) !== selectedSessionIdentity(state) ||
     modalIdentity(previous) !== modalIdentity(state) ||
-    (previous.overlay === "config" && !sameSettingsSurface(previous, state))
+    (
+      (previous.overlay === "config" || previous.overlay === "session_settings")
+      && !sameSettingsSurface(previous, state)
+    )
   ) {
     return [];
   }
@@ -2250,10 +2428,29 @@ function setWindowMaximized(maximized: boolean): void {
   button.querySelector<HTMLElement>(".maximize-icon")?.classList.toggle("restore", maximized);
 }
 
-function localConfirmationStillTargetsRow(
+function localConfirmationStillTargetsOwner(
   confirmation: NonNullable<typeof uiState.pendingLocalConfirmation>,
   state: DesktopWebState
 ): boolean {
+  if (confirmation.kind === "settings_close") {
+    return uiState.configDirty
+      && settingsCloseTargetStillMatches(confirmation.expectedTarget, state);
+  }
+  if (confirmation.kind === "session_settings_close") {
+    const target = state.session_settings.target;
+    const owner = uiState.sessionSettings.owner;
+    return state.overlay === "session_settings"
+      && uiState.sessionSettings.dirty
+      && owner !== null
+      && sameSessionSettingsTarget(confirmation.expectedTarget, owner)
+      && (
+        target === null
+        || (
+          sameSessionSettingsRootOwner(confirmation.expectedTarget, target)
+          && sameSessionSettingsRootOwner(owner, target)
+        )
+      );
+  }
   if (confirmation.kind === "project") {
     const row = state.project_rows[confirmation.index];
     return row?.label === confirmation.title
@@ -2387,6 +2584,10 @@ function reportError(value: unknown): void {
   const error = humanizeError(value);
   if (currentState) {
     uiState.recoverableError = error;
+    uiState.recoverableErrorOwner = settingsRecoverableErrorOwnerIdentity(
+      projectViewState(currentState, uiState),
+      uiState.initialSetup.step,
+    );
     acceptState(currentState, true);
     return;
   }

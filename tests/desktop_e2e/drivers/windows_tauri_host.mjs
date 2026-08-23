@@ -49,6 +49,31 @@ async function optionalFileIdentity(candidate) {
   }
 }
 
+const SCENARIO_ENVIRONMENT_KEY = /^MOYAI_[A-Z0-9_]{2,95}$/;
+const HARNESS_OWNED_ENVIRONMENT = new Set([
+  "MOYAI_CONFIG_PATH",
+  "MOYAI_DATA_DIR",
+  "MOYAI_DESKTOP_PREFS_PATH",
+]);
+
+export function normalizeScenarioEnvironment(value) {
+  if (value === undefined || value === null) return {};
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("scenario environment must be an object");
+  }
+  const normalized = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (!SCENARIO_ENVIRONMENT_KEY.test(key) || HARNESS_OWNED_ENVIRONMENT.has(key)) {
+      throw new TypeError(`scenario environment key is not allowed: ${key}`);
+    }
+    if (typeof entry !== "string" || entry.includes("\0")) {
+      throw new TypeError(`scenario environment value is invalid: ${key}`);
+    }
+    normalized[key] = entry;
+  }
+  return normalized;
+}
+
 export function selectActiveCleanupDriver(currentDriver, initialDriver, { restartBegan }) {
   if (typeof restartBegan !== "boolean") throw new TypeError("restartBegan must be boolean");
   return currentDriver ?? (restartBegan ? null : initialDriver);
@@ -147,7 +172,7 @@ export class WindowsTauriHost {
     }, { phase, owner: "run-context" });
   }
 
-  async launch({ context, sink, phase }) {
+  async launch({ context, scenario, sink, phase }) {
     this.#generation += 1;
     const stdout = this.#generation === 1
       ? context.paths.stdout
@@ -162,6 +187,7 @@ export class WindowsTauriHost {
       cwd: context.paths.workspace,
       env: {
         ...process.env,
+        ...normalizeScenarioEnvironment(scenario.environment),
         MOYAI_CONFIG_PATH: context.paths.config_file,
         MOYAI_DATA_DIR: context.paths.data,
         MOYAI_DESKTOP_PREFS_PATH: context.paths.prefs_file,

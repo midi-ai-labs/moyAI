@@ -13,6 +13,14 @@ use crate::tool::truncate::clip_text_with_ellipsis;
 
 pub const MAX_DOCLING_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_DOCLING_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_DOCLING_READINESS_TIMEOUT_MS: u64 = 5_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoclingReadinessResult {
+    pub endpoint: String,
+    pub http_status: u16,
+    pub ready: bool,
+}
 
 #[derive(Debug)]
 pub struct DoclingLocalInput {
@@ -64,6 +72,33 @@ impl DoclingClient {
 
     pub fn config(&self) -> &DoclingConfig {
         &self.config
+    }
+
+    pub async fn check_readiness(&self) -> Result<DoclingReadinessResult, ToolError> {
+        if !self.config.enabled {
+            return Err(ToolError::Message(
+                "docling readiness check requires docling.enabled=true".to_string(),
+            ));
+        }
+        let base_url = crate::config::model::canonical_docling_base_url(&self.config.base_url)
+            .map_err(ToolError::Message)?;
+        let endpoint = endpoint(&base_url, "/ready");
+        let response = self
+            .request_builder(&endpoint, reqwest::Method::GET)?
+            .timeout(Duration::from_millis(docling_readiness_timeout_ms(
+                self.config.timeout_ms,
+            )))
+            .send()
+            .await
+            .map_err(|error| {
+                ToolError::Message(format!("docling readiness request failed: {error}"))
+            })?;
+        let status = response.status();
+        Ok(DoclingReadinessResult {
+            endpoint,
+            http_status: status.as_u16(),
+            ready: status.is_success(),
+        })
     }
 
     pub async fn convert(
@@ -220,6 +255,10 @@ impl DoclingClient {
 
 pub fn normalize_docling_base_url(base_url: &str) -> String {
     base_url.trim().trim_end_matches('/').to_string()
+}
+
+pub fn docling_readiness_timeout_ms(configured_timeout_ms: u64) -> u64 {
+    configured_timeout_ms.clamp(1, MAX_DOCLING_READINESS_TIMEOUT_MS)
 }
 
 fn append_convert_form_fields(mut form: Form, request: &DoclingConvertRequest) -> Form {
@@ -464,6 +503,52 @@ mod tests {
     use axum::routing::any;
 
     use super::*;
+
+    #[test]
+    fn readiness_timeout_is_bounded_independently_from_conversion_timeout() {
+        assert_eq!(docling_readiness_timeout_ms(0), 1);
+        assert_eq!(docling_readiness_timeout_ms(250), 250);
+        assert_eq!(
+            docling_readiness_timeout_ms(120_000),
+            MAX_DOCLING_READINESS_TIMEOUT_MS
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_readiness_check_returns_typed_http_status() {
+        for (response_status, ready) in [
+            (StatusCode::NO_CONTENT, true),
+            (StatusCode::SERVICE_UNAVAILABLE, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind Docling readiness fixture");
+            let address = listener.local_addr().expect("fixture address");
+            let app = Router::new().fallback(any(move || async move { response_status }));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve Docling readiness fixture");
+            });
+            let client = DoclingClient::new(DoclingConfig {
+                enabled: true,
+                base_url: format!("http://{address}/"),
+                timeout_ms: 120_000,
+                api_key_env: None,
+                headers: BTreeMap::new(),
+            });
+
+            let result = client
+                .check_readiness()
+                .await
+                .expect("HTTP response is a typed readiness result");
+
+            assert_eq!(result.endpoint, format!("http://{address}/ready"));
+            assert_eq!(result.http_status, response_status.as_u16());
+            assert_eq!(result.ready, ready);
+            server.abort();
+        }
+    }
 
     #[tokio::test]
     async fn typed_effect_admission_is_checked_at_docling_send_boundary() {

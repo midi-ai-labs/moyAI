@@ -118,16 +118,46 @@ export function lineValue(text: string, label: string): string {
   return line ? line.slice(prefix.length).trim() : "";
 }
 
+export interface ConfigFieldValue {
+  key: string;
+  text: string;
+}
+
+/** Mirrors Rust's canonical Docling base URL plus its explicit `/ready` route. */
+export function doclingReadinessEndpoint(rawBaseUrl: string): string | null {
+  try {
+    const url = new URL(rawBaseUrl.trim());
+    if ((url.protocol !== "http:" && url.protocol !== "https:")
+      || !url.hostname
+      || url.username
+      || url.password
+      || url.search
+      || url.hash
+    ) return null;
+    const path = url.pathname.replace(/\/+$/, "");
+    url.pathname = `${path || ""}/ready`;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 export function validateConfigInput(
   field: ConfigFieldProjection,
   rawValue: string,
+  contextualValues: readonly ConfigFieldValue[] = [],
 ): { ok: boolean; message: string } {
   const value = rawValue.trim();
+  const doclingDisabled = contextualValues.find(({ key }) => key === "docling.enabled")
+    ?.text.trim().toLowerCase() === "false";
+  if (field.key === "docling.base_url" && doclingDisabled) {
+    return { ok: true, message: "Doclingが無効な間は入力値を保持します。" };
+  }
   if (value.length === 0) {
     if (field.required) return { ok: false, message: "値を入力してください。" };
     return { ok: true, message: "空欄は継承または削除として扱います。" };
   }
-  if (field.key === "model.base_url") {
+  if (field.key === "model.base_url" || field.key === "docling.base_url") {
     const validation = validateProviderBaseUrl(value);
     if (!validation.ok) return { ok: false, message: validation.message };
   } else if (field.key.endsWith("base_url")) {
@@ -179,11 +209,6 @@ export function validateConfigInput(
   return { ok: true, message: "入力形式は問題ありません。" };
 }
 
-export interface ConfigFieldValue {
-  key: string;
-  text: string;
-}
-
 export interface ConfigFieldValidationResult {
   ok: boolean;
   invalidKey: string | null;
@@ -192,8 +217,8 @@ export interface ConfigFieldValidationResult {
 
 /** Use the same field parser metadata for live DOM validation and render-time commit gating. */
 export function validateConfigFieldValues(
-  fields: ConfigFieldProjection[],
-  values: ConfigFieldValue[] = fields.map((field) => ({ key: field.key, text: field.value })),
+  fields: readonly ConfigFieldProjection[],
+  values: readonly ConfigFieldValue[] = fields.map((field) => ({ key: field.key, text: field.value })),
 ): ConfigFieldValidationResult {
   const fieldsByKey = new Map(fields.map((field) => [field.key, field]));
   for (const value of values) {
@@ -205,7 +230,7 @@ export function validateConfigFieldValues(
         message: "設定項目が見つかりません。",
       };
     }
-    const validation = validateConfigInput(field, value.text);
+    const validation = validateConfigInput(field, value.text, values);
     if (!validation.ok) {
       return {
         ok: false,

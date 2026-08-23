@@ -28,6 +28,12 @@ import {
 } from "./task_activity_indicator.ts";
 import { titlebarMenuPopupRole } from "./titlebar_interaction.ts";
 import {
+  INITIAL_SETUP_STEPS,
+  initialSetupStepIndex,
+  validateInitialSetupStep,
+  type InitialSetupStep,
+} from "./initial_setup_state.ts";
+import {
   DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
   createDesktopRenderModel,
   type DesktopRenderLocalPresentation,
@@ -106,6 +112,28 @@ const TYPED_CONFIG_KEYS: readonly string[] = Object.freeze([
   "mcp.servers_json",
 ]);
 
+const INITIAL_SETUP_PROVIDER_KEYS = new Set([
+  "model.base_url",
+  "model.provider_metadata_mode",
+  "model.context_window",
+  "model.max_output_tokens",
+]);
+const INITIAL_SETUP_MODEL_PRIMARY_KEYS = new Set([
+  "model.model",
+  "model.supports_tools",
+  "model.supports_reasoning",
+  "model.supports_images",
+  "model.parallel_tool_calls",
+]);
+const INITIAL_SETUP_TOOL_PRIMARY_KEYS = new Set([
+  "docling.enabled",
+  "docling.base_url",
+  "docling.timeout_ms",
+  "docling.api_key_env",
+  "mcp.enabled",
+  "mcp.servers_json",
+]);
+
 export interface DesktopMarkupOptions {
   readonly backgroundInert: boolean;
   readonly taskActivityDelay: string;
@@ -118,9 +146,22 @@ export function renderDesktopMarkup(
 ): string {
   const state = model.view;
   const local = model.local;
+  if (startupSetupRequired(state) && state.overlay === "initial_setup") {
+    const setupMarkup = `
+      <div class="app-frame initial-setup-frame" style="--window-opacity: ${state.window_opacity_percent / 100}">
+        ${renderTitlebar(local.windowMaximized, true, "")}
+        ${renderInitialSetupWizard(state, local)}
+      </div>
+      ${state.confirmation_visible ? renderConfirmation(state, local.modal.permissionDecision) : ""}
+    `;
+    return applyActionAvailabilityToButtons(setupMarkup, model);
+  }
   const localConfirmationPending = local.modal.localConfirmation !== null;
+  const settingsClosePending = local.modal.localConfirmation?.kind === "settings_close"
+    || local.modal.localConfirmation?.kind === "session_settings_close";
   const sideChatDeletePending = local.sideChat.deleteConfirmation !== null;
-  const localModalPending = localConfirmationPending || sideChatDeletePending;
+  const localModalObscuresOverlay = (localConfirmationPending && !settingsClosePending)
+    || sideChatDeletePending;
   const markup = `
     <div class="app-frame ${local.artifactPane.collapsed ? "artifact-collapsed" : ""} ${!local.artifactPane.collapsed && local.artifactPane.mode === "side_chat" ? "side-chat-open" : ""}" style="--window-opacity: ${state.window_opacity_percent / 100}; --task-activity-delay: ${options.taskActivityDelay}">
       ${renderTitlebar(local.windowMaximized, options.backgroundInert, state.overlay)}
@@ -137,6 +178,8 @@ export function renderDesktopMarkup(
         ${renderArtifactPane(state, local)}
       </div>
     </div>
+    ${state.confirmation_visible ? renderConfirmation(state, local.modal.permissionDecision) : ""}
+    ${!state.confirmation_visible && !localModalObscuresOverlay && state.overlay !== "none" ? renderOverlay(state, local, model) : ""}
     ${
       !state.confirmation_visible && local.modal.localConfirmation
         ? renderLocalConfirmation(
@@ -151,8 +194,6 @@ export function renderDesktopMarkup(
         ? renderSideChatDeleteConfirmation(state, local)
         : ""
     }
-    ${state.confirmation_visible ? renderConfirmation(state, local.modal.permissionDecision) : ""}
-    ${!state.confirmation_visible && !localModalPending && state.overlay !== "none" ? renderOverlay(state, local, model) : ""}
     ${options.backgroundInert ? "" : renderRecoverableError(local.recoverableError)}
   `;
   return applyActionAvailabilityToButtons(markup, model);
@@ -237,6 +278,446 @@ function startupCheckMark(status: string): string {
   if (status === "warning") return "!";
   if (status === "fail") return "NG";
   return "…";
+}
+
+const INITIAL_SETUP_STEP_LABELS: Readonly<Record<InitialSetupStep, string>> = {
+  start: "開始 / Import",
+  provider: "LLM Provider",
+  model: "Model",
+  permissions: "Permissions",
+  tools: "Optional Tools",
+  finish: "Finish",
+};
+
+function renderInitialSetupWizard(
+  state: DesktopViewState,
+  local: Readonly<DesktopRenderLocalPresentation>,
+): string {
+  const step = local.initialSetup.step;
+  const stepIndex = initialSetupStepIndex(step);
+  const values = state.config_fields.map((field) => ({ key: field.key, text: field.value }));
+  const validation = validateInitialSetupStep(step, state.config_fields, values);
+  const auxiliaryKind = local.initialSetup.auxiliaryPendingKind;
+  const pending = local.initialSetup.finishPending
+    || local.configMutationPending
+    || auxiliaryKind !== null;
+  const pendingMessage = local.initialSetup.finishPending || local.configMutationPending
+    ? "設定を保存しています…"
+    : auxiliaryKind === "import"
+      ? "TOML設定を読み込んでいます…"
+      : auxiliaryKind === "docling_readiness"
+        ? "Doclingの接続確認を開始しています…"
+        : "";
+  return `
+    <main class="initial-setup-shell" data-surface="initial-setup" data-current-step="${step}" aria-labelledby="initial-setup-title" aria-busy="${String(pending)}">
+      <aside class="initial-setup-progress" aria-label="初期設定の進行状況">
+        <div class="initial-setup-brand">
+          <span>moyAI</span>
+          <strong>Initial Setup</strong>
+        </div>
+        <ol>
+          ${INITIAL_SETUP_STEPS.map((candidate, index) => `
+            <li data-step="${candidate}" data-step-state="${index < stepIndex ? "complete" : index === stepIndex ? "current" : "upcoming"}" aria-label="${index + 1}. ${escapeHtml(INITIAL_SETUP_STEP_LABELS[candidate])}" ${index === stepIndex ? 'aria-current="step"' : ""}>
+              <span>${index + 1}</span>
+              <strong>${escapeHtml(INITIAL_SETUP_STEP_LABELS[candidate])}</strong>
+            </li>
+          `).join("")}
+        </ol>
+        <p>外部サービスへの接続確認は明示操作だけで実行され、保存完了の条件にはなりません。</p>
+      </aside>
+      <section class="initial-setup-workspace">
+        <header class="initial-setup-header">
+          <div>
+            <small>STEP ${stepIndex + 1} / ${INITIAL_SETUP_STEPS.length}</small>
+            <h1 id="initial-setup-title">${escapeHtml(INITIAL_SETUP_STEP_LABELS[step])}</h1>
+          </div>
+          <span class="initial-setup-reason">${escapeHtml(initialSetupReasonLabel(state.startup.initial_setup_reason))}</span>
+        </header>
+        <div class="initial-setup-content" data-step-panel="${step}">
+          ${renderInitialSetupStep(state, local, step)}
+        </div>
+        <div id="settings-validation" class="initial-setup-validation validation ${validation.ok ? "ok" : "error"}" data-settings-live-region="initial-setup-validation" role="status" aria-live="polite">
+          ${escapeHtml(pending ? pendingMessage : validation.ok ? validation.message : `${validation.invalidKey}: ${validation.message}`)}
+        </div>
+        ${renderInitialSetupRecoverableError(local.recoverableError)}
+        <footer class="initial-setup-actions">
+          <button data-action="initial-setup-back" ${step === "start" ? "hidden" : ""}>前へ</button>
+          <span>${step === "finish" ? "保存後に通常のDesktopを開きます。" : "入力値はFinishまで保存されません。"}</span>
+          ${step === "finish"
+            ? `<button id="initial-setup-primary" class="send wide-send" data-action="finish-initial-setup">${pending ? "保存しています…" : "設定を保存してmoyAIを開く"}</button>`
+            : `<button id="initial-setup-primary" class="send" data-action="initial-setup-next">次へ</button>`}
+        </footer>
+      </section>
+    </main>
+  `;
+}
+
+function renderInitialSetupRecoverableError(
+  error: DesktopRenderLocalPresentation["recoverableError"],
+): string {
+  return renderSettingsRecoverableError(
+    error,
+    "initial-setup-recoverable-error",
+    "initial-setup-error-notice",
+  );
+}
+
+function renderSettingsRecoverableError(
+  error: DesktopRenderLocalPresentation["recoverableError"],
+  identity: string,
+  extraClass = "",
+): string {
+  const visible = error !== null;
+  return `
+    <aside id="${identity}" class="ui-error-notice ${extraClass}" data-settings-passive="${identity}" data-settings-preserve-focused-region role="alert" aria-live="assertive" aria-atomic="true" ${visible ? "" : 'hidden aria-hidden="true"'}>
+      <div>
+        <strong>${visible ? escapeHtml(error.title) : ""}</strong>
+        <span>${visible ? escapeHtml(error.hint) : ""}</span>
+        ${visible && error.details.trim().length > 0 ? `<details data-details-key="${identity}-details"><summary data-focus-key="${identity}-summary">技術詳細</summary><pre>${escapeHtml(error.details)}</pre></details>` : ""}
+      </div>
+      <button class="icon-button" data-action="dismiss-ui-error" title="閉じる" aria-label="エラー通知を閉じる" ${visible ? "" : "hidden"}>×</button>
+    </aside>
+  `;
+}
+
+function initialSetupReasonLabel(
+  reason: DesktopWebState["startup"]["initial_setup_reason"],
+): string {
+  if (reason === "config_missing") return "設定ファイルがありません";
+  if (reason === "provider_invalid") return "Provider設定の確認が必要です";
+  if (reason === "optional_tool_invalid") return "Optional Tool設定の確認が必要です";
+  return "ローカル設定を確認してください";
+}
+
+function renderInitialSetupStep(
+  state: DesktopViewState,
+  local: Readonly<DesktopRenderLocalPresentation>,
+  step: InitialSetupStep,
+): string {
+  if (step === "start") return renderInitialSetupStartStep(state, local);
+  if (step === "provider") return renderInitialSetupProviderStep(state);
+  if (step === "model") return renderInitialSetupModelStep(state);
+  if (step === "permissions") return renderInitialSetupPermissionsStep(state);
+  if (step === "tools") return renderInitialSetupToolsStep(state, local);
+  return renderInitialSetupFinishStep(state, local);
+}
+
+function renderInitialSetupStartStep(
+  state: DesktopViewState,
+  local: Readonly<DesktopRenderLocalPresentation>,
+): string {
+  const configPath = state.startup.global_config_path ?? state.startup.setup_target?.globalConfigPath ?? "";
+  const importedSourcePath = local.initialSetup.importedSourcePath;
+  const importing = local.initialSetup.auxiliaryPendingKind === "import";
+  return `
+    <section class="initial-setup-section" aria-labelledby="initial-setup-start-heading">
+      <div class="initial-setup-intro">
+        <h2 id="initial-setup-start-heading">ローカル環境の設定を始めます</h2>
+        <p>既定値を確認しながら進むか、既存のTOML設定を読み込めます。ファイル名は任意ですが、拡張子と全設定schemaを保存前に検証します。</p>
+      </div>
+      <dl class="initial-setup-path">
+        <dt>保存先</dt>
+        <dd title="${escapeHtml(configPath)}">${escapeHtml(configPath || "保存先を取得できませんでした")}</dd>
+      </dl>
+      <div class="initial-setup-choice-row">
+        <div>
+          <strong>既定値から設定</strong>
+          <p>次へ進み、Provider、Model、Permissions、Optional Toolsを順に確認します。</p>
+        </div>
+        <div>
+          <strong>既存TOMLをImport</strong>
+          <p>選択したTOMLを検証し、Wizardのdraftへだけ読み込みます。ディスクへの保存とruntime reloadはFinishまで行いません。</p>
+          <button data-action="import-config-toml" aria-describedby="initial-setup-import-help" aria-busy="${String(importing)}">${importing ? "読み込んでいます…" : "TOML設定を選択"}</button>
+          <small id="initial-setup-import-help" class="settings-field-help" data-settings-passive="initial-setup-import-source">${importedSourcePath
+            ? `読込元: ${escapeHtml(importedSourcePath)}。内容はまだ保存されていません。`
+            : "キャンセルした場合、現在のdraftは変わりません。"}</small>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderInitialSetupProviderStep(state: DesktopViewState): string {
+  return `
+    <section class="initial-setup-section" aria-labelledby="initial-setup-provider-heading">
+      <div class="initial-setup-intro">
+        <h2 id="initial-setup-provider-heading">ローカルLLMの接続先</h2>
+        <p>URLとProvider metadata modeを設定します。到達できない値も、形式が正しければ保存できます。</p>
+      </div>
+      <div class="settings-grid-two initial-setup-form-grid">
+        ${renderConfigTextField(state, "model.base_url", "Base URL", "url", "", { initialSetup: true })}
+        ${renderConfigEnumField(state, "model.provider_metadata_mode", "Provider mode", {
+          lm_studio_native_required: "LM Studio metadata API",
+          openai_compatible_only: "OpenAI compatible",
+        }, { initialSetup: true })}
+        ${renderConfigTextField(state, "model.context_window", "Context window", "number", "", { initialSetup: true })}
+        ${renderConfigTextField(state, "model.max_output_tokens", "Max output tokens", "number", "", { initialSetup: true })}
+      </div>
+      <div class="initial-setup-note">ProviderへのHTTP requestはこのstepを進むだけでは送信されません。</div>
+    </section>
+  `;
+}
+
+function renderInitialSetupModelStep(state: DesktopViewState): string {
+  const modelField = configField(state, "model.model");
+  const currentModel = modelField?.field.value ?? "";
+  const options = state.provider_model_ids.map((id, index) => ({
+    id,
+    label: state.provider_models[index] ?? id,
+  }));
+  if (currentModel && !options.some((option) => option.id === currentModel)) {
+    options.unshift({ id: currentModel, label: `${currentModel}（現在の入力）` });
+  }
+  const describedBy = modelField
+    ? configFieldDescriptionIds(modelField.field, [], false)
+    : "settings-validation";
+  const advancedFields = state.config_fields.filter((field) => (
+    field.key.startsWith("model.")
+    && !INITIAL_SETUP_PROVIDER_KEYS.has(field.key)
+    && !INITIAL_SETUP_MODEL_PRIMARY_KEYS.has(field.key)
+  ));
+  return `
+    <section class="initial-setup-section" aria-labelledby="initial-setup-model-heading">
+      <div class="settings-section-head initial-setup-intro">
+        <div>
+          <h2 id="initial-setup-model-heading">使用するModel</h2>
+          <p>モデル一覧の取得は任意です。一覧がなくてもModel IDを直接入力できます。</p>
+        </div>
+        <button data-action="load-provider-models">${state.provider_loading ? "読込中…" : "モデル一覧を読み込む"}</button>
+      </div>
+      ${modelField ? `
+        <div class="settings-grid-two initial-setup-form-grid">
+          <div class="settings-field">
+            <label for="initial-setup-model-select">モデル候補</label>
+            <select id="initial-setup-model-select" class="settings-control" data-main-provider-model-control data-config-index="${modelField.index}" data-config-key="model.model" aria-describedby="${describedBy}" ${options.length > 0 ? "" : "disabled"}>
+              ${options.map((option) => `<option value="${escapeHtml(option.id)}" ${option.id === currentModel ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}
+            </select>
+            <small class="settings-field-help">明示的に取得した現在のProvider候補です。</small>
+          </div>
+          <div class="settings-field">
+            <label for="initial-setup-model-manual">Model ID</label>
+            <input id="initial-setup-model-manual" class="settings-control" data-main-provider-model-control data-config-index="${modelField.index}" data-config-key="model.model" value="${escapeHtml(currentModel)}" autocomplete="off" spellcheck="false" aria-describedby="${describedBy}" />
+            ${renderConfigFieldHelp(modelField.field, "一覧にないModel IDも入力できます。")}
+          </div>
+        </div>
+      ` : renderMissingConfigField("model.model")}
+      <div class="settings-toggle-grid initial-setup-capabilities">
+        ${renderConfigToggleField(state, "model.supports_tools", "Tools", { initialSetup: true })}
+        ${renderConfigToggleField(state, "model.supports_reasoning", "Reasoning", { initialSetup: true })}
+        ${renderConfigToggleField(state, "model.supports_images", "Images", { initialSetup: true })}
+        ${renderConfigToggleField(state, "model.parallel_tool_calls", "Parallel tool calls", { initialSetup: true })}
+      </div>
+      ${renderInitialSetupAdvancedSection(
+        state,
+        "model",
+        advancedFields,
+        "initial-setup-model-advanced",
+        "Model詳細設定（Advanced）",
+      )}
+      <div class="provider-status ${state.provider_status.kind === "success" ? "ok" : state.provider_status.kind}" data-settings-live-region="initial-setup-provider-status" role="status" aria-live="polite">
+        <strong>${escapeHtml(state.provider_status.title)}</strong>
+        <p>${escapeHtml(state.provider_status.hint)}</p>
+      </div>
+    </section>
+  `;
+}
+
+function renderInitialSetupPermissionsStep(state: DesktopViewState): string {
+  return `
+    <section class="initial-setup-section" aria-labelledby="initial-setup-permissions-heading">
+      <div class="initial-setup-intro">
+        <h2 id="initial-setup-permissions-heading">ツール実行の承認方法</h2>
+        <p>この既定値は新しいchatへ使われます。root sessionを開いた後はSession Settingsから、そのsessionだけ変更できます。</p>
+      </div>
+      ${renderConfigEnumField(state, "permissions.access_mode", "Access mode", {
+        default: "承認を求める",
+        auto_review: "代理で承認",
+        full_access: "フルアクセス",
+      }, { initialSetup: true })}
+      <div class="initial-setup-permission-guide">
+        <div><strong>承認を求める</strong><span>副作用のある操作を人が確認します。</span></div>
+        <div><strong>代理で承認</strong><span>独立したGuardianが判断し、不成立時は安全側に拒否します。</span></div>
+        <div><strong>フルアクセス</strong><span>確認dialogなしで、現在のユーザー権限として実行します。</span></div>
+      </div>
+    </section>
+  `;
+}
+
+function renderInitialSetupToolsStep(
+  state: DesktopViewState,
+  local: Readonly<DesktopRenderLocalPresentation>,
+): string {
+  const doclingEnabled = configField(state, "docling.enabled")?.field.value.trim().toLowerCase() === "true";
+  const dependencyOptions: ConfigFieldRenderOptions = {
+    disabled: !doclingEnabled,
+    initialSetup: true,
+  };
+  const advancedFields = state.config_fields.filter((field) => (
+    (field.key.startsWith("docling.") || field.key.startsWith("mcp."))
+    && !INITIAL_SETUP_TOOL_PRIMARY_KEYS.has(field.key)
+  ));
+  return `
+    <section class="initial-setup-section" aria-labelledby="initial-setup-tools-heading">
+      <div class="initial-setup-intro">
+        <h2 id="initial-setup-tools-heading">Optional Tools</h2>
+        <p>DoclingとMCPは後からPreferencesで設定できます。無効のままでも初期設定を完了できます。</p>
+      </div>
+      <div class="initial-setup-tool-band">
+        <div class="settings-section-head compact">
+          <div><h3>Docling</h3><p>PDF / DOCXなどの構造化document変換。</p></div>
+          <div class="settings-tool-actions">
+            ${renderConfigToggleField(state, "docling.enabled", "Doclingを有効化", { initialSetup: true })}
+            <button data-action="check-docling-readiness" aria-controls="docling-readiness-status" aria-busy="${String(local.initialSetup.auxiliaryPendingKind === "docling_readiness")}">${local.initialSetup.auxiliaryPendingKind === "docling_readiness" ? "確認中…" : "Test Docling"}</button>
+            <span class="settings-field-help">現在のdraftを保存せず、明示操作で接続だけ確認します。</span>
+          </div>
+        </div>
+        <div class="settings-grid-two">
+          ${renderConfigTextField(state, "docling.base_url", "Docling base URL", "url", "", dependencyOptions)}
+          ${renderConfigTextField(state, "docling.timeout_ms", "Timeout ms", "number", "", dependencyOptions)}
+          ${renderConfigTextField(state, "docling.api_key_env", "API key env", "text", "", dependencyOptions)}
+        </div>
+        ${renderDoclingReadiness(
+          state,
+          local.initialSetup.auxiliaryPendingKind === "docling_readiness",
+          {
+            allowDirtyDraft: true,
+            projectedResultVisible: local.initialSetup.doclingReadinessVisible,
+          },
+        )}
+      </div>
+      <div class="initial-setup-tool-band">
+        <div class="settings-section-head compact">
+          <div><h3>MCP</h3><p>明示設定したHTTP MCP serverだけを利用します。</p></div>
+          ${renderConfigToggleField(state, "mcp.enabled", "MCPを有効化", { initialSetup: true })}
+        </div>
+        <details data-details-key="initial-setup-mcp-advanced">
+          <summary>MCP server設定（Advanced）</summary>
+          ${renderConfigJsonField(state, "mcp.servers_json", "MCP servers JSON", { initialSetup: true })}
+        </details>
+      </div>
+      ${renderInitialSetupAdvancedSection(
+        state,
+        "tools",
+        advancedFields,
+        "initial-setup-tools-advanced",
+        "Optional Tools詳細設定（Advanced）",
+      )}
+    </section>
+  `;
+}
+
+function renderInitialSetupFinishStep(
+  state: DesktopViewState,
+  local: Readonly<DesktopRenderLocalPresentation>,
+): string {
+  const warnings = [
+    ...state.startup.checks.filter((check) => check.status !== "pass").map((check) => check.message),
+    ...(state.provider_status.kind === "warning" || state.provider_status.kind === "error"
+      ? [state.provider_status.hint]
+      : []),
+    ...(local.initialSetup.doclingReadinessVisible
+      && state.docling_readiness.status === "unavailable"
+      ? [state.docling_readiness.message]
+      : []),
+  ].filter((message, index, all) => message.trim().length > 0 && all.indexOf(message) === index);
+  const advancedFields = state.config_fields.filter((field) => (
+    !field.key.startsWith("model.")
+    && !field.key.startsWith("docling.")
+    && !field.key.startsWith("mcp.")
+    && field.key !== "permissions.access_mode"
+  ));
+  return `
+    <section class="initial-setup-section" aria-labelledby="initial-setup-finish-heading">
+      <div class="initial-setup-intro">
+        <h2 id="initial-setup-finish-heading">保存内容を確認</h2>
+        <p>ローカルschema検証を通過した設定だけを、表示中の保存先へ一度のtransactionで保存します。</p>
+      </div>
+      <div class="initial-setup-review-grid" data-settings-live-region="initial-setup-review">
+        <section aria-labelledby="initial-setup-diff-heading">
+          <h3 id="initial-setup-diff-heading">変更予定</h3>
+          ${local.initialSetup.differences.length === 0
+            ? '<p class="initial-setup-empty-review">既定値をそのまま保存します。</p>'
+            : `<dl class="initial-setup-diff">${local.initialSetup.differences.map((entry) => `
+                <div><dt>${escapeHtml(entry.key)}</dt><dd><del>${escapeHtml(entry.before || "(未設定)")}</del><ins>${escapeHtml(entry.after || "(未設定)")}</ins></dd></div>
+              `).join("")}</dl>`}
+        </section>
+        <section aria-labelledby="initial-setup-warning-heading">
+          <h3 id="initial-setup-warning-heading">Diagnostics</h3>
+          ${warnings.length === 0
+            ? '<p class="initial-setup-empty-review">保存を妨げるwarningはありません。外部接続の未確認は実行時にtyped errorとして表示されます。</p>'
+            : `<ul class="initial-setup-warnings">${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>`}
+        </section>
+      </div>
+      <dl class="initial-setup-path compact">
+        <dt>保存先</dt><dd>${escapeHtml(state.startup.global_config_path ?? state.startup.setup_target?.globalConfigPath ?? "")}</dd>
+      </dl>
+      ${renderInitialSetupAdvancedSection(
+        state,
+        "finish",
+        advancedFields,
+        "initial-setup-finish-advanced",
+        "その他の設定（Advanced）",
+      )}
+    </section>
+  `;
+}
+
+function renderInitialSetupAdvancedSection(
+  state: DesktopViewState,
+  step: InitialSetupStep,
+  fields: readonly ConfigFieldProjection[],
+  detailsKey: string,
+  title: string,
+): string {
+  if (fields.length === 0) return "";
+  const validation = validateInitialSetupStep(
+    step,
+    state.config_fields,
+    state.config_fields.map((field) => ({ key: field.key, text: field.value })),
+  );
+  const invalidKey = validation.ok ? null : validation.invalidKey;
+  const invalidHere = invalidKey !== null && fields.some((field) => field.key === invalidKey);
+  const alertId = `${detailsKey}-validation`;
+  return `
+    <details class="initial-setup-advanced" data-details-key="${detailsKey}" ${invalidHere ? "open" : ""}>
+      <summary>${escapeHtml(title)} <span>${fields.length}項目</span></summary>
+      <p class="settings-field-help">通常は変更不要です。各項目はprojected typeとschema制約に沿って編集されます。</p>
+      ${invalidHere ? `<p id="${alertId}" class="initial-setup-advanced-error" role="alert">${escapeHtml(invalidKey)}: ${escapeHtml(validation.message)}。下の該当項目を修正してください。</p>` : ""}
+      <div class="settings-grid-two initial-setup-advanced-grid">
+        ${fields.map((field) => renderInitialSetupTypedField(state, field)).join("")}
+      </div>
+    </details>
+  `;
+}
+
+function renderInitialSetupTypedField(
+  state: DesktopViewState,
+  field: ConfigFieldProjection,
+): string {
+  const options: ConfigFieldRenderOptions = { initialSetup: true };
+  if (field.value_type === "boolean") {
+    return renderConfigToggleField(state, field.key, field.key, options);
+  }
+  if (field.value_type === "enum" || field.options.length > 0) {
+    return renderConfigEnumField(
+      state,
+      field.key,
+      field.key,
+      Object.fromEntries(field.options.map((value) => [value, value])),
+      options,
+    );
+  }
+  if (field.value_type === "json") {
+    return renderConfigJsonField(state, field.key, field.key, options);
+  }
+  return renderConfigTextField(
+    state,
+    field.key,
+    field.key,
+    field.value_type === "integer" || field.value_type === "number" ? "number" : "text",
+    "",
+    options,
+  );
 }
 
 export function renderTitlebar(maximized = false, applicationCommandsInert = false, activeOverlay = ""): string {
@@ -488,6 +969,12 @@ export function renderTopbar(
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
   const exportDisabled = !state.history_export_enabled || !navigationIsIdle(state);
   const exportTitle = exportDisabled ? "保存できる表示中の履歴がありません" : "表示中の履歴をMarkdown保存";
+  const sessionSettingsAvailable = state.session_settings?.available === true
+    && state.session_settings.target !== null;
+  const modelSettingsAction = sessionSettingsAvailable ? "show-session-settings" : "show-provider";
+  const accessSettingsAction = sessionSettingsAvailable ? "show-session-settings" : "toggle-access";
+  const accessSettingsEnabled = sessionSettingsAvailable
+    || state.config_draft.access_mode_mutation_enabled;
   return `
     <header class="topbar">
       <div class="title-row">
@@ -507,10 +994,10 @@ export function renderTopbar(
         </div>
         <div class="chips">
           <button data-action="${projectContextAction}" title="${escapeHtml(state.workspace_path)}">${escapeHtml(workspaceLabel)}</button>
-          <button data-action="show-provider" title="${escapeHtml(state.provider_label)}">
+          <button data-action="${modelSettingsAction}" ${sessionSettingsAvailable ? 'data-session-settings-trigger="model"' : ""} title="${escapeHtml(sessionSettingsAvailable ? "このセッションのProvider / Model設定" : state.provider_label)}">
             <span>${escapeHtml(state.model_label)}</span><small>${escapeHtml(state.provider_label)}</small>
           </button>
-           <button data-action="toggle-access" title="権限モードを切り替え（承認を求める → 代理で承認 → フルアクセス）" aria-disabled="${state.config_draft.access_mode_mutation_enabled ? "false" : "true"}" ${state.config_draft.access_mode_mutation_enabled ? "" : "disabled"}>${escapeHtml(displayAccessLabel(state.access_label))}</button>
+          <button data-action="${accessSettingsAction}" ${sessionSettingsAvailable ? 'data-session-settings-trigger="access"' : ""} title="${sessionSettingsAvailable ? "このセッションのAccess mode設定" : "権限モードを切り替え（承認を求める → 代理で承認 → フルアクセス）"}" aria-disabled="${String(!accessSettingsEnabled)}" ${accessSettingsEnabled ? "" : "disabled"}>${escapeHtml(displayAccessLabel(state.access_label))}</button>
           <button class="icon-button" data-action="export-transcript" title="${exportTitle}" aria-label="${exportTitle}" ${exportDisabled ? "disabled" : ""}>${icon("download")}</button>
           <button class="icon-button responsive-output-toggle" data-action="toggle-artifact-pane" data-focus-key="artifact-pane-toggle" title="${local.artifactPane.collapsed ? "右ペインを表示" : "右ペインを閉じる"}" aria-label="${local.artifactPane.collapsed ? "右ペインを表示" : "右ペインを閉じる"}" aria-expanded="${local.artifactPane.collapsed ? "false" : "true"}">${icon("folder")}</button>
         </div>
@@ -1078,6 +1565,7 @@ export function renderOverlay(
 ): string {
   if (state.overlay === "provider") return renderProviderOverlay(state, local);
   if (state.overlay === "config") return renderConfigOverlay(state, local);
+  if (state.overlay === "session_settings") return renderSessionSettingsOverlay(state, local);
   if (state.overlay === "workspace") return renderWorkspaceOverlay(state);
   if (state.overlay === "prompt_review") return renderPromptReviewOverlay(state);
   if (state.overlay === "command_palette") return renderCommandPalette(state, renderModel);
@@ -1122,6 +1610,140 @@ function renderAboutOverlay(state: DesktopViewState): string {
         </div>
         <div class="modal-actions">
           <button data-action="close-overlay" autofocus>OK</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderSessionSettingsOverlay(
+  state: DesktopViewState,
+  local: Readonly<DesktopRenderLocalPresentation>,
+): string {
+  const projection = state.session_settings;
+  const draft = local.sessionSettings.draft;
+  const target = projection.target;
+  const pending = local.sessionSettings.mutationPending || local.configMutationPending;
+  const closeConfirmationPending = local.modal.localConfirmation?.kind === "session_settings_close";
+  if (!projection.available || target === null || draft === null) {
+    return `
+      <div class="modal-backdrop" ${closeConfirmationPending ? 'inert aria-hidden="true"' : ""}>
+        <section class="modal settings-modal session-settings-modal" data-modal="session-settings" data-surface="session-settings" role="dialog" aria-modal="true" aria-labelledby="session-settings-dialog-title" tabindex="-1">
+          <div class="settings-header">
+            <div>
+              <h2 id="session-settings-dialog-title">Session Settings</h2>
+              <p>${escapeHtml(projection.unavailable_reason || "root sessionを選択すると設定できます。")}</p>
+            </div>
+            <button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>
+          </div>
+          ${renderSettingsRecoverableError(
+            local.recoverableError,
+            "session-settings-recoverable-error",
+            "session-settings-error-notice",
+          )}
+          <div class="session-settings-unavailable" role="status">${escapeHtml(projection.unavailable_reason || "この画面では変更できるsessionがありません。")}</div>
+        </section>
+      </div>
+    `;
+  }
+
+  const validation = local.sessionSettings.validation;
+  const staleTarget = local.sessionSettings.availability.staleTarget === true;
+  const providerDisabled = pending || staleTarget || !projection.provider_mutation_enabled;
+  const accessDisabled = pending || staleTarget || !projection.access_mutation_enabled;
+  const fieldInvalid = (field: keyof NonNullable<typeof validation>["fields"]): boolean =>
+    validation?.fields[field].ok === false;
+  const providerAvailabilityHelp = projection.provider_mutation_enabled
+    ? "このroot sessionへだけ適用します。Preferencesの既定値は変更しません。"
+    : "実行中はProvider、Model、Context、出力量を変更できません。Access modeだけを変更できます。";
+  const inheritedHelp = (inherited: boolean, label: string): string => inherited
+    ? `Preferencesから継承中です。数値を入力した場合だけ、このroot session専用の${label}になります。`
+    : `このroot session専用の${label}です。空欄にして適用するとPreferences継承へ戻ります。`;
+  const statusKind = validation?.ok === false
+    ? "error"
+    : local.sessionSettings.availability.enabled || !local.sessionSettings.dirty
+      ? "ok"
+      : "warning";
+  return `
+    <div class="modal-backdrop" ${closeConfirmationPending ? 'inert aria-hidden="true"' : ""}>
+      <section class="modal settings-modal session-settings-modal" data-modal="session-settings" data-surface="session-settings" data-root-session-id="${escapeHtml(target.rootSessionId)}" role="dialog" aria-modal="true" aria-labelledby="session-settings-dialog-title" aria-describedby="session-settings-scope-help session-settings-status" aria-busy="${String(pending)}" tabindex="-1">
+        <div class="settings-header session-settings-header">
+          <div>
+            <div class="session-settings-title-line">
+              <h2 id="session-settings-dialog-title">Session Settings</h2>
+              <span class="session-scope-badge" data-session-scope="root-only">このセッションだけ</span>
+            </div>
+            <p id="session-settings-scope-help">選択中のroot sessionへ適用します。子Agentと次のrunは、このsessionの有効値を共有します。</p>
+          </div>
+          <div class="settings-header-actions">
+            <span class="dirty-badge session-settings-dirty ${local.sessionSettings.dirty ? "visible" : ""}" data-settings-passive="session-settings-dirty-badge">未適用</span>
+            <button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる" aria-haspopup="${local.sessionSettings.dirty ? "alertdialog" : "false"}">${icon("x")}</button>
+          </div>
+        </div>
+        ${renderSettingsRecoverableError(
+          local.recoverableError,
+          "session-settings-recoverable-error",
+          "session-settings-error-notice",
+        )}
+        <div class="session-settings-content">
+          <section class="session-settings-group" aria-labelledby="session-settings-provider-title">
+            <div class="session-settings-group-heading">
+              <div>
+                <h3 id="session-settings-provider-title">Provider / Model</h3>
+                <p data-settings-passive="session-provider-availability">${escapeHtml(providerAvailabilityHelp)}</p>
+              </div>
+              <span class="session-settings-lock" data-settings-passive="session-provider-lock" ${projection.provider_mutation_enabled ? "hidden" : ""}>実行中は固定</span>
+            </div>
+            <div class="settings-grid-two">
+              <div class="settings-field">
+                <label for="session-settings-base-url">Base URL</label>
+                <input id="session-settings-base-url" class="session-settings-control" data-session-setting="base-url" type="url" value="${escapeHtml(draft.baseUrl)}" autocomplete="off" spellcheck="false" aria-describedby="session-settings-base-url-help session-settings-status" ${fieldInvalid("baseUrl") ? 'aria-invalid="true"' : ""} ${providerDisabled ? "disabled" : ""} />
+                <small id="session-settings-base-url-help" class="settings-field-help">接続先URL。Provider metadata modeはPreferencesの設定を使います。</small>
+              </div>
+              <div class="settings-field">
+                <label for="session-settings-model">Model</label>
+                <input id="session-settings-model" class="session-settings-control" data-session-setting="model" value="${escapeHtml(draft.model)}" autocomplete="off" spellcheck="false" aria-describedby="session-settings-model-help session-settings-status" ${fieldInvalid("model") ? 'aria-invalid="true"' : ""} ${providerDisabled ? "disabled" : ""} />
+                <small id="session-settings-model-help" class="settings-field-help">このsessionで使用するModel IDです。</small>
+              </div>
+              <div class="settings-field">
+                <label for="session-settings-context-window">Context window <span class="inherited-badge" data-settings-passive="session-context-inherited-badge" ${projection.context_window_inherited ? "" : "hidden"}>継承中</span></label>
+                <input id="session-settings-context-window" class="session-settings-control" data-session-setting="context-window" inputmode="numeric" value="${escapeHtml(draft.contextWindow)}" placeholder="Preferencesを継承" aria-describedby="session-settings-context-window-help session-settings-status" ${fieldInvalid("contextWindow") ? 'aria-invalid="true"' : ""} ${providerDisabled ? "disabled" : ""} />
+                <small id="session-settings-context-window-help" class="settings-field-help" data-settings-passive="session-context-inherited-help">${escapeHtml(inheritedHelp(projection.context_window_inherited, "Context window"))}</small>
+              </div>
+              <div class="settings-field">
+                <label for="session-settings-max-output-tokens">Max output tokens <span class="inherited-badge" data-settings-passive="session-max-output-inherited-badge" ${projection.max_output_tokens_inherited ? "" : "hidden"}>継承中</span></label>
+                <input id="session-settings-max-output-tokens" class="session-settings-control" data-session-setting="max-output-tokens" inputmode="numeric" value="${escapeHtml(draft.maxOutputTokens)}" placeholder="Preferencesを継承" aria-describedby="session-settings-max-output-tokens-help session-settings-status" ${fieldInvalid("maxOutputTokens") ? 'aria-invalid="true"' : ""} ${providerDisabled ? "disabled" : ""} />
+                <small id="session-settings-max-output-tokens-help" class="settings-field-help" data-settings-passive="session-max-output-inherited-help">${escapeHtml(inheritedHelp(projection.max_output_tokens_inherited, "最大出力量"))}</small>
+              </div>
+            </div>
+          </section>
+          <section class="session-settings-group" aria-labelledby="session-settings-access-title">
+            <div class="session-settings-group-heading">
+              <div>
+                <h3 id="session-settings-access-title">Access mode</h3>
+                <p>このsessionでのツール実行時の承認方法です。実行中も、安全なowner照合を通る場合は変更できます。保存後の次のpermission decisionからrootと子Agentへ反映され、既に表示中の確認や開始済み操作は変わりません。</p>
+              </div>
+            </div>
+            <div class="settings-field session-settings-access-field">
+              <label for="session-settings-access-mode">承認方法</label>
+              <select id="session-settings-access-mode" class="session-settings-control" data-session-setting="access-mode" aria-describedby="session-settings-access-help session-settings-status" ${fieldInvalid("accessMode") ? 'aria-invalid="true"' : ""} ${accessDisabled ? "disabled" : ""}>
+                <option value="default" ${draft.accessMode === "default" ? "selected" : ""}>承認を求める</option>
+                <option value="auto_review" ${draft.accessMode === "auto_review" ? "selected" : ""}>代理で承認</option>
+                <option value="full_access" ${draft.accessMode === "full_access" ? "selected" : ""}>フルアクセス</option>
+              </select>
+              <small id="session-settings-access-help" class="settings-field-help">Preferencesの既定値は変更しません。</small>
+            </div>
+          </section>
+        </div>
+        <div class="session-settings-footer">
+          <div id="session-settings-status" class="validation ${statusKind}" data-settings-live-region="session-settings-status" role="status" aria-live="polite">${escapeHtml(pending ? "Session Settingsを適用しています…" : local.sessionSettings.availability.reason)}</div>
+          <div class="session-settings-actions">
+            <button data-action="open-preferences-from-session-settings">Preferencesで既定値を開く</button>
+            <span class="session-settings-primary-actions">
+              <button data-action="discard-session-settings" ${local.sessionSettings.dirty ? "" : "hidden"}>変更を破棄</button>
+              <button class="send wide-send" data-action="apply-session-settings">${pending ? "適用しています…" : "このセッションに適用"}</button>
+            </span>
+          </div>
         </div>
       </section>
     </div>
@@ -1357,6 +1979,12 @@ function renderConfigOverlay(
   const configValidation = validateConfigFieldValues(state.config_fields);
   const configCommitState = configCommitControlState(state.config_draft.commit_enabled, configValidation.ok);
   const configCommitAttributes = `${configCommitState.disabled ? "disabled " : ""}aria-disabled="${configCommitState.ariaDisabled}"`;
+  const doclingEnabled = configField(state, "docling.enabled")?.field.value.trim().toLowerCase() === "true";
+  const doclingDependencyOptions: ConfigFieldRenderOptions = {
+    disabled: !doclingEnabled,
+    descriptionIds: doclingEnabled ? [] : ["docling-disabled-help"],
+  };
+  const settingsClosePending = local.modal.localConfirmation?.kind === "settings_close";
   const validationKind = configValidation.ok ? "ok" : "error";
   const validationText = configValidation.ok
     ? state.config_draft.dirty
@@ -1364,8 +1992,8 @@ function renderConfigOverlay(
       : "入力形式は問題ありません。"
     : `${configValidation.invalidKey}: ${configValidation.message}`;
   return `
-    <div class="modal-backdrop">
-      <section class="modal settings-modal ${setupRequired ? "setup-modal" : ""}" data-modal role="dialog" aria-modal="true" aria-labelledby="config-dialog-title" tabindex="-1">
+    <div class="modal-backdrop" ${settingsClosePending ? "inert aria-hidden=\"true\"" : ""}>
+      <section class="modal settings-modal ${setupRequired ? "setup-modal" : ""}" data-modal role="dialog" aria-modal="true" aria-labelledby="config-dialog-title" aria-busy="${String(local.configMutationPending)}" tabindex="-1">
         <div class="settings-header">
           <div>
             <h2 id="config-dialog-title">${escapeHtml(title)}</h2>
@@ -1496,14 +2124,24 @@ function renderConfigOverlay(
                     <h4>Docling</h4>
                     <p>PDF / DOCX などの構造化 document 変換に使います。無効時は agent tool surface から外れます。</p>
                   </div>
-                  ${renderConfigToggleField(state, "docling.enabled", "有効")}
+                  <div class="settings-tool-actions">
+                    ${renderConfigToggleField(state, "docling.enabled", "Docling を有効化")}
+                    <button data-action="check-docling-readiness" aria-controls="docling-readiness-status" aria-busy="${String(local.doclingReadinessRequestPending)}" ${local.doclingReadinessRequestPending ? "disabled" : ""}>Test Docling</button>
+                  </div>
                 </div>
-                <div class="settings-grid-two">
-                  ${renderConfigTextField(state, "docling.base_url", "Docling base URL", "url")}
-                  ${renderConfigTextField(state, "docling.timeout_ms", "Timeout ms", "number")}
-                  ${renderConfigTextField(state, "docling.api_key_env", "API key env")}
+                <p id="docling-disabled-help" class="settings-disabled-help" role="status" aria-live="polite" ${doclingEnabled ? "hidden" : ""}>Doclingがオフのため、接続設定は変更できません。「Docling を有効化」をオンにすると編集できます。</p>
+                <div class="settings-docling-dependent" data-docling-dependent aria-disabled="${String(!doclingEnabled)}">
+                  <div class="settings-grid-two">
+                    ${renderConfigTextField(state, "docling.base_url", "Docling base URL", "url", "", doclingDependencyOptions)}
+                    ${renderConfigTextField(state, "docling.timeout_ms", "Timeout ms", "number", "", doclingDependencyOptions)}
+                    ${renderConfigTextField(state, "docling.api_key_env", "API key env", "text", "", doclingDependencyOptions)}
+                  </div>
+                  <details class="settings-docling-advanced" data-details-key="settings-docling-advanced">
+                    <summary>Docling 接続ヘッダー（Advanced）</summary>
+                    ${renderConfigJsonField(state, "docling.headers_json", "Headers JSON", doclingDependencyOptions)}
+                  </details>
                 </div>
-                ${renderConfigJsonField(state, "docling.headers_json", "Headers JSON")}
+                ${renderDoclingReadiness(state, local.doclingReadinessRequestPending)}
               </div>
               <div class="settings-subsection">
                 <div class="settings-section-head compact">
@@ -1543,7 +2181,7 @@ function renderConfigOverlay(
                   ${state.config_fields
                     .map((field, index) => ({ field, index }))
                     .filter(({ field }) => !TYPED_CONFIG_KEYS.includes(field.key))
-                    .map(({ field, index }) => renderRawConfigField(field, index, state.config_draft.edit_enabled))
+                    .map(({ field, index }) => renderRawConfigField(state, field, index))
                     .join("")}
                 </div>
               </details>
@@ -1589,10 +2227,14 @@ function configFieldSectionHelpId(key: string): string {
   return "settings-advanced-help";
 }
 
-function configFieldDescriptionIds(field: ConfigFieldProjection, extraIds: string[] = []): string {
+function configFieldDescriptionIds(
+  field: ConfigFieldProjection,
+  extraIds: string[] = [],
+  includeSectionHelp = true,
+): string {
   return [...new Set([
     configFieldHelpId(field.key),
-    configFieldSectionHelpId(field.key),
+    ...(includeSectionHelp ? [configFieldSectionHelpId(field.key)] : []),
     "settings-validation",
     ...extraIds,
   ])].join(" ");
@@ -1629,12 +2271,22 @@ function renderConfigFieldHelp(field: ConfigFieldProjection, explicitHelp = ""):
   return `<small id="${configFieldHelpId(field.key)}" class="settings-field-help">${escapeHtml(configFieldHelpText(field, explicitHelp))}</small>`;
 }
 
-function configFieldValidationAttribute(field: ConfigFieldProjection): string {
-  return validateConfigInput(field, field.value).ok ? "" : ' aria-invalid="true"';
+function configFieldValidationAttribute(
+  state: DesktopViewState,
+  field: ConfigFieldProjection,
+): string {
+  const values = state.config_fields.map(({ key, value }) => ({ key, text: value }));
+  return validateConfigInput(field, field.value, values).ok ? "" : ' aria-invalid="true"';
 }
 
 function renderMissingConfigField(key: string): string {
   return `<div class="settings-field missing"><label>${escapeHtml(key)}</label><small>未対応の設定項目です。</small></div>`;
+}
+
+interface ConfigFieldRenderOptions {
+  disabled?: boolean;
+  descriptionIds?: readonly string[];
+  initialSetup?: boolean;
 }
 
 function renderConfigTextField(
@@ -1643,6 +2295,7 @@ function renderConfigTextField(
   label: string,
   type = "text",
   help = "",
+  options: ConfigFieldRenderOptions = {},
 ): string {
   const found = configField(state, key);
   if (!found) return renderMissingConfigField(key);
@@ -1651,7 +2304,7 @@ function renderConfigTextField(
   return `
     <div class="settings-field">
       <label for="${controlId}">${escapeHtml(label)}${renderEnvBadge(found.field)}</label>
-      <input id="${controlId}" class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" type="${type === "number" ? "text" : type}"${inputMode} value="${escapeHtml(found.field.value)}" aria-describedby="${configFieldDescriptionIds(found.field)}"${configFieldValidationAttribute(found.field)} ${state.config_draft.edit_enabled ? "" : "disabled"} />
+      <input id="${controlId}" class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" type="${type === "number" ? "text" : type}"${inputMode} value="${escapeHtml(found.field.value)}" aria-describedby="${configFieldDescriptionIds(found.field, [...(options.descriptionIds ?? [])], !options.initialSetup)}"${configFieldValidationAttribute(state, found.field)} ${state.config_draft.edit_enabled && !options.disabled ? "" : "disabled"} />
       ${renderConfigFieldHelp(found.field, help)}
     </div>
   `;
@@ -1677,14 +2330,14 @@ function renderMainProviderModelField(state: DesktopViewState): string {
   return `
     <div class="settings-field main-provider-model-field">
       <label for="main-provider-model">Model${renderEnvBadge(found.field)}</label>
-      <select id="main-provider-model" class="settings-control" data-main-provider-model-control data-config-index="${found.index}" data-config-key="model.model" aria-describedby="${describedBy}"${configFieldValidationAttribute(found.field)} ${controlsEnabled && options.length > 0 ? "" : "disabled"}>
+      <select id="main-provider-model" class="settings-control" data-main-provider-model-control data-config-index="${found.index}" data-config-key="model.model" aria-describedby="${describedBy}"${configFieldValidationAttribute(state, found.field)} ${controlsEnabled && options.length > 0 ? "" : "disabled"}>
         ${currentModel.length === 0 ? '<option value="" selected disabled>モデルを選択してください</option>' : ""}
         ${options.map((option) => `<option value="${escapeHtml(option.id)}" ${option.id === currentModel ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}
       </select>
       <details class="side-chat-manual-model main-provider-manual-model" data-details-key="main-provider-manual-model">
         <summary>一覧にないモデルIDを入力</summary>
         <label for="main-provider-model-manual">モデルID</label>
-        <input id="main-provider-model-manual" class="settings-control" data-main-provider-model-control data-config-index="${found.index}" data-config-key="model.model" value="${escapeHtml(found.field.value)}" autocomplete="off" spellcheck="false" aria-describedby="${describedBy}"${configFieldValidationAttribute(found.field)} ${controlsEnabled ? "" : "disabled"} />
+        <input id="main-provider-model-manual" class="settings-control" data-main-provider-model-control data-config-index="${found.index}" data-config-key="model.model" value="${escapeHtml(found.field.value)}" autocomplete="off" spellcheck="false" aria-describedby="${describedBy}"${configFieldValidationAttribute(state, found.field)} ${controlsEnabled ? "" : "disabled"} />
       </details>
       ${renderConfigFieldHelp(found.field)}
     </div>
@@ -1710,28 +2363,91 @@ function mainProviderCatalogStatusText(state: DesktopViewState): string {
   return "「モデル読込・詳細設定」で現在のLLM URLとProvider modeに対応する候補を取得できます。一覧にないモデルIDは直接入力できます。";
 }
 
-function renderConfigJsonField(state: DesktopViewState, key: string, label: string): string {
+function renderDoclingReadiness(
+  state: DesktopViewState,
+  localRequestPending: boolean,
+  options: {
+    allowDirtyDraft?: boolean;
+    projectedResultVisible?: boolean;
+  } = {},
+): string {
+  const enabled = configField(state, "docling.enabled")?.field.value.trim().toLowerCase() === "true";
+  const readiness = state.docling_readiness;
+  const dirtyBlocksReadiness = state.config_draft.dirty && !options.allowDirtyDraft;
+  const projectedResultVisible = options.projectedResultVisible ?? true;
+  const effectiveStatus = localRequestPending
+    ? "checking"
+    : projectedResultVisible
+      ? readiness.status
+      : "idle";
+  const status = !enabled || dirtyBlocksReadiness ? "idle" : effectiveStatus;
+  const title = !enabled
+    ? "Docling は無効です"
+    : dirtyBlocksReadiness
+      ? "未保存の設定があります"
+      : effectiveStatus === "checking"
+        ? "Docling の接続を確認しています…"
+        : effectiveStatus === "ready"
+          ? "Docling を利用できます"
+          : effectiveStatus === "unavailable"
+            ? "Docling に接続できません"
+            : "Docling は未確認です";
+  const message = !enabled
+    ? "有効化して設定を保存すると、明示的に接続確認できます。"
+    : dirtyBlocksReadiness
+      ? "変更を設定ファイルへ保存してから Test Docling を実行してください。"
+      : localRequestPending
+        ? "接続確認を開始しています。"
+        : projectedResultVisible
+          ? readiness.message
+          : "現在のdraftではまだ接続を確認していません。";
+  const technical = !localRequestPending
+    && !dirtyBlocksReadiness
+    && projectedResultVisible
+    && readiness.endpoint.trim().length > 0
+    ? `${readiness.endpoint}${readiness.httpStatus === null ? "" : ` · HTTP ${readiness.httpStatus}`}`
+    : "";
+  return `
+    <div id="docling-readiness-status" class="settings-readiness ${status}" data-settings-live-region="docling-readiness" data-docling-readiness-status="${status}" role="status" aria-live="polite" aria-busy="${String(status === "checking")}">
+      <strong>${escapeHtml(title)}</strong>
+      <span>${escapeHtml(message)}</span>
+      ${technical ? `<small>${escapeHtml(technical)}</small>` : ""}
+    </div>
+  `;
+}
+
+function renderConfigJsonField(
+  state: DesktopViewState,
+  key: string,
+  label: string,
+  options: ConfigFieldRenderOptions = {},
+): string {
   const found = configField(state, key);
   if (!found) return renderMissingConfigField(key);
   const controlId = configFieldControlId(found.field.key);
   return `
     <div class="settings-field wide">
       <label for="${controlId}">${escapeHtml(label)}${renderEnvBadge(found.field)}</label>
-      <textarea id="${controlId}" class="settings-control settings-json" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" aria-describedby="${configFieldDescriptionIds(found.field)}"${configFieldValidationAttribute(found.field)} ${state.config_draft.edit_enabled ? "" : "disabled"}>${escapeHtml(found.field.value)}</textarea>
+      <textarea id="${controlId}" class="settings-control settings-json" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" aria-describedby="${configFieldDescriptionIds(found.field, [...(options.descriptionIds ?? [])], !options.initialSetup)}"${configFieldValidationAttribute(state, found.field)} ${state.config_draft.edit_enabled && !options.disabled ? "" : "disabled"}>${escapeHtml(found.field.value)}</textarea>
       ${renderConfigFieldHelp(found.field)}
     </div>
   `;
 }
 
-function renderConfigToggleField(state: DesktopViewState, key: string, label: string): string {
+function renderConfigToggleField(
+  state: DesktopViewState,
+  key: string,
+  label: string,
+  options: ConfigFieldRenderOptions = {},
+): string {
   const found = configField(state, key);
   if (!found) return renderMissingConfigField(key);
   const checked = found.field.value.trim().toLowerCase() === "true" ? "checked" : "";
   const controlId = configFieldControlId(found.field.key);
   return `
     <div class="settings-toggle-field">
-      <label class="settings-toggle" for="${controlId}">
-        <input id="${controlId}" class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" type="checkbox" ${checked} aria-describedby="${configFieldDescriptionIds(found.field)}"${configFieldValidationAttribute(found.field)} ${state.config_draft.edit_enabled ? "" : "disabled"} />
+      <label class="settings-toggle" for="${controlId}" data-config-key="${escapeHtml(key)}">
+        <input id="${controlId}" class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" type="checkbox" ${checked} aria-describedby="${configFieldDescriptionIds(found.field, [...(options.descriptionIds ?? [])], !options.initialSetup)}"${configFieldValidationAttribute(state, found.field)} ${state.config_draft.edit_enabled && !options.disabled ? "" : "disabled"} />
         <span class="toggle-ui"></span>
         <span>${escapeHtml(label)}${renderEnvBadge(found.field)}</span>
       </label>
@@ -1745,6 +2461,7 @@ function renderConfigEnumField(
   key: string,
   label: string,
   optionLabels: Record<string, string>,
+  renderOptions: ConfigFieldRenderOptions = {},
 ): string {
   const found = configField(state, key);
   if (!found) return renderMissingConfigField(key);
@@ -1753,7 +2470,7 @@ function renderConfigEnumField(
   return `
     <div class="settings-field wide">
       <label for="${controlId}">${escapeHtml(label)}${renderEnvBadge(found.field)}</label>
-      <select id="${controlId}" class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" aria-describedby="${configFieldDescriptionIds(found.field)}"${configFieldValidationAttribute(found.field)} ${state.config_draft.edit_enabled ? "" : "disabled"}>
+      <select id="${controlId}" class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" aria-describedby="${configFieldDescriptionIds(found.field, [...(renderOptions.descriptionIds ?? [])], !renderOptions.initialSetup)}"${configFieldValidationAttribute(state, found.field)} ${state.config_draft.edit_enabled && !renderOptions.disabled ? "" : "disabled"}>
         ${options.map((value) => `<option value="${escapeHtml(value)}" ${found.field.value === value ? "selected" : ""}>${escapeHtml(optionLabels[value] ?? value)}</option>`).join("")}
       </select>
       ${renderConfigFieldHelp(found.field)}
@@ -1762,15 +2479,15 @@ function renderConfigEnumField(
 }
 
 function renderRawConfigField(
+  state: DesktopViewState,
   field: ConfigFieldProjection,
   index: number,
-  editEnabled: boolean,
 ): string {
   const controlId = configFieldControlId(field.key);
   return `
     <div class="settings-field raw">
       <label for="${controlId}">${escapeHtml(field.key)}${renderEnvBadge(field)}</label>
-      <textarea id="${controlId}" class="settings-control settings-raw-value" data-config-index="${index}" data-config-key="${escapeHtml(field.key)}" aria-describedby="${configFieldDescriptionIds(field)}"${configFieldValidationAttribute(field)} ${editEnabled ? "" : "disabled"}>${escapeHtml(field.value)}</textarea>
+      <textarea id="${controlId}" class="settings-control settings-raw-value" data-config-index="${index}" data-config-key="${escapeHtml(field.key)}" aria-describedby="${configFieldDescriptionIds(field)}"${configFieldValidationAttribute(state, field)} ${state.config_draft.edit_enabled ? "" : "disabled"}>${escapeHtml(field.value)}</textarea>
       ${renderConfigFieldHelp(field)}
     </div>
   `;

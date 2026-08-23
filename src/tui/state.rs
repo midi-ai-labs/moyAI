@@ -1552,6 +1552,7 @@ mod tests {
             base_url: "http://local".to_string(),
             access_mode: crate::config::AccessMode::FullAccess,
             model_parameters: crate::session::SessionModelParameters::default(),
+            session_settings_revision: 0,
             created_at_ms: 1,
             updated_at_ms: 2,
             completed_at_ms: Some(2),

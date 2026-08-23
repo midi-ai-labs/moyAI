@@ -1,16 +1,35 @@
-import type { DesktopWebState, RowMutationTarget } from "./types.ts";
+import type {
+  ConfigMutationTarget,
+  DesktopWebState,
+  RowMutationTarget,
+  SessionSettingsMutationTarget,
+} from "./types.ts";
 import type { PermissionDecisionState } from "./decision_state.ts";
 import { renderPermissionAgentIdentity } from "./render_agent_activity.ts";
 import { runCanBeCancelled } from "./run_control.ts";
 import { escapeHtml } from "./utils.ts";
 
-export type LocalConfirmation = {
+type RowLocalConfirmation = {
   kind: "project" | "session" | "chat_session" | "archive_session" | "unarchive_session" | "rollback_session";
   index: number;
   title: string;
   detail: string;
   expectedTarget: RowMutationTarget;
 };
+
+export type SettingsCloseConfirmation = {
+  kind: "settings_close";
+  expectedTarget: ConfigMutationTarget;
+};
+
+export type SessionSettingsCloseConfirmation = {
+  kind: "session_settings_close";
+  expectedTarget: SessionSettingsMutationTarget;
+};
+
+export type LocalConfirmation = RowLocalConfirmation
+  | SettingsCloseConfirmation
+  | SessionSettingsCloseConfirmation;
 
 export function renderConfirmation(
   state: DesktopWebState,
@@ -78,6 +97,47 @@ export function renderConfirmation(
 }
 
 export function renderLocalConfirmation(confirm: LocalConfirmation, pending = false, error = ""): string {
+  if (confirm.kind === "session_settings_close") {
+    return `
+      <div class="modal-backdrop">
+        <section class="modal confirmation settings-close-confirmation" role="alertdialog" data-modal="session-settings-close-confirmation" aria-modal="true" aria-labelledby="session-settings-close-confirm-title" aria-describedby="session-settings-close-confirm-summary" tabindex="-1" ${pending ? 'aria-busy="true"' : ""}>
+          <h2 id="session-settings-close-confirm-title">このセッションの変更を破棄しますか？</h2>
+          <div class="confirm-summary" id="session-settings-close-confirm-summary">Session Settingsを閉じると、未適用の入力は破棄されます。</div>
+          <dl class="confirm-details">
+            <dt>対象</dt><dd>${escapeHtml(confirm.expectedTarget.rootSessionId)}</dd>
+            <dt>影響</dt><dd>保存済みのroot session設定とPreferencesには影響しません。</dd>
+          </dl>
+          <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1">${pending ? "Session Settingsを閉じています。" : escapeHtml(error)}</div>
+          <div class="modal-actions">
+            <button data-action="cancel-local-confirm" ${pending ? "disabled" : "autofocus"}>キャンセル</button>
+            <button class="danger-button" data-action="confirm-session-settings-discard-close" ${pending ? "disabled" : ""}>${pending ? "閉じています…" : "変更を破棄して閉じる"}</button>
+          </div>
+        </section>
+      </div>
+    `;
+  }
+  if (confirm.kind === "settings_close") {
+    const target = confirm.expectedTarget.sessionId
+      ? `チャット ${confirm.expectedTarget.sessionId}`
+      : `ワークスペース ${confirm.expectedTarget.workspacePath}`;
+    return `
+      <div class="modal-backdrop">
+        <section class="modal confirmation settings-close-confirmation" role="alertdialog" data-modal="settings-close-confirmation" aria-modal="true" aria-labelledby="settings-close-confirm-title" aria-describedby="settings-close-confirm-summary" tabindex="-1" ${pending ? 'aria-busy="true"' : ""}>
+          <h2 id="settings-close-confirm-title">未保存の変更を破棄しますか？</h2>
+          <div class="confirm-summary" id="settings-close-confirm-summary">Preferencesを閉じると、入力中の変更は破棄されます。この操作は元に戻せません。</div>
+          <dl class="confirm-details">
+            <dt>設定対象</dt><dd>${escapeHtml(target)}</dd>
+            <dt>影響</dt><dd>保存済みの設定と現在の実行中セッションには影響しません。</dd>
+          </dl>
+          <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1">${pending ? "Preferencesを閉じています。" : escapeHtml(error)}</div>
+          <div class="modal-actions">
+            <button data-action="cancel-local-confirm" ${pending ? "disabled" : "autofocus"}>キャンセル</button>
+            <button class="danger-button" data-action="confirm-settings-discard-close" ${pending ? "disabled" : ""}>${pending ? "閉じています…" : "変更を破棄して閉じる"}</button>
+          </div>
+        </section>
+      </div>
+    `;
+  }
   const archive = confirm.kind === "archive_session";
   const unarchive = confirm.kind === "unarchive_session";
   const rollback = confirm.kind === "rollback_session";

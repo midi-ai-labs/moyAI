@@ -9,12 +9,19 @@ use crate::config::loader::{
     acquire_global_config_write_lease, global_config_path, read_toml_utf8_bounded,
 };
 use crate::config::model::{AccessMode, ResolvedConfig};
-use crate::config::{ConfigField, ProviderEndpoint};
+use crate::config::{ConfigField, ConfigLoader, ProviderEndpoint};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfigSaveScope {
-    Session,
-    Global,
+pub enum GlobalConfigAdoptionPolicy {
+    StrictCurrentSchema,
+    PreserveUnknownTopLevelSections,
+}
+
+#[derive(Debug, Clone)]
+pub struct GlobalConfigSaveResult {
+    pub message: String,
+    pub resolved_config: ResolvedConfig,
+    pub preserved_unknown_top_level_sections: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,17 +122,28 @@ impl ConfigEditorState {
         build_resolved_config_from_field_values(base, &fields)
     }
 
-    pub fn save_scope(&self, _root: &Utf8Path, scope: ConfigSaveScope) -> Result<String, String> {
-        match scope {
-            ConfigSaveScope::Session => {
-                return Err("session override is memory only; use Apply Session".to_string());
-            }
-            ConfigSaveScope::Global => {
-                let path = global_config_path().map_err(|error| error.to_string())?;
-                save_config_sections(&path, self)?;
-                Ok(format!("saved global config to {}", path))
-            }
+    pub fn save_global(
+        &self,
+        _root: &Utf8Path,
+        adoption_policy: GlobalConfigAdoptionPolicy,
+    ) -> Result<GlobalConfigSaveResult, String> {
+        let path = global_config_path().map_err(|error| error.to_string())?;
+        let (resolved_config, preserved_unknown_top_level_sections) =
+            save_config_sections(&path, self, adoption_policy)?;
+        let mut message = format!("saved global config to {}", path);
+        if !preserved_unknown_top_level_sections.is_empty() {
+            let count = preserved_unknown_top_level_sections.len();
+            message.push_str(&format!(
+                "; preserved {count} unrecognized top-level config section{} without applying {}",
+                if count == 1 { "" } else { "s" },
+                if count == 1 { "it" } else { "them" },
+            ));
         }
+        Ok(GlobalConfigSaveResult {
+            message,
+            resolved_config,
+            preserved_unknown_top_level_sections,
+        })
     }
 
     pub fn remember_global_access_mode(access_mode: AccessMode) -> Result<Utf8PathBuf, String> {
@@ -207,31 +225,64 @@ fn access_mode_from_document(document: &toml::Value) -> Result<AccessMode, Strin
     }
 }
 
-fn save_config_sections(path: &Utf8Path, editor: &ConfigEditorState) -> Result<(), String> {
+fn save_config_sections(
+    path: &Utf8Path,
+    editor: &ConfigEditorState,
+    adoption_policy: GlobalConfigAdoptionPolicy,
+) -> Result<(ResolvedConfig, Vec<String>), String> {
+    let _write_lease =
+        acquire_global_config_write_lease(path).map_err(|error| error.to_string())?;
+    let (text, dirty) = prepare_config_section_update(path, editor)?;
+    let (resolved_config, preserved_unknown_top_level_sections) = match adoption_policy {
+        GlobalConfigAdoptionPolicy::StrictCurrentSchema => (
+            ConfigLoader::resolve_global_config_text_with_environment(path, &text)
+                .map_err(|error| error.to_string())?,
+            Vec::new(),
+        ),
+        GlobalConfigAdoptionPolicy::PreserveUnknownTopLevelSections => {
+            let resolved =
+                ConfigLoader::resolve_forward_compatible_global_config_text_with_environment(
+                    path, &text,
+                )
+                .map_err(|error| error.to_string())?;
+            (
+                resolved.resolved_config,
+                resolved.preserved_unknown_top_level_sections,
+            )
+        }
+    };
+    if !dirty {
+        return Ok((resolved_config, preserved_unknown_top_level_sections));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    persist_config_tempfile(path, &text)?;
+    Ok((resolved_config, preserved_unknown_top_level_sections))
+}
+
+fn prepare_config_section_update(
+    path: &Utf8Path,
+    editor: &ConfigEditorState,
+) -> Result<(String, bool), String> {
     let dirty_values = editor
         .fields
         .iter()
         .filter(|field| field.dirty)
         .map(|field| (field.key, field.value.as_str()))
         .collect::<Vec<_>>();
-    if dirty_values.is_empty() {
-        return Ok(());
-    }
-
-    let _write_lease =
-        acquire_global_config_write_lease(path).map_err(|error| error.to_string())?;
+    let dirty = !dirty_values.is_empty();
     let mut existing = read_toml_document(path)?;
-    let patch = parse_config_field_patch(&dirty_values)?;
-    let patch = toml::Value::try_from(patch).map_err(|error| error.to_string())?;
-    for (field, _) in dirty_values {
-        apply_dirty_toml_field(&mut existing, &patch, field)?;
+    if dirty {
+        let patch = parse_config_field_patch(&dirty_values)?;
+        let patch = toml::Value::try_from(patch).map_err(|error| error.to_string())?;
+        for (field, _) in dirty_values {
+            apply_dirty_toml_field(&mut existing, &patch, field)?;
+        }
     }
     normalize_provider_endpoint_in_document(&mut existing)?;
     let text = toml::to_string_pretty(&existing).map_err(|error| error.to_string())?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    persist_config_tempfile(path, &text)
+    Ok((text, dirty))
 }
 
 fn read_toml_document(path: &Utf8Path) -> Result<toml::Value, String> {
@@ -340,10 +391,34 @@ mod tests {
     use camino::Utf8PathBuf;
 
     use super::{
-        ConfigEditorState, ConfigField, compare_and_set_access_mode, parse_editor_patch,
-        save_access_mode, save_config_sections,
+        ConfigEditorState, ConfigField, GlobalConfigAdoptionPolicy, compare_and_set_access_mode,
+        parse_editor_patch, save_access_mode,
     };
     use crate::config::{AccessMode, ProviderMetadataMode, ResolvedConfig};
+
+    fn save_config_sections(
+        path: &camino::Utf8Path,
+        editor: &ConfigEditorState,
+    ) -> Result<ResolvedConfig, String> {
+        super::save_config_sections(
+            path,
+            editor,
+            GlobalConfigAdoptionPolicy::PreserveUnknownTopLevelSections,
+        )
+        .map(|(resolved_config, _)| resolved_config)
+    }
+
+    fn save_config_sections_resolved(
+        path: &camino::Utf8Path,
+        editor: &ConfigEditorState,
+    ) -> Result<ResolvedConfig, String> {
+        super::save_config_sections(
+            path,
+            editor,
+            GlobalConfigAdoptionPolicy::StrictCurrentSchema,
+        )
+        .map(|(resolved_config, _)| resolved_config)
+    }
 
     #[test]
     fn config_editor_excludes_removed_model_behavior_guards() {
@@ -638,10 +713,12 @@ mod tests {
         access.value = "full_access".to_string();
         access.dirty = true;
 
-        save_config_sections(&path, &editor).expect("merge dirty config");
+        let adopted = save_config_sections(&path, &editor).expect("merge dirty config");
 
         let saved = std::fs::read_to_string(&path).expect("read saved config");
         let saved: toml::Value = toml::from_str(&saved).expect("parse saved config");
+        assert_eq!(adopted.model.model, "external-current");
+        assert_eq!(adopted.permissions.access_mode, AccessMode::FullAccess);
         assert_eq!(saved["model"]["model"].as_str(), Some("external-current"));
         assert_eq!(saved["model"]["api_key_env"].as_str(), Some("EXTERNAL_KEY"));
         assert!(saved["model"].get("base_url").is_none());
@@ -653,6 +730,86 @@ mod tests {
         assert_eq!(
             saved["permissions"]["access_mode"].as_str(),
             Some("full_access")
+        );
+    }
+
+    #[test]
+    fn forward_compatible_global_save_rejects_invalid_current_data_before_persist() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        let original =
+            "[workspace]\nprotected_paths = [\"relative/path\"]\n\n[future]\nflag = \"keep\"\n";
+        std::fs::write(&path, original).expect("invalid external current config");
+        let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+        let model = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::Model)
+            .expect("model field");
+        model.value = "next-model".to_string();
+        model.dirty = true;
+
+        let error = save_config_sections(&path, &editor)
+            .expect_err("known invalid data must prevent forward-compatible persistence");
+
+        assert!(error.contains("workspace.protected_paths"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("unchanged config"),
+            original
+        );
+    }
+
+    #[test]
+    fn forward_compatible_global_save_rejects_unknown_fields_inside_current_sections() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        let original =
+            "[model]\nmodel = \"current\"\nfuture_knob = true\n\n[future]\nflag = \"keep\"\n";
+        std::fs::write(&path, original).expect("unknown current-section field");
+        let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+        let access = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::AccessMode)
+            .expect("access mode field");
+        access.value = "full_access".to_string();
+        access.dirty = true;
+
+        let error = save_config_sections(&path, &editor)
+            .expect_err("unknown fields in a current section must fail closed");
+
+        assert!(error.contains("future_knob"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("unchanged config"),
+            original
+        );
+    }
+
+    #[test]
+    fn strict_global_save_rejects_unknown_top_level_sections_before_persist() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        let original = "[model]\nmodel = \"current\"\n\n[future]\nflag = \"keep\"\n";
+        std::fs::write(&path, original).expect("future section");
+        let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+        let access = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::AccessMode)
+            .expect("access mode field");
+        access.value = "full_access".to_string();
+        access.dirty = true;
+
+        let error = save_config_sections_resolved(&path, &editor)
+            .expect_err("strict adoption must reject unknown top-level sections");
+
+        assert!(error.contains("future"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("unchanged config"),
+            original
         );
     }
 
@@ -673,6 +830,73 @@ mod tests {
             std::fs::read_to_string(&path).expect("read config"),
             original
         );
+    }
+
+    #[test]
+    fn global_save_resolves_the_complete_candidate_before_atomic_persist() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        let invalid_existing =
+            "[workspace]\nprotected_paths = [\"relative/path\"]\n\n[docling]\nenabled = false\n";
+        std::fs::write(&path, invalid_existing).expect("invalid existing config");
+        let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+        let enabled = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::DoclingEnabled)
+            .expect("Docling enabled field");
+        enabled.value = "true".to_string();
+        enabled.dirty = true;
+
+        let error = save_config_sections_resolved(&path, &editor)
+            .expect_err("the complete resulting config is invalid");
+
+        assert!(error.contains("workspace.protected_paths"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("unchanged config"),
+            invalid_existing,
+            "preflight failure must leave the persisted owner unchanged"
+        );
+    }
+
+    #[test]
+    fn global_save_returns_the_exact_resolved_config_committed_to_disk() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        std::fs::write(
+            &path,
+            "[docling]\nenabled = false\nbase_url = \"http://127.0.0.1:8123\"\n",
+        )
+        .expect("seed config");
+        let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+        for (key, value) in [
+            (ConfigField::DoclingEnabled, "true"),
+            (
+                ConfigField::DoclingBaseUrl,
+                " https://docling.example.test/api/ ",
+            ),
+        ] {
+            let field = editor
+                .fields
+                .iter_mut()
+                .find(|field| field.key == key)
+                .expect("Docling field");
+            field.value = value.to_string();
+            field.dirty = true;
+        }
+
+        let resolved = save_config_sections_resolved(&path, &editor).expect("atomic save");
+
+        assert!(resolved.docling.enabled);
+        assert_eq!(
+            resolved.docling.base_url,
+            "https://docling.example.test/api"
+        );
+        let saved = std::fs::read_to_string(&path).expect("saved config");
+        assert!(saved.contains("enabled = true"));
+        assert!(saved.contains("https://docling.example.test/api/"));
     }
 
     #[test]

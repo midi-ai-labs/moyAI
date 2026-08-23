@@ -15,9 +15,12 @@ use crate::config::{ProviderEndpoint, ProviderMetadataMode, ReasoningSummary, Re
 use crate::error::AppRunError;
 use crate::llm::{ProviderModelInfo, ProviderModelLoadState, fetch_provider_model_infos};
 use crate::protocol::TurnId;
-use crate::session::{ActiveTurnExpectation, SessionId, SessionSpawnEdge};
+use crate::session::{ActiveTurnExpectation, SessionId, SessionSettingsPatch, SessionSpawnEdge};
 
-use super::app::{DesktopController, PendingPermissionResolution};
+use super::app::{
+    DesktopController, PendingPermissionResolution, RootSessionSettingsApplyError,
+    RootSessionSettingsPersistenceOutcome,
+};
 use super::args::DesktopArgs;
 use super::models::DesktopStopMutationTarget;
 use super::query::{
@@ -27,6 +30,7 @@ use super::query::{
 use super::state::{DesktopOverlay, DesktopStatusCode};
 use super::web_model::{
     DesktopAgentExecutionProjection, DesktopAgentInterruptTarget, DesktopWebState,
+    access_runtime_owner_terminal_settlement_matches,
 };
 
 type SharedController = Arc<Mutex<DesktopController>>;
@@ -89,6 +93,7 @@ macro_rules! desktop_command_manifest {
             show_project_menu,
             create_project_from_picker,
             show_config_editor,
+            show_session_settings,
             show_provider_editor,
             show_workspace_picker,
             show_command_palette,
@@ -100,16 +105,21 @@ macro_rules! desktop_command_manifest {
             open_global_config_folder,
             open_user_data_folder,
             import_global_config_toml,
+            load_initial_setup_config_toml,
             open_typed_path,
             open_artifact_folder,
             set_local_search,
             insert_command,
             load_provider_models,
+            check_docling_readiness,
+            check_initial_setup_docling_readiness,
             apply_provider_session,
             save_provider_global,
             reset_config_draft,
             apply_session_config,
             save_global_config,
+            finish_initial_setup,
+            apply_session_settings,
             toggle_access_mode,
             preview_window_opacity,
             set_window_opacity,
@@ -144,6 +154,17 @@ const DESKTOP_COMMAND_WIRE_NAMES: &[&str] = desktop_command_manifest!(desktop_co
 struct DesktopCommandConflict {
     message: String,
     status_code: DesktopStatusCode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AlreadyProjectedSessionSettingsWrite {
+    settings_revision: u64,
+    next_config_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionSettingsSettlementPolicy {
+    access_only: bool,
 }
 
 impl DesktopCommandConflict {
@@ -3015,8 +3036,17 @@ async fn show_project_menu(
 #[tauri::command]
 async fn create_project_from_picker(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::create_project_from_picker).await
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        if !controller.create_project_from_picker() {
+            return Err(rejected_action(
+                controller,
+                "project creation was not started",
+            ));
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -3026,6 +3056,23 @@ async fn show_config_editor(
     mutate_controller_checked(controller, |controller| {
         ensure_unscoped_prompt_review_action(controller, "configuration editor")?;
         controller.state.show_config_editor();
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn show_session_settings(
+    controller: State<'_, SharedController>,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "session settings")?;
+        if !controller.state.show_session_settings() {
+            return Err(rejected_action(
+                controller,
+                "session settings require the current root session",
+            ));
+        }
         Ok(())
     })
     .await
@@ -3100,8 +3147,7 @@ async fn switch_workspace(
     mutate_controller_checked(controller, |controller| {
         ensure_draft_action_target(controller, &expected_target)?;
         ensure_unscoped_prompt_review_action(controller, "workspace navigation")?;
-        controller.state.set_workspace_input(text);
-        if !controller.switch_workspace() {
+        if !controller.switch_workspace_to(text) {
             return Err(rejected_action(
                 controller,
                 "the workspace was not switched",
@@ -3211,6 +3257,66 @@ async fn import_global_config_toml(
             .map_err(DesktopCommandError::internal)?,
         imported,
     ))
+}
+
+#[tauri::command]
+async fn load_initial_setup_config_toml(
+    controller: State<'_, SharedController>,
+    expected_config_target: DesktopConfigMutationTarget,
+    expected_setup_target: DesktopInitialSetupMutationTarget,
+) -> Result<Option<DesktopInitialSetupConfigDraft>, DesktopCommandError> {
+    {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        if let Err(conflict) =
+            ensure_initial_setup_mutation_target(&controller, &expected_setup_target)
+        {
+            return Err(command_conflict_error(&mut controller, conflict));
+        }
+        if let Err(conflict) = ensure_config_mutation_target(&controller, &expected_config_target) {
+            return Err(command_conflict_error(&mut controller, conflict));
+        }
+    }
+
+    // Native dialogs and bounded file reads may wait on the user or filesystem.
+    // Keep them outside the controller lock, then CAS the exact owners again.
+    let loaded = DesktopController::pick_initial_setup_config_toml_dialog().and_then(|selected| {
+        selected
+            .map(|path| {
+                DesktopController::load_initial_setup_config_toml_path(&path)
+                    .map(|values| (path, values))
+            })
+            .transpose()
+    });
+
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    if let Err(conflict) = ensure_initial_setup_mutation_target(&controller, &expected_setup_target)
+    {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    if let Err(conflict) = ensure_config_mutation_target(&controller, &expected_config_target) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    let Some((path, values)) = (match loaded {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            let conflict = DesktopCommandConflict::with_status(
+                DesktopStatusCode::ConfigImportFailed,
+                format!("initial setup import failed: {error}"),
+            );
+            return Err(command_conflict_error(&mut controller, conflict));
+        }
+    }) else {
+        return Ok(None);
+    };
+    Ok(Some(DesktopInitialSetupConfigDraft {
+        source_path: path.to_string(),
+        values: values
+            .into_iter()
+            .map(|(key, text)| DesktopConfigValueInput { key, text })
+            .collect(),
+    }))
 }
 
 #[tauri::command]
@@ -3398,6 +3504,52 @@ async fn load_provider_models(
 }
 
 #[tauri::command]
+async fn check_docling_readiness(
+    controller: State<'_, SharedController>,
+    expected_target: DesktopConfigMutationTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "Docling readiness check")?;
+        ensure_config_mutation_target(controller, &expected_target)?;
+        if !controller.check_docling_readiness() {
+            return Err(rejected_action(
+                controller,
+                "the Docling readiness check was not started",
+            ));
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn check_initial_setup_docling_readiness(
+    controller: State<'_, SharedController>,
+    values: Vec<DesktopConfigValueInput>,
+    expected_config_target: DesktopConfigMutationTarget,
+    expected_setup_target: DesktopInitialSetupMutationTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_initial_setup_mutation_target(controller, &expected_setup_target)?;
+        ensure_config_mutation_target(controller, &expected_config_target)?;
+        validate_complete_config_draft(controller, &values)?;
+        if !controller.check_initial_setup_docling_readiness(
+            values
+                .into_iter()
+                .map(|value| (value.key, value.text))
+                .collect(),
+        ) {
+            return Err(rejected_action(
+                controller,
+                "the initial-setup Docling readiness check was not started",
+            ));
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
 async fn apply_provider_session(
     controller: State<'_, SharedController>,
     input: DesktopProviderActionInput,
@@ -3443,10 +3595,17 @@ async fn save_provider_global(
     .await
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct DesktopConfigValueInput {
     key: String,
     text: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopInitialSetupConfigDraft {
+    source_path: String,
+    values: Vec<DesktopConfigValueInput>,
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
@@ -3458,12 +3617,40 @@ struct DesktopConfigMutationTarget {
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DesktopInitialSetupMutationTarget {
+    workspace_path: String,
+    global_config_path: String,
+    setup_generation: String,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopAccessModeMutationTarget {
     workspace_path: String,
     session_id: Option<String>,
     config_generation: String,
     access_mode: crate::config::AccessMode,
+    runtime_owner_token: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DesktopSessionSettingsInput {
+    base_url: String,
+    model: String,
+    access_mode: crate::config::AccessMode,
+    context_window: String,
+    max_output_tokens: String,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DesktopSessionSettingsMutationTarget {
+    workspace_path: String,
+    root_session_id: String,
+    settings_revision: String,
+    config_generation: String,
     runtime_owner_token: String,
 }
 
@@ -3488,7 +3675,7 @@ fn validate_complete_config_draft(
     controller: &DesktopController,
     values: &[DesktopConfigValueInput],
 ) -> Result<bool, DesktopCommandConflict> {
-    complete_config_draft_is_dirty(&controller.state.provider_config.effective_config, values)
+    complete_config_draft_is_dirty(controller.state.global_config(), values)
 }
 
 fn complete_config_draft_is_dirty(
@@ -3537,6 +3724,346 @@ fn ensure_config_mutation_target(
             .map(|session_id| session_id.to_string()),
         controller.state.provider_config.config_generation,
     )
+}
+
+fn validate_initial_setup_mutation_target(
+    expected: &DesktopInitialSetupMutationTarget,
+    workspace_path: &str,
+    global_config_path: &str,
+    setup_generation: u64,
+) -> Result<(), DesktopCommandConflict> {
+    if expected.workspace_path != workspace_path
+        || expected.global_config_path != global_config_path
+        || expected.setup_generation != setup_generation.to_string()
+    {
+        return Err(DesktopCommandConflict::new(
+            "initial-setup owner changed before Finish; review the current setup state and try again",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_initial_setup_mutation_target(
+    controller: &DesktopController,
+    expected: &DesktopInitialSetupMutationTarget,
+) -> Result<(), DesktopCommandConflict> {
+    if !controller.state.startup.requires_initial_setup()
+        || controller.state.view.overlay != DesktopOverlay::InitialSetup
+    {
+        return Err(DesktopCommandConflict::new(
+            "initial setup is no longer the active configuration owner",
+        ));
+    }
+    validate_initial_setup_mutation_target(
+        expected,
+        controller.app.workspace.authority_root().as_str(),
+        controller
+            .state
+            .startup
+            .global_config_path
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+            .as_str(),
+        controller.state.startup.setup_generation,
+    )
+}
+
+fn validate_session_settings_mutation_target(
+    expected: &DesktopSessionSettingsMutationTarget,
+    workspace_path: &str,
+    root_session_id: &str,
+    settings_revision: u64,
+    config_generation: u64,
+    runtime_owner_token: &str,
+) -> Result<(), DesktopCommandConflict> {
+    validate_session_settings_settlement_target(
+        expected,
+        workspace_path,
+        root_session_id,
+        settings_revision,
+        config_generation,
+        runtime_owner_token,
+        false,
+        None,
+    )
+}
+
+fn rebase_session_settings_persistence_outcome(
+    controller: &mut DesktopController,
+    outcome: &RootSessionSettingsPersistenceOutcome,
+) -> bool {
+    controller
+        .state
+        .apply_persisted_root_session_record(outcome.canonical_session().clone())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_session_settings_settlement_target(
+    expected: &DesktopSessionSettingsMutationTarget,
+    workspace_path: &str,
+    root_session_id: &str,
+    settings_revision: u64,
+    config_generation: u64,
+    runtime_owner_token: &str,
+    allow_access_owner_terminal_crossing: bool,
+    already_projected_applied: Option<AlreadyProjectedSessionSettingsWrite>,
+) -> Result<(), DesktopCommandConflict> {
+    let runtime_owner_matches = expected.runtime_owner_token == runtime_owner_token
+        || (allow_access_owner_terminal_crossing
+            && access_runtime_owner_terminal_settlement_matches(
+                &expected.runtime_owner_token,
+                runtime_owner_token,
+            ));
+    let settings_revision_matches = expected.settings_revision == settings_revision.to_string()
+        || already_projected_applied
+            .is_some_and(|applied| applied.settings_revision == settings_revision);
+    let config_generation_matches = expected.config_generation == config_generation.to_string()
+        || already_projected_applied
+            .is_some_and(|applied| applied.next_config_generation == Some(config_generation));
+    if expected.workspace_path != workspace_path
+        || expected.root_session_id != root_session_id
+        || !settings_revision_matches
+        || !config_generation_matches
+        || !runtime_owner_matches
+    {
+        return Err(DesktopCommandConflict::new(
+            "root-session settings owner changed before Apply; reopen the panel and try again",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_session_settings_mutation_target(
+    controller: &DesktopController,
+    expected: &DesktopSessionSettingsMutationTarget,
+) -> Result<u64, DesktopCommandConflict> {
+    if controller.state.view.overlay != DesktopOverlay::SessionSettings {
+        return Err(DesktopCommandConflict::new(
+            "session settings are no longer the active panel",
+        ));
+    }
+    let session = controller
+        .state
+        .open_session
+        .as_ref()
+        .filter(|open_session| {
+            Some(open_session.session_id()) == controller.state.app_state.current_session_id
+        })
+        .map(|open_session| open_session.session())
+        .ok_or_else(|| {
+            DesktopCommandConflict::new("the current root-session settings owner is unavailable")
+        })?;
+    let (runtime_owner_token, _) = controller.access_mode_mutation_runtime_contract();
+    validate_session_settings_mutation_target(
+        expected,
+        controller.app.workspace.authority_root().as_str(),
+        &session.id.to_string(),
+        session.session_settings_revision,
+        controller.state.provider_config.config_generation,
+        &runtime_owner_token,
+    )?;
+    Ok(session.session_settings_revision)
+}
+
+fn ensure_session_settings_settlement_target(
+    controller: &DesktopController,
+    expected: &DesktopSessionSettingsMutationTarget,
+    policy: SessionSettingsSettlementPolicy,
+    outcome: Option<&RootSessionSettingsPersistenceOutcome>,
+) -> Result<u64, DesktopCommandConflict> {
+    if controller.state.view.overlay != DesktopOverlay::SessionSettings {
+        return Err(DesktopCommandConflict::new(
+            "session settings are no longer the active panel",
+        ));
+    }
+    let session = controller
+        .state
+        .open_session
+        .as_ref()
+        .filter(|open_session| {
+            Some(open_session.session_id()) == controller.state.app_state.current_session_id
+        })
+        .map(|open_session| open_session.session())
+        .ok_or_else(|| {
+            DesktopCommandConflict::new("the current root-session settings owner is unavailable")
+        })?;
+    let (runtime_owner_token, _) = controller.access_mode_mutation_runtime_contract();
+    let already_projected_applied = match outcome {
+        Some(RootSessionSettingsPersistenceOutcome::Applied(result))
+            if controller
+                .state
+                .persisted_root_session_settings_and_effective_config_are_projected(
+                    &result.update.session,
+                ) =>
+        {
+            let next_config_generation = (result.update.changed
+                && result.config_generation_delta == 1)
+                .then(|| {
+                    expected
+                        .config_generation
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|generation| generation.to_string() == expected.config_generation)
+                        .and_then(|generation| generation.checked_add(1))
+                        .filter(|generation| {
+                            *generation == controller.state.provider_config.config_generation
+                        })
+                })
+                .flatten();
+            Some(AlreadyProjectedSessionSettingsWrite {
+                settings_revision: result.update.session.session_settings_revision,
+                next_config_generation,
+            })
+        }
+        _ => None,
+    };
+    validate_session_settings_settlement_target(
+        expected,
+        controller.app.workspace.authority_root().as_str(),
+        &session.id.to_string(),
+        session.session_settings_revision,
+        controller.state.provider_config.config_generation,
+        &runtime_owner_token,
+        policy.access_only,
+        already_projected_applied,
+    )?;
+    Ok(session.session_settings_revision)
+}
+
+fn parse_session_settings_u32(
+    field: &str,
+    value: &str,
+    require_positive: bool,
+) -> Result<u32, DesktopCommandConflict> {
+    let parsed = value
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| DesktopCommandConflict::new(format!("{field} must be an unsigned integer")))?;
+    if require_positive && parsed == 0 {
+        return Err(DesktopCommandConflict::new(format!(
+            "{field} must be greater than zero"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn parse_optional_session_settings_u32(
+    field: &str,
+    value: &str,
+    require_positive: bool,
+) -> Result<Option<u32>, DesktopCommandConflict> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    parse_session_settings_u32(field, value, require_positive).map(Some)
+}
+
+fn session_model_parameter_patch(
+    current: &crate::session::SessionModelParameters,
+    context_window: Option<u32>,
+    max_output_tokens: Option<u32>,
+) -> SessionSettingsPatch {
+    let clears_existing_override = (current.context_window.is_some() && context_window.is_none())
+        || (current.max_output_tokens.is_some() && max_output_tokens.is_none());
+    if clears_existing_override {
+        return SessionSettingsPatch {
+            reset_model_parameters: true,
+            temperature: current.temperature,
+            top_p: current.top_p,
+            top_k: current.top_k,
+            context_window,
+            max_output_tokens,
+            ..SessionSettingsPatch::default()
+        };
+    }
+    SessionSettingsPatch {
+        context_window: (context_window != current.context_window)
+            .then_some(context_window)
+            .flatten(),
+        max_output_tokens: (max_output_tokens != current.max_output_tokens)
+            .then_some(max_output_tokens)
+            .flatten(),
+        ..SessionSettingsPatch::default()
+    }
+}
+
+fn session_settings_patch_for_values(
+    session: &crate::session::SessionRecord,
+    base_url: String,
+    model: String,
+    access_mode: crate::config::AccessMode,
+    context_window: Option<u32>,
+    max_output_tokens: Option<u32>,
+) -> (SessionSettingsPatch, bool) {
+    let mut patch =
+        session_model_parameter_patch(&session.model_parameters, context_window, max_output_tokens);
+    patch.base_url = (base_url != session.base_url).then_some(base_url);
+    patch.model = (model != session.model).then_some(model);
+    patch.access_mode = (access_mode != session.access_mode).then_some(access_mode);
+    let changes_turn_config = patch.base_url.is_some()
+        || patch.model.is_some()
+        || patch.reset_model_parameters
+        || patch.context_window.is_some()
+        || patch.max_output_tokens.is_some();
+    (patch, changes_turn_config)
+}
+
+fn build_session_settings_patch(
+    controller: &DesktopController,
+    input: DesktopSessionSettingsInput,
+) -> Result<(SessionSettingsPatch, bool), DesktopCommandConflict> {
+    let session = controller
+        .state
+        .open_session
+        .as_ref()
+        .filter(|open_session| {
+            Some(open_session.session_id()) == controller.state.app_state.current_session_id
+        })
+        .map(|open_session| open_session.session())
+        .ok_or_else(|| {
+            DesktopCommandConflict::new("the current root-session settings owner is unavailable")
+        })?;
+    let base_url = crate::config::ProviderEndpoint::parse(&input.base_url)
+        .map_err(|error| DesktopCommandConflict::new(error.to_string()))?
+        .as_str()
+        .to_string();
+    let model = input.model.trim().to_string();
+    if model.is_empty() {
+        return Err(DesktopCommandConflict::new(
+            "session settings model must not be empty",
+        ));
+    }
+    let context_window =
+        parse_optional_session_settings_u32("context window", &input.context_window, true)?;
+    let max_output_tokens =
+        parse_optional_session_settings_u32("max output tokens", &input.max_output_tokens, false)?;
+    Ok(session_settings_patch_for_values(
+        session,
+        base_url,
+        model,
+        input.access_mode,
+        context_window,
+        max_output_tokens,
+    ))
+}
+
+fn session_settings_storage_error(
+    controller: &mut DesktopController,
+    error: String,
+) -> DesktopCommandError {
+    controller
+        .state
+        .set_status_message(format!("session settings were not saved: {error}"));
+    let state = controller.next_web_state().ok();
+    DesktopCommandError {
+        kind: "internal",
+        category: DesktopCommandErrorCategory::Storage,
+        code: DesktopCommandErrorCode::StorageFailure,
+        message: error,
+        state,
+    }
 }
 
 fn ensure_config_draft_commit_admission(
@@ -3689,6 +4216,196 @@ async fn save_global_config(
             .next_web_state()
             .map_err(DesktopCommandError::internal)?,
         saved,
+    ))
+}
+
+#[tauri::command]
+async fn finish_initial_setup(
+    controller: State<'_, SharedController>,
+    values: Vec<DesktopConfigValueInput>,
+    expected_config_target: DesktopConfigMutationTarget,
+    expected_setup_target: DesktopInitialSetupMutationTarget,
+) -> Result<(DesktopWebState, bool), DesktopCommandError> {
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    if let Err(conflict) = ensure_unscoped_prompt_review_action(&mut controller, "initial setup") {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    if let Err(conflict) = ensure_initial_setup_mutation_target(&controller, &expected_setup_target)
+    {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    if let Err(conflict) = ensure_config_mutation_target(&controller, &expected_config_target) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    if let Err(conflict) = ensure_config_draft_commit_admission(&controller) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    if let Err(conflict) = validate_complete_config_draft(&controller, &values) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    let finished = controller.finish_initial_setup(
+        values
+            .into_iter()
+            .map(|value| (value.key, value.text))
+            .collect(),
+    );
+    controller.drain_runtime_messages();
+    Ok((
+        controller
+            .next_web_state()
+            .map_err(DesktopCommandError::internal)?,
+        finished,
+    ))
+}
+
+#[tauri::command]
+async fn apply_session_settings(
+    controller: State<'_, SharedController>,
+    input: DesktopSessionSettingsInput,
+    expected_target: DesktopSessionSettingsMutationTarget,
+) -> Result<(DesktopWebState, bool), DesktopCommandError> {
+    let (persistence, operation_id, settlement_policy) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        if let Err(conflict) =
+            ensure_unscoped_prompt_review_action(&mut controller, "session settings")
+        {
+            return Err(command_conflict_error(&mut controller, conflict));
+        }
+        let expected_revision =
+            match ensure_session_settings_mutation_target(&controller, &expected_target) {
+                Ok(revision) => revision,
+                Err(conflict) => return Err(command_conflict_error(&mut controller, conflict)),
+            };
+        let (patch, changes_turn_config) = match build_session_settings_patch(&controller, input) {
+            Ok(result) => result,
+            Err(conflict) => return Err(command_conflict_error(&mut controller, conflict)),
+        };
+        if patch.is_empty() {
+            controller
+                .state
+                .set_status_message("session settings already match the saved root-session values");
+            return Ok((
+                controller
+                    .next_web_state()
+                    .map_err(DesktopCommandError::internal)?,
+                true,
+            ));
+        }
+        if changes_turn_config && !controller.session_settings_turn_config_mutation_admission_open()
+        {
+            let conflict = DesktopCommandConflict::new(
+                "provider, model, context, and output settings can be saved after the active root run finishes",
+            );
+            return Err(command_conflict_error(&mut controller, conflict));
+        }
+        if !changes_turn_config
+            && patch.access_mode.is_some()
+            && !controller.access_mode_mutation_admission_open()
+        {
+            let conflict = DesktopCommandConflict::new(
+                "access mode cannot change while navigation or an owner mutation is active",
+            );
+            return Err(command_conflict_error(&mut controller, conflict));
+        }
+        let persistence = match controller
+            .prepare_root_session_settings_persistence(expected_revision, patch)
+        {
+            Ok(Some(persistence)) => persistence,
+            Ok(None) => {
+                let conflict = DesktopCommandConflict::new(
+                    "root-session settings changed before Apply; reopen the panel and try again",
+                );
+                return Err(command_conflict_error(&mut controller, conflict));
+            }
+            Err(RootSessionSettingsApplyError::ActiveTree(message)) => {
+                let conflict = DesktopCommandConflict::new(format!(
+                    "root-session settings changed while the agent tree became active; keep the draft and retry after it finishes: {message}"
+                ));
+                return Err(command_conflict_error(&mut controller, conflict));
+            }
+            Err(RootSessionSettingsApplyError::Internal(error)) => {
+                return Err(session_settings_storage_error(&mut controller, error));
+            }
+        };
+        let operation_id = controller.state.begin_session_settings_persistence();
+        let settlement_policy = SessionSettingsSettlementPolicy {
+            access_only: persistence.access_only(),
+        };
+        controller
+            .state
+            .set_status_message("saving the exact root-session settings owner");
+        (persistence, operation_id, settlement_policy)
+    };
+
+    // SQLite can wait on another process. Persist without holding the controller
+    // lock; the registered mutation owner closes new in-process admissions.
+    let persisted =
+        match tauri::async_runtime::spawn_blocking(move || persistence.execute_blocking()).await {
+            Ok(result) => result,
+            Err(error) => Err(RootSessionSettingsApplyError::Internal(format!(
+                "session settings persistence worker failed: {error}"
+            ))),
+        };
+
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    if !controller
+        .state
+        .finish_session_settings_persistence(operation_id)
+    {
+        if let Ok(outcome) = &persisted {
+            let _ = rebase_session_settings_persistence_outcome(&mut controller, outcome);
+        }
+        let conflict = DesktopCommandConflict::new(
+            "the session-settings persistence owner was superseded; keep the draft and reload",
+        );
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    if let Err(conflict) = ensure_session_settings_settlement_target(
+        &controller,
+        &expected_target,
+        settlement_policy,
+        persisted.as_ref().ok(),
+    ) {
+        if let Ok(outcome) = &persisted {
+            let _ = rebase_session_settings_persistence_outcome(&mut controller, outcome);
+        }
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    let result = match persisted {
+        Ok(RootSessionSettingsPersistenceOutcome::Applied(result)) => result,
+        Ok(RootSessionSettingsPersistenceOutcome::Conflict { session, .. }) => {
+            let _ = controller
+                .state
+                .apply_persisted_root_session_record(session);
+            let conflict = DesktopCommandConflict::new(
+                "saved root-session settings changed before Apply; keep the draft, review the refreshed saved state, and retry",
+            );
+            return Err(command_conflict_error(&mut controller, conflict));
+        }
+        Err(RootSessionSettingsApplyError::ActiveTree(message)) => {
+            let conflict = DesktopCommandConflict::new(format!(
+                "root-session settings changed while the agent tree became active; keep the draft and retry after it finishes: {message}"
+            ));
+            return Err(command_conflict_error(&mut controller, conflict));
+        }
+        Err(RootSessionSettingsApplyError::Internal(error)) => {
+            return Err(session_settings_storage_error(&mut controller, error));
+        }
+    };
+    if !controller.settle_root_session_settings_persistence(result) {
+        let conflict = DesktopCommandConflict::new(
+            "the root-session settings owner changed before settlement; reload the current chat",
+        );
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    Ok((
+        controller
+            .next_web_state()
+            .map_err(DesktopCommandError::internal)?,
+        true,
     ))
 }
 
@@ -3931,6 +4648,462 @@ mod tests {
                 8,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn initial_setup_target_rejects_path_generation_and_workspace_drift() {
+        let expected = DesktopInitialSetupMutationTarget {
+            workspace_path: "C:/workspace".to_string(),
+            global_config_path: "C:/config/config.toml".to_string(),
+            setup_generation: "7".to_string(),
+        };
+        assert!(
+            validate_initial_setup_mutation_target(
+                &expected,
+                "C:/workspace",
+                "C:/config/config.toml",
+                7,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_initial_setup_mutation_target(
+                &expected,
+                "C:/other",
+                "C:/config/config.toml",
+                7,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_initial_setup_mutation_target(
+                &expected,
+                "C:/workspace",
+                "C:/other/config.toml",
+                7,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_initial_setup_mutation_target(
+                &expected,
+                "C:/workspace",
+                "C:/config/config.toml",
+                8,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn session_settings_target_rejects_every_root_owner_drift() {
+        let expected = DesktopSessionSettingsMutationTarget {
+            workspace_path: "C:/workspace".to_string(),
+            root_session_id: "session-a".to_string(),
+            settings_revision: "11".to_string(),
+            config_generation: "13".to_string(),
+            runtime_owner_token: "tree:17".to_string(),
+        };
+        assert!(
+            validate_session_settings_mutation_target(
+                &expected,
+                "C:/workspace",
+                "session-a",
+                11,
+                13,
+                "tree:17",
+            )
+            .is_ok()
+        );
+        for (workspace, session, revision, generation, runtime) in [
+            ("C:/other", "session-a", 11, 13, "tree:17"),
+            ("C:/workspace", "session-b", 11, 13, "tree:17"),
+            ("C:/workspace", "session-a", 12, 13, "tree:17"),
+            ("C:/workspace", "session-a", 11, 14, "tree:17"),
+            ("C:/workspace", "session-a", 11, 13, "idle:17"),
+        ] {
+            assert!(
+                validate_session_settings_mutation_target(
+                    &expected, workspace, session, revision, generation, runtime,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn access_only_session_settings_error_settlement_uses_the_captured_same_epoch_policy() {
+        let target = DesktopSessionSettingsMutationTarget {
+            workspace_path: "C:/workspace".to_string(),
+            root_session_id: "session-a".to_string(),
+            settings_revision: "11".to_string(),
+            config_generation: "13".to_string(),
+            runtime_owner_token: "tree:17".to_string(),
+        };
+
+        assert!(
+            validate_session_settings_settlement_target(
+                &target,
+                "C:/workspace",
+                "session-a",
+                11,
+                13,
+                "tree:17",
+                true,
+                None,
+            )
+            .is_ok(),
+            "an access-only operation keeps its policy even when no successful worker outcome exists"
+        );
+        assert!(
+            validate_session_settings_settlement_target(
+                &target,
+                "C:/workspace",
+                "session-a",
+                11,
+                13,
+                "idle:17",
+                true,
+                None,
+            )
+            .is_ok(),
+            "an access-only write may settle after its captured tree reaches idle"
+        );
+        assert!(
+            validate_session_settings_settlement_target(
+                &target,
+                "C:/workspace",
+                "session-a",
+                11,
+                13,
+                "root:17",
+                true,
+                None,
+            )
+            .is_ok(),
+            "an access-only write may settle when its captured child tree completes and the same root resumes"
+        );
+        assert!(
+            validate_session_settings_settlement_target(
+                &target,
+                "C:/workspace",
+                "session-a",
+                11,
+                13,
+                "idle:17",
+                false,
+                None,
+            )
+            .is_err(),
+            "turn-config writes retain strict runtime-token equality"
+        );
+        for current in ["root:18", "tree:18", "idle:18"] {
+            assert!(
+                validate_session_settings_settlement_target(
+                    &target,
+                    "C:/workspace",
+                    "session-a",
+                    11,
+                    13,
+                    current,
+                    true,
+                    None,
+                )
+                .is_err(),
+                "a new or non-terminal runtime owner must be rejected: {current}"
+            );
+        }
+        assert!(
+            validate_session_settings_settlement_target(
+                &target,
+                "C:/workspace",
+                "session-b",
+                11,
+                13,
+                "idle:17",
+                true,
+                None,
+            )
+            .is_err(),
+            "same-epoch completion never relaxes the durable session owner"
+        );
+        assert!(
+            validate_session_settings_settlement_target(
+                &target,
+                "C:/other",
+                "session-a",
+                11,
+                13,
+                "idle:17",
+                true,
+                None,
+            )
+            .is_err(),
+            "same-epoch completion never relaxes the workspace owner"
+        );
+        assert!(
+            validate_session_settings_settlement_target(
+                &target,
+                "C:/workspace",
+                "session-a",
+                11,
+                14,
+                "idle:17",
+                true,
+                None,
+            )
+            .is_err(),
+            "same-epoch completion never relaxes the config-generation owner"
+        );
+
+        let root_target = DesktopSessionSettingsMutationTarget {
+            runtime_owner_token: "root:19".to_string(),
+            ..target
+        };
+        for current in ["tree:19", "idle:19"] {
+            assert!(
+                validate_session_settings_settlement_target(
+                    &root_target,
+                    "C:/workspace",
+                    "session-a",
+                    11,
+                    13,
+                    current,
+                    true,
+                    None,
+                )
+                .is_ok()
+            );
+        }
+
+        let idle_target = DesktopSessionSettingsMutationTarget {
+            runtime_owner_token: "idle:20".to_string(),
+            ..root_target
+        };
+        for current in ["root:20", "tree:20"] {
+            assert!(
+                validate_session_settings_settlement_target(
+                    &idle_target,
+                    "C:/workspace",
+                    "session-a",
+                    11,
+                    13,
+                    current,
+                    true,
+                    None,
+                )
+                .is_err(),
+                "an idle owner cannot adopt a later active phase: {current}"
+            );
+        }
+    }
+
+    #[test]
+    fn own_settings_write_settles_at_its_result_revision_only_after_exact_projection() {
+        let target = DesktopSessionSettingsMutationTarget {
+            workspace_path: "C:/workspace".to_string(),
+            root_session_id: "session-a".to_string(),
+            settings_revision: "11".to_string(),
+            config_generation: "13".to_string(),
+            runtime_owner_token: "idle:17".to_string(),
+        };
+
+        assert!(
+            validate_session_settings_settlement_target(
+                &target,
+                "C:/workspace",
+                "session-a",
+                12,
+                13,
+                "idle:17",
+                false,
+                None,
+            )
+            .is_err(),
+            "a result revision is not accepted until the caller proves that the exact settings projection is already current"
+        );
+        assert!(
+            validate_session_settings_settlement_target(
+                &target,
+                "C:/workspace",
+                "session-a",
+                12,
+                13,
+                "idle:17",
+                false,
+                Some(AlreadyProjectedSessionSettingsWrite {
+                    settings_revision: 12,
+                    next_config_generation: None,
+                }),
+            )
+            .is_ok(),
+            "the command's own N+1 projection may settle idempotently"
+        );
+        assert!(
+            validate_session_settings_settlement_target(
+                &target,
+                "C:/workspace",
+                "session-a",
+                12,
+                14,
+                "idle:17",
+                false,
+                Some(AlreadyProjectedSessionSettingsWrite {
+                    settings_revision: 12,
+                    next_config_generation: None,
+                }),
+            )
+            .is_err(),
+            "a durable or effective no-op cannot claim an unrelated config-generation increment"
+        );
+        assert!(
+            validate_session_settings_settlement_target(
+                &target,
+                "C:/workspace",
+                "session-a",
+                12,
+                14,
+                "idle:17",
+                false,
+                Some(AlreadyProjectedSessionSettingsWrite {
+                    settings_revision: 12,
+                    next_config_generation: Some(14),
+                }),
+            )
+            .is_ok(),
+            "an exact settings result may settle after applying its one expected effective-config generation"
+        );
+        assert!(
+            validate_session_settings_settlement_target(
+                &target,
+                "C:/workspace",
+                "session-a",
+                12,
+                15,
+                "idle:17",
+                false,
+                Some(AlreadyProjectedSessionSettingsWrite {
+                    settings_revision: 12,
+                    next_config_generation: Some(14),
+                }),
+            )
+            .is_err(),
+            "a later unrelated config generation remains a conflict"
+        );
+        assert!(
+            validate_session_settings_settlement_target(
+                &target,
+                "C:/workspace",
+                "session-a",
+                13,
+                13,
+                "idle:17",
+                false,
+                Some(AlreadyProjectedSessionSettingsWrite {
+                    settings_revision: 12,
+                    next_config_generation: None,
+                }),
+            )
+            .is_err(),
+            "a later settings revision cannot be adopted as this command's result"
+        );
+    }
+
+    #[test]
+    fn session_settings_blank_limit_clears_only_that_override() {
+        let current = crate::session::SessionModelParameters {
+            temperature: Some(0.4),
+            top_p: Some(0.8),
+            top_k: Some(40),
+            context_window: Some(65_536),
+            max_output_tokens: Some(4_096),
+        };
+
+        let patch = session_model_parameter_patch(&current, None, Some(8_192));
+        let next = patch.apply_to_model_parameters(&current);
+
+        assert!(patch.reset_model_parameters);
+        assert_eq!(next.temperature, current.temperature);
+        assert_eq!(next.top_p, current.top_p);
+        assert_eq!(next.top_k, current.top_k);
+        assert_eq!(next.context_window, None);
+        assert_eq!(next.max_output_tokens, Some(8_192));
+        assert_eq!(
+            parse_optional_session_settings_u32("context window", "  ", true)
+                .expect("blank inherits"),
+            None
+        );
+    }
+
+    #[test]
+    fn unchanged_session_limits_do_not_reset_other_model_parameters() {
+        let current = crate::session::SessionModelParameters {
+            temperature: Some(0.4),
+            top_p: Some(0.8),
+            top_k: Some(40),
+            context_window: None,
+            max_output_tokens: Some(4_096),
+        };
+
+        let mut patch = session_model_parameter_patch(&current, None, Some(4_096));
+        patch.access_mode = Some(crate::config::AccessMode::FullAccess);
+
+        assert!(!patch.reset_model_parameters);
+        assert_eq!(patch.apply_to_model_parameters(&current), current);
+    }
+
+    #[test]
+    fn canonical_session_settings_no_op_is_an_explicit_success_without_a_revision_write() {
+        let session = crate::session::SessionRecord {
+            id: SessionId::new(),
+            project_id: crate::session::ProjectId::new(),
+            title: "session".to_string(),
+            status: crate::session::SessionStatus::Running,
+            cwd: camino::Utf8PathBuf::from("C:/workspace"),
+            model: "current-model".to_string(),
+            base_url: "http://127.0.0.1:1234".to_string(),
+            access_mode: crate::config::AccessMode::Default,
+            model_parameters: crate::session::SessionModelParameters::default(),
+            session_settings_revision: 7,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            completed_at_ms: None,
+        };
+        let base_url = crate::config::ProviderEndpoint::parse(" http://127.0.0.1:1234/ ")
+            .expect("canonical endpoint")
+            .as_str()
+            .to_string();
+        let (patch, changes_turn_config) = session_settings_patch_for_values(
+            &session,
+            base_url,
+            " current-model ".trim().to_string(),
+            session.access_mode,
+            None,
+            None,
+        );
+
+        assert!(patch.is_empty());
+        assert!(!changes_turn_config);
+        assert_eq!(session.session_settings_revision, 7);
+    }
+
+    #[test]
+    fn initial_setup_import_draft_serializes_the_camel_case_wire_contract() {
+        let payload = DesktopInitialSetupConfigDraft {
+            source_path: "C:/config/import.toml".to_string(),
+            values: vec![DesktopConfigValueInput {
+                key: "model.model".to_string(),
+                text: "draft-model".to_string(),
+            }],
+        };
+
+        assert_eq!(
+            serde_json::to_value(payload).expect("serialize import draft"),
+            serde_json::json!({
+                "sourcePath": "C:/config/import.toml",
+                "values": [{"key": "model.model", "text": "draft-model"}],
+            })
         );
     }
 

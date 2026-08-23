@@ -91,6 +91,12 @@ function state(
       action_overlay: "none",
     },
     config_fields: [],
+    docling_readiness: {
+      status: "idle",
+      endpoint: "",
+      httpStatus: null,
+      message: "Docling readiness has not been checked.",
+    },
     side_chat: sideChat({ owner_session_id: ownerSessionId, ...sideOverrides }),
     agent_activity_rows: [],
     config_draft: {

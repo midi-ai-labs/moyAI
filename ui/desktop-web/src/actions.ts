@@ -5,6 +5,7 @@ import {
   beginConfigMutation,
   configMutationPending,
   finishConfigMutation,
+  replaceCompleteConfigDraft,
   type ConfigValueInput,
 } from "./config_mutation.ts";
 import {
@@ -20,6 +21,29 @@ import {
   sessionRowActionAvailable,
 } from "./navigation_state.ts";
 import { rowMutationArgs } from "./row_target.ts";
+import { settingsCloseTargetStillMatches } from "./settings_surface.ts";
+import {
+  advanceInitialSetupStep,
+  beginInitialSetupFinish,
+  finishInitialSetup,
+  retreatInitialSetupStep,
+  validateInitialSetupStep,
+} from "./initial_setup_state.ts";
+import {
+  beginInitialSetupAuxiliaryRequest,
+  finishInitialSetupAuxiliaryRequest,
+  initialSetupAuxiliaryPendingKind,
+  recordInitialSetupDoclingReadinessOwner,
+  recordInitialSetupImportedSource,
+} from "./initial_setup_auxiliary_state.ts";
+import {
+  beginSessionSettingsMutation,
+  clearSessionSettings,
+  finishSessionSettingsMutation,
+  reconcileSessionSettings,
+  sameSessionSettingsRootOwner,
+  sameSessionSettingsTarget,
+} from "./session_settings_state.ts";
 import {
   beginQuickChatDeleteFocusContinuation,
 } from "./quick_chat_delete_focus_continuation.ts";
@@ -31,16 +55,21 @@ import type {
   DesktopWebState,
   ProjectRow,
   RowMutationTarget,
+  SessionSettingsMutationTarget,
   SessionRow,
   SideChatCatalogResult,
 } from "./types.ts";
 import {
+  beginDoclingReadinessRequest,
   beginSideChatCatalogLoad,
   failSideChatCatalogLoad,
+  finishDoclingReadinessRequest,
   finishSideChatCatalogLoad,
   openAgentPane,
   openSideChatPane,
   rebaseSideChatDraftAfterConfigure,
+  sessionSettingsDraftFromProjection,
+  sessionSettingsMutationAvailability,
   setArtifactPaneCollapsed,
   showAgentList,
   showOutputPane,
@@ -58,8 +87,13 @@ import {
   draftMutationTarget,
   providerCapabilities,
   providerDraftPayload,
+  synchronizeInitialSetupProviderDraft,
 } from "./view_state.ts";
-import { validateSideChatProviderSettings } from "./utils.ts";
+import {
+  doclingReadinessEndpoint,
+  validateConfigFieldValues,
+  validateSideChatProviderSettings,
+} from "./utils.ts";
 
 export type ActionMenu = "file" | "edit" | "view" | "help";
 
@@ -81,6 +115,7 @@ export interface ActionContext {
   getViewState: () => DesktopViewState | null;
   getRenderModel: () => DesktopRenderModel | null;
   acceptProjection: (state: DesktopWebState, render?: boolean) => void;
+  waitForInteractionIdle: () => Promise<void>;
   rerender: () => void;
   mutate: (
     name: string,
@@ -126,6 +161,35 @@ interface ActionSourceDefinition extends Omit<ActionDefinition, "enabled"> {
 
 function always(): boolean {
   return true;
+}
+
+function doclingReadinessCheckEnabled(
+  state: DesktopViewState,
+  model: DesktopRenderModel,
+): boolean {
+  const enabled = state.config_fields.find((field) => field.key === "docling.enabled")
+    ?.value.trim().toLowerCase() === "true";
+  if (state.overlay === "initial_setup") {
+    return startupSetupRequired(state)
+      && state.startup.setup_target !== null
+      && model.local.initialSetup.step === "tools"
+      && enabled
+      && validateInitialSetupStep(
+        "finish",
+        state.config_fields,
+        currentConfigValues(state),
+      ).ok
+      && state.docling_readiness.status !== "checking"
+      && !model.local.configMutationPending
+      && model.local.initialSetup.auxiliaryPendingKind === null;
+  }
+  return state.overlay === "config"
+    && enabled
+    && !state.config_draft.dirty
+    && state.config_draft.external_owner_mutation_open
+    && state.docling_readiness.status !== "checking"
+    && !model.local.configMutationPending
+    && !model.local.doclingReadinessRequestPending;
 }
 
 async function runWithoutRender(name: string, context: ActionContext): Promise<void> {
@@ -233,6 +297,449 @@ async function runConfigMutation(
   context.acceptProjection(state);
 }
 
+function currentConfigValues(state: DesktopViewState): ConfigValueInput[] {
+  return state.config_fields.map((field) => ({ key: field.key, text: field.value }));
+}
+
+interface InitialSetupConfigImportResult {
+  sourcePath: string;
+  values: ConfigValueInput[];
+}
+
+async function loadInitialSetupConfigToml(
+  state: DesktopViewState,
+  context: ActionContext,
+): Promise<void> {
+  const setupTarget = state.startup.setup_target;
+  if (
+    !startupSetupRequired(state)
+    || state.overlay !== "initial_setup"
+    || context.uiState.initialSetup.step !== "start"
+    || setupTarget === null
+    || configMutationPending(context.uiState)
+  ) return;
+  const request = beginInitialSetupAuxiliaryRequest(
+    context.uiState.initialSetupAuxiliary,
+    "import",
+    setupTarget,
+    state.config_target,
+    context.uiState.configDraftRevision,
+  );
+  if (!request) return;
+  context.rerender();
+  try {
+    const result = await command<InitialSetupConfigImportResult | null>(
+      "load_initial_setup_config_toml",
+      {
+        expectedConfigTarget: request.configTarget,
+        expectedSetupTarget: request.setupTarget,
+      },
+    );
+    const current = context.getViewState();
+    const accepted = finishInitialSetupAuxiliaryRequest(
+      context.uiState.initialSetupAuxiliary,
+      request,
+      current?.startup.setup_target ?? null,
+      current?.config_target ?? request.configTarget,
+      context.uiState.configDraftRevision,
+    );
+    if (!accepted || current === null) {
+      context.rerender();
+      return;
+    }
+    if (result === null) {
+      context.rerender();
+      return;
+    }
+    if (!completeImportedConfigIsValid(current, result.values)) {
+      context.rerender();
+      context.reportError("選択したTOMLの設定項目が現在のschemaと一致しませんでした。");
+      return;
+    }
+    if (!replaceCompleteConfigDraft(
+      context.uiState,
+      current.config_target,
+      current.config_fields.map((field) => ({
+        key: field.key,
+        text: context.uiState.configDraftBaselineValues.get(field.key) ?? field.value,
+      })),
+      result.values,
+    )) {
+      context.rerender();
+      context.reportError("選択したTOMLを完全な設定draftとして読み込めませんでした。");
+      return;
+    }
+    const importedView = context.getViewState();
+    if (importedView) {
+      synchronizeInitialSetupProviderDraft(importedView, context.uiState);
+    }
+    recordInitialSetupImportedSource(
+      context.uiState.initialSetupAuxiliary,
+      current.startup.setup_target!,
+      current.config_target,
+      result.sourcePath,
+    );
+    context.rerender();
+  } catch (error) {
+    const current = context.getViewState();
+    finishInitialSetupAuxiliaryRequest(
+      context.uiState.initialSetupAuxiliary,
+      request,
+      current?.startup.setup_target ?? null,
+      current?.config_target ?? request.configTarget,
+      context.uiState.configDraftRevision,
+    );
+    if (context.recoverCommandConflict(error)) return;
+    context.rerender();
+    context.reportError(error);
+  }
+}
+
+function completeImportedConfigIsValid(
+  state: DesktopViewState,
+  values: readonly ConfigValueInput[],
+): boolean {
+  const expectedKeys = new Set(state.config_fields.map((field) => field.key));
+  const actualKeys = new Set(values.map((value) => value.key));
+  return values.length === state.config_fields.length
+    && actualKeys.size === values.length
+    && actualKeys.size === expectedKeys.size
+    && Array.from(expectedKeys).every((key) => actualKeys.has(key))
+    && validateConfigFieldValues(state.config_fields, values).ok;
+}
+
+async function checkInitialSetupDoclingReadiness(
+  state: DesktopViewState,
+  context: ActionContext,
+): Promise<void> {
+  const setupTarget = state.startup.setup_target;
+  const values = currentConfigValues(state);
+  const baseUrl = values.find((value) => value.key === "docling.base_url")?.text ?? "";
+  const readinessEndpoint = doclingReadinessEndpoint(baseUrl);
+  if (
+    !startupSetupRequired(state)
+    || state.overlay !== "initial_setup"
+    || context.uiState.initialSetup.step !== "tools"
+    || setupTarget === null
+    || readinessEndpoint === null
+    || !validateInitialSetupStep("finish", state.config_fields, values).ok
+  ) return;
+  const request = beginInitialSetupAuxiliaryRequest(
+    context.uiState.initialSetupAuxiliary,
+    "docling_readiness",
+    setupTarget,
+    state.config_target,
+    context.uiState.configDraftRevision,
+    readinessEndpoint,
+  );
+  if (!request) return;
+  context.rerender();
+  try {
+    const nextState = await command<DesktopWebState>(
+      "check_initial_setup_docling_readiness",
+      {
+        values,
+        expectedConfigTarget: request.configTarget,
+        expectedSetupTarget: request.setupTarget,
+      },
+    );
+    const current = context.getViewState();
+    const accepted = finishInitialSetupAuxiliaryRequest(
+      context.uiState.initialSetupAuxiliary,
+      request,
+      current?.startup.setup_target ?? null,
+      current?.config_target ?? request.configTarget,
+      context.uiState.configDraftRevision,
+    );
+    if (accepted) {
+      recordInitialSetupDoclingReadinessOwner(
+        context.uiState.initialSetupAuxiliary,
+        request,
+      );
+    }
+    context.acceptProjection(nextState);
+    context.rerender();
+  } catch (error) {
+    const current = context.getViewState();
+    finishInitialSetupAuxiliaryRequest(
+      context.uiState.initialSetupAuxiliary,
+      request,
+      current?.startup.setup_target ?? null,
+      current?.config_target ?? request.configTarget,
+      context.uiState.configDraftRevision,
+    );
+    if (context.recoverCommandConflict(error)) return;
+    context.rerender();
+    context.reportError(error);
+  }
+}
+
+function initialSetupNavigationEnabled(
+  state: DesktopViewState,
+  context: ActionContext,
+): boolean {
+  return startupSetupRequired(state)
+    && state.overlay === "initial_setup"
+    && state.startup.setup_target !== null
+    && !configMutationPending(context.uiState)
+    && initialSetupAuxiliaryPendingKind(context.uiState.initialSetupAuxiliary) === null
+    && context.uiState.initialSetup.activeFinish === null;
+}
+
+function moveInitialSetupForward(state: DesktopViewState, context: ActionContext): void {
+  if (!initialSetupNavigationEnabled(state, context)) return;
+  advanceInitialSetupStep(
+    context.uiState.initialSetup,
+    state.config_fields,
+    currentConfigValues(state),
+  );
+  context.rerender();
+}
+
+function moveInitialSetupBack(state: DesktopViewState, context: ActionContext): void {
+  if (!initialSetupNavigationEnabled(state, context)) return;
+  if (retreatInitialSetupStep(context.uiState.initialSetup)) context.rerender();
+}
+
+async function finishInitialSetupFlow(
+  state: DesktopViewState,
+  context: ActionContext,
+): Promise<void> {
+  const setupTarget = state.startup.setup_target;
+  if (
+    !initialSetupNavigationEnabled(state, context)
+    || setupTarget === null
+  ) return;
+  const values = context.prepareConfigSnapshot(state.config_target);
+  if (!values) return;
+  const finishRequest = beginInitialSetupFinish(
+    context.uiState.initialSetup,
+    setupTarget,
+    state.config_target,
+    context.uiState.configDraftRevision,
+    state.config_fields,
+    values,
+  );
+  if (!finishRequest) return;
+  const configRequest = beginConfigMutation(context.uiState, state.config_target);
+  context.rerender();
+
+  try {
+    const [nextState, succeeded] = await command<[DesktopWebState, boolean]>(
+      "finish_initial_setup",
+      {
+        values,
+        expectedConfigTarget: finishRequest.configTarget,
+        expectedSetupTarget: finishRequest.setupTarget,
+      },
+    );
+    const currentTarget = context.getViewState()?.config_target ?? finishRequest.configTarget;
+    const setupAccepted = finishInitialSetup(
+      context.uiState.initialSetup,
+      finishRequest,
+      currentTarget,
+      context.uiState.configDraftRevision,
+      {
+        succeeded,
+        setupTarget: nextState.startup.setup_target,
+        configTarget: nextState.config_target,
+      },
+    );
+    const configAccepted = finishConfigMutation(
+      context.uiState,
+      configRequest,
+      succeeded,
+      nextState.config_target,
+      currentTarget,
+    );
+    context.acceptProjection(nextState);
+    if (!setupAccepted || !configAccepted) {
+      context.reportError("初期設定の保存中に設定対象が変更されました。現在の内容を確認してください。");
+    }
+  } catch (error) {
+    const currentTarget = context.getViewState()?.config_target ?? finishRequest.configTarget;
+    finishInitialSetup(
+      context.uiState.initialSetup,
+      finishRequest,
+      currentTarget,
+      context.uiState.configDraftRevision,
+      {
+        succeeded: false,
+        setupTarget: finishRequest.setupTarget,
+        configTarget: finishRequest.configTarget,
+      },
+    );
+    finishConfigMutation(
+      context.uiState,
+      configRequest,
+      false,
+      finishRequest.configTarget,
+      currentTarget,
+    );
+    if (context.recoverCommandConflict(error)) return;
+    context.rerender();
+    context.reportError(error);
+  }
+}
+
+function currentSessionSettingsTarget(
+  state: DesktopViewState,
+): SessionSettingsMutationTarget | null {
+  return state.overlay === "session_settings"
+    && state.session_settings.available
+    ? state.session_settings.target
+    : null;
+}
+
+async function applySessionSettings(
+  state: DesktopViewState,
+  context: ActionContext,
+): Promise<void> {
+  const target = currentSessionSettingsTarget(state);
+  const availability = sessionSettingsMutationAvailability(
+    context.uiState.sessionSettings,
+    state.session_settings,
+  );
+  if (
+    target === null
+    || !availability.enabled
+    || context.uiState.externalConfigMutationPending
+    || configMutationPending(context.uiState)
+  ) return;
+  const request = beginSessionSettingsMutation(context.uiState.sessionSettings, target);
+  if (!request) return;
+  context.uiState.externalConfigMutationPending = true;
+  context.rerender();
+  try {
+    const [nextState, succeeded] = await command<[DesktopWebState, boolean]>(
+      "apply_session_settings",
+      {
+        input: {
+          baseUrl: request.draft.baseUrl,
+          model: request.draft.model,
+          accessMode: request.draft.accessMode,
+          contextWindow: request.draft.contextWindow,
+          maxOutputTokens: request.draft.maxOutputTokens,
+        },
+        expectedTarget: request.target,
+      },
+    );
+    const settlementTarget = nextState.session_settings.target;
+    const accepted = settlementTarget !== null
+      && finishSessionSettingsMutation(context.uiState.sessionSettings, request, {
+        succeeded,
+        target: settlementTarget,
+        values: sessionSettingsDraftFromProjection(nextState.session_settings),
+      });
+    if (!accepted) {
+      finishSessionSettingsMutation(context.uiState.sessionSettings, request, {
+        succeeded: false,
+        target: request.target,
+        values: request.draft,
+      });
+    }
+    context.acceptProjection(nextState);
+    if (!accepted) {
+      context.reportError("Session Settingsの保存対象が変更されました。現在のroot sessionを確認してください。");
+    }
+  } catch (error) {
+    finishSessionSettingsMutation(context.uiState.sessionSettings, request, {
+      succeeded: false,
+      target: request.target,
+      values: request.draft,
+    });
+    if (context.recoverCommandConflict(error)) return;
+    context.rerender();
+    context.reportError(error);
+  } finally {
+    context.uiState.externalConfigMutationPending = false;
+    context.rerender();
+  }
+}
+
+async function requestSessionSettingsClose(
+  state: DesktopViewState,
+  context: ActionContext,
+): Promise<void> {
+  const target = currentSessionSettingsTarget(state);
+  const owner = context.uiState.sessionSettings.owner;
+  if (context.uiState.sessionSettings.activeMutation !== null) return;
+  if (!context.uiState.sessionSettings.dirty) {
+    await context.mutate("close_overlay");
+    return;
+  }
+  const confirmationTarget = owner ?? target;
+  if (
+    confirmationTarget === null
+    || owner === null
+    || !sameSessionSettingsRootOwner(owner, confirmationTarget)
+  ) return;
+  finishLocalDecision(context.uiState);
+  context.uiState.pendingLocalConfirmation = {
+    kind: "session_settings_close",
+    expectedTarget: { ...confirmationTarget },
+  };
+  context.rerender();
+}
+
+async function confirmSessionSettingsDiscardClose(context: ActionContext): Promise<void> {
+  const pending = context.uiState.pendingLocalConfirmation;
+  const current = context.getViewState();
+  const target = current?.session_settings.target ?? null;
+  const owner = context.uiState.sessionSettings.owner;
+  if (
+    pending?.kind !== "session_settings_close"
+    || context.uiState.localConfirmationDecisionPending
+    || owner === null
+    || !context.uiState.sessionSettings.dirty
+    || !sameSessionSettingsTarget(pending.expectedTarget, owner)
+    || (target !== null && !sameSessionSettingsRootOwner(pending.expectedTarget, target))
+  ) return;
+  if (!beginLocalDecision(context.uiState, true)) return;
+  context.rerender();
+  try {
+    const nextState = await command<DesktopWebState>("close_overlay");
+    if (nextState.overlay === "session_settings") {
+      failLocalDecision(context.uiState, "Session Settingsを閉じられませんでした。もう一度お試しください。");
+      context.acceptProjection(nextState);
+      return;
+    }
+    clearSessionSettings(context.uiState.sessionSettings);
+    finishLocalDecision(context.uiState);
+    context.uiState.pendingLocalConfirmation = null;
+    context.acceptProjection(nextState);
+  } catch (error) {
+    failLocalDecision(context.uiState, "Session Settingsを閉じられませんでした。もう一度お試しください。");
+    if (context.recoverCommandConflict(error)) {
+      context.rerender();
+      return;
+    }
+    context.rerender();
+    context.reportError(error);
+  }
+}
+
+function discardCurrentSessionSettings(
+  state: DesktopViewState,
+  context: ActionContext,
+): void {
+  const target = currentSessionSettingsTarget(state);
+  const owner = context.uiState.sessionSettings.owner;
+  if (
+    target === null
+    || owner === null
+    || context.uiState.sessionSettings.activeMutation !== null
+    || !sameSessionSettingsRootOwner(owner, target)
+  ) return;
+  clearSessionSettings(context.uiState.sessionSettings);
+  reconcileSessionSettings(
+    context.uiState.sessionSettings,
+    target,
+    sessionSettingsDraftFromProjection(state.session_settings),
+  );
+  context.rerender();
+}
+
 async function resetConfigDraft(context: ActionContext): Promise<void> {
   if (configMutationPending(context.uiState)) return;
   const current = context.getViewState();
@@ -280,6 +787,135 @@ async function resetConfigDraft(context: ActionContext): Promise<void> {
     fallbackAction: "close-overlay",
   };
   context.acceptProjection(state);
+}
+
+async function requestSettingsClose(
+  state: DesktopViewState,
+  context: ActionContext,
+): Promise<void> {
+  if (
+    configMutationPending(context.uiState)
+    || !settingsCloseTargetStillMatches(state.config_target, state)
+  ) return;
+  if (!state.config_draft.dirty) {
+    await context.mutate("close_overlay");
+    return;
+  }
+  finishLocalDecision(context.uiState);
+  context.uiState.pendingLocalConfirmation = {
+    kind: "settings_close",
+    expectedTarget: { ...state.config_target },
+  };
+  context.rerender();
+}
+
+async function confirmSettingsDiscardClose(context: ActionContext): Promise<void> {
+  const pending = context.uiState.pendingLocalConfirmation;
+  const current = context.getViewState();
+  if (
+    pending?.kind !== "settings_close"
+    || context.uiState.localConfirmationDecisionPending
+    || configMutationPending(context.uiState)
+    || !current?.config_draft.dirty
+    || !settingsCloseTargetStillMatches(pending.expectedTarget, current)
+  ) return;
+  const projection = context.getProjection();
+  if (!projection || !settingsCloseTargetStillMatches(pending.expectedTarget, projection)) return;
+  const values = projection.config_fields.map((field) => ({ key: field.key, text: field.value }));
+  if (!beginLocalDecision(context.uiState, true)) return;
+  const request = beginConfigMutation(context.uiState, pending.expectedTarget);
+  context.rerender();
+
+  let resetState: DesktopWebState;
+  try {
+    resetState = await command<DesktopWebState>("reset_config_draft", {
+      values,
+      expectedTarget: request.target,
+    });
+  } catch (error) {
+    const currentTarget = context.getViewState()?.config_target ?? null;
+    const finished = finishConfigMutation(
+      context.uiState,
+      request,
+      false,
+      request.target,
+      currentTarget,
+    );
+    failLocalDecision(context.uiState, "変更を破棄できませんでした。入力内容を確認して、もう一度お試しください。");
+    if (context.recoverCommandConflict(error)) {
+      context.rerender();
+      return;
+    }
+    if (!finished) {
+      context.rerender();
+      return;
+    }
+    context.rerender();
+    context.reportError(error);
+    return;
+  }
+
+  if (!settingsCloseTargetStillMatches(request.target, resetState)) {
+    finishConfigMutation(
+      context.uiState,
+      request,
+      false,
+      request.target,
+      context.getViewState()?.config_target ?? null,
+    );
+    failLocalDecision(context.uiState, "設定対象が変更されたため、Preferencesを閉じませんでした。");
+    context.rerender();
+    return;
+  }
+
+  if (!finishConfigMutation(
+    context.uiState,
+    request,
+    true,
+    resetState.config_target,
+    context.getViewState()?.config_target ?? null,
+  )) {
+    failLocalDecision(context.uiState, "設定対象が変更されたため、Preferencesを閉じませんでした。");
+    context.rerender();
+    return;
+  }
+
+  const beforeLocalSettle = context.getViewState();
+  if (!beforeLocalSettle || !settingsCloseTargetStillMatches(request.target, beforeLocalSettle)) {
+    finishLocalDecision(context.uiState);
+    context.uiState.pendingLocalConfirmation = null;
+    context.rerender();
+    return;
+  }
+
+  // Settle the local alertdialog in its own render. The modal return stacks then pop the
+  // Settings layer before the Rust overlay close pops the shell layer in the following render.
+  context.uiState.pendingLocalConfirmation = null;
+  context.acceptProjection(resetState);
+  await context.waitForInteractionIdle();
+
+  const beforeClose = context.getViewState();
+  if (!beforeClose || !settingsCloseTargetStillMatches(request.target, beforeClose)) {
+    finishLocalDecision(context.uiState);
+    context.rerender();
+    return;
+  }
+
+  try {
+    const closedState = await command<DesktopWebState>("close_overlay");
+    finishLocalDecision(context.uiState);
+    context.acceptProjection(closedState);
+  } catch (error) {
+    finishLocalDecision(context.uiState);
+    context.uiState.settingsActionFocusContinuation = {
+      target: { ...request.target },
+      primaryAction: "close-overlay",
+      fallbackAction: null,
+    };
+    if (context.recoverCommandConflict(error)) return;
+    context.rerender();
+    context.reportError(error);
+  }
 }
 
 async function runSessionRowMutation(
@@ -747,6 +1383,86 @@ const ACTION_DEFINITIONS = [
     run: (_state, context) => context.mutate("show_config_editor"),
   },
   {
+    id: "show-session-settings",
+    label: "このセッションの設定",
+    palette: true,
+    enabled: (state) => state.session_settings?.available === true
+      && state.session_settings.target !== null,
+    run: (_state, context) => context.mutate("show_session_settings"),
+  },
+  {
+    id: "initial-setup-next",
+    label: "次へ",
+    enabled: (state, _payload, model) => startupSetupRequired(state)
+      && state.overlay === "initial_setup"
+      && state.startup.setup_target !== null
+      && model.local.initialSetup.step !== "finish"
+      && !model.local.initialSetup.finishPending
+      && model.local.initialSetup.auxiliaryPendingKind === null
+      && !model.local.configMutationPending
+      && validateInitialSetupStep(
+        model.local.initialSetup.step,
+        state.config_fields,
+        currentConfigValues(state),
+      ).ok,
+    run: (state, context) => moveInitialSetupForward(state, context),
+  },
+  {
+    id: "initial-setup-back",
+    label: "前へ",
+    enabled: (state, _payload, model) => startupSetupRequired(state)
+      && state.overlay === "initial_setup"
+      && model.local.initialSetup.step !== "start"
+      && !model.local.initialSetup.finishPending
+      && model.local.initialSetup.auxiliaryPendingKind === null
+      && !model.local.configMutationPending,
+    run: (state, context) => moveInitialSetupBack(state, context),
+  },
+  {
+    id: "finish-initial-setup",
+    label: "設定を保存してmoyAIを開く",
+    enabled: (state, _payload, model) => startupSetupRequired(state)
+      && state.overlay === "initial_setup"
+      && state.startup.setup_target !== null
+      && model.local.initialSetup.step === "finish"
+      && !model.local.initialSetup.finishPending
+      && model.local.initialSetup.auxiliaryPendingKind === null
+      && !model.local.configMutationPending
+      && validateInitialSetupStep(
+        "finish",
+        state.config_fields,
+        currentConfigValues(state),
+      ).ok,
+    run: (state, context) => finishInitialSetupFlow(state, context),
+  },
+  {
+    id: "apply-session-settings",
+    label: "このセッションに適用",
+    enabled: (state, _payload, model) => state.overlay === "session_settings"
+      && state.session_settings?.target != null
+      && model.local.sessionSettings.availability.enabled
+      && !model.local.sessionSettings.mutationPending
+      && !model.local.configMutationPending,
+    run: (state, context) => applySessionSettings(state, context),
+  },
+  {
+    id: "discard-session-settings",
+    label: "Session Settingsの変更を破棄",
+    enabled: (state, _payload, model) => state.overlay === "session_settings"
+      && state.session_settings?.target != null
+      && model.local.sessionSettings.dirty
+      && !model.local.sessionSettings.mutationPending,
+    run: (state, context) => discardCurrentSessionSettings(state, context),
+  },
+  {
+    id: "open-preferences-from-session-settings",
+    label: "Preferencesで永続設定を開く",
+    enabled: (state, _payload, model) => state.overlay === "session_settings"
+      && !model.local.sessionSettings.dirty
+      && !model.local.sessionSettings.mutationPending,
+    run: (_state, context) => context.mutate("show_config_editor"),
+  },
+  {
     id: "show-shortcuts",
     label: "ショートカット",
     menu: "help",
@@ -1106,9 +1822,19 @@ const ACTION_DEFINITIONS = [
     id: "load-provider-models",
     label: "Provider モデル読込",
     palette: true,
-    enabled: (state, _payload, model) => providerCapabilities(state).canLoadProviderModels
-      && !model.local.configMutationPending,
+    enabled: (state, _payload, model) => (
+      state.overlay === "initial_setup"
+        ? validateInitialSetupStep(
+            "provider",
+            state.config_fields,
+            currentConfigValues(state),
+          ).ok && !state.provider_loading
+        : providerCapabilities(state).canLoadProviderModels
+    ) && !model.local.configMutationPending,
     run: (state, context) => {
+      if (state.overlay === "initial_setup") {
+        synchronizeInitialSetupProviderDraft(state, context.uiState);
+      }
       const request = beginProviderCatalogRequest(context.uiState, state);
       if (!request) return;
       context.rerender();
@@ -1119,6 +1845,27 @@ const ACTION_DEFINITIONS = [
           state.config_target,
         ),
       );
+    },
+  },
+  {
+    id: "check-docling-readiness",
+    label: "Doclingの接続を確認",
+    enabled: (state, _payload, model) => doclingReadinessCheckEnabled(state, model),
+    run: async (state, context) => {
+      if (state.overlay === "initial_setup") {
+        await checkInitialSetupDoclingReadiness(state, context);
+        return;
+      }
+      const request = beginDoclingReadinessRequest(context.uiState, state.config_target);
+      if (!request) return;
+      context.rerender();
+      try {
+        await context.mutate("check_docling_readiness", {
+          expectedTarget: { ...request.expectedTarget },
+        });
+      } finally {
+        if (finishDoclingReadinessRequest(context.uiState, request)) context.rerender();
+      }
     },
   },
   {
@@ -1174,6 +1921,9 @@ const ACTION_DEFINITIONS = [
       || payload.value === "openai_compatible_only",
     run: (_state, context, payload) => {
       if (payload.value !== "lm_studio_native_required" && payload.value !== "openai_compatible_only") return;
+      if (context.uiState.drafts.provider.metadataMode !== payload.value) {
+        context.uiState.drafts.providerCatalogIdentityRevision += 1;
+      }
       context.uiState.drafts.provider.metadataMode = payload.value;
       context.uiState.drafts.providerRevision += 1;
       context.rerender();
@@ -1233,7 +1983,15 @@ const ACTION_DEFINITIONS = [
     label: "エラーを閉じる",
     enabled: (_state, _payload, model) => model.local.recoverableError !== null,
     run: (_state, context) => {
+      if (typeof document !== "undefined") {
+        const active = document.activeElement;
+        if (
+          active instanceof HTMLElement
+          && active.closest("[data-settings-preserve-focused-region]") !== null
+        ) active.blur();
+      }
       context.uiState.recoverableError = null;
+      context.uiState.recoverableErrorOwner = null;
       context.rerender();
     },
   },
@@ -1294,8 +2052,19 @@ const ACTION_DEFINITIONS = [
     label: "確認をキャンセル",
     enabled: (_state, _payload, model) => model.local.modal.localConfirmation !== null
       && !model.local.modal.localDecisionPending,
-    run: (_state, context) => {
+    run: (state, context) => {
       if (context.uiState.localConfirmationDecisionPending) return;
+      const pending = context.uiState.pendingLocalConfirmation;
+      if (
+        pending?.kind === "settings_close"
+        && settingsCloseTargetStillMatches(pending.expectedTarget, state)
+      ) {
+        context.uiState.settingsActionFocusContinuation = {
+          target: { ...pending.expectedTarget },
+          primaryAction: "close-overlay",
+          fallbackAction: null,
+        };
+      }
       context.uiState.pendingLocalConfirmation = null;
       finishLocalDecision(context.uiState);
       context.rerender();
@@ -1330,6 +2099,34 @@ const ACTION_DEFINITIONS = [
     enabled: (_state, _payload, model) => model.local.modal.localConfirmation?.kind === "rollback_session"
       && !model.local.modal.localDecisionPending,
     run: (_state, context) => confirmLocalRollback(context),
+  },
+  {
+    id: "confirm-settings-discard-close",
+    label: "未保存の設定を破棄して閉じる",
+    enabled: (state, _payload, model) => {
+      const confirmation = model.local.modal.localConfirmation;
+      return confirmation?.kind === "settings_close"
+        && !model.local.modal.localDecisionPending
+        && state.config_draft.dirty
+        && settingsCloseTargetStillMatches(confirmation.expectedTarget, state);
+    },
+    run: (_state, context) => confirmSettingsDiscardClose(context),
+  },
+  {
+    id: "confirm-session-settings-discard-close",
+    label: "Session Settingsの変更を破棄して閉じる",
+    enabled: (state, _payload, model) => {
+      const confirmation = model.local.modal.localConfirmation;
+      const target = state.session_settings?.target ?? null;
+      return confirmation?.kind === "session_settings_close"
+        && !model.local.modal.localDecisionPending
+        && model.local.sessionSettings.dirty
+        && (
+          target === null
+          || sameSessionSettingsRootOwner(confirmation.expectedTarget, target)
+        );
+    },
+    run: (_state, context) => confirmSessionSettingsDiscardClose(context),
   },
   {
     id: "artifact",
@@ -1412,7 +2209,9 @@ const ACTION_DEFINITIONS = [
   {
     id: "close-overlay",
     label: "画面を閉じる",
-    enabled: (state) => !startupSetupRequired(state)
+    enabled: (state, _payload, model) => !startupSetupRequired(state)
+      && (state.overlay !== "config" || !model.local.configMutationPending)
+      && (state.overlay !== "session_settings" || !model.local.sessionSettings.mutationPending)
       && (state.overlay !== "prompt_review"
         || snapshotPromptReviewMutationTarget(state.review_target) !== null),
     run: async (state, context) => {
@@ -1423,15 +2222,32 @@ const ACTION_DEFINITIONS = [
         await context.mutate("cancel_prompt_review", { expectedTarget });
         return;
       }
+      if (state.overlay === "config") {
+        await requestSettingsClose(state, context);
+        return;
+      }
+      if (state.overlay === "session_settings") {
+        await requestSessionSettingsClose(state, context);
+        return;
+      }
       await context.mutate("close_overlay");
     },
   },
   {
     id: "import-config-toml",
     label: "TOML設定をインポート",
-    enabled: (state, _payload, model) => state.config_draft.external_owner_mutation_open
-      && !model.local.configMutationPending,
-    run: (state, context) => importConfigToml(state, context),
+    enabled: (state, _payload, model) => state.overlay === "initial_setup"
+      ? startupSetupRequired(state)
+        && state.startup.setup_target !== null
+        && model.local.initialSetup.step === "start"
+        && model.local.initialSetup.auxiliaryPendingKind === null
+        && !model.local.initialSetup.finishPending
+        && !model.local.configMutationPending
+      : state.config_draft.external_owner_mutation_open
+        && !model.local.configMutationPending,
+    run: (state, context) => state.overlay === "initial_setup"
+      ? loadInitialSetupConfigToml(state, context)
+      : importConfigToml(state, context),
   },
   {
     id: "insert-command",
@@ -1626,7 +2442,7 @@ async function confirmLocalDelete(context: ActionContext): Promise<void> {
         context.uiState.quickChatDeleteFocusContinuation = null;
       },
     );
-  } else {
+  } else if (pending.kind === "session") {
     await runLocalConfirmationMutation(context, "delete_session", pending.index, pending.expectedTarget);
   }
 }

@@ -3,6 +3,7 @@ pub enum DesktopAsyncOperationKind {
     AgentRun,
     SnapshotRefresh,
     ProviderModelCatalogLoad,
+    DoclingReadinessCheck,
     WorkspaceLoad,
     SessionLoad,
     TurnPageLoad,
@@ -17,6 +18,7 @@ pub enum DesktopAsyncOperationKind {
     PromptEnhance,
     SteerSubmission,
     AccessModePersistence,
+    SessionSettingsPersistence,
 }
 
 impl DesktopAsyncOperationKind {
@@ -25,6 +27,7 @@ impl DesktopAsyncOperationKind {
             Self::AgentRun => "agent_run",
             Self::SnapshotRefresh => "snapshot_refresh",
             Self::ProviderModelCatalogLoad => "provider_model_catalog_load",
+            Self::DoclingReadinessCheck => "docling_readiness_check",
             Self::WorkspaceLoad => "workspace_load",
             Self::SessionLoad => "session_load",
             Self::TurnPageLoad => "turn_page_load",
@@ -39,6 +42,7 @@ impl DesktopAsyncOperationKind {
             Self::PromptEnhance => "prompt_enhance",
             Self::SteerSubmission => "steer_submission",
             Self::AccessModePersistence => "access_mode_persistence",
+            Self::SessionSettingsPersistence => "session_settings_persistence",
         }
     }
 

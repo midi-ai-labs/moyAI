@@ -4,6 +4,10 @@ import { createPointerKeyboardScenario } from "./scenarios/pointer_keyboard.mjs"
 import { createPromptReviewCancelScenario } from "./scenarios/prompt_review_cancel.mjs";
 import { createProviderRestartScenario } from "./scenarios/provider_restart.mjs";
 import { createRunStopScenario } from "./scenarios/run_stop.mjs";
+import { createSettingsDoclingReadinessScenario } from "./scenarios/settings_docling_readiness.mjs";
+import { createSettingsInitialSetupScenario } from "./scenarios/settings_initial_setup.mjs";
+import { createSettingsPreferencesScenario } from "./scenarios/settings_preferences.mjs";
+import { createSettingsSessionScenario } from "./scenarios/settings_session.mjs";
 import { createAgentInterruptScenario } from "./scenarios/agent_interrupt.mjs";
 
 const factories = new Map([
@@ -13,6 +17,10 @@ const factories = new Map([
   ["native-dialog.cancel", createNativeDialogCancelScenario],
   ["prompt-review.cancel", createPromptReviewCancelScenario],
   ["provider.restart", createProviderRestartScenario],
+  ["settings.docling-readiness", createSettingsDoclingReadinessScenario],
+  ["settings.initial-setup", createSettingsInitialSetupScenario],
+  ["settings.preferences", createSettingsPreferencesScenario],
+  ["settings.session", createSettingsSessionScenario],
   ["run.stop", createRunStopScenario],
 ]);
 

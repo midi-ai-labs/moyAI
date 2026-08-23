@@ -43,9 +43,35 @@ function positiveInteger(value, name) {
   return value;
 }
 
+function optionalHttpStatus(value, name) {
+  if (value === null || value === undefined) return null;
+  if (!Number.isInteger(value) || value < 200 || value > 599) {
+    throw new TypeError(`${name} must be null or an HTTP status from 200 through 599`);
+  }
+  return value;
+}
+
 function nonEmptyString(value, name) {
   if (typeof value !== "string" || value.trim().length === 0) throw new TypeError(`${name} must be a non-empty string`);
   return value;
+}
+
+function scriptedTurns(value, fallbackPrompt, fallbackResponseText) {
+  if (value === null || value === undefined) {
+    return Object.freeze([Object.freeze({ prompt: fallbackPrompt, responseText: fallbackResponseText })]);
+  }
+  if (!Array.isArray(value) || value.length < 1 || value.length > 8) {
+    throw new TypeError("scripted provider turns must contain 1 through 8 entries");
+  }
+  return Object.freeze(value.map((turn, index) => {
+    if (!exactKeys(turn, ["prompt", "responseText"])) {
+      throw new TypeError(`scripted provider turn ${index} must use its exact schema`);
+    }
+    return Object.freeze({
+      prompt: nonEmptyString(turn.prompt, `turns[${index}].prompt`),
+      responseText: nonEmptyString(turn.responseText, `turns[${index}].responseText`),
+    });
+  }));
 }
 
 function responseBytes(value) {
@@ -513,25 +539,54 @@ function routeFor(target) {
   if (!target.exact_target) return "unknown";
   if (target.pathname === "/v1/models") return "models";
   if (target.pathname === "/v1/responses") return "responses";
+  if (target.pathname === "/ready") return "docling_readiness";
   return "unknown";
+}
+
+function writeEmptyResponse(response, status) {
+  response.sendDate = false;
+  response.writeHead(status, {
+    "cache-control": "no-store",
+    connection: "close",
+    "content-length": "0",
+  });
+  response.end();
 }
 
 function closeServer(server, sockets) {
   return new Promise((resolve, reject) => {
     let forcedConnectionCount = 0;
+    let serverCloseReturned = false;
+    let settled = false;
+    const complete = (callback) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(settlementPoll);
+      clearTimeout(forceTimer);
+      clearTimeout(hardTimer);
+      callback();
+    };
+    const settleIfClosed = () => {
+      if (serverCloseReturned && sockets.size === 0) {
+        complete(() => resolve(forcedConnectionCount));
+      }
+    };
+    const settlementPoll = setInterval(settleIfClosed, 5);
     const forceTimer = setTimeout(() => {
       forcedConnectionCount = sockets.size;
       for (const socket of sockets) socket.destroy();
       server.closeAllConnections?.();
     }, 250);
     const hardTimer = setTimeout(() => {
-      reject(new Error("scripted provider did not close within its resource deadline"));
+      complete(() => reject(new Error("scripted provider did not close within its resource deadline")));
     }, 5_000);
     server.close((error) => {
-      clearTimeout(forceTimer);
-      clearTimeout(hardTimer);
-      if (error) reject(error);
-      else resolve(forcedConnectionCount);
+      if (error) {
+        complete(() => reject(error));
+        return;
+      }
+      serverCloseReturned = true;
+      settleIfClosed();
     });
     server.closeIdleConnections?.();
   });
@@ -580,6 +635,12 @@ export class ScriptedProvider {
   #closed = false;
   #closePromise = null;
   #closeObservation = null;
+  #doclingReadinessStatus;
+  #doclingReadinessRequestCount = 0;
+  #doclingReadinessReleased = false;
+  #doclingReadinessReleasedByCleanup = false;
+  #releaseDoclingReadiness;
+  #doclingReadinessRelease;
 
   constructor({
     modelId = SCRIPTED_PROVIDER_MODEL_ID,
@@ -588,17 +649,28 @@ export class ScriptedProvider {
     maxBodyBytes = SCRIPTED_PROVIDER_MAX_BODY_BYTES,
     expectedMaxOutputTokens = SCRIPTED_PROVIDER_MAX_OUTPUT_TOKENS,
     responseBehavior: configuredResponseBehavior = "complete",
+    doclingReadinessStatus = null,
+    turns = null,
     script = null,
   } = {}) {
     this.modelId = nonEmptyString(modelId, "modelId");
     this.expectedPrompt = nonEmptyString(expectedPrompt, "expectedPrompt");
     this.responseText = nonEmptyString(responseText, "responseText");
+    this.turns = scriptedTurns(turns, this.expectedPrompt, this.responseText);
     this.maxBodyBytes = positiveInteger(maxBodyBytes, "maxBodyBytes");
     this.expectedMaxOutputTokens = positiveInteger(expectedMaxOutputTokens, "expectedMaxOutputTokens");
     this.responseBehavior = responseBehavior(configuredResponseBehavior);
+    this.#doclingReadinessStatus = optionalHttpStatus(doclingReadinessStatus, "doclingReadinessStatus");
+    this.#doclingReadinessRelease = new Promise((resolve) => { this.#releaseDoclingReadiness = resolve; });
     this.script = agentInterruptScript(script);
     if (this.script !== null && this.responseBehavior !== "complete") {
       throw new TypeError("agent interrupt scripted provider mode owns its response lifecycle");
+    }
+    if (this.script !== null && turns !== null) {
+      throw new TypeError("agent interrupt scripted provider mode cannot use ordinary turns");
+    }
+    if (this.responseBehavior !== "complete" && this.turns.length !== 1) {
+      throw new TypeError("held scripted provider mode requires exactly one ordinary turn");
     }
     this.#server = http.createServer((request, response) => {
       const ledgerIndex = this.#ledger.length;
@@ -663,11 +735,34 @@ export class ScriptedProvider {
       request_count: this.#ledger.length,
       accepted_response_count: this.#acceptedResponseCount,
       successful_response_count: this.#successfulResponseCount,
-      script_kind: this.script?.kind ?? "single_turn",
+      script_kind: this.script?.kind ?? (this.turns.length === 1 ? "single_turn" : "ordered_turns"),
       scripted_responses_request_count: this.#scriptedResponsesRequestCount,
       scripted_responses_maximum: this.script === null
-        ? 1
+        ? this.turns.length
         : SCRIPTED_PROVIDER_AGENT_INTERRUPT_MAX_RESPONSES,
+      docling_readiness_configured: this.#doclingReadinessStatus !== null,
+      docling_readiness_status: this.#doclingReadinessStatus,
+      docling_readiness_request_count: this.#doclingReadinessRequestCount,
+      docling_readiness_released: this.#doclingReadinessReleased,
+      docling_readiness_released_by_cleanup: this.#doclingReadinessReleasedByCleanup,
+    };
+  }
+
+  releaseDoclingReadiness() {
+    if (this.#doclingReadinessStatus === null) {
+      throw new Error("scripted Docling readiness is not configured");
+    }
+    if (this.#doclingReadinessReleased) throw new Error("scripted Docling readiness was already released");
+    const rows = this.#ledger.filter((row) => row.route === "docling_readiness");
+    if (rows.length !== 1 || rows[0].response_phase !== "held" || rows[0].response_status !== null) {
+      throw new Error("scripted Docling readiness release requires one exact held request");
+    }
+    this.#doclingReadinessReleased = true;
+    this.#releaseDoclingReadiness();
+    return {
+      released: true,
+      response_status: this.#doclingReadinessStatus,
+      request: structuredClone(rows[0]),
     };
   }
 
@@ -677,6 +772,11 @@ export class ScriptedProvider {
     if (this.#address === null) throw new Error("scripted provider cannot close before it starts");
     const before = this.resourceObservation();
     this.#closePromise = (async () => {
+      if (this.#doclingReadinessStatus !== null && !this.#doclingReadinessReleased) {
+        this.#doclingReadinessReleased = true;
+        this.#doclingReadinessReleasedByCleanup = true;
+        this.#releaseDoclingReadiness();
+      }
       const forcedConnectionCount = await closeServer(this.#server, this.#sockets);
       this.#closed = true;
       const after = this.resourceObservation();
@@ -720,6 +820,38 @@ export class ScriptedProvider {
       row.response_status = 404;
       fixedError(response, 404, "not_found");
       request.resume();
+      return;
+    }
+    if (route === "docling_readiness") {
+      if (request.method !== "GET") {
+        row.response_phase = "rejected";
+        row.response_status = 405;
+        fixedError(response, 405, "method_not_allowed", { allow: "GET" });
+        request.resume();
+        return;
+      }
+      if (this.#doclingReadinessStatus === null) {
+        row.response_phase = "rejected";
+        row.response_status = 404;
+        fixedError(response, 404, "docling_readiness_not_configured");
+        request.resume();
+        return;
+      }
+      if (this.#doclingReadinessRequestCount !== 0) {
+        row.response_phase = "rejected";
+        row.response_status = 409;
+        fixedError(response, 409, "docling_readiness_already_consumed");
+        request.resume();
+        return;
+      }
+      this.#doclingReadinessRequestCount += 1;
+      row.contract = { pass: true, expected_method: "GET", expected_pathname: "/ready" };
+      row.response_phase = "held";
+      request.resume();
+      await this.#doclingReadinessRelease;
+      row.response_phase = "completed";
+      row.response_status = this.#doclingReadinessStatus;
+      writeEmptyResponse(response, this.#doclingReadinessStatus);
       return;
     }
     if (route === "models") {
@@ -795,20 +927,22 @@ export class ScriptedProvider {
       return;
     }
 
-    row.contract = requestContract(decoded.value, this.modelId, this.expectedPrompt, this.expectedMaxOutputTokens);
+    const turn = this.turns[this.#acceptedResponseCount] ?? this.turns.at(-1);
+    row.contract = requestContract(decoded.value, this.modelId, turn.prompt, this.expectedMaxOutputTokens);
     if (!row.contract.pass) {
       row.response_phase = "rejected";
       row.response_status = 422;
       fixedError(response, 422, "request_contract_mismatch");
       return;
     }
-    if (this.#acceptedResponseCount !== 0) {
+    if (this.#acceptedResponseCount >= this.turns.length) {
       row.response_phase = "rejected";
       row.response_status = 409;
       fixedError(response, 409, "successful_response_already_consumed");
       return;
     }
 
+    const turnIndex = this.#acceptedResponseCount;
     this.#acceptedResponseCount += 1;
     if (this.responseBehavior === "hold_until_peer_close") {
       row.response_phase = "held";
@@ -820,7 +954,10 @@ export class ScriptedProvider {
     this.#successfulResponseCount += 1;
     row.response_phase = "completed";
     row.response_status = 200;
-    writeResponse(response, 200, "text/event-stream", responsesSse(this.responseText));
+    writeResponse(response, 200, "text/event-stream", responsesSse(turn.responseText, {
+      itemId: turnIndex === 0 ? "msg_main_ok" : `msg_main_ok_${turnIndex + 1}`,
+      responseId: turnIndex === 0 ? "resp_main_ok" : `resp_main_ok_${turnIndex + 1}`,
+    }));
   }
 
   async #handleAgentInterruptResponse(response, row) {

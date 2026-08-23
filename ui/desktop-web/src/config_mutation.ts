@@ -48,6 +48,40 @@ export function updateConfigDraftValue(
   if (!owner.configDirty) resetConfigDraftStorage(owner);
 }
 
+/**
+ * Atomically replaces the complete browser draft after a read-only validated import.
+ * Missing, duplicated, or unknown fields are rejected without touching the current draft.
+ */
+export function replaceCompleteConfigDraft(
+  owner: ConfigMutationOwner,
+  target: ConfigMutationTarget,
+  baselineValues: readonly ConfigValueInput[],
+  importedValues: readonly ConfigValueInput[],
+): boolean {
+  const baseline = completeConfigValueMap(baselineValues);
+  const imported = completeConfigValueMap(importedValues);
+  if (
+    baseline === null
+    || imported === null
+    || baseline.size !== imported.size
+    || Array.from(baseline.keys()).some((key) => !imported.has(key))
+  ) return false;
+
+  owner.configDraftValues.clear();
+  owner.configDraftBaselineValues.clear();
+  for (const [key, baselineText] of baseline) {
+    owner.configDraftBaselineValues.set(key, baselineText);
+    owner.configDraftValues.set(key, imported.get(key)!);
+  }
+  owner.configDraftTarget = { ...target };
+  owner.configDirty = Array.from(owner.configDraftValues).some(
+    ([key, text]) => baseline.get(key) !== text,
+  );
+  owner.configDraftRevision += 1n;
+  if (!owner.configDirty) resetConfigDraftStorage(owner);
+  return true;
+}
+
 export function configMutationValues(
   owner: ConfigMutationOwner,
   target: ConfigMutationTarget,
@@ -141,4 +175,15 @@ function resetConfigDraftStorage(owner: ConfigMutationOwner): void {
   owner.configDraftValues.clear();
   owner.configDraftBaselineValues.clear();
   owner.configDraftTarget = null;
+}
+
+function completeConfigValueMap(
+  values: readonly ConfigValueInput[],
+): Map<string, string> | null {
+  const result = new Map<string, string>();
+  for (const value of values) {
+    if (!value.key || result.has(value.key)) return null;
+    result.set(value.key, value.text);
+  }
+  return result;
 }

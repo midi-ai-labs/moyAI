@@ -1,6 +1,7 @@
 const REGULAR_MODAL_OVERLAYS = new Set([
   "provider",
   "config",
+  "session_settings",
   "workspace",
   "prompt_review",
   "command_palette",
@@ -16,7 +17,10 @@ export function modalIsOpen(
   state: { confirmation_visible: boolean; overlay: string },
   localModalOpen: boolean,
 ): boolean {
-  return state.confirmation_visible || localModalOpen || isRegularModalOverlay(state.overlay);
+  return state.confirmation_visible
+    || localModalOpen
+    || state.overlay === "initial_setup"
+    || isRegularModalOverlay(state.overlay);
 }
 
 export interface SideChatDeleteModalTarget {
@@ -72,6 +76,15 @@ export function overlayPrimaryFocusSelectors(overlay: string): readonly string[]
   if (overlay === "command_palette") return ["#local-search"];
   if (overlay === "provider") return ["#provider-url"];
   if (overlay === "config") return [".settings-control"];
+  if (overlay === "session_settings") {
+    return [
+      ".session-settings-control:not(:disabled):not([aria-disabled='true'])",
+      ".session-settings-modal",
+    ];
+  }
+  if (overlay === "initial_setup") {
+    return ["#initial-setup-primary", ".initial-setup-shell .settings-control"];
+  }
   if (overlay === "workspace") return ["#workspace-input"];
   if (overlay === "prompt_review") return ["#review-draft"];
   if (!isRegularModalOverlay(overlay)) return [];

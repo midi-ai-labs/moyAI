@@ -2,9 +2,24 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  normalizeScenarioEnvironment,
   releaseResourcesThenAuditClosedStore,
   selectActiveCleanupDriver,
 } from "../drivers/windows_tauri_host.mjs";
+
+test("scenario environment permits only bounded product config overrides", () => {
+  assert.deepEqual(normalizeScenarioEnvironment({
+    MOYAI_BASE_URL: "http://127.0.0.1:43111",
+    MOYAI_DOCLING_ENABLED: "true",
+  }), {
+    MOYAI_BASE_URL: "http://127.0.0.1:43111",
+    MOYAI_DOCLING_ENABLED: "true",
+  });
+  assert.throws(() => normalizeScenarioEnvironment([]), /must be an object/);
+  assert.throws(() => normalizeScenarioEnvironment({ PATH: "C:\\bin" }), /not allowed/);
+  assert.throws(() => normalizeScenarioEnvironment({ MOYAI_CONFIG_PATH: "C:\\other.toml" }), /not allowed/);
+  assert.throws(() => normalizeScenarioEnvironment({ MOYAI_BASE_URL: "bad\0value" }), /value is invalid/);
+});
 
 test("cleanup never falls back to the closed generation-one driver after restart begins", () => {
   const generationOne = { generation: 1 };

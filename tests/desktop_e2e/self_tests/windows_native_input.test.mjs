@@ -6,12 +6,16 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 
 import {
   NativeInputError,
+  TAURI_MAIN_WINDOW_CLASS,
   captureOwnedWindowPng,
   closeOwnedNativeDialog,
   closeOwnedWindowForCleanup,
+  dragExactOwnedWindow,
+  exactOwnedWindowDragObserved,
   probeExactOwnedWindow,
   selectFreshOwnedRootWindow,
   selectFreshForegroundWindow,
+  selectSingleOwnedRootWindow,
   sendEscapeToOwnedForegroundWindow,
   snapshotOwnedTopLevelWindows,
 } from "../drivers/windows_native_input.mjs";
@@ -107,6 +111,36 @@ test("fresh owned-root selection isolates an exact native class before foregroun
   );
 });
 
+test("current Tauri root selection uses its exact native class and tolerates same-process auxiliary roots", () => {
+  const main = windowRow("0x100", { class_name: TAURI_MAIN_WINDOW_CLASS, thread_id: 700 });
+  const singleInstanceCoordinator = windowRow("0x200", {
+    class_name: "local.moyai.desktop-sic",
+    title: "local.moyai.desktop-siw",
+    rect: { left: 0, top: 0, right: 16, bottom: 16, width: 16, height: 16 },
+  });
+  const taoEventTarget = windowRow("0x300", {
+    class_name: "Tao Thread Event Target",
+    title: "",
+    rect: { left: 0, top: 0, right: 16, bottom: 16, width: 16, height: 16 },
+  });
+  const observed = snapshot([main, singleInstanceCoordinator, taoEventTarget], main.hwnd);
+  assert.deepEqual(
+    selectSingleOwnedRootWindow(observed, owner, { expectedClassName: TAURI_MAIN_WINDOW_CLASS }),
+    main,
+  );
+  assert.throws(
+    () => selectSingleOwnedRootWindow(observed, owner),
+    /expectedClassName must be a non-empty current native class fingerprint/,
+  );
+  assert.throws(
+    () => selectSingleOwnedRootWindow(observed, owner, { expectedClassName: "MissingClass" }),
+    (error) => error instanceof NativeInputError
+      && error.code === "native-window-cardinality"
+      && error.evidence.candidate_windows.length === 0
+      && error.evidence.auxiliary_current_windows.length === 3,
+  );
+});
+
 test("fresh selection rejects hidden, disabled, non-root, foreign, duplicate, and drifted process identities", () => {
   const main = windowRow("0x100", { class_name: "TauriMain" });
   const hidden = windowRow("0x200", { visible: false });
@@ -140,7 +174,7 @@ test("fresh selection rejects hidden, disabled, non-root, foreign, duplicate, an
   );
 });
 
-test("Escape, UIA dialog close, PNG, and exact-HWND cleanup wrappers preserve their delivery boundaries", async () => {
+test("Escape, drag, UIA dialog close, PNG, and exact-HWND cleanup wrappers preserve their delivery boundaries", async () => {
   const candidate = windowRow("0xA20");
   const calls = [];
   const invoke = async (action, parameters) => {
@@ -161,6 +195,41 @@ test("Escape, UIA dialog close, PNG, and exact-HWND cleanup wrappers preserve th
     }
     if (action === "CapturePng") {
       return { available: true, png_base64: "iVBORw0KGgo=", window: candidate };
+    }
+    if (action === "DragWindow") {
+      return {
+        foreground_activation_verified: true,
+        foreground_pre_input_verified: true,
+        foreground_post_input_verified: true,
+        delivery_verified: true,
+        button_initially_up: true,
+        mouse_down_count: 1,
+        mouse_up_count: 1,
+        mouse_up_attempted: true,
+        button_release_verified: true,
+        cursor_moved_by_driver: true,
+        cursor_restore_attempted: true,
+        cursor_restore_succeeded: true,
+        cleanup_only: false,
+        representative_input: true,
+        dpi: 144,
+        css_to_device_scale: 1.5,
+        client_rect: { left: 0, top: 0, right: 600, bottom: 400, width: 600, height: 400 },
+        requested_css: { client_offset_x: 200, client_offset_y: 15, delta_x: 80, delta_y: 48 },
+        delivered_device: {
+          start_x: 300,
+          start_y: 22,
+          delta_x: 120,
+          delta_y: 72,
+          path: [{ step: 1, x: 320, y: 34, succeeded: true }, { step: 2, x: 420, y: 94, succeeded: true }],
+        },
+        window_before: candidate,
+        window_after: windowRow(candidate.hwnd, {
+          rect: { left: 90, top: 68, right: 690, bottom: 468, width: 600, height: 400 },
+        }),
+        position_delta: { x: 80, y: 48 },
+        size_unchanged: true,
+      };
     }
     if (action === "CloseDialog") {
       return {
@@ -190,6 +259,19 @@ test("Escape, UIA dialog close, PNG, and exact-HWND cleanup wrappers preserve th
     { invoke },
   );
   assert.equal(escape.input_count, 2);
+  const drag = await dragExactOwnedWindow(
+    {
+      executionRoot: "C:\\execution",
+      ownerPath: "C:\\execution\\owner.json",
+      candidate,
+      clientOffsetX: 200,
+      clientOffsetY: 15,
+      deltaX: 80,
+      deltaY: 48,
+    },
+    { invoke },
+  );
+  assert.equal(exactOwnedWindowDragObserved(drag), true);
   const dialogClose = await closeOwnedNativeDialog(
     { executionRoot: "C:\\execution", ownerPath: "C:\\execution\\owner.json", candidate },
     { invoke },
@@ -206,7 +288,7 @@ test("Escape, UIA dialog close, PNG, and exact-HWND cleanup wrappers preserve th
     { invoke },
   );
   assert.equal(cleanup.cleanup_only, true);
-  assert.deepEqual(calls.map((call) => call.action), ["SendEscape", "CloseDialog", "CapturePng", "CloseCleanup"]);
+  assert.deepEqual(calls.map((call) => call.action), ["SendEscape", "DragWindow", "CloseDialog", "CapturePng", "CloseCleanup"]);
   for (const call of calls) {
     assert.equal(call.parameters.WindowHandle, candidate.hwnd);
     assert.equal(call.parameters.ExpectedThreadId, candidate.thread_id);
@@ -245,6 +327,126 @@ test("Escape, UIA dialog close, PNG, and exact-HWND cleanup wrappers preserve th
     ),
     (error) => error.code === "native-escape-delivery-invalid" && error.evidence.input_count === 2,
   );
+  await assert.rejects(
+    () => dragExactOwnedWindow(
+      {
+        executionRoot: "C:\\execution",
+        ownerPath: "C:\\execution\\owner.json",
+        candidate,
+        clientOffsetX: 200,
+        clientOffsetY: 15,
+        deltaX: 80,
+        deltaY: 48,
+      },
+      { invoke: async () => ({
+        foreground_activation_verified: true,
+        foreground_pre_input_verified: true,
+        foreground_post_input_verified: true,
+        delivery_verified: false,
+        button_initially_up: true,
+        mouse_down_count: 1,
+        mouse_up_count: 0,
+        mouse_up_attempted: true,
+        button_release_verified: false,
+        cursor_moved_by_driver: true,
+        cursor_restore_attempted: true,
+        cursor_restore_succeeded: true,
+        cleanup_only: false,
+        representative_input: true,
+        requested_css: { client_offset_x: 200, client_offset_y: 15, delta_x: 80, delta_y: 48 },
+        delivered_device: { path: [{ step: 1, succeeded: true }] },
+        window_before: candidate,
+        window_after: candidate,
+      }) },
+    ),
+    (error) => error.code === "native-window-drag-delivery-invalid"
+      && error.evidence.button_release_verified === false,
+  );
+  await assert.rejects(
+    () => dragExactOwnedWindow(
+      {
+        executionRoot: "C:\\execution",
+        ownerPath: "C:\\execution\\owner.json",
+        candidate,
+        clientOffsetX: 200,
+        clientOffsetY: 15,
+        deltaX: 80,
+        deltaY: 48,
+      },
+      { invoke: async () => ({
+        foreground_activation_verified: false,
+        foreground_pre_input_verified: false,
+        foreground_post_input_verified: true,
+        delivery_verified: false,
+        button_initially_up: null,
+        mouse_down_count: 0,
+        mouse_up_count: 0,
+        mouse_up_attempted: false,
+        button_release_verified: true,
+        cursor_moved_by_driver: false,
+        cursor_restore_attempted: false,
+        cursor_restore_succeeded: false,
+        cleanup_only: false,
+        representative_input: false,
+        requested_css: { client_offset_x: 200, client_offset_y: 15, delta_x: 80, delta_y: 48 },
+        delivered_device: { path: [] },
+        window_before: candidate,
+        window_after: candidate,
+      }) },
+    ),
+    (error) => error.code === "native-window-drag-delivery-invalid"
+      && error.evidence.mouse_down_count === 0
+      && error.evidence.mouse_up_count === 0
+      && error.evidence.mouse_up_attempted === false
+      && error.evidence.cursor_moved_by_driver === false
+      && error.evidence.cursor_restore_attempted === false,
+  );
+  await assert.rejects(
+    () => dragExactOwnedWindow(
+      {
+        executionRoot: "C:\\execution",
+        ownerPath: "C:\\execution\\owner.json",
+        candidate,
+        clientOffsetX: 200,
+        clientOffsetY: 15,
+        deltaX: 80,
+        deltaY: 48,
+      },
+      { invoke: async () => ({
+        foreground_activation_verified: true,
+        foreground_pre_input_verified: true,
+        foreground_post_input_verified: true,
+        delivery_verified: false,
+        button_initially_up: false,
+        mouse_down_count: 0,
+        mouse_up_count: 0,
+        mouse_up_attempted: false,
+        button_release_verified: false,
+        cursor_moved_by_driver: false,
+        cursor_restore_attempted: false,
+        cursor_restore_succeeded: false,
+        cleanup_only: false,
+        representative_input: false,
+        requested_css: { client_offset_x: 200, client_offset_y: 15, delta_x: 80, delta_y: 48 },
+        delivered_device: { path: [] },
+        window_before: candidate,
+        window_after: candidate,
+      }) },
+    ),
+    (error) => error.code === "native-window-drag-delivery-invalid"
+      && error.evidence.button_initially_up === false
+      && error.evidence.mouse_down_count === 0
+      && error.evidence.mouse_up_count === 0
+      && error.evidence.mouse_up_attempted === false
+      && error.evidence.cursor_moved_by_driver === false
+      && error.evidence.cursor_restore_attempted === false,
+  );
+  assert.equal(exactOwnedWindowDragObserved({
+    window_before: candidate,
+    window_after: candidate,
+    position_delta: { x: 0, y: 0 },
+    size_unchanged: true,
+  }), false);
   await assert.rejects(
     () => closeOwnedNativeDialog(
       { executionRoot: "C:\\execution", ownerPath: "C:\\execution\\owner.json", candidate },

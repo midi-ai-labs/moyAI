@@ -47,6 +47,7 @@ import {
 import {
   renderArtifactPane,
   renderComposer,
+  renderLocalConfirmation,
   renderOverlay,
   renderSidebar,
   renderThreadContent,
@@ -98,7 +99,144 @@ import {
   reconcileUiDrafts,
   rejectDraftMutation,
   sessionSearchMutationTarget,
+  synchronizeInitialSetupProviderDraft,
 } from "../src/view_state.ts";
+
+test("Initial Setup catalog evidence is invalidated by A to B to A config-draft edits", () => {
+  const providerFields: ConfigFieldProjection[] = [
+    {
+      key: "model.base_url",
+      value: "http://provider-a.test/v1",
+      env_override: null,
+      value_type: "string",
+      required: true,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.provider_metadata_mode",
+      value: "openai_compatible_only",
+      env_override: null,
+      value_type: "enum",
+      required: true,
+      min_value: null,
+      max_value: null,
+      options: ["openai_compatible_only", "lm_studio_native_required"],
+    },
+    {
+      key: "model.context_window",
+      value: "65536",
+      env_override: null,
+      value_type: "integer",
+      required: true,
+      min_value: 1,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.max_output_tokens",
+      value: "1024",
+      env_override: null,
+      value_type: "integer",
+      required: true,
+      min_value: 0,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.model",
+      value: "model-a",
+      env_override: null,
+      value_type: "string",
+      required: true,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+  ];
+  const state = projection({
+    confirmation_visible: false,
+    overlay: "initial_setup",
+    startup: {
+      status: "requires_config",
+      title: "Initial Setup",
+      message: "Configure",
+      detail: "",
+      action_overlay: "initial_setup",
+      initial_setup_required: true,
+      initial_setup_reason: "config_missing",
+      global_config_path: "C:/config/config.toml",
+      setup_target: {
+        workspacePath: "C:/workspace",
+        globalConfigPath: "C:/config/config.toml",
+        setupGeneration: "3",
+      },
+      checks: [],
+    },
+    provider_base_url: "http://provider-a.test/v1",
+    provider_metadata_mode: "openai_compatible_only",
+    provider_context_window: "65536",
+    provider_max_output_tokens: "1024",
+    provider_catalog_base_url: "http://provider-a.test",
+    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_model_ids: ["model-a", "model-a-alt"],
+    provider_models: ["Model A", "Model A alt"],
+    provider_selected_index: 0,
+    config_fields: providerFields,
+  });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, state);
+  assert.deepEqual(projectViewState(state, ui).provider_model_ids, ["model-a", "model-a-alt"]);
+  const catalogIdentityRevision = ui.drafts.providerCatalogIdentityRevision;
+  updateConfigDraftValue(
+    ui,
+    state.config_target,
+    providerFields.map(({ key, value }) => ({ key, text: value })),
+    "model.model",
+    "model-a-alt",
+  );
+  const selectedModel = projectViewState(state, ui);
+  assert.equal(synchronizeInitialSetupProviderDraft(selectedModel, ui), true);
+  assert.equal(ui.drafts.providerCatalogIdentityRevision, catalogIdentityRevision);
+  assert.deepEqual(
+    projectViewState(state, ui).provider_model_ids,
+    ["model-a", "model-a-alt"],
+    "model selection updates the complete draft without invalidating URL/mode catalog evidence",
+  );
+  const request = beginProviderCatalogRequest(ui, state);
+  assert.ok(request);
+  const originalRevision = ui.drafts.providerRevision;
+
+  updateConfigDraftValue(
+    ui,
+    state.config_target,
+    providerFields.map(({ key, value }) => ({ key, text: value })),
+    "model.base_url",
+    "http://provider-b.test/v1",
+  );
+  const providerB = projectViewState(state, ui);
+  assert.equal(synchronizeInitialSetupProviderDraft(providerB, ui), true);
+  assert.equal(ui.drafts.providerRevision, originalRevision + 1);
+  assert.deepEqual(projectViewState(state, ui).provider_model_ids, []);
+
+  updateConfigDraftValue(
+    ui,
+    state.config_target,
+    projectViewState(state, ui).config_fields.map(({ key, value }) => ({ key, text: value })),
+    "model.base_url",
+    "http://provider-a.test/v1",
+  );
+  const providerAAgain = projectViewState(state, ui);
+  assert.equal(synchronizeInitialSetupProviderDraft(providerAAgain, ui), true);
+  assert.equal(ui.drafts.providerRevision, originalRevision + 2);
+  assert.equal(request.providerRevision, catalogIdentityRevision);
+  assert.deepEqual(
+    projectViewState(state, ui).provider_model_ids,
+    [],
+    "the old A catalog cannot become current evidence after an ABA draft edit",
+  );
+});
 
 function actionTestModel(
   state: DesktopViewState,
@@ -114,7 +252,13 @@ function actionTestModel(
     },
     attachmentTrayOpen: uiState.attachmentTrayOpen,
     configMutationPending: uiState.activeConfigMutationGeneration !== null
-      || uiState.externalConfigMutationPending,
+      || uiState.externalConfigMutationPending
+      || (
+        state.overlay === "config"
+        && uiState.localConfirmationDecisionPending
+        && uiState.pendingLocalConfirmation === null
+      ),
+    doclingReadinessRequestPending: uiState.doclingReadinessTransaction.active !== null,
     modal: {
       localConfirmation: uiState.pendingLocalConfirmation,
       localDecisionPending: uiState.localConfirmationDecisionPending,
@@ -298,6 +442,12 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
     provider_selected_model_summary: [],
     provider_loading: false,
     provider_apply_enabled: true,
+    docling_readiness: {
+      status: "idle",
+      endpoint: "",
+      httpStatus: null,
+      message: "Docling readiness has not been checked.",
+    },
     config_target: {
       workspacePath: "C:/workspace",
       sessionId: SESSION_A,
@@ -348,11 +498,13 @@ function reviewTarget(
 
 function renderLocal(overrides: {
   configMutationPending?: boolean;
+  doclingReadinessRequestPending?: boolean;
   sideChat?: Partial<DesktopRenderLocalPresentation["sideChat"]>;
 } = {}): DesktopRenderLocalPresentation {
   return {
     ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
     configMutationPending: overrides.configMutationPending ?? false,
+    doclingReadinessRequestPending: overrides.doclingReadinessRequestPending ?? false,
     sideChat: {
       ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.sideChat,
       ...overrides.sideChat,
@@ -503,12 +655,23 @@ test("installed prompt and delegated Settings handlers update capability state s
     hidden = false;
   }
   class FakeInput extends FakeHtmlElement {
-    value = "3600000";
-    type = "text";
+    value: string;
+    type: string;
     checked = false;
     disabled = false;
-    dataset = { configKey: "model.request_timeout_ms" };
+    dataset: { configKey: string };
     readonly attributes = new Map<string, string>();
+
+    constructor(
+      configKey = "model.request_timeout_ms",
+      value = "3600000",
+      type = "text",
+    ) {
+      super();
+      this.dataset = { configKey };
+      this.value = value;
+      this.type = type;
+    }
 
     matches(selector: string): boolean {
       return selector === ".settings-control";
@@ -572,8 +735,13 @@ test("installed prompt and delegated Settings handlers update capability state s
   const prompt = new FakePrompt();
   const send = new FakeButton("send");
   const settingsInput = new FakeInput();
+  const doclingToggle = new FakeInput("docling.enabled", "", "checkbox");
+  doclingToggle.checked = true;
+  const doclingUrl = new FakeInput("docling.base_url", "http://127.0.0.1:5001", "url");
   const apply = new FakeButton("apply-session-config");
   const save = new FakeButton("save-global-config");
+  const doclingReadiness = new FakeButton("check-docling-readiness");
+  doclingReadiness.disabled = false;
   const validation = new FakeValidation();
   const documentListeners = new Map<string, Array<(event: { target: unknown }) => void>>();
   const fakeDocument = {
@@ -592,9 +760,9 @@ test("installed prompt and delegated Settings handlers update capability state s
       return null;
     },
     querySelectorAll: (selector: string) => {
-      if (selector === ".settings-control") return [settingsInput];
-      if (selector.includes("apply-session-config") && selector.includes("save-global-config")) {
-        return [apply, save];
+      if (selector === ".settings-control") return [settingsInput, doclingToggle, doclingUrl];
+      if (selector === ".settings-modal button[data-action]") {
+        return [apply, save, doclingReadiness];
       }
       return [];
     },
@@ -629,16 +797,38 @@ test("installed prompt and delegated Settings handlers update capability state s
       can_submit: true,
       enhance_enabled: false,
       draft_prompt: "",
-      config_fields: [{
-        key: "model.request_timeout_ms",
-        value: "3600000",
-        env_override: "MOYAI_REQUEST_TIMEOUT_MS",
-        value_type: "integer",
-        required: true,
-        min_value: 1,
-        max_value: 3600000,
-        options: [],
-      }],
+      config_fields: [
+        {
+          key: "model.request_timeout_ms",
+          value: "3600000",
+          env_override: "MOYAI_REQUEST_TIMEOUT_MS",
+          value_type: "integer",
+          required: true,
+          min_value: 1,
+          max_value: 3600000,
+          options: [],
+        },
+        {
+          key: "docling.enabled",
+          value: "true",
+          env_override: null,
+          value_type: "boolean",
+          required: false,
+          min_value: null,
+          max_value: null,
+          options: [],
+        },
+        {
+          key: "docling.base_url",
+          value: "http://127.0.0.1:5001",
+          env_override: null,
+          value_type: "string",
+          required: true,
+          min_value: null,
+          max_value: null,
+          options: [],
+        },
+      ],
     });
     const ui = createUiLocalState();
     reconcileUiDrafts(ui, null, rustProjection, null);
@@ -649,6 +839,7 @@ test("installed prompt and delegated Settings handlers update capability state s
       getViewState: () => projectViewState(rustProjection, ui),
       getRenderModel: () => actionTestModel(projectViewState(rustProjection, ui), ui),
       invalidateCommandPaletteInsertion: () => undefined,
+      rerender: () => undefined,
     } as unknown as ActionContext;
 
     wireEvents(view, context);
@@ -666,6 +857,7 @@ test("installed prompt and delegated Settings handlers update capability state s
     assert.equal(apply.disabled, false);
     assert.equal(save.disabled, false);
     assert.equal(apply.getAttribute("aria-disabled"), "false");
+    assert.equal(doclingReadiness.disabled, true, "every Settings action consumes the fresh dirty model");
 
     dispatchSettings("input", "0");
     assert.equal(apply.disabled, true);
@@ -676,6 +868,23 @@ test("installed prompt and delegated Settings handlers update capability state s
     dispatchSettings("change", "3598000");
     assert.equal(apply.disabled, false);
     assert.equal(settingsInput.getAttribute("aria-invalid"), null);
+
+    doclingUrl.value = "https://docling.example.test/convert?token=hidden";
+    for (const listener of documentListeners.get("input") ?? []) listener({ target: doclingUrl });
+    assert.equal(doclingUrl.getAttribute("aria-invalid"), "true");
+    assert.match(validation.textContent, /docling\.base_url: URL にquery string/);
+
+    doclingToggle.checked = false;
+    for (const listener of documentListeners.get("change") ?? []) listener({ target: doclingToggle });
+    assert.equal(
+      doclingUrl.getAttribute("aria-invalid"),
+      null,
+      "the same complete draft context removes inline URL errors while Docling is disabled",
+    );
+
+    doclingToggle.checked = true;
+    for (const listener of documentListeners.get("change") ?? []) listener({ target: doclingToggle });
+    assert.equal(doclingUrl.getAttribute("aria-invalid"), "true");
   } finally {
     for (const [name, descriptor] of previousGlobals) {
       if (descriptor) Object.defineProperty(globalThis, name, descriptor);
@@ -2583,6 +2792,68 @@ test("frontend provider URL validation mirrors the Rust ProviderEndpoint boundar
   assert.equal(validateSideChatProviderSettings("http://localhost/v1", "   ").ok, false);
 });
 
+test("Docling base URL validation follows the enabled value in the same complete draft", () => {
+  const field = (
+    key: string,
+    value: string,
+    valueType: ConfigFieldProjection["value_type"] = "string",
+  ): ConfigFieldProjection => ({
+    key,
+    value,
+    env_override: null,
+    value_type: valueType,
+    required: true,
+    min_value: null,
+    max_value: null,
+    options: [],
+  });
+  const enabled = field("docling.enabled", "true", "boolean");
+  const baseUrl = field("docling.base_url", "https://docling.example.test/api");
+  const values = (enabledValue: string, baseUrlValue: string) => [
+    { key: enabled.key, text: enabledValue },
+    { key: baseUrl.key, text: baseUrlValue },
+  ];
+  const fields = [enabled, baseUrl];
+
+  for (const retained of [
+    "",
+    "inactive-draft",
+    "https://user:secret@docling.example.test/api",
+    "https://docling.example.test/api?token=hidden",
+    "https://docling.example.test/api#hidden",
+  ]) {
+    const disabledValues = values("false", retained);
+    assert.equal(validateConfigInput(baseUrl, retained, disabledValues).ok, true, retained);
+    assert.equal(validateConfigFieldValues(fields, disabledValues).ok, true, retained);
+  }
+
+  const validEnabled = values("true", "HTTPS://DOCLING.EXAMPLE.TEST/api/");
+  assert.equal(validateConfigInput(baseUrl, validEnabled[1].text, validEnabled).ok, true);
+  assert.equal(validateConfigFieldValues(fields, validEnabled).ok, true);
+
+  for (const rejected of [
+    "https://user:secret@docling.example.test/api",
+    "https://docling.example.test/api?token=hidden",
+    "https://docling.example.test/api#hidden",
+  ]) {
+    const enabledValues = values("true", rejected);
+    assert.equal(validateConfigInput(baseUrl, rejected, enabledValues).ok, false, rejected);
+    assert.deepEqual(validateConfigFieldValues(fields, enabledValues).invalidKey, "docling.base_url");
+  }
+
+  const modelBaseUrl = field("model.base_url", "https://provider.example/v1?token=hidden");
+  const modelValues = [
+    { key: enabled.key, text: "false" },
+    { key: baseUrl.key, text: "inactive-draft" },
+    { key: modelBaseUrl.key, text: modelBaseUrl.value },
+  ];
+  assert.deepEqual(
+    validateConfigFieldValues([enabled, baseUrl, modelBaseUrl], modelValues).invalidKey,
+    "model.base_url",
+    "disabling Docling must not change the Main provider URL boundary",
+  );
+});
+
 test("local full-draft validation owns Settings actions and command-palette admission", () => {
   const timeoutField: ConfigFieldProjection = {
     key: "model.request_timeout_ms",
@@ -3663,6 +3934,7 @@ test("provider catalog completion is rejected after a mid-flight URL edit", () =
 
   ui.drafts.provider.baseUrl = "http://192.168.10.101:1234";
   ui.drafts.providerRevision += 1;
+  ui.drafts.providerCatalogIdentityRevision += 1;
   const completion = projection({
     ...initial,
     projection_revision: "3",
@@ -3717,8 +3989,10 @@ test("provider catalog completion is rejected after an ABA draft edit", () => {
 
   ui.drafts.provider.baseUrl = "http://192.168.10.101:1234";
   ui.drafts.providerRevision += 1;
+  ui.drafts.providerCatalogIdentityRevision += 1;
   ui.drafts.provider.baseUrl = "http://127.0.0.1:9763/slow";
   ui.drafts.providerRevision += 1;
+  ui.drafts.providerCatalogIdentityRevision += 1;
   const loadingView = projectViewState(loading, ui);
   assert.equal(loadingView.provider_loading, true, "the Rust-owned request remains in flight");
   assert.equal(loadingView.provider_base_url, "http://127.0.0.1:9763/slow");
@@ -3884,8 +4158,10 @@ test("provider catalog rapid double dispatch preserves one owner through ABA set
 
   ui.drafts.provider.baseUrl = "http://192.168.10.101:1234";
   ui.drafts.providerRevision += 1;
+  ui.drafts.providerCatalogIdentityRevision += 1;
   ui.drafts.provider.baseUrl = "http://127.0.0.1:9763/slow";
   ui.drafts.providerRevision += 1;
+  ui.drafts.providerCatalogIdentityRevision += 1;
   const completion = projection({
     ...initial,
     projection_revision: "3",
@@ -3979,6 +4255,7 @@ test("provider catalog completion is rejected after a mid-flight mode edit", () 
 
   ui.drafts.provider.metadataMode = "lm_studio_native_required";
   ui.drafts.providerRevision += 1;
+  ui.drafts.providerCatalogIdentityRevision += 1;
   const completion = projection({
     ...initial,
     projection_revision: "3",
@@ -4321,6 +4598,153 @@ test("settings renders one typed LLM response timeout with total-response help",
   assert.match(html, /data-config-key="model\.request_timeout_ms"[^>]+value="3600000"/);
   assert.doesNotMatch(html, /model\.stream_idle_timeout_ms/);
   assert.doesNotMatch(html, /settings-raw-value[^>]+model\.request_timeout_ms/);
+});
+
+test("Docling dependencies expose one visible toggle owner and disable connection editors while off", () => {
+  const doclingField = (
+    key: string,
+    value: string,
+    valueType: ConfigFieldProjection["value_type"] = "string",
+  ): ConfigFieldProjection => ({
+    key,
+    value,
+    env_override: null,
+    value_type: valueType,
+    required: false,
+    min_value: null,
+    max_value: null,
+    options: [],
+  });
+  const fields = (
+    enabled: boolean,
+    baseUrl = "http://127.0.0.1:5001",
+  ): ConfigFieldProjection[] => [
+    doclingField("docling.enabled", String(enabled), "boolean"),
+    { ...doclingField("docling.base_url", baseUrl, "string"), required: true },
+    doclingField("docling.timeout_ms", "120000", "integer"),
+    doclingField("docling.api_key_env", "DOCLING_API_KEY", "string"),
+    doclingField("docling.headers_json", "{}", "json"),
+  ];
+
+  const off = renderOverlay(projection({ overlay: "config", config_fields: fields(false) }));
+  assert.match(off, /<label class="settings-toggle"[^>]*data-config-key="docling\.enabled"[^>]*>/);
+  assert.match(off, />Docling を有効化/);
+  assert.match(off, /id="docling-disabled-help"[^>]*(?<!hidden)>Doclingがオフのため/);
+  assert.match(off, /data-docling-dependent aria-disabled="true"/);
+  for (const key of ["docling.base_url", "docling.timeout_ms", "docling.api_key_env", "docling.headers_json"]) {
+    assert.match(off, new RegExp(`data-config-key="${key.replace(".", "\\.")}"[^>]*aria-describedby="[^"]*docling-disabled-help[^"]*"[^>]*disabled`));
+  }
+  assert.match(off, /<summary>Docling 接続ヘッダー（Advanced）<\/summary>/);
+
+  const on = renderOverlay(projection({ overlay: "config", config_fields: fields(true) }));
+  assert.match(on, /id="docling-disabled-help"[^>]*hidden/);
+  assert.match(on, /data-docling-dependent aria-disabled="false"/);
+  assert.match(on, /data-config-key="docling\.base_url"(?![^>]*disabled)[^>]*>/);
+
+  const invalidUrl = "https://docling.example.test/api?token=hidden";
+  const offInvalid = renderOverlay(projection({ overlay: "config", config_fields: fields(false, invalidUrl) }));
+  const onInvalid = renderOverlay(projection({ overlay: "config", config_fields: fields(true, invalidUrl) }));
+  const baseUrlControl = (html: string) => html.match(
+    /<input[^>]*data-config-key="docling\.base_url"[^>]*>/,
+  )?.[0] ?? "";
+  assert.doesNotMatch(baseUrlControl(offInvalid), /aria-invalid="true"/);
+  assert.match(baseUrlControl(onInvalid), /aria-invalid="true"/);
+});
+
+test("Docling readiness stays an explicit clean-config action with typed section status", () => {
+  const fields: ConfigFieldProjection[] = [
+    {
+      key: "docling.enabled",
+      value: "true",
+      env_override: null,
+      value_type: "boolean",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "docling.base_url",
+      value: "http://127.0.0.1:5001",
+      env_override: null,
+      value_type: "string",
+      required: true,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+  ];
+  const ready = projection({
+    overlay: "config",
+    config_fields: fields,
+    docling_readiness: {
+      status: "ready",
+      endpoint: "http://127.0.0.1:5001/ready",
+      httpStatus: 200,
+      message: "Docling /ready returned HTTP 200.",
+    },
+  });
+  const action = registryActionById("check-docling-readiness");
+  assert.ok(action);
+  assert.equal(action.enabled(actionTestModel(ready), { index: -1, value: "" }), true);
+  const readyHtml = renderOverlay(ready, renderLocal());
+  assert.match(readyHtml, /data-action="check-docling-readiness"[^>]*aria-controls="docling-readiness-status"/);
+  assert.match(readyHtml, /data-settings-live-region="docling-readiness"[^>]*data-docling-readiness-status="ready"/);
+  assert.match(readyHtml, /Docling を利用できます/);
+  assert.match(readyHtml, /HTTP 200/);
+
+  const localPending = renderLocal({ doclingReadinessRequestPending: true });
+  assert.equal(
+    action.enabled(createDesktopRenderModel(ready, localPending), { index: -1, value: "" }),
+    false,
+  );
+  const localPendingHtml = renderOverlay(ready, localPending);
+  assert.match(
+    localPendingHtml,
+    /data-action="check-docling-readiness"[^>]*aria-busy="true"[^>]*disabled/,
+  );
+  assert.match(localPendingHtml, /data-docling-readiness-status="checking"[^>]*aria-busy="true"/);
+  assert.match(localPendingHtml, /接続確認を開始しています/);
+  assert.doesNotMatch(localPendingHtml, /HTTP 200/);
+
+  const checking = {
+    ...ready,
+    docling_readiness: { ...ready.docling_readiness, status: "checking" as const },
+  };
+  assert.equal(action.enabled(actionTestModel(checking), { index: -1, value: "" }), false);
+  assert.match(renderOverlay(checking, renderLocal()), /data-docling-readiness-status="checking"[^>]*aria-busy="true"/);
+
+  const dirty = {
+    ...ready,
+    config_draft: {
+      ...ready.config_draft,
+      dirty: true,
+      discard_enabled: true,
+      commit_enabled: true,
+      external_owner_mutation_open: true,
+    },
+  };
+  assert.equal(
+    action.enabled(actionTestModel(dirty), { index: -1, value: "" }),
+    false,
+    "dirty draft alone closes the saved-effective-config readiness action",
+  );
+  const dirtyHtml = renderOverlay(dirty, renderLocal());
+  assert.match(dirtyHtml, /未保存の設定があります/);
+  assert.match(dirtyHtml, /保存してから Test Docling/);
+});
+
+test("dirty Settings close confirmation is modal, target-scoped, and has no backdrop action", () => {
+  const html = renderLocalConfirmation({
+    kind: "settings_close",
+    expectedTarget: projection().config_target,
+  });
+  assert.match(html, /class="modal confirmation settings-close-confirmation" role="alertdialog"/);
+  assert.match(html, /aria-labelledby="settings-close-confirm-title"/);
+  assert.match(html, /aria-describedby="settings-close-confirm-summary"/);
+  assert.match(html, /data-action="cancel-local-confirm"/);
+  assert.match(html, /data-action="confirm-settings-discard-close"/);
+  assert.doesNotMatch(html, /modal-backdrop"[^>]*data-action/);
 });
 
 test("invalid local Settings values close Apply and Save while valid dirty values reopen them", () => {

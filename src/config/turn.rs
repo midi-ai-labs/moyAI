@@ -138,6 +138,8 @@ pub enum ResolvedTurnConfigError {
     #[error("{message}")]
     ProviderRuntime { message: String },
     #[error("{message}")]
+    DoclingRuntime { message: String },
+    #[error("{message}")]
     WorkspaceBoundary { message: String },
 }
 
@@ -399,6 +401,9 @@ impl ResolvedTurnConfig {
             .normalize_and_validate_provider_runtime()
             .map_err(|message| ResolvedTurnConfigError::ProviderRuntime { message })?;
         effective
+            .normalize_and_validate_docling_runtime()
+            .map_err(|message| ResolvedTurnConfigError::DoclingRuntime { message })?;
+        effective
             .validate_workspace_boundary_roots()
             .map_err(|message| ResolvedTurnConfigError::WorkspaceBoundary { message })?;
         let provider = ProviderTarget::from_resolved_config(&effective)?;
@@ -558,6 +563,26 @@ mod tests {
             ));
             assert!(error.to_string().contains(field));
         }
+    }
+
+    #[test]
+    fn complete_turn_capture_rejects_an_invalid_enabled_docling_endpoint() {
+        let mut config = ResolvedConfig::default();
+        config.docling.enabled = true;
+        config.docling.base_url =
+            "https://user:super-secret@docling.example.test?api_key=hidden".to_string();
+
+        let error = ResolvedTurnConfig::capture(config)
+            .expect_err("invalid enabled Docling endpoint must not enter turn state");
+
+        assert!(matches!(
+            &error,
+            ResolvedTurnConfigError::DoclingRuntime { .. }
+        ));
+        let diagnostic = format!("{error:?}: {error}");
+        assert!(diagnostic.contains("docling.base_url"));
+        assert!(!diagnostic.contains("super-secret"));
+        assert!(!diagnostic.contains("hidden"));
     }
 
     #[test]

@@ -484,6 +484,14 @@ impl ResolvedConfig {
         Ok(())
     }
 
+    pub(crate) fn normalize_and_validate_docling_runtime(&mut self) -> Result<(), String> {
+        if !self.docling.enabled {
+            return Ok(());
+        }
+        self.docling.base_url = canonical_docling_base_url(&self.docling.base_url)?;
+        Ok(())
+    }
+
     pub(crate) fn validate_workspace_boundary_roots(&self) -> Result<(), String> {
         for (field, paths) in [
             (
@@ -509,6 +517,39 @@ impl ResolvedConfig {
         }
         Ok(())
     }
+}
+
+pub(crate) fn canonical_docling_base_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "config field `docling.base_url` must not be empty when `docling.enabled` is true"
+                .to_string(),
+        );
+    }
+    let mut url = reqwest::Url::parse(trimmed)
+        .map_err(|_| "config field `docling.base_url` must be a valid absolute URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("config field `docling.base_url` must use http or https".to_string());
+    }
+    if url.host_str().is_none() {
+        return Err("config field `docling.base_url` must include a host".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "config field `docling.base_url` must not contain URL userinfo; configure credentials through `docling.api_key_env` or `docling.headers`"
+                .to_string(),
+        );
+    }
+    if url.query().is_some() {
+        return Err("config field `docling.base_url` must not contain a query string".to_string());
+    }
+    if url.fragment().is_some() {
+        return Err("config field `docling.base_url` must not contain a fragment".to_string());
+    }
+    let path = url.path().trim_end_matches('/').to_string();
+    url.set_path(if path.is_empty() { "/" } else { &path });
+    Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
 pub(crate) fn validate_optional_provider_float(
@@ -714,6 +755,25 @@ pub struct PartialResolvedConfig {
     pub logging: Option<PartialLoggingConfig>,
 }
 
+impl PartialResolvedConfig {
+    pub(crate) const CURRENT_TOP_LEVEL_SECTIONS: [&'static str; 14] = [
+        "model",
+        "session",
+        "multi_agent",
+        "permissions",
+        "shell",
+        "format",
+        "instructions",
+        "workspace",
+        "inspection",
+        "file_guard",
+        "docling",
+        "mcp",
+        "tool_output",
+        "logging",
+    ];
+}
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartialModelConfig {
@@ -917,6 +977,39 @@ mod config_contract_tests {
         AccessMode, McpServerConfig, PartialModelConfig, PartialResolvedConfig, ResolvedConfig,
     };
     use crate::tool::ToolEffectClass;
+
+    #[test]
+    fn forward_compatible_top_level_section_inventory_matches_the_current_schema() {
+        let complete_section_inventory = PartialResolvedConfig {
+            model: Some(Default::default()),
+            session: Some(Default::default()),
+            multi_agent: Some(Default::default()),
+            permissions: Some(Default::default()),
+            shell: Some(Default::default()),
+            format: Some(Default::default()),
+            instructions: Some(Default::default()),
+            workspace: Some(Default::default()),
+            inspection: Some(Default::default()),
+            file_guard: Some(Default::default()),
+            docling: Some(Default::default()),
+            mcp: Some(Default::default()),
+            tool_output: Some(Default::default()),
+            logging: Some(Default::default()),
+        };
+        let serialized = toml::Value::try_from(complete_section_inventory)
+            .expect("serialize complete current section inventory");
+        let mut actual = serialized
+            .as_table()
+            .expect("config root table")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let mut expected = PartialResolvedConfig::CURRENT_TOP_LEVEL_SECTIONS.to_vec();
+        actual.sort_unstable();
+        expected.sort_unstable();
+
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn access_modes_keep_canonical_keys_labels_and_three_state_order() {

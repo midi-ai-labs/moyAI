@@ -1028,6 +1028,23 @@ impl SqliteSessionRepository {
         expected_access_mode: AccessMode,
         access_mode: AccessMode,
     ) -> Result<Option<SessionSettingsUpdate>, StorageError> {
+        let current = self.get_session(session_id).await?;
+        self.compare_and_set_root_session_access_mode_at_revision(
+            session_id,
+            current.session_settings_revision,
+            expected_access_mode,
+            access_mode,
+        )
+        .await
+    }
+
+    pub async fn compare_and_set_root_session_access_mode_at_revision(
+        &self,
+        session_id: SessionId,
+        expected_session_settings_revision: u64,
+        expected_access_mode: AccessMode,
+        access_mode: AccessMode,
+    ) -> Result<Option<SessionSettingsUpdate>, StorageError> {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = session_record_from_connection(&transaction, session_id)?;
@@ -1044,7 +1061,9 @@ impl SqliteSessionRepository {
                 "session {session_id} is a child agent session; root access mode ownership was rejected"
             )));
         }
-        if current.access_mode != expected_access_mode {
+        if current.session_settings_revision != expected_session_settings_revision
+            || current.access_mode != expected_access_mode
+        {
             transaction.commit()?;
             return Ok(None);
         }
@@ -1055,12 +1074,20 @@ impl SqliteSessionRepository {
                 changed: false,
             }));
         }
+        if current.session_settings_revision >= i64::MAX as u64 {
+            return Err(StorageError::Message(format!(
+                "root session {session_id} settings revision is exhausted"
+            )));
+        }
         let now = SystemClock::now_ms().max(current.updated_at_ms.saturating_add(1));
         let updated = transaction.execute(
             "UPDATE sessions
-             SET access_mode = ?3, updated_at_ms = ?4
+             SET access_mode = ?3, updated_at_ms = ?4,
+                 session_settings_revision = session_settings_revision + 1
              WHERE id = ?1
                AND access_mode = ?2
+               AND session_settings_revision = ?5
+               AND session_settings_revision < 9223372036854775807
                AND NOT EXISTS (
                    SELECT 1 FROM session_spawn_edges
                    WHERE child_session_id = sessions.id
@@ -1069,7 +1096,118 @@ impl SqliteSessionRepository {
                 session_id.to_string(),
                 expected_access_mode.as_str(),
                 access_mode.as_str(),
-                now
+                now,
+                i64::try_from(expected_session_settings_revision).map_err(|_| {
+                    StorageError::Message(format!(
+                        "root session {session_id} settings revision is out of range"
+                    ))
+                })?
+            ],
+        )?;
+        if updated != 1 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let session = session_record_from_connection(&transaction, session_id)?;
+        transaction.commit()?;
+        Ok(Some(SessionSettingsUpdate {
+            session,
+            changed: true,
+        }))
+    }
+
+    pub async fn compare_and_set_root_session_settings(
+        &self,
+        session_id: SessionId,
+        expected_session_settings_revision: u64,
+        patch: &SessionSettingsPatch,
+    ) -> Result<Option<SessionSettingsUpdate>, StorageError> {
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = session_record_from_connection(&transaction, session_id)?;
+        let is_child = transaction
+            .query_row(
+                "SELECT 1 FROM session_spawn_edges WHERE child_session_id = ?1",
+                params![session_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if is_child {
+            return Err(StorageError::Message(format!(
+                "session {session_id} is a child agent session; root settings ownership was rejected"
+            )));
+        }
+        if current.session_settings_revision != expected_session_settings_revision {
+            transaction.commit()?;
+            return Ok(None);
+        }
+
+        let next_cwd = patch.cwd.clone().unwrap_or_else(|| current.cwd.clone());
+        let next_model = patch.model.clone().unwrap_or_else(|| current.model.clone());
+        let next_base_url = patch
+            .base_url
+            .clone()
+            .unwrap_or_else(|| current.base_url.clone());
+        let next_base_url = ProviderEndpoint::parse(&next_base_url)
+            .map_err(|error| StorageError::Message(error.to_string()))?
+            .as_str()
+            .to_string();
+        let next_access_mode = patch.access_mode.unwrap_or(current.access_mode);
+        let next_model_parameters = patch.apply_to_model_parameters(&current.model_parameters);
+        let changed = next_cwd != current.cwd
+            || next_model != current.model
+            || next_base_url != current.base_url
+            || next_access_mode != current.access_mode
+            || next_model_parameters != current.model_parameters;
+        if !changed {
+            transaction.commit()?;
+            return Ok(Some(SessionSettingsUpdate {
+                session: current,
+                changed: false,
+            }));
+        }
+        if let Some(active_session_id) =
+            active_session_for_mutation_branch(&transaction, session_id, true)?
+        {
+            return Err(StorageError::SessionSettingsActiveTree {
+                root_session_id: session_id,
+                active_session_id,
+            });
+        }
+        let expected_revision =
+            i64::try_from(expected_session_settings_revision).map_err(|_| {
+                StorageError::Message(format!(
+                    "root session {session_id} settings revision is out of range"
+                ))
+            })?;
+        if expected_revision == i64::MAX {
+            return Err(StorageError::Message(format!(
+                "root session {session_id} settings revision is exhausted"
+            )));
+        }
+        let now = SystemClock::now_ms().max(current.updated_at_ms.saturating_add(1));
+        let updated = transaction.execute(
+            "UPDATE sessions
+             SET cwd_path = ?2, model_name = ?3, base_url = ?4, access_mode = ?5,
+                 model_parameters_json = ?6, updated_at_ms = ?7,
+                 session_settings_revision = session_settings_revision + 1
+             WHERE id = ?1
+               AND session_settings_revision = ?8
+               AND session_settings_revision < 9223372036854775807
+               AND NOT EXISTS (
+                   SELECT 1 FROM session_spawn_edges
+                   WHERE child_session_id = sessions.id
+               )",
+            params![
+                session_id.to_string(),
+                next_cwd.as_str(),
+                next_model,
+                next_base_url,
+                next_access_mode.as_str(),
+                serde_json::to_string(&next_model_parameters)?,
+                now,
+                expected_revision,
             ],
         )?;
         if updated != 1 {
@@ -1115,7 +1253,8 @@ impl SqliteSessionRepository {
                      sessions.cwd_path, sessions.model_name, sessions.base_url,
                      sessions.access_mode, sessions.model_parameters_json,
                      sessions.created_at_ms, sessions.updated_at_ms,
-                     sessions.completed_at_ms, sessions.status,
+                     sessions.completed_at_ms, sessions.session_settings_revision,
+                     sessions.status,
                      sessions.active_run_id, sessions.active_turn_id,
                      sessions.active_run_lease_expires_at_ms,
                      (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
@@ -1157,8 +1296,8 @@ impl SqliteSessionRepository {
                 |row| {
                     Ok((
                         session_record_with_identity_from_row(row)?,
-                        raw_session_runtime_state_from_row(row, 12)?,
-                        row.get::<_, i64>(18)?,
+                        raw_session_runtime_state_from_row(row, 13)?,
+                        row.get::<_, i64>(19)?,
                     ))
                 },
             )?
@@ -1317,6 +1456,7 @@ impl SqliteSessionRepository {
         let mut statement = connection.prepare(
             "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
                     model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    session_settings_revision,
                     archived_at_ms IS NOT NULL, active_run_id, active_turn_id,
                     active_run_lease_expires_at_ms,
                     (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
@@ -1357,6 +1497,7 @@ impl SqliteSessionRepository {
         let sql = format!(
             "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
                     model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    session_settings_revision,
                     archived_at_ms IS NOT NULL, active_run_id, active_turn_id,
                     active_run_lease_expires_at_ms,
                     (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
@@ -1419,6 +1560,7 @@ impl SqliteSessionRepository {
         let sql = format!(
             "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
                     model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    session_settings_revision,
                     archived_at_ms IS NOT NULL, active_run_id, active_turn_id,
                     active_run_lease_expires_at_ms,
                     (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
@@ -5784,6 +5926,7 @@ impl SessionRepository for SqliteSessionRepository {
             .query_row(
                 "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
                         model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                        session_settings_revision,
                         status, active_run_id, active_turn_id, active_run_lease_expires_at_ms,
                         (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
                          WHERE terminal_event.session_id = sessions.id
@@ -5838,6 +5981,7 @@ impl SessionRepository for SqliteSessionRepository {
         let sql = format!(
             "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
                     model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    session_settings_revision,
                     status, active_run_id, active_turn_id, active_run_lease_expires_at_ms,
                     (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
                      WHERE terminal_event.session_id = sessions.id
@@ -5877,6 +6021,7 @@ impl SessionRepository for SqliteSessionRepository {
         let mut statement = connection.prepare(
             "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
                     model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    session_settings_revision,
                     status, active_run_id, active_turn_id, active_run_lease_expires_at_ms,
                     (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
                      WHERE terminal_event.session_id = sessions.id
@@ -5930,6 +6075,7 @@ impl SessionRepository for SqliteSessionRepository {
         let sql = format!(
             "SELECT id, project_id, title, status, cwd_path, model_name, base_url, access_mode,
                     model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    session_settings_revision,
                     status, active_run_id, active_turn_id, active_run_lease_expires_at_ms,
                     (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
                      WHERE terminal_event.session_id = sessions.id
@@ -6045,12 +6191,19 @@ impl SessionRepository for SqliteSessionRepository {
                 "session {active_session_id} is active or has a pending agent trigger; settings update requires a quiescent session"
             )));
         }
+        if current.session_settings_revision >= i64::MAX as u64 {
+            return Err(StorageError::Message(format!(
+                "session {id} settings revision is exhausted"
+            )));
+        }
         let now = SystemClock::now_ms().max(current.updated_at_ms.saturating_add(1));
-        transaction.execute(
+        let updated = transaction.execute(
             "UPDATE sessions
              SET cwd_path = ?2, model_name = ?3, base_url = ?4, access_mode = ?5,
-                 model_parameters_json = ?6, updated_at_ms = ?7
-             WHERE id = ?1",
+                 model_parameters_json = ?6, updated_at_ms = ?7,
+                 session_settings_revision = session_settings_revision + 1
+             WHERE id = ?1
+               AND session_settings_revision < 9223372036854775807",
             params![
                 id.to_string(),
                 next_cwd.as_str(),
@@ -6061,6 +6214,11 @@ impl SessionRepository for SqliteSessionRepository {
                 now,
             ],
         )?;
+        if updated != 1 {
+            return Err(StorageError::Message(format!(
+                "session {id} settings revision could not advance"
+            )));
+        }
         let session = session_record_from_connection(&transaction, id)?;
         transaction.commit()?;
         Ok(SessionSettingsUpdate {
@@ -6363,6 +6521,20 @@ fn parse_session_id_column(
         })
 }
 
+fn parse_session_settings_revision_column(
+    row: &rusqlite::Row<'_>,
+    column_index: usize,
+) -> rusqlite::Result<u64> {
+    let value = row.get::<_, i64>(column_index)?;
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column_index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
 fn session_record_with_identity_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<SessionRecord> {
@@ -6388,6 +6560,7 @@ fn session_record_with_identity_from_row(
         created_at_ms: row.get(9)?,
         updated_at_ms: row.get(10)?,
         completed_at_ms: row.get(11)?,
+        session_settings_revision: parse_session_settings_revision_column(row, 12)?,
     })
 }
 
@@ -6395,7 +6568,7 @@ fn session_record_with_raw_runtime_state_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<(SessionRecord, RawSessionRuntimeState)> {
     let session = session_record_with_identity_from_row(row)?;
-    let raw = raw_session_runtime_state_from_row(row, 12)?;
+    let raw = raw_session_runtime_state_from_row(row, 13)?;
     Ok((session, raw))
 }
 
@@ -6428,14 +6601,14 @@ fn session_projection_from_row(
 ) -> rusqlite::Result<RawSessionProjectionState> {
     Ok(RawSessionProjectionState {
         session: session_record_with_identity_from_row(row)?,
-        archived: row.get(12)?,
-        active_run_id: row.get(13)?,
-        active_turn_id: row.get(14)?,
-        active_run_lease_expires_at_ms: row.get(15)?,
-        terminal_count: row.get(16)?,
-        terminal_json: row.get(17)?,
-        active_turn_sequence_no: row.get(18)?,
-        admission_revision: row.get(19)?,
+        archived: row.get(13)?,
+        active_run_id: row.get(14)?,
+        active_turn_id: row.get(15)?,
+        active_run_lease_expires_at_ms: row.get(16)?,
+        terminal_count: row.get(17)?,
+        terminal_json: row.get(18)?,
+        active_turn_sequence_no: row.get(19)?,
+        admission_revision: row.get(20)?,
     })
 }
 
@@ -6580,6 +6753,7 @@ pub(crate) fn session_record_from_connection(
         .query_row(
             "SELECT project_id, title, status, cwd_path, model_name, base_url, access_mode,
                     model_parameters_json, created_at_ms, updated_at_ms, completed_at_ms,
+                    session_settings_revision,
                     active_run_id, active_turn_id, active_run_lease_expires_at_ms,
                     (SELECT COUNT(*) FROM protocol_runtime_events AS terminal_event
                      WHERE terminal_event.session_id = sessions.id
@@ -6616,12 +6790,13 @@ pub(crate) fn session_record_from_connection(
                         created_at_ms: row.get(8)?,
                         updated_at_ms: row.get(9)?,
                         completed_at_ms: row.get(10)?,
+                        session_settings_revision: parse_session_settings_revision_column(row, 11)?,
                     },
-                    row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<String>>(12)?,
-                    row.get::<_, Option<i64>>(13)?,
-                    row.get::<_, i64>(14)?,
-                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, Option<String>>(16)?,
                 ))
             },
         )
@@ -19403,6 +19578,11 @@ mod tests {
     async fn persisted_auto_review_access_mode_round_trips_through_the_typed_repository() {
         let (store, session_id) = test_repo().await;
         let repository = store.session_repo();
+        let initial_revision = repository
+            .get_session(session_id)
+            .await
+            .expect("initial session")
+            .session_settings_revision;
         let update = repository
             .compare_and_set_root_session_access_mode(
                 session_id,
@@ -19416,6 +19596,10 @@ mod tests {
         assert!(update.changed);
         assert_eq!(update.session.access_mode, AccessMode::AutoReview);
         assert_eq!(
+            update.session.session_settings_revision,
+            initial_revision + 1
+        );
+        assert_eq!(
             repository
                 .get_session(session_id)
                 .await
@@ -19423,6 +19607,220 @@ mod tests {
                 .access_mode,
             AccessMode::AutoReview
         );
+    }
+
+    #[tokio::test]
+    async fn root_settings_cas_rejects_child_stale_and_active_targets_but_access_stays_live() {
+        let (store, root_session_id) = test_repo().await;
+        let repository = store.session_repo();
+        let initial = repository
+            .get_session(root_session_id)
+            .await
+            .expect("initial root");
+        let updated = repository
+            .compare_and_set_root_session_settings(
+                root_session_id,
+                initial.session_settings_revision,
+                &SessionSettingsPatch {
+                    model: Some("updated-model".to_string()),
+                    context_window: Some(65_536),
+                    max_output_tokens: Some(4_096),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("root settings CAS")
+            .expect("matching root revision");
+        assert!(updated.changed);
+        assert_eq!(updated.session.model, "updated-model");
+        assert_eq!(
+            updated.session.model_parameters.context_window,
+            Some(65_536)
+        );
+        assert_eq!(
+            updated.session.session_settings_revision,
+            initial.session_settings_revision + 1
+        );
+
+        let stale = repository
+            .compare_and_set_root_session_settings(
+                root_session_id,
+                initial.session_settings_revision,
+                &SessionSettingsPatch {
+                    model: Some("stale-model".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stale root settings target");
+        assert!(stale.is_none());
+        let stale_access = repository
+            .compare_and_set_root_session_access_mode_at_revision(
+                root_session_id,
+                initial.session_settings_revision,
+                AccessMode::Default,
+                AccessMode::FullAccess,
+            )
+            .await
+            .expect("stale access target");
+        assert!(stale_access.is_none());
+
+        let child = create_sibling_session(&store, root_session_id, "settings_child").await;
+        repository
+            .insert_session_spawn_edge(
+                root_session_id,
+                root_session_id,
+                child.id,
+                "/root/settings_child",
+                "settings_child",
+            )
+            .await
+            .expect("child edge");
+        let child_error = repository
+            .compare_and_set_root_session_settings(
+                child.id,
+                child.session_settings_revision,
+                &SessionSettingsPatch {
+                    model: Some("forbidden-child-model".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("child session settings owner must fail closed");
+        assert!(child_error.to_string().contains("child agent session"));
+        let child_access_error = repository
+            .compare_and_set_root_session_access_mode_at_revision(
+                child.id,
+                child.session_settings_revision,
+                AccessMode::Default,
+                AccessMode::FullAccess,
+            )
+            .await
+            .expect_err("child access owner must fail closed");
+        assert!(
+            child_access_error
+                .to_string()
+                .contains("child agent session")
+        );
+
+        repository
+            .admit_session_turn(root_session_id, TurnId::new())
+            .await
+            .expect("root admission")
+            .expect("root admitted");
+        let active_error = repository
+            .compare_and_set_root_session_settings(
+                root_session_id,
+                updated.session.session_settings_revision,
+                &SessionSettingsPatch {
+                    model: Some("active-model".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("generic settings must reject an active root");
+        assert!(matches!(
+            active_error,
+            StorageError::SessionSettingsActiveTree {
+                root_session_id: blocked_root,
+                active_session_id,
+            } if blocked_root == root_session_id && active_session_id == root_session_id
+        ));
+
+        let access = repository
+            .compare_and_set_root_session_access_mode_at_revision(
+                root_session_id,
+                updated.session.session_settings_revision,
+                AccessMode::Default,
+                AccessMode::FullAccess,
+            )
+            .await
+            .expect("access decision-time CAS while active")
+            .expect("matching access mode");
+        assert!(access.changed);
+        assert_eq!(access.session.access_mode, AccessMode::FullAccess);
+        assert_eq!(
+            access.session.session_settings_revision,
+            updated.session.session_settings_revision + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_root_settings_writers_commit_exactly_one_revision() {
+        let (store, session_id) = test_repo().await;
+        let second_store = StoreBundle::new(
+            SqliteStore::open(store.paths()).expect("second process-like SQLite connection"),
+        );
+        let expected_revision = store
+            .session_repo()
+            .get_session(session_id)
+            .await
+            .expect("initial session")
+            .session_settings_revision;
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+
+        let spawn_writer = |repository: SqliteSessionRepository,
+                            barrier: Arc<std::sync::Barrier>,
+                            model: &'static str| {
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("writer runtime");
+                barrier.wait();
+                runtime.block_on(repository.compare_and_set_root_session_settings(
+                    session_id,
+                    expected_revision,
+                    &SessionSettingsPatch {
+                        model: Some(model.to_string()),
+                        ..Default::default()
+                    },
+                ))
+            })
+        };
+        let first = spawn_writer(
+            store.session_repo(),
+            Arc::clone(&barrier),
+            "concurrent-model-a",
+        );
+        let second = spawn_writer(
+            second_store.session_repo(),
+            Arc::clone(&barrier),
+            "concurrent-model-b",
+        );
+        barrier.wait();
+
+        let outcomes = [
+            first
+                .join()
+                .expect("first writer thread")
+                .expect("first CAS"),
+            second
+                .join()
+                .expect("second writer thread")
+                .expect("second CAS"),
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| outcome.as_ref().is_some_and(|update| update.changed))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_none()).count(),
+            1
+        );
+        let persisted = store
+            .session_repo()
+            .get_session(session_id)
+            .await
+            .expect("persisted winner");
+        assert_eq!(persisted.session_settings_revision, expected_revision + 1);
+        assert!(matches!(
+            persisted.model.as_str(),
+            "concurrent-model-a" | "concurrent-model-b"
+        ));
     }
 
     async fn active_turn(store: &StoreBundle, session_id: SessionId) -> (AdmissionId, TurnId) {

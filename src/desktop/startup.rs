@@ -20,6 +20,23 @@ pub enum DesktopStartupCheckStatus {
     Fail,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopInitialSetupReason {
+    ConfigMissing,
+    ProviderInvalid,
+    OptionalToolInvalid,
+}
+
+impl DesktopInitialSetupReason {
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::ConfigMissing => "config_missing",
+            Self::ProviderInvalid => "provider_invalid",
+            Self::OptionalToolInvalid => "optional_tool_invalid",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DesktopStartupCheck {
     pub key: &'static str,
@@ -65,7 +82,10 @@ pub struct DesktopStartupState {
     pub detail: String,
     pub action_overlay: Option<DesktopOverlay>,
     pub checks: Vec<DesktopStartupCheck>,
-    config_requires_attention: bool,
+    pub global_config_path: Option<Utf8PathBuf>,
+    pub setup_generation: u64,
+    pub initial_setup_reason: Option<DesktopInitialSetupReason>,
+    setup_completion_pending: bool,
 }
 
 impl Default for DesktopStartupState {
@@ -83,7 +103,10 @@ impl DesktopStartupState {
             detail: String::new(),
             action_overlay: None,
             checks: Vec::new(),
-            config_requires_attention: false,
+            global_config_path: None,
+            setup_generation: 0,
+            initial_setup_reason: None,
+            setup_completion_pending: false,
         }
     }
 
@@ -94,7 +117,7 @@ impl DesktopStartupState {
         config: &ResolvedConfig,
     ) -> Self {
         let mut checks = Vec::new();
-        let config_message = match (global_config_existed_at_launch, global_config_path) {
+        let config_message = match (global_config_existed_at_launch, global_config_path.as_ref()) {
             (true, Some(path)) => {
                 format!("設定ファイルを確認しました: {path}")
             }
@@ -123,6 +146,20 @@ impl DesktopStartupState {
         checks.push(Self::provider_config_check(config));
         checks.push(Self::docling_config_check(config));
 
+        let initial_setup_reason =
+            if !global_config_existed_at_launch {
+                Some(DesktopInitialSetupReason::ConfigMissing)
+            } else if checks.iter().any(|check| {
+                check.key == "provider" && check.status == DesktopStartupCheckStatus::Fail
+            }) {
+                Some(DesktopInitialSetupReason::ProviderInvalid)
+            } else if checks.iter().any(|check| {
+                check.key == "docling" && check.status == DesktopStartupCheckStatus::Fail
+            }) {
+                Some(DesktopInitialSetupReason::OptionalToolInvalid)
+            } else {
+                None
+            };
         let mut state = Self {
             status: DesktopStartupStatus::Ready,
             title: "moyAI".to_string(),
@@ -131,25 +168,40 @@ impl DesktopStartupState {
                 .to_string(),
             action_overlay: None,
             checks,
-            config_requires_attention: !global_config_existed_at_launch,
+            global_config_path,
+            setup_generation: 1,
+            initial_setup_reason,
+            setup_completion_pending: initial_setup_reason.is_some(),
         };
         state.recompute();
         state
     }
 
     pub fn refresh_config(&mut self, config: &ResolvedConfig) {
+        self.setup_generation = self.setup_generation.saturating_add(1);
         self.set_check(Self::provider_config_check(config));
         self.set_check(Self::docling_config_check(config));
+        if let Some(reason) = self.current_validation_reason() {
+            self.setup_completion_pending = true;
+            self.initial_setup_reason = Some(reason);
+        }
         self.recompute();
     }
 
-    pub fn mark_config_reviewed(&mut self) {
-        self.config_requires_attention = false;
+    pub fn complete_after_persist(&mut self) {
+        self.setup_generation = self.setup_generation.saturating_add(1);
+        if let Some(reason) = self.current_validation_reason() {
+            self.setup_completion_pending = true;
+            self.initial_setup_reason = Some(reason);
+        } else {
+            self.setup_completion_pending = false;
+            self.initial_setup_reason = None;
+        }
         self.recompute();
     }
 
     pub fn requires_initial_setup(&self) -> bool {
-        self.config_requires_attention
+        self.setup_completion_pending
     }
 
     fn set_check(&mut self, check: DesktopStartupCheck) {
@@ -201,39 +253,55 @@ impl DesktopStartupState {
         )
     }
 
-    fn recompute(&mut self) {
-        let provider_failed = self.checks.iter().any(|check| {
-            check.key == "provider" && check.status == DesktopStartupCheckStatus::Fail
-        });
-        let docling_failed = self
+    fn current_validation_reason(&self) -> Option<DesktopInitialSetupReason> {
+        if self
             .checks
             .iter()
-            .any(|check| check.key == "docling" && check.status == DesktopStartupCheckStatus::Fail);
-        if self.config_requires_attention {
-            self.status = DesktopStartupStatus::RequiresConfig;
-            self.title = "設定の確認が必要です".to_string();
-            self.message =
-                "初回起動用の設定を作成しました。起動後に設定画面を開きます。".to_string();
-            self.detail = "LLM URL、model、権限 preset を確認してください。".to_string();
-            self.action_overlay = Some(DesktopOverlay::ConfigEditor);
-            return;
+            .any(|check| check.key == "provider" && check.status == DesktopStartupCheckStatus::Fail)
+        {
+            Some(DesktopInitialSetupReason::ProviderInvalid)
+        } else if self
+            .checks
+            .iter()
+            .any(|check| check.key == "docling" && check.status == DesktopStartupCheckStatus::Fail)
+        {
+            Some(DesktopInitialSetupReason::OptionalToolInvalid)
+        } else {
+            None
         }
+    }
 
-        if provider_failed {
-            self.status = DesktopStartupStatus::RequiresProvider;
-            self.title = "LLM 設定の確認が必要です".to_string();
-            self.message = "起動後に LLM URL 画面を開きます。".to_string();
-            self.detail = "base URL と model を設定してください。".to_string();
-            self.action_overlay = Some(DesktopOverlay::ProviderEditor);
-            return;
-        }
-
-        if docling_failed {
-            self.status = DesktopStartupStatus::RequiresConfig;
-            self.title = "Docling 設定の確認が必要です".to_string();
-            self.message = "起動後に設定画面を開きます。".to_string();
-            self.detail = "docling.enabled と docling.base_url を確認してください。".to_string();
-            self.action_overlay = Some(DesktopOverlay::ConfigEditor);
+    fn recompute(&mut self) {
+        if self.setup_completion_pending {
+            let reason = self
+                .current_validation_reason()
+                .or(self.initial_setup_reason)
+                .unwrap_or(DesktopInitialSetupReason::ConfigMissing);
+            self.initial_setup_reason = Some(reason);
+            match reason {
+                DesktopInitialSetupReason::ConfigMissing => {
+                    self.status = DesktopStartupStatus::RequiresConfig;
+                    self.title = "設定の確認が必要です".to_string();
+                    self.message =
+                        "初回起動用の設定を作成しました。初期設定を完了してください。".to_string();
+                    self.detail =
+                        "LLM、権限、任意ツールを確認して設定ファイルへ保存します。".to_string();
+                }
+                DesktopInitialSetupReason::ProviderInvalid => {
+                    self.status = DesktopStartupStatus::RequiresProvider;
+                    self.title = "LLM 設定の確認が必要です".to_string();
+                    self.message = "初期設定で LLM URL と model を確認してください。".to_string();
+                    self.detail = "外部接続の成功は保存の前提ではありません。".to_string();
+                }
+                DesktopInitialSetupReason::OptionalToolInvalid => {
+                    self.status = DesktopStartupStatus::RequiresConfig;
+                    self.title = "Docling 設定の確認が必要です".to_string();
+                    self.message = "初期設定で任意ツールの設定を確認してください。".to_string();
+                    self.detail =
+                        "Doclingを無効にするか、有効なbase URLを入力してください。".to_string();
+                }
+            }
+            self.action_overlay = Some(DesktopOverlay::InitialSetup);
             return;
         }
 
@@ -244,6 +312,7 @@ impl DesktopStartupState {
             "provider catalogとavailability diagnosticsは明示操作時だけnetworkへ接続します。"
                 .to_string();
         self.action_overlay = None;
+        self.initial_setup_reason = None;
     }
 }
 
@@ -267,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn config_refresh_replaces_provider_and_docling_checks_without_pending_state() {
+    fn config_refresh_keeps_the_initial_setup_latch_until_persisted_finish() {
         let mut invalid = ResolvedConfig::default();
         invalid.model.base_url.clear();
         invalid.docling.enabled = true;
@@ -292,10 +361,49 @@ mod tests {
         valid.docling.base_url = "http://127.0.0.1:8123".to_string();
         state.refresh_config(&valid);
 
-        assert_eq!(state.status, DesktopStartupStatus::Ready);
+        assert_eq!(state.status, DesktopStartupStatus::RequiresProvider);
+        assert!(state.requires_initial_setup());
         assert!(state.checks.iter().all(|check| {
             check.key != "provider" && check.key != "docling"
                 || check.status == DesktopStartupCheckStatus::Pass
         }));
+        state.complete_after_persist();
+        assert_eq!(state.status, DesktopStartupStatus::Ready);
+        assert!(!state.requires_initial_setup());
+    }
+
+    #[test]
+    fn missing_config_and_invalid_local_fields_share_the_dedicated_setup_shell() {
+        let mut valid = ResolvedConfig::default();
+        let mut missing = DesktopStartupState::begin(
+            false,
+            Some(Utf8PathBuf::from("C:/config/config.toml")),
+            Utf8Path::new("."),
+            &valid,
+        );
+
+        assert!(missing.requires_initial_setup());
+        assert_eq!(missing.action_overlay, Some(DesktopOverlay::InitialSetup));
+        assert_eq!(
+            missing.initial_setup_reason,
+            Some(DesktopInitialSetupReason::ConfigMissing)
+        );
+
+        missing.complete_after_persist();
+        assert!(!missing.requires_initial_setup());
+
+        valid.model.base_url.clear();
+        missing.refresh_config(&valid);
+        assert!(missing.requires_initial_setup());
+        assert_eq!(missing.action_overlay, Some(DesktopOverlay::InitialSetup));
+        assert_eq!(
+            missing.initial_setup_reason,
+            Some(DesktopInitialSetupReason::ProviderInvalid)
+        );
+        missing.complete_after_persist();
+        assert!(
+            missing.requires_initial_setup(),
+            "reviewing a missing config must not bypass a current local validation failure"
+        );
     }
 }

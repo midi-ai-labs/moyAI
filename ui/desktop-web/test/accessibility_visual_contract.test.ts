@@ -213,6 +213,31 @@ test("quiet text meets normal-text contrast and reduced-motion disables continuo
   assert.match(reducedMotion, /border-radius:\s*5px/);
 });
 
+test("hidden recoverable notices override the visible error surface", () => {
+  const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  const visibleRule = css.match(/\.ui-error-notice\s*\{([^}]*)\}/)?.[1];
+  const hiddenRule = css.match(/\.ui-error-notice\[hidden\]\s*\{([^}]*)\}/)?.[1];
+
+  assert.ok(visibleRule);
+  assert.match(visibleRule, /display:\s*flex/);
+  assert.ok(hiddenRule);
+  assert.match(hiddenRule, /display:\s*none\s*!important/);
+});
+
+test("wide primary text actions override the icon-only send button width", () => {
+  const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  const iconSendStart = css.indexOf(".send {");
+  const wideSendStart = css.indexOf(".wide-send {");
+  assert.notEqual(iconSendStart, -1);
+  assert.ok(wideSendStart > iconSendStart, "the text variant must win the width cascade");
+
+  const iconRule = css.slice(iconSendStart, css.indexOf("}", iconSendStart) + 1);
+  const wideRule = css.slice(wideSendStart, css.indexOf("}", wideSendStart) + 1);
+  assert.match(iconRule, /width:\s*34px/);
+  assert.match(wideRule, /width:\s*auto/);
+  assert.match(wideRule, /min-width:\s*112px/);
+});
+
 test("task activity keeps distinct shapes and selected versus background emphasis", () => {
   const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
   assert.match(

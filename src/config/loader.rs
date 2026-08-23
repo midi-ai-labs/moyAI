@@ -51,6 +51,12 @@ pub(crate) fn acquire_global_config_write_lease(
 
 pub struct ConfigLoader;
 
+#[derive(Debug)]
+pub(crate) struct ForwardCompatibleGlobalConfigResolution {
+    pub resolved_config: ResolvedConfig,
+    pub preserved_unknown_top_level_sections: Vec<String>,
+}
+
 impl ConfigLoader {
     pub fn load(
         _start_dir: &Utf8Path,
@@ -73,8 +79,36 @@ impl ConfigLoader {
         config_source: &Utf8Path,
         text: &str,
     ) -> Result<(), ConfigError> {
+        Self::resolve_global_config_text_without_environment(config_source, text).map(drop)
+    }
+
+    pub(crate) fn resolve_global_config_text_without_environment(
+        config_source: &Utf8Path,
+        text: &str,
+    ) -> Result<ResolvedConfig, ConfigError> {
         let global = parse_global_config_text(config_source, text)?;
-        Self::resolve_config(config_source, Some(global), None, None).map(drop)
+        Self::resolve_config(config_source, Some(global), None, None)
+    }
+
+    pub(crate) fn resolve_global_config_text_with_environment(
+        config_source: &Utf8Path,
+        text: &str,
+    ) -> Result<ResolvedConfig, ConfigError> {
+        let global = parse_global_config_text(config_source, text)?;
+        Self::resolve_global_config(config_source, Some(global), None)
+    }
+
+    pub(crate) fn resolve_forward_compatible_global_config_text_with_environment(
+        config_source: &Utf8Path,
+        text: &str,
+    ) -> Result<ForwardCompatibleGlobalConfigResolution, ConfigError> {
+        let (global, preserved_unknown_top_level_sections) =
+            parse_forward_compatible_global_config_text(config_source, text)?;
+        let resolved_config = Self::resolve_global_config(config_source, Some(global), None)?;
+        Ok(ForwardCompatibleGlobalConfigResolution {
+            resolved_config,
+            preserved_unknown_top_level_sections,
+        })
     }
 
     fn resolve_global_config(
@@ -136,6 +170,13 @@ impl ConfigLoader {
                     "invalid config loaded from `{config_source}`: {error}"
                 ))
             })?;
+        resolved
+            .normalize_and_validate_docling_runtime()
+            .map_err(|error| {
+                ConfigError::Message(format!(
+                    "invalid config loaded from `{config_source}`: {error}"
+                ))
+            })?;
         let endpoint = ProviderEndpoint::parse(&resolved.model.base_url)
             .map_err(|error| ConfigError::Message(error.to_string()))?;
         resolved.model.base_url = endpoint.as_str().to_string();
@@ -183,6 +224,36 @@ fn parse_global_config_text(
         path: path.to_string(),
         source,
     })
+}
+
+fn parse_forward_compatible_global_config_text(
+    path: &Utf8Path,
+    text: &str,
+) -> Result<(PartialResolvedConfig, Vec<String>), ConfigError> {
+    let mut document =
+        toml::from_str::<toml::Value>(text).map_err(|source| ConfigError::ParseFile {
+            path: path.to_string(),
+            source,
+        })?;
+    let root = document.as_table_mut().ok_or_else(|| {
+        ConfigError::Message(format!("config loaded from `{path}` must be a TOML table"))
+    })?;
+    let mut preserved_unknown_top_level_sections = root
+        .keys()
+        .filter(|section| {
+            !PartialResolvedConfig::CURRENT_TOP_LEVEL_SECTIONS.contains(&section.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    preserved_unknown_top_level_sections.sort();
+    root.retain(|section, _| PartialResolvedConfig::CURRENT_TOP_LEVEL_SECTIONS.contains(&section));
+    let current_schema_text = toml::to_string(&document).map_err(|error| {
+        ConfigError::Message(format!(
+            "failed to project current config sections from `{path}`: {error}"
+        ))
+    })?;
+    parse_global_config_text(path, &current_schema_text)
+        .map(|config| (config, preserved_unknown_top_level_sections))
 }
 
 pub(crate) fn read_toml_utf8_bounded(path: &Utf8Path) -> Result<String, ConfigError> {
@@ -815,6 +886,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn draft_import_resolution_does_not_materialize_environment_overrides() {
+        let source = Utf8Path::new("import.toml");
+        let text = "[model]\nmodel = \"file-model\"\n";
+        if std::env::var_os("MOYAI_IMPORT_DRAFT_ENV_TEST_CHILD").is_some() {
+            let resolved =
+                ConfigLoader::resolve_global_config_text_without_environment(source, text)
+                    .expect("strict imported draft");
+            assert_eq!(resolved.model.model, "file-model");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().expect("current test exe"))
+            .args([
+                "--exact",
+                "config::loader::tests::draft_import_resolution_does_not_materialize_environment_overrides",
+                "--nocapture",
+            ])
+            .env("MOYAI_IMPORT_DRAFT_ENV_TEST_CHILD", "1")
+            .env("MOYAI_MODEL", "environment-model")
+            .output()
+            .expect("isolated import resolution test");
+        assert!(
+            output.status.success(),
+            "isolated import resolution failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn default_global_config_is_created_with_editable_defaults() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 path");
@@ -914,6 +1015,34 @@ mod tests {
 
         assert_eq!(config.model.model, "global-model");
         assert_eq!(config.model.base_url, "http://global");
+    }
+
+    #[test]
+    fn forward_compatible_adoption_ignores_only_unknown_top_level_sections() {
+        let source = Utf8Path::new("externally-updated-config.toml");
+        let text = "[model]\nmodel = \"external-model\"\n\n[future]\nflag = \"preserve\"\n";
+
+        let strict = ConfigLoader::resolve_global_config_text_with_environment(source, text)
+            .expect_err("strict current-schema adoption rejects unknown sections");
+        assert!(strict.to_string().contains("future"));
+
+        let adopted = ConfigLoader::resolve_forward_compatible_global_config_text_with_environment(
+            source, text,
+        )
+        .expect("a running older surface may adopt current sections and preserve newer ones");
+        assert_eq!(adopted.resolved_config.model.model, "external-model");
+        assert_eq!(
+            adopted.preserved_unknown_top_level_sections,
+            vec!["future".to_string()]
+        );
+
+        let unknown_current_field = "[model]\nmodel = \"external-model\"\nfuture_knob = true\n\n[future]\nflag = \"preserve\"\n";
+        let error = ConfigLoader::resolve_forward_compatible_global_config_text_with_environment(
+            source,
+            unknown_current_field,
+        )
+        .expect_err("unknown fields inside a current section remain invalid");
+        assert!(error.to_string().contains("future_knob"));
     }
 
     #[test]
@@ -1179,6 +1308,57 @@ mod tests {
             assert!(!diagnostic.contains("hidden"));
             assert!(!diagnostic.contains(endpoint));
         }
+    }
+
+    #[test]
+    fn enabled_docling_endpoint_is_validated_without_a_readiness_probe_at_load() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let valid_path =
+            Utf8PathBuf::from_path_buf(temp.path().join("docling-valid.toml")).expect("utf8");
+        fs::write(
+            &valid_path,
+            "[docling]\nenabled = true\nbase_url = \" https://docling.example.test/api/ \"\n",
+        )
+        .expect("valid Docling config");
+
+        let valid = ConfigLoader::load_with_global_path(valid_path, None)
+            .expect("loading config validates syntax without contacting Docling");
+        assert_eq!(valid.docling.base_url, "https://docling.example.test/api");
+
+        for (name, endpoint) in [
+            ("relative", "docling.internal"),
+            ("scheme", "file:///tmp/docling.sock"),
+            ("userinfo", "https://user:super-secret@docling.example.test"),
+            ("query", "https://docling.example.test?api_key=hidden"),
+        ] {
+            let path = Utf8PathBuf::from_path_buf(temp.path().join(format!("docling-{name}.toml")))
+                .expect("utf8");
+            fs::write(
+                &path,
+                format!("[docling]\nenabled = true\nbase_url = \"{endpoint}\"\n"),
+            )
+            .expect("invalid Docling config");
+
+            let error = ConfigLoader::load_with_global_path(path.clone(), None)
+                .expect_err("invalid enabled Docling endpoint must fail closed");
+            let diagnostic = format!("{error:?}: {error}");
+            assert!(diagnostic.contains("docling.base_url"));
+            assert!(diagnostic.contains(path.as_str()));
+            assert!(!diagnostic.contains("super-secret"));
+            assert!(!diagnostic.contains("hidden"));
+            assert!(!diagnostic.contains(endpoint));
+        }
+
+        let disabled_path =
+            Utf8PathBuf::from_path_buf(temp.path().join("docling-disabled.toml")).expect("utf8");
+        fs::write(
+            &disabled_path,
+            "[docling]\nenabled = false\nbase_url = \"inactive-draft\"\n",
+        )
+        .expect("disabled Docling config");
+        let disabled = ConfigLoader::load_with_global_path(disabled_path, None)
+            .expect("disabled Docling keeps its inactive draft value");
+        assert_eq!(disabled.docling.base_url, "inactive-draft");
     }
 
     #[test]
