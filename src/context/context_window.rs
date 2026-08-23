@@ -365,8 +365,7 @@ mod tests {
             model.provider_metadata_mode,
             ProviderApiMode::ChatCompletions,
             ProviderDeadlines {
-                response_start_timeout_ms: 1,
-                stream_idle_timeout_ms: 1,
+                request_timeout_ms: 1,
                 connect_timeout_ms: 1,
                 max_connect_retries: 0,
             },
@@ -554,8 +553,7 @@ mod tests {
             model.provider_metadata_mode,
             api_mode,
             ProviderDeadlines {
-                response_start_timeout_ms: 1,
-                stream_idle_timeout_ms: 1,
+                request_timeout_ms: 1,
                 connect_timeout_ms: 1,
                 max_connect_retries: 0,
             },

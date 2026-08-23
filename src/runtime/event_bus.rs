@@ -5,7 +5,7 @@ use tokio::sync::broadcast;
 
 use crate::error::RuntimeError;
 use crate::protocol::{RuntimeEvent, RuntimeEventId};
-use crate::session::{RunEvent, SessionId};
+use crate::session::{RunEvent, RunEventDurability, SessionId};
 
 #[derive(Clone)]
 pub struct RunEventPublisher {
@@ -51,12 +51,32 @@ pub trait RunEventSink {
     }
 
     fn emit_committed(&mut self, event: RunEvent) -> Result<(), RuntimeError> {
+        validate_run_event_durability(&event, RunEventDurability::Committed, "emit_committed")?;
         self.emit(event)
     }
 
     fn emit_runtime_only(&mut self, event: RunEvent) -> Result<(), RuntimeError> {
+        validate_run_event_durability(
+            &event,
+            RunEventDurability::RuntimeOnly,
+            "emit_runtime_only",
+        )?;
         self.emit(event)
     }
+}
+
+pub(crate) fn validate_run_event_durability(
+    event: &RunEvent,
+    expected: RunEventDurability,
+    boundary: &str,
+) -> Result<(), RuntimeError> {
+    let actual = event.durability();
+    if actual == expected {
+        return Ok(());
+    }
+    Err(RuntimeError::Message(format!(
+        "{boundary} requires {expected:?} RunEvent durability, got {actual:?}"
+    )))
 }
 
 #[derive(Clone)]
@@ -412,8 +432,42 @@ pub(crate) fn session_runtime_event_hub_fans_out_committed_events_by_session_fix
 
 #[cfg(test)]
 mod tests {
+    use crate::error::RuntimeError;
     use crate::protocol::{RuntimeEvent, RuntimeEventId, RuntimeEventMsg, TurnId};
-    use crate::session::SessionId;
+    use crate::runtime::RunEventSink;
+    use crate::session::{RunEvent, SessionId};
+
+    #[derive(Default)]
+    struct CountingSink {
+        emitted: usize,
+    }
+
+    impl RunEventSink for CountingSink {
+        fn emit(&mut self, _event: RunEvent) -> Result<(), RuntimeError> {
+            self.emitted += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_explicit_sink_paths_reject_durability_mismatches_before_delivery() {
+        let mut sink = CountingSink::default();
+        assert!(
+            sink.emit_runtime_only(RunEvent::RecoverableRuntimeFeedback {
+                session_id: SessionId::new(),
+                message: "durable warning".to_string(),
+            })
+            .is_err()
+        );
+        assert!(
+            sink.emit_committed(RunEvent::TextDelta {
+                response_id: crate::protocol::ModelResponseId::new(),
+                delta: "ephemeral".to_string(),
+            })
+            .is_err()
+        );
+        assert_eq!(sink.emitted, 0);
+    }
 
     #[test]
     fn session_runtime_event_hub_fans_out_committed_events_by_session() {

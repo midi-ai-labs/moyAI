@@ -5,10 +5,14 @@ import {
   advancePendingHistoryPrepend,
   captureViewportAnchor,
   createPendingHistoryPrepend,
+  focusHistoryPrependReturnIfUnowned,
+  historyPrependFocusCandidates,
+  historyPrependFocusContinuationIsCurrent,
   pinThreadToEnd,
   pinResolvedThreadToEnd,
   rejectPendingHistoryPrepend,
   restoreViewportAnchor,
+  runCompletionEdge,
   shouldRevealThreadEnd,
   syncResolvedInactiveThreadViewport,
   ThreadTailFollowAffinity,
@@ -47,6 +51,92 @@ test("an active run-tail owner reveals through a transient raw geometry gap", ()
   const thread = { scrollTop: 0, scrollHeight: 2_400 };
   pinThreadToEnd(thread);
   assert.equal(thread.scrollTop, 2_400, "the run-start render pins synchronously before a poll can replace it");
+});
+
+test("run completion is an edge instead of a terminal status level", () => {
+  const cases = [
+    {
+      name: "busy true -> false completes without a terminal-status change",
+      previous: { busy: true, terminal: false },
+      current: { busy: false, terminal: false },
+      expected: true,
+    },
+    {
+      name: "nonterminal -> terminal completes without a busy edge",
+      previous: { busy: false, terminal: false },
+      current: { busy: false, terminal: true },
+      expected: true,
+    },
+    {
+      name: "completed -> completed revision is not another completion",
+      previous: { busy: false, terminal: true },
+      current: { busy: false, terminal: true },
+      expected: false,
+    },
+    {
+      name: "completed -> failed terminal-kind change stays terminal -> terminal",
+      previous: { busy: false, terminal: true },
+      current: { busy: false, terminal: true },
+      expected: false,
+    },
+    {
+      name: "idle nonterminal revision has no completion edge",
+      previous: { busy: false, terminal: false },
+      current: { busy: false, terminal: false },
+      expected: false,
+    },
+  ] as const;
+
+  for (const scenario of cases) {
+    assert.equal(
+      runCompletionEdge(scenario.previous, scenario.current),
+      scenario.expected,
+      scenario.name,
+    );
+  }
+});
+
+test("a revision-only completed render preserves a near-tail viewport while completion edges still pin", () => {
+  const revisionOnlyThread = clampedThread({
+    scrollTop: 250,
+    scrollHeight: 755,
+    clientHeight: 423,
+  });
+  assert.equal(threadGap(revisionOnlyThread), 82, "the viewport is inside the passive 96px threshold");
+  const revisionOnlyCompletion = runCompletionEdge(
+    { busy: false, terminal: true },
+    { busy: false, terminal: true },
+  );
+  assert.equal(revisionOnlyCompletion, false, "a completed projection level is not a new completion");
+  if (shouldRevealThreadEnd({
+    sessionChanged: false,
+    runStartRequested: false,
+    previouslyNearEnd: true,
+    updateWantsEnd: revisionOnlyCompletion,
+  })) {
+    pinThreadToEnd(revisionOnlyThread);
+  }
+  assert.equal(revisionOnlyThread.scrollTop, 250, "revision-only Refresh keeps the exact thread position");
+
+  const terminalThread = clampedThread({
+    scrollTop: 250,
+    scrollHeight: 755,
+    clientHeight: 423,
+  });
+  const completion = runCompletionEdge(
+    { busy: true, terminal: false },
+    { busy: false, terminal: true },
+  );
+  assert.equal(completion, true);
+  if (shouldRevealThreadEnd({
+    sessionChanged: false,
+    runStartRequested: false,
+    previouslyNearEnd: true,
+    updateWantsEnd: completion,
+  })) {
+    pinThreadToEnd(terminalThread);
+  }
+  assert.equal(threadGap(terminalThread), 0, "a real terminal edge still reveals the final output");
 });
 
 test("run-scoped tail affinity survives long composer layout, replacement, streaming, and terminal render", () => {
@@ -237,6 +327,163 @@ test("pending history prepend waits for its async owner projection and consumes 
   assert.equal(advancePendingHistoryPrepend(completed.pending, start).disposition, "none");
 });
 
+test("history prepend keeps focus inside the exact transaction while loading and returns to its trigger", () => {
+  const dom = mockHistoryFocusDocument({ active: "trigger" });
+  const start = historyState();
+  const pending = createPendingHistoryPrepend(start, 7, dom.document);
+  assert.ok(pending);
+  assert.equal(pending.returnFocusRequested, true);
+  const accepted = acknowledgePendingHistoryPrepend(pending);
+
+  dom.setTriggerDisabled(true);
+  const loadingState = historyState({ pending_async_operations: ["turn_page_load"] });
+  const loading = advancePendingHistoryPrepend(accepted, loadingState);
+  assert.equal(loading.focusPhase, "loading");
+  assert.strictEqual(loading.focusContinuation, accepted);
+  assert.equal(
+    historyPrependFocusContinuationIsCurrent(
+      loading.focusContinuation!,
+      loadingState,
+      loading.pending,
+      7,
+      "loading",
+    ),
+    true,
+  );
+  assert.equal(
+    focusHistoryPrependReturnIfUnowned(dom.document, loading.focusContinuation!),
+    "focused-thread",
+    "a still-connected disabled trigger hands focus to its same-owner thread",
+  );
+  assert.equal(dom.activeKind(), "thread");
+
+  dom.setTriggerDisabled(false);
+  const settledState = historyState({ turn_page_offset: 40 });
+  const settled = advancePendingHistoryPrepend(loading.pending, settledState);
+  assert.equal(settled.focusPhase, "settled");
+  assert.equal(
+    historyPrependFocusContinuationIsCurrent(
+      settled.focusContinuation!,
+      settledState,
+      settled.pending,
+      7,
+      "settled",
+    ),
+    true,
+  );
+  assert.equal(
+    focusHistoryPrependReturnIfUnowned(dom.document, settled.focusContinuation!),
+    "focused-trigger",
+  );
+  assert.equal(dom.activeKind(), "trigger");
+});
+
+test("history prepend keeps the anchor and returns off-viewport focus to its visible thread owner", () => {
+  const dom = mockHistoryFocusDocument({
+    active: "trigger",
+    triggerBounds: mockFocusRect(20, -900, 220, -856),
+    threadScrollTop: 764,
+  });
+  const pending = createPendingHistoryPrepend(historyState(), 9, dom.document);
+  assert.ok(pending);
+  const scrollTopBeforeFocus = dom.threadScrollTop();
+
+  assert.equal(
+    focusHistoryPrependReturnIfUnowned(dom.document, pending),
+    "focused-thread",
+  );
+  assert.equal(dom.activeKind(), "thread");
+  assert.deepEqual(dom.focusOptions("thread"), { preventScroll: true });
+  assert.equal(dom.threadScrollTop(), scrollTopBeforeFocus, "focus fallback must not move the preserved anchor");
+});
+
+test("history prepend exports the visible trigger then thread fallback without focusing", () => {
+  const dom = mockHistoryFocusDocument({ active: "trigger" });
+  const pending = createPendingHistoryPrepend(historyState(), 10, dom.document);
+  assert.ok(pending);
+  dom.setActive("body");
+
+  const candidates = historyPrependFocusCandidates(dom.document, pending);
+  assert.equal(candidates.length, 2);
+  assert.equal((candidates[0]?.resolve() as { kind?: string } | null)?.kind, "trigger");
+  assert.equal((candidates[1]?.resolve() as { kind?: string } | null)?.kind, "thread");
+  assert.equal(dom.activeKind(), "body", "resolving candidates has no focus side effect");
+
+  const offscreen = mockHistoryFocusDocument({
+    active: "trigger",
+    triggerBounds: mockFocusRect(20, -900, 220, -856),
+  });
+  const offscreenPending = createPendingHistoryPrepend(historyState(), 11, offscreen.document);
+  assert.ok(offscreenPending);
+  offscreen.setActive("body");
+  const offscreenCandidates = historyPrependFocusCandidates(offscreen.document, offscreenPending);
+  assert.equal(offscreenCandidates[0]?.resolve(), null);
+  assert.equal(
+    (offscreenCandidates[1]?.resolve() as { kind?: string } | null)?.kind,
+    "thread",
+  );
+});
+
+test("history prepend uses the thread at offset zero and never steals meaningful focus", () => {
+  const dom = mockHistoryFocusDocument({ active: "trigger" });
+  const pending = createPendingHistoryPrepend(historyState(), 11, dom.document);
+  assert.ok(pending);
+  const accepted = acknowledgePendingHistoryPrepend(pending);
+  const settledState = historyState({ turn_page_offset: 0 });
+  const settled = advancePendingHistoryPrepend(accepted, settledState);
+  assert.ok(settled.focusContinuation);
+
+  dom.removeTrigger();
+  dom.setActive("body");
+  assert.equal(
+    focusHistoryPrependReturnIfUnowned(dom.document, settled.focusContinuation),
+    "focused-thread",
+  );
+  assert.equal(dom.activeKind(), "thread");
+
+  const stillPaged = mockHistoryFocusDocument({ active: "other" });
+  assert.equal(
+    focusHistoryPrependReturnIfUnowned(stillPaged.document, settled.focusContinuation),
+    "owned",
+  );
+  assert.equal(stillPaged.activeKind(), "other");
+});
+
+test("history prepend focus rejects owner, generation, error, and non-trigger activation drift", () => {
+  const dom = mockHistoryFocusDocument({ active: "trigger" });
+  const pending = createPendingHistoryPrepend(historyState(), 21, dom.document);
+  assert.ok(pending);
+  const accepted = acknowledgePendingHistoryPrepend(pending);
+  const loadingState = historyState({ pending_async_operations: ["turn_page_load"] });
+
+  assert.equal(
+    historyPrependFocusContinuationIsCurrent(accepted, loadingState, accepted, 22, "loading"),
+    false,
+    "a newer request generation owns focus",
+  );
+  assert.equal(
+    historyPrependFocusContinuationIsCurrent(
+      accepted,
+      historyState({ workspace_path: "C:/other", pending_async_operations: ["turn_page_load"] }),
+      accepted,
+      21,
+      "loading",
+    ),
+    false,
+    "a different workspace/session owner cannot receive focus",
+  );
+  const failed = advancePendingHistoryPrepend(accepted, historyState());
+  assert.equal(failed.disposition, "discard");
+  assert.equal(failed.focusContinuation, null, "a failed settlement cannot restore focus");
+  assert.equal(rejectPendingHistoryPrepend(accepted, 21), null, "an explicit command error clears the owner");
+
+  const otherActivation = mockHistoryFocusDocument({ active: "other" });
+  const withoutFocus = createPendingHistoryPrepend(historyState(), 23, otherActivation.document);
+  assert.ok(withoutFocus);
+  assert.equal(withoutFocus.returnFocusRequested, false);
+  assert.equal(focusHistoryPrependReturnIfUnowned(otherActivation.document, withoutFocus), "not-requested");
+});
+
 test("turn-page admission follows only the exact async operation owner", () => {
   assert.equal(turnPageLoadPending(historyState()), false);
   assert.equal(
@@ -379,6 +626,118 @@ function historyState(
     pending_async_operations: [],
     ...overrides,
   };
+}
+
+type HistoryFocusElementKind = "body" | "root" | "thread" | "trigger" | "other";
+
+interface MockHistoryFocusDocument {
+  document: Document;
+  activeKind: () => HistoryFocusElementKind | null;
+  focusOptions: (kind: HistoryFocusElementKind) => FocusOptions | null;
+  threadScrollTop: () => number;
+  setActive: (kind: HistoryFocusElementKind) => void;
+  setTriggerDisabled: (disabled: boolean) => void;
+  removeTrigger: () => void;
+}
+
+function mockHistoryFocusDocument(
+  options: {
+    active: HistoryFocusElementKind;
+    triggerBounds?: DOMRect;
+    threadScrollTop?: number;
+  },
+): MockHistoryFocusDocument {
+  const owner: {
+    active: MockHistoryFocusElement | null;
+    trigger: MockHistoryFocusElement | null;
+    focusOptions: Map<HistoryFocusElementKind, FocusOptions>;
+    threadScrollTop: number;
+  } = {
+    active: null,
+    trigger: null,
+    focusOptions: new Map(),
+    threadScrollTop: options.threadScrollTop ?? 0,
+  };
+  class MockHistoryFocusElement {
+    hidden = false;
+    disabled = false;
+    readonly kind: HistoryFocusElementKind;
+
+    constructor(kind: HistoryFocusElementKind) {
+      this.kind = kind;
+    }
+
+    querySelector(selector: string): MockHistoryFocusElement | null {
+      return this.kind === "thread" && selector === '[data-focus-key="load-previous-turn-page"]'
+        ? owner.trigger
+        : null;
+    }
+
+    matches(selector: string): boolean {
+      return selector === ":disabled" && this.disabled;
+    }
+
+    getAttribute(name: string): string | null {
+      return name === "aria-disabled" && this.disabled ? "true" : null;
+    }
+
+    closest(): MockHistoryFocusElement | null {
+      return null;
+    }
+
+    getBoundingClientRect(): DOMRect {
+      if (this.kind === "thread") return mockFocusRect(0, 100, 800, 500);
+      if (this.kind === "trigger") return options.triggerBounds ?? mockFocusRect(20, 120, 220, 164);
+      return mockFocusRect(0, 0, 1, 1);
+    }
+
+    focus(focusOptions: FocusOptions = {}): void {
+      owner.focusOptions.set(this.kind, focusOptions);
+      if (!focusOptions.preventScroll) owner.threadScrollTop = 0;
+      owner.active = this;
+    }
+  }
+
+  const elements = new Map<HistoryFocusElementKind, MockHistoryFocusElement>([
+    ["body", new MockHistoryFocusElement("body")],
+    ["root", new MockHistoryFocusElement("root")],
+    ["thread", new MockHistoryFocusElement("thread")],
+    ["trigger", new MockHistoryFocusElement("trigger")],
+    ["other", new MockHistoryFocusElement("other")],
+  ]);
+  owner.trigger = elements.get("trigger")!;
+  owner.active = elements.get(options.active)!;
+  const documentTarget = {
+    get activeElement() { return owner.active; },
+    body: elements.get("body"),
+    documentElement: elements.get("root"),
+    querySelector: (selector: string) => selector === "#thread" ? elements.get("thread") : null,
+  } as unknown as Document;
+  return {
+    document: documentTarget,
+    activeKind: () => owner.active?.kind ?? null,
+    focusOptions: (kind) => owner.focusOptions.get(kind) ?? null,
+    threadScrollTop: () => owner.threadScrollTop,
+    setActive: (kind) => { owner.active = elements.get(kind)!; },
+    setTriggerDisabled: (disabled) => {
+      if (owner.trigger) owner.trigger.disabled = disabled;
+    },
+    removeTrigger: () => { owner.trigger = null; },
+  };
+}
+
+function mockFocusRect(left: number, top: number, right: number, bottom: number): DOMRect {
+  return {
+    x: left,
+    y: top,
+    left,
+    top,
+    right,
+    bottom,
+    width: right - left,
+    height: bottom - top,
+    toJSON: () => ({}),
+  } as DOMRect;
 }
 
 function transcriptRow(

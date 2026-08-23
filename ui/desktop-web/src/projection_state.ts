@@ -16,6 +16,14 @@ export function appliedProjectionRevision(
   return comparison !== null && comparison > 0 ? canonicalProjectionRevision(candidateRevision) : lastAppliedRevision;
 }
 
+export function projectionRevisionAtLeast(
+  candidateRevision: string,
+  baselineRevision: string,
+): boolean {
+  const comparison = compareProjectionRevisions(candidateRevision, baselineRevision);
+  return comparison !== null && comparison >= 0;
+}
+
 export function deferredProjectionCandidatePreferred(
   currentRevision: string,
   candidateRevision: string,

@@ -15,18 +15,19 @@ use crate::runtime::{ActiveRunInterruptOutcome, RunCancellationCause};
 #[cfg(test)]
 use crate::session::AdmissionId;
 use crate::session::{
-    CanonicalHistoryPage, CanonicalRuntimeEventPage, CanonicalSessionFence, CanonicalSessionRead,
-    CanonicalSessionSnapshot, CanonicalTurnPage, DurableTurnTerminal, IdleTurnAdmission,
-    IdleTurnRejectionReason, LoadedSessionList, LoadedSessionStatus, LoadedSessionSummary,
-    NewSession, ProjectId, ProjectRecord, ProjectRepository, RunEvent, RunningSessionRejoin,
-    SessionContext, SessionForkResult, SessionId, SessionRecord, SessionRepository,
-    SessionRollbackResult, SessionSelector, SessionSettingsPatch, SessionSettingsUpdate,
-    SessionStartRequest, SessionStatus, SessionTitleUpdate,
+    ActiveTurnExpectation, CanonicalHistoryPage, CanonicalRuntimeEventPage, CanonicalSessionFence,
+    CanonicalSessionRead, CanonicalSessionSnapshot, CanonicalTurnPage, DurableTurnTerminal,
+    IdleTurnAdmission, IdleTurnRejectionReason, LoadedSessionList, LoadedSessionStatus,
+    LoadedSessionSummary, NewSession, ProjectId, ProjectRecord, ProjectRepository, RunEvent,
+    RunningSessionRejoin, SessionContext, SessionForkResult, SessionId, SessionRecord,
+    SessionRepository, SessionRollbackResult, SessionSelector, SessionSettingsPatch,
+    SessionSettingsUpdate, SessionStartRequest, SessionStatus, SessionTitleUpdate,
 };
 use crate::storage::StoreBundle;
 use crate::storage::session_repo::{
     AgentExecutionWakeTerminalOwner, AgentExecutionWakeTerminalSettlement, AgentTreeStopFence,
-    DurableSessionStopState, PendingAgentTriggerSettlement, RunningSessionTerminalTarget,
+    DurableSessionStopState, ExactExecutionInterruptRequestSettlement,
+    ExactRootExecutionValidationState, PendingAgentTriggerSettlement, RunningSessionTerminalTarget,
 };
 use crate::workspace::{PathGuard, Workspace, WorkspaceDiscovery};
 
@@ -36,6 +37,26 @@ const RUNNING_SESSION_RECOVERY_PAGE_SIZE: usize = 64;
 pub struct SessionService {
     pub store: StoreBundle,
     runtime_event_projector: Option<CanonicalRuntimeEventProjector>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactTreeStopOutcome {
+    Applied { cancelled: bool },
+    TargetChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactRootExecutionValidation {
+    Running,
+    Terminal,
+    TargetChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactExecutionInterruptRequestOutcome {
+    Recorded,
+    AlreadyRequested,
+    TargetChanged,
 }
 
 impl SessionService {
@@ -177,7 +198,8 @@ impl SessionService {
         Ok(())
     }
 
-    pub async fn cancel_running_session(
+    #[cfg(test)]
+    pub(crate) async fn cancel_running_session(
         &self,
         session_id: crate::session::SessionId,
     ) -> Result<bool, SessionError> {
@@ -202,7 +224,7 @@ impl SessionService {
     /// A replacement turn, an idle/terminal session, or a differently-classified local
     /// cancellation all fail closed. When no process-local run owns the exact durable turn, the
     /// same compare-and-set terminalization used by ordinary Stop closes that captured turn.
-    pub async fn cancel_running_session_turn(
+    async fn cancel_running_session_turn(
         &self,
         session_id: SessionId,
         expected_turn_id: TurnId,
@@ -255,7 +277,83 @@ impl SessionService {
         )
     }
 
-    pub async fn cancel_running_session_tree(
+    /// Atomically validates the durable state of the exact root execution captured by the caller.
+    ///
+    /// This is a read-only compare-and-set boundary: revision and latest-turn ownership are read in
+    /// one immediate storage transaction, and no terminal or tree fence is written.
+    pub(crate) async fn validate_root_execution_at_expectation(
+        &self,
+        session_id: SessionId,
+        expected_turn_id: TurnId,
+        expected_revision: u64,
+    ) -> Result<ExactRootExecutionValidation, SessionError> {
+        Ok(
+            match self
+                .store
+                .session_repo()
+                .validate_root_execution_at_expectation(
+                    session_id,
+                    expected_turn_id,
+                    expected_revision,
+                )
+                .await?
+            {
+                ExactRootExecutionValidationState::Running => ExactRootExecutionValidation::Running,
+                ExactRootExecutionValidationState::Terminal => {
+                    ExactRootExecutionValidation::Terminal
+                }
+                ExactRootExecutionValidationState::TargetChanged => {
+                    ExactRootExecutionValidation::TargetChanged
+                }
+            },
+        )
+    }
+
+    /// Persists an exact root UserStop or exact child AgentInterrupted request.
+    ///
+    /// This never terminalizes or fans out. The durable admission owner observes the request via
+    /// lease renewal and settles the typed cause only after local commit reservations drain.
+    pub(crate) async fn request_exact_execution_interrupt(
+        &self,
+        session_id: SessionId,
+        expected_turn_id: TurnId,
+        expected_revision: u64,
+        cause: TurnInterruptionCause,
+    ) -> Result<ExactExecutionInterruptRequestOutcome, SessionError> {
+        if !matches!(
+            cause,
+            TurnInterruptionCause::UserStop | TurnInterruptionCause::AgentInterrupted
+        ) {
+            return Err(SessionError::Message(
+                "exact execution interrupt request only accepts UserStop or AgentInterrupted"
+                    .to_string(),
+            ));
+        }
+        let settlement = self
+            .store
+            .session_repo()
+            .request_exact_execution_interrupt(
+                session_id,
+                expected_turn_id,
+                expected_revision,
+                cause,
+            )
+            .await?;
+        Ok(match settlement {
+            ExactExecutionInterruptRequestSettlement::Recorded => {
+                ExactExecutionInterruptRequestOutcome::Recorded
+            }
+            ExactExecutionInterruptRequestSettlement::AlreadyRequested => {
+                ExactExecutionInterruptRequestOutcome::AlreadyRequested
+            }
+            ExactExecutionInterruptRequestSettlement::TargetChanged => {
+                ExactExecutionInterruptRequestOutcome::TargetChanged
+            }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn cancel_running_session_tree(
         &self,
         session_id: crate::session::SessionId,
         root_cause: TurnInterruptionCause,
@@ -353,6 +451,50 @@ impl SessionService {
             .fanout_agent_tree_stop_at_fence(session_id, fence)
             .await?;
         Ok(cancelled)
+    }
+
+    /// Applies a Desktop Stop to the exact durable root state captured with the user action.
+    ///
+    /// The durable fence is recorded before any in-memory cancellation or subtree enumeration.
+    /// This makes the fence the single tree-wide race owner: a replacement turn cannot be
+    /// cancelled merely because the Stop worker reached this service late. A just-completed
+    /// captured turn remains eligible so its already-spawned descendants can still be stopped.
+    pub async fn cancel_running_session_tree_at_expectation(
+        &self,
+        session_id: crate::session::SessionId,
+        expected: ActiveTurnExpectation,
+        root_cause: TurnInterruptionCause,
+    ) -> Result<ExactTreeStopOutcome, SessionError> {
+        let repo = self.store.session_repo();
+        let Some(fence) = repo
+            .record_agent_tree_stop_fence_for_expected_state(session_id, root_cause, expected)
+            .await?
+        else {
+            return Ok(ExactTreeStopOutcome::TargetChanged);
+        };
+
+        let mut cancelled = match expected {
+            ActiveTurnExpectation::Turn { turn_id, .. } => {
+                self.cancel_running_session_turn(session_id, turn_id, root_cause)
+                    .await?
+            }
+            ActiveTurnExpectation::Idle { .. } => false,
+        };
+        cancelled |= self
+            .fanout_agent_tree_stop_at_fence(session_id, fence)
+            .await?;
+        Ok(ExactTreeStopOutcome::Applied { cancelled })
+    }
+
+    pub async fn active_turn_expectation_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<ActiveTurnExpectation>, SessionError> {
+        self.store
+            .session_repo()
+            .active_turn_expectation_for_session(session_id)
+            .await
+            .map_err(SessionError::from)
     }
 
     async fn fanout_agent_tree_stop_at_fence(
@@ -454,6 +596,7 @@ impl SessionService {
         Ok(cancelled)
     }
 
+    #[cfg(test)]
     async fn settle_captured_root_for_tree_stop(
         &self,
         session_id: SessionId,
@@ -503,21 +646,6 @@ impl SessionService {
         ))
     }
 
-    pub async fn interrupt_running_session(
-        &self,
-        session_id: SessionId,
-    ) -> Result<SessionRecord, SessionError> {
-        if !self.cancel_running_session(session_id).await? {
-            let session = self.store.session_repo().get_session(session_id).await?;
-            return Err(SessionError::Message(format!(
-                "session {} is {}; interrupt requires a running session",
-                session.id,
-                session.status.key()
-            )));
-        }
-        Ok(self.store.session_repo().get_session(session_id).await?)
-    }
-
     pub async fn evaluate_idle_turn_admission(
         &self,
         session_id: SessionId,
@@ -548,11 +676,12 @@ impl SessionService {
     pub async fn store_active_turn_steer(
         &self,
         session_id: crate::session::SessionId,
+        expected_admission_revision: u64,
         steer: &SteerTurn,
     ) -> Result<(), SessionError> {
         self.store
             .session_repo()
-            .accept_active_turn_steer(session_id, steer)
+            .accept_active_turn_steer(session_id, expected_admission_revision, steer)
             .await?;
         if self.store.active_runs().is_active(session_id) {
             let _ = self
@@ -650,11 +779,12 @@ impl SessionService {
         target: RunningSessionTerminalTarget,
     ) -> Result<bool, SessionError> {
         let projection_cursor = self.capture_runtime_projection_cursor(session_id)?;
-        let terminalized = self
+        let settlement = self
             .store
             .session_repo()
-            .terminalize_captured_running_session_with_protocol_event(session_id, &event, target)
+            .settle_captured_running_session_with_protocol_event(session_id, &event, target)
             .await?;
+        let terminalized = settlement.commit().was_applied();
         if terminalized {
             self.project_runtime_events_after_cursor(
                 session_id,
@@ -672,11 +802,14 @@ impl SessionService {
         target: RunningSessionTerminalTarget,
     ) -> Result<bool, SessionError> {
         let projection_cursor = self.capture_runtime_projection_cursor(session_id)?;
-        let terminalized = self
+        let settlement = self
             .store
             .session_repo()
-            .recover_captured_running_session_with_protocol_event(session_id, &event, target)
+            .settle_orphaned_captured_running_session_with_protocol_event(
+                session_id, &event, target,
+            )
             .await?;
+        let terminalized = settlement.commit().was_applied();
         if terminalized {
             self.project_runtime_events_after_cursor(
                 session_id,
@@ -1420,6 +1553,7 @@ fn loaded_session_summary_from_projection(
         archived: projection.archived,
         active_turn_id: projection.active_turn_id,
         active_turn_sequence_no: projection.active_turn_sequence_no,
+        admission_revision: projection.admission_revision,
         pending_permission_requests: 0,
         pending_user_input_requests: 0,
         session: projection.session,
@@ -1434,6 +1568,7 @@ fn canonical_session_snapshot_from_storage(
         protocol,
         active_turn_position,
         pending_turn_inputs,
+        admission_revision,
     } = snapshot;
     let CanonicalProtocolSnapshot {
         fence,
@@ -1468,6 +1603,7 @@ fn canonical_session_snapshot_from_storage(
             latest_turn_id: latest_turn_position.map(|(turn_id, _)| turn_id),
             active_turn_id: active_turn_position.map(|(turn_id, _)| turn_id),
             active_turn_sequence_no: active_turn_position.map(|(_, sequence_no)| sequence_no),
+            admission_revision,
         },
         fence: CanonicalSessionFence {
             append_position: fence.append_position,
@@ -2328,7 +2464,7 @@ mod tests {
         };
 
         service
-            .store_active_turn_steer(session.session.id, &steer)
+            .store_active_turn_steer(session.session.id, 1, &steer)
             .await
             .expect("queue steer");
         let history = service
@@ -3193,6 +3329,1108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_execution_interrupt_request_is_idempotent_observable_and_does_not_terminalize() {
+        let (owner, requester, workspace) = cross_process_service_fixture().await;
+        let session = create_session(&owner, &workspace).await;
+        let (admission_id, turn_id) = admit_session_turn(&owner, session.session.id).await;
+        let revision = owner
+            .active_turn_expectation_for_session(session.session.id)
+            .await
+            .expect("running expectation")
+            .expect("session exists")
+            .revision();
+
+        let invalid_cause = requester
+            .request_exact_execution_interrupt(
+                session.session.id,
+                turn_id,
+                revision,
+                TurnInterruptionCause::ApprovalAborted,
+            )
+            .await
+            .expect_err("exact interrupt request rejects non-local causes");
+        assert!(invalid_cause.to_string().contains("AgentInterrupted"));
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    session.session.id,
+                    turn_id,
+                    revision,
+                    TurnInterruptionCause::AgentInterrupted,
+                )
+                .await
+                .expect("root topology mismatch"),
+            ExactExecutionInterruptRequestOutcome::TargetChanged
+        );
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    session.session.id,
+                    turn_id,
+                    revision,
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .expect("record request"),
+            ExactExecutionInterruptRequestOutcome::Recorded
+        );
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    session.session.id,
+                    turn_id,
+                    revision,
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .expect("repeat request"),
+            ExactExecutionInterruptRequestOutcome::AlreadyRequested
+        );
+
+        let repository = owner.store.session_repo();
+        assert_eq!(
+            repository
+                .get_session(session.session.id)
+                .await
+                .expect("requested session")
+                .status,
+            SessionStatus::Running
+        );
+        assert!(
+            repository
+                .durable_terminal_for_turn(session.session.id, turn_id)
+                .await
+                .expect("requested terminal")
+                .is_none(),
+            "recording external intent must never terminalize the exact turn"
+        );
+        assert!(matches!(
+            repository
+                .renew_admitted_run_lease(session.session.id, admission_id, turn_id)
+                .await
+                .expect("owner renewal observes request"),
+            crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::InterruptRequested(
+                TurnInterruptionCause::UserStop
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_first_forces_exact_interrupt_and_stale_a_cannot_stop_new_b() {
+        let (owner, requester, workspace) = cross_process_service_fixture().await;
+        let session = create_session(&owner, &workspace).await;
+        let (admission_a, turn_a) = admit_session_turn(&owner, session.session.id).await;
+        let revision_a = owner
+            .active_turn_expectation_for_session(session.session.id)
+            .await
+            .expect("A expectation")
+            .expect("session exists")
+            .revision();
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    session.session.id,
+                    turn_a,
+                    revision_a,
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .expect("request A"),
+            ExactExecutionInterruptRequestOutcome::Recorded
+        );
+
+        terminalize_admitted_session(&owner, session.session.id, turn_a).await;
+        let terminal_a = owner
+            .store
+            .session_repo()
+            .durable_terminal_for_turn(session.session.id, turn_a)
+            .await
+            .expect("A terminal")
+            .expect("A exact interrupt terminal");
+        assert!(matches!(
+            terminal_a.outcome,
+            TurnTerminalOutcome::Interrupted {
+                cause: TurnInterruptionCause::UserStop
+            }
+        ));
+        assert!(
+            owner
+                .store
+                .session_repo()
+                .release_stopped_run_admission(session.session.id, admission_a)
+                .await
+                .expect("release A")
+        );
+        let (admission_b, turn_b) = admit_session_turn(&owner, session.session.id).await;
+        let revision_b = owner
+            .active_turn_expectation_for_session(session.session.id)
+            .await
+            .expect("B expectation")
+            .expect("session exists")
+            .revision();
+
+        for (turn_id, revision) in [(turn_a, revision_a), (turn_b, revision_a)] {
+            assert_eq!(
+                requester
+                    .request_exact_execution_interrupt(
+                        session.session.id,
+                        turn_id,
+                        revision,
+                        TurnInterruptionCause::UserStop,
+                    )
+                    .await
+                    .expect("stale request"),
+                ExactExecutionInterruptRequestOutcome::TargetChanged
+            );
+        }
+        assert!(matches!(
+            owner
+                .store
+                .session_repo()
+                .renew_admitted_run_lease(session.session.id, admission_b, turn_b)
+                .await
+                .expect("B renewal"),
+            crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::Renewed
+        ));
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    session.session.id,
+                    turn_b,
+                    revision_b,
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .expect("request B after A consumed"),
+            ExactExecutionInterruptRequestOutcome::Recorded
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_interrupt_request_and_normal_terminal_serialize_without_split_ownership() {
+        let (owner, requester, workspace) = cross_process_service_fixture().await;
+        let session = create_session(&owner, &workspace).await;
+        let (_, turn_id) = admit_session_turn(&owner, session.session.id).await;
+        let revision = owner
+            .active_turn_expectation_for_session(session.session.id)
+            .await
+            .expect("race expectation")
+            .expect("race session exists")
+            .revision();
+
+        let terminal = terminalize_admitted_session(&owner, session.session.id, turn_id);
+        let request = requester.request_exact_execution_interrupt(
+            session.session.id,
+            turn_id,
+            revision,
+            TurnInterruptionCause::UserStop,
+        );
+        let ((), request_outcome) = tokio::join!(terminal, request);
+        let request_outcome = request_outcome.expect("serialized interrupt request");
+        let durable = owner
+            .store
+            .session_repo()
+            .durable_terminal_for_turn(session.session.id, turn_id)
+            .await
+            .expect("race terminal read")
+            .expect("race terminal exists");
+        match request_outcome {
+            ExactExecutionInterruptRequestOutcome::Recorded => assert!(matches!(
+                durable.outcome,
+                TurnTerminalOutcome::Interrupted {
+                    cause: TurnInterruptionCause::UserStop
+                }
+            )),
+            ExactExecutionInterruptRequestOutcome::TargetChanged => {
+                assert!(matches!(durable.outcome, TurnTerminalOutcome::Completed));
+            }
+            ExactExecutionInterruptRequestOutcome::AlreadyRequested => {
+                panic!("a fresh serialized request cannot already exist")
+            }
+        }
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    session.session.id,
+                    turn_id,
+                    revision,
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .expect("post-terminal request"),
+            ExactExecutionInterruptRequestOutcome::TargetChanged
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_first_rejects_late_interrupt_and_preserves_completed_terminal() {
+        let (owner, requester, workspace) = cross_process_service_fixture().await;
+        let session = create_session(&owner, &workspace).await;
+        let (_, turn_id) = admit_session_turn(&owner, session.session.id).await;
+        let revision = owner
+            .active_turn_expectation_for_session(session.session.id)
+            .await
+            .expect("terminal-first expectation")
+            .expect("terminal-first session exists")
+            .revision();
+
+        terminalize_admitted_session(&owner, session.session.id, turn_id).await;
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    session.session.id,
+                    turn_id,
+                    revision,
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .expect("late request"),
+            ExactExecutionInterruptRequestOutcome::TargetChanged
+        );
+        let durable = owner
+            .store
+            .session_repo()
+            .durable_terminal_for_turn(session.session.id, turn_id)
+            .await
+            .expect("terminal-first read")
+            .expect("terminal-first durable terminal");
+        assert!(matches!(durable.outcome, TurnTerminalOutcome::Completed));
+    }
+
+    #[tokio::test]
+    async fn rollback_revision_prevents_a_or_b_interrupt_request_from_reaching_a_new_owner() {
+        let (owner, requester, workspace) = cross_process_service_fixture().await;
+        let session = create_session(&owner, &workspace).await;
+        let repository = owner.store.session_repo();
+        let (admission_a, turn_a) = admit_session_turn(&owner, session.session.id).await;
+        let revision_a = owner
+            .active_turn_expectation_for_session(session.session.id)
+            .await
+            .expect("A expectation")
+            .expect("A session")
+            .revision();
+        assert_eq!(revision_a, 1);
+        terminalize_admitted_session(&owner, session.session.id, turn_a).await;
+        assert!(
+            repository
+                .release_stopped_run_admission(session.session.id, admission_a)
+                .await
+                .expect("release A")
+        );
+
+        let (admission_b, turn_b) = admit_session_turn(&owner, session.session.id).await;
+        let revision_b = owner
+            .active_turn_expectation_for_session(session.session.id)
+            .await
+            .expect("B expectation")
+            .expect("B session")
+            .revision();
+        assert_eq!(revision_b, 2);
+        terminalize_admitted_session(&owner, session.session.id, turn_b).await;
+        assert!(
+            repository
+                .release_stopped_run_admission(session.session.id, admission_b)
+                .await
+                .expect("release B")
+        );
+
+        let rollback = repository
+            .rollback_session_transaction(session.session.id, 1)
+            .await
+            .expect("rollback B to A");
+        assert_eq!(rollback.dropped_turn_ids, vec![turn_b]);
+        assert_eq!(
+            owner
+                .active_turn_expectation_for_session(session.session.id)
+                .await
+                .expect("rollback expectation")
+                .expect("rollback session"),
+            ActiveTurnExpectation::Idle {
+                latest_turn_id: Some(turn_a),
+                revision: 3,
+            }
+        );
+        for (turn_id, revision) in [(turn_a, revision_a), (turn_b, revision_b)] {
+            assert_eq!(
+                requester
+                    .request_exact_execution_interrupt(
+                        session.session.id,
+                        turn_id,
+                        revision,
+                        TurnInterruptionCause::UserStop,
+                    )
+                    .await
+                    .expect("rolled-back stale request"),
+                ExactExecutionInterruptRequestOutcome::TargetChanged
+            );
+        }
+
+        let turn_c = TurnId::new();
+        let admission_c = repository
+            .admit_session_turn_with_initial_user_turn_after_latest(
+                session.session.id,
+                turn_c,
+                None,
+                Some(turn_a),
+                3,
+            )
+            .await
+            .expect("admit after rollback")
+            .expect("post-rollback user run admitted");
+        assert_eq!(admission_c.admission_revision, 4);
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    session.session.id,
+                    turn_a,
+                    3,
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .expect("rollback A identity cannot target C"),
+            ExactExecutionInterruptRequestOutcome::TargetChanged
+        );
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    session.session.id,
+                    turn_c,
+                    admission_c.admission_revision,
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .expect("current post-rollback request"),
+            ExactExecutionInterruptRequestOutcome::Recorded
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_execution_interrupt_request_enforces_root_user_stop_topology() {
+        let (owner, requester, workspace) = cross_process_service_fixture().await;
+        let root = create_session(&owner, &workspace).await;
+        let child = create_session(&owner, &workspace).await;
+        let sibling = create_session(&owner, &workspace).await;
+        let repository = owner.store.session_repo();
+        repository
+            .insert_session_spawn_edge(
+                root.session.id,
+                root.session.id,
+                child.session.id,
+                "/root/child",
+                "child",
+            )
+            .await
+            .expect("child edge");
+        repository
+            .insert_session_spawn_edge(
+                root.session.id,
+                root.session.id,
+                sibling.session.id,
+                "/root/sibling",
+                "sibling",
+            )
+            .await
+            .expect("sibling edge");
+        let (root_admission, root_turn) = admit_session_turn(&owner, root.session.id).await;
+        let (child_admission, child_turn) = admit_session_turn(&owner, child.session.id).await;
+        let (sibling_admission, sibling_turn) =
+            admit_session_turn(&owner, sibling.session.id).await;
+        let root_revision = owner
+            .active_turn_expectation_for_session(root.session.id)
+            .await
+            .expect("root expectation")
+            .expect("root exists")
+            .revision();
+        let child_revision = owner
+            .active_turn_expectation_for_session(child.session.id)
+            .await
+            .expect("child expectation")
+            .expect("child exists")
+            .revision();
+        let sibling_revision = owner
+            .active_turn_expectation_for_session(sibling.session.id)
+            .await
+            .expect("sibling expectation")
+            .expect("sibling exists")
+            .revision();
+
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    child.session.id,
+                    child_turn,
+                    child_revision,
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .expect("reject child request"),
+            ExactExecutionInterruptRequestOutcome::TargetChanged
+        );
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    root.session.id,
+                    root_turn,
+                    root_revision,
+                    TurnInterruptionCause::AgentInterrupted,
+                )
+                .await
+                .expect("reject AgentInterrupted on root"),
+            ExactExecutionInterruptRequestOutcome::TargetChanged
+        );
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    child.session.id,
+                    child_turn,
+                    child_revision,
+                    TurnInterruptionCause::AgentInterrupted,
+                )
+                .await
+                .expect("request exact child interruption"),
+            ExactExecutionInterruptRequestOutcome::Recorded
+        );
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    child.session.id,
+                    child_turn,
+                    child_revision,
+                    TurnInterruptionCause::AgentInterrupted,
+                )
+                .await
+                .expect("repeat exact child interruption"),
+            ExactExecutionInterruptRequestOutcome::AlreadyRequested
+        );
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    child.session.id,
+                    child_turn,
+                    child_revision,
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .expect("cross-cause request fails closed"),
+            ExactExecutionInterruptRequestOutcome::TargetChanged
+        );
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    root.session.id,
+                    root_turn,
+                    root_revision,
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .expect("request root"),
+            ExactExecutionInterruptRequestOutcome::Recorded
+        );
+        assert!(matches!(
+            repository
+                .renew_admitted_run_lease(root.session.id, root_admission, root_turn)
+                .await
+                .expect("root renewal"),
+            crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::InterruptRequested(
+                TurnInterruptionCause::UserStop
+            )
+        ));
+        assert!(matches!(
+            repository
+                .renew_admitted_run_lease(child.session.id, child_admission, child_turn)
+                .await
+                .expect("child renewal observes exact interruption"),
+            crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::InterruptRequested(
+                TurnInterruptionCause::AgentInterrupted
+            )
+        ));
+        assert!(matches!(
+            repository
+                .renew_admitted_run_lease(sibling.session.id, sibling_admission, sibling_turn,)
+                .await
+                .expect("sibling renewal"),
+            crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::Renewed
+        ));
+        assert_eq!(sibling_revision, 1);
+        assert_eq!(
+            repository
+                .get_session(child.session.id)
+                .await
+                .expect("child session")
+                .status,
+            SessionStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn child_interrupt_request_waits_for_each_local_commit_reservation_before_terminal() {
+        let (owner, requester, workspace) = cross_process_service_fixture().await;
+        let root = create_session(&owner, &workspace).await;
+        let child = create_session(&owner, &workspace).await;
+        let repository = owner.store.session_repo();
+        repository
+            .insert_session_spawn_edge(
+                root.session.id,
+                root.session.id,
+                child.session.id,
+                "/root/reserved_child",
+                "reserved_child",
+            )
+            .await
+            .expect("reserved child edge");
+        let (admission_id, turn_id) = admit_session_turn(&owner, child.session.id).await;
+        let revision = owner
+            .active_turn_expectation_for_session(child.session.id)
+            .await
+            .expect("child expectation")
+            .expect("child exists")
+            .revision();
+        let cause = TurnInterruptionCause::AgentInterrupted;
+
+        let effect_control = RunControl::new();
+        let effect_commit = effect_control
+            .begin_tool_effect_commit()
+            .expect("reserve effect commit");
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(child.session.id, turn_id, revision, cause)
+                .await
+                .expect("record during effect commit"),
+            ExactExecutionInterruptRequestOutcome::Recorded
+        );
+        assert!(matches!(
+            repository
+                .renew_admitted_run_lease(child.session.id, admission_id, turn_id)
+                .await
+                .expect("effect-commit renewal"),
+            crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::InterruptRequested(
+                TurnInterruptionCause::AgentInterrupted
+            )
+        ));
+        assert!(!effect_control.interrupt(cause));
+        assert_eq!(effect_control.cause(), None);
+        assert_eq!(
+            repository
+                .get_session(child.session.id)
+                .await
+                .expect("effect-commit session")
+                .status,
+            SessionStatus::Running
+        );
+        assert!(
+            repository
+                .durable_terminal_for_turn(child.session.id, turn_id)
+                .await
+                .expect("effect-commit terminal")
+                .is_none()
+        );
+        effect_commit.release();
+        assert_eq!(
+            effect_control.cause(),
+            Some(RunCancellationCause::Interruption(cause))
+        );
+
+        let settlement_control = RunControl::new();
+        let tool_settlement = settlement_control
+            .begin_tool_settlement()
+            .expect("reserve tool settlement");
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(child.session.id, turn_id, revision, cause)
+                .await
+                .expect("repeat during tool settlement"),
+            ExactExecutionInterruptRequestOutcome::AlreadyRequested
+        );
+        assert!(!settlement_control.interrupt(cause));
+        assert_eq!(settlement_control.cause(), None);
+        assert_eq!(
+            repository
+                .get_session(child.session.id)
+                .await
+                .expect("tool-settlement session")
+                .status,
+            SessionStatus::Running
+        );
+        tool_settlement.release();
+        assert_eq!(
+            settlement_control.cause(),
+            Some(RunCancellationCause::Interruption(cause))
+        );
+
+        let success_control = RunControl::new();
+        let success_commit = success_control
+            .begin_success_commit()
+            .expect("reserve success commit");
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(child.session.id, turn_id, revision, cause)
+                .await
+                .expect("repeat during success commit"),
+            ExactExecutionInterruptRequestOutcome::AlreadyRequested
+        );
+        assert!(!success_control.interrupt(cause));
+        assert_eq!(success_control.cause(), None);
+        assert_eq!(
+            repository
+                .get_session(child.session.id)
+                .await
+                .expect("success-commit session")
+                .status,
+            SessionStatus::Running
+        );
+        success_commit.release();
+        assert_eq!(
+            success_control.cause(),
+            Some(RunCancellationCause::Interruption(cause))
+        );
+
+        assert_eq!(
+            repository
+                .terminalize_admitted_turn_with_protocol_event(
+                    child.session.id,
+                    admission_id,
+                    &test_terminal_event(child.session.id, TurnTerminalOutcome::Completed,),
+                    turn_id,
+                    None,
+                    None,
+                )
+                .await
+                .expect("terminalize after all reservations release"),
+            crate::storage::session_repo::AdmittedTerminalCommit::Applied
+        );
+        let terminal = repository
+            .durable_terminal_for_turn(child.session.id, turn_id)
+            .await
+            .expect("terminal read")
+            .expect("child terminal");
+        assert!(matches!(
+            terminal.outcome,
+            TurnTerminalOutcome::Interrupted {
+                cause: TurnInterruptionCause::AgentInterrupted
+            }
+        ));
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(child.session.id, turn_id, revision, cause)
+                .await
+                .expect("terminal-first request loses"),
+            ExactExecutionInterruptRequestOutcome::TargetChanged
+        );
+    }
+
+    #[tokio::test]
+    async fn success_commit_request_first_forces_requested_child_interrupt_at_terminal_txn() {
+        let (owner, requester, workspace) = cross_process_service_fixture().await;
+        let root = create_session(&owner, &workspace).await;
+        let child = create_session(&owner, &workspace).await;
+        let repository = owner.store.session_repo();
+        repository
+            .insert_session_spawn_edge(
+                root.session.id,
+                root.session.id,
+                child.session.id,
+                "/root/success_race_child",
+                "success_race_child",
+            )
+            .await
+            .expect("success-race child edge");
+        let (admission_id, turn_id) = admit_session_turn(&owner, child.session.id).await;
+        let revision = owner
+            .active_turn_expectation_for_session(child.session.id)
+            .await
+            .expect("success-race expectation")
+            .expect("success-race child exists")
+            .revision();
+        let cause = TurnInterruptionCause::AgentInterrupted;
+        let control = RunControl::new();
+        let success_commit = control
+            .begin_success_commit()
+            .expect("reserve success commit before external request");
+
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(child.session.id, turn_id, revision, cause)
+                .await
+                .expect("record request after success reservation"),
+            ExactExecutionInterruptRequestOutcome::Recorded
+        );
+        assert!(!control.interrupt(cause));
+        assert_eq!(control.cause(), None);
+        let settlement = repository
+            .settle_admitted_turn_with_protocol_event(
+                child.session.id,
+                admission_id,
+                &test_terminal_event(child.session.id, TurnTerminalOutcome::Completed),
+                turn_id,
+                None,
+                None,
+            )
+            .await
+            .expect("storage owns success-race linearization");
+        assert_eq!(
+            settlement.commit(),
+            crate::storage::session_repo::AdmittedTerminalCommit::Applied
+        );
+        assert!(matches!(
+            settlement.into_terminal().map(|terminal| terminal.outcome),
+            Some(TurnTerminalOutcome::Interrupted {
+                cause: TurnInterruptionCause::AgentInterrupted
+            })
+        ));
+        let durable = repository
+            .durable_terminal_for_turn(child.session.id, turn_id)
+            .await
+            .expect("success-race terminal read")
+            .expect("success-race terminal");
+        assert!(matches!(
+            durable.outcome,
+            TurnTerminalOutcome::Interrupted {
+                cause: TurnInterruptionCause::AgentInterrupted
+            }
+        ));
+
+        success_commit.release();
+        assert_eq!(
+            control.cause(),
+            Some(RunCancellationCause::Interruption(cause))
+        );
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(child.session.id, turn_id, revision, cause)
+                .await
+                .expect("post-terminal request loses"),
+            ExactExecutionInterruptRequestOutcome::TargetChanged
+        );
+    }
+
+    #[tokio::test]
+    async fn request_is_observed_immediately_after_root_continuation_admission_and_blocks_another()
+    {
+        let (owner, requester, workspace) = cross_process_service_fixture().await;
+        let session = create_session(&owner, &workspace).await;
+        let (admission_a, turn_a) = admit_session_turn(&owner, session.session.id).await;
+        let revision_a = owner
+            .active_turn_expectation_for_session(session.session.id)
+            .await
+            .expect("A expectation")
+            .expect("session exists")
+            .revision();
+        terminalize_admitted_session(&owner, session.session.id, turn_a).await;
+        assert!(
+            owner
+                .store
+                .session_repo()
+                .release_stopped_run_admission(session.session.id, admission_a)
+                .await
+                .expect("release A")
+        );
+
+        let turn_b = TurnId::new();
+        let continuation_b = owner
+            .store
+            .session_repo()
+            .admit_root_continuation_turn_with_initial_user_turn(
+                session.session.id,
+                turn_b,
+                None,
+                turn_a,
+                revision_a,
+                false,
+            )
+            .await
+            .expect("admit continuation B");
+        let crate::storage::session_repo::ActiveGoalTurnAdmission::Admitted(admission_b) =
+            continuation_b
+        else {
+            panic!("continuation B was not admitted");
+        };
+        assert_eq!(
+            requester
+                .request_exact_execution_interrupt(
+                    session.session.id,
+                    turn_b,
+                    admission_b.admission_revision,
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .expect("request immediately after continuation admission"),
+            ExactExecutionInterruptRequestOutcome::Recorded
+        );
+        assert!(matches!(
+            owner
+                .store
+                .session_repo()
+                .renew_admitted_run_lease(session.session.id, admission_b.admission_id, turn_b)
+                .await
+                .expect("continuation renewal"),
+            crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::InterruptRequested(
+                TurnInterruptionCause::UserStop
+            )
+        ));
+        assert!(matches!(
+            owner
+                .store
+                .session_repo()
+                .admit_root_continuation_turn_with_initial_user_turn(
+                    session.session.id,
+                    TurnId::new(),
+                    None,
+                    turn_b,
+                    admission_b.admission_revision,
+                    false,
+                )
+                .await
+                .expect("refuse continuation across pending Stop"),
+            crate::storage::session_repo::ActiveGoalTurnAdmission::Unavailable
+        ));
+    }
+
+    #[tokio::test]
+    async fn orphan_recovery_prefers_pending_exact_user_stop_over_failure() {
+        let (owner, recovery, workspace) = cross_process_service_fixture().await;
+        let session = create_session(&owner, &workspace).await;
+        let turn_id = TurnId::new();
+        let admission = owner
+            .store
+            .session_repo()
+            .admit_session_turn_at(session.session.id, turn_id, 0, 1)
+            .await
+            .expect("admit expired root")
+            .expect("expired root admitted");
+        assert_eq!(
+            recovery
+                .request_exact_execution_interrupt(
+                    session.session.id,
+                    turn_id,
+                    admission.admission_revision,
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .expect("request expired root Stop"),
+            ExactExecutionInterruptRequestOutcome::Recorded
+        );
+        assert!(matches!(
+            owner
+                .store
+                .session_repo()
+                .renew_admitted_run_lease(session.session.id, admission.admission_id, turn_id,)
+                .await
+                .expect("expired owner still observes exact Stop"),
+            crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::InterruptRequested(
+                TurnInterruptionCause::UserStop
+            )
+        ));
+
+        assert_eq!(
+            recovery
+                .mark_stale_running_sessions("owner disappeared")
+                .await
+                .expect("recover orphan"),
+            1
+        );
+        let terminal = owner
+            .store
+            .session_repo()
+            .durable_terminal_for_turn(session.session.id, turn_id)
+            .await
+            .expect("orphan terminal")
+            .expect("orphan terminal exists");
+        assert!(matches!(
+            terminal.outcome,
+            TurnTerminalOutcome::Interrupted {
+                cause: TurnInterruptionCause::UserStop
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn orphan_recovery_prefers_pending_exact_agent_interrupted_for_child() {
+        let (owner, recovery, workspace) = cross_process_service_fixture().await;
+        let root = create_session(&owner, &workspace).await;
+        let child = create_session(&owner, &workspace).await;
+        owner
+            .store
+            .session_repo()
+            .insert_session_spawn_edge(
+                root.session.id,
+                root.session.id,
+                child.session.id,
+                "/root/orphan_child",
+                "orphan_child",
+            )
+            .await
+            .expect("orphan child edge");
+        let turn_id = TurnId::new();
+        let admission = owner
+            .store
+            .session_repo()
+            .admit_session_turn_at(child.session.id, turn_id, 0, 1)
+            .await
+            .expect("admit expired child")
+            .expect("expired child admitted");
+        assert_eq!(
+            recovery
+                .request_exact_execution_interrupt(
+                    child.session.id,
+                    turn_id,
+                    admission.admission_revision,
+                    TurnInterruptionCause::AgentInterrupted,
+                )
+                .await
+                .expect("request expired child interruption"),
+            ExactExecutionInterruptRequestOutcome::Recorded
+        );
+        assert!(matches!(
+            owner
+                .store
+                .session_repo()
+                .renew_admitted_run_lease(child.session.id, admission.admission_id, turn_id)
+                .await
+                .expect("expired child still observes exact interruption"),
+            crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::InterruptRequested(
+                TurnInterruptionCause::AgentInterrupted
+            )
+        ));
+        assert_eq!(
+            recovery
+                .mark_stale_running_sessions("child owner disappeared")
+                .await
+                .expect("recover child orphan"),
+            1
+        );
+        let terminal = owner
+            .store
+            .session_repo()
+            .durable_terminal_for_turn(child.session.id, turn_id)
+            .await
+            .expect("child orphan terminal")
+            .expect("child orphan terminal exists");
+        assert!(matches!(
+            terminal.outcome,
+            TurnTerminalOutcome::Interrupted {
+                cause: TurnInterruptionCause::AgentInterrupted
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_tree_stop_applies_only_to_the_captured_running_turn() {
+        let (service, workspace, _) = service_fixture().await;
+        let session = create_session(&service, &workspace).await;
+        let (_, turn_a) = admit_session_turn(&service, session.session.id).await;
+
+        assert_eq!(
+            service
+                .cancel_running_session_tree_at_expectation(
+                    session.session.id,
+                    ActiveTurnExpectation::Turn {
+                        turn_id: turn_a,
+                        revision: 1,
+                    },
+                    TurnInterruptionCause::UserStop,
+                )
+                .await
+                .expect("exact running tree Stop"),
+            ExactTreeStopOutcome::Applied { cancelled: true }
+        );
+        assert!(
+            service
+                .store
+                .session_repo()
+                .durable_terminal_for_turn(session.session.id, turn_a)
+                .await
+                .expect("captured turn terminal")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_stop_fence_accepts_terminal_a_but_rejects_replacement_b_and_idle_aba() {
+        let (service, workspace, _) = service_fixture().await;
+        let session = create_session(&service, &workspace).await;
+        let (admission_a, turn_a) = admit_session_turn(&service, session.session.id).await;
+        terminalize_admitted_session(&service, session.session.id, turn_a).await;
+        let repository = service.store.session_repo();
+
+        assert!(
+            repository
+                .record_agent_tree_stop_fence_for_expected_state(
+                    session.session.id,
+                    TurnInterruptionCause::UserStop,
+                    ActiveTurnExpectation::Turn {
+                        turn_id: turn_a,
+                        revision: 1,
+                    },
+                )
+                .await
+                .expect("terminal-latest A fence")
+                .is_some(),
+            "Stop captured during A may still fence A's detached descendants after A terminalizes"
+        );
+        assert!(
+            repository
+                .release_stopped_run_admission(session.session.id, admission_a)
+                .await
+                .expect("release terminal A admission")
+        );
+
+        let (admission_b, turn_b) = admit_session_turn(&service, session.session.id).await;
+        assert!(
+            repository
+                .record_agent_tree_stop_fence_for_expected_state(
+                    session.session.id,
+                    TurnInterruptionCause::UserStop,
+                    ActiveTurnExpectation::Turn {
+                        turn_id: turn_a,
+                        revision: 1,
+                    },
+                )
+                .await
+                .expect("stale A fence against B")
+                .is_none(),
+            "replacement B must reject a Stop captured for A"
+        );
+        assert_eq!(
+            repository
+                .fresh_running_turn_for_session(session.session.id)
+                .await
+                .expect("replacement running turn"),
+            Some(turn_b)
+        );
+        assert!(
+            repository
+                .durable_terminal_for_turn(session.session.id, turn_b)
+                .await
+                .expect("replacement terminal")
+                .is_none(),
+            "stale A Stop must not terminalize replacement B"
+        );
+
+        terminalize_admitted_session(&service, session.session.id, turn_b).await;
+        assert!(
+            repository
+                .release_stopped_run_admission(session.session.id, admission_b)
+                .await
+                .expect("release terminal B admission")
+        );
+        assert!(
+            repository
+                .record_agent_tree_stop_fence_for_expected_state(
+                    session.session.id,
+                    TurnInterruptionCause::UserStop,
+                    ActiveTurnExpectation::Idle {
+                        latest_turn_id: Some(turn_a),
+                        revision: 1,
+                    },
+                )
+                .await
+                .expect("stale Idle(A) after B")
+                .is_none(),
+            "Idle(latest A) must remain an ABA fence after B settles"
+        );
+    }
+
+    #[tokio::test]
     async fn exact_turn_interrupt_rejects_stale_a_after_replacement_b_without_touching_b() {
         let (service, workspace, _) = service_fixture().await;
         let session = create_session(&service, &workspace).await;
@@ -3298,6 +4536,95 @@ mod tests {
         );
         assert_cancelled_admission(&owner, child_a.session.id, child_a_admission, child_a_turn)
             .await;
+    }
+
+    #[tokio::test]
+    async fn root_tree_stop_preserves_an_exact_child_interrupt_and_stops_only_its_live_sibling() {
+        let (owner, canceller, workspace) = cross_process_service_fixture().await;
+        let root = create_session(&owner, &workspace).await;
+        let child_a = create_session(&owner, &workspace).await;
+        let child_b = create_session(&owner, &workspace).await;
+        let unrelated = create_session(&owner, &workspace).await;
+        for (child, path) in [(&child_a, "/root/child_a"), (&child_b, "/root/child_b")] {
+            owner
+                .store
+                .session_repo()
+                .insert_session_spawn_edge(
+                    root.session.id,
+                    root.session.id,
+                    child.session.id,
+                    path,
+                    path.trim_start_matches("/root/"),
+                )
+                .await
+                .expect("spawn edge");
+        }
+        let (root_admission, root_turn) = admit_session_turn(&owner, root.session.id).await;
+        let (child_a_admission, child_a_turn) =
+            admit_session_turn(&owner, child_a.session.id).await;
+        let (child_b_admission, child_b_turn) =
+            admit_session_turn(&owner, child_b.session.id).await;
+        let (_unrelated_admission, unrelated_turn) =
+            admit_session_turn(&owner, unrelated.session.id).await;
+
+        assert!(
+            canceller
+                .cancel_running_session_turn(
+                    child_a.session.id,
+                    child_a_turn,
+                    TurnInterruptionCause::AgentInterrupted,
+                )
+                .await
+                .expect("exact child A interrupt")
+        );
+        assert!(
+            canceller
+                .cancel_running_session_tree(root.session.id, TurnInterruptionCause::UserStop)
+                .await
+                .expect("root tree Stop")
+        );
+
+        let repository = owner.store.session_repo();
+        for (session_id, turn_id, expected_cause) in [
+            (root.session.id, root_turn, TurnInterruptionCause::UserStop),
+            (
+                child_a.session.id,
+                child_a_turn,
+                TurnInterruptionCause::AgentInterrupted,
+            ),
+            (
+                child_b.session.id,
+                child_b_turn,
+                TurnInterruptionCause::TreeStopped,
+            ),
+        ] {
+            assert_eq!(
+                repository
+                    .durable_terminal_for_turn(session_id, turn_id)
+                    .await
+                    .expect("tree member terminal")
+                    .expect("tree member settled")
+                    .outcome,
+                TurnTerminalOutcome::Interrupted {
+                    cause: expected_cause,
+                }
+            );
+            assert!(
+                !repository
+                    .has_fresh_run_admission(session_id)
+                    .await
+                    .expect("tree member admission released")
+            );
+        }
+        assert_eq!(
+            repository
+                .fresh_running_turn_for_session(unrelated.session.id)
+                .await
+                .expect("unrelated owner remains readable"),
+            Some(unrelated_turn),
+            "a root tree Stop must not classify another root session"
+        );
+        let _ = (root_admission, child_a_admission, child_b_admission);
     }
 
     #[tokio::test]
@@ -4254,11 +5581,19 @@ mod tests {
         terminalize_admitted_session(&owner, root.session.id, root_turn).await;
         let (child_admission, child_turn) = admit_session_turn(&owner, child.session.id).await;
 
-        assert!(
+        assert_eq!(
             canceller
-                .cancel_running_session_tree(root.session.id, TurnInterruptionCause::UserStop,)
+                .cancel_running_session_tree_at_expectation(
+                    root.session.id,
+                    ActiveTurnExpectation::Turn {
+                        turn_id: root_turn,
+                        revision: 1,
+                    },
+                    TurnInterruptionCause::UserStop,
+                )
                 .await
-                .expect("tree stop")
+                .expect("exact terminal-crossing tree Stop"),
+            ExactTreeStopOutcome::Applied { cancelled: true }
         );
         assert_eq!(
             owner

@@ -669,6 +669,8 @@ pub struct CanonicalSessionRead {
     pub active_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_sequence_no: Option<i64>,
+    #[serde(default)]
+    pub admission_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -716,6 +718,8 @@ pub struct LoadedSessionSummary {
     pub active_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_sequence_no: Option<i64>,
+    #[serde(default)]
+    pub admission_revision: u64,
     #[serde(default)]
     pub pending_permission_requests: u32,
     #[serde(default)]
@@ -800,6 +804,8 @@ pub struct SessionContext {
 pub struct RunSummary {
     session_id: SessionId,
     turn_id: TurnId,
+    #[serde(default)]
+    admission_revision: u64,
     terminal: DurableTurnTerminal,
 }
 
@@ -812,6 +818,7 @@ impl RunSummary {
         Self {
             session_id,
             turn_id,
+            admission_revision: 0,
             terminal,
         }
     }
@@ -822,6 +829,15 @@ impl RunSummary {
 
     pub const fn turn_id(&self) -> TurnId {
         self.turn_id
+    }
+
+    pub const fn admission_revision(&self) -> u64 {
+        self.admission_revision
+    }
+
+    pub(crate) fn with_admission_revision(mut self, admission_revision: u64) -> Self {
+        self.admission_revision = admission_revision;
+        self
     }
 
     pub const fn terminal(&self) -> &DurableTurnTerminal {
@@ -941,6 +957,61 @@ pub struct TokenUsage {
     pub reasoning_tokens: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunEventDurability {
+    /// Ephemeral display telemetry that may be dropped under bounded backpressure.
+    RuntimeOnly,
+    /// A fact owned by canonical session/protocol storage.
+    Committed,
+}
+
+/// Exact durable turn state observed by an interactive mutation surface.
+///
+/// Both variants carry the per-session admission revision. The revision advances whenever a
+/// canonical turn identity is inserted or removed, so rollback cannot recreate an older
+/// interactive mutation owner merely by restoring the same latest turn id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveTurnExpectation {
+    Idle {
+        latest_turn_id: Option<TurnId>,
+        revision: u64,
+    },
+    Turn {
+        turn_id: TurnId,
+        revision: u64,
+    },
+}
+
+impl ActiveTurnExpectation {
+    /// Explicit initial state for a session that has not yet persisted any turn identity.
+    pub const fn initial_idle() -> Self {
+        Self::Idle {
+            latest_turn_id: None,
+            revision: 0,
+        }
+    }
+
+    pub const fn active_turn_id(self) -> Option<TurnId> {
+        match self {
+            Self::Idle { .. } => None,
+            Self::Turn { turn_id, .. } => Some(turn_id),
+        }
+    }
+
+    pub const fn latest_turn_id(self) -> Option<TurnId> {
+        match self {
+            Self::Idle { latest_turn_id, .. } => latest_turn_id,
+            Self::Turn { turn_id, .. } => Some(turn_id),
+        }
+    }
+
+    pub const fn revision(self) -> u64 {
+        match self {
+            Self::Idle { revision, .. } | Self::Turn { revision, .. } => revision,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RunEvent {
@@ -1053,6 +1124,33 @@ pub enum RunEvent {
 }
 
 impl RunEvent {
+    /// Classifies every event at the shared session owner so renderers and
+    /// protocol projection cannot independently redefine persistence semantics.
+    pub const fn durability(&self) -> RunEventDurability {
+        match self {
+            Self::ProviderPhase { .. }
+            | Self::TextDelta { .. }
+            | Self::ReasoningSummaryDelta { .. } => RunEventDurability::RuntimeOnly,
+            Self::SessionStarted { .. }
+            | Self::SessionTitleUpdated { .. }
+            | Self::UserTurnStored { .. }
+            | Self::ModelRequestPrepared { .. }
+            | Self::WorldStateUpdated { .. }
+            | Self::AssistantMessageCommitted { .. }
+            | Self::ToolCallPending { .. }
+            | Self::ToolCallCompleted { .. }
+            | Self::ToolCallDeclined { .. }
+            | Self::ToolCallCancelled { .. }
+            | Self::ToolCallFailed { .. }
+            | Self::FileChangesRecorded { .. }
+            | Self::CompactionCompleted { .. }
+            | Self::PermissionRequested { .. }
+            | Self::PermissionResolved { .. }
+            | Self::RecoverableRuntimeFeedback { .. }
+            | Self::TurnTerminal { .. } => RunEventDurability::Committed,
+        }
+    }
+
     pub fn session_id(&self) -> Option<SessionId> {
         match self {
             Self::SessionStarted { session_id, .. }
@@ -1082,6 +1180,54 @@ impl RunEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_event_durability_keeps_only_display_telemetry_runtime_only() {
+        let runtime_only = [
+            RunEvent::ProviderPhase {
+                response_id: crate::protocol::ModelResponseId::new(),
+                event: crate::llm::ProviderPhaseEvent {
+                    request_id: crate::llm::ProviderRequestId::new(),
+                    endpoint: "http://127.0.0.1:1234/v1".to_string(),
+                    phase: crate::llm::ProviderPhase::AttemptStarted,
+                    attempt: 1,
+                    elapsed_ms: 0,
+                    terminal_status: None,
+                    usage: None,
+                    failure: None,
+                },
+            },
+            RunEvent::TextDelta {
+                response_id: crate::protocol::ModelResponseId::new(),
+                delta: "partial".to_string(),
+            },
+            RunEvent::ReasoningSummaryDelta {
+                response_id: crate::protocol::ModelResponseId::new(),
+                delta: "summary".to_string(),
+            },
+        ];
+        assert!(
+            runtime_only
+                .iter()
+                .all(|event| event.durability() == RunEventDurability::RuntimeOnly)
+        );
+
+        let committed = [
+            RunEvent::SessionStarted {
+                session_id: SessionId::new(),
+                title: "session".to_string(),
+            },
+            RunEvent::AssistantMessageCommitted {
+                response_id: crate::protocol::ModelResponseId::new(),
+                text: "complete".to_string(),
+            },
+        ];
+        assert!(
+            committed
+                .iter()
+                .all(|event| event.durability() == RunEventDurability::Committed)
+        );
+    }
 
     #[test]
     fn request_diagnostics_keeps_legacy_records_without_wire_facts_compatible() {

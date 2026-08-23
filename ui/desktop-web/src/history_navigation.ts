@@ -1,3 +1,4 @@
+import type { FocusTargetCandidate } from "./focus_arbiter.ts";
 import type { TranscriptRow } from "./types.ts";
 
 export interface TranscriptAnchor {
@@ -28,6 +29,11 @@ export interface ThreadEndRevealInput {
   runStartRequested: boolean;
   previouslyNearEnd: boolean;
   updateWantsEnd: boolean;
+}
+
+export interface RunCompletionSample {
+  busy: boolean;
+  terminal: boolean;
 }
 
 export interface ThreadTailFollowOwner {
@@ -72,14 +78,27 @@ export interface PendingHistoryPrepend {
   ownerIdentity: string;
   startingOffset: number;
   commandAccepted: boolean;
+  returnFocusRequested: boolean;
 }
 
 export type HistoryPrependDisposition = "none" | "wait" | "consume" | "discard";
 
+export type HistoryPrependFocusPhase = "loading" | "settled";
+
 export interface HistoryPrependTransition {
   pending: PendingHistoryPrepend | null;
   disposition: HistoryPrependDisposition;
+  focusContinuation: PendingHistoryPrepend | null;
+  focusPhase: HistoryPrependFocusPhase | null;
 }
+
+export type HistoryPrependFocusResult =
+  | "focused-trigger"
+  | "focused-thread"
+  | "already-focused"
+  | "not-requested"
+  | "owned"
+  | "unavailable";
 
 export function turnPageLoadPending(
   state: { pending_async_operations?: ReadonlyArray<string> },
@@ -91,6 +110,14 @@ export function shouldRevealThreadEnd(input: ThreadEndRevealInput): boolean {
   return input.sessionChanged
     || input.runStartRequested
     || (input.previouslyNearEnd && input.updateWantsEnd);
+}
+
+export function runCompletionEdge(
+  previous: RunCompletionSample,
+  current: RunCompletionSample,
+): boolean {
+  return (previous.busy && !current.busy)
+    || (!previous.terminal && current.terminal);
 }
 
 export function pinThreadToEnd(
@@ -329,14 +356,17 @@ export function restoreViewportAnchor(thread: HTMLElement, snapshot: ViewportAnc
 export function createPendingHistoryPrepend(
   state: HistoryPrependProjection,
   generation: number,
+  documentTarget?: Document,
 ): PendingHistoryPrepend | null {
   const ownerIdentity = historyPrependOwnerIdentity(state);
   if (!ownerIdentity || !(state.turn_page_offset > 0)) return null;
+  const trigger = documentTarget ? historyPrependTrigger(documentTarget) : null;
   return {
     generation,
     ownerIdentity,
     startingOffset: state.turn_page_offset,
     commandAccepted: false,
+    returnFocusRequested: trigger !== null && documentTarget?.activeElement === trigger,
   };
 }
 
@@ -357,28 +387,147 @@ export function advancePendingHistoryPrepend(
   pending: PendingHistoryPrepend | null,
   state: HistoryPrependProjection,
 ): HistoryPrependTransition {
-  if (!pending) return { pending: null, disposition: "none" };
+  if (!pending) return emptyHistoryPrependTransition("none");
   if (historyPrependOwnerIdentity(state) !== pending.ownerIdentity) {
-    return { pending: null, disposition: "discard" };
+    return emptyHistoryPrependTransition("discard");
   }
   if (state.turn_page_offset < pending.startingOffset) {
-    return { pending: null, disposition: "consume" };
+    return {
+      pending: null,
+      disposition: "consume",
+      focusContinuation: pending.returnFocusRequested ? pending : null,
+      focusPhase: pending.returnFocusRequested ? "settled" : null,
+    };
   }
   if (state.turn_page_offset > pending.startingOffset) {
-    return { pending: null, disposition: "discard" };
+    return emptyHistoryPrependTransition("discard");
   }
   if (
     !pending.commandAccepted
     || turnPageLoadPending(state)
   ) {
-    return { pending, disposition: "wait" };
+    return {
+      pending,
+      disposition: "wait",
+      focusContinuation: pending.returnFocusRequested ? pending : null,
+      focusPhase: pending.returnFocusRequested ? "loading" : null,
+    };
   }
-  return { pending: null, disposition: "discard" };
+  return emptyHistoryPrependTransition("discard");
 }
 
 export function historyPrependOwnerIdentity(state: HistoryPrependProjection): string | null {
   const sessionId = state.session_rows[state.selected_session_index]?.session_id;
   return sessionId ? `${state.workspace_path}\u0000${sessionId}` : null;
+}
+
+export function historyPrependFocusContinuationIsCurrent(
+  continuation: PendingHistoryPrepend,
+  state: HistoryPrependProjection,
+  pending: PendingHistoryPrepend | null,
+  latestGeneration: number,
+  phase: HistoryPrependFocusPhase,
+): boolean {
+  if (
+    !continuation.returnFocusRequested
+    || continuation.generation !== latestGeneration
+    || historyPrependOwnerIdentity(state) !== continuation.ownerIdentity
+  ) {
+    return false;
+  }
+  if (phase === "loading") {
+    return pending?.generation === continuation.generation
+      && state.turn_page_offset === continuation.startingOffset;
+  }
+  return pending === null && state.turn_page_offset < continuation.startingOffset;
+}
+
+/**
+ * Resolves the exact post-render focus fallback chain without moving focus.
+ * Eligibility such as disabled/hidden/inert is intentionally left to the shared arbiter.
+ */
+export function historyPrependFocusCandidates(
+  documentTarget: Document,
+  continuation: PendingHistoryPrepend,
+): readonly FocusTargetCandidate[] {
+  if (!continuation.returnFocusRequested) return [];
+  return [
+    {
+      resolve: () => {
+        const thread = historyPrependThread(documentTarget);
+        const trigger = historyPrependTrigger(documentTarget);
+        return thread && trigger && elementFullyVisibleWithin(trigger, thread) ? trigger : null;
+      },
+    },
+    { resolve: () => historyPrependThread(documentTarget) },
+  ];
+}
+
+export function focusHistoryPrependReturnIfUnowned(
+  documentTarget: Document,
+  continuation: PendingHistoryPrepend,
+): HistoryPrependFocusResult {
+  if (!continuation.returnFocusRequested) return "not-requested";
+  const thread = historyPrependThread(documentTarget);
+  if (!thread || elementUnavailable(thread)) return "unavailable";
+  const target = historyPrependFocusCandidates(documentTarget, continuation)
+    .map((candidate) => candidate.resolve() as HTMLElement | null)
+    .find((candidate) => candidate !== null && !elementUnavailable(candidate)) ?? null;
+  if (!target) return "unavailable";
+  const trigger = historyPrependTrigger(documentTarget);
+  const active = documentTarget.activeElement;
+  if (active === target) return "already-focused";
+  if (
+    active !== null
+    && active !== documentTarget.body
+    && active !== documentTarget.documentElement
+    && !(active === thread && target === trigger)
+    && !(active === trigger && target === thread)
+  ) {
+    return "owned";
+  }
+  target.focus({ preventScroll: true });
+  if (documentTarget.activeElement !== target) return "unavailable";
+  return target === trigger ? "focused-trigger" : "focused-thread";
+}
+
+function historyPrependThread(documentTarget: Document): HTMLElement | null {
+  return documentTarget.querySelector<HTMLElement>("#thread");
+}
+
+function historyPrependTrigger(documentTarget: Document): HTMLElement | null {
+  return historyPrependThread(documentTarget)?.querySelector<HTMLElement>(
+    '[data-focus-key="load-previous-turn-page"]',
+  ) ?? null;
+}
+
+function elementUnavailable(element: HTMLElement): boolean {
+  return element.matches(":disabled")
+    || element.getAttribute("aria-disabled") === "true"
+    || element.hidden
+    || element.closest("[inert], [aria-hidden='true']") !== null;
+}
+
+function elementFullyVisibleWithin(element: HTMLElement, owner: HTMLElement): boolean {
+  const bounds = element.getBoundingClientRect();
+  const ownerBounds = owner.getBoundingClientRect();
+  return bounds.width > 0
+    && bounds.height > 0
+    && bounds.left >= ownerBounds.left
+    && bounds.top >= ownerBounds.top
+    && bounds.right <= ownerBounds.right
+    && bounds.bottom <= ownerBounds.bottom;
+}
+
+function emptyHistoryPrependTransition(
+  disposition: Extract<HistoryPrependDisposition, "none" | "discard">,
+): HistoryPrependTransition {
+  return {
+    pending: null,
+    disposition,
+    focusContinuation: null,
+    focusPhase: null,
+  };
 }
 
 function transcriptIdentity(row: TranscriptRow): string {

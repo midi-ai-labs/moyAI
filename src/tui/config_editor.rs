@@ -4,241 +4,17 @@ use std::io::Write;
 use camino::{Utf8Path, Utf8PathBuf};
 use tempfile::NamedTempFile;
 
-use crate::config::ProviderEndpoint;
+use crate::config::field::{build_resolved_config_from_field_values, parse_config_field_patch};
 use crate::config::loader::{
     acquire_global_config_write_lease, global_config_path, read_toml_utf8_bounded,
 };
-use crate::config::merge::apply_patch as apply_config_patch;
-use crate::config::model::{
-    AccessMode, McpServerConfig, MultiAgentMode, PartialDoclingConfig, PartialFileGuardConfig,
-    PartialInspectionConfig, PartialMcpConfig, PartialModelConfig, PartialMultiAgentConfig,
-    PartialPermissionsConfig, PartialResolvedConfig, PartialShellConfig, ProviderMetadataMode,
-    ResolvedConfig,
-};
+use crate::config::model::{AccessMode, ResolvedConfig};
+use crate::config::{ConfigField, ProviderEndpoint};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigSaveScope {
     Session,
     Global,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfigField {
-    BaseUrl,
-    Model,
-    ProviderMetadataMode,
-    AccessMode,
-    MultiAgentEnabled,
-    MultiAgentMode,
-    MultiAgentMaxAgents,
-    MultiAgentMaxModelRequests,
-    Temperature,
-    TopP,
-    TopK,
-    PresencePenalty,
-    FrequencyPenalty,
-    Seed,
-    StopSequences,
-    ContextWindow,
-    MaxOutputTokens,
-    RequestTimeoutMs,
-    StreamIdleTimeoutMs,
-    ConnectTimeoutMs,
-    MaxRetries,
-    SupportsTools,
-    SupportsReasoning,
-    SupportsImages,
-    ParallelToolCalls,
-    MaxParallelPredictions,
-    ExtraHeadersJson,
-    ExtraBodyJson,
-    ShellHideWindows,
-    InspectionDefaultMaxDepth,
-    InspectionDefaultMaxEntriesPerDir,
-    InspectionMaxExtensionsReported,
-    InspectionIncludeHiddenByDefault,
-    FileGuardMaxInlineReadBytes,
-    FileGuardLargeFileWarningBytes,
-    FileGuardBlockedReadExtensions,
-    FileGuardStructuredDocumentExtensions,
-    DoclingEnabled,
-    DoclingBaseUrl,
-    DoclingTimeoutMs,
-    DoclingApiKeyEnv,
-    DoclingHeadersJson,
-    McpEnabled,
-    McpServersJson,
-}
-
-impl ConfigField {
-    pub const ALL: [ConfigField; 44] = [
-        ConfigField::BaseUrl,
-        ConfigField::Model,
-        ConfigField::ProviderMetadataMode,
-        ConfigField::AccessMode,
-        ConfigField::MultiAgentEnabled,
-        ConfigField::MultiAgentMode,
-        ConfigField::MultiAgentMaxAgents,
-        ConfigField::MultiAgentMaxModelRequests,
-        ConfigField::Temperature,
-        ConfigField::TopP,
-        ConfigField::TopK,
-        ConfigField::PresencePenalty,
-        ConfigField::FrequencyPenalty,
-        ConfigField::Seed,
-        ConfigField::StopSequences,
-        ConfigField::ContextWindow,
-        ConfigField::MaxOutputTokens,
-        ConfigField::RequestTimeoutMs,
-        ConfigField::StreamIdleTimeoutMs,
-        ConfigField::ConnectTimeoutMs,
-        ConfigField::MaxRetries,
-        ConfigField::SupportsTools,
-        ConfigField::SupportsReasoning,
-        ConfigField::SupportsImages,
-        ConfigField::ParallelToolCalls,
-        ConfigField::MaxParallelPredictions,
-        ConfigField::ExtraHeadersJson,
-        ConfigField::ExtraBodyJson,
-        ConfigField::ShellHideWindows,
-        ConfigField::InspectionDefaultMaxDepth,
-        ConfigField::InspectionDefaultMaxEntriesPerDir,
-        ConfigField::InspectionMaxExtensionsReported,
-        ConfigField::InspectionIncludeHiddenByDefault,
-        ConfigField::FileGuardMaxInlineReadBytes,
-        ConfigField::FileGuardLargeFileWarningBytes,
-        ConfigField::FileGuardBlockedReadExtensions,
-        ConfigField::FileGuardStructuredDocumentExtensions,
-        ConfigField::DoclingEnabled,
-        ConfigField::DoclingBaseUrl,
-        ConfigField::DoclingTimeoutMs,
-        ConfigField::DoclingApiKeyEnv,
-        ConfigField::DoclingHeadersJson,
-        ConfigField::McpEnabled,
-        ConfigField::McpServersJson,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            ConfigField::BaseUrl => "model.base_url",
-            ConfigField::Model => "model.model",
-            ConfigField::ProviderMetadataMode => "model.provider_metadata_mode",
-            ConfigField::AccessMode => "permissions.access_mode",
-            ConfigField::MultiAgentEnabled => "multi_agent.enabled",
-            ConfigField::MultiAgentMode => "multi_agent.mode",
-            ConfigField::MultiAgentMaxAgents => "multi_agent.max_concurrent_agents",
-            ConfigField::MultiAgentMaxModelRequests => "multi_agent.max_concurrent_model_requests",
-            ConfigField::Temperature => "model.temperature",
-            ConfigField::TopP => "model.top_p",
-            ConfigField::TopK => "model.top_k",
-            ConfigField::PresencePenalty => "model.presence_penalty",
-            ConfigField::FrequencyPenalty => "model.frequency_penalty",
-            ConfigField::Seed => "model.seed",
-            ConfigField::StopSequences => "model.stop_sequences",
-            ConfigField::ContextWindow => "model.context_window",
-            ConfigField::MaxOutputTokens => "model.max_output_tokens",
-            ConfigField::RequestTimeoutMs => "model.request_timeout_ms",
-            ConfigField::StreamIdleTimeoutMs => "model.stream_idle_timeout_ms",
-            ConfigField::ConnectTimeoutMs => "model.connect_timeout_ms",
-            ConfigField::MaxRetries => "model.max_retries",
-            ConfigField::SupportsTools => "model.supports_tools",
-            ConfigField::SupportsReasoning => "model.supports_reasoning",
-            ConfigField::SupportsImages => "model.supports_images",
-            ConfigField::ParallelToolCalls => "model.parallel_tool_calls",
-            ConfigField::MaxParallelPredictions => "model.max_parallel_predictions",
-            ConfigField::ExtraHeadersJson => "model.extra_headers_json",
-            ConfigField::ExtraBodyJson => "model.extra_body_json",
-            ConfigField::ShellHideWindows => "shell.hide_windows",
-            ConfigField::InspectionDefaultMaxDepth => "inspection.default_max_depth",
-            ConfigField::InspectionDefaultMaxEntriesPerDir => {
-                "inspection.default_max_entries_per_dir"
-            }
-            ConfigField::InspectionMaxExtensionsReported => "inspection.max_extensions_reported",
-            ConfigField::InspectionIncludeHiddenByDefault => "inspection.include_hidden_by_default",
-            ConfigField::FileGuardMaxInlineReadBytes => "file_guard.max_inline_read_bytes",
-            ConfigField::FileGuardLargeFileWarningBytes => "file_guard.large_file_warning_bytes",
-            ConfigField::FileGuardBlockedReadExtensions => "file_guard.blocked_read_extensions",
-            ConfigField::FileGuardStructuredDocumentExtensions => {
-                "file_guard.structured_document_extensions"
-            }
-            ConfigField::DoclingEnabled => "docling.enabled",
-            ConfigField::DoclingBaseUrl => "docling.base_url",
-            ConfigField::DoclingTimeoutMs => "docling.timeout_ms",
-            ConfigField::DoclingApiKeyEnv => "docling.api_key_env",
-            ConfigField::DoclingHeadersJson => "docling.headers_json",
-            ConfigField::McpEnabled => "mcp.enabled",
-            ConfigField::McpServersJson => "mcp.servers_json",
-        }
-    }
-
-    pub fn env_override(self) -> Option<&'static str> {
-        match self {
-            ConfigField::BaseUrl => Some("MOYAI_BASE_URL"),
-            ConfigField::Model => Some("MOYAI_MODEL"),
-            ConfigField::ProviderMetadataMode => Some("MOYAI_PROVIDER_METADATA_MODE"),
-            ConfigField::AccessMode => Some("MOYAI_ACCESS_MODE"),
-            ConfigField::MultiAgentEnabled => Some("MOYAI_MULTI_AGENT_ENABLED"),
-            ConfigField::MultiAgentMode => Some("MOYAI_MULTI_AGENT_MODE"),
-            ConfigField::MultiAgentMaxAgents => Some("MOYAI_MULTI_AGENT_MAX_AGENTS"),
-            ConfigField::MultiAgentMaxModelRequests => Some("MOYAI_MULTI_AGENT_MAX_MODEL_REQUESTS"),
-            ConfigField::Temperature => Some("MOYAI_TEMPERATURE"),
-            ConfigField::TopP => Some("MOYAI_TOP_P"),
-            ConfigField::TopK => Some("MOYAI_TOP_K"),
-            ConfigField::PresencePenalty => Some("MOYAI_PRESENCE_PENALTY"),
-            ConfigField::FrequencyPenalty => Some("MOYAI_FREQUENCY_PENALTY"),
-            ConfigField::Seed => Some("MOYAI_SEED"),
-            ConfigField::StopSequences => Some("MOYAI_STOP_SEQUENCES"),
-            ConfigField::ContextWindow => Some("MOYAI_CONTEXT_WINDOW"),
-            ConfigField::MaxOutputTokens => Some("MOYAI_MAX_OUTPUT_TOKENS"),
-            ConfigField::RequestTimeoutMs => Some("MOYAI_REQUEST_TIMEOUT_MS"),
-            ConfigField::StreamIdleTimeoutMs => Some("MOYAI_STREAM_IDLE_TIMEOUT_MS"),
-            ConfigField::ConnectTimeoutMs => Some("MOYAI_CONNECT_TIMEOUT_MS"),
-            ConfigField::MaxRetries => Some("MOYAI_MAX_RETRIES"),
-            ConfigField::SupportsTools => Some("MOYAI_SUPPORTS_TOOLS"),
-            ConfigField::SupportsReasoning => Some("MOYAI_SUPPORTS_REASONING"),
-            ConfigField::SupportsImages => Some("MOYAI_SUPPORTS_IMAGES"),
-            ConfigField::ParallelToolCalls => Some("MOYAI_PARALLEL_TOOL_CALLS"),
-            ConfigField::MaxParallelPredictions => Some("MOYAI_MAX_PARALLEL_PREDICTIONS"),
-            ConfigField::ExtraHeadersJson => Some("MOYAI_EXTRA_HEADERS"),
-            ConfigField::ExtraBodyJson => Some("MOYAI_EXTRA_BODY_JSON"),
-            ConfigField::ShellHideWindows => Some("MOYAI_SHELL_HIDE_WINDOWS"),
-            ConfigField::InspectionDefaultMaxDepth => Some("MOYAI_INSPECTION_MAX_DEPTH"),
-            ConfigField::InspectionDefaultMaxEntriesPerDir => {
-                Some("MOYAI_INSPECTION_MAX_ENTRIES_PER_DIR")
-            }
-            ConfigField::InspectionMaxExtensionsReported => {
-                Some("MOYAI_INSPECTION_MAX_EXTENSIONS_REPORTED")
-            }
-            ConfigField::InspectionIncludeHiddenByDefault => {
-                Some("MOYAI_INSPECTION_INCLUDE_HIDDEN")
-            }
-            ConfigField::FileGuardMaxInlineReadBytes => Some("MOYAI_MAX_INLINE_READ_BYTES"),
-            ConfigField::FileGuardLargeFileWarningBytes => Some("MOYAI_LARGE_FILE_WARNING_BYTES"),
-            ConfigField::FileGuardBlockedReadExtensions => Some("MOYAI_BLOCKED_READ_EXTENSIONS"),
-            ConfigField::FileGuardStructuredDocumentExtensions => {
-                Some("MOYAI_STRUCTURED_DOCUMENT_EXTENSIONS")
-            }
-            ConfigField::DoclingEnabled => Some("MOYAI_DOCLING_ENABLED"),
-            ConfigField::DoclingBaseUrl => Some("MOYAI_DOCLING_BASE_URL"),
-            ConfigField::DoclingTimeoutMs => Some("MOYAI_DOCLING_TIMEOUT_MS"),
-            ConfigField::DoclingApiKeyEnv => Some("MOYAI_DOCLING_API_KEY_ENV"),
-            ConfigField::DoclingHeadersJson => Some("MOYAI_DOCLING_HEADERS"),
-            ConfigField::McpEnabled => Some("MOYAI_MCP_ENABLED"),
-            ConfigField::McpServersJson => Some("MOYAI_MCP_SERVERS_JSON"),
-        }
-    }
-
-    fn toml_path(self) -> (&'static str, &'static str) {
-        match self {
-            ConfigField::ExtraHeadersJson => ("model", "extra_headers"),
-            ConfigField::DoclingHeadersJson => ("docling", "headers"),
-            ConfigField::McpServersJson => ("mcp", "servers"),
-            _ => self
-                .label()
-                .split_once('.')
-                .expect("config editor labels are section-qualified"),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -262,7 +38,7 @@ impl ConfigEditorState {
                 .into_iter()
                 .map(|key| ConfigFieldState {
                     key,
-                    value: field_value(key, config),
+                    value: key.value(config),
                     dirty: false,
                 })
                 .collect(),
@@ -331,30 +107,12 @@ impl ConfigEditorState {
     }
 
     pub fn build_resolved_config(&self, base: &ResolvedConfig) -> Result<ResolvedConfig, String> {
-        validate_complete_editor_values(self)?;
-        let mut config = apply_config_patch(base.clone(), parse_editor_patch(self)?);
-
-        for field in &self.fields {
-            if !field.value.trim().is_empty() {
-                continue;
-            }
-            match field.key {
-                ConfigField::Temperature => config.model.temperature = None,
-                ConfigField::TopP => config.model.top_p = None,
-                ConfigField::TopK => config.model.top_k = None,
-                ConfigField::PresencePenalty => config.model.presence_penalty = None,
-                ConfigField::FrequencyPenalty => config.model.frequency_penalty = None,
-                ConfigField::Seed => config.model.seed = None,
-                ConfigField::ExtraHeadersJson => config.model.extra_headers.clear(),
-                ConfigField::ExtraBodyJson => config.model.extra_body_json = None,
-                ConfigField::DoclingApiKeyEnv => config.docling.api_key_env = None,
-                ConfigField::DoclingHeadersJson => config.docling.headers.clear(),
-                ConfigField::McpServersJson => config.mcp.servers.clear(),
-                _ => {}
-            }
-        }
-
-        Ok(config)
+        let fields = self
+            .fields
+            .iter()
+            .map(|field| (field.key, field.value.as_str()))
+            .collect::<Vec<_>>();
+        build_resolved_config_from_field_values(base, &fields)
     }
 
     pub fn save_scope(&self, _root: &Utf8Path, scope: ConfigSaveScope) -> Result<String, String> {
@@ -450,22 +208,22 @@ fn access_mode_from_document(document: &toml::Value) -> Result<AccessMode, Strin
 }
 
 fn save_config_sections(path: &Utf8Path, editor: &ConfigEditorState) -> Result<(), String> {
-    let dirty_fields = editor
+    let dirty_values = editor
         .fields
         .iter()
         .filter(|field| field.dirty)
-        .map(|field| field.key)
+        .map(|field| (field.key, field.value.as_str()))
         .collect::<Vec<_>>();
-    if dirty_fields.is_empty() {
+    if dirty_values.is_empty() {
         return Ok(());
     }
 
     let _write_lease =
         acquire_global_config_write_lease(path).map_err(|error| error.to_string())?;
     let mut existing = read_toml_document(path)?;
-    let patch = parse_editor_patch_matching(editor, true)?;
+    let patch = parse_config_field_patch(&dirty_values)?;
     let patch = toml::Value::try_from(patch).map_err(|error| error.to_string())?;
-    for field in dirty_fields {
+    for (field, _) in dirty_values {
         apply_dirty_toml_field(&mut existing, &patch, field)?;
     }
     normalize_provider_endpoint_in_document(&mut existing)?;
@@ -516,6 +274,14 @@ fn apply_dirty_toml_field(
         })?;
         section.remove(field_name);
     }
+    if field == ConfigField::RequestTimeoutMs {
+        if let Some(model) = root.get_mut("model") {
+            let model = model
+                .as_table_mut()
+                .ok_or_else(|| "global config section `model` must be a TOML table".to_string())?;
+            model.remove("stream_idle_timeout_ms");
+        }
+    }
     Ok(())
 }
 
@@ -553,386 +319,16 @@ fn persist_config_tempfile(path: &Utf8Path, text: &str) -> Result<(), String> {
         .map_err(|error| error.error.to_string())
 }
 
-fn parse_editor_patch(editor: &ConfigEditorState) -> Result<PartialResolvedConfig, String> {
-    parse_editor_patch_matching(editor, false)
-}
-
-fn validate_complete_editor_values(editor: &ConfigEditorState) -> Result<(), String> {
-    for field in &editor.fields {
-        if !field.value.trim().is_empty() || field_allows_empty_complete_value(field.key) {
-            continue;
-        }
-        return Err(format!("{} must not be empty", field.key.label()));
-    }
-    Ok(())
-}
-
-fn field_allows_empty_complete_value(field: ConfigField) -> bool {
-    matches!(
-        field,
-        ConfigField::Temperature
-            | ConfigField::TopP
-            | ConfigField::TopK
-            | ConfigField::PresencePenalty
-            | ConfigField::FrequencyPenalty
-            | ConfigField::Seed
-            | ConfigField::StopSequences
-            | ConfigField::ExtraHeadersJson
-            | ConfigField::ExtraBodyJson
-            | ConfigField::FileGuardBlockedReadExtensions
-            | ConfigField::FileGuardStructuredDocumentExtensions
-            | ConfigField::DoclingApiKeyEnv
-            | ConfigField::DoclingHeadersJson
-            | ConfigField::McpServersJson
-    )
-}
-
-fn parse_editor_patch_matching(
+#[cfg(test)]
+fn parse_editor_patch(
     editor: &ConfigEditorState,
-    dirty_only: bool,
-) -> Result<PartialResolvedConfig, String> {
-    let mut patch = PartialResolvedConfig::default();
-    let mut model = PartialModelConfig::default();
-    let mut permissions = PartialPermissionsConfig::default();
-    let mut multi_agent = PartialMultiAgentConfig::default();
-    let mut shell = PartialShellConfig::default();
-    let mut inspection = PartialInspectionConfig::default();
-    let mut file_guard = PartialFileGuardConfig::default();
-    let mut docling = PartialDoclingConfig::default();
-    let mut mcp = PartialMcpConfig::default();
-
-    for field in &editor.fields {
-        if dirty_only && !field.dirty {
-            continue;
-        }
-        let text = field.value.trim();
-        match field.key {
-            ConfigField::BaseUrl => {
-                model.base_url = match parse_string(text) {
-                    Some(value) => Some(
-                        ProviderEndpoint::parse(&value)
-                            .map_err(|error| error.to_string())?
-                            .as_str()
-                            .to_string(),
-                    ),
-                    None => None,
-                }
-            }
-            ConfigField::Model => model.model = parse_string(text),
-            ConfigField::ProviderMetadataMode => {
-                model.provider_metadata_mode = match parse_string(text) {
-                    Some(value) => Some(parse_provider_metadata_mode(&value)?),
-                    None => None,
-                }
-            }
-            ConfigField::AccessMode => {
-                permissions.access_mode = match parse_string(text) {
-                    Some(value) => Some(parse_access_mode(&value)?),
-                    None => None,
-                }
-            }
-            ConfigField::MultiAgentEnabled => multi_agent.enabled = parse_bool(text)?,
-            ConfigField::MultiAgentMode => {
-                multi_agent.mode = match parse_string(text) {
-                    Some(value) => Some(parse_multi_agent_mode(&value)?),
-                    None => None,
-                }
-            }
-            ConfigField::MultiAgentMaxAgents => {
-                multi_agent.max_concurrent_agents = parse_number(text)?
-            }
-            ConfigField::MultiAgentMaxModelRequests => {
-                multi_agent.max_concurrent_model_requests = parse_number(text)?
-            }
-            ConfigField::Temperature => model.temperature = parse_number(text)?,
-            ConfigField::TopP => model.top_p = parse_number(text)?,
-            ConfigField::TopK => model.top_k = parse_number(text)?,
-            ConfigField::PresencePenalty => model.presence_penalty = parse_number(text)?,
-            ConfigField::FrequencyPenalty => model.frequency_penalty = parse_number(text)?,
-            ConfigField::Seed => model.seed = parse_number(text)?,
-            ConfigField::StopSequences => model.stop_sequences = Some(parse_csv(text)),
-            ConfigField::ContextWindow => model.context_window = parse_number(text)?,
-            ConfigField::MaxOutputTokens => model.max_output_tokens = parse_number(text)?,
-            ConfigField::RequestTimeoutMs => model.request_timeout_ms = parse_number(text)?,
-            ConfigField::StreamIdleTimeoutMs => model.stream_idle_timeout_ms = parse_number(text)?,
-            ConfigField::ConnectTimeoutMs => model.connect_timeout_ms = parse_number(text)?,
-            ConfigField::MaxRetries => model.max_retries = parse_number(text)?,
-            ConfigField::SupportsTools => model.supports_tools = parse_bool(text)?,
-            ConfigField::SupportsReasoning => model.supports_reasoning = parse_bool(text)?,
-            ConfigField::SupportsImages => model.supports_images = parse_bool(text)?,
-            ConfigField::ParallelToolCalls => model.parallel_tool_calls = parse_bool(text)?,
-            ConfigField::MaxParallelPredictions => {
-                model.max_parallel_predictions = parse_number(text)?
-            }
-            ConfigField::ExtraHeadersJson => {
-                model.extra_headers = match parse_string(text) {
-                    Some(value) => Some(
-                        serde_json::from_str(&value)
-                            .map_err(|error| format!("extra_headers_json: {error}"))?,
-                    ),
-                    None => None,
-                }
-            }
-            ConfigField::ExtraBodyJson => {
-                model.extra_body_json = match parse_string(text) {
-                    Some(value) => Some(
-                        serde_json::from_str(&value)
-                            .map_err(|error| format!("extra_body_json: {error}"))?,
-                    ),
-                    None => None,
-                }
-            }
-            ConfigField::ShellHideWindows => shell.hide_windows = parse_bool(text)?,
-            ConfigField::InspectionDefaultMaxDepth => {
-                inspection.default_max_depth = parse_number(text)?
-            }
-            ConfigField::InspectionDefaultMaxEntriesPerDir => {
-                inspection.default_max_entries_per_dir = parse_number(text)?
-            }
-            ConfigField::InspectionMaxExtensionsReported => {
-                inspection.max_extensions_reported = parse_number(text)?
-            }
-            ConfigField::InspectionIncludeHiddenByDefault => {
-                inspection.include_hidden_by_default = parse_bool(text)?
-            }
-            ConfigField::FileGuardMaxInlineReadBytes => {
-                file_guard.max_inline_read_bytes = parse_number(text)?
-            }
-            ConfigField::FileGuardLargeFileWarningBytes => {
-                file_guard.large_file_warning_bytes = parse_number(text)?
-            }
-            ConfigField::FileGuardBlockedReadExtensions => {
-                file_guard.blocked_read_extensions = Some(parse_extension_csv(text))
-            }
-            ConfigField::FileGuardStructuredDocumentExtensions => {
-                file_guard.structured_document_extensions = Some(parse_extension_csv(text))
-            }
-            ConfigField::DoclingEnabled => docling.enabled = parse_bool(text)?,
-            ConfigField::DoclingBaseUrl => docling.base_url = parse_string(text),
-            ConfigField::DoclingTimeoutMs => docling.timeout_ms = parse_number(text)?,
-            ConfigField::DoclingApiKeyEnv => docling.api_key_env = Some(parse_string(text)),
-            ConfigField::DoclingHeadersJson => {
-                docling.headers = match parse_string(text) {
-                    Some(value) => Some(
-                        serde_json::from_str(&value)
-                            .map_err(|error| format!("docling.headers_json: {error}"))?,
-                    ),
-                    None => None,
-                }
-            }
-            ConfigField::McpEnabled => mcp.enabled = parse_bool(text)?,
-            ConfigField::McpServersJson => {
-                mcp.servers = match parse_string(text) {
-                    Some(value) => Some(
-                        serde_json::from_str::<Vec<McpServerConfig>>(&value)
-                            .map_err(|error| format!("mcp.servers_json: {error}"))?,
-                    ),
-                    None => None,
-                }
-            }
-        }
-    }
-
-    patch.model = Some(model);
-    patch.permissions = Some(permissions);
-    patch.multi_agent = Some(multi_agent);
-    patch.shell = Some(shell);
-    patch.inspection = Some(inspection);
-    patch.file_guard = Some(file_guard);
-    patch.docling = Some(docling);
-    patch.mcp = Some(mcp);
-    Ok(patch)
-}
-
-fn parse_provider_metadata_mode(value: &str) -> Result<ProviderMetadataMode, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "lm_studio_native_required"
-        | "lm-studio-native-required"
-        | "lmstudio"
-        | "lm_studio"
-        | "lm-studio" => Ok(ProviderMetadataMode::LmStudioNativeRequired),
-        "openai_compatible_only"
-        | "openai-compatible-only"
-        | "openai"
-        | "openai_compat"
-        | "openai-compatible" => Ok(ProviderMetadataMode::OpenAiCompatibleOnly),
-        other => Err(format!("unsupported provider_metadata_mode `{other}`")),
-    }
-}
-
-fn parse_access_mode(value: &str) -> Result<AccessMode, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "default" | "normal" => Ok(AccessMode::Default),
-        "auto_review" | "auto-review" | "autoreview" | "auto" => Ok(AccessMode::AutoReview),
-        "full_access" | "full-access" | "full" => Ok(AccessMode::FullAccess),
-        other => Err(format!("unsupported access_mode `{other}`")),
-    }
-}
-
-fn parse_multi_agent_mode(value: &str) -> Result<MultiAgentMode, String> {
-    MultiAgentMode::parse(&value.to_ascii_lowercase())
-        .ok_or_else(|| format!("unsupported multi_agent.mode `{value}`"))
-}
-
-fn parse_string(value: &str) -> Option<String> {
-    (!value.is_empty()).then(|| value.to_string())
-}
-
-fn parse_csv(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
-fn parse_extension_csv(value: &str) -> Vec<String> {
-    parse_csv(value)
-        .into_iter()
-        .map(|value| value.trim_start_matches('.').to_ascii_lowercase())
-        .collect()
-}
-
-fn parse_bool(value: &str) -> Result<Option<bool>, String> {
-    if value.is_empty() {
-        return Ok(None);
-    }
-    value
-        .parse::<bool>()
-        .map(Some)
-        .map_err(|error| error.to_string())
-}
-
-fn parse_number<T>(value: &str) -> Result<Option<T>, String>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    if value.is_empty() {
-        return Ok(None);
-    }
-    value
-        .parse::<T>()
-        .map(Some)
-        .map_err(|error| error.to_string())
-}
-
-fn field_value(key: ConfigField, config: &ResolvedConfig) -> String {
-    match key {
-        ConfigField::BaseUrl => config.model.base_url.clone(),
-        ConfigField::Model => config.model.model.clone(),
-        ConfigField::ProviderMetadataMode => match config.model.provider_metadata_mode {
-            ProviderMetadataMode::LmStudioNativeRequired => "lm_studio_native_required".to_string(),
-            ProviderMetadataMode::OpenAiCompatibleOnly => "openai_compatible_only".to_string(),
-        },
-        ConfigField::AccessMode => match config.permissions.access_mode {
-            AccessMode::Default => "default".to_string(),
-            AccessMode::AutoReview => "auto_review".to_string(),
-            AccessMode::FullAccess => "full_access".to_string(),
-        },
-        ConfigField::MultiAgentEnabled => config.multi_agent.enabled.to_string(),
-        ConfigField::MultiAgentMode => config.multi_agent.mode.as_str().to_string(),
-        ConfigField::MultiAgentMaxAgents => config.multi_agent.max_concurrent_agents.to_string(),
-        ConfigField::MultiAgentMaxModelRequests => {
-            config.multi_agent.max_concurrent_model_requests.to_string()
-        }
-        ConfigField::Temperature => config
-            .model
-            .temperature
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        ConfigField::TopP => config
-            .model
-            .top_p
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        ConfigField::TopK => config
-            .model
-            .top_k
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        ConfigField::PresencePenalty => config
-            .model
-            .presence_penalty
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        ConfigField::FrequencyPenalty => config
-            .model
-            .frequency_penalty
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        ConfigField::Seed => config
-            .model
-            .seed
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-        ConfigField::StopSequences => config.model.stop_sequences.join(", "),
-        ConfigField::ContextWindow => config.model.context_window.to_string(),
-        ConfigField::MaxOutputTokens => config.model.max_output_tokens.to_string(),
-        ConfigField::RequestTimeoutMs => config.model.request_timeout_ms.to_string(),
-        ConfigField::StreamIdleTimeoutMs => config.model.stream_idle_timeout_ms.to_string(),
-        ConfigField::ConnectTimeoutMs => config.model.connect_timeout_ms.to_string(),
-        ConfigField::MaxRetries => config.model.max_retries.to_string(),
-        ConfigField::SupportsTools => config.model.supports_tools.to_string(),
-        ConfigField::SupportsReasoning => config.model.supports_reasoning.to_string(),
-        ConfigField::SupportsImages => config.model.supports_images.to_string(),
-        ConfigField::ParallelToolCalls => config.model.parallel_tool_calls.to_string(),
-        ConfigField::MaxParallelPredictions => config.model.max_parallel_predictions.to_string(),
-        ConfigField::ExtraHeadersJson => {
-            serde_json::to_string(&config.model.extra_headers).unwrap_or_default()
-        }
-        ConfigField::ExtraBodyJson => config
-            .model
-            .extra_body_json
-            .as_ref()
-            .map(ValueExt::to_json_string)
-            .unwrap_or_default(),
-        ConfigField::ShellHideWindows => config.shell.hide_windows.to_string(),
-        ConfigField::InspectionDefaultMaxDepth => config.inspection.default_max_depth.to_string(),
-        ConfigField::InspectionDefaultMaxEntriesPerDir => {
-            config.inspection.default_max_entries_per_dir.to_string()
-        }
-        ConfigField::InspectionMaxExtensionsReported => {
-            config.inspection.max_extensions_reported.to_string()
-        }
-        ConfigField::InspectionIncludeHiddenByDefault => {
-            config.inspection.include_hidden_by_default.to_string()
-        }
-        ConfigField::FileGuardMaxInlineReadBytes => {
-            config.file_guard.max_inline_read_bytes.to_string()
-        }
-        ConfigField::FileGuardLargeFileWarningBytes => {
-            config.file_guard.large_file_warning_bytes.to_string()
-        }
-        ConfigField::FileGuardBlockedReadExtensions => {
-            config.file_guard.blocked_read_extensions.join(", ")
-        }
-        ConfigField::FileGuardStructuredDocumentExtensions => {
-            config.file_guard.structured_document_extensions.join(", ")
-        }
-        ConfigField::DoclingEnabled => config.docling.enabled.to_string(),
-        ConfigField::DoclingBaseUrl => config.docling.base_url.clone(),
-        ConfigField::DoclingTimeoutMs => config.docling.timeout_ms.to_string(),
-        ConfigField::DoclingApiKeyEnv => config.docling.api_key_env.clone().unwrap_or_default(),
-        ConfigField::DoclingHeadersJson => {
-            serde_json::to_string(&config.docling.headers).unwrap_or_default()
-        }
-        ConfigField::McpEnabled => config.mcp.enabled.to_string(),
-        ConfigField::McpServersJson => {
-            serde_json::to_string(&config.mcp.servers).unwrap_or_default()
-        }
-    }
-}
-
-trait ValueExt {
-    fn to_json_string(&self) -> String;
-}
-
-impl ValueExt for serde_json::Value {
-    fn to_json_string(&self) -> String {
-        self.to_string()
-    }
+) -> Result<crate::config::model::PartialResolvedConfig, String> {
+    let fields = editor
+        .fields
+        .iter()
+        .map(|field| (field.key, field.value.as_str()))
+        .collect::<Vec<_>>();
+    parse_config_field_patch(&fields)
 }
 
 #[cfg(test)]
@@ -960,6 +356,41 @@ mod tests {
 
         assert!(!labels.contains(&"model.prompt_profile"));
         assert!(!labels.contains(&"session.max_steps_per_turn"));
+    }
+
+    #[test]
+    fn config_editor_exposes_one_typed_llm_response_timeout() {
+        let config = ResolvedConfig::default();
+        let editor = ConfigEditorState::from_config(&config);
+        let timeout_fields = editor
+            .fields
+            .iter()
+            .filter(|field| field.key.label().contains("timeout"))
+            .collect::<Vec<_>>();
+
+        let response_timeout = editor
+            .fields
+            .iter()
+            .find(|field| field.key == ConfigField::RequestTimeoutMs)
+            .expect("canonical LLM response timeout field");
+
+        assert_eq!(response_timeout.value, "3600000");
+        assert_eq!(response_timeout.key.display_label(), "LLM response timeout");
+        assert!(response_timeout.key.help().contains("stream完了"));
+        assert!(
+            editor
+                .fields
+                .iter()
+                .all(|field| field.key.label() != "model.stream_idle_timeout_ms")
+        );
+        assert_eq!(
+            timeout_fields
+                .iter()
+                .filter(|field| field.key.label().starts_with("model."))
+                .count(),
+            2,
+            "the model surface retains the response and connect timeout settings only"
+        );
     }
 
     #[test]
@@ -1241,6 +672,141 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&path).expect("read config"),
             original
+        );
+    }
+
+    #[test]
+    fn saving_request_timeout_replaces_the_legacy_stream_timeout_alias() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        std::fs::write(
+            &path,
+            "[model]\nstream_idle_timeout_ms = 3600000\nmodel = \"keep-model\"\n",
+        )
+        .expect("legacy timeout config");
+        let mut effective = ResolvedConfig::default();
+        effective.model.request_timeout_ms = 3_600_000;
+        effective.model.model = "keep-model".to_string();
+        let mut editor = ConfigEditorState::from_config(&effective);
+        let timeout = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::RequestTimeoutMs)
+            .expect("canonical timeout field");
+        timeout.value = "1800000".to_string();
+        timeout.dirty = true;
+
+        save_config_sections(&path, &editor).expect("save canonical timeout");
+
+        let saved = std::fs::read_to_string(&path).expect("read saved config");
+        let saved: toml::Value = toml::from_str(&saved).expect("parse saved config");
+        assert_eq!(
+            saved["model"]["request_timeout_ms"].as_integer(),
+            Some(1_800_000)
+        );
+        assert!(saved["model"].get("stream_idle_timeout_ms").is_none());
+        assert_eq!(saved["model"]["model"].as_str(), Some("keep-model"));
+    }
+
+    #[test]
+    fn request_timeout_range_is_enforced_before_apply_or_persist() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        let sentinel = "[model]\nmodel = \"keep-model\"\n";
+        std::fs::write(&path, sentinel).expect("config sentinel");
+        let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+        let timeout = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::RequestTimeoutMs)
+            .expect("canonical timeout field");
+        timeout.value = "3600001".to_string();
+        timeout.dirty = true;
+
+        let apply_error = editor
+            .build_resolved_config(&ResolvedConfig::default())
+            .expect_err("out-of-range timeout must not enter session config");
+        let save_error = save_config_sections(&path, &editor)
+            .expect_err("out-of-range timeout must not reach disk");
+
+        assert!(apply_error.contains("between 1 and 3600000"));
+        assert!(save_error.contains("between 1 and 3600000"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("unchanged config"),
+            sentinel
+        );
+    }
+
+    #[test]
+    fn interactive_constraints_are_rejected_before_session_commit_or_disk_write() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        let sentinel = "[model]\nmodel = \"keep-model\"\n";
+
+        for (field, value) in [
+            (ConfigField::ContextWindow, "0"),
+            (ConfigField::MaxParallelPredictions, "0"),
+            (ConfigField::MultiAgentMaxAgents, "0"),
+            (ConfigField::MultiAgentMaxModelRequests, "0"),
+            (ConfigField::Temperature, "NaN"),
+            (ConfigField::TopP, "inf"),
+            (ConfigField::PresencePenalty, "-inf"),
+            (ConfigField::FrequencyPenalty, "NaN"),
+        ] {
+            std::fs::write(&path, sentinel).expect("reset config sentinel");
+            let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+            let edited = editor
+                .fields
+                .iter_mut()
+                .find(|candidate| candidate.key == field)
+                .expect("interactive config field");
+            edited.value = value.to_string();
+            edited.dirty = true;
+
+            let apply_error = editor
+                .build_resolved_config(&ResolvedConfig::default())
+                .expect_err("invalid value must not enter the session config");
+            let save_error = save_config_sections(&path, &editor)
+                .expect_err("invalid value must not reach the global config");
+
+            assert!(apply_error.contains(field.label()), "{apply_error}");
+            assert!(save_error.contains(field.label()), "{save_error}");
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("unchanged config"),
+                sentinel,
+                "{} must fail before persistence",
+                field.label(),
+            );
+        }
+    }
+
+    #[test]
+    fn clearing_request_timeout_without_a_model_section_is_a_noop() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        std::fs::write(&path, "[format]\nensure_trailing_newline = false\n")
+            .expect("config without model section");
+        let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+        let timeout = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::RequestTimeoutMs)
+            .expect("canonical timeout field");
+        timeout.value.clear();
+        timeout.dirty = true;
+
+        save_config_sections(&path, &editor).expect("clear inherited timeout override");
+
+        let saved = std::fs::read_to_string(&path).expect("saved config");
+        let saved: toml::Value = toml::from_str(&saved).expect("parse saved config");
+        assert!(saved.get("model").is_none());
+        assert_eq!(
+            saved["format"]["ensure_trailing_newline"].as_bool(),
+            Some(false)
         );
     }
 

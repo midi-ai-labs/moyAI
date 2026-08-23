@@ -59,7 +59,7 @@ moyAI は、そうした環境でも使いやすい開発用の相棒を目指�
 
 ## できること
 
-- Project Chat / Quick Chat / Transcript / Artifact Pane / Settings を備えた Tauri Desktop App
+- Project Chat / Quick Chat / Transcript / Artifact Pane / Settings と、メインとは別modelで動くtool-lessなsession-scopedサイドチャットを備えた Tauri Desktop App
 - Desktop は1ユーザーにつき1 instanceだけ起動し、再起動操作では既存windowを復元
 - Desktop の Stop は表示時のworkspace / root session / run generation / Agent Tree epochを検証し、古い画面操作を別runへ適用しない。Settingsの入力値、baseline、dirty状態、monotonic revisionはfrontend local draftだけが所有し、Rustにmirrorを置かない。Rustはtyped clean/dirty capability variantを投影し、Apply / Save / Reset / 別config owner mutationの前にcomplete draftとdecimal-string config generation targetをstatelessに検証する。commit時は一時的な完全`ResolvedConfig`を一度だけ作り、optionalの空欄を古いglobal/base値から再継承しない。active steerもdurable受理後だけ入力をclearする
 - terminal から利用できる CLI / TUI
@@ -167,8 +167,7 @@ model = "qwen/qwen3.6-27b"
 provider_metadata_mode = "lm_studio_native_required"
 provider_api_mode = "responses"
 reasoning_summary = "none"
-request_timeout_ms = 1800000
-stream_idle_timeout_ms = 1800000
+request_timeout_ms = 3600000
 context_window = 131072
 supports_tools = true
 supports_images = true
@@ -194,11 +193,12 @@ base_url = "http://127.0.0.1:8123"
 enabled = false
 ```
 
-`request_timeout_ms`はconnect attempt、connect retry待機、request body送信、response header待ちを共有する一つの
-response-start operation budget、`stream_idle_timeout_ms`はstream開始後にSSE eventが届かない期間の
-rolling timeoutです。どちらも既定値は1,800,000ms（30分）です。この2設定は変更可能なno-progress deadlineで、
-aggregate stream capではありません。別にresponse header受信後は、製品固定で変更できない
-1,800,000ms（30分）のaggregate stream-duration limitが適用され、どちらの設定を増やしてもこの上限は延長されません。
+`request_timeout_ms`は、1回のprovider generation request全体を所有する単一deadlineです。最初のPOST attemptから
+connect retry待機、request body送信、response header待ち、stream terminalまでを含み、header受信時に時計を
+リセットしません。既定値は3,600,000ms（60分）で、設定可能な上限も同じ値です。Desktop Settings、
+TUI、ImportしたTOML、`MOYAI_REQUEST_TIMEOUT_MS`は同じ値を使います。旧`stream_idle_timeout_ms` TOML keyと
+`MOYAI_STREAM_IDLE_TIMEOUT_MS` environment variableは移行入力としてだけ受理します。旧keyだけならrequest timeoutへ
+昇格し、新旧が同値なら受理し、異なる値なら黙って片方を選ばずconfig errorを返します。
 `max_output_tokens`は通常文だけでなくreasoningとtool-call引数のserialized output全体を制限します。
 文書全体を`write`するようなtool-heavy runではproviderごとに検証済みのbudgetを使い、製品既定値は
 `32768`です。provider側の`response.failed`、例えば
@@ -259,7 +259,6 @@ effect = "read"
 - `MOYAI_DATA_DIR`
 - `MOYAI_ACCESS_MODE`
 - `MOYAI_REQUEST_TIMEOUT_MS`
-- `MOYAI_STREAM_IDLE_TIMEOUT_MS`
 - `MOYAI_CONTEXT_WINDOW`
 - `MOYAI_MAX_OUTPUT_TOKENS`
 - `MOYAI_SUPPORTS_IMAGES`

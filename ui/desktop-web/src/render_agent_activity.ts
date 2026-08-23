@@ -10,6 +10,7 @@ import {
 } from "./agent_activity.ts";
 import type { AgentActivityRow, DesktopWebState } from "./types.ts";
 import type { AgentExecutionCacheEntry } from "./ui_state.ts";
+import { agentExecutionPreviousFocusKey } from "./agent_execution_prepend_continuation.ts";
 import { renderTranscriptRows } from "./render_transcript.ts";
 import { escapeHtml } from "./utils.ts";
 
@@ -116,15 +117,16 @@ function renderAgentJobCard(row: AgentActivityRow, selectedAgentPath: string | n
 
 function renderInspectorListCard(row: AgentActivityRow): string {
   const visual = stableAgentVisual(row.agent_path);
+  const label = agentDisplayName(row);
   const preview = plainAgentPreview(activityPreview(row) || row.task_preview.trim());
   return `<div class="sub-agent-list-card-shell">
     <button type="button" class="sub-agent-list-card agent-tone-${visual.tone} agent-status-${row.status} ${row.updated ? "updated" : ""}"
       data-action="show-agent-pane" data-agent-path="${escapeHtml(row.agent_path)}"
       data-focus-key="sub-agent-card:${escapeHtml(row.agent_path)}"
-      aria-label="${escapeHtml(`${agentDisplayName(row)}のSub Agent履歴を表示`)}"
+      title="${escapeHtml(label)}" aria-label="${escapeHtml(`${label}のSub Agent履歴を表示`)}"
       aria-controls="sub-agent-inspector">
       <span class="agent-symbol" aria-hidden="true">${visual.glyph}</span>
-      <span class="agent-job-copy"><strong>${escapeHtml(agentDisplayName(row))}</strong><small>${escapeHtml(preview)}</small></span>
+      <span class="agent-job-copy"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(preview)}</small></span>
       <span class="agent-status-label">${escapeHtml(agentStatusLabel(row.status))}</span>
       <span class="agent-job-chevron" aria-hidden="true">›</span>
     </button>
@@ -144,7 +146,9 @@ function renderAgentExecution(row: AgentActivityRow, execution: AgentExecutionCa
     : "";
   const previousHistoryAction = projection?.turn_page_has_previous
     ? `<button type="button" class="agent-execution-previous" data-action="load-previous-agent-execution-page"
-         data-agent-path="${escapeHtml(row.agent_path)}" ${execution?.status === "loading" ? "disabled" : ""}>
+         data-agent-path="${escapeHtml(row.agent_path)}"
+         data-focus-key="${escapeHtml(agentExecutionPreviousFocusKey(row.agent_path))}"
+         ${execution?.status === "loading" ? 'disabled aria-disabled="true"' : ""}>
          ${execution?.status === "loading" ? '<span class="busy-spinner small"></span><span>読み込み中</span>' : "以前の実行履歴"}
        </button>`
     : "";
@@ -169,7 +173,7 @@ function renderAgentExecution(row: AgentActivityRow, execution: AgentExecutionCa
 }
 
 function renderAgentInterruptButton(row: AgentActivityRow): string {
-  if (row.status !== "running" || !row.can_interrupt || row.active_turn_id === null) return "";
+  if (row.interrupt_target === null) return "";
   return `<button type="button" class="icon-only danger agent-interrupt"
     data-action="interrupt-agent" data-agent-path="${escapeHtml(row.agent_path)}"
     title="${escapeHtml(`${agentDisplayName(row)}を停止`)}"

@@ -1,43 +1,97 @@
 import { command } from "./api.ts";
-import { dispatchRegisteredAction, type ActionContext } from "./actions.ts";
 import {
-  beginConfigMutation,
+  actionEnabledById,
+  dispatchAction,
+  persistSideChatDraft,
+  type ActionContext,
+  type ActionPayload,
+} from "./actions.ts";
+import {
   configMutationValues,
-  finishConfigMutation,
   reconcileConfigDraftTarget,
   type ConfigValueInput,
   updateConfigDraftValue,
 } from "./config_mutation.ts";
 import {
-  beginLocalDecision,
-  failLocalDecision,
-  finishLocalDecision,
   permissionDecisionForEscape,
 } from "./decision_state.ts";
 import {
+  confirmationFocusIsMeaningful,
   confirmationFocusSelectors,
   isRegularModalOverlay,
+  localModalIdentity,
   modalIdentity,
   modalIsOpen,
-  nextDialogFocusIndex,
+  overlayPrimaryFocusRequired,
+  overlayPrimaryFocusSelectors,
 } from "./modal_state.ts";
-import { globalShortcutAction } from "./keyboard_shortcut.ts";
-import { navigationIsIdle } from "./navigation_state.ts";
-import { rowMutationArgs } from "./row_target.ts";
-import { composerSendTitle } from "./render.ts";
-import { TitlebarDragGesture, windowControlKeyboardActivation } from "./titlebar_interaction.ts";
+import { containDialogFocus } from "./dialog_focus.ts";
+import type { PostRenderFocusIntent } from "./focus_arbiter.ts";
+import {
+  globalShortcutAction,
+  modalShortcutShouldPreventDefault,
+  type KeyboardShortcutSample,
+} from "./keyboard_shortcut.ts";
+import { repeatedNewSessionPointerActivation } from "./new_session_mutation.ts";
+import {
+  abandonQuickChatDeleteFocusContinuation,
+} from "./quick_chat_delete_focus_continuation.ts";
+import { composerSendTitle, sideChatCatalogStatusText } from "./render.ts";
+import {
+  applyTitlebarMenuRovingTabIndex,
+  TitlebarDragGesture,
+  titlebarMenuFromOverlay,
+  titlebarMenuKeyboardDecision,
+  titlebarMenuTabContinuationAction,
+  titlebarMenuTriggerAction,
+  titlebarMenuUsesRovingFocus,
+  windowControlKeyboardActivation,
+} from "./titlebar_interaction.ts";
 import type {
   ConfigFieldProjection,
   ConfigMutationTarget,
   DesktopViewState,
   DesktopWebState,
-  RowMutationTarget,
 } from "./types.ts";
-import type { UiLocalState } from "./ui_state.ts";
-import { goalSlashCommandHint, validateConfigInput } from "./utils.ts";
 import {
-  deriveUiCapabilities,
-  activeConfigDraftProjection,
+  sideChatConfigurationOpen,
+  sideChatCatalogViewForState,
+  sideChatDeleteConfirmationStillTargets,
+  sideChatDraftForState,
+  sideChatModelOptionLabel,
+  sideChatModelOptions,
+  sideChatMutationPending,
+  sideChatOperationsOpen,
+  sideChatOwnerSessionId,
+  type UiLocalState,
+} from "./ui_state.ts";
+import {
+  goalSlashCommandHint,
+  providerOverlayFeedback,
+  validateConfigFieldValues,
+  validateConfigInput,
+  validateSideChatProviderSettings,
+} from "./utils.ts";
+import {
+  activateSettingsSectionNavigation,
+  settingsSurfaceIdentity,
+} from "./settings_surface.ts";
+import {
+  beginMainRunFocusContinuation,
+  pointerTargetsMainRunControl,
+} from "./run_focus_continuation.ts";
+import {
+  beginSideChatFocusContinuation,
+  invalidateSideChatFocusInteraction,
+  pointerTargetsSideChatRunControl,
+} from "./side_chat_focus_continuation.ts";
+import {
+  invalidateRefreshPromptFocus,
+  recordRefreshPointerInteraction,
+  wireMainPromptInputOnce,
+} from "./main_prompt_continuity.ts";
+import {
+  composerOwner,
   configDraftEditOpen,
   draftMutationTarget,
   localSearchOwner,
@@ -50,6 +104,7 @@ let opacityPreviewFrame: number | null = null;
 let opacityPreviewInFlight = false;
 let delegatedEventsInstalled = false;
 const TEXT_MUTATION_DEBOUNCE_MS = 180;
+const SIDE_CHAT_DRAFT_DEBOUNCE_MS = 450;
 const MIN_WINDOW_OPACITY_PERCENT = 50;
 const MAX_WINDOW_OPACITY_PERCENT = 100;
 
@@ -65,51 +120,252 @@ interface PendingTextMutation {
   generation: number;
 }
 
+export interface TextMutationSettlementOwner {
+  readonly hasQueuedValue: boolean;
+  readonly currentGeneration: number;
+  readonly requestGeneration: number;
+  readonly targetStillMatches: boolean;
+}
+
 const pendingTextMutations = new Map<string, PendingTextMutation>();
 let nextTextMutationGeneration = 1;
 const titlebarDragGesture = new TitlebarDragGesture();
+const NON_TEXT_INPUT_TYPES = new Set([
+  "button",
+  "checkbox",
+  "color",
+  "file",
+  "hidden",
+  "image",
+  "radio",
+  "range",
+  "reset",
+  "submit",
+]);
+const TEXT_SELECTION_INPUT_TYPES = new Set(["text", "search", "tel", "url", "password"]);
+
+interface SettingsSelectAllShortcutSample {
+  key: string;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  altKey: boolean;
+}
 
 export function installGlobalKeyboardShortcuts(context: ActionContext): void {
   document.addEventListener("keydown", (event) => {
     if (event.isComposing || event.keyCode === 229) return;
     const currentState = context.getViewState();
+    const target = event.target;
+    const sideChatDeleteTarget = currentState && sideChatDeleteConfirmationStillTargets(
+      context.uiState.sideChatDeleteConfirmation,
+      currentState,
+    ) ? context.uiState.sideChatDeleteConfirmation : null;
+    const activeLocalModalIdentity = localModalIdentity(
+      context.uiState.pendingLocalConfirmation !== null,
+      sideChatDeleteTarget,
+    );
+    if (
+      event.key === "Escape"
+      && currentState
+      && !currentState.confirmation_visible
+      && activeLocalModalIdentity?.startsWith("side-chat-delete:")
+      && sideChatDeleteTarget
+    ) {
+      event.preventDefault();
+      if (!sideChatMutationPending(context.uiState, sideChatDeleteTarget.ownerSessionId)) {
+        void dispatchAction(
+          "cancel-delete-side-chat",
+          context,
+          { index: -1, value: "" },
+        ).catch((error) => context.reportError(error));
+      }
+      return;
+    }
+    if (currentState && handleTitlebarMenuKeyboard(event, currentState, context)) return;
     if (
       currentState &&
-      modalIsOpen(currentState, context.uiState.pendingLocalConfirmation !== null)
+      modalIsOpen(currentState, activeLocalModalIdentity !== null)
     ) {
-      if (event.key === "Tab") {
+      if (handleSettingsSelectAllShortcut(event, currentState)) {
+        event.preventDefault();
+      } else if (event.key === "Tab") {
         trapDialogFocus(event);
       } else if (event.key === "Escape" && currentState.confirmation_visible) {
         event.preventDefault();
         if (permissionDecisionForEscape(currentState.confirmation_visible, event.repeat) === "abort") {
-          void dispatchRegisteredAction("abort-permission", currentState, context, { index: -1, value: "" });
+          void dispatchAction("abort-permission", context, { index: -1, value: "" });
         }
       } else if (event.key === "Escape" && context.uiState.pendingLocalConfirmation) {
         event.preventDefault();
-        if (!context.uiState.localConfirmationDecisionPending) {
-          context.uiState.pendingLocalConfirmation = null;
-          context.uiState.localConfirmationDecisionError = "";
-          context.rerender();
-        }
+        void dispatchAction("cancel-local-confirm", context, { index: -1, value: "" })
+          .catch((error) => context.reportError(error));
       } else if (event.key === "Escape" && isRegularModalOverlay(currentState.overlay)) {
         event.preventDefault();
-        if (!startupSetupRequired(currentState)) void context.mutate("close_overlay");
-      } else if (event.ctrlKey || event.metaKey || event.altKey || /^F\d+$/.test(event.key)) {
+        if (!startupSetupRequired(currentState)) dismissOverlayForState(currentState, context);
+      } else if (modalShortcutShouldPreventDefault(
+        event,
+        isRegularModalOverlay(currentState.overlay) && isNativeTextEditingTarget(target),
+      )) {
         event.preventDefault();
       }
       return;
     }
-    const shortcutAction = globalShortcutAction(event);
+    const shortcutAction = shortcutActionForComposer(
+      event,
+      target instanceof Element && target.closest("#side-chat-prompt") !== null,
+    );
     if (shortcutAction && currentState) {
       event.preventDefault();
-      void dispatchRegisteredAction(shortcutAction, currentState, context, { index: -1, value: "" });
+      void dispatchAction(shortcutAction, context, {
+        index: -1,
+        value: "",
+        activationSource: "shortcut",
+      });
     }
     if (event.key === "Escape" && currentState && currentState.overlay !== "none") {
       event.preventDefault();
       if (startupSetupRequired(currentState)) return;
-      void context.mutate("close_overlay");
+      dismissOverlayForState(currentState, context);
     }
   });
+}
+
+export function overlayDismissAction(overlay: string): "cancel-review" | "close-overlay" {
+  return overlay === "prompt_review" ? "cancel-review" : "close-overlay";
+}
+
+function startupSetupRequired(state: DesktopWebState): boolean {
+  return state.startup.initial_setup_required && state.startup.action_overlay === state.overlay;
+}
+
+function dismissOverlayForState(state: DesktopViewState, context: ActionContext): void {
+  void dispatchAction(overlayDismissAction(state.overlay), context, { index: -1, value: "" }).catch((error) =>
+    context.reportError(error),
+  );
+}
+
+function handleTitlebarMenuKeyboard(
+  event: KeyboardEvent,
+  state: DesktopViewState,
+  context: ActionContext,
+): boolean {
+  if (!titlebarMenuFromOverlay(state.overlay)) return false;
+  const target = event.target;
+  if (!(target instanceof Element)) return false;
+  const popover = target.closest<HTMLElement>(".titlebar-popover[data-titlebar-menu]");
+  if (!popover) return false;
+  if (event.key === "Escape" && event.repeat) {
+    event.preventDefault();
+    event.stopPropagation();
+    return true;
+  }
+  const actions = Array.from(
+    popover.querySelectorAll<HTMLElement>(
+      "button[data-titlebar-menu-action]:not(:disabled):not([aria-disabled='true'])",
+    ),
+  );
+  const currentAction = target.closest<HTMLElement>("button[data-titlebar-menu-action]");
+  const nativeWidget = !titlebarMenuUsesRovingFocus(popover.getAttribute("role"))
+    || target.closest("input, select, textarea, [contenteditable='true']") !== null;
+  const decision = titlebarMenuKeyboardDecision(
+    event.key,
+    currentAction ? actions.indexOf(currentAction) : -1,
+    actions.length,
+    nativeWidget,
+  );
+  if (decision.kind === "native") return false;
+  if (decision.kind === "close-natural") {
+    if (event.repeat) {
+      event.preventDefault();
+      event.stopPropagation();
+      return true;
+    }
+    const triggerAction = titlebarMenuTriggerAction(state.overlay);
+    const titlebarActions = Array.from(
+      document.querySelectorAll<HTMLElement>(
+        ".app-titlebar button[data-action]:not(:disabled):not([aria-disabled='true'])",
+      ),
+      (candidate) => candidate.dataset.action ?? "",
+    ).filter((action) => action.length > 0);
+    const continuationAction = triggerAction
+      ? titlebarMenuTabContinuationAction(titlebarActions, triggerAction, event.shiftKey) ?? triggerAction
+      : null;
+    context.uiState.titlebarMenuFocusContinuation = continuationAction
+      ? { overlay: state.overlay, action: continuationAction }
+      : null;
+    event.preventDefault();
+    event.stopPropagation();
+    if (!startupSetupRequired(state)) {
+      void dispatchAction("close-overlay", context, { index: -1, value: "" })
+        .catch((error) => context.reportError(error));
+    }
+    return true;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  if (decision.kind === "close") {
+    const triggerAction = titlebarMenuTriggerAction(state.overlay);
+    context.uiState.titlebarMenuFocusContinuation = triggerAction
+      ? { overlay: state.overlay, action: triggerAction }
+      : null;
+    if (!startupSetupRequired(state)) {
+      void dispatchAction("close-overlay", context, { index: -1, value: "" })
+        .catch((error) => context.reportError(error));
+    }
+  } else {
+    applyTitlebarMenuRovingTabIndex(actions, decision.index);
+    actions[decision.index]?.focus({ preventScroll: true });
+  }
+  return true;
+}
+
+function isNativeTextEditingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false;
+  if (target instanceof HTMLTextAreaElement) return !target.disabled && !target.readOnly;
+  if (target instanceof HTMLInputElement) {
+    return !target.disabled
+      && !target.readOnly
+      && !NON_TEXT_INPUT_TYPES.has(target.type.toLowerCase());
+  }
+  return target.closest('[contenteditable="true"], [contenteditable="plaintext-only"]') !== null;
+}
+
+/**
+ * Keeps Select All owned by the current Settings editor even when WebView2 temporarily routes
+ * the native Ctrl+A default action to the document while a Tauri command is pending. The current
+ * connected active element is the only eligible owner, so a stale async completion cannot select
+ * text in a detached or replacement Settings surface.
+ */
+export function handleSettingsSelectAllShortcut(
+  sample: SettingsSelectAllShortcutSample,
+  state: Pick<DesktopViewState, "overlay" | "confirmation_visible">,
+  activeElement: Element | null = document.activeElement,
+): boolean {
+  if (
+    state.overlay !== "config"
+    || state.confirmation_visible
+    || !(sample.ctrlKey || sample.metaKey)
+    || sample.altKey
+    || sample.key.toLowerCase() !== "a"
+    || !activeElement?.isConnected
+    || activeElement.closest(".settings-modal") === null
+  ) return false;
+
+  if (activeElement instanceof HTMLTextAreaElement) {
+    if (activeElement.disabled || activeElement.readOnly) return false;
+    activeElement.setSelectionRange(0, activeElement.value.length);
+    return true;
+  }
+  if (
+    activeElement instanceof HTMLInputElement
+    && !activeElement.disabled
+    && !activeElement.readOnly
+    && TEXT_SELECTION_INPUT_TYPES.has(activeElement.type.toLowerCase())
+  ) {
+    activeElement.setSelectionRange(0, activeElement.value.length);
+    return true;
+  }
+  return false;
 }
 
 export function wireEvents(state: DesktopViewState, context: ActionContext): void {
@@ -117,39 +373,58 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
   const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
   if (prompt) {
     resizePromptComposer(prompt);
+    wireMainPromptInputOnce(prompt, (event) => {
+      const prompt = event.currentTarget as HTMLTextAreaElement;
+      const text = prompt.value;
+      resizePromptComposer(prompt);
+      context.uiState.drafts.prompt = text;
+      context.uiState.drafts.composerRevision += 1;
+      const projection = context.getProjection();
+      if (projection) {
+        updateGoalCommandHint(text);
+        const send = document.querySelector<HTMLButtonElement>('[data-action="send"]');
+        if (send) {
+          synchronizeActionButtonAvailability(send, context);
+          const title = composerSendTitle(projection, text);
+          send.title = title;
+          send.setAttribute("aria-label", title);
+        }
+        const enhance = document.querySelector<HTMLButtonElement>('[data-action="enhance-prompt"]');
+        if (enhance) {
+          synchronizeActionButtonAvailability(enhance, context);
+          const title = projection.navigation_loading
+            ? "画面の切り替え完了後にEnhanceできます"
+            : projection.busy
+              ? "実行中はEnhanceできません"
+            : text.trim().length === 0
+              ? "依頼文を入力してください"
+              : "Enhance";
+          enhance.title = title;
+          enhance.setAttribute("aria-label", title);
+        }
+      }
+      resizePromptComposer(prompt);
+    });
   }
-  prompt?.addEventListener("input", (event) => {
-    const prompt = event.currentTarget as HTMLTextAreaElement;
-    const text = prompt.value;
-    resizePromptComposer(prompt);
-    context.uiState.drafts.prompt = text;
-    context.uiState.drafts.composerRevision += 1;
+  const sideChatDraft = sideChatDraftForState(context.uiState, state);
+  document.querySelector<HTMLTextAreaElement>("#side-chat-prompt")?.addEventListener("input", (event) => {
+    if (!sideChatDraft || !sideChatOperationsOpen(context.uiState)) return;
+    sideChatDraft.text = (event.currentTarget as HTMLTextAreaElement).value;
+    sideChatDraft.revision += 1;
+    if (sideChatDraft.saveTimer !== null) window.clearTimeout(sideChatDraft.saveTimer);
+    sideChatDraft.saveTimer = window.setTimeout(() => {
+      sideChatDraft.saveTimer = null;
+      const projection = context.getProjection();
+      if (projection) void persistSideChatDraft(projection, context);
+    }, SIDE_CHAT_DRAFT_DEBOUNCE_MS);
+    updateSideChatActionButtons(state, context);
+  });
+  document.querySelector<HTMLTextAreaElement>("#side-chat-prompt")?.addEventListener("change", () => {
+    if (!sideChatDraft) return;
+    if (sideChatDraft.saveTimer !== null) window.clearTimeout(sideChatDraft.saveTimer);
+    sideChatDraft.saveTimer = null;
     const projection = context.getProjection();
-    if (projection) {
-      const capabilities = deriveUiCapabilities(projection, context.uiState);
-      updateGoalCommandHint(text);
-      const send = document.querySelector<HTMLButtonElement>('[data-action="send"]');
-      if (send) {
-        send.disabled = !capabilities.canSubmit;
-        const title = composerSendTitle(projection, text);
-        send.title = title;
-        send.setAttribute("aria-label", title);
-      }
-      const enhance = document.querySelector<HTMLButtonElement>('[data-action="enhance-prompt"]');
-      if (enhance) {
-        enhance.disabled = !capabilities.canEnhance;
-        const title = projection.navigation_loading
-          ? "画面の切り替え完了後にEnhanceできます"
-          : projection.busy
-            ? "実行中はEnhanceできません"
-          : text.trim().length === 0
-            ? "依頼文を入力してください"
-            : "Enhance";
-        enhance.title = title;
-        enhance.setAttribute("aria-label", title);
-      }
-    }
-    resizePromptComposer(prompt);
+    if (projection) void persistSideChatDraft(projection, context);
   });
   document.querySelector<HTMLInputElement>("#image-input")?.addEventListener("input", (event) => {
     context.uiState.drafts.imageInput = (event.currentTarget as HTMLInputElement).value;
@@ -171,18 +446,10 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
     updateProviderActionButtons(context);
   });
   const settingsControls = collectSettingsControls();
-  settingsControls.forEach((control) => {
-    const update = () => {
-      if (!updateSettingsControlDraft(control, context)) return;
-      updateDirtyBadges(context);
-      validateSettingsForm(context, state.config_fields, false);
-    };
-    control.addEventListener("input", update);
-    control.addEventListener("change", update);
-  });
   if (settingsControls.length > 0) {
     validateSettingsForm(context, state.config_fields, false);
   }
+  updateSideChatActionButtons(state, context);
   document.querySelector<HTMLInputElement>("#workspace-input")?.addEventListener("input", (event) => {
     context.uiState.drafts.workspaceInput = (event.currentTarget as HTMLInputElement).value;
     context.uiState.drafts.workspaceRevision += 1;
@@ -232,36 +499,140 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
   });
   const opacityInput = document.querySelector<HTMLInputElement>("#opacity-input");
   opacityInput?.addEventListener("input", (event) => {
-    scheduleOpacityPreview(Number((event.currentTarget as HTMLInputElement).value), context);
+    const input = event.currentTarget as HTMLInputElement;
+    const percent = clampOpacityPercent(Number(input.value));
+    input.setAttribute("aria-valuetext", `${percent}%`);
+    scheduleOpacityPreview(percent, context);
   });
   opacityInput?.addEventListener("change", (event) => {
     void context.mutate("set_window_opacity", {
       percent: clampOpacityPercent(Number((event.currentTarget as HTMLInputElement).value)),
     });
   });
-  focusOverlayPrimary(state, context.uiState);
 }
 
 function installDelegatedActionEvents(context: ActionContext): void {
   if (delegatedEventsInstalled) return;
   delegatedEventsInstalled = true;
+  const invalidateSideChatFocusContinuation = () => {
+    invalidateSideChatFocusInteraction(context.uiState);
+  };
+  const invalidateQuickChatDeleteFocusContinuation = () => {
+    context.uiState.quickChatDeleteFocusContinuation = abandonQuickChatDeleteFocusContinuation(
+      context.uiState.quickChatDeleteFocusContinuation,
+    );
+  };
+  const invalidateRefreshFocusContinuation = () => {
+    invalidateRefreshPromptFocus(context.uiState);
+  };
+  const invalidateCommandPaletteInsertion = () => {
+    context.invalidateCommandPaletteInsertion();
+  };
+  document.addEventListener("pointerdown", invalidateCommandPaletteInsertion, true);
+  document.addEventListener("keydown", (event) => {
+    if (shouldInvalidateCommandPaletteInsertionForKeydown(event.repeat)) {
+      invalidateCommandPaletteInsertion();
+    }
+  }, true);
+  document.addEventListener("compositionstart", invalidateCommandPaletteInsertion, true);
+  document.addEventListener("input", invalidateCommandPaletteInsertion, true);
+  document.addEventListener("wheel", invalidateCommandPaletteInsertion, { capture: true, passive: true });
+  window.addEventListener("blur", invalidateCommandPaletteInsertion);
+  window.addEventListener("pagehide", invalidateCommandPaletteInsertion);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") invalidateCommandPaletteInsertion();
+  });
+  document.addEventListener("pointerdown", invalidateSideChatFocusContinuation, true);
+  document.addEventListener("keydown", invalidateSideChatFocusContinuation, true);
+  document.addEventListener("compositionstart", invalidateSideChatFocusContinuation, true);
+  document.addEventListener("wheel", invalidateSideChatFocusContinuation, { capture: true, passive: true });
+  document.addEventListener("pointerdown", invalidateQuickChatDeleteFocusContinuation, true);
+  document.addEventListener("keydown", invalidateQuickChatDeleteFocusContinuation, true);
+  document.addEventListener("compositionstart", invalidateQuickChatDeleteFocusContinuation, true);
+  document.addEventListener("wheel", invalidateQuickChatDeleteFocusContinuation, { capture: true, passive: true });
+  document.addEventListener("keydown", invalidateRefreshFocusContinuation, true);
+  document.addEventListener("compositionstart", invalidateRefreshFocusContinuation, true);
+  document.addEventListener("wheel", invalidateRefreshFocusContinuation, { capture: true, passive: true });
+  window.addEventListener("blur", invalidateRefreshFocusContinuation);
+  window.addEventListener("pagehide", invalidateRefreshFocusContinuation);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") invalidateRefreshFocusContinuation();
+  });
+  const updateSettingsControl = (event: Event) => {
+    const target = event.target;
+    if (
+      !(target instanceof HTMLInputElement)
+      && !(target instanceof HTMLTextAreaElement)
+      && !(target instanceof HTMLSelectElement)
+    ) {
+      return;
+    }
+    if (target.matches(".side-chat-settings-control")) {
+      const currentState = context.getViewState();
+      const ownerSessionId = currentState ? sideChatOwnerSessionId(currentState) : null;
+      const draft = currentState ? sideChatDraftForState(context.uiState, currentState) : null;
+      if (
+        !currentState
+        || !ownerSessionId
+        || !draft
+        || !sideChatOperationsOpen(context.uiState)
+        || !sideChatConfigurationOpen(currentState)
+        || sideChatMutationPending(context.uiState, ownerSessionId)
+      ) return;
+      const nextValue = target.value;
+      const setting = target.dataset.sideChatSetting;
+      if (setting === "base-url" && draft.setupBaseUrl !== nextValue) {
+        draft.setupBaseUrl = nextValue;
+        draft.setupRevision += 1;
+      } else if (setting === "model" && draft.setupModel !== nextValue) {
+        draft.setupModel = nextValue;
+        draft.setupRevision += 1;
+      }
+      updateSideChatActionButtons(currentState, context);
+      return;
+    }
+    if (!target.matches(".settings-control") || !updateSettingsControlDraft(target, context)) return;
+    synchronizeMainProviderModelControls(target);
+    const currentState = context.getViewState();
+    if (currentState) validateSettingsForm(context, currentState.config_fields, false);
+  };
+  document.addEventListener("input", updateSettingsControl);
+  document.addEventListener("change", updateSettingsControl);
   document.addEventListener("click", (event) => {
     const target = event.target;
     if (!(target instanceof Element)) return;
+    const currentState = context.getViewState();
+    if (!currentState) return;
+    if (handleSettingsNavigationClick(event, currentState)) return;
     const node = target.closest<HTMLElement>("[data-action]");
     if (!node || (node instanceof HTMLButtonElement && node.disabled)) return;
+    if (
+      node.hasAttribute("data-window-control")
+      && titlebarDragGesture.consumeWindowControlClickSuppression(event.detail > 0)
+    ) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
     if (
       target.closest("[data-modal]") &&
       (node.classList.contains("modal-backdrop") || node.classList.contains("menu-scrim"))
     ) {
       return;
     }
-    const currentState = context.getViewState();
-    if (!currentState) return;
     const action = node.dataset.action ?? "";
+    if (repeatedNewSessionPointerActivation(action, event.detail)) return;
+    context.uiState.mainRunFocusContinuation = beginMainRunFocusContinuation(
+      currentState,
+      action,
+    );
+    context.uiState.sideChatFocusContinuation = beginSideChatFocusContinuation(
+      currentState,
+      action,
+    );
     const index = Number(node.dataset.index ?? "-1");
     const value = node.dataset.agentPath ?? node.dataset.historyTarget ?? node.dataset.mode ?? "";
-    void dispatchAction(action, index, value, currentState, context).catch((error) => context.reportError(error));
+    void dispatchAction(action, context, { index, value }).catch((error) => context.reportError(error));
   });
   document.addEventListener("keydown", (event) => {
     if (event.repeat || (event.key !== "Enter" && event.key !== " ")) return;
@@ -279,11 +650,30 @@ function installDelegatedActionEvents(context: ActionContext): void {
     const action = node.dataset.action ?? "";
     const index = Number(node.dataset.index ?? "-1");
     const value = node.dataset.agentPath ?? node.dataset.historyTarget ?? node.dataset.mode ?? "";
-    void dispatchAction(action, index, value, currentState, context).catch((error) => context.reportError(error));
+    void dispatchAction(action, context, { index, value }).catch((error) => context.reportError(error));
   });
   document.addEventListener("pointerdown", (event) => {
     const target = event.target;
     if (!(target instanceof Element)) return;
+    const projection = context.getProjection();
+    const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
+    recordRefreshPointerInteraction(context.uiState, {
+      owner: projection ? composerOwner(projection) : "",
+      targetsRefresh: target.closest('[data-action="refresh"]') !== null,
+      promptFocused: prompt !== null && document.activeElement === prompt,
+    });
+    if (
+      context.uiState.mainRunFocusContinuation
+      && !pointerTargetsMainRunControl(target)
+    ) {
+      context.uiState.mainRunFocusContinuation = null;
+    }
+    if (
+      context.uiState.sideChatFocusContinuation
+      && !pointerTargetsSideChatRunControl(target)
+    ) {
+      context.uiState.sideChatFocusContinuation = null;
+    }
     titlebarDragGesture.pointerDown(titlebarPointerSample(event, target));
   });
   document.addEventListener("pointermove", (event) => {
@@ -295,7 +685,10 @@ function installDelegatedActionEvents(context: ActionContext): void {
     void command("start_window_drag").catch(() => context.desktopWindow.startDragging());
   });
   document.addEventListener("pointerup", (event) => titlebarDragGesture.pointerUp(event.pointerId));
-  document.addEventListener("pointercancel", () => titlebarDragGesture.cancel());
+  document.addEventListener("pointercancel", () => {
+    titlebarDragGesture.cancel();
+    invalidateRefreshFocusContinuation();
+  });
   window.addEventListener("blur", () => titlebarDragGesture.cancel());
   document.addEventListener("dblclick", (event) => {
     const target = event.target;
@@ -313,7 +706,7 @@ function installDelegatedActionEvents(context: ActionContext): void {
     event.stopPropagation();
     const currentState = context.getViewState();
     if (currentState) {
-      void dispatchRegisteredAction("toggle-maximize-window", currentState, context, { index: -1, value: "" }).catch((error) =>
+      void dispatchAction("toggle-maximize-window", context, { index: -1, value: "" }).catch((error) =>
         context.reportError(error),
       );
     }
@@ -328,11 +721,28 @@ function installDelegatedActionEvents(context: ActionContext): void {
     const currentState = context.getViewState();
     const action = control.dataset.action ?? "";
     if (currentState && action) {
-      void dispatchRegisteredAction(action, currentState, context, { index: -1, value: "" }).catch((error) =>
+      void dispatchAction(action, context, { index: -1, value: "" }).catch((error) =>
         context.reportError(error),
       );
     }
   });
+}
+
+export function shouldInvalidateCommandPaletteInsertionForKeydown(repeat: boolean): boolean {
+  return !repeat;
+}
+
+export function handleSettingsNavigationClick(
+  event: MouseEvent,
+  state: DesktopViewState,
+): boolean {
+  if (state.overlay !== "config" || state.confirmation_visible) return false;
+  const target = event.target;
+  if (!(target instanceof Element)) return false;
+  const anchor = target.closest<HTMLAnchorElement>(".settings-nav a[href^='#']");
+  if (!anchor || !activateSettingsSectionNavigation(anchor)) return false;
+  event.preventDefault();
+  return true;
 }
 
 export function shouldDispatchDelegatedKeyboardAction(tagName: string, hasHref = false): boolean {
@@ -356,19 +766,8 @@ function titlebarPointerSample(event: PointerEvent, target: Element) {
 function trapDialogFocus(event: KeyboardEvent): void {
   const dialog = document.querySelector<HTMLElement>(".modal[role='dialog'], .modal[role='alertdialog']");
   if (!dialog) return;
-  const focusable = Array.from(
-    dialog.querySelectorAll<HTMLElement>(
-      "button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex]:not([tabindex='-1'])",
-    ),
-  ).filter((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true");
   event.preventDefault();
-  if (focusable.length === 0) {
-    (dialog.querySelector<HTMLElement>(".permission-decision-status") ?? dialog).focus();
-    return;
-  }
-  const currentIndex = focusable.indexOf(document.activeElement as HTMLElement);
-  const nextIndex = nextDialogFocusIndex(currentIndex, focusable.length, event.shiftKey);
-  focusable[nextIndex]?.focus();
+  containDialogFocus(dialog, document.activeElement, event.shiftKey);
 }
 
 function resizePromptComposer(prompt: HTMLTextAreaElement): void {
@@ -447,14 +846,25 @@ async function flushTextMutation(key: string, context: ActionContext): Promise<v
     const target = entry.target;
     const generation = entry.generation;
     entry.args = null;
+    const settlementOwner = (): TextMutationSettlementOwner => ({
+      hasQueuedValue: entry.args !== null,
+      currentGeneration: entry.generation,
+      requestGeneration: generation,
+      targetStillMatches: searchTargetStillMatches(key, target, context),
+    });
     const request = command<DesktopWebState>(name, args)
       .then((state) => {
-        if (entry.args === null && entry.generation === generation && searchTargetStillMatches(key, target, context)) {
+        if (textMutationSettlementOwnerIsCurrent(settlementOwner())) {
           context.acceptProjection(state, renderResult);
         }
       })
       .catch((error) => {
-        if (!context.recoverCommandConflict(error)) context.reportError(error);
+        settleTextMutationFailure(
+          settlementOwner(),
+          error,
+          context.recoverCommandConflict,
+          context.reportError,
+        );
       });
     entry.inFlight = request;
     try {
@@ -477,26 +887,71 @@ function searchTargetStillMatches(key: string, target: string, context: ActionCo
 }
 
 function updateProviderActionButtons(context: ActionContext): void {
-  const projection = context.getProjection();
-  if (!projection) return;
-  const capabilities = deriveUiCapabilities(projection, context.uiState);
   const load = document.querySelector<HTMLButtonElement>('[data-action="load-provider-models"]');
-  if (load) load.disabled = !capabilities.canLoadProviderModels;
+  if (load) synchronizeActionButtonAvailability(load, context);
   document
     .querySelectorAll<HTMLButtonElement>('[data-action="apply-provider-session"], [data-action="save-provider-global"]')
-    .forEach((button) => {
-      button.disabled = !capabilities.canApplyProvider;
-    });
+    .forEach((button) => synchronizeActionButtonAvailability(button, context));
+  const view = context.getViewState();
+  if (view) synchronizeProviderOverlayFeedback(view);
+}
+
+export function textMutationSettlementOwnerIsCurrent(
+  owner: TextMutationSettlementOwner,
+): boolean {
+  return !owner.hasQueuedValue
+    && owner.currentGeneration === owner.requestGeneration
+    && owner.targetStillMatches;
+}
+
+export function settleTextMutationFailure(
+  owner: TextMutationSettlementOwner,
+  error: unknown,
+  recoverCommandConflict: (error: unknown) => boolean,
+  reportError: (error: unknown) => void,
+): boolean {
+  if (!textMutationSettlementOwnerIsCurrent(owner)) return false;
+  if (!recoverCommandConflict(error)) reportError(error);
+  return true;
+}
+
+export function synchronizeProviderOverlayFeedback(state: DesktopViewState): void {
+  const feedback = providerOverlayFeedback(state.provider_base_url, state.provider_status);
+  const input = document.querySelector<HTMLInputElement>("#provider-url");
+  input?.setAttribute("aria-invalid", String(!feedback.baseUrl.ok));
+
+  const status = document.querySelector<HTMLElement>("#provider-status");
+  if (!status) return;
+  status.className = `provider-status ${feedback.status.kind === "success" ? "ok" : feedback.status.kind}`;
+  const title = status.querySelector<HTMLElement>("[data-provider-status-title]");
+  const hint = status.querySelector<HTMLElement>("[data-provider-status-hint]");
+  if (title) title.textContent = feedback.status.title;
+  if (hint) hint.textContent = feedback.status.hint;
+  const details = status.querySelector<HTMLDetailsElement>("[data-details-key='provider-status-details']");
+  const detailsText = status.querySelector<HTMLElement>("[data-provider-status-details]");
+  if (detailsText) detailsText.textContent = feedback.status.details;
+  if (details) details.hidden = feedback.status.details.trim().length === 0;
 }
 
 function updateReviewActionButtons(context: ActionContext): void {
-  const projection = context.getProjection();
-  if (!projection) return;
-  const capabilities = deriveUiCapabilities(projection, context.uiState);
   const enhanced = document.querySelector<HTMLButtonElement>('[data-action="send-review-enhanced"]');
-  if (enhanced) enhanced.disabled = !capabilities.canSendEnhancedReview;
+  if (enhanced) synchronizeActionButtonAvailability(enhanced, context);
   const raw = document.querySelector<HTMLButtonElement>('[data-action="send-review-raw"]');
-  if (raw) raw.disabled = !capabilities.canSendRawReview;
+  if (raw) synchronizeActionButtonAvailability(raw, context);
+}
+
+function synchronizeActionButtonAvailability(
+  button: HTMLButtonElement,
+  context: ActionContext,
+): void {
+  const action = button.dataset.action ?? "";
+  const model = context.getRenderModel();
+  const payload: ActionPayload = {
+    index: Number(button.dataset.index ?? "-1"),
+    value: button.dataset.agentPath ?? button.dataset.historyTarget ?? button.dataset.mode ?? "",
+  };
+  button.disabled = !model || !actionEnabledById(action, model, payload);
+  button.setAttribute("aria-disabled", String(button.disabled));
 }
 
 export function prepareConfigMutation(
@@ -551,6 +1006,28 @@ function updateSettingsControlDraft(control: SettingsControl, context: ActionCon
   return true;
 }
 
+function synchronizeMainProviderModelControls(source: SettingsControl): void {
+  if (!source.matches("[data-main-provider-model-control]")) return;
+  const value = source.value;
+  document.querySelectorAll<SettingsControl>("[data-main-provider-model-control]").forEach((control) => {
+    if (control === source) return;
+    if (control instanceof HTMLSelectElement) {
+      control.querySelectorAll<HTMLOptionElement>("option[data-manual-option]").forEach((option) => option.remove());
+      const existing = Array.from(control.options).some((option) => option.value === value);
+      if (!existing && value.length > 0) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = `${value}（手入力）`;
+        option.dataset.manualOption = "true";
+        control.prepend(option);
+      }
+      control.value = value;
+      return;
+    }
+    control.value = value;
+  });
+}
+
 function validateSettingsForm(
   context: ActionContext,
   fields: ConfigFieldProjection[],
@@ -558,32 +1035,34 @@ function validateSettingsForm(
 ): boolean {
   const controls = collectSettingsControls();
   const validation = document.querySelector<HTMLElement>("#settings-validation");
+  const values = controls.flatMap((control) => {
+    const key = control.dataset.configKey ?? "";
+    return key ? [{ key, text: settingsControlValue(control) }] : [];
+  });
+  const formValidation = validateConfigFieldValues(fields, values);
   for (const control of controls) {
     const key = control.dataset.configKey ?? "";
     if (!key) continue;
     const field = fields.find((candidate) => candidate.key === key);
     if (!field) continue;
     const result = validateConfigInput(field, settingsControlValue(control));
-    if (!result.ok) {
-      if (validation) {
-        validation.textContent = `${key}: ${result.message}`;
-        validation.classList.toggle("ok", false);
-        validation.classList.toggle("error", true);
-      }
-      updateDirtyBadges(context);
-      if (focusInvalid) control.focus();
-      return false;
-    }
+    if (result.ok) control.removeAttribute("aria-invalid");
+    else control.setAttribute("aria-invalid", "true");
   }
-  if (validation && controls.length > 0) {
-    validation.textContent = context.uiState.configDirty
-      ? "未保存の設定があります。Apply、保存、または変更を破棄するまで別画面からの設定変更は停止します。"
-      : "入力形式は問題ありません。";
-    validation.classList.toggle("ok", true);
-    validation.classList.toggle("error", false);
+  if (validation) {
+    validation.textContent = formValidation.ok
+      ? context.uiState.configDirty
+        ? "未保存の設定があります。Apply、保存、または変更を破棄するまで別画面からの設定変更は停止します。"
+        : "入力形式は問題ありません。"
+      : `${formValidation.invalidKey}: ${formValidation.message}`;
+    validation.classList.toggle("ok", formValidation.ok);
+    validation.classList.toggle("error", !formValidation.ok);
   }
-  updateDirtyBadges(context);
-  return true;
+  updateDirtyBadges(context, formValidation.ok);
+  if (focusInvalid && !formValidation.ok) {
+    controls.find((control) => control.dataset.configKey === formValidation.invalidKey)?.focus();
+  }
+  return formValidation.ok;
 }
 
 function validateConfigValues(
@@ -591,25 +1070,17 @@ function validateConfigValues(
   fields: ConfigFieldProjection[],
   focusInvalid: boolean,
 ): boolean {
-  for (const value of values) {
-    const field = fields.find((candidate) => candidate.key === value.key);
-    if (!field) return false;
-    const result = validateConfigInput(field, value.text);
-    if (result.ok) continue;
-    if (focusInvalid) {
-      document.querySelector<SettingsControl>(
-        `[data-config-key="${CSS.escape(value.key)}"]`,
-      )?.focus();
-    }
-    return false;
+  const validation = validateConfigFieldValues(fields, values);
+  if (!validation.ok && focusInvalid && validation.invalidKey) {
+    document.querySelector<SettingsControl>(
+      `[data-config-key="${CSS.escape(validation.invalidKey)}"]`,
+    )?.focus();
   }
-  return true;
+  return validation.ok;
 }
 
-function updateDirtyBadges(context: ActionContext): void {
+function updateDirtyBadges(context: ActionContext, _validationOk: boolean): void {
   const uiState = context.uiState;
-  const projection = context.getProjection();
-  const capability = projection ? activeConfigDraftProjection(projection, uiState) : null;
   document.querySelectorAll<HTMLElement>(".dirty-badge").forEach((node) => {
     node.classList.toggle("visible", uiState.configDirty);
   });
@@ -617,18 +1088,159 @@ function updateDirtyBadges(context: ActionContext): void {
     .querySelectorAll<HTMLButtonElement>(".settings-modal [data-action='discard-config-draft']")
     .forEach((button) => {
       button.hidden = !uiState.configDirty;
-      button.disabled = capability ? !capability.discard_enabled : true;
-      button.setAttribute("aria-disabled", String(button.disabled));
+      synchronizeActionButtonAvailability(button, context);
     });
-  const commitEnabled = capability?.commit_enabled === true;
   document
     .querySelectorAll<HTMLButtonElement>(
       ".settings-modal [data-action='apply-session-config'], .settings-modal [data-action='save-global-config']",
     )
-    .forEach((button) => {
-      button.disabled = !commitEnabled;
-      button.setAttribute("aria-disabled", String(!commitEnabled));
-    });
+    .forEach((button) => synchronizeActionButtonAvailability(button, context));
+  document
+    .querySelectorAll<HTMLButtonElement>(".settings-modal [data-action='import-config-toml']")
+    .forEach((button) => synchronizeActionButtonAvailability(button, context));
+}
+
+export function shortcutActionForComposer(
+  sample: KeyboardShortcutSample,
+  sideChatComposerActive: boolean,
+): string | null {
+  const action = globalShortcutAction(sample);
+  return action === "send" && sideChatComposerActive ? "send-side-chat" : action;
+}
+
+function updateSideChatActionButtons(state: DesktopWebState, context: ActionContext): void {
+  const ownerSessionId = sideChatOwnerSessionId(state);
+  const draft = sideChatDraftForState(context.uiState, state);
+  const pending = sideChatMutationPending(context.uiState, ownerSessionId);
+  const deleting = state.side_chat.deleting;
+  const operationsOpen = sideChatOperationsOpen(context.uiState);
+  const configurationOpen = operationsOpen && sideChatConfigurationOpen(state) && !pending;
+  const catalog = sideChatCatalogViewForState(context.uiState, state);
+  const settingsValidation = validateSideChatProviderSettings(
+    draft?.setupBaseUrl ?? "",
+    draft?.setupModel ?? "",
+  );
+  const invalidSettings = ownerSessionId !== null && !settingsValidation.ok;
+  document.querySelectorAll<HTMLInputElement>(".side-chat-settings-control").forEach((control) => {
+    control.disabled = !configurationOpen;
+    control.setAttribute("aria-disabled", String(!configurationOpen));
+  });
+  synchronizeSideChatCatalogControls(state, context, configurationOpen);
+  const configure = document.querySelector<HTMLButtonElement>('[data-action="configure-side-chat"]');
+  if (configure) {
+    synchronizeActionButtonAvailability(configure, context);
+    configure.textContent = pending
+      ? "処理中…"
+      : state.side_chat.configured ? "設定を更新" : "設定する";
+  }
+  const settingsStatus = document.querySelector<HTMLElement>("#side-chat-settings-status");
+  if (settingsStatus) {
+    const error = state.side_chat.last_error.trim();
+    settingsStatus.textContent = ownerSessionId === null
+      ? "通常チャットを選択すると、そのチャット専用のside providerを設定できます。"
+      : deleting
+        ? "サイドチャットを削除しています。完了するまで設定は変更できません。"
+        : !operationsOpen
+          ? "メインLLM設定の処理が完了するまで、サイドチャット設定は変更できません。"
+        : pending
+          ? "サイドチャット操作の完了を待っています…"
+          : invalidSettings
+            ? settingsValidation.message
+          : error
+            ? error
+            : state.side_chat.configured && !state.side_chat.can_send
+              ? "サイドチャットの実行中は設定を変更できません。停止または完了後に更新してください。"
+              : state.side_chat.configured
+                ? `${state.side_chat.model} を選択中のチャットで使用します。`
+                : "LLM URLとモデルを入力して、選択中のチャットへ設定してください。";
+    settingsStatus.classList.toggle("error", error.length > 0 || invalidSettings);
+    settingsStatus.classList.toggle("ok", error.length === 0 && !invalidSettings);
+  }
+  const baseUrlControl = document.querySelector<HTMLInputElement>("#side-chat-base-url");
+  if (baseUrlControl) {
+    if (ownerSessionId !== null && !settingsValidation.baseUrl.ok) {
+      baseUrlControl.setAttribute("aria-invalid", "true");
+    } else {
+      baseUrlControl.removeAttribute("aria-invalid");
+    }
+  }
+  document.querySelectorAll<HTMLElement>("[data-side-chat-setting='model']").forEach((control) => {
+    if (ownerSessionId !== null && !settingsValidation.modelOk) {
+      control.setAttribute("aria-invalid", "true");
+    } else {
+      control.removeAttribute("aria-invalid");
+    }
+  });
+  const send = document.querySelector<HTMLButtonElement>('[data-action="send-side-chat"]');
+  if (send) synchronizeActionButtonAvailability(send, context);
+  const cancel = document.querySelector<HTMLButtonElement>('[data-action="cancel-side-chat"]');
+  if (cancel) synchronizeActionButtonAvailability(cancel, context);
+  const remove = document.querySelector<HTMLButtonElement>('[data-action="request-delete-side-chat"]');
+  if (remove) synchronizeActionButtonAvailability(remove, context);
+
+  const sideChatSettings = document.querySelector<HTMLElement>("#settings-side-chat");
+  if (sideChatSettings) {
+    sideChatSettings.setAttribute("aria-busy", String(!operationsOpen || pending || catalog.status === "loading"));
+  }
+}
+
+function synchronizeSideChatCatalogControls(
+  state: DesktopWebState,
+  context: ActionContext,
+  configurationOpen: boolean,
+): void {
+  const draft = sideChatDraftForState(context.uiState, state);
+  const catalog = sideChatCatalogViewForState(context.uiState, state);
+  const settingsValidation = validateSideChatProviderSettings(
+    draft?.setupBaseUrl ?? "",
+    draft?.setupModel ?? "",
+  );
+  const options = sideChatModelOptions(catalog, draft?.setupModel ?? "");
+  const select = document.querySelector<HTMLSelectElement>("#side-chat-model");
+  if (select) {
+    const desired = [
+      ...(draft?.setupModel.trim() ? [] : [{ value: "", label: "モデルを選択してください", disabled: true }]),
+      ...options.map((option) => ({
+        value: option.id,
+        label: sideChatModelOptionLabel(option),
+        disabled: false,
+      })),
+    ];
+    const currentSignature = Array.from(select.options)
+      .map((option) => `${option.value}\u0000${option.textContent ?? ""}`)
+      .join("\u0001");
+    const desiredSignature = desired
+      .map((option) => `${option.value}\u0000${option.label}`)
+      .join("\u0001");
+    if (currentSignature !== desiredSignature) {
+      select.replaceChildren(...desired.map((candidate) => {
+        const option = document.createElement("option");
+        option.value = candidate.value;
+        option.textContent = candidate.label;
+        option.disabled = candidate.disabled;
+        return option;
+      }));
+    }
+    select.value = draft?.setupModel.trim() ?? "";
+    select.disabled = !configurationOpen || options.length === 0;
+    select.setAttribute("aria-disabled", String(select.disabled));
+  }
+  const manual = document.querySelector<HTMLInputElement>("#side-chat-model-manual");
+  if (manual && manual !== document.activeElement && draft) manual.value = draft.setupModel;
+
+  const load = document.querySelector<HTMLButtonElement>('[data-action="load-side-chat-models"]');
+  if (load) {
+    synchronizeActionButtonAvailability(load, context);
+    load.textContent = catalog.status === "loading" ? "読込中…" : "モデル読込";
+  }
+  const status = document.querySelector<HTMLElement>("#side-chat-model-catalog-status");
+  if (status) {
+    const invalidUrl = sideChatOwnerSessionId(state) !== null && !settingsValidation.baseUrl.ok;
+    status.textContent = invalidUrl
+      ? settingsValidation.baseUrl.message
+      : sideChatCatalogStatusText(catalog);
+    status.classList.toggle("error", catalog.status === "error" || invalidUrl);
+  }
 }
 
 function scheduleOpacityPreview(percent: number, context: ActionContext): void {
@@ -661,284 +1273,90 @@ async function flushOpacityPreview(context: ActionContext): Promise<void> {
   }
 }
 
-async function dispatchAction(action: string, index: number, value: string, state: DesktopViewState, context: ActionContext): Promise<void> {
-  if (await dispatchRegisteredAction(action, state, context, { index, value })) return;
-  switch (action) {
-    case "toggle-attachment-tray":
-      context.uiState.attachmentTrayOpen = !context.uiState.attachmentTrayOpen;
-      context.rerender();
-      return;
-    case "dismiss-ui-error":
-      context.uiState.recoverableError = null;
-      context.rerender();
-      return;
-    case "new-project-session":
-      if (!navigationIsIdle(state)) return;
-      await runIndexedMutation("new_project_session", index, state.project_rows[index]?.project_id, state, context);
-      return;
-    case "project":
-      if (!navigationIsIdle(state)) return;
-      await runIndexedMutation("select_project", index, state.project_rows[index]?.project_id, state, context);
-      return;
-    case "session":
-      if (!navigationIsIdle(state)) return;
-      await runIndexedMutation("select_session", index, state.session_rows[index]?.session_id, state, context);
-      return;
-    case "chat-session":
-      if (!navigationIsIdle(state)) return;
-      await runIndexedMutation("select_chat_session", index, state.chat_session_rows[index]?.session_id, state, context);
-      return;
-    case "cancel-local-confirm":
-      if (context.uiState.localConfirmationDecisionPending) return;
-      context.uiState.pendingLocalConfirmation = null;
-      finishLocalDecision(context.uiState);
-      context.rerender();
-      return;
-    case "confirm-local-delete":
-      await confirmLocalDelete(context);
-      return;
-    case "confirm-local-archive-state":
-      await confirmLocalArchiveState(context);
-      return;
-    case "confirm-local-rollback":
-      await confirmLocalRollback(context);
-      return;
-    case "artifact":
-      await runIndexedMutation("select_artifact", index, state.artifact_rows[index]?.path, state, context);
-      return;
-    case "remove-image":
-      await runIndexedMutation("remove_image", index, state.attached_images[index], state, context);
-      return;
-    case "send-review-enhanced":
-      if (!state.send_enhanced_enabled) return;
-      await context.mutate("send_prompt_review", {
-        enhanced: true,
-        text: state.review_draft_text,
-        expectedTarget: draftMutationTarget(state),
-      });
-      return;
-    case "send-review-raw":
-      if (!state.send_raw_enabled) return;
-      await context.mutate("send_prompt_review", {
-        enhanced: false,
-        text: state.review_draft_text,
-        expectedTarget: draftMutationTarget(state),
-      });
-      return;
-    case "cancel-review":
-      await context.mutate("cancel_prompt_review");
-      return;
-    case "show-file-menu":
-      await context.mutate("show_file_menu");
-      return;
-    case "show-edit-menu":
-      await context.mutate("show_edit_menu");
-      return;
-    case "show-view-menu":
-      await context.mutate("show_view_menu");
-      return;
-    case "show-help-menu":
-      await context.mutate("show_help_menu");
-      return;
-    case "close-overlay":
-      if (startupSetupRequired(state)) return;
-      await context.mutate("close_overlay");
-      return;
-    case "import-config-toml":
-      {
-        if (!state.config_draft.external_owner_mutation_open) return;
-        try {
-          const request = beginConfigImportMutation(
-            context.uiState,
-            state.config_target,
-            context.rerender,
-          );
-          let nextState: DesktopWebState;
-          let imported: boolean;
-          try {
-            [nextState, imported] = await command<[DesktopWebState, boolean]>("import_global_config_toml", {
-              draftValues: context.prepareConfigSnapshot(state.config_target) ?? [],
-              expectedTarget: request.target,
-            });
-          } catch (error) {
-            const finished = finishConfigMutation(
-              context.uiState,
-              request,
-              false,
-              request.target,
-              context.getViewState()?.config_target ?? null,
-            );
-            if (context.recoverCommandConflict(error)) return;
-            if (!finished) return;
-            context.rerender();
-            context.reportError(error);
-            return;
-          }
-          if (!finishConfigMutation(
-            context.uiState,
-            request,
-            imported,
-            nextState.config_target,
-            context.getViewState()?.config_target ?? null,
-          )) return;
-          context.acceptProjection(nextState);
-        } finally {
-          context.uiState.externalConfigMutationPending = false;
-          context.rerender();
-        }
-      }
-      return;
-    case "insert-command":
-      await runIndexedMutation("insert_command", index, state.command_rows[index]?.path, state, context);
-      return;
-    default:
-      return;
-  }
-}
-
-export function beginConfigImportMutation(
+export function focusOverlayPrimary(
+  state: DesktopViewState,
   uiState: UiLocalState,
-  target: ConfigMutationTarget,
-  rerender: () => void,
-) {
-  uiState.externalConfigMutationPending = true;
-  const request = beginConfigMutation(uiState, target);
-  rerender();
-  return request;
-}
-
-function startupSetupRequired(state: DesktopWebState): boolean {
-  return state.startup.initial_setup_required && state.startup.action_overlay === state.overlay;
-}
-
-async function confirmLocalDelete(context: ActionContext): Promise<void> {
-  const pending = context.uiState.pendingLocalConfirmation;
-  if (!pending || context.uiState.localConfirmationDecisionPending) {
-    return;
-  }
-  if (pending.kind === "project") {
-    await runLocalConfirmationMutation(context, "delete_project", pending.index, pending.expectedTarget);
-  } else if (pending.kind === "chat_session") {
-    await runLocalConfirmationMutation(context, "delete_chat_session", pending.index, pending.expectedTarget);
-  } else {
-    await runLocalConfirmationMutation(context, "delete_session", pending.index, pending.expectedTarget);
-  }
-}
-
-async function confirmLocalArchiveState(context: ActionContext): Promise<void> {
-  const pending = context.uiState.pendingLocalConfirmation;
-  if (
-    !pending ||
-    context.uiState.localConfirmationDecisionPending ||
-    (pending.kind !== "archive_session" && pending.kind !== "unarchive_session")
-  ) {
-    return;
-  }
-  await runLocalConfirmationMutation(
-    context,
-    pending.kind === "archive_session" ? "archive_session" : "unarchive_session",
-    pending.index,
-    pending.expectedTarget,
+): PostRenderFocusIntent | null {
+  // The initiating modal/menu may be rerendered while a new-session command is pending. Its
+  // detached trigger deliberately leaves focus unclaimed for the typed composer continuation.
+  if (uiState.activeNewSessionMutation !== null) return null;
+  const sideChatDeleteTarget = sideChatDeleteConfirmationStillTargets(
+    uiState.sideChatDeleteConfirmation,
+    state,
+  ) ? uiState.sideChatDeleteConfirmation : null;
+  const activeLocalModalIdentity = localModalIdentity(
+    uiState.pendingLocalConfirmation !== null,
+    sideChatDeleteTarget,
   );
-}
-
-async function confirmLocalRollback(context: ActionContext): Promise<void> {
-  const pending = context.uiState.pendingLocalConfirmation;
-  if (!pending || context.uiState.localConfirmationDecisionPending || pending.kind !== "rollback_session") {
-    return;
-  }
-  await runLocalConfirmationMutation(context, "rollback_session", pending.index, pending.expectedTarget);
-}
-
-async function runLocalConfirmationMutation(
-  context: ActionContext,
-  name: string,
-  index: number,
-  expectedTarget: RowMutationTarget,
-): Promise<void> {
-  if (!beginLocalDecision(context.uiState, context.uiState.pendingLocalConfirmation !== null)) return;
-  context.rerender();
-  try {
-    const nextState = await command<DesktopWebState>(name, { index, expectedTarget });
-    finishLocalDecision(context.uiState);
-    context.uiState.pendingLocalConfirmation = null;
-    context.acceptProjection(nextState);
-  } catch (error) {
-    failLocalDecision(context.uiState, "処理を開始できませんでした。もう一度お試しください。");
-    if (context.recoverCommandConflict(error)) {
-      context.rerender();
-      return;
-    }
-    context.rerender();
-    context.reportError(error);
-  }
-}
-
-async function runIndexedMutation(
-  name: string,
-  index: number,
-  rowId: string | null | undefined,
-  state: DesktopWebState,
-  context: ActionContext,
-): Promise<void> {
-  const args = rowMutationArgs(state, index, rowId);
-  if (args) await context.mutate(name, args);
-}
-
-function focusOverlayPrimary(state: DesktopWebState, uiState: UiLocalState): void {
   const overlayKey = state.confirmation_visible
     ? modalIdentity(state)
-    : uiState.pendingLocalConfirmation
-      ? "local-confirm"
+    : activeLocalModalIdentity
+      ? activeLocalModalIdentity
       : state.overlay;
+  const focusOwnerKey = overlayKey === "config"
+    ? `config:${settingsSurfaceIdentity(state) ?? "unavailable"}`
+    : overlayKey;
+  const confirmationOverlay = overlayKey.startsWith("permission:") || activeLocalModalIdentity !== null;
+  const confirmationPending = overlayKey.startsWith("permission:")
+    ? uiState.permissionDecision?.phase === "submitting"
+    : overlayKey === "local-confirm"
+      ? uiState.localConfirmationDecisionPending
+      : sideChatDeleteTarget !== null
+        && sideChatMutationPending(uiState, sideChatDeleteTarget.ownerSessionId);
   const active = document.activeElement;
-  const activeModal = document.querySelector<HTMLElement>(".modal[role='dialog'], .modal[role='alertdialog'], .modal[data-modal]");
-  if (
+  const activeModal = document.querySelector<HTMLElement>(
+    ".modal[role='dialog'], .modal[role='alertdialog'], .modal[data-modal], .titlebar-popover[data-modal]",
+  );
+  const hasMeaningfulActiveElement = Boolean(
     active instanceof HTMLElement &&
     active !== document.body &&
     active !== document.documentElement &&
-    (overlayKey === "none" || activeModal?.contains(active))
-  ) {
-    uiState.lastFocusedOverlay = overlayKey;
-    return;
+    (overlayKey === "none" || activeModal?.contains(active)) &&
+    (!confirmationOverlay || confirmationFocusIsMeaningful(
+      confirmationPending,
+      active.matches(".permission-decision-status"),
+    ))
+  );
+  if (hasMeaningfulActiveElement) {
+    uiState.lastFocusedOverlay = focusOwnerKey;
+    return null;
   }
-  if (overlayKey === uiState.lastFocusedOverlay) {
-    if (active && active !== document.body && active !== document.documentElement) return;
+  if (!overlayPrimaryFocusRequired(
+    overlayKey,
+    focusOwnerKey,
+    uiState.lastFocusedOverlay,
+    confirmationOverlay,
+    hasMeaningfulActiveElement,
+  )) {
+    return null;
   }
-  uiState.lastFocusedOverlay = overlayKey;
-  const confirmationOverlay = overlayKey.startsWith("permission:") || overlayKey === "local-confirm";
-  const selector =
-    overlayKey === "command_palette"
-      ? "#local-search"
-      : overlayKey === "provider"
-        ? "#provider-url"
-        : overlayKey === "config"
-          ? ".settings-control"
-          : overlayKey === "workspace"
-            ? "#workspace-input"
-            : overlayKey === "prompt_review"
-              ? "#review-draft"
-              : confirmationOverlay
-                ? ""
-                : isRegularModalOverlay(overlayKey)
-                  ? ".modal button:not(:disabled), .modal[role='dialog']"
-                  : "";
-  if (!selector && !confirmationOverlay) {
-    return;
+  const scheduledFocusOwner = focusOwnerKey;
+  const selectors =
+    titlebarMenuFromOverlay(overlayKey)
+      ? [".titlebar-popover button[data-titlebar-menu-action]:not(:disabled):not([aria-disabled='true'])"]
+      : confirmationOverlay
+        ? []
+        : overlayPrimaryFocusSelectors(overlayKey);
+  if (selectors.length === 0 && !confirmationOverlay) {
+    return null;
   }
-  requestAnimationFrame(() => {
-    const confirmationPending = overlayKey.startsWith("permission:")
-      ? uiState.permissionDecision?.phase === "submitting"
-      : uiState.localConfirmationDecisionPending;
-    const target = confirmationOverlay
-      ? confirmationFocusSelectors(confirmationPending)
-        .map((candidate) => document.querySelector<HTMLElement>(candidate))
-        .find((candidate) => candidate !== null)
-      : document.querySelector<HTMLElement>(selector);
-    target?.focus();
-    if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
-      const end = target.value.length;
-      target.setSelectionRange(end, end);
-    }
-  });
+  const focusSelectors = confirmationOverlay
+    ? confirmationFocusSelectors(confirmationPending)
+    : selectors;
+  return {
+    source: "modal-primary",
+    priority: "modal-containment",
+    claim: { kind: "force" },
+    candidates: focusSelectors.map((selector) => ({
+      resolve: () => document.querySelector<HTMLElement>(selector),
+      settle: (target) => {
+        uiState.lastFocusedOverlay = scheduledFocusOwner;
+        if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+          const end = target.value.length;
+          target.setSelectionRange(end, end);
+        }
+      },
+    })),
+    isCurrent: () => uiState.activeNewSessionMutation === null,
+  };
 }

@@ -57,7 +57,7 @@ moyAI is designed around those constraints:
 
 ## Highlights
 
-- Tauri Desktop app with project chat, quick chat, transcript, artifacts, settings, and provider discovery.
+- Tauri Desktop app with project chat, quick chat, transcript, artifacts, settings, provider discovery, and a tool-less session-scoped side chat that can use a model separate from the main task.
 - Desktop renders canonical history as a continuous conversation: user bubbles and plain assistant responses have no display-only step numbers, completed work history is collapsible without swallowing the root Agent's final response, and older bounded chunks prepend in place with a left-side hover/jump rail instead of replacing the page.
 - One Desktop instance per user; launching it again restores the existing window.
 - Desktop Stop validates the projected workspace, root session, run generation, and Agent Tree epoch, so stale UI actions cannot cancel a later run. Settings values, baseline, dirty state, and monotonic revision exist only in one frontend-local draft owner. Rust projects typed clean/dirty capability variants and statelessly validates a complete draft plus a decimal-string config-generation target before Apply, Save, Reset, or another config-owner mutation. Commit builds one complete temporary `ResolvedConfig`, preserving cleared optional values instead of re-layering them. Active-turn steer clears input only after durable acceptance.
@@ -166,8 +166,7 @@ model = "qwen/qwen3.6-27b"
 provider_metadata_mode = "lm_studio_native_required"
 provider_api_mode = "responses"
 reasoning_summary = "none"
-request_timeout_ms = 1800000
-stream_idle_timeout_ms = 1800000
+request_timeout_ms = 3600000
 context_window = 131072
 supports_tools = true
 supports_images = true
@@ -193,13 +192,14 @@ base_url = "http://127.0.0.1:8123"
 enabled = false
 ```
 
-`request_timeout_ms` is one response-start operation budget shared by connection attempts, connection
-retry delays, request-body upload, and waiting for response headers. `stream_idle_timeout_ms` limits a period with no SSE
-event after streaming starts. Both default to 1,800,000 ms (30 minutes). These two settings are configurable
-no-progress deadlines, not the aggregate stream cap. Separately, after response headers, the product
-applies a non-configurable aggregate stream-duration limit of 1,800,000 ms (30 minutes); increasing
-either setting does not extend that bound. Explicit config or environment overrides for the two
-no-progress deadlines remain supported.
+`request_timeout_ms` is the single deadline for one provider generation request. It starts with the
+first POST attempt and covers eligible retry delays, request-body upload, response headers, and the
+stream through its terminal event without resetting at the header boundary. It defaults to 3,600,000 ms
+(60 minutes), which is also the maximum accepted value. Desktop Settings, TUI, imported TOML,
+and `MOYAI_REQUEST_TIMEOUT_MS` all use this same owner. The legacy `stream_idle_timeout_ms` TOML key and
+`MOYAI_STREAM_IDLE_TIMEOUT_MS` environment variable remain accepted for migration only: a legacy-only
+value becomes the request timeout, equal old/new values are accepted, and conflicting values are rejected
+with a config error instead of silently choosing one.
 `max_output_tokens` bounds the complete model output, including reasoning and serialized tool-call
 arguments. Tool-heavy runs that write a whole document need the provider's verified profile budget;
 the product default uses `32768`. A provider-side
@@ -266,7 +266,6 @@ Common environment variables:
 - `MOYAI_DATA_DIR`
 - `MOYAI_ACCESS_MODE`
 - `MOYAI_REQUEST_TIMEOUT_MS`
-- `MOYAI_STREAM_IDLE_TIMEOUT_MS`
 - `MOYAI_CONTEXT_WINDOW`
 - `MOYAI_MAX_OUTPUT_TOKENS`
 - `MOYAI_SUPPORTS_IMAGES`
@@ -328,7 +327,7 @@ boundaries observed by moyAI; they do not infer provider-process startup, server
 model-instance loading. A long `request_in_flight` phase establishes only that the operation has not
 reached response headers. Before POST, moyAI bounds messages, tools, schemas, extra body, stop data,
 images, and the exact serialized wire bytes. After headers, it also bounds raw stream bytes, events,
-tool calls, arguments, idle time, and absolute stream duration.
+tool calls, arguments, and the remaining portion of the same request deadline.
 For an explicit task-local audit, set `MOYAI_HTTP_REQUEST_CAPTURE_DIR` to an absolute directory.
 The HTTP transport then writes the exact prepared outbound request JSON plus
 API-mode/endpoint/byte-count, capture-stage, and provider-request-ID metadata. The shared request ID

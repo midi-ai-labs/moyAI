@@ -206,6 +206,7 @@ function renderWorkSummary(
   agentActivityRows: readonly AgentActivityRow[],
   options: TranscriptRenderOptions,
 ): string {
+  const durableIdentity = row.stable_history_identity?.trim();
   const running = row.row_kind === "work_summary_running";
   const incomplete = row.row_kind === "work_summary_incomplete";
   const open = running || incomplete ? "open" : "";
@@ -226,7 +227,8 @@ function renderWorkSummary(
     options,
   );
   return `
-    <article class="message work-summary ${escapeHtml(row.row_kind)}" data-history-anchor="${escapeHtml(anchorId)}">
+    <article class="message work-summary ${escapeHtml(row.row_kind)}" data-history-anchor="${escapeHtml(anchorId)}"
+      ${durableIdentity ? `data-history-identity="${escapeHtml(durableIdentity)}"` : ""}>
       <div class="message-body">
         <details data-details-key="work-summary:${escapeHtml(detailsId)}" ${open}>
           <summary data-focus-key="work-summary:${escapeHtml(anchorId)}"><span>${escapeHtml(row.title)}</span>${statusText ? `<small>${escapeHtml(statusText)}</small>` : ""}</summary>

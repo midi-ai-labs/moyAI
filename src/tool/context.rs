@@ -144,6 +144,7 @@ pub(crate) fn targets_configured_instruction_authority(
 pub struct ToolEffectAdmission {
     control: RunControl,
     sandbox_plan: ProcessSandboxPlan,
+    permission_retry_lease: Option<crate::storage::PermissionReviewLease>,
 }
 
 impl ToolEffectAdmission {
@@ -151,7 +152,16 @@ impl ToolEffectAdmission {
         Self {
             control,
             sandbox_plan,
+            permission_retry_lease: None,
         }
+    }
+
+    fn with_permission_retry_lease(
+        mut self,
+        lease: Option<crate::storage::PermissionReviewLease>,
+    ) -> Self {
+        self.permission_retry_lease = lease;
+        self
     }
 
     pub(crate) fn sandbox_plan(&self) -> &ProcessSandboxPlan {
@@ -163,6 +173,38 @@ impl ToolEffectAdmission {
     /// effect so a later formatter, process, network request, or mutation cannot start after a
     /// terminal producer wins.
     pub fn admit(&self) -> Result<(), ToolError> {
+        if let Some(lease) = &self.permission_retry_lease {
+            let admission = lease.admit_if_authority_current().map_err(|error| {
+                let message = format!(
+                    "automatic permission effect admission could not prove its durable retry-fence ownership: {error}"
+                );
+                self.control.fail(message.clone());
+                ToolError::Message(message)
+            })?;
+            match admission {
+                crate::storage::PermissionEffectAdmission::Admitted => {}
+                crate::storage::PermissionEffectAdmission::AuthorityChanged {
+                    current_authority_history_item_id,
+                } => {
+                    let Some(settlement) = self.control.begin_tool_settlement() else {
+                        return Err(ToolError::RunInterrupted);
+                    };
+                    return Err(ToolError::PermissionDenied {
+                        reason: format!(
+                            "canonical user authorization changed before the approved effect could start (current generation: {current_authority_history_item_id:?})"
+                        ),
+                        settlement: Some(settlement),
+                    });
+                }
+                crate::storage::PermissionEffectAdmission::NotOwned => {
+                    let message =
+                        "automatic permission effect admission lost its durable retry-fence ownership"
+                            .to_string();
+                    self.control.fail(message.clone());
+                    return Err(ToolError::Message(message));
+                }
+            }
+        }
         self.control
             .begin_tool_effect_admission()
             .ok_or(ToolError::RunInterrupted)?
@@ -239,6 +281,11 @@ impl RunMutationFence {
         };
         match outcome {
             RunAdmissionLeaseRenewalOutcome::Renewed => {}
+            RunAdmissionLeaseRenewalOutcome::InterruptRequested(cause) => {
+                self.control
+                    .request_cancel(RunCancellationCause::Interruption(cause));
+                return Err(self.rejected_error("the exact execution interruption was requested"));
+            }
             RunAdmissionLeaseRenewalOutcome::StopFenced(outcome) => {
                 match outcome {
                     crate::protocol::TurnTerminalOutcome::Interrupted { cause } => {
@@ -364,7 +411,7 @@ impl<'a> ToolContext<'a> {
                 self.workspace,
                 self.config,
             )?;
-            return self.accept_tool_effect(sandbox_plan);
+            return self.accept_tool_effect(sandbox_plan, None);
         }
 
         if request.access == AccessKind::Shell {
@@ -378,16 +425,16 @@ impl<'a> ToolContext<'a> {
             let evidence = match &guardian_evidence {
                 PermissionGuardianEvidenceState::Complete(evidence) => evidence,
                 PermissionGuardianEvidenceState::Incomplete { reason } => {
-                    return self.decline_permission(format!(
-                        "automatic permission guardian was not given complete action evidence, so the action was blocked: {reason}. Do not retry it or an equivalent workaround without new user authorization"
+                    return self.fail_unfenced_auto_review(format!(
+                        "automatic permission admission cannot establish a durable retry fence because action evidence is incomplete: {reason}"
                     ));
                 }
             };
             let decision = match self.permission_guardian.as_deref_mut() {
                 Some(guardian) => guardian.review(&request, evidence).await,
                 None => {
-                    return self.decline_permission(
-                        "automatic permission guardian is unavailable; the action was blocked"
+                    return self.fail_unfenced_auto_review(
+                        "automatic permission admission cannot establish a durable retry fence because the Guardian is unavailable"
                             .to_string(),
                     );
                 }
@@ -397,13 +444,29 @@ impl<'a> ToolContext<'a> {
             }
             return match decision {
                 Ok(PermissionGuardianDecision::Allow { .. }) => {
-                    self.accept_tool_effect(approved_process_sandbox_plan(request.access))
+                    let Some(retry_lease) = self
+                        .permission_guardian
+                        .as_deref_mut()
+                        .and_then(PermissionGuardian::take_approved_retry_lease)
+                    else {
+                        return self.fail_unfenced_auto_review(
+                            "automatic permission Guardian allowed an elevated effect without an owned retry-fence lease"
+                                .to_string(),
+                        );
+                    };
+                    self.accept_tool_effect(
+                        approved_process_sandbox_plan(request.access),
+                        Some(retry_lease),
+                    )
                 }
                 Ok(PermissionGuardianDecision::Deny { rationale }) => self.decline_permission(
                     format!(
                         "automatic permission guardian denied the action: {rationale}. The action was not executed; do not retry it or an equivalent workaround without new user authorization"
                     ),
                 ),
+                Err(crate::tool::permission_guardian::PermissionGuardianError::UnfencedAdmission(
+                    reason,
+                )) => self.fail_unfenced_auto_review(reason),
                 Err(error) => self.decline_permission(format!(
                     "automatic permission guardian could not authorize the action, so it was blocked: {error}. Do not retry it or an equivalent workaround without new user authorization"
                 )),
@@ -420,7 +483,7 @@ impl<'a> ToolContext<'a> {
             })?;
         match outcome {
             ConfirmationOutcome::Resolved(ToolApprovalDecision::Approved) => {
-                self.accept_tool_effect(approved_process_sandbox_plan(request.access))
+                self.accept_tool_effect(approved_process_sandbox_plan(request.access), None)
             }
             ConfirmationOutcome::Resolved(ToolApprovalDecision::Denied { reason }) => {
                 self.decline_permission(reason)
@@ -447,11 +510,12 @@ impl<'a> ToolContext<'a> {
     fn accept_tool_effect(
         &self,
         sandbox_plan: ProcessSandboxPlan,
+        permission_retry_lease: Option<crate::storage::PermissionReviewLease>,
     ) -> Result<ToolEffectAdmission, ToolError> {
-        Ok(ToolEffectAdmission::new(
-            self.run_control.clone(),
-            sandbox_plan,
-        ))
+        Ok(
+            ToolEffectAdmission::new(self.run_control.clone(), sandbox_plan)
+                .with_permission_retry_lease(permission_retry_lease),
+        )
     }
 
     fn decline_permission(&self, reason: String) -> Result<ToolEffectAdmission, ToolError> {
@@ -463,6 +527,11 @@ impl<'a> ToolContext<'a> {
             reason,
             settlement: Some(settlement),
         })
+    }
+
+    fn fail_unfenced_auto_review(&self, reason: String) -> Result<ToolEffectAdmission, ToolError> {
+        self.run_control.fail(reason.clone());
+        Err(ToolError::Message(reason))
     }
 
     async fn current_permission_access_mode(&self) -> Result<AccessMode, ToolError> {
@@ -896,7 +965,7 @@ mod tests {
                 session.session.id,
                 AdmissionId::new(),
                 TurnId::new(),
-                control,
+                control.clone(),
             ),
             prompt: &mut prompt,
             services: &services,
@@ -1090,7 +1159,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_review_uses_guardian_as_final_decision_without_human_fallback() {
+    async fn auto_review_has_no_human_fallback_and_allow_requires_owned_retry_lease() {
         for outcome in [
             FixedGuardianOutcome::Allow,
             FixedGuardianOutcome::Deny,
@@ -1133,7 +1202,9 @@ mod tests {
                 .await;
             drop(context);
             match guardian.outcome {
-                FixedGuardianOutcome::Allow => assert!(result.is_ok()),
+                FixedGuardianOutcome::Allow => {
+                    assert!(matches!(result, Err(ToolError::Message(_))))
+                }
                 FixedGuardianOutcome::Deny | FixedGuardianOutcome::Fail => {
                     assert!(matches!(result, Err(ToolError::PermissionDenied { .. })))
                 }
@@ -1169,7 +1240,7 @@ mod tests {
             permission_guardian: Some(&mut guardian),
         };
 
-        let admission = context
+        let result = context
             .confirm_if_needed_with_details(
                 AccessKind::Shell,
                 "run with explicitly requested elevation".to_string(),
@@ -1178,12 +1249,11 @@ mod tests {
                 true,
                 Vec::new(),
             )
-            .await
-            .expect("guardian-approved elevation");
-        assert!(matches!(
-            admission.sandbox_plan(),
-            ProcessSandboxPlan::Unrestricted
-        ));
+            .await;
+        assert!(
+            matches!(result, Err(ToolError::Message(_))),
+            "a Guardian Allow without the mandatory durable lease must fail closed"
+        );
         drop(context);
         assert_eq!(prompt.requests, 0);
         assert_eq!(guardian.requests.len(), 1);
@@ -1225,7 +1295,7 @@ mod tests {
             permission_guardian: Some(&mut guardian),
         };
 
-        let admission = context
+        let result = context
             .confirm_if_needed(
                 AccessKind::Read,
                 "send a file to a configured service".to_string(),
@@ -1233,9 +1303,11 @@ mod tests {
                 false,
                 vec![crate::tool::PermissionRisk::ConfiguredLocalService],
             )
-            .await
-            .expect("guardian-approved non-process effect");
-        assert_eq!(admission.sandbox_plan(), &ProcessSandboxPlan::NoProcess);
+            .await;
+        assert!(
+            matches!(result, Err(ToolError::Message(_))),
+            "a non-process Allow also requires the same durable lease"
+        );
         drop(context);
         assert_eq!(prompt.requests, 0);
         assert_eq!(guardian.requests.len(), 1);
@@ -1268,7 +1340,7 @@ mod tests {
                 session.session.id,
                 AdmissionId::new(),
                 TurnId::new(),
-                control,
+                control.clone(),
             ),
             prompt: &mut prompt,
             services: &services,
@@ -1290,9 +1362,72 @@ mod tests {
             .await;
         drop(context);
 
-        assert!(matches!(result, Err(ToolError::PermissionDenied { .. })));
+        assert!(matches!(result, Err(ToolError::Message(_))));
+        assert!(
+            control.is_cancelled(),
+            "an unfenced AutoReview admission error must terminate the run"
+        );
         assert_eq!(guardian.requests, 0);
         assert_eq!(prompt.requests, 0);
+    }
+
+    #[tokio::test]
+    async fn effect_admission_missing_owned_fence_fails_the_run_before_any_effect() {
+        let (_config, session, services) = permission_fixture(AccessMode::AutoReview).await;
+        let authority_id = crate::protocol::HistoryItemId::new();
+        services
+            .store
+            .protocol_event_store()
+            .seed_history_item_for_test(&crate::protocol::HistoryItem {
+                id: authority_id,
+                session_id: session.session.id,
+                scope: crate::protocol::HistoryScope::Turn {
+                    turn_id: TurnId::new(),
+                },
+                sequence_no: 0,
+                created_at_ms: 1,
+                payload: crate::protocol::HistoryItemPayload::UserTurn {
+                    content: vec![crate::protocol::ContentPart::Text {
+                        text: "authorize one review".to_string(),
+                    }],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                },
+            })
+            .expect("seed canonical authority");
+        let key = crate::storage::PermissionRetryFenceKey::new(
+            session.session.id,
+            1,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect("retry key");
+        let lease = match services
+            .store
+            .permission_retry_fence_store()
+            .begin_review(
+                key,
+                authority_id,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .expect("begin review")
+        {
+            crate::storage::BeginPermissionReview::Claimed(lease) => lease,
+            other => panic!("expected claimed review, got {other:?}"),
+        };
+        assert_eq!(
+            lease.mark_allowed_pending().expect("record allow"),
+            crate::storage::PermissionReviewTransition::Applied
+        );
+        let control = RunControl::new();
+        let admission = ToolEffectAdmission::new(control.clone(), ProcessSandboxPlan::NoProcess)
+            .with_permission_retry_lease(Some(lease.clone()));
+        assert_eq!(
+            lease.release().expect("delete owned fence fixture"),
+            crate::storage::PermissionReviewTransition::Applied
+        );
+
+        assert!(matches!(admission.admit(), Err(ToolError::Message(_))));
+        assert!(control.is_cancelled());
     }
 
     #[tokio::test]

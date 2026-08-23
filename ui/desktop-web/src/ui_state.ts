@@ -1,13 +1,34 @@
-import type { LocalConfirmation } from "./render.ts";
+import type { LocalConfirmation } from "./render_overlays.ts";
 import { agentActivityRowIdentity } from "./agent_activity.ts";
+import {
+  asyncTransactionIsCurrent,
+  beginAsyncTransaction,
+  clearAsyncTransaction,
+  createAsyncTransactionSlot,
+  type AsyncTransactionSlot,
+} from "./async_transaction.ts";
 import type {
   AgentActivityRow,
   AgentExecutionExpectedTarget,
   AgentExecutionProjection,
   ConfigMutationTarget,
   DesktopWebState,
+  PromptReviewMutationTarget,
+  ProviderMetadataMode,
+  SideChatCatalogModel,
+  SideChatCatalogResult,
 } from "./types.ts";
+import type { AttachmentFocusContinuation } from "./attachment_focus_continuation.ts";
 import type { PermissionDecisionState } from "./decision_state.ts";
+import type { MainRunFocusContinuation } from "./run_focus_continuation.ts";
+import type { SideChatFocusContinuation } from "./side_chat_focus_continuation.ts";
+import type { SettingsActionFocusContinuation } from "./settings_surface.ts";
+import type { QuickChatDeleteFocusContinuation } from "./quick_chat_delete_focus_continuation.ts";
+import type { AgentExecutionPrependContinuation } from "./agent_execution_prepend_continuation.ts";
+import type { RefreshPromptFocusContinuation } from "./main_prompt_continuity.ts";
+import type { NewSessionMutationRequest } from "./new_session_mutation.ts";
+import type { TaskActivityAnimationEpoch } from "./task_activity_indicator.ts";
+import { validateProviderBaseUrl } from "./utils.ts";
 
 export interface ProviderDraft {
   baseUrl: string;
@@ -17,15 +38,29 @@ export interface ProviderDraft {
   selectedModelId: string;
 }
 
+export interface ProviderCatalogTarget {
+  readonly providerOwner: string;
+  readonly providerRevision: number;
+  readonly baseUrl: string;
+  readonly metadataMode: ProviderMetadataMode;
+}
+
+export interface ProviderCatalogRequest extends ProviderCatalogTarget {
+  readonly token: number;
+  admitted: boolean;
+}
+
 export interface UiDraftState {
   initialized: boolean;
   composerOwner: string;
+  composerSessionOwner: string;
   composerCommitGeneration: string;
   sessionSearchOwner: string;
   providerOwner: string;
   prompt: string;
   imageInput: string;
   workspaceInput: string;
+  reviewTarget: PromptReviewMutationTarget | null;
   reviewDraft: string;
   localSearch: string;
   sessionSearch: string;
@@ -41,10 +76,25 @@ export interface UiDraftState {
     workspacePath: string;
     composerRevision: number;
     imageRevision: number;
+    reviewTarget: PromptReviewMutationTarget | null;
     reviewRevision: number | null;
     baseCommitGeneration: string;
     commandAccepted: boolean;
   } | null;
+}
+
+export interface MainComposerLocalDraft {
+  prompt: string;
+  imageInput: string;
+}
+
+export interface SessionInteractionSnapshot {
+  threadScrollLeft: number;
+  threadScrollTop: number;
+  promptScrollLeft: number;
+  promptScrollTop: number;
+  promptSelectionStart: number;
+  promptSelectionEnd: number;
 }
 
 export interface UiRecoverableError {
@@ -53,8 +103,80 @@ export interface UiRecoverableError {
   details: string;
 }
 
-export type ArtifactPaneMode = "output" | "agents";
+export type ArtifactPaneMode = "output" | "agents" | "side_chat";
 export type AgentPaneFocusTarget = "agent-pane-back" | "output-agent-trigger";
+export type ArtifactPaneFocusTarget = "content" | "trigger";
+
+export interface SideChatLocalDraft {
+  chatId: string | null;
+  text: string;
+  revision: number;
+  persistedText: string;
+  persistedRevision: string;
+  saveTimer: number | null;
+  saveInFlight: boolean;
+  savePromise: Promise<void> | null;
+  saveQueued: boolean;
+  setupBaseUrl: string;
+  setupModel: string;
+  setupRevision: number;
+}
+
+export interface SideChatMutationState {
+  kind: "configure" | "send" | "cancel" | "delete";
+  chatId: string | null;
+  generation: string;
+}
+
+export type SideChatCatalogStatus = "idle" | "loading" | "ready" | "error";
+
+export interface SideChatCatalogEntry {
+  ownerSessionId: string;
+  baseUrl: string;
+  metadataMode: ProviderMetadataMode;
+  configGeneration: string;
+  models: SideChatCatalogModel[];
+  status: Exclude<SideChatCatalogStatus, "idle">;
+  error: string;
+  requestToken: number;
+}
+
+export interface SideChatCatalogTarget {
+  readonly key: string;
+  readonly ownerSessionId: string;
+  readonly setupRevision: number;
+  readonly baseUrl: string;
+  readonly metadataMode: ProviderMetadataMode;
+  readonly configGeneration: string;
+}
+
+export interface SideChatCatalogRequest extends SideChatCatalogTarget {
+  readonly token: number;
+}
+
+export interface SideChatCatalogSettlement {
+  catalogAccepted: boolean;
+  localStateChanged: boolean;
+}
+
+export interface SideChatCatalogView {
+  status: SideChatCatalogStatus;
+  source: "none" | "main" | "side";
+  ownerSessionId: string | null;
+  baseUrl: string;
+  models: SideChatCatalogModel[];
+  error: string;
+}
+
+export interface SideChatModelOption extends SideChatCatalogModel {
+  currentOnly: boolean;
+}
+
+export interface SideChatDeleteConfirmation {
+  ownerSessionId: string;
+  chatId: string;
+  expectedGeneration: string;
+}
 
 export interface AgentExecutionCacheEntry {
   status: "loading" | "ready" | "error";
@@ -64,21 +186,28 @@ export interface AgentExecutionCacheEntry {
   error: string;
 }
 
-export interface AgentExecutionRequest {
-  cacheKey: string;
-  generation: number;
-  ownerIdentity: string;
-  expectedTarget: AgentExecutionExpectedTarget;
-  activityIdentity: string;
-  operation: "replace" | "prepend";
-  expectedOffset: number | null;
-  expectedEnd: number | null;
+export interface AgentExecutionTarget {
+  readonly cacheKey: string;
+  readonly ownerIdentity: string;
+  readonly expectedTarget: Readonly<AgentExecutionExpectedTarget>;
+  readonly activityIdentity: string;
+  readonly operation: "replace" | "prepend";
+  readonly expectedOffset: number | null;
+  readonly expectedEnd: number | null;
+}
+
+export interface AgentExecutionRequest extends AgentExecutionTarget {
+  readonly generation: number;
 }
 
 export interface UiLocalState {
   drafts: UiDraftState;
+  mainComposerDrafts: Map<string, MainComposerLocalDraft>;
+  sessionInteractionSnapshots: Map<string, SessionInteractionSnapshot>;
   runStartMutationPending: boolean;
+  taskActivityAnimationEpoch: TaskActivityAnimationEpoch | null;
   externalConfigMutationPending: boolean;
+  activeNewSessionMutation: NewSessionMutationRequest | null;
   pendingLocalConfirmation: LocalConfirmation | null;
   configDirty: boolean;
   configDraftValues: Map<string, string>;
@@ -88,18 +217,35 @@ export interface UiLocalState {
   nextConfigMutationGeneration: bigint;
   activeConfigMutationGeneration: bigint | null;
   lastFocusedOverlay: string;
+  settingsActionFocusContinuation: SettingsActionFocusContinuation | null;
+  titlebarMenuFocusContinuation: { overlay: string; action: string } | null;
+  mainRunFocusContinuation: MainRunFocusContinuation | null;
+  sideChatFocusContinuation: SideChatFocusContinuation | null;
+  quickChatDeleteFocusContinuation: QuickChatDeleteFocusContinuation | null;
+  sideChatFocusInteractionGeneration: bigint;
+  refreshPromptFocusInteractionGeneration: bigint;
+  pendingRefreshPromptFocus: RefreshPromptFocusContinuation | null;
   focusPromptAfterRender: boolean;
   initialPromptFocusDone: boolean;
   artifactPaneCollapsed: boolean;
+  artifactPaneFocusAfterRender: ArtifactPaneFocusTarget | null;
   artifactPaneMode: ArtifactPaneMode;
   selectedAgentPath: string | null;
   agentPaneOwnerIdentity: string;
   focusSelectedAgentAfterRender: boolean;
   agentPaneFocusAfterRender: AgentPaneFocusTarget | null;
   agentExecutionCache: Map<string, AgentExecutionCacheEntry>;
-  activeAgentExecutionRequest: AgentExecutionRequest | null;
-  nextAgentExecutionGeneration: number;
+  agentExecutionTransaction: AsyncTransactionSlot<AgentExecutionRequest>;
+  agentExecutionPrependContinuation: AgentExecutionPrependContinuation | null;
+  sideChatDrafts: Map<string, SideChatLocalDraft>;
+  sideChatMutations: Map<string, SideChatMutationState>;
+  sideChatCatalogs: Map<string, SideChatCatalogEntry>;
+  sideChatCatalogTransaction: AsyncTransactionSlot<SideChatCatalogRequest>;
+  providerCatalogTransaction: AsyncTransactionSlot<ProviderCatalogRequest>;
+  rejectedProviderCatalogRequest: ProviderCatalogRequest | null;
+  sideChatDeleteConfirmation: SideChatDeleteConfirmation | null;
   attachmentTrayOpen: boolean;
+  attachmentFocusContinuation: AttachmentFocusContinuation | null;
   permissionDecision: PermissionDecisionState | null;
   nextPermissionSubmissionId: number;
   localConfirmationDecisionPending: boolean;
@@ -113,12 +259,14 @@ export function createUiLocalState(): UiLocalState {
     drafts: {
       initialized: false,
       composerOwner: "",
+      composerSessionOwner: "",
       composerCommitGeneration: "0",
       sessionSearchOwner: "",
       providerOwner: "",
       prompt: "",
       imageInput: "",
       workspaceInput: "",
+      reviewTarget: null,
       reviewDraft: "",
       localSearch: "",
       sessionSearch: "",
@@ -137,8 +285,12 @@ export function createUiLocalState(): UiLocalState {
       providerRevision: 0,
       pendingRunSubmission: null,
     },
+    mainComposerDrafts: new Map(),
+    sessionInteractionSnapshots: new Map(),
     runStartMutationPending: false,
+    taskActivityAnimationEpoch: null,
     externalConfigMutationPending: false,
+    activeNewSessionMutation: null,
     pendingLocalConfirmation: null,
     configDirty: false,
     configDraftValues: new Map(),
@@ -148,19 +300,36 @@ export function createUiLocalState(): UiLocalState {
     nextConfigMutationGeneration: 1n,
     activeConfigMutationGeneration: null,
     lastFocusedOverlay: "none",
+    settingsActionFocusContinuation: null,
+    titlebarMenuFocusContinuation: null,
+    mainRunFocusContinuation: null,
+    sideChatFocusContinuation: null,
+    quickChatDeleteFocusContinuation: null,
+    sideChatFocusInteractionGeneration: 0n,
+    refreshPromptFocusInteractionGeneration: 0n,
+    pendingRefreshPromptFocus: null,
     focusPromptAfterRender: false,
     initialPromptFocusDone: false,
     artifactPaneCollapsed: typeof window !== "undefined"
       && window.localStorage.getItem("moyai.artifactPaneCollapsed") === "true",
+    artifactPaneFocusAfterRender: null,
     artifactPaneMode: "output",
     selectedAgentPath: null,
     agentPaneOwnerIdentity: "",
     focusSelectedAgentAfterRender: false,
     agentPaneFocusAfterRender: null,
     agentExecutionCache: new Map(),
-    activeAgentExecutionRequest: null,
-    nextAgentExecutionGeneration: 1,
+    agentExecutionTransaction: createAsyncTransactionSlot(),
+    agentExecutionPrependContinuation: null,
+    sideChatDrafts: new Map(),
+    sideChatMutations: new Map(),
+    sideChatCatalogs: new Map(),
+    sideChatCatalogTransaction: createAsyncTransactionSlot(),
+    providerCatalogTransaction: createAsyncTransactionSlot(),
+    rejectedProviderCatalogRequest: null,
+    sideChatDeleteConfirmation: null,
     attachmentTrayOpen: false,
+    attachmentFocusContinuation: null,
     permissionDecision: null,
     nextPermissionSubmissionId: 1,
     localConfirmationDecisionPending: false,
@@ -175,6 +344,440 @@ export function setArtifactPaneCollapsed(uiState: UiLocalState, collapsed: boole
   if (typeof window !== "undefined") {
     window.localStorage.setItem("moyai.artifactPaneCollapsed", String(collapsed));
   }
+}
+
+type SideChatOwnerState = Pick<
+  DesktopWebState,
+  "draft_target" | "provider_base_url" | "provider_effective_base_url" | "side_chat"
+>;
+
+export function sideChatOwnerSessionId(state: SideChatOwnerState): string | null {
+  const selectedOwner = state.draft_target.sessionId;
+  const projectedOwner = state.side_chat.owner_session_id;
+  if (selectedOwner === null || (projectedOwner !== null && projectedOwner !== selectedOwner)) {
+    return null;
+  }
+  return projectedOwner ?? selectedOwner;
+}
+
+export function sideChatConfigurationOpen(state: SideChatOwnerState): boolean {
+  return sideChatOwnerSessionId(state) !== null
+    && !state.side_chat.deleting
+    && (!state.side_chat.configured || state.side_chat.can_send);
+}
+
+export function sideChatDeleteConfirmationStillTargets(
+  confirmation: SideChatDeleteConfirmation | null,
+  state: SideChatOwnerState,
+): boolean {
+  return confirmation !== null
+    && !state.side_chat.deleting
+    && confirmation.ownerSessionId === sideChatOwnerSessionId(state)
+    && confirmation.chatId === state.side_chat.chat_id
+    && confirmation.expectedGeneration === state.side_chat.generation;
+}
+
+export function sideChatDraftForState(
+  uiState: UiLocalState,
+  state: SideChatOwnerState,
+): SideChatLocalDraft | null {
+  const ownerSessionId = sideChatOwnerSessionId(state);
+  if (!ownerSessionId) return null;
+  const chatId = state.side_chat.chat_id;
+  const existing = uiState.sideChatDrafts.get(ownerSessionId);
+  if (existing && existing.chatId === chatId) {
+    const locallyDirty = existing.text !== existing.persistedText;
+    if (
+      !locallyDirty
+      && !existing.saveInFlight
+      && existing.persistedRevision !== state.side_chat.draft_revision
+    ) {
+      existing.text = state.side_chat.draft_text;
+      existing.persistedText = state.side_chat.draft_text;
+      existing.persistedRevision = state.side_chat.draft_revision;
+    }
+    return existing;
+  }
+  const draft: SideChatLocalDraft = {
+    chatId,
+    text: state.side_chat.draft_text,
+    revision: 0,
+    persistedText: state.side_chat.draft_text,
+    persistedRevision: state.side_chat.draft_revision,
+    saveTimer: null,
+    saveInFlight: false,
+    savePromise: null,
+    saveQueued: false,
+    setupBaseUrl: state.side_chat.base_url.trim()
+      || state.provider_effective_base_url.trim()
+      || state.provider_base_url.trim(),
+    setupModel: state.side_chat.model,
+    setupRevision: 0,
+  };
+  uiState.sideChatDrafts.set(ownerSessionId, draft);
+  return draft;
+}
+
+export function sideChatMutationPending(
+  uiState: UiLocalState,
+  ownerSessionId: string | null,
+): boolean {
+  return ownerSessionId !== null && uiState.sideChatMutations.has(ownerSessionId);
+}
+
+export function sideChatOperationsOpen(
+  uiState: Pick<UiLocalState, "activeConfigMutationGeneration" | "externalConfigMutationPending">,
+): boolean {
+  // The per-session Side provider is an independent owner: a dirty or locally invalid Main
+  // Settings draft is allowed, while an admitted Main config transaction closes both surfaces.
+  return uiState.activeConfigMutationGeneration === null
+    && !uiState.externalConfigMutationPending;
+}
+
+export function canonicalSideChatProviderBaseUrl(input: string): string {
+  return validateProviderBaseUrl(input).canonicalBaseUrl;
+}
+
+export function canonicalSideChatCatalogBaseUrl(input: string): string {
+  const providerBaseUrl = canonicalSideChatProviderBaseUrl(input);
+  if (!providerBaseUrl) return "";
+  const url = new URL(providerBaseUrl);
+  const path = url.pathname.replace(/\/+$/, "");
+  const catalogPath = path.endsWith("/v1") ? path.slice(0, -3) : path;
+  url.pathname = catalogPath || "/";
+  return url.toString().replace(/\/+$/, "");
+}
+
+export function rebaseSideChatDraftAfterConfigure(
+  uiState: UiLocalState,
+  state: DesktopWebState,
+  ownerSessionId: string,
+  requestedBaseUrl: string,
+  requestedModel: string,
+): boolean {
+  if (
+    sideChatOwnerSessionId(state) !== ownerSessionId
+    || !state.side_chat.configured
+    || canonicalSideChatProviderBaseUrl(state.side_chat.base_url)
+      !== canonicalSideChatProviderBaseUrl(requestedBaseUrl)
+    || state.side_chat.model.trim() !== requestedModel.trim()
+  ) return false;
+
+  const draft = sideChatDraftForState(uiState, state);
+  if (!draft) return false;
+  const locallyDirty = draft.text !== draft.persistedText;
+  draft.setupBaseUrl = state.side_chat.base_url;
+  draft.setupModel = state.side_chat.model;
+  draft.setupRevision += 1;
+  draft.persistedText = state.side_chat.draft_text;
+  draft.persistedRevision = state.side_chat.draft_revision;
+  if (!locallyDirty && !draft.saveInFlight) draft.text = state.side_chat.draft_text;
+  return true;
+}
+
+export function sideChatCatalogUrlValid(input: string): boolean {
+  return canonicalSideChatCatalogBaseUrl(input).length > 0;
+}
+
+export function sideChatCatalogKey(ownerSessionId: string, baseUrl: string): string {
+  return `${ownerSessionId}\u0000${canonicalSideChatCatalogBaseUrl(baseUrl)}`;
+}
+
+export function sideChatCatalogViewForState(
+  uiState: UiLocalState,
+  state: DesktopWebState,
+): SideChatCatalogView {
+  const ownerSessionId = sideChatOwnerSessionId(state);
+  const draft = sideChatDraftForState(uiState, state);
+  if (!ownerSessionId || !draft) return emptySideChatCatalogView();
+  const baseUrl = canonicalSideChatCatalogBaseUrl(draft.setupBaseUrl);
+  const key = sideChatCatalogKey(ownerSessionId, baseUrl);
+  const local = uiState.sideChatCatalogs.get(key);
+  if (
+    local
+    && local.ownerSessionId === ownerSessionId
+    && local.baseUrl === baseUrl
+    && local.metadataMode === state.provider_effective_metadata_mode
+    && local.configGeneration === state.config_target.configGeneration
+  ) {
+    return {
+      status: local.status,
+      source: "side",
+      ownerSessionId,
+      baseUrl,
+      models: local.models,
+      error: local.error,
+    };
+  }
+  const seeded = mainProviderCatalogSeed(state, baseUrl);
+  if (seeded.length > 0) {
+    return {
+      status: "ready",
+      source: "main",
+      ownerSessionId,
+      baseUrl,
+      models: seeded,
+      error: "",
+    };
+  }
+  return {
+    ...emptySideChatCatalogView(),
+    ownerSessionId,
+    baseUrl,
+  };
+}
+
+export function sideChatModelOptions(
+  catalog: SideChatCatalogView,
+  currentModel: string,
+): SideChatModelOption[] {
+  const current = currentModel.trim();
+  const seen = new Set<string>();
+  const options: SideChatModelOption[] = catalog.models.flatMap((model): SideChatModelOption[] => {
+    const id = model.id.trim();
+    if (!id || seen.has(id)) return [];
+    seen.add(id);
+    return [{
+      id,
+      label: model.label.trim() || id,
+      loadState: model.loadState,
+      currentOnly: false,
+    } satisfies SideChatModelOption];
+  });
+  if (current && !seen.has(current)) {
+    options.unshift({
+      id: current,
+      label: `${current}（現在の設定）`,
+      loadState: "unknown",
+      currentOnly: true,
+    });
+  }
+  return options;
+}
+
+export function sideChatModelOptionLabel(option: SideChatModelOption): string {
+  if (option.currentOnly) return option.label;
+  if (option.loadState === "loaded") return `${option.label}（ロード済み）`;
+  if (option.loadState === "not_loaded") return `${option.label}（未ロード）`;
+  return option.label;
+}
+
+export function sideChatCatalogLoadOpen(
+  uiState: UiLocalState,
+  state: DesktopWebState,
+): boolean {
+  const ownerSessionId = sideChatOwnerSessionId(state);
+  const draft = sideChatDraftForState(uiState, state);
+  if (
+    !ownerSessionId
+    || !draft
+    || !sideChatOperationsOpen(uiState)
+    || !sideChatConfigurationOpen(state)
+    || sideChatMutationPending(uiState, ownerSessionId)
+    || !sideChatCatalogUrlValid(draft.setupBaseUrl)
+  ) return false;
+  return sideChatCatalogViewForState(uiState, state).status !== "loading";
+}
+
+export function beginSideChatCatalogLoad(
+  uiState: UiLocalState,
+  state: DesktopWebState,
+): SideChatCatalogRequest | null {
+  if (!sideChatCatalogLoadOpen(uiState, state)) return null;
+  const superseded = uiState.sideChatCatalogTransaction.active;
+  if (superseded) deleteLoadingSideChatCatalogEntry(uiState, superseded);
+  const ownerSessionId = sideChatOwnerSessionId(state);
+  const draft = sideChatDraftForState(uiState, state);
+  if (!ownerSessionId || !draft) return null;
+  const baseUrl = canonicalSideChatCatalogBaseUrl(draft.setupBaseUrl);
+  const key = sideChatCatalogKey(ownerSessionId, baseUrl);
+  const request = beginAsyncTransaction(uiState.sideChatCatalogTransaction, {
+    key,
+    ownerSessionId,
+    setupRevision: draft.setupRevision,
+    baseUrl,
+    metadataMode: state.provider_effective_metadata_mode,
+    configGeneration: state.config_target.configGeneration,
+  } satisfies SideChatCatalogTarget, "supersede", (token, target) => ({ token, ...target }));
+  const previous = sideChatCatalogViewForState(uiState, state);
+  uiState.sideChatCatalogs.set(key, {
+    ownerSessionId,
+    baseUrl,
+    metadataMode: request.metadataMode,
+    configGeneration: request.configGeneration,
+    models: previous.models,
+    status: "loading",
+    error: "",
+    requestToken: request.token,
+  });
+  return request;
+}
+
+export function finishSideChatCatalogLoad(
+  uiState: UiLocalState,
+  state: DesktopWebState | null,
+  request: SideChatCatalogRequest,
+  result: SideChatCatalogResult,
+): SideChatCatalogSettlement {
+  if (!sideChatCatalogRequestIsCurrent(uiState, request)) {
+    return { catalogAccepted: false, localStateChanged: false };
+  }
+  clearAsyncTransaction(uiState.sideChatCatalogTransaction, request);
+  if (!state || !sideChatCatalogRequestStillTargets(uiState, state, request)) {
+    rejectStaleSideChatCatalogEntry(uiState, request);
+    return { catalogAccepted: false, localStateChanged: true };
+  }
+  const responseMatches = result.ownerSessionId === request.ownerSessionId
+    && canonicalSideChatCatalogBaseUrl(result.baseUrl) === request.baseUrl
+    && result.metadataMode === request.metadataMode
+    && result.configGeneration === request.configGeneration;
+  if (!responseMatches) {
+    uiState.sideChatCatalogs.set(request.key, {
+      ownerSessionId: request.ownerSessionId,
+      baseUrl: request.baseUrl,
+      metadataMode: request.metadataMode,
+      configGeneration: request.configGeneration,
+      models: [],
+      status: "error",
+      error: "モデル一覧の応答対象が、現在のSide Chat設定と一致しませんでした。",
+      requestToken: request.token,
+    });
+    return { catalogAccepted: false, localStateChanged: true };
+  }
+  uiState.sideChatCatalogs.set(request.key, {
+    ownerSessionId: request.ownerSessionId,
+    baseUrl: request.baseUrl,
+    metadataMode: request.metadataMode,
+    configGeneration: request.configGeneration,
+    models: result.models,
+    status: "ready",
+    error: "",
+    requestToken: request.token,
+  });
+  return { catalogAccepted: true, localStateChanged: true };
+}
+
+export function failSideChatCatalogLoad(
+  uiState: UiLocalState,
+  state: DesktopWebState | null,
+  request: SideChatCatalogRequest,
+  error: string,
+): SideChatCatalogSettlement {
+  if (!sideChatCatalogRequestIsCurrent(uiState, request)) {
+    return { catalogAccepted: false, localStateChanged: false };
+  }
+  clearAsyncTransaction(uiState.sideChatCatalogTransaction, request);
+  if (!state || !sideChatCatalogRequestStillTargets(uiState, state, request)) {
+    rejectStaleSideChatCatalogEntry(uiState, request);
+    return { catalogAccepted: false, localStateChanged: true };
+  }
+  const previous = uiState.sideChatCatalogs.get(request.key);
+  uiState.sideChatCatalogs.set(request.key, {
+    ownerSessionId: request.ownerSessionId,
+    baseUrl: request.baseUrl,
+    metadataMode: request.metadataMode,
+    configGeneration: request.configGeneration,
+    models: previous?.models ?? [],
+    status: "error",
+    error: error.trim() || "モデル一覧を読み込めませんでした。",
+    requestToken: request.token,
+  });
+  return { catalogAccepted: false, localStateChanged: true };
+}
+
+function sideChatCatalogRequestIsCurrent(
+  uiState: UiLocalState,
+  request: SideChatCatalogRequest,
+): boolean {
+  return asyncTransactionIsCurrent(uiState.sideChatCatalogTransaction, request);
+}
+
+function sideChatCatalogRequestStillTargets(
+  uiState: UiLocalState,
+  state: DesktopWebState,
+  request: SideChatCatalogRequest,
+): boolean {
+  const ownerSessionId = sideChatOwnerSessionId(state);
+  const draft = sideChatDraftForState(uiState, state);
+  return sideChatOperationsOpen(uiState)
+    && ownerSessionId === request.ownerSessionId
+    && draft !== null
+    && draft.setupRevision === request.setupRevision
+    && canonicalSideChatCatalogBaseUrl(draft.setupBaseUrl) === request.baseUrl
+    && state.provider_effective_metadata_mode === request.metadataMode
+    && state.config_target.configGeneration === request.configGeneration;
+}
+
+function deleteLoadingSideChatCatalogEntry(
+  uiState: UiLocalState,
+  request: SideChatCatalogRequest,
+): void {
+  const entry = uiState.sideChatCatalogs.get(request.key);
+  if (entry?.requestToken === request.token && entry.status === "loading") {
+    uiState.sideChatCatalogs.delete(request.key);
+  }
+}
+
+function rejectStaleSideChatCatalogEntry(
+  uiState: UiLocalState,
+  request: SideChatCatalogRequest,
+): void {
+  uiState.sideChatCatalogs.set(request.key, {
+    ownerSessionId: request.ownerSessionId,
+    baseUrl: request.baseUrl,
+    metadataMode: request.metadataMode,
+    configGeneration: request.configGeneration,
+    models: [],
+    status: "error",
+    error: "モデル一覧の読込中にSide Chat設定が変更されました。現在の設定で、もう一度モデル一覧を読み込んでください。",
+    requestToken: request.token,
+  });
+}
+
+function mainProviderCatalogSeed(
+  state: DesktopWebState,
+  baseUrl: string,
+): SideChatCatalogModel[] {
+  if (
+    !state.provider_catalog_base_url
+    || canonicalSideChatCatalogBaseUrl(state.provider_catalog_base_url) !== baseUrl
+    || state.provider_catalog_metadata_mode !== state.provider_effective_metadata_mode
+  ) return [];
+  return state.provider_model_ids.flatMap((id, index) => {
+    const modelId = id.trim();
+    if (!modelId) return [];
+    return [{
+      id: modelId,
+      label: state.provider_models[index]?.trim() || modelId,
+      loadState: "unknown" as const,
+    }];
+  });
+}
+
+function emptySideChatCatalogView(): SideChatCatalogView {
+  return {
+    status: "idle",
+    source: "none",
+    ownerSessionId: null,
+    baseUrl: "",
+    models: [],
+    error: "",
+  };
+}
+
+export function openSideChatPane(
+  uiState: UiLocalState,
+  state: SideChatOwnerState,
+): boolean {
+  if (!sideChatOwnerSessionId(state)) return false;
+  uiState.artifactPaneMode = "side_chat";
+  uiState.selectedAgentPath = null;
+  uiState.focusSelectedAgentAfterRender = false;
+  uiState.agentPaneFocusAfterRender = null;
+  uiState.agentExecutionTransaction.active = null;
+  setArtifactPaneCollapsed(uiState, false);
+  uiState.artifactPaneFocusAfterRender = "content";
+  return true;
 }
 
 export function agentPaneOwnerIdentity(
@@ -217,7 +820,7 @@ export function reconcileAgentPaneState(
     uiState.focusSelectedAgentAfterRender = false;
     uiState.agentPaneFocusAfterRender = null;
     uiState.agentExecutionCache.clear();
-    uiState.activeAgentExecutionRequest = null;
+    uiState.agentExecutionTransaction.active = null;
     return;
   }
   if (
@@ -228,14 +831,14 @@ export function reconcileAgentPaneState(
     uiState.selectedAgentPath = null;
     uiState.focusSelectedAgentAfterRender = false;
     uiState.agentPaneFocusAfterRender = null;
-    uiState.activeAgentExecutionRequest = null;
+    uiState.agentExecutionTransaction.active = null;
   }
   if (state.agent_activity_rows.length === 0 && uiState.artifactPaneMode === "agents") {
     uiState.artifactPaneMode = "output";
     uiState.selectedAgentPath = null;
     uiState.focusSelectedAgentAfterRender = false;
     uiState.agentPaneFocusAfterRender = null;
-    uiState.activeAgentExecutionRequest = null;
+    uiState.agentExecutionTransaction.active = null;
   }
 }
 
@@ -266,7 +869,7 @@ export function showOutputPane(uiState: UiLocalState, focusOutputTrigger = false
   uiState.selectedAgentPath = null;
   uiState.focusSelectedAgentAfterRender = false;
   uiState.agentPaneFocusAfterRender = focusOutputTrigger ? "output-agent-trigger" : null;
-  uiState.activeAgentExecutionRequest = null;
+  uiState.agentExecutionTransaction.active = null;
 }
 
 export function showAgentList(uiState: UiLocalState): void {
@@ -274,7 +877,7 @@ export function showAgentList(uiState: UiLocalState): void {
   uiState.selectedAgentPath = null;
   uiState.focusSelectedAgentAfterRender = false;
   uiState.agentPaneFocusAfterRender = "agent-pane-back";
-  uiState.activeAgentExecutionRequest = null;
+  uiState.agentExecutionTransaction.active = null;
 }
 
 export function beginAgentExecutionLoad(
@@ -283,33 +886,30 @@ export function beginAgentExecutionLoad(
   row: AgentActivityRow,
 ): AgentExecutionRequest {
   const rootSessionId = state.draft_target.sessionId ?? "";
-  const expectedTarget: AgentExecutionExpectedTarget = {
+  const expectedTarget = Object.freeze({
     workspacePath: state.workspace_path,
     rootSessionId,
     agentPath: row.agent_path,
     childSessionId: row.session_id,
-  };
+  } satisfies AgentExecutionExpectedTarget);
   const cacheKey = agentExecutionCacheKey(expectedTarget);
-  const generation = uiState.nextAgentExecutionGeneration++;
-  const request: AgentExecutionRequest = {
+  const request = beginAsyncTransaction(uiState.agentExecutionTransaction, {
     cacheKey,
-    generation,
     ownerIdentity: agentPaneOwnerIdentity(state),
     expectedTarget,
     activityIdentity: agentActivityRowIdentity(row),
     operation: "replace",
     expectedOffset: null,
     expectedEnd: null,
-  };
+  } satisfies AgentExecutionTarget, "supersede", (generation, target) => ({ generation, ...target }));
   const cached = uiState.agentExecutionCache.get(cacheKey);
   uiState.agentExecutionCache.set(cacheKey, {
     status: "loading",
-    generation,
+    generation: request.generation,
     expectedTarget,
     projection: cached?.projection ?? null,
     error: "",
   });
-  uiState.activeAgentExecutionRequest = request;
   return request;
 }
 
@@ -318,39 +918,36 @@ export function beginPreviousAgentExecutionPageLoad(
   state: Pick<DesktopWebState, "workspace_path" | "draft_target">,
   row: AgentActivityRow,
 ): AgentExecutionRequest | null {
-  if (uiState.activeAgentExecutionRequest !== null) return null;
   const rootSessionId = state.draft_target.sessionId ?? "";
-  const expectedTarget: AgentExecutionExpectedTarget = {
+  const expectedTarget = Object.freeze({
     workspacePath: state.workspace_path,
     rootSessionId,
     agentPath: row.agent_path,
     childSessionId: row.session_id,
-  };
+  } satisfies AgentExecutionExpectedTarget);
   const cacheKey = agentExecutionCacheKey(expectedTarget);
   const cached = uiState.agentExecutionCache.get(cacheKey);
   const expectedOffset = cached?.projection?.turn_page_offset ?? 0;
   const expectedEnd = cached?.projection?.turn_page_end ?? 0;
   if (expectedOffset <= 0 || expectedEnd <= expectedOffset) return null;
 
-  const generation = uiState.nextAgentExecutionGeneration++;
-  const request: AgentExecutionRequest = {
+  const request = beginAsyncTransaction(uiState.agentExecutionTransaction, {
     cacheKey,
-    generation,
     ownerIdentity: agentPaneOwnerIdentity(state),
     expectedTarget,
     activityIdentity: agentActivityRowIdentity(row),
     operation: "prepend",
     expectedOffset,
     expectedEnd,
-  };
+  } satisfies AgentExecutionTarget, "single-flight", (generation, target) => ({ generation, ...target }));
+  if (!request) return null;
   uiState.agentExecutionCache.set(cacheKey, {
     status: "loading",
-    generation,
+    generation: request.generation,
     expectedTarget,
     projection: cached?.projection ?? null,
     error: "",
   });
-  uiState.activeAgentExecutionRequest = request;
   return request;
 }
 
@@ -369,7 +966,7 @@ export function finishAgentExecutionLoad(
       projection: cached?.projection ?? null,
       error: "読み込み結果の対象が現在のSub Agentと一致しませんでした。",
     });
-    uiState.activeAgentExecutionRequest = null;
+    clearAsyncTransaction(uiState.agentExecutionTransaction, request);
     return true;
   }
   if (request.operation === "prepend") {
@@ -394,7 +991,7 @@ export function finishAgentExecutionLoad(
         projection: newer ?? null,
         error: "以前の実行履歴が現在の表示範囲と連続していませんでした。",
       });
-      uiState.activeAgentExecutionRequest = null;
+      clearAsyncTransaction(uiState.agentExecutionTransaction, request);
       return true;
     }
     uiState.agentExecutionCache.set(request.cacheKey, {
@@ -404,7 +1001,7 @@ export function finishAgentExecutionLoad(
       projection,
       error: "",
     });
-    uiState.activeAgentExecutionRequest = null;
+    clearAsyncTransaction(uiState.agentExecutionTransaction, request);
     return true;
   }
   uiState.agentExecutionCache.set(request.cacheKey, {
@@ -414,7 +1011,7 @@ export function finishAgentExecutionLoad(
     projection,
     error: "",
   });
-  uiState.activeAgentExecutionRequest = null;
+  clearAsyncTransaction(uiState.agentExecutionTransaction, request);
   return true;
 }
 
@@ -432,7 +1029,7 @@ export function failAgentExecutionLoad(
     projection: cached?.projection ?? null,
     error,
   });
-  uiState.activeAgentExecutionRequest = null;
+  clearAsyncTransaction(uiState.agentExecutionTransaction, request);
   return true;
 }
 
@@ -466,9 +1063,7 @@ function agentExecutionRequestIsCurrent(
   uiState: UiLocalState,
   request: AgentExecutionRequest,
 ): boolean {
-  const active = uiState.activeAgentExecutionRequest;
-  return active?.generation === request.generation
-    && active.cacheKey === request.cacheKey
+  return asyncTransactionIsCurrent(uiState.agentExecutionTransaction, request)
     && uiState.agentPaneOwnerIdentity === request.ownerIdentity
     && uiState.artifactPaneMode === "agents"
     && uiState.selectedAgentPath === request.expectedTarget.agentPath;

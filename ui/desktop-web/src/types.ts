@@ -49,6 +49,8 @@ export interface SessionRow {
   archived: boolean;
   active_turn_id?: RowId | null;
   active_turn_sequence_no?: number | null;
+  admission_revision: string;
+  interrupt_target?: StopMutationTarget | null;
   pending_permission_requests: number;
   pending_user_input_requests: number;
   short_id: string;
@@ -89,7 +91,7 @@ export interface AgentActivityRow {
   started_order: number;
   updated: boolean;
   active_turn_id: RowId | null;
-  can_interrupt: boolean;
+  interrupt_target: AgentInterruptExpectedTarget | null;
 }
 
 export interface AgentExecutionExpectedTarget {
@@ -180,7 +182,21 @@ export interface ConfigDraftCapabilitiesProjection {
 export interface DraftActionTarget {
   workspacePath: string;
   sessionId: string | null;
-  ownerGeneration: number;
+  ownerGeneration: string;
+}
+
+export type RunExpectedState =
+  | { kind: "idle"; latestTurnId: string | null; admissionRevision: string }
+  | { kind: "turn"; turnId: string; admissionRevision: string };
+
+export interface PromptReviewMutationTarget extends DraftActionTarget {
+  requestId: string;
+  expectedState: RunExpectedState;
+}
+
+export interface CommandPaletteInsertionResult {
+  state: DesktopWebState;
+  insertionText: string;
 }
 
 export interface RunMutationTarget {
@@ -188,10 +204,31 @@ export interface RunMutationTarget {
   sessionId: string | null;
   runtimeOwnerToken: string;
   permissionConfirmationId: string | null;
+  expectedState: RunExpectedState;
 }
+
+export type StopMutationTarget =
+  | {
+    kind: "root";
+    workspacePath: string;
+    sessionId: string | null;
+    rootGeneration: string;
+    latestTurnId: string | null;
+    admissionRevision: string;
+    permissionConfirmationId: string | null;
+  }
+  | {
+    kind: "turn";
+    workspacePath: string;
+    sessionId: string;
+    turnId: string;
+    admissionRevision: string;
+    rootEpoch: string;
+  };
 
 export interface AgentInterruptExpectedTarget extends AgentExecutionExpectedTarget {
   expectedTurnId: RowId;
+  admissionRevision: string;
 }
 
 export interface SessionSearchTarget {
@@ -211,6 +248,7 @@ export type DesktopStatusCode =
   | "provider_transport"
   | "model_unavailable"
   | "image_unsupported"
+  | "image_attachment_invalid"
   | "permission_policy_denied"
   | "config_import_failed"
   | "approval_aborted"
@@ -237,7 +275,58 @@ export interface PlanProjection {
   steps: PlanStepProjection[];
 }
 
+export interface DesktopAboutProjection {
+  product_name: string;
+  version: string;
+  license_identifier: string;
+  copyright_notice: string;
+}
+
+export type SideChatStatus = "idle" | "running" | "completed" | "failed" | "cancelled";
+
+export interface SideChatMessageProjection {
+  id: string;
+  sequence_no: number;
+  role: "user" | "assistant" | "error";
+  content: string;
+}
+
+export type ProviderMetadataMode = "lm_studio_native_required" | "openai_compatible_only";
+
+export interface SideChatCatalogModel {
+  id: string;
+  label: string;
+  loadState: "loaded" | "not_loaded" | "unknown";
+}
+
+export interface SideChatCatalogResult {
+  ownerSessionId: string;
+  baseUrl: string;
+  metadataMode: ProviderMetadataMode;
+  configGeneration: string;
+  models: SideChatCatalogModel[];
+}
+
+export interface SideChatProjection {
+  configured: boolean;
+  deleting: boolean;
+  chat_id: string | null;
+  owner_session_id: string | null;
+  model: string;
+  base_url: string;
+  status: SideChatStatus;
+  phase: string;
+  last_error: string;
+  generation: string;
+  draft_text: string;
+  draft_revision: string;
+  messages: SideChatMessageProjection[];
+  can_send: boolean;
+  can_cancel: boolean;
+}
+
 export type ComposerSubmitMode = "new_request" | "steer" | "blocked";
+export type TaskActivityState = "idle" | "running" | "finalizing" | "attention";
 
 export interface DesktopWebState {
   projection_revision: string;
@@ -277,7 +366,9 @@ export interface DesktopWebState {
   can_submit: boolean;
   can_cancel_run: boolean;
   run_target: RunMutationTarget;
+  stop_target: StopMutationTarget | null;
   busy: boolean;
+  task_activity_state: TaskActivityState;
   async_polling_required: boolean;
   pending_async_operations: string[];
   navigation_loading: boolean;
@@ -286,6 +377,8 @@ export interface DesktopWebState {
   post_run_refresh_pending: boolean;
   background_mutation_pending: boolean;
   overlay: string;
+  about: DesktopAboutProjection;
+  side_chat: SideChatProjection;
   project_rows: ProjectRow[];
   selected_project_index: number;
   session_rows: SessionRow[];
@@ -313,14 +406,14 @@ export interface DesktopWebState {
   local_search_results_text: string;
   command_rows: Array<{ name: string; label: string; path: string }>;
   provider_base_url: string;
-  provider_metadata_mode: "lm_studio_native_required" | "openai_compatible_only";
+  provider_metadata_mode: ProviderMetadataMode;
   provider_effective_base_url: string;
-  provider_effective_metadata_mode: "lm_studio_native_required" | "openai_compatible_only";
+  provider_effective_metadata_mode: ProviderMetadataMode;
   provider_effective_context_window: string;
   provider_effective_max_output_tokens: string;
   provider_effective_model_id: string;
   provider_catalog_base_url: string | null;
-  provider_catalog_metadata_mode: "lm_studio_native_required" | "openai_compatible_only" | null;
+  provider_catalog_metadata_mode: ProviderMetadataMode | null;
   provider_context_window: string;
   provider_max_output_tokens: string;
   provider_models: string[];
@@ -333,6 +426,7 @@ export interface DesktopWebState {
   config_fields: ConfigFieldProjection[];
   config_target: ConfigMutationTarget;
   workspace_input: string;
+  review_target: PromptReviewMutationTarget | null;
   review_raw_text: string;
   review_draft_text: string;
   review_status_text: string;

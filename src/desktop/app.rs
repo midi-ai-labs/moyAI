@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Component, Path};
 use std::process::Command as ProcessCommand;
@@ -9,27 +9,33 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::app::session_title::NEW_SESSION_PLACEHOLDER_TITLE;
 use crate::app::{
-    AgentActivityRecord, App, AppBootstrap, AppCommand, AppCommandOutcome, ReviewRequest,
-    RunConfigInput, RunRequest, SessionSteerRequest,
+    AgentActivityRecord, App, AppBootstrap, AppCommand, AppCommandOutcome,
+    ExactRootExecutionStopOutcome, ReviewRequest, RunConfigInput, RunRequest, SessionSteerRequest,
 };
 use crate::cli::{
     ConfirmationOutcome, ConfirmationPrompt, EventRenderer, OutputMode, ReviewDecision,
     SharedConfirmationPrompt,
 };
+use crate::config::field::build_resolved_config_from_key_values;
 use crate::config::loader::{
     acquire_global_config_write_lease, global_config_path, read_toml_utf8_bounded,
 };
 use crate::config::merge::apply_patch as apply_config_patch;
 use crate::config::model::{PartialModelConfig, PartialResolvedConfig};
-use crate::config::{ConfigLoader, ProviderMetadataMode, ResolvedConfig, ShellFamily};
+use crate::config::{
+    ConfigField, ConfigLoader, ProviderMetadataMode, ResolvedConfig, ShellFamily,
+    sanitize_provider_endpoint,
+};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
 use crate::llm::{
     ProviderModelInfo, apply_provider_model_info_to_config, extra_body_with_num_ctx,
     fetch_provider_model_infos, normalize_provider_base_url,
 };
+#[cfg(test)]
+use crate::protocol::TurnInterruptionCause;
 use crate::protocol::{
     ProtocolEventStore as _, RuntimeEvent, RuntimeEventMsg, ToolApprovalDecision, TurnId,
-    TurnInterruptionCause,
+    UserInputItem, UserTurn,
 };
 use crate::runtime::{
     AgentStatus, LocalTaskExecutor, OwnedTaskHandle, RunCancelOutcome, RunCancellationCause,
@@ -40,11 +46,13 @@ use crate::session::markdown::{
     canonical_markdown_export_read, render_codex_turn_block_markdown,
 };
 use crate::session::{
-    EditorContext, LoadedSessionStatus, ProjectId, ProjectRecord, RunEvent, RunSummary, SessionId,
-    SessionRecord, SessionStatus, canonical_session_read_to_markdown, history_markdown_file_name,
+    ActiveTurnExpectation, EditorContext, LoadedSessionStatus, ProjectId, ProjectRecord, RunEvent,
+    RunEventDurability, RunSummary, SessionId, SessionRecord, SessionStatus,
+    canonical_session_read_to_markdown, history_markdown_file_name,
 };
+use crate::storage::{SideChatBinding, SideChatId, SideChatProviderTarget};
 use crate::tool::PermissionRequest;
-use crate::tui::config_editor::{ConfigEditorState, ConfigField};
+use crate::tui::config_editor::ConfigEditorState;
 use crate::workspace::project::normalize_path;
 use tauri::Manager;
 use tempfile::NamedTempFile;
@@ -64,17 +72,21 @@ use super::query::{
     load_latest_session_detail, load_session_detail, load_snapshot, load_snapshot_continue_last,
     load_snapshot_for_selection, load_snapshot_for_session_search,
 };
+use super::side_chat::{
+    SideChatRequestProfile, SideChatStreamEvent, execute_admitted_canonical_side_chat,
+};
 use super::state::{DesktopState, DesktopStatusCode};
 #[cfg(test)]
 use super::web_model::desktop_web_state;
 use super::web_model::{
-    DesktopRuntimeProjection, DesktopWebState, access_runtime_owner_token,
-    agent_activity_projection, desktop_web_state_with_permission, navigation_admission_blocker,
+    DesktopRuntimeProjection, DesktopSideChatMessageProjection, DesktopSideChatProjection,
+    DesktopWebState, access_runtime_owner_token, agent_activity_projection,
+    desktop_web_state_with_permission, navigation_admission_blocker,
 };
 
 const DESKTOP_RUNTIME_DRAIN_BUDGET: usize = 256;
 const DESKTOP_RUNTIME_MAILBOX_CAPACITY: usize = 512;
-const DESKTOP_CONTROL_MAILBOX_CAPACITY: usize = 64;
+const SIDE_CHAT_START_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const DESKTOP_SESSION_RUNTIME_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(100);
 const DESKTOP_SESSION_RUNTIME_CURSOR_PAGE_LIMIT: usize = 1;
@@ -111,7 +123,6 @@ enum RuntimeMessage {
     SteerFinished {
         target: SteerSubmissionTarget,
         image_paths: Vec<Utf8PathBuf>,
-        cancel_prompt_review_on_commit: bool,
         result: Result<(), String>,
     },
     SnapshotLoaded {
@@ -196,49 +207,43 @@ enum RuntimeMessage {
         worker: Arc<AccessModePersistenceWorker>,
         result: Result<Utf8PathBuf, String>,
     },
+    SideChatDelta {
+        owner_session_id: SessionId,
+        side_chat_id: String,
+        run_generation: u64,
+        delta: String,
+    },
+    SideChatPhase {
+        owner_session_id: SessionId,
+        side_chat_id: String,
+        run_generation: u64,
+        phase: String,
+    },
+    SideChatFinished {
+        owner_session_id: SessionId,
+        side_chat_id: String,
+        run_generation: u64,
+        result: Result<(), String>,
+    },
 }
 
 #[derive(Clone)]
 struct DesktopControlPlaneSender {
-    tx: mpsc::SyncSender<RuntimeMessage>,
-    terminal_fallback: Arc<Mutex<Option<RuntimeMessage>>>,
+    tx: mpsc::Sender<RuntimeMessage>,
 }
 
 impl DesktopControlPlaneSender {
-    fn try_send(&self, message: RuntimeMessage) -> Result<(), String> {
-        self.tx.try_send(message).map_err(|error| match error {
-            mpsc::TrySendError::Full(_) => {
-                "desktop control mailbox is full; the request was rejected".to_string()
-            }
-            mpsc::TrySendError::Disconnected(_) => {
-                "desktop control mailbox is unavailable".to_string()
-            }
-        })
-    }
-
-    fn publish_terminal(&self, message: RuntimeMessage) {
-        match self.tx.try_send(message) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(message)) => {
-                if let Ok(mut fallback) = self.terminal_fallback.lock() {
-                    *fallback = Some(message);
-                }
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {}
-        }
+    fn send(&self, message: RuntimeMessage) -> Result<(), String> {
+        self.tx
+            .send(message)
+            .map_err(|_| "desktop control mailbox is unavailable".to_string())
     }
 }
 
 #[cfg(test)]
 fn test_desktop_control_plane() -> (DesktopControlPlaneSender, mpsc::Receiver<RuntimeMessage>) {
-    let (tx, rx) = mpsc::sync_channel(DESKTOP_CONTROL_MAILBOX_CAPACITY);
-    (
-        DesktopControlPlaneSender {
-            tx,
-            terminal_fallback: Arc::new(Mutex::new(None)),
-        },
-        rx,
-    )
+    let (tx, rx) = mpsc::channel();
+    (DesktopControlPlaneSender { tx }, rx)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,6 +391,17 @@ struct DraftRequestTarget {
     workspace_root: Utf8PathBuf,
     session_id: Option<SessionId>,
     owner_generation: u64,
+    expected_active_turn: ActiveTurnExpectation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromptReviewTarget {
+    request_id: u64,
+    workspace_root: Utf8PathBuf,
+    composer_workspace_path: String,
+    composer_session_id: Option<SessionId>,
+    composer_owner_generation: u64,
+    expected_active_turn: ActiveTurnExpectation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,6 +409,7 @@ struct SteerSubmissionTarget {
     operation_id: DesktopAsyncOperationId,
     workspace_root: Utf8PathBuf,
     session_id: SessionId,
+    expected_active_turn: ActiveTurnExpectation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -540,6 +557,10 @@ impl RuntimeMessage {
             | RuntimeMessage::WorkspaceSwitchedForNewProjectSession { .. } => {
                 RuntimeMessageAsyncContract::NavigationOperation
             }
+            RuntimeMessage::SideChatDelta { .. } | RuntimeMessage::SideChatPhase { .. } => {
+                RuntimeMessageAsyncContract::RunStream
+            }
+            RuntimeMessage::SideChatFinished { .. } => RuntimeMessageAsyncContract::TerminalRun,
         }
     }
 }
@@ -553,7 +574,13 @@ enum SessionLoadReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CurrentSessionRefreshPurpose {
     Refresh,
-    StopRequestRefresh { root_admission_fence: u64 },
+    StopRequestRefresh {
+        root_admission_fence: u64,
+        root_stop_attempt: Option<DesktopRootStopAttempt>,
+        expected_active_turn: Option<ActiveTurnExpectation>,
+        in_memory_stop_accepted: bool,
+        durable_outcome: Option<ExactRootExecutionStopOutcome>,
+    },
 }
 
 struct LoadedSession {
@@ -767,6 +794,24 @@ struct DesktopRootRun {
     run_control: RunControl,
     phase: DesktopRootRunPhase,
     worker: Option<OwnedTaskHandle>,
+    next_stop_attempt_id: u64,
+    active_stop_attempt_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DesktopRootStopAttempt {
+    generation: u64,
+    attempt_id: u64,
+}
+
+enum DesktopRootStopAttemptAdmission {
+    Acquired {
+        attempt: DesktopRootStopAttempt,
+        run_control: RunControl,
+    },
+    AlreadyPending,
+    NotOwned,
+    Exhausted,
 }
 
 struct PendingRootSubmission {
@@ -775,7 +820,7 @@ struct PendingRootSubmission {
     owner_session_id: Option<SessionId>,
     prompt_dispatch: crate::session::PromptDispatchPart,
     image_paths: Vec<Utf8PathBuf>,
-    cancel_prompt_review_on_commit: bool,
+    prompt_review_to_cancel: Option<PromptReviewTarget>,
 }
 
 struct DesktopSessionRuntimeListener {
@@ -802,6 +847,8 @@ impl DesktopRunLifecycle {
             run_control,
             phase: DesktopRootRunPhase::Running,
             worker: None,
+            next_stop_attempt_id: 1,
+            active_stop_attempt_id: None,
         });
     }
 
@@ -838,12 +885,57 @@ impl DesktopRunLifecycle {
             .is_some_and(|run| run.generation == generation)
     }
 
+    fn root_scope_control(&self, generation: u64) -> Option<RunControl> {
+        self.root
+            .as_ref()
+            .filter(|run| run.generation == generation)
+            .map(|run| run.run_control.clone())
+    }
+
+    fn begin_stop_attempt(&mut self, generation: u64) -> DesktopRootStopAttemptAdmission {
+        let Some(run) = self
+            .root
+            .as_mut()
+            .filter(|run| run.generation == generation)
+        else {
+            return DesktopRootStopAttemptAdmission::NotOwned;
+        };
+        if run.active_stop_attempt_id.is_some() {
+            return DesktopRootStopAttemptAdmission::AlreadyPending;
+        }
+        let attempt_id = run.next_stop_attempt_id;
+        let Some(next_attempt_id) = attempt_id.checked_add(1) else {
+            return DesktopRootStopAttemptAdmission::Exhausted;
+        };
+        run.next_stop_attempt_id = next_attempt_id;
+        run.active_stop_attempt_id = Some(attempt_id);
+        DesktopRootStopAttemptAdmission::Acquired {
+            attempt: DesktopRootStopAttempt {
+                generation,
+                attempt_id,
+            },
+            run_control: run.run_control.clone(),
+        }
+    }
+
+    fn finish_stop_attempt(&mut self, attempt: DesktopRootStopAttempt) -> bool {
+        let Some(run) = self.root.as_mut().filter(|run| {
+            run.generation == attempt.generation
+                && run.active_stop_attempt_id == Some(attempt.attempt_id)
+        }) else {
+            return false;
+        };
+        run.active_stop_attempt_id = None;
+        true
+    }
+
     fn root_is_finalizing(&self) -> bool {
         self.root
             .as_ref()
             .is_some_and(|run| run.phase == DesktopRootRunPhase::Finalizing)
     }
 
+    #[cfg(test)]
     fn can_steer_root(&self) -> bool {
         self.root
             .as_ref()
@@ -854,24 +946,6 @@ impl DesktopRunLifecycle {
         self.root
             .as_ref()
             .is_some_and(|run| run.run_control.is_cancelled())
-    }
-
-    fn request_cancel(&mut self) -> bool {
-        let Some(run) = self.root.as_mut() else {
-            return false;
-        };
-        let accepted = match run
-            .run_control
-            .request_cancel(RunCancellationCause::Interruption(
-                TurnInterruptionCause::UserStop,
-            )) {
-            RunCancelOutcome::Applied | RunCancelOutcome::Deferred(_) => true,
-            RunCancelOutcome::Rejected => false,
-        };
-        if accepted {
-            run.phase = DesktopRootRunPhase::Finalizing;
-        }
-        accepted
     }
 
     fn observe_terminal_event(&mut self) {
@@ -1070,8 +1144,8 @@ mod command_projection_owner_tests {
                 project_id: app.workspace.project_id,
                 title: "nested workspace".to_string(),
                 cwd: selected_directory.clone(),
-                model: app.config.model.model.clone(),
-                base_url: app.config.model.base_url.clone(),
+                model: "session-saved-model".to_string(),
+                base_url: "http://127.0.0.1:4555/v1".to_string(),
                 access_mode: app.config.permissions.access_mode,
             })
             .await
@@ -1117,6 +1191,18 @@ mod command_projection_owner_tests {
             controller.state.app_state.current_session_id,
             Some(session.id)
         );
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .model = "current-settings-model".to_string();
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .base_url = "http://127.0.0.1:4666/v1".to_string();
 
         let export_title = controller
             .state
@@ -1162,9 +1248,12 @@ mod command_projection_owner_tests {
                 .as_deref()
                 .is_some_and(|message| message.contains(expected_export.as_str()))
         );
+        let canonical_history =
+            std::fs::read_to_string(&expected_export).expect("canonical history markdown");
+        assert!(canonical_history.contains("Model: session-saved-model"));
+        assert!(canonical_history.contains("Base URL: http://127.0.0.1:4555/v1"));
 
-        let transcript_file_name =
-            transcript_markdown_file_name(&controller.state.selected_session_title(), session.id);
+        let transcript_file_name = transcript_markdown_file_name(&session.title, session.id);
         let expected_transcript = selected_directory
             .join(".moyai")
             .join("transcript-exports")
@@ -1181,6 +1270,10 @@ mod command_projection_owner_tests {
             "automatic transcript export must not escape to the ancestor project root"
         );
         assert!(transcript.contains(selected_directory.as_str()));
+        assert!(transcript.contains("Provider: `http://127.0.0.1:4555/v1`"));
+        assert!(transcript.contains("Model: `session-saved-model`"));
+        assert!(!transcript.contains("http://127.0.0.1:4666/v1"));
+        assert!(!transcript.contains("current-settings-model"));
     }
 
     #[tokio::test]
@@ -1303,7 +1396,7 @@ mod command_projection_owner_tests {
             owner_session_id: None,
             prompt_dispatch: crate::session::PromptDispatchPart::raw("first nested run"),
             image_paths: Vec::new(),
-            cancel_prompt_review_on_commit: false,
+            prompt_review_to_cancel: None,
         });
         let created_session_id = SessionId::new();
         controller.state.app_state.current_session_id = Some(created_session_id);
@@ -1539,48 +1632,48 @@ mod command_projection_owner_tests {
     }
 
     #[test]
-    fn pre_admission_root_owns_cancellation_before_any_run_event() {
-        let cancel = RunControl::new();
-        let observer = cancel.clone();
+    fn root_stop_attempt_is_single_flight_and_stale_completion_cannot_release_a_new_attempt() {
         let mut lifecycle = DesktopRunLifecycle::default();
-        lifecycle.begin(12, cancel);
+        let root_control = RunControl::new();
+        lifecycle.begin(12, root_control.clone());
 
-        assert_eq!(lifecycle.root_generation(), Some(12));
-        assert!(lifecycle.root_is_active());
-        assert!(!observer.is_cancelled());
-        assert!(lifecycle.request_cancel());
-        assert!(observer.is_cancelled());
-        assert!(lifecycle.root_is_finalizing());
-    }
+        let first = match lifecycle.begin_stop_attempt(12) {
+            DesktopRootStopAttemptAdmission::Acquired {
+                attempt,
+                run_control,
+            } => {
+                assert!(run_control.same_owner(&root_control));
+                attempt
+            }
+            _ => panic!("the exact generation must acquire its first Stop coordinator"),
+        };
+        assert!(matches!(
+            lifecycle.begin_stop_attempt(12),
+            DesktopRootStopAttemptAdmission::AlreadyPending
+        ));
+        assert!(!lifecycle.finish_stop_attempt(DesktopRootStopAttempt {
+            generation: 11,
+            attempt_id: first.attempt_id,
+        }));
+        assert!(lifecycle.finish_stop_attempt(first));
 
-    #[test]
-    fn deferred_stop_finalizes_desktop_ui_while_success_remains_authoritative() {
-        let control = RunControl::new();
-        let success = control
-            .begin_success_commit()
-            .expect("success commit reservation");
-        let mut lifecycle = DesktopRunLifecycle::default();
-        lifecycle.begin(13, control.clone());
+        let second = match lifecycle.begin_stop_attempt(12) {
+            DesktopRootStopAttemptAdmission::Acquired { attempt, .. } => attempt,
+            _ => panic!("the exact generation must admit a retry after settlement"),
+        };
+        assert_ne!(second.attempt_id, first.attempt_id);
+        assert!(!lifecycle.finish_stop_attempt(first));
+        assert!(matches!(
+            lifecycle.begin_stop_attempt(12),
+            DesktopRootStopAttemptAdmission::AlreadyPending
+        ));
+        assert!(lifecycle.finish_stop_attempt(second));
 
-        assert!(
-            lifecycle.request_cancel(),
-            "a deferred Stop is accepted as a pending UI terminal"
-        );
-        assert!(lifecycle.root_is_finalizing());
-        assert!(!lifecycle.can_steer_root());
-        assert_eq!(control.cause(), None);
-
-        assert!(success.seal());
-        assert!(control.success_is_sealed());
-        assert_eq!(control.cause(), None);
-        lifecycle.finish_root();
-
-        let sealed = RunControl::new();
-        assert!(sealed.seal_success());
-        lifecycle.begin(14, sealed);
-        assert!(!lifecycle.request_cancel());
-        assert!(!lifecycle.root_is_finalizing());
-        assert!(lifecycle.can_steer_root());
+        lifecycle.begin(13, RunControl::new());
+        assert!(matches!(
+            lifecycle.begin_stop_attempt(12),
+            DesktopRootStopAttemptAdmission::NotOwned
+        ));
     }
 
     #[test]
@@ -1613,6 +1706,42 @@ mod command_projection_owner_tests {
                 .access_mode,
             crate::config::AccessMode::FullAccess
         );
+    }
+
+    #[tokio::test]
+    async fn settings_reject_invalid_constraints_before_effective_config_commit() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let generation = controller.state.provider_config.config_generation;
+
+        for (field, value) in [
+            (ConfigField::ContextWindow, "0"),
+            (ConfigField::MaxParallelPredictions, "0"),
+            (ConfigField::MultiAgentMaxAgents, "0"),
+            (ConfigField::MultiAgentMaxModelRequests, "0"),
+            (ConfigField::Temperature, "NaN"),
+            (ConfigField::TopP, "inf"),
+            (ConfigField::PresencePenalty, "-inf"),
+            (ConfigField::FrequencyPenalty, "NaN"),
+        ] {
+            let original = field.value(&controller.state.provider_config.effective_config);
+
+            assert!(
+                !controller
+                    .apply_session_config(vec![(field.label().to_string(), value.to_string(),)]),
+                "{} must be rejected",
+                field.label(),
+            );
+            assert_eq!(
+                field.value(&controller.state.provider_config.effective_config),
+                original,
+                "{} changed despite the rejected commit",
+                field.label(),
+            );
+            assert_eq!(
+                controller.state.provider_config.config_generation, generation,
+                "a rejected config must not advance the owner generation",
+            );
+        }
     }
 
     #[test]
@@ -2474,6 +2603,698 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
+    async fn initial_setup_session_apply_completes_only_the_forced_startup_review() {
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let persisted_model = controller.app.config.model.model.clone();
+        controller.state.begin_startup(false, None, &root);
+        assert!(controller.state.startup.requires_initial_setup());
+        assert!(controller.state.view.startup_overlay_forced);
+        assert_eq!(
+            controller.state.view.overlay,
+            super::super::state::DesktopOverlay::ConfigEditor
+        );
+
+        let temporary_model = "temporary-initial-setup-model";
+        let values =
+            ConfigEditorState::from_config(&controller.state.provider_config.effective_config)
+                .fields
+                .into_iter()
+                .map(|field| {
+                    let value = if field.key == ConfigField::Model {
+                        temporary_model.to_string()
+                    } else {
+                        field.value
+                    };
+                    (field.key.label().to_string(), value)
+                })
+                .collect();
+
+        assert!(controller.apply_session_config(values));
+        assert!(!controller.state.startup.requires_initial_setup());
+        assert!(!controller.state.view.startup_overlay_forced);
+        assert_eq!(
+            controller.state.view.overlay,
+            super::super::state::DesktopOverlay::None
+        );
+        assert_eq!(
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .model
+                .model,
+            temporary_model
+        );
+        assert_eq!(
+            controller.app.config.model.model, persisted_model,
+            "session Apply must not replace the persisted global config owner"
+        );
+
+        controller.state.show_config_editor();
+        assert!(!controller.state.view.startup_overlay_forced);
+        let normal_values =
+            ConfigEditorState::from_config(&controller.state.provider_config.effective_config)
+                .fields
+                .into_iter()
+                .map(|field| (field.key.label().to_string(), field.value))
+                .collect();
+        assert!(controller.apply_session_config(normal_values));
+        assert_eq!(
+            controller.state.view.overlay,
+            super::super::state::DesktopOverlay::ConfigEditor,
+            "ordinary Preferences Apply keeps the existing Settings workflow"
+        );
+    }
+
+    async fn side_chat_test_controller()
+    -> (tempfile::TempDir, Utf8PathBuf, DesktopController, SessionId) {
+        use crate::session::SessionRepository as _;
+
+        let (temp, root, mut controller) = empty_access_test_controller().await;
+        let session = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(crate::session::NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "side chat owner".to_string(),
+                cwd: root.clone(),
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: controller.app.config.permissions.access_mode,
+            })
+            .await
+            .expect("side chat owner session");
+        let snapshot = load_snapshot_for_selection(&controller.app, Some(session.id))
+            .await
+            .expect("owner snapshot");
+        controller.state.replace_snapshot(snapshot);
+        controller.state.app_state.current_session_id = Some(session.id);
+        controller.state.app_state.current_session_title = session.title;
+        (temp, root, controller, session.id)
+    }
+
+    #[tokio::test]
+    async fn side_chat_start_ack_owns_process_and_canonical_admission() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("side provider");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking side provider");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("provider address")
+        );
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (_temp, _root, mut controller, owner_session_id) = side_chat_test_controller().await;
+        controller
+            .configure_side_chat(
+                owner_session_id,
+                endpoint,
+                "google/gemma-4-12b-qat".to_string(),
+            )
+            .expect("configure side chat");
+        let binding = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("binding read")
+            .expect("binding");
+        let provider = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ = accepted_tx.send(());
+                        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+                        drop(stream);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if release_rx.try_recv().is_ok() || std::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("side provider accept failed: {error}"),
+                }
+            }
+        });
+
+        controller
+            .start_side_chat(
+                owner_session_id,
+                binding.id,
+                binding.request_generation,
+                binding.draft_revision,
+                "canonical side question".to_string(),
+            )
+            .expect("admitted side chat start");
+        accepted_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("provider connection");
+
+        let projection = controller
+            .app
+            .store
+            .side_chat_repo()
+            .conversation_projection(owner_session_id)
+            .expect("conversation projection")
+            .expect("durable conversation");
+        assert_eq!(projection.binding.request_generation, 1);
+        assert_eq!(projection.binding.persisted_draft, "");
+        assert_eq!(projection.status, SessionStatus::Running);
+        assert!(projection.messages.iter().any(|message| {
+            message.role == crate::storage::SideChatConversationRole::User
+                && message.content == "canonical side question"
+        }));
+        assert!(
+            controller
+                .app
+                .store
+                .active_runs()
+                .is_active(binding.conversation_session_id)
+        );
+        assert!(
+            controller
+                .app
+                .store
+                .try_acquire_run_process_lease(binding.conversation_session_id)
+                .is_err()
+        );
+
+        let active_turn_id = controller
+            .app
+            .store
+            .active_runs()
+            .active_turn_id(binding.conversation_session_id)
+            .expect("registered side turn");
+        assert_eq!(
+            controller.app.store.active_runs().cancel_turn(
+                binding.conversation_session_id,
+                active_turn_id,
+                TurnInterruptionCause::UserStop,
+            ),
+            crate::runtime::ActiveRunInterruptOutcome::Applied,
+            "the registry and provider request must share one cancellation owner"
+        );
+        let _ = release_tx.send(());
+        for _ in 0..300 {
+            controller.drain_runtime_messages();
+            if !controller.side_chat_runs.contains_key(&owner_session_id) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!controller.side_chat_runs.contains_key(&owner_session_id));
+        assert!(
+            !controller
+                .app
+                .store
+                .active_runs()
+                .is_active(binding.conversation_session_id)
+        );
+        let _released_process_owner = controller
+            .app
+            .store
+            .try_acquire_run_process_lease(binding.conversation_session_id)
+            .expect("released side process owner");
+        provider.join().expect("side provider thread");
+    }
+
+    #[tokio::test]
+    async fn active_side_chat_rejects_stale_owner_actions_then_deletes_durably() {
+        use crate::session::SessionRepository as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("side provider");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking side provider");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("provider address")
+        );
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (_temp, _root, mut controller, owner_session_id) = side_chat_test_controller().await;
+        controller
+            .configure_side_chat(
+                owner_session_id,
+                endpoint,
+                "google/gemma-4-12b-qat".to_string(),
+            )
+            .expect("configure side chat");
+        let initial = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("binding read")
+            .expect("binding");
+        let conversation_session_id = initial.conversation_session_id;
+        let provider = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ = accepted_tx.send(());
+                        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+                        drop(stream);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if release_rx.try_recv().is_ok() || std::time::Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("side provider accept failed: {error}"),
+                }
+            }
+        });
+
+        controller
+            .start_side_chat(
+                owner_session_id,
+                initial.id,
+                initial.request_generation,
+                initial.draft_revision,
+                "delete this side conversation".to_string(),
+            )
+            .expect("admitted side chat start");
+        accepted_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("provider connection");
+        let admitted = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("admitted binding read")
+            .expect("admitted binding");
+
+        let other = controller
+            .app
+            .store
+            .session_repo()
+            .create_session(crate::session::NewSession {
+                project_id: controller.app.workspace.project_id,
+                title: "other selected session".to_string(),
+                cwd: controller.app.workspace.root.clone(),
+                model: controller.app.config.model.model.clone(),
+                base_url: controller.app.config.model.base_url.clone(),
+                access_mode: controller.app.config.permissions.access_mode,
+            })
+            .await
+            .expect("other main session");
+        let other_snapshot = load_snapshot_for_selection(&controller.app, Some(other.id))
+            .await
+            .expect("other owner snapshot");
+        controller.state.replace_snapshot(other_snapshot);
+        controller.state.app_state.current_session_id = Some(other.id);
+        controller.state.app_state.current_session_title = other.title;
+
+        let cancel_error = controller
+            .cancel_side_chat(owner_session_id, admitted.id, admitted.request_generation)
+            .expect_err("stale owner must not stop an active side chat");
+        assert!(cancel_error.contains("selected main session changed"));
+        let delete_error = controller
+            .delete_side_chat(owner_session_id, admitted.id, admitted.request_generation)
+            .expect_err("stale owner must not tombstone an active side chat");
+        assert!(delete_error.contains("selected main session changed"));
+        assert!(
+            !controller
+                .side_chat_runs
+                .get(&owner_session_id)
+                .expect("active owner run")
+                .cancel
+                .is_cancelled(),
+            "the stale Stop target must have no cancellation side effect"
+        );
+        assert_eq!(
+            controller
+                .app
+                .store
+                .side_chat_repo()
+                .get_by_owner(owner_session_id)
+                .expect("unchanged binding read")
+                .expect("unchanged binding")
+                .delete_requested_at_ms,
+            None,
+            "the stale delete target must not persist a tombstone"
+        );
+
+        let owner_snapshot = load_snapshot_for_selection(&controller.app, Some(owner_session_id))
+            .await
+            .expect("restore owner snapshot");
+        controller.state.replace_snapshot(owner_snapshot);
+        controller.state.app_state.current_session_id = Some(owner_session_id);
+        controller.state.app_state.current_session_title = "side chat owner".to_string();
+
+        controller
+            .delete_side_chat(owner_session_id, admitted.id, admitted.request_generation)
+            .expect("accept active side deletion");
+
+        let deleting = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("deleting binding read")
+            .expect("deleting binding");
+        assert!(
+            deleting.delete_requested_at_ms.is_some(),
+            "the destructive confirmation must be durable before provider cancellation settles"
+        );
+        let active = controller
+            .side_chat_runs
+            .get(&owner_session_id)
+            .expect("side run remains owned while deletion finalizes");
+        assert!(active.delete_after_finish);
+        assert!(active.cancel.is_cancelled());
+
+        let _ = release_tx.send(());
+        for _ in 0..300 {
+            controller.drain_runtime_messages();
+            if !controller.side_chat_runs.contains_key(&owner_session_id) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!controller.side_chat_runs.contains_key(&owner_session_id));
+        assert!(
+            controller
+                .app
+                .store
+                .side_chat_repo()
+                .get_by_owner(owner_session_id)
+                .expect("deleted binding read")
+                .is_none()
+        );
+        assert!(
+            controller
+                .app
+                .session_service
+                .get_session(conversation_session_id)
+                .await
+                .is_err(),
+            "the hidden canonical side conversation must be deleted"
+        );
+        controller
+            .app
+            .session_service
+            .get_session(owner_session_id)
+            .await
+            .expect("main owner remains available");
+        provider.join().expect("side provider thread");
+    }
+
+    #[tokio::test]
+    async fn side_chat_process_owner_failure_preserves_draft_and_generation() {
+        let (_temp, _root, mut controller, owner_session_id) = side_chat_test_controller().await;
+        controller
+            .configure_side_chat(
+                owner_session_id,
+                "http://127.0.0.1:1234".to_string(),
+                "google/gemma-4-12b-qat".to_string(),
+            )
+            .expect("configure side chat");
+        let repository = controller.app.store.side_chat_repo();
+        let binding = repository
+            .get_by_owner(owner_session_id)
+            .expect("binding read")
+            .expect("binding");
+        let draft = repository
+            .update_draft(
+                owner_session_id,
+                binding.id,
+                binding.draft_revision,
+                "keep this draft",
+            )
+            .expect("persist draft")
+            .binding;
+        let process_owner = controller
+            .app
+            .store
+            .try_acquire_run_process_lease(binding.conversation_session_id)
+            .expect("competing process owner");
+
+        let error = controller
+            .start_side_chat(
+                owner_session_id,
+                binding.id,
+                binding.request_generation,
+                draft.draft_revision,
+                "must not be admitted".to_string(),
+            )
+            .expect_err("competing process owner must reject start");
+
+        assert!(error.contains("another live process"));
+        assert!(!controller.side_chat_runs.contains_key(&owner_session_id));
+        let preserved = repository
+            .get_by_owner(owner_session_id)
+            .expect("preserved binding read")
+            .expect("preserved binding");
+        assert_eq!(preserved.request_generation, binding.request_generation);
+        assert_eq!(preserved.persisted_draft, "keep this draft");
+        assert_eq!(preserved.draft_revision, draft.draft_revision);
+        let projection = repository
+            .conversation_projection(owner_session_id)
+            .expect("preserved conversation")
+            .expect("conversation projection");
+        assert_eq!(projection.status, SessionStatus::Idle);
+        assert!(projection.messages.is_empty());
+        drop(process_owner);
+    }
+
+    #[tokio::test]
+    async fn side_chat_submit_rejects_stale_draft_revision_before_starting_a_worker() {
+        let (_temp, _root, mut controller, owner_session_id) = side_chat_test_controller().await;
+        controller
+            .configure_side_chat(
+                owner_session_id,
+                "http://127.0.0.1:1234".to_string(),
+                "google/gemma-4-12b-qat".to_string(),
+            )
+            .expect("configure side chat");
+        let repository = controller.app.store.side_chat_repo();
+        let binding = repository
+            .get_by_owner(owner_session_id)
+            .expect("binding read")
+            .expect("binding");
+        let saved = repository
+            .update_draft(
+                owner_session_id,
+                binding.id,
+                binding.draft_revision,
+                "newer durable draft",
+            )
+            .expect("save newer draft")
+            .binding;
+
+        let error = controller
+            .start_side_chat(
+                owner_session_id,
+                binding.id,
+                binding.request_generation,
+                binding.draft_revision,
+                "stale submitted text".to_string(),
+            )
+            .expect_err("stale draft revision must reject submit");
+
+        assert!(error.contains("side chat draft changed"));
+        assert!(!controller.side_chat_runs.contains_key(&owner_session_id));
+        let preserved = repository
+            .get_by_owner(owner_session_id)
+            .expect("preserved binding read")
+            .expect("preserved binding");
+        assert_eq!(preserved.request_generation, binding.request_generation);
+        assert_eq!(preserved.persisted_draft, "newer durable draft");
+        assert_eq!(preserved.draft_revision, saved.draft_revision);
+    }
+
+    #[tokio::test]
+    async fn side_chat_admission_failure_preserves_draft_and_generation() {
+        let (_temp, _root, mut controller, owner_session_id) = side_chat_test_controller().await;
+        controller
+            .configure_side_chat(
+                owner_session_id,
+                "http://127.0.0.1:1234".to_string(),
+                "google/gemma-4-12b-qat".to_string(),
+            )
+            .expect("configure side chat");
+        let side_chat_repository = controller.app.store.side_chat_repo();
+        let binding = side_chat_repository
+            .get_by_owner(owner_session_id)
+            .expect("binding read")
+            .expect("binding");
+        let draft = side_chat_repository
+            .update_draft(
+                owner_session_id,
+                binding.id,
+                binding.draft_revision,
+                "keep this draft",
+            )
+            .expect("persist draft")
+            .binding;
+        let blocking_turn_id = TurnId::new();
+        let blocking_user_turn = UserTurn {
+            turn_id: blocking_turn_id,
+            items: vec![UserInputItem::Text {
+                text: "existing request".to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+        };
+        let blocking_admission = controller
+            .app
+            .store
+            .session_repo()
+            .admit_session_turn_with_initial_user_turn(
+                binding.conversation_session_id,
+                blocking_turn_id,
+                Some(&blocking_user_turn),
+            )
+            .await
+            .expect("blocking admission")
+            .expect("admitted blocker");
+
+        let error = controller
+            .start_side_chat(
+                owner_session_id,
+                binding.id,
+                binding.request_generation,
+                draft.draft_revision,
+                "must not replace the active turn".to_string(),
+            )
+            .expect_err("active canonical turn must reject admission");
+
+        assert!(error.contains("could not admit request generation"));
+        assert!(!controller.side_chat_runs.contains_key(&owner_session_id));
+        let preserved = side_chat_repository
+            .get_by_owner(owner_session_id)
+            .expect("preserved binding read")
+            .expect("preserved binding");
+        assert_eq!(preserved.request_generation, binding.request_generation);
+        assert_eq!(preserved.persisted_draft, "keep this draft");
+        assert_eq!(preserved.draft_revision, draft.draft_revision);
+        let terminal = crate::session::DurableTurnTerminal {
+            outcome: crate::protocol::TurnTerminalOutcome::Interrupted {
+                cause: TurnInterruptionCause::UserStop,
+            },
+            final_response_id: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        };
+        controller
+            .app
+            .store
+            .session_repo()
+            .terminalize_admitted_turn_with_protocol_event(
+                binding.conversation_session_id,
+                blocking_admission.admission_id,
+                &RunEvent::TurnTerminal {
+                    session_id: binding.conversation_session_id,
+                    terminal: Box::new(terminal),
+                },
+                blocking_turn_id,
+                None,
+                None,
+            )
+            .await
+            .expect("terminalize blocker");
+    }
+
+    #[tokio::test]
+    async fn side_chat_ack_timeout_retains_worker_until_late_admission_is_terminal() {
+        let (_temp, _root, mut controller, owner_session_id) = side_chat_test_controller().await;
+        controller
+            .configure_side_chat(
+                owner_session_id,
+                "http://127.0.0.1:1234".to_string(),
+                "google/gemma-4-12b-qat".to_string(),
+            )
+            .expect("configure side chat");
+        let side_chat_repository = controller.app.store.side_chat_repo();
+        let binding = side_chat_repository
+            .get_by_owner(owner_session_id)
+            .expect("binding read")
+            .expect("binding");
+        let saved_draft = side_chat_repository
+            .update_draft(
+                owner_session_id,
+                binding.id,
+                binding.draft_revision,
+                "late draft",
+            )
+            .expect("persist draft")
+            .binding;
+        let database_path = controller.app.store.paths().database_path.clone();
+        let blocker = rusqlite::Connection::open(database_path.as_std_path())
+            .expect("blocking sqlite connection");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold sqlite writer");
+
+        let error = controller
+            .start_side_chat_with_ack_timeout(
+                owner_session_id,
+                binding.id,
+                binding.request_generation,
+                saved_draft.draft_revision,
+                "late canonical question".to_string(),
+                std::time::Duration::from_millis(50),
+            )
+            .expect_err("blocked admission must exceed the acknowledgement timeout");
+
+        assert!(error.contains("did not acknowledge within 50ms"));
+        let pending = controller
+            .side_chat_runs
+            .get(&owner_session_id)
+            .expect("timed-out worker remains owned");
+        assert!(pending.cancel.is_cancelled());
+        assert_eq!(pending.run_generation, 1);
+        blocker
+            .execute_batch("COMMIT")
+            .expect("release sqlite writer");
+
+        for _ in 0..300 {
+            controller.drain_runtime_messages();
+            if !controller.side_chat_runs.contains_key(&owner_session_id) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!controller.side_chat_runs.contains_key(&owner_session_id));
+        let projection = side_chat_repository
+            .conversation_projection(owner_session_id)
+            .expect("late conversation projection")
+            .expect("late conversation");
+        assert_eq!(projection.binding.request_generation, 1);
+        assert_eq!(projection.binding.persisted_draft, "");
+        assert_eq!(projection.status, SessionStatus::Cancelled);
+        assert!(projection.messages.iter().any(|message| {
+            message.role == crate::storage::SideChatConversationRole::User
+                && message.content == "late canonical question"
+        }));
+        assert!(
+            !controller
+                .app
+                .store
+                .active_runs()
+                .is_active(binding.conversation_session_id)
+        );
+        let _released_process_owner = controller
+            .app
+            .store
+            .try_acquire_run_process_lease(binding.conversation_session_id)
+            .expect("late side process owner released after terminal");
+    }
+
+    #[tokio::test]
     async fn provider_limit_only_apply_does_not_require_a_catalog_reload() {
         let (_temp, _root, mut controller) = empty_access_test_controller().await;
         let baseline = controller
@@ -2958,9 +3779,553 @@ mod command_projection_owner_tests {
                 latest_turn_id,
                 active_turn_id: None,
                 active_turn_sequence_no: None,
+                admission_revision: u64::from(latest_turn_id.is_some()),
             },
             agent_activity_records: None,
         }
+    }
+
+    fn loaded_running_test_session(
+        controller: &DesktopController,
+        root: &Utf8Path,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> LoadedSession {
+        let mut loaded =
+            loaded_test_session(controller, root, session_id, SessionStatus::Running, None);
+        loaded.read.latest_turn_id = Some(turn_id);
+        loaded.read.active_turn_id = Some(turn_id);
+        loaded.read.active_turn_sequence_no = Some(0);
+        loaded.read.admission_revision = 1;
+        loaded
+    }
+
+    #[tokio::test]
+    async fn prompt_enhance_rejects_an_active_background_owner_mutation() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let operation_id = controller.state.begin_steer_submission();
+
+        assert!(!controller.start_prompt_enhance("new review".to_string()));
+        assert!(!controller.state.prompt_enhance_pending());
+        assert!(controller.state.app_state.prompt_review.is_none());
+        assert_eq!(
+            controller.state.app_state.status_message.as_deref(),
+            Some("prompt enhancement is not currently available")
+        );
+
+        assert!(controller.state.finish_steer_submission(operation_id));
+    }
+
+    #[tokio::test]
+    async fn prompt_review_operations_require_the_captured_idle_run_owner() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let turn_target = ActiveTurnExpectation::Turn {
+            turn_id: TurnId::new(),
+            revision: 0,
+        };
+
+        assert!(
+            !controller
+                .start_prompt_enhance_at("do not trap this review".to_string(), turn_target,)
+        );
+        assert!(!controller.state.prompt_enhance_pending());
+        assert!(controller.state.app_state.prompt_review.is_none());
+
+        assert!(
+            !controller
+                .start_review_uncommitted_at("review current changes".to_string(), turn_target,)
+        );
+        assert!(!controller.run_lifecycle.root_is_active());
+        assert_eq!(
+            controller.state.app_state.status_message.as_deref(),
+            Some("uncommitted review requires the captured idle run owner")
+        );
+
+        controller.state.begin_prompt_enhance_at(
+            77,
+            "seeded Turn review",
+            CancellationToken::new(),
+            turn_target,
+        );
+        assert!(
+            controller
+                .state
+                .finish_prompt_enhance(77, "seeded enhanced review".to_string())
+        );
+        assert!(!controller.send_prompt_review_at(
+            77,
+            true,
+            "seeded enhanced review".to_string(),
+            turn_target,
+        ));
+        let seeded_review_target = controller
+            .prompt_review_target(77)
+            .expect("seeded review target");
+        assert!(!controller.launch_run_with_options(
+            "seeded enhanced review".to_string(),
+            crate::session::PromptDispatchPart::raw("seeded enhanced review"),
+            None,
+            Some(seeded_review_target),
+            turn_target,
+        ));
+        assert_eq!(
+            controller
+                .state
+                .app_state
+                .prompt_review
+                .as_ref()
+                .map(|review| review.request_id),
+            Some(77),
+            "a rejected Turn-owned review remains recoverable through exact cancel"
+        );
+        assert!(!controller.state.steer_submission_pending());
+        assert!(!controller.run_lifecycle.root_is_active());
+    }
+
+    #[tokio::test]
+    async fn prompt_review_central_admission_preserves_owner_and_draft_for_every_mutation_class() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        controller
+            .state
+            .begin_prompt_enhance(78, "review source", CancellationToken::new());
+        assert!(
+            controller
+                .state
+                .finish_prompt_enhance(78, "review draft".to_string())
+        );
+
+        for mutation_class in [
+            "provider model loading",
+            "provider configuration",
+            "configuration",
+            "configuration import",
+            "access mode",
+            "workspace navigation",
+            "workspace picker",
+            "overlay replacement",
+            "image attachment",
+        ] {
+            assert!(!controller.ensure_unscoped_prompt_review_action(mutation_class));
+            assert_eq!(
+                controller
+                    .state
+                    .app_state
+                    .prompt_review
+                    .as_ref()
+                    .map(|review| (
+                        review.request_id,
+                        review.raw_prompt_text.as_str(),
+                        review.current_draft_text.as_str(),
+                    )),
+                Some((78, "review source", "review draft")),
+                "{mutation_class} must reject without consuming the review owner",
+            );
+            assert_eq!(
+                controller.state.prompt_review_expected_active_turn(78),
+                Some(ActiveTurnExpectation::initial_idle()),
+            );
+            assert_eq!(
+                controller.state.view.overlay,
+                super::super::state::DesktopOverlay::PromptReview,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn steer_settlement_has_no_prompt_review_cancellation_capability() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let session_id = SessionId::new();
+        controller.state.app_state.current_session_id = Some(session_id);
+        controller.state.rebind_composer_owner(Some(session_id));
+        controller
+            .state
+            .begin_prompt_enhance(41, "review A", CancellationToken::new());
+        assert!(
+            controller
+                .state
+                .finish_prompt_enhance(41, "enhanced A".to_string())
+        );
+        let steer_target = SteerSubmissionTarget {
+            operation_id: controller.state.begin_steer_submission(),
+            workspace_root: controller.app.workspace.root.clone(),
+            session_id,
+            expected_active_turn: crate::session::ActiveTurnExpectation::initial_idle(),
+        };
+
+        controller.state.cancel_prompt_review();
+        controller
+            .state
+            .begin_prompt_enhance(42, "review B", CancellationToken::new());
+        assert!(
+            controller
+                .state
+                .finish_prompt_enhance(42, "enhanced B".to_string())
+        );
+        controller
+            .control_tx
+            .send(RuntimeMessage::SteerFinished {
+                target: steer_target,
+                image_paths: Vec::new(),
+                result: Ok(()),
+            })
+            .expect("stale review A steer settlement");
+
+        controller.drain_runtime_messages();
+
+        assert_eq!(
+            controller
+                .state
+                .app_state
+                .prompt_review
+                .as_ref()
+                .map(|review| (review.request_id, review.current_draft_text.as_str())),
+            Some((42, "enhanced B"))
+        );
+        assert!(!controller.state.steer_submission_pending());
+    }
+
+    #[tokio::test]
+    async fn stale_root_commit_cannot_cancel_a_newer_prompt_review() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        controller
+            .state
+            .begin_prompt_enhance(51, "review A", CancellationToken::new());
+        assert!(
+            controller
+                .state
+                .finish_prompt_enhance(51, "enhanced A".to_string())
+        );
+        let stale_review_target = controller
+            .prompt_review_target(51)
+            .expect("review A target");
+        controller.pending_root_submission = Some(PendingRootSubmission {
+            run_generation: 91,
+            owner_workspace_path: controller.root_submission_owner_workspace_path(),
+            owner_session_id: None,
+            prompt_dispatch: crate::session::PromptDispatchPart::raw("review A"),
+            image_paths: Vec::new(),
+            prompt_review_to_cancel: Some(stale_review_target),
+        });
+
+        controller.state.cancel_prompt_review();
+        controller
+            .state
+            .begin_prompt_enhance(52, "review B", CancellationToken::new());
+        assert!(
+            controller
+                .state
+                .finish_prompt_enhance(52, "enhanced B".to_string())
+        );
+
+        assert!(controller.commit_pending_root_submission(91));
+        assert_eq!(
+            controller
+                .state
+                .app_state
+                .prompt_review
+                .as_ref()
+                .map(|review| (review.request_id, review.current_draft_text.as_str())),
+            Some((52, "enhanced B"))
+        );
+    }
+
+    #[tokio::test]
+    async fn first_session_adoption_cancels_the_exact_submitted_prompt_review() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        controller
+            .state
+            .begin_prompt_enhance(61, "first review", CancellationToken::new());
+        assert!(
+            controller
+                .state
+                .finish_prompt_enhance(61, "first enhanced".to_string())
+        );
+        let review_target = controller
+            .prompt_review_target(61)
+            .expect("first-session review target");
+        controller.pending_root_submission = Some(PendingRootSubmission {
+            run_generation: 92,
+            owner_workspace_path: controller.root_submission_owner_workspace_path(),
+            owner_session_id: None,
+            prompt_dispatch: crate::session::PromptDispatchPart::raw("first review"),
+            image_paths: Vec::new(),
+            prompt_review_to_cancel: Some(review_target),
+        });
+        let adopted_session_id = SessionId::new();
+        controller.state.app_state.current_session_id = Some(adopted_session_id);
+
+        assert!(controller.commit_pending_root_submission(92));
+        assert!(controller.state.app_state.prompt_review.is_none());
+        assert!(controller.state.composer.is_owned_by(
+            &controller.state.snapshot.workspace_path,
+            Some(adopted_session_id)
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepted_running_live_refresh_attaches_one_exact_runtime_listener() {
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        controller.state.app_state.current_session_id = Some(session_id);
+        let target = SessionRefreshRequestTarget {
+            workspace_root: root.clone(),
+            session_id,
+        };
+        let first_request = controller
+            .session_projection_refresh_requests
+            .begin(target.clone());
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::LiveSessionRefreshed {
+                request_id: first_request,
+                target: target.clone(),
+                result: Ok(loaded_running_test_session(
+                    &controller,
+                    &root,
+                    session_id,
+                    turn_id,
+                )),
+            })
+            .expect("first running refresh");
+        controller.drain_runtime_messages();
+
+        let listener = controller
+            .session_runtime_listener
+            .as_ref()
+            .expect("accepted Running projection must attach its canonical cursor");
+        assert_eq!(listener.target.session_id, session_id);
+        assert_eq!(listener.target.turn_id, turn_id);
+        let generation = listener.generation;
+        let cancel = listener.cancel.clone();
+
+        let duplicate_request = controller
+            .session_projection_refresh_requests
+            .begin(target.clone());
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::LiveSessionRefreshed {
+                request_id: duplicate_request,
+                target,
+                result: Ok(loaded_running_test_session(
+                    &controller,
+                    &root,
+                    session_id,
+                    turn_id,
+                )),
+            })
+            .expect("duplicate running refresh");
+        controller.drain_runtime_messages();
+
+        assert_eq!(
+            controller
+                .session_runtime_listener
+                .as_ref()
+                .map(|listener| listener.generation),
+            Some(generation),
+            "the same canonical target must reuse its listener generation"
+        );
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn admitted_user_turn_attaches_its_exact_cursor_without_waiting_for_refresh() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let run_generation = 27;
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        controller
+            .run_lifecycle
+            .begin(run_generation, RunControl::new());
+        controller.state.begin_agent_run();
+        controller
+            .control_tx
+            .send(RuntimeMessage::RunEvent {
+                run_generation,
+                event: RunEvent::SessionStarted {
+                    session_id,
+                    title: "new run".to_string(),
+                },
+            })
+            .expect("session bootstrap");
+        controller
+            .control_tx
+            .send(RuntimeMessage::RunEvent {
+                run_generation,
+                event: RunEvent::UserTurnStored {
+                    session_id,
+                    turn: Box::new(UserTurn {
+                        turn_id,
+                        items: vec![UserInputItem::Text {
+                            text: "attach the durable cursor".to_string(),
+                        }],
+                        prompt_dispatch: None,
+                        editor_context: None,
+                    }),
+                },
+            })
+            .expect("durable admission bootstrap");
+
+        controller.drain_runtime_messages();
+
+        assert!(
+            controller
+                .session_runtime_listener
+                .as_ref()
+                .is_some_and(|listener| {
+                    listener.target.workspace_root == controller.app.workspace.root
+                        && listener.target.session_id == session_id
+                        && listener.target.turn_id == turn_id
+                }),
+            "UserTurnStored must close the listener gap before an async session refresh settles"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_listener_generation_rejects_target_aba() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let session_id = SessionId::new();
+        let first_turn_id = TurnId::new();
+        let other_turn_id = TurnId::new();
+        let first_target = SessionRuntimeListenerTarget {
+            workspace_root: controller.app.workspace.root.clone(),
+            session_id,
+            turn_id: first_turn_id,
+        };
+        let other_target = SessionRuntimeListenerTarget {
+            workspace_root: controller.app.workspace.root.clone(),
+            session_id,
+            turn_id: other_turn_id,
+        };
+        controller.state.app_state.current_session_id = Some(session_id);
+        controller.state.app_state.run_status = crate::tui::state::RunStatus::Running;
+
+        controller.reconcile_session_runtime_listener(Some(first_target.clone()));
+        let first_generation = controller
+            .session_runtime_listener
+            .as_ref()
+            .expect("first listener")
+            .generation;
+        let first_cancel = controller
+            .session_runtime_listener
+            .as_ref()
+            .expect("first listener")
+            .cancel
+            .clone();
+        controller.reconcile_session_runtime_listener(Some(other_target));
+        assert!(first_cancel.is_cancelled());
+        let other_cancel = controller
+            .session_runtime_listener
+            .as_ref()
+            .expect("replacement listener")
+            .cancel
+            .clone();
+        controller.reconcile_session_runtime_listener(Some(first_target.clone()));
+        assert!(other_cancel.is_cancelled());
+        let current_generation = controller
+            .session_runtime_listener
+            .as_ref()
+            .expect("re-adopted first target")
+            .generation;
+        assert!(current_generation > first_generation);
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::CanonicalSessionEvent {
+                listener_generation: first_generation,
+                target: first_target,
+                event: RuntimeEvent {
+                    id: crate::protocol::RuntimeEventId::new(),
+                    session_id,
+                    turn_id: first_turn_id,
+                    sequence_no: 1,
+                    created_at_ms: 1,
+                    msg: RuntimeEventMsg::TurnTerminal {
+                        terminal: Box::new(crate::session::DurableTurnTerminal {
+                            outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                            final_response_id: None,
+                            tool_call_count: 0,
+                            failed_tool_count: 0,
+                            change_count: 0,
+                            metrics: Default::default(),
+                        }),
+                    },
+                },
+            })
+            .expect("stale ABA listener event");
+        controller.drain_runtime_messages();
+
+        assert_eq!(
+            controller.state.app_state.run_status,
+            crate::tui::state::RunStatus::Running
+        );
+        assert_eq!(
+            controller
+                .session_runtime_listener
+                .as_ref()
+                .map(|listener| listener.generation),
+            Some(current_generation)
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_finished_overtakes_a_stale_running_refresh_and_leaves_no_listener() {
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let run_generation = 28;
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        controller.state.app_state.current_session_id = Some(session_id);
+        controller.state.begin_agent_run();
+        controller
+            .run_lifecycle
+            .begin(run_generation, RunControl::new());
+        let target = SessionRefreshRequestTarget {
+            workspace_root: root.clone(),
+            session_id,
+        };
+        let stale_request = controller
+            .session_projection_refresh_requests
+            .begin(target.clone());
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::LiveSessionRefreshed {
+                request_id: stale_request,
+                target,
+                result: Ok(loaded_running_test_session(
+                    &controller,
+                    &root,
+                    session_id,
+                    turn_id,
+                )),
+            })
+            .expect("queued stale running refresh");
+        controller
+            .control_tx
+            .send(RuntimeMessage::Finished {
+                run_generation,
+                result: Ok(RunSummary::from_terminal(
+                    session_id,
+                    turn_id,
+                    crate::session::DurableTurnTerminal {
+                        outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                        final_response_id: None,
+                        tool_call_count: 0,
+                        failed_tool_count: 0,
+                        change_count: 0,
+                        metrics: Default::default(),
+                    },
+                )),
+            })
+            .expect("lossless worker settlement");
+
+        controller.drain_runtime_messages();
+
+        assert!(!controller.run_lifecycle.root_is_active());
+        assert!(controller.session_runtime_listener.is_none());
+        assert_eq!(
+            controller.state.app_state.run_status,
+            crate::tui::state::RunStatus::Completed
+        );
     }
 
     #[tokio::test]
@@ -2986,6 +4351,12 @@ mod command_projection_owner_tests {
                 target: target.clone(),
                 purpose: CurrentSessionRefreshPurpose::StopRequestRefresh {
                     root_admission_fence,
+                    root_stop_attempt: None,
+                    expected_active_turn: Some(ActiveTurnExpectation::initial_idle()),
+                    in_memory_stop_accepted: true,
+                    durable_outcome: Some(ExactRootExecutionStopOutcome::Applied {
+                        cancelled: true,
+                    }),
                 },
                 result: Ok(loaded_test_session(
                     &controller,
@@ -3013,6 +4384,12 @@ mod command_projection_owner_tests {
                 target,
                 purpose: CurrentSessionRefreshPurpose::StopRequestRefresh {
                     root_admission_fence,
+                    root_stop_attempt: None,
+                    expected_active_turn: Some(ActiveTurnExpectation::initial_idle()),
+                    in_memory_stop_accepted: true,
+                    durable_outcome: Some(ExactRootExecutionStopOutcome::Applied {
+                        cancelled: true,
+                    }),
                 },
                 result: Err("duplicate Stop settlement".to_string()),
             })
@@ -3054,6 +4431,12 @@ mod command_projection_owner_tests {
                 target,
                 purpose: CurrentSessionRefreshPurpose::StopRequestRefresh {
                     root_admission_fence: controller.next_root_run_generation,
+                    root_stop_attempt: None,
+                    expected_active_turn: Some(ActiveTurnExpectation::initial_idle()),
+                    in_memory_stop_accepted: true,
+                    durable_outcome: Some(ExactRootExecutionStopOutcome::Applied {
+                        cancelled: true,
+                    }),
                 },
                 result: Ok(loaded_test_session(
                     &controller,
@@ -3115,6 +4498,100 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
+    async fn target_changed_stop_refresh_loads_b_without_marking_b_stopping() {
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let session_id = SessionId::new();
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        controller.state.app_state.current_session_id = Some(session_id);
+        controller.state.begin_agent_run();
+        controller.state.app_state.run_status = crate::tui::state::RunStatus::Running;
+        controller.state.mark_post_run_refresh_pending();
+        let target = SessionRefreshRequestTarget {
+            workspace_root: root.clone(),
+            session_id,
+        };
+        let request_id = controller
+            .session_projection_refresh_requests
+            .begin(target.clone());
+
+        controller
+            .runtime_tx
+            .send(RuntimeMessage::CurrentSessionRefreshed {
+                request_id,
+                target,
+                purpose: CurrentSessionRefreshPurpose::StopRequestRefresh {
+                    root_admission_fence: controller.next_root_run_generation,
+                    root_stop_attempt: None,
+                    expected_active_turn: Some(ActiveTurnExpectation::Turn {
+                        turn_id: turn_a,
+                        revision: 1,
+                    }),
+                    in_memory_stop_accepted: true,
+                    durable_outcome: Some(ExactRootExecutionStopOutcome::TargetChanged),
+                },
+                result: Ok(loaded_running_test_session(
+                    &controller,
+                    &root,
+                    session_id,
+                    turn_b,
+                )),
+            })
+            .expect("TargetChanged Stop refresh");
+        controller.drain_runtime_messages();
+
+        assert_eq!(
+            controller.current_active_turn_expectation(),
+            ActiveTurnExpectation::Turn {
+                turn_id: turn_b,
+                revision: 1,
+            }
+        );
+        assert_eq!(
+            controller.state.app_state.run_status,
+            crate::tui::state::RunStatus::Running
+        );
+        assert_ne!(controller.state.app_state.progress.status, "Stopping");
+        assert_eq!(
+            controller.state.app_state.status_message.as_deref(),
+            Some("the task changed before Stop was applied; the replacement was not stopped")
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_a_stop_dispatches_after_the_controller_projects_terminal_latest_a() {
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let session_id = SessionId::new();
+        let turn_a = TurnId::new();
+        let mut loaded = loaded_test_session(
+            &controller,
+            &root,
+            session_id,
+            SessionStatus::Completed,
+            None,
+        );
+        loaded.read.latest_turn_id = Some(turn_a);
+        loaded.read.admission_revision = 1;
+        controller.state.load_open_session(&loaded.read);
+        assert_eq!(
+            controller.current_active_turn_expectation(),
+            ActiveTurnExpectation::Idle {
+                latest_turn_id: Some(turn_a),
+                revision: 1,
+            }
+        );
+
+        controller.cancel_exact_turn_at(turn_a, 1);
+
+        assert!(controller.session_projection_refresh_requests.is_pending());
+        assert!(controller.state.post_run_refresh_pending());
+        assert_eq!(
+            controller.state.app_state.status_message.as_deref(),
+            Some("validating the exact task Stop target...")
+        );
+    }
+
+    #[tokio::test]
     async fn stop_request_refresh_from_before_the_next_root_admission_cannot_mutate_that_root() {
         let (_temp, root, mut controller) = empty_access_test_controller().await;
         let session_id = SessionId::new();
@@ -3157,6 +4634,12 @@ mod command_projection_owner_tests {
                 target,
                 purpose: CurrentSessionRefreshPurpose::StopRequestRefresh {
                     root_admission_fence: old_root_admission_fence,
+                    root_stop_attempt: None,
+                    expected_active_turn: Some(ActiveTurnExpectation::initial_idle()),
+                    in_memory_stop_accepted: true,
+                    durable_outcome: Some(ExactRootExecutionStopOutcome::Applied {
+                        cancelled: true,
+                    }),
                 },
                 result: Ok(loaded_test_session(
                     &controller,
@@ -3179,10 +4662,14 @@ mod command_projection_owner_tests {
             crate::tui::state::RunStatus::Running
         );
         assert_eq!(controller.state.composer.draft_prompt, "new root draft");
-        assert!(controller.state.app_state.prompt_review.is_some());
         assert_eq!(
-            controller.state.composer.review_draft_text,
-            "new root review"
+            controller
+                .state
+                .app_state
+                .prompt_review
+                .as_ref()
+                .map(|review| review.current_draft_text.as_str()),
+            Some("new root review")
         );
         assert!(controller.state.post_run_refresh_pending());
         assert_eq!(
@@ -3541,7 +5028,7 @@ mod command_projection_owner_tests {
         let root_control = RunControl::new();
         controller.run_lifecycle.begin(1, root_control.clone());
         let request = test_permission("child stop routing");
-        let (response, _receiver) = mpsc::channel();
+        let (response, receiver) = mpsc::channel();
         let child_control = RunControl::new();
         controller.pending_permission = Some(PendingPermission {
             confirmation_id: 42,
@@ -3550,7 +5037,7 @@ mod command_projection_owner_tests {
             run_control: child_control.clone(),
         });
 
-        controller.cancel_active_run();
+        assert!(controller.cancel_root_run_at_generation(1));
 
         assert_eq!(
             root_control.cause(),
@@ -3563,6 +5050,10 @@ mod command_projection_owner_tests {
             None,
             "the Desktop Stop surface must not classify a pending child directly"
         );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         assert!(controller.pending_permission.is_some());
 
         assert!(child_control.interrupt(TurnInterruptionCause::TreeStopped));
@@ -3577,26 +5068,278 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
-    async fn stop_without_a_root_resolves_only_the_displayed_approval_ticket() {
+    async fn desktop_main_stop_targets_only_the_current_root_and_preserves_child_owners() {
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let session = controller
+            .app
+            .session_service
+            .start_or_resume(
+                crate::session::SessionStartRequest {
+                    selector: crate::session::SessionSelector::New,
+                    title: Some("desktop tree Stop".to_string()),
+                    cwd: root,
+                    model: controller.app.config.model.model.clone(),
+                    base_url: controller.app.config.model.base_url.clone(),
+                    access_mode: controller.app.config.permissions.access_mode,
+                },
+                controller.app.workspace.clone(),
+            )
+            .await
+            .expect("root session");
+        let root_scope = RunControl::new();
+        let runtime = controller.app.process_runtime.agent_runtime();
+        let root_execution = runtime
+            .begin_root(
+                &session,
+                Arc::new(
+                    crate::config::ResolvedTurnConfig::capture(controller.app.config.clone())
+                        .expect("valid test turn config"),
+                ),
+                SharedConfirmationPrompt::new(DesktopConfirmationPrompt {
+                    control: controller.control_tx.clone(),
+                    next_permission_request_id: controller.next_permission_request_id.clone(),
+                }),
+                root_scope.clone(),
+            )
+            .await
+            .expect("root execution");
+        let root_turn_id = TurnId::new();
+        let root_admission_guard = root_scope
+            .begin_root_admission(session.session.id, root_turn_id)
+            .expect("publish root admission plan");
+        let root_admission = controller
+            .app
+            .store
+            .session_repo()
+            .admit_session_turn(session.session.id, root_turn_id)
+            .await
+            .expect("root admission")
+            .expect("root admitted");
+        root_admission_guard
+            .commit(root_admission.admission_revision)
+            .expect("publish canonical root admission receipt");
+        root_execution
+            .context
+            .bind_durable_turn_owner(
+                root_admission.admission_id,
+                root_turn_id,
+                root_admission.admission_revision,
+            )
+            .expect("bind root owner");
+        let tree_control = root_execution.context.tree_control_for_test();
+        let (_, child_a) = tree_control
+            .register_child(
+                &crate::runtime::AgentPath::root(),
+                "child_a",
+                SessionId::new(),
+                Some("already interrupted".to_string()),
+            )
+            .expect("child A");
+        let (_, child_b) = tree_control
+            .register_child(
+                &crate::runtime::AgentPath::root(),
+                "child_b",
+                SessionId::new(),
+                Some("held sibling".to_string()),
+            )
+            .expect("child B");
+        let child_a_control = child_a.run_control();
+        let child_b_control = child_b.run_control();
+        tree_control
+            .cancel_agent(&crate::runtime::AgentPath::try_from("/root/child_a").expect("path"))
+            .expect("exact child A interrupt");
+
+        controller.state.app_state.current_session_id = Some(session.session.id);
+        controller.run_lifecycle.begin(44, root_scope.clone());
+        controller.state.begin_agent_run();
+        assert!(controller.cancel_root_run_at_generation(44));
+
+        for _ in 0..200 {
+            controller.drain_runtime_messages();
+            if !controller.session_projection_refresh_requests.is_pending() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            !controller.session_projection_refresh_requests.is_pending(),
+            "durable root Stop refresh must settle"
+        );
+        assert!(
+            !tree_control.tree_is_cancelled(),
+            "ordinary root Stop must not acquire the explicit tree-wide cancellation owner"
+        );
+        assert_eq!(
+            root_execution.run_control().cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop,
+            ))
+        );
+        assert_eq!(
+            child_a_control.cause(),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::AgentInterrupted,
+            )),
+            "Main Stop must not overwrite the prior exact child terminal owner"
+        );
+        assert_eq!(
+            child_b_control.cause(),
+            None,
+            "ordinary root Stop must not classify an unaffected sibling"
+        );
+        let repository = controller.app.store.session_repo();
+        assert!(
+            repository
+                .durable_terminal_for_turn(session.session.id, root_turn_id)
+                .await
+                .expect("pre-settlement root terminal lookup")
+                .is_none(),
+            "Stop records intent; the admitted owner remains the terminal writer"
+        );
+        let renewal = repository
+            .renew_admitted_run_lease(
+                session.session.id,
+                root_admission.admission_id,
+                root_turn_id,
+            )
+            .await
+            .expect("root owner observes Stop intent");
+        assert!(
+            matches!(
+                renewal,
+                crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::InterruptRequested(
+                    TurnInterruptionCause::UserStop
+                )
+            ),
+            "unexpected root lease renewal after Stop: {renewal:?}"
+        );
+        let settlement = repository
+            .settle_admitted_turn_with_protocol_event(
+                session.session.id,
+                root_admission.admission_id,
+                &RunEvent::TurnTerminal {
+                    session_id: session.session.id,
+                    terminal: Box::new(crate::session::DurableTurnTerminal {
+                        outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                        final_response_id: None,
+                        tool_call_count: 0,
+                        failed_tool_count: 0,
+                        change_count: 0,
+                        metrics: Default::default(),
+                    }),
+                },
+                root_turn_id,
+                None,
+                None,
+            )
+            .await
+            .expect("admitted root terminal settlement");
+        assert_eq!(
+            settlement.commit(),
+            crate::storage::session_repo::AdmittedTerminalCommit::Applied
+        );
+        let settled_terminal = settlement
+            .into_terminal()
+            .expect("authoritative root terminal receipt");
+        assert_eq!(
+            settled_terminal.outcome,
+            crate::protocol::TurnTerminalOutcome::Interrupted {
+                cause: TurnInterruptionCause::UserStop,
+            },
+            "the committed Stop request overrides a later success proposal"
+        );
+
+        tree_control
+            .complete_execution(
+                child_a,
+                crate::runtime::InactiveAgentStatus::Interrupted,
+                None,
+            )
+            .expect("settle child A");
+        tree_control
+            .complete_execution(
+                child_b,
+                crate::runtime::InactiveAgentStatus::Completed(None),
+                None,
+            )
+            .expect("settle child B");
+        runtime.complete_root(
+            root_execution,
+            &Ok(RunSummary::from_terminal(
+                session.session.id,
+                root_turn_id,
+                settled_terminal,
+            )),
+            Some(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop,
+            )),
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            runtime.wait_for_tree_quiescence(session.session.id),
+        )
+        .await
+        .expect("tree quiescence timeout")
+        .expect("tree quiescence");
+    }
+
+    #[tokio::test]
+    async fn permission_without_an_exact_execution_owner_has_no_stop_capability() {
         let (_temp, _root, mut controller) = empty_access_test_controller().await;
         let request = test_permission("detached child approval");
         let (response, receiver) = mpsc::channel();
+        let run_control = RunControl::new();
+        let observer = run_control.clone();
         controller.pending_permission = Some(PendingPermission {
             confirmation_id: 42,
             request,
             responder: response,
-            run_control: RunControl::new(),
+            run_control,
         });
 
-        controller.cancel_active_run();
-
-        assert_eq!(receiver.try_recv(), Ok(ReviewDecision::Abort));
-        assert!(controller.pending_permission.is_none());
-        let expected_status = crate::tui::state::permission_decision_pending_status_message();
+        let projection = controller.next_web_state().expect("permission projection");
+        assert!(!projection.can_cancel_run);
+        assert!(projection.stop_target.is_none());
+        assert!(projection.confirmation_visible);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         assert_eq!(
-            controller.state.app_state.status_message.as_deref(),
-            Some(expected_status.as_str())
+            observer.cause(),
+            None,
+            "permission presence cannot mint an implicit UserStop owner"
         );
+        assert!(controller.pending_permission.is_some());
+    }
+
+    #[tokio::test]
+    async fn terminal_permission_projection_preserves_the_existing_first_writer() {
+        for cause in [
+            RunCancellationCause::Interruption(TurnInterruptionCause::ApprovalAborted),
+            RunCancellationCause::Failure("provider failed first".to_string()),
+        ] {
+            let (_temp, _root, mut controller) = empty_access_test_controller().await;
+            let (response, receiver) = mpsc::channel();
+            let run_control = RunControl::new();
+            assert!(run_control.cancel(cause.clone()));
+            controller.pending_permission = Some(PendingPermission {
+                confirmation_id: 42,
+                request: test_permission("late Stop"),
+                responder: response,
+                run_control: run_control.clone(),
+            });
+
+            let projection = controller.next_web_state().expect("terminal projection");
+            assert_eq!(run_control.cause(), Some(cause.clone()));
+            assert!(!projection.can_cancel_run);
+            assert!(projection.stop_target.is_none());
+            assert!(!projection.confirmation_visible);
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+        }
     }
 
     #[tokio::test]
@@ -3700,9 +5443,11 @@ mod command_projection_owner_tests {
         assert!(controller.current_agent_tree_active());
         assert!(!controller.run_lifecycle.root_is_active());
 
-        controller.cancel_active_run();
+        let projection = controller.next_web_state().expect("child-only projection");
 
         assert!(!controller.session_projection_refresh_requests.is_pending());
+        assert!(!projection.can_cancel_run);
+        assert!(projection.stop_target.is_none());
         assert_eq!(
             repository
                 .get_session(root.id)
@@ -3719,11 +5464,6 @@ mod command_projection_owner_tests {
                 .status,
             SessionStatus::Running
         );
-        assert_eq!(
-            controller.state.app_state.status_message.as_deref(),
-            Some("停止できる実行中タスクはありません。"),
-            "ordinary Stop has no implicit subtree target"
-        );
         controller.loaded_agent_activity_records = Some((
             root.id,
             vec![agent_record(
@@ -3733,16 +5473,16 @@ mod command_projection_owner_tests {
                 "",
             )],
         ));
-        controller.cancel_active_run();
+        let stale_projection = controller
+            .next_web_state()
+            .expect("stale child-only projection");
         assert_eq!(
             controller.state.app_state.run_status,
             crate::tui::state::RunStatus::Completed,
             "a child-only Stop must not reclassify the preserved root"
         );
-        assert_eq!(
-            controller.state.app_state.status_message.as_deref(),
-            Some("停止できる実行中タスクはありません。")
-        );
+        assert!(!stale_projection.can_cancel_run);
+        assert!(stale_projection.stop_target.is_none());
     }
 
     #[tokio::test]
@@ -4177,7 +5917,7 @@ mod command_projection_owner_tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("persistence worker started");
 
-        controller.cancel_active_run();
+        assert!(controller.cancel_root_run_at_generation(1));
         assert!(
             cancel_observer.is_cancelled(),
             "Stop must cancel the root before blocked persistence completes"
@@ -4254,17 +5994,26 @@ mod command_projection_owner_tests {
                 .state
                 .finish_prompt_enhance(11, "enhanced review draft".to_string())
         );
-        assert!(!controller.send_prompt_review(true, "edited review draft".to_string()));
+        assert!(!controller.send_prompt_review(11, true, "edited review draft".to_string()));
         assert_eq!(
             controller.state.composer.draft_prompt,
             "submit after access settles"
         );
         assert_eq!(
-            controller.state.composer.review_draft_text,
-            "edited review draft"
+            controller
+                .state
+                .app_state
+                .prompt_review
+                .as_ref()
+                .map(|review| review.current_draft_text.as_str()),
+            Some("edited review draft")
         );
         assert_eq!(controller.next_root_run_generation, initial_generation);
         assert!(!controller.run_lifecycle.root_is_active());
+        assert!(
+            controller.state.cancel_prompt_review_if_current(11),
+            "the failed exact review send retains its draft until the user cancels that owner"
+        );
 
         controller.run_lifecycle.begin(77, RunControl::new());
         assert!(!controller.start_run("steer after access settles".to_string()));
@@ -4396,7 +6145,7 @@ mod command_projection_owner_tests {
             updated: false,
             is_current_turn: false,
             active_turn_id: None,
-            can_interrupt: false,
+            interrupt_target: None,
         }
     }
 
@@ -4893,6 +6642,9 @@ mod command_projection_owner_tests {
                 .state
                 .finish_prompt_enhance(77, "edited review".to_string())
         );
+        let review_target = controller
+            .prompt_review_target(77)
+            .expect("review target before run admission");
         let failed_generation = 900;
         controller
             .run_lifecycle
@@ -4904,7 +6656,7 @@ mod command_projection_owner_tests {
             owner_session_id: Some(session_a.id),
             prompt_dispatch: crate::session::PromptDispatchPart::raw("retain on preflight error"),
             image_paths: vec![retained_image.clone()],
-            cancel_prompt_review_on_commit: true,
+            prompt_review_to_cancel: Some(review_target.clone()),
         });
         assert!(
             controller
@@ -4927,7 +6679,15 @@ mod command_projection_owner_tests {
         controller.drain_runtime_messages();
         assert_eq!(controller.composer_commit_generation, 0);
         assert!(controller.pending_root_submission.is_some());
-        assert_eq!(controller.state.composer.review_draft_text, "edited review");
+        assert_eq!(
+            controller
+                .state
+                .app_state
+                .prompt_review
+                .as_ref()
+                .map(|review| review.current_draft_text.as_str()),
+            Some("edited review")
+        );
         controller
             .runtime_tx
             .send(RuntimeMessage::Finished {
@@ -4955,8 +6715,15 @@ mod command_projection_owner_tests {
                 .all(|row| row.row_kind != super::super::models::DesktopTranscriptRowKind::User)
         );
         assert!(controller.pending_root_submission.is_none());
-        assert!(controller.state.app_state.prompt_review.is_some());
-        assert_eq!(controller.state.composer.review_draft_text, "edited review");
+        assert_eq!(
+            controller
+                .state
+                .app_state
+                .prompt_review
+                .as_ref()
+                .map(|review| review.current_draft_text.as_str()),
+            Some("edited review")
+        );
         assert_eq!(
             controller.state.view.overlay,
             super::super::state::DesktopOverlay::PromptReview
@@ -4973,7 +6740,7 @@ mod command_projection_owner_tests {
             owner_session_id: Some(session_a.id),
             prompt_dispatch: crate::session::PromptDispatchPart::raw("commit after admission"),
             image_paths: vec![retained_image.clone()],
-            cancel_prompt_review_on_commit: true,
+            prompt_review_to_cancel: Some(review_target),
         });
         let delayed_refresh_target = SessionRefreshRequestTarget {
             workspace_root: root.clone(),
@@ -5032,13 +6799,17 @@ mod command_projection_owner_tests {
                 },
             })
             .expect("durable user message");
-        assert!(controller.run_lifecycle.request_cancel());
+        assert!(controller.cancel_root_run_at_generation(admitted_generation));
         controller.drain_runtime_messages();
         assert_eq!(controller.composer_commit_generation, 1);
         assert!(controller.state.composer.image_attachment_paths.is_empty());
         assert!(controller.pending_root_submission.is_none());
         assert!(controller.state.app_state.prompt_review.is_none());
-        assert!(controller.state.composer.review_draft_text.is_empty());
+        assert!(
+            desktop_web_state(&controller.state, &DesktopRuntimeProjection::default())
+                .review_draft_text
+                .is_empty()
+        );
         assert_eq!(
             controller.state.view.overlay,
             super::super::state::DesktopOverlay::None
@@ -5065,7 +6836,7 @@ mod command_projection_owner_tests {
             owner_session_id: None,
             prompt_dispatch: crate::session::PromptDispatchPart::raw("first run"),
             image_paths: vec![submitted_image],
-            cancel_prompt_review_on_commit: false,
+            prompt_review_to_cancel: None,
         });
         controller.state.app_state.current_session_id = Some(created_session_id);
         assert!(controller.commit_pending_root_submission(902));
@@ -5222,7 +6993,7 @@ mod command_projection_owner_tests {
         let selected =
             activity_records_for_projection(root_session_id, vec![live.clone()], Some(&durable));
         assert_eq!(selected, vec![live]);
-        assert!(agent_activity_projection(selected).1);
+        assert!(agent_activity_projection("C:/workspace", root_session_id, selected).1);
     }
 
     #[test]
@@ -5393,6 +7164,45 @@ mod command_projection_owner_tests {
                 .expect("second confirmation result")
                 .expect("second confirmation"),
             ReviewDecision::Approved
+        );
+    }
+
+    #[test]
+    fn disconnected_control_plane_rejects_bootstrap_and_permission() {
+        let (runtime_tx, _runtime_rx) = mpsc::sync_channel(1);
+        let (control_tx, control_rx) = mpsc::channel();
+        drop(control_rx);
+        let disconnected = DesktopControlPlaneSender { tx: control_tx };
+        let mut renderer = DesktopRenderer {
+            runtime_tx,
+            bootstrap_control: disconnected.clone(),
+            run_generation: 42,
+            notification_title: "test".to_string(),
+            notified_terminal: false,
+        };
+        let bootstrap_error = renderer
+            .render(&RunEvent::SessionStarted {
+                session_id: SessionId::new(),
+                title: "unavailable".to_string(),
+            })
+            .expect_err("disconnected bootstrap must fail");
+        assert!(
+            bootstrap_error
+                .to_string()
+                .contains("control mailbox is unavailable")
+        );
+
+        let mut prompt = DesktopConfirmationPrompt {
+            control: disconnected,
+            next_permission_request_id: Arc::new(AtomicU64::new(1)),
+        };
+        let permission_error = prompt
+            .confirm(&test_permission("disconnected"))
+            .expect_err("disconnected permission must fail");
+        assert!(
+            permission_error
+                .to_string()
+                .contains("control mailbox is unavailable")
         );
     }
 
@@ -5613,6 +7423,273 @@ mod command_projection_owner_tests {
             "the same completion is consumed at most once"
         );
     }
+
+    #[test]
+    fn renderer_leaves_an_ordinary_committed_assistant_to_the_canonical_cursor() {
+        let (runtime_tx, runtime_rx) = mpsc::sync_channel(1);
+        let (control, control_rx) = test_desktop_control_plane();
+        let mut renderer = DesktopRenderer {
+            runtime_tx,
+            bootstrap_control: control,
+            run_generation: 77,
+            notification_title: "test".to_string(),
+            notified_terminal: false,
+        };
+
+        renderer
+            .render(&RunEvent::AssistantMessageCommitted {
+                response_id: crate::protocol::ModelResponseId::new(),
+                text: "canonical only".to_string(),
+            })
+            .expect("committed assistant renderer observation");
+
+        assert!(matches!(
+            runtime_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn renderer_allows_runtime_only_delta_loss_when_the_mailbox_is_full() {
+        let run_generation = 78;
+        let response_id = crate::protocol::ModelResponseId::new();
+        let (runtime_tx, runtime_rx) = mpsc::sync_channel(1);
+        runtime_tx
+            .try_send(RuntimeMessage::RunEvent {
+                run_generation,
+                event: RunEvent::TextDelta {
+                    response_id,
+                    delta: "retained".to_string(),
+                },
+            })
+            .expect("fill runtime mailbox");
+        let (control, control_rx) = test_desktop_control_plane();
+        let mut renderer = DesktopRenderer {
+            runtime_tx,
+            bootstrap_control: control,
+            run_generation,
+            notification_title: "test".to_string(),
+            notified_terminal: false,
+        };
+
+        renderer
+            .render(&RunEvent::TextDelta {
+                response_id,
+                delta: "dropped".to_string(),
+            })
+            .expect("runtime-only saturation is lossy by contract");
+
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            runtime_rx.recv().expect("retained delta"),
+            RuntimeMessage::RunEvent {
+                event: RunEvent::TextDelta { delta, .. },
+                ..
+            } if delta == "retained"
+        ));
+        assert!(matches!(
+            runtime_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn bootstrap_and_worker_settlement_bypass_a_full_runtime_mailbox_in_fifo_order() {
+        let run_generation = 79;
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let response_id = crate::protocol::ModelResponseId::new();
+        let summary = RunSummary::from_terminal(
+            session_id,
+            turn_id,
+            crate::session::DurableTurnTerminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                final_response_id: Some(response_id),
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            },
+        );
+        let (runtime_tx, runtime_rx) = mpsc::sync_channel(1);
+        runtime_tx
+            .try_send(RuntimeMessage::RunEvent {
+                run_generation,
+                event: RunEvent::TextDelta {
+                    response_id,
+                    delta: "mailbox backlog".to_string(),
+                },
+            })
+            .expect("fill runtime mailbox");
+        let (control, control_rx) = test_desktop_control_plane();
+        let mut renderer = DesktopRenderer {
+            runtime_tx,
+            bootstrap_control: control.clone(),
+            run_generation,
+            notification_title: "test".to_string(),
+            notified_terminal: false,
+        };
+
+        renderer
+            .render(&RunEvent::SessionStarted {
+                session_id,
+                title: "new session".to_string(),
+            })
+            .expect("lossless session bootstrap");
+        renderer
+            .render(&RunEvent::UserTurnStored {
+                session_id,
+                turn: Box::new(UserTurn {
+                    turn_id,
+                    items: vec![UserInputItem::Text {
+                        text: "durable prompt".to_string(),
+                    }],
+                    prompt_dispatch: None,
+                    editor_context: None,
+                }),
+            })
+            .expect("lossless user-turn bootstrap");
+        publish_desktop_run_finished(&control, run_generation, Ok(summary));
+
+        assert!(matches!(
+            control_rx.recv().expect("session bootstrap"),
+            RuntimeMessage::RunEvent {
+                run_generation: 79,
+                event: RunEvent::SessionStarted { session_id: received, .. },
+            } if received == session_id
+        ));
+        assert!(matches!(
+            control_rx.recv().expect("user-turn bootstrap"),
+            RuntimeMessage::RunEvent {
+                run_generation: 79,
+                event: RunEvent::UserTurnStored { session_id: received, .. },
+            } if received == session_id
+        ));
+        assert!(matches!(
+            control_rx.recv().expect("worker settlement"),
+            RuntimeMessage::Finished {
+                run_generation: 79,
+                result: Ok(received),
+            } if received.session_id() == session_id
+        ));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            runtime_rx.recv().expect("unchanged runtime backlog"),
+            RuntimeMessage::RunEvent {
+                event: RunEvent::TextDelta { delta, .. },
+                ..
+            } if delta == "mailbox backlog"
+        ));
+    }
+
+    #[tokio::test]
+    async fn controller_drains_lossless_control_before_a_runtime_backlog() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let run_generation = 80;
+        let response_id = crate::protocol::ModelResponseId::new();
+        let summary = RunSummary::from_terminal(
+            SessionId::new(),
+            TurnId::new(),
+            crate::session::DurableTurnTerminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                final_response_id: Some(response_id),
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            },
+        );
+        controller
+            .run_lifecycle
+            .begin(run_generation, RunControl::new());
+        controller.state.begin_agent_run();
+        for _ in 0..DESKTOP_RUNTIME_MAILBOX_CAPACITY {
+            controller
+                .runtime_tx
+                .try_send(RuntimeMessage::RunEvent {
+                    run_generation,
+                    event: RunEvent::TextDelta {
+                        response_id,
+                        delta: String::new(),
+                    },
+                })
+                .expect("fill runtime mailbox exactly");
+        }
+        publish_desktop_run_finished(&controller.control_tx, run_generation, Ok(summary));
+
+        controller.drain_runtime_messages();
+
+        assert!(
+            !controller.run_lifecycle.root_is_active(),
+            "control settlement must be admitted before the first bounded runtime drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn steer_settlement_bypasses_a_full_runtime_mailbox() {
+        let (_temp, root, mut controller) = empty_access_test_controller().await;
+        let session_id = SessionId::new();
+        controller.state.app_state.current_session_id = Some(session_id);
+        let attachment = root.join("steer.png");
+        controller
+            .state
+            .composer
+            .image_attachment_paths
+            .push(attachment.clone());
+        let target = SteerSubmissionTarget {
+            operation_id: controller.state.begin_steer_submission(),
+            workspace_root: root,
+            session_id,
+            expected_active_turn: crate::session::ActiveTurnExpectation::initial_idle(),
+        };
+        let response_id = crate::protocol::ModelResponseId::new();
+        for _ in 0..DESKTOP_RUNTIME_MAILBOX_CAPACITY {
+            controller
+                .runtime_tx
+                .try_send(RuntimeMessage::RunEvent {
+                    run_generation: 999,
+                    event: RunEvent::TextDelta {
+                        response_id,
+                        delta: String::new(),
+                    },
+                })
+                .expect("fill runtime mailbox exactly");
+        }
+        controller
+            .control_tx
+            .send(RuntimeMessage::SteerFinished {
+                target,
+                image_paths: vec![attachment],
+                result: Ok(()),
+            })
+            .expect("publish steer settlement");
+
+        controller.drain_runtime_messages();
+
+        assert!(!controller.state.steer_submission_pending());
+        assert!(controller.state.composer.image_attachment_paths.is_empty());
+        assert_eq!(controller.composer_commit_generation, 1);
+    }
+
+    #[test]
+    fn committed_assistant_requires_a_canonical_projection_refresh() {
+        assert!(live_event_requires_canonical_refresh(
+            &RunEvent::AssistantMessageCommitted {
+                response_id: crate::protocol::ModelResponseId::new(),
+                text: "canonical response".to_string(),
+            }
+        ));
+    }
 }
 
 struct PendingPermission {
@@ -5620,6 +7697,41 @@ struct PendingPermission {
     request: PermissionRequest,
     responder: mpsc::Sender<ReviewDecision>,
     run_control: RunControl,
+}
+
+struct DesktopSideChatRun {
+    side_chat_id: String,
+    run_generation: u64,
+    cancel: CancellationToken,
+    worker: OwnedTaskHandle,
+    phase: String,
+    streamed_text: String,
+    delete_after_finish: bool,
+}
+
+impl DesktopSideChatRun {
+    fn owns(&self, side_chat_id: &str, run_generation: u64) -> bool {
+        self.side_chat_id == side_chat_id && self.run_generation == run_generation
+    }
+}
+
+fn side_chat_request_profile(binding: &SideChatBinding) -> SideChatRequestProfile {
+    SideChatRequestProfile {
+        base_url: binding.base_url.clone(),
+        model: binding.model.clone(),
+        provider_metadata_mode: binding.provider_metadata_mode,
+        provider_api_mode: binding.provider_api_mode,
+        request_timeout_ms: binding.request_timeout_ms,
+        connect_timeout_ms: binding.connect_timeout_ms,
+        max_retries: binding.max_retries,
+        context_window: binding.context_window,
+        max_output_tokens: binding.max_output_tokens,
+        // Side-chat provider credentials are deliberately isolated from the main task target.
+        // A future credential surface must persist its own reference rather than inheriting the
+        // main provider's environment variable or request headers.
+        api_key_env: None,
+        extra_headers: Default::default(),
+    }
 }
 
 pub(crate) struct DesktopController {
@@ -5631,14 +7743,16 @@ pub(crate) struct DesktopController {
     runtime_rx: mpsc::Receiver<RuntimeMessage>,
     control_tx: DesktopControlPlaneSender,
     control_rx: mpsc::Receiver<RuntimeMessage>,
-    control_terminal_fallback: Arc<Mutex<Option<RuntimeMessage>>>,
     root_task_runtime: LocalTaskExecutor,
+    side_chat_task_runtime: LocalTaskExecutor,
     pending_permission: Option<PendingPermission>,
     next_permission_request_id: Arc<AtomicU64>,
     run_lifecycle: DesktopRunLifecycle,
     pending_root_submission: Option<PendingRootSubmission>,
     composer_commit_generation: u64,
     next_root_run_generation: u64,
+    side_chat_runs: HashMap<SessionId, DesktopSideChatRun>,
+    side_chat_errors: HashMap<SessionId, String>,
     next_enhance_request_id: u64,
     next_session_runtime_listener_generation: u64,
     session_runtime_listener: Option<DesktopSessionRuntimeListener>,
@@ -5676,14 +7790,16 @@ impl DesktopController {
         persist_preferences_to_disk: bool,
     ) -> Result<Self, AppRunError> {
         let (runtime_tx, runtime_rx) = mpsc::sync_channel(DESKTOP_RUNTIME_MAILBOX_CAPACITY);
-        let (control_channel_tx, control_rx) = mpsc::sync_channel(DESKTOP_CONTROL_MAILBOX_CAPACITY);
-        let control_terminal_fallback = Arc::new(Mutex::new(None));
+        // Bootstrap identity, permission requests, and worker settlement share
+        // one lossless FIFO. It is drained before the lossy runtime stream.
+        let (control_channel_tx, control_rx) = mpsc::channel();
         let control_tx = DesktopControlPlaneSender {
             tx: control_channel_tx,
-            terminal_fallback: Arc::clone(&control_terminal_fallback),
         };
         let root_task_runtime =
             LocalTaskExecutor::new("moyai-desktop-root-runtime").map_err(AppRunError::Message)?;
+        let side_chat_task_runtime = LocalTaskExecutor::new("moyai-desktop-side-chat-runtime")
+            .map_err(AppRunError::Message)?;
         if args.directory.is_some() {
             preferences.unmark_project_deleted(&app.workspace.root);
         } else {
@@ -5820,14 +7936,16 @@ impl DesktopController {
             runtime_rx,
             control_tx,
             control_rx,
-            control_terminal_fallback,
             root_task_runtime,
+            side_chat_task_runtime,
             pending_permission: None,
             next_permission_request_id: Arc::new(AtomicU64::new(1)),
             run_lifecycle: DesktopRunLifecycle::default(),
             pending_root_submission: None,
             composer_commit_generation: 0,
             next_root_run_generation: 1,
+            side_chat_runs: HashMap::new(),
+            side_chat_errors: HashMap::new(),
             next_enhance_request_id: 1,
             next_session_runtime_listener_generation: 1,
             session_runtime_listener: None,
@@ -5846,7 +7964,7 @@ impl DesktopController {
             attachment_asset_app: None,
             authorized_attachment_assets: BTreeSet::new(),
         };
-        controller.attach_runtime_listener_for_open_running_session();
+        controller.reconcile_runtime_listener_with_open_session();
         controller.persist_preferences();
         Ok(controller)
     }
@@ -5860,8 +7978,10 @@ impl DesktopController {
             root_run_generation: self.run_lifecycle.root_generation(),
             last_root_run_epoch: self.last_root_run_epoch(),
             composer_commit_generation: self.composer_commit_generation,
+            active_turn_expectation: self.current_active_turn_expectation(),
             ..DesktopRuntimeProjection::default()
         };
+        runtime_projection.side_chat = self.side_chat_projection();
         if let Some(root_session_id) = self.state.app_state.current_session_id {
             let live_records = self.app.run_service.agent_activity_records(root_session_id);
             let records = activity_records_for_projection(
@@ -5882,8 +8002,11 @@ impl DesktopController {
                 .filter(|record| record.is_current_turn)
                 .cloned()
                 .collect();
-            let (rows, tree_active) = agent_activity_projection(records);
-            let (current_turn_rows, _) = agent_activity_projection(current_turn_records);
+            let workspace_path = self.state.snapshot.workspace_path.as_str();
+            let (rows, tree_active) =
+                agent_activity_projection(workspace_path, root_session_id, records);
+            let (current_turn_rows, _) =
+                agent_activity_projection(workspace_path, root_session_id, current_turn_records);
             runtime_projection.agent_activity_rows = rows;
             runtime_projection.current_turn_agent_activity_rows = current_turn_rows;
             runtime_projection.agent_tree_active = tree_active;
@@ -5899,7 +8022,547 @@ impl DesktopController {
                 .map(|pending| (pending.confirmation_id, &pending.request)),
         );
         projection.projection_revision = projection_revision_text(revision);
+        if !self.side_chat_runs.is_empty() {
+            projection.async_polling_required = true;
+            if !projection
+                .pending_async_operations
+                .iter()
+                .any(|operation| operation == "side_chat")
+            {
+                projection
+                    .pending_async_operations
+                    .push("side_chat".to_string());
+            }
+        }
         Ok(projection)
+    }
+
+    pub(crate) fn current_active_turn_expectation(&self) -> ActiveTurnExpectation {
+        let Some(session_id) = self.state.app_state.current_session_id else {
+            return ActiveTurnExpectation::initial_idle();
+        };
+        let projected = self.state.app_state.active_turn_expectation;
+        if matches!(
+            self.state.app_state.run_status,
+            crate::tui::state::RunStatus::Running
+        ) {
+            if let Some(turn_id) = self
+                .session_runtime_listener
+                .as_ref()
+                .filter(|listener| {
+                    listener.target.workspace_root == self.app.workspace.root
+                        && listener.target.session_id == session_id
+                })
+                .map(|listener| listener.target.turn_id)
+            {
+                if projected.active_turn_id() == Some(turn_id) {
+                    return projected;
+                }
+                if let Some(open_expectation) = self
+                    .state
+                    .open_session
+                    .as_ref()
+                    .filter(|open| open.session_id() == session_id)
+                    .map(OpenSessionView::active_turn_expectation)
+                    .filter(|expected| expected.active_turn_id() == Some(turn_id))
+                {
+                    return open_expectation;
+                }
+                if let ActiveTurnExpectation::Idle { revision, .. } = projected {
+                    return ActiveTurnExpectation::Turn {
+                        turn_id,
+                        revision: revision + 1,
+                    };
+                }
+            }
+        }
+        projected
+    }
+
+    fn side_chat_projection(&self) -> DesktopSideChatProjection {
+        let Some(owner_session_id) = self.state.app_state.current_session_id else {
+            return DesktopSideChatProjection::default();
+        };
+        let default_base_url = self
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .base_url
+            .clone();
+        let durable = match self
+            .app
+            .store
+            .side_chat_repo()
+            .conversation_projection(owner_session_id)
+        {
+            Ok(projection) => projection,
+            Err(error) => {
+                return DesktopSideChatProjection {
+                    owner_session_id: Some(owner_session_id.to_string()),
+                    base_url: default_base_url,
+                    status: "failed".to_string(),
+                    phase: "storage read failed".to_string(),
+                    last_error: error.to_string(),
+                    ..DesktopSideChatProjection::default()
+                };
+            }
+        };
+        let Some(durable) = durable else {
+            return DesktopSideChatProjection {
+                owner_session_id: Some(owner_session_id.to_string()),
+                base_url: default_base_url,
+                status: "idle".to_string(),
+                last_error: self
+                    .side_chat_errors
+                    .get(&owner_session_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                generation: "0".to_string(),
+                ..DesktopSideChatProjection::default()
+            };
+        };
+        let binding = durable.binding;
+        let mut messages = durable
+            .messages
+            .into_iter()
+            .map(|message| DesktopSideChatMessageProjection {
+                id: message.id.to_string(),
+                sequence_no: usize::try_from(message.sequence_no).unwrap_or(usize::MAX),
+                role: match message.role {
+                    crate::storage::side_chat::SideChatConversationRole::User => "user",
+                    crate::storage::side_chat::SideChatConversationRole::Assistant => "assistant",
+                    crate::storage::side_chat::SideChatConversationRole::Error => "error",
+                }
+                .to_string(),
+                content: message.content,
+            })
+            .collect::<Vec<_>>();
+        let active = self
+            .side_chat_runs
+            .get(&owner_session_id)
+            .filter(|run| run.side_chat_id == binding.id.to_string());
+        if let Some(run) = active
+            && !run.streamed_text.is_empty()
+        {
+            let next_sequence = messages
+                .last()
+                .map_or(0, |message| message.sequence_no.saturating_add(1));
+            messages.push(DesktopSideChatMessageProjection {
+                id: format!("stream:{}:{}", binding.id, run.run_generation),
+                sequence_no: next_sequence,
+                role: "assistant".to_string(),
+                content: run.streamed_text.clone(),
+            });
+        }
+        let deleting = binding.delete_requested_at_ms.is_some();
+        DesktopSideChatProjection {
+            configured: true,
+            deleting,
+            chat_id: Some(binding.id.to_string()),
+            owner_session_id: Some(owner_session_id.to_string()),
+            model: binding.model,
+            base_url: binding.base_url,
+            status: active
+                .map(|_| "running".to_string())
+                .unwrap_or_else(|| durable.status.key().to_string()),
+            phase: active.map_or_else(
+                || {
+                    if deleting {
+                        "deletion pending".to_string()
+                    } else {
+                        String::new()
+                    }
+                },
+                |run| run.phase.clone(),
+            ),
+            last_error: self
+                .side_chat_errors
+                .get(&owner_session_id)
+                .cloned()
+                .or(durable.last_error)
+                .unwrap_or_default(),
+            generation: binding.request_generation.to_string(),
+            draft_text: binding.persisted_draft,
+            draft_revision: binding.draft_revision.to_string(),
+            messages,
+            can_send: !deleting && active.is_none() && durable.status != SessionStatus::Running,
+            can_cancel: !deleting && active.is_some(),
+        }
+    }
+
+    pub(crate) fn configure_side_chat(
+        &mut self,
+        owner_session_id: SessionId,
+        base_url: String,
+        model: String,
+    ) -> Result<(), String> {
+        self.ensure_current_side_chat_owner(owner_session_id)?;
+        if self.side_chat_runs.contains_key(&owner_session_id) {
+            return Err("the side chat must be stopped before its provider is changed".to_string());
+        }
+        let mut model_config = self.state.provider_config.effective_config.model.clone();
+        model_config.base_url = base_url;
+        model_config.model = model;
+        model_config.supports_tools = false;
+        model_config.supports_reasoning = false;
+        model_config.supports_images = false;
+        model_config.parallel_tool_calls = false;
+        let target =
+            SideChatProviderTarget::try_from(&model_config).map_err(|error| error.to_string())?;
+        self.app
+            .store
+            .side_chat_repo()
+            .configure(owner_session_id, target)
+            .map_err(|error| error.to_string())?;
+        self.side_chat_errors.remove(&owner_session_id);
+        Ok(())
+    }
+
+    pub(crate) fn save_side_chat_draft(
+        &mut self,
+        owner_session_id: SessionId,
+        side_chat_id: SideChatId,
+        expected_draft_revision: u64,
+        text: String,
+    ) -> Result<(), String> {
+        self.ensure_current_side_chat_owner(owner_session_id)?;
+        self.app
+            .store
+            .side_chat_repo()
+            .update_draft(
+                owner_session_id,
+                side_chat_id,
+                expected_draft_revision,
+                text,
+            )
+            .map_err(|error| error.to_string())?;
+        self.side_chat_errors.remove(&owner_session_id);
+        Ok(())
+    }
+
+    pub(crate) fn start_side_chat(
+        &mut self,
+        owner_session_id: SessionId,
+        side_chat_id: SideChatId,
+        expected_generation: u64,
+        expected_draft_revision: u64,
+        text: String,
+    ) -> Result<(), String> {
+        self.start_side_chat_with_ack_timeout(
+            owner_session_id,
+            side_chat_id,
+            expected_generation,
+            expected_draft_revision,
+            text,
+            SIDE_CHAT_START_ACK_TIMEOUT,
+        )
+    }
+
+    fn start_side_chat_with_ack_timeout(
+        &mut self,
+        owner_session_id: SessionId,
+        side_chat_id: SideChatId,
+        expected_generation: u64,
+        expected_draft_revision: u64,
+        text: String,
+        admission_ack_timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        self.ensure_current_side_chat_owner(owner_session_id)?;
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return Err("side chat text must not be empty".to_string());
+        }
+        if self.side_chat_runs.contains_key(&owner_session_id) {
+            return Err("the side chat already has an active request".to_string());
+        }
+        let binding = self
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "the selected main session has no side chat".to_string())?;
+        if binding.id != side_chat_id || binding.request_generation != expected_generation {
+            return Err("the side chat target changed before the action".to_string());
+        }
+        if binding.draft_revision != expected_draft_revision {
+            return Err(format!(
+                "the side chat draft changed before the action: expected {expected_draft_revision}, current {}",
+                binding.draft_revision
+            ));
+        }
+        let provisional_generation = expected_generation
+            .checked_add(1)
+            .ok_or_else(|| "side chat request generation is exhausted".to_string())?;
+        let conversation_session_id = binding.conversation_session_id;
+        let side_chat_id_text = binding.id.to_string();
+        let turn_id = TurnId::new();
+        let user_turn = UserTurn {
+            turn_id,
+            items: vec![UserInputItem::Text { text }],
+            prompt_dispatch: None,
+            editor_context: None,
+        };
+        let run_control = RunControl::new();
+        let cancel = run_control.token();
+        let worker_cancel = cancel.clone();
+        let worker_run_control = run_control.clone();
+        let store = self.app.store.clone();
+        let stream_owner_session_id = owner_session_id;
+        let stream_side_chat_id = side_chat_id_text.clone();
+        let runtime_tx = self.runtime_tx.clone();
+        let control_tx = self.control_tx.clone();
+        let (worker_start_tx, worker_start_rx) = tokio::sync::oneshot::channel::<()>();
+        let (admission_ack_tx, admission_ack_rx) = mpsc::sync_channel::<Result<u64, String>>(1);
+        let worker =
+            self.side_chat_task_runtime
+                .spawn(provisional_generation, move || async move {
+                    if worker_start_rx.await.is_err() {
+                        return;
+                    }
+                    let publish_start_failure = |error: String| {
+                        let _ = admission_ack_tx.send(Err(error.clone()));
+                        let _ = control_tx.send(RuntimeMessage::SideChatFinished {
+                            owner_session_id: stream_owner_session_id,
+                            side_chat_id: stream_side_chat_id.clone(),
+                            run_generation: provisional_generation,
+                            result: Err(error),
+                        });
+                    };
+                    let process_run_lease =
+                        match store.try_acquire_run_process_lease(conversation_session_id) {
+                            Ok(lease) => lease,
+                            Err(error) => {
+                                publish_start_failure(error.to_string());
+                                return;
+                            }
+                        };
+                    let active_run_lease = match store
+                        .active_runs()
+                        .try_start(conversation_session_id, worker_run_control)
+                    {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            drop(process_run_lease);
+                            publish_start_failure(error.to_string());
+                            return;
+                        }
+                    };
+                    if let Err(error) = active_run_lease.set_turn_id(turn_id) {
+                        drop(active_run_lease);
+                        drop(process_run_lease);
+                        publish_start_failure(error.to_string());
+                        return;
+                    }
+                    let admitted = match store
+                        .side_chat_repo()
+                        .claim_and_admit_request(
+                            stream_owner_session_id,
+                            side_chat_id,
+                            expected_generation,
+                            expected_draft_revision,
+                            turn_id,
+                            &user_turn,
+                        )
+                        .await
+                    {
+                        Ok(admitted) => admitted,
+                        Err(error) => {
+                            drop(active_run_lease);
+                            drop(process_run_lease);
+                            publish_start_failure(error.to_string());
+                            return;
+                        }
+                    };
+                    let run_generation = admitted.generation;
+                    let profile = side_chat_request_profile(&admitted.binding);
+                    let admission_id = admitted.admission.admission_id;
+                    if admission_ack_tx.send(Ok(run_generation)).is_err() {
+                        // The command owner disappeared after admission. Preserve canonical truth by
+                        // settling the admitted turn instead of leaving an unowned Running session.
+                        worker_cancel.cancel();
+                    }
+                    let result = execute_admitted_canonical_side_chat(
+                        store,
+                        conversation_session_id,
+                        admission_id,
+                        turn_id,
+                        profile,
+                        worker_cancel,
+                        |event| {
+                            let message = match event {
+                                SideChatStreamEvent::TextDelta(delta) => {
+                                    RuntimeMessage::SideChatDelta {
+                                        owner_session_id: stream_owner_session_id,
+                                        side_chat_id: stream_side_chat_id.clone(),
+                                        run_generation,
+                                        delta,
+                                    }
+                                }
+                                SideChatStreamEvent::ProviderPhase(phase) => {
+                                    RuntimeMessage::SideChatPhase {
+                                        owner_session_id: stream_owner_session_id,
+                                        side_chat_id: stream_side_chat_id.clone(),
+                                        run_generation,
+                                        phase,
+                                    }
+                                }
+                            };
+                            let _ = runtime_tx.try_send(message);
+                        },
+                    )
+                    .await;
+                    drop(active_run_lease);
+                    drop(process_run_lease);
+                    let _ = control_tx.send(RuntimeMessage::SideChatFinished {
+                        owner_session_id: stream_owner_session_id,
+                        side_chat_id: stream_side_chat_id,
+                        run_generation,
+                        result,
+                    });
+                })?;
+        if worker_start_tx.send(()).is_err() {
+            drop(worker);
+            return Err("side chat worker stopped before admission".to_string());
+        }
+        let (run_generation, phase, start_result) = match admission_ack_rx
+            .recv_timeout(admission_ack_timeout)
+        {
+            Ok(Ok(run_generation)) if run_generation == provisional_generation => {
+                (run_generation, "request admitted".to_string(), Ok(()))
+            }
+            Ok(Ok(run_generation)) => {
+                cancel.cancel();
+                (
+                    run_generation,
+                    "stopping after an unexpected request generation".to_string(),
+                    Err(format!(
+                        "side chat admission returned generation {run_generation}, expected {provisional_generation}"
+                    )),
+                )
+            }
+            Ok(Err(error)) => {
+                drop(worker);
+                return Err(error);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                cancel.cancel();
+                (
+                    provisional_generation,
+                    "start acknowledgement timed out; stop requested".to_string(),
+                    Err(format!(
+                        "side chat admission did not acknowledge within {}ms",
+                        admission_ack_timeout.as_millis()
+                    )),
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                drop(worker);
+                return Err("side chat worker stopped before acknowledging admission".to_string());
+            }
+        };
+        self.side_chat_runs.insert(
+            owner_session_id,
+            DesktopSideChatRun {
+                side_chat_id: side_chat_id_text,
+                run_generation,
+                cancel,
+                worker,
+                phase,
+                streamed_text: String::new(),
+                delete_after_finish: false,
+            },
+        );
+        self.side_chat_errors.remove(&owner_session_id);
+        start_result
+    }
+
+    pub(crate) fn cancel_side_chat(
+        &mut self,
+        owner_session_id: SessionId,
+        side_chat_id: SideChatId,
+        expected_generation: u64,
+    ) -> Result<(), String> {
+        self.ensure_current_side_chat_owner(owner_session_id)?;
+        self.validate_side_chat_target(owner_session_id, side_chat_id, expected_generation)?;
+        let run = self
+            .side_chat_runs
+            .get_mut(&owner_session_id)
+            .ok_or_else(|| "the side chat no longer has an active request".to_string())?;
+        if run.side_chat_id != side_chat_id.to_string() {
+            return Err("the side chat request owner changed".to_string());
+        }
+        run.phase = "stop requested".to_string();
+        run.cancel.cancel();
+        self.side_chat_errors.remove(&owner_session_id);
+        Ok(())
+    }
+
+    pub(crate) fn delete_side_chat(
+        &mut self,
+        owner_session_id: SessionId,
+        side_chat_id: SideChatId,
+        expected_generation: u64,
+    ) -> Result<(), String> {
+        self.ensure_current_side_chat_owner(owner_session_id)?;
+        self.validate_side_chat_target(owner_session_id, side_chat_id, expected_generation)?;
+        let repository = self.app.store.side_chat_repo();
+        repository
+            .request_delete(owner_session_id, side_chat_id, expected_generation)
+            .map_err(|error| error.to_string())?;
+        if let Some(run) = self.side_chat_runs.get_mut(&owner_session_id) {
+            if run.side_chat_id != side_chat_id.to_string() {
+                return Err("the side chat request owner changed".to_string());
+            }
+            run.delete_after_finish = true;
+            run.phase = "stopping before deletion".to_string();
+            run.cancel.cancel();
+            self.side_chat_errors.remove(&owner_session_id);
+            return Ok(());
+        }
+        repository
+            .finalize_pending_deletions()
+            .map_err(|error| error.to_string())?;
+        self.side_chat_errors.remove(&owner_session_id);
+        Ok(())
+    }
+
+    pub(crate) fn set_side_chat_command_error(
+        &mut self,
+        owner_session_id: SessionId,
+        message: impl Into<String>,
+    ) {
+        self.side_chat_errors
+            .insert(owner_session_id, message.into());
+    }
+
+    fn ensure_current_side_chat_owner(&self, owner_session_id: SessionId) -> Result<(), String> {
+        if self.state.app_state.current_session_id != Some(owner_session_id) {
+            return Err(
+                "the selected main session changed before the side chat action".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_side_chat_target(
+        &self,
+        owner_session_id: SessionId,
+        side_chat_id: SideChatId,
+        expected_generation: u64,
+    ) -> Result<(), String> {
+        let binding = self
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "the selected main session has no side chat".to_string())?;
+        if binding.id != side_chat_id || binding.request_generation != expected_generation {
+            return Err("the side chat target changed before the action".to_string());
+        }
+        Ok(())
     }
 
     pub(crate) fn authorize_attachment_asset(
@@ -6096,6 +8759,9 @@ impl DesktopController {
     }
 
     fn ensure_navigation_admission(&mut self, target: &str) -> bool {
+        if !self.ensure_unscoped_prompt_review_action(target) {
+            return false;
+        }
         let Some(reason) = navigation_admission_blocker(
             self.state.is_busy(),
             self.state.background_mutation_pending(),
@@ -6106,6 +8772,16 @@ impl DesktopController {
         };
         self.state
             .set_status_message(format!("{target} cannot change while {reason}"));
+        false
+    }
+
+    pub(crate) fn ensure_unscoped_prompt_review_action(&mut self, target: &str) -> bool {
+        if self.state.app_state.prompt_review.is_none() {
+            return true;
+        }
+        self.state.set_status_message(format!(
+            "{target} cannot replace the active Prompt Review; send or cancel that exact review first"
+        ));
         false
     }
 
@@ -6137,7 +8813,7 @@ impl DesktopController {
         self.state.finish_history_export();
     }
 
-    fn attach_runtime_listener_for_open_running_session(&mut self) {
+    fn reconcile_runtime_listener_with_open_session(&mut self) {
         let target = self.state.open_session.as_ref().and_then(|open_session| {
             if open_session.session().status != SessionStatus::Running {
                 return None;
@@ -6148,8 +8824,12 @@ impl DesktopController {
                 turn_id: open_session.active_turn_id()?,
             })
         });
+        self.reconcile_session_runtime_listener(target);
+    }
+
+    fn reconcile_session_runtime_listener(&mut self, target: Option<SessionRuntimeListenerTarget>) {
         let Some(target) = target else {
-            self.stop_session_runtime_listener();
+            self.session_runtime_listener = None;
             return;
         };
         if self
@@ -6160,7 +8840,7 @@ impl DesktopController {
             return;
         }
 
-        self.stop_session_runtime_listener();
+        self.session_runtime_listener = None;
         let generation = self.next_session_runtime_listener_generation;
         let Some(next_generation) = generation.checked_add(1) else {
             self.state.set_status_message(
@@ -6185,7 +8865,7 @@ impl DesktopController {
     }
 
     fn stop_session_runtime_listener(&mut self) {
-        self.session_runtime_listener = None;
+        self.reconcile_session_runtime_listener(None);
     }
 
     fn invalidate_session_search_requests(&mut self) {
@@ -6324,7 +9004,16 @@ impl DesktopController {
         true
     }
 
-    pub(crate) fn interrupt_session(&mut self, session_id: SessionId) -> bool {
+    pub(crate) fn interrupt_session(
+        &mut self,
+        session_id: SessionId,
+        expected_turn_id: TurnId,
+        expected_admission_revision: u64,
+    ) -> bool {
+        let expected_active_turn = ActiveTurnExpectation::Turn {
+            turn_id: expected_turn_id,
+            revision: expected_admission_revision,
+        };
         if !self.ensure_navigation_admission("running chat interrupt") {
             return false;
         }
@@ -6341,7 +9030,7 @@ impl DesktopController {
         }
         self.invalidate_session_target_requests();
         if self.state.app_state.current_session_id == Some(session_id) && self.state.is_busy() {
-            self.cancel_active_run();
+            self.cancel_exact_turn_at(expected_turn_id, expected_admission_revision);
             return true;
         }
         self.state
@@ -6353,7 +9042,7 @@ impl DesktopController {
             session_id,
             operation_id,
         };
-        self.spawn_session_interrupt(target);
+        self.spawn_session_interrupt(target, expected_active_turn);
         true
     }
 
@@ -6469,27 +9158,35 @@ impl DesktopController {
                 .set_status_message("select a session before exporting transcript");
             return;
         };
+        let Some(session) = self
+            .state
+            .open_session
+            .as_ref()
+            .filter(|open_session| open_session.session_id() == session_id)
+            .map(|open_session| open_session.session().clone())
+        else {
+            self.state
+                .set_status_message("transcript export target is no longer available");
+            return;
+        };
         let detail = self.state.selected_detail();
         if detail.transcript_rows.is_empty() {
             self.state
                 .set_status_message("open transcript has no rows to export");
             return;
         }
-        let file_name =
-            transcript_markdown_file_name(&self.state.selected_session_title(), session_id);
-        let export_path = self
-            .app
-            .workspace
-            .authority_root()
+        let file_name = transcript_markdown_file_name(&session.title, session.id);
+        let export_path = session
+            .cwd
             .join(".moyai")
             .join("transcript-exports")
             .join(file_name);
         let markdown = open_transcript_rows_to_markdown(
-            &self.state.selected_session_title(),
-            self.app.workspace.authority_root(),
-            session_id,
-            &self.state.provider_config.effective_config.model.base_url,
-            &self.state.provider_config.effective_config.model.model,
+            &session.title,
+            &session.cwd,
+            session.id,
+            &session.base_url,
+            &session.model,
             &detail.transcript_rows,
             &detail.file_changes,
         );
@@ -6862,7 +9559,7 @@ impl DesktopController {
     fn spawn_session_cancel_persist(
         &mut self,
         session_id: SessionId,
-        in_memory_stop_accepted: bool,
+        expected_active_turn: ActiveTurnExpectation,
     ) {
         let app = self.app.clone();
         let root_admission_fence = self.next_root_run_generation;
@@ -6879,29 +9576,124 @@ impl DesktopController {
                 .enable_all()
                 .build()
                 .expect("failed to build desktop cancel-persist runtime");
-            let result = runtime.block_on(async move {
-                let durable_stop_accepted = app
-                    .session_service
-                    .cancel_running_session(session_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if !in_memory_stop_accepted && !durable_stop_accepted {
-                    return Err("current task no longer accepted the Stop request".to_string());
-                }
-                let detail = load_session_detail(&app, session_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                loaded_session_from_detail_with_activity(&app, detail).await
+            let (durable_outcome, in_memory_stop_accepted, result) = runtime.block_on(async move {
+                let (durable_outcome, in_memory_stop_accepted) =
+                    match claim_exact_root_execution_stop(&app, session_id, expected_active_turn)
+                        .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(error) => return (None, false, Err(error.to_string())),
+                    };
+                let detail = match load_session_detail(&app, session_id).await {
+                    Ok(detail) => detail,
+                    Err(error) => {
+                        return (
+                            Some(durable_outcome),
+                            in_memory_stop_accepted,
+                            Err(error.to_string()),
+                        );
+                    }
+                };
+                (
+                    Some(durable_outcome),
+                    in_memory_stop_accepted,
+                    loaded_session_from_detail_with_activity(&app, detail).await,
+                )
             });
-            control_tx.publish_terminal(RuntimeMessage::CurrentSessionRefreshed {
+            let _ = control_tx.send(RuntimeMessage::CurrentSessionRefreshed {
                 request_id,
                 target,
                 purpose: CurrentSessionRefreshPurpose::StopRequestRefresh {
                     root_admission_fence,
+                    root_stop_attempt: None,
+                    expected_active_turn: Some(expected_active_turn),
+                    in_memory_stop_accepted,
+                    durable_outcome,
                 },
                 result,
             });
         });
+    }
+
+    fn spawn_root_session_cancel_persist(
+        &mut self,
+        generation: u64,
+        session_id: SessionId,
+        root_scope_control: RunControl,
+        stop_plan: crate::app::run_service::RootExecutionStopPlan,
+        root_stop_attempt: DesktopRootStopAttempt,
+    ) {
+        let app = self.app.clone();
+        let root_admission_fence = self.next_root_run_generation;
+        let target = SessionRefreshRequestTarget {
+            workspace_root: self.app.workspace.root.clone(),
+            session_id,
+        };
+        let request_id = self
+            .session_projection_refresh_requests
+            .begin(target.clone());
+        let control_tx = self.control_tx.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build desktop root cancel-persist runtime");
+            let (durable_outcome, in_memory_stop_accepted, expected_active_turn, result) = runtime
+                .block_on(async move {
+                    let claim = match app
+                        .run_service
+                        .claim_root_execution_stop(&root_scope_control, stop_plan)
+                        .await
+                    {
+                        Ok(claim) => claim,
+                        Err(error) => return (None, false, None, Err(error.to_string())),
+                    };
+                    let local_stop_accepted = claim
+                        .local_stop
+                        .is_some_and(crate::runtime::RootExecutionLocalStop::stop_accepted);
+                    if claim
+                        .session_id
+                        .is_some_and(|claimed| claimed != session_id)
+                    {
+                        return (
+                            claim.durable_outcome,
+                            local_stop_accepted,
+                            claim.expected_active_turn,
+                            Err("the canonical root Stop plan changed sessions".to_string()),
+                        );
+                    }
+                    let detail = match load_session_detail(&app, session_id).await {
+                        Ok(detail) => detail,
+                        Err(error) => {
+                            return (
+                                claim.durable_outcome,
+                                local_stop_accepted,
+                                claim.expected_active_turn,
+                                Err(error.to_string()),
+                            );
+                        }
+                    };
+                    (
+                        claim.durable_outcome,
+                        local_stop_accepted,
+                        claim.expected_active_turn,
+                        loaded_session_from_detail_with_activity(&app, detail).await,
+                    )
+                });
+            let _ = control_tx.send(RuntimeMessage::CurrentSessionRefreshed {
+                request_id,
+                target,
+                purpose: CurrentSessionRefreshPurpose::StopRequestRefresh {
+                    root_admission_fence,
+                    root_stop_attempt: Some(root_stop_attempt),
+                    expected_active_turn,
+                    in_memory_stop_accepted,
+                    durable_outcome,
+                },
+                result,
+            });
+        });
+        debug_assert_eq!(self.run_lifecycle.root_generation(), Some(generation));
     }
 
     fn spawn_session_delete(&self, session_id: SessionId, operation_id: DesktopAsyncOperationId) {
@@ -7039,7 +9831,11 @@ impl DesktopController {
         });
     }
 
-    fn spawn_session_interrupt(&self, target: SessionMutationRequestTarget) {
+    fn spawn_session_interrupt(
+        &self,
+        target: SessionMutationRequestTarget,
+        expected_active_turn: ActiveTurnExpectation,
+    ) {
         let app = self.app.clone();
         let runtime_tx = self.runtime_tx.clone();
         std::thread::spawn(move || {
@@ -7049,10 +9845,11 @@ impl DesktopController {
                 .build()
                 .expect("failed to build desktop session-interrupt runtime");
             let result = runtime.block_on(async move {
-                app.session_service
-                    .interrupt_running_session(session_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                let (outcome, _) =
+                    claim_exact_root_execution_stop(&app, session_id, expected_active_turn).await?;
+                if matches!(outcome, ExactRootExecutionStopOutcome::TargetChanged) {
+                    return Err("the running chat changed before interrupt was applied".to_string());
+                }
                 load_session_operation_projection(
                     &app,
                     session_id,
@@ -7153,7 +9950,11 @@ impl DesktopController {
         });
     }
 
-    pub(crate) fn start_run(&mut self, prompt: String) -> bool {
+    pub(crate) fn start_run_at(
+        &mut self,
+        prompt: String,
+        expected_active_turn: ActiveTurnExpectation,
+    ) -> bool {
         if self.state.navigation_loading() {
             self.state
                 .set_status_message("wait for navigation to finish before sending");
@@ -7165,7 +9966,12 @@ impl DesktopController {
             return false;
         }
         let prompt_dispatch = crate::session::PromptDispatchPart::raw(&prompt);
-        self.launch_run_with_options(prompt, prompt_dispatch, None, false)
+        self.launch_run_with_options(prompt, prompt_dispatch, None, None, expected_active_turn)
+    }
+
+    #[cfg(test)]
+    fn start_run(&mut self, prompt: String) -> bool {
+        self.start_run_at(prompt, self.current_active_turn_expectation())
     }
 
     pub(crate) fn start_quick_chat(&mut self) -> bool {
@@ -7323,27 +10129,51 @@ impl DesktopController {
         }
     }
 
-    pub(crate) fn start_review_uncommitted(&mut self, prompt: String) -> bool {
+    pub(crate) fn start_review_uncommitted_at(
+        &mut self,
+        prompt: String,
+        expected_active_turn: ActiveTurnExpectation,
+    ) -> bool {
+        if !matches!(expected_active_turn, ActiveTurnExpectation::Idle { .. }) {
+            self.state
+                .set_status_message("uncommitted review requires the captured idle run owner");
+            return false;
+        }
         let prompt = prompt.trim().to_string();
         let prompt_dispatch = crate::session::PromptDispatchPart::raw(&prompt);
         self.launch_run_with_options(
             prompt,
             prompt_dispatch,
             Some(ReviewRequest::Uncommitted),
-            false,
+            None,
+            expected_active_turn,
         )
     }
 
-    pub(crate) fn start_prompt_enhance(&mut self, raw_prompt: String) -> bool {
+    #[cfg(test)]
+    fn start_review_uncommitted(&mut self, prompt: String) -> bool {
+        self.start_review_uncommitted_at(prompt, self.current_active_turn_expectation())
+    }
+
+    pub(crate) fn start_prompt_enhance_at(
+        &mut self,
+        raw_prompt: String,
+        expected_active_turn: ActiveTurnExpectation,
+    ) -> bool {
+        if !self.ensure_unscoped_prompt_review_action("prompt enhancement") {
+            return false;
+        }
         let raw_prompt = raw_prompt.trim().to_string();
         if !unique_background_request_admission_open(false, self.state.prompt_enhance_pending()) {
             self.state
                 .set_status_message("prompt enhancement is already in progress");
             return false;
         }
-        if raw_prompt.is_empty()
+        if !matches!(expected_active_turn, ActiveTurnExpectation::Idle { .. })
+            || raw_prompt.is_empty()
             || self.state.is_busy()
             || self.state.navigation_loading()
+            || self.state.background_mutation_pending()
             || self.run_lifecycle.root_is_active()
         {
             self.state
@@ -7361,21 +10191,41 @@ impl DesktopController {
             workspace_root: self.app.workspace.root.clone(),
             session_id: self.state.app_state.current_session_id,
             owner_generation: self.state.composer.owner_generation(),
+            expected_active_turn,
         };
         let cancellation = CancellationToken::new();
-        self.state
-            .begin_prompt_enhance(request_id, &raw_prompt, cancellation.clone());
+        self.state.begin_prompt_enhance_at(
+            request_id,
+            &raw_prompt,
+            cancellation.clone(),
+            expected_active_turn,
+        );
         let runtime_tx = self.runtime_tx.clone();
         let config = self.state.provider_config.effective_config.clone();
+        let session_service = self.app.session_service.clone();
+        let target_session_id = target.session_id;
+        let target_expected_active_turn = target.expected_active_turn;
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build desktop enhance runtime");
             let result = runtime.block_on(async move {
-                crate::tui::prompt_enhance::enhance_prompt(&config, &raw_prompt, cancellation)
-                    .await
-                    .map_err(|error| error.to_string())
+                crate::tui::prompt_enhance::enhance_prompt_for_captured_idle(
+                    &session_service,
+                    target_session_id,
+                    target_expected_active_turn,
+                    || async move {
+                        crate::tui::prompt_enhance::enhance_prompt(
+                            &config,
+                            &raw_prompt,
+                            cancellation,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
+                    },
+                )
+                .await
             });
             let _ = runtime_tx.send(RuntimeMessage::EnhanceFinished {
                 request_id,
@@ -7386,22 +10236,74 @@ impl DesktopController {
         true
     }
 
-    pub(crate) fn send_prompt_review(&mut self, send_enhanced: bool, review_draft: String) -> bool {
+    #[cfg(test)]
+    fn start_prompt_enhance(&mut self, raw_prompt: String) -> bool {
+        self.start_prompt_enhance_at(raw_prompt, self.current_active_turn_expectation())
+    }
+
+    pub(crate) fn send_prompt_review_at(
+        &mut self,
+        review_request_id: u64,
+        send_enhanced: bool,
+        review_draft: String,
+        expected_active_turn: ActiveTurnExpectation,
+    ) -> bool {
         if self.state.navigation_loading() {
             self.state
                 .set_status_message("wait for navigation to finish before sending");
             return false;
         }
-        if send_enhanced {
-            self.state.set_review_draft(review_draft);
+        let Some(prompt_review_to_cancel) = self.prompt_review_target(review_request_id) else {
+            self.state
+                .set_status_message("enhanced draft target is no longer current");
+            return false;
+        };
+        if prompt_review_to_cancel.expected_active_turn != expected_active_turn {
+            self.state
+                .set_status_message("the active run owner changed since this Prompt Review began");
+            return false;
         }
-        let Some(prompt_dispatch) = self.state.build_prompt_dispatch(send_enhanced) else {
+        if !matches!(expected_active_turn, ActiveTurnExpectation::Idle { .. }) {
+            self.state
+                .set_status_message("Prompt Review send requires the captured idle run owner");
+            return false;
+        }
+        // The editable review draft is frontend-owned until this atomic action.
+        // Commit the exact submitted text for both choices so the durable
+        // PromptDispatchPart preserves edit provenance even when the user sends
+        // the original prompt rather than the enhanced text.
+        let Some(prompt_dispatch) = self.state.build_prompt_dispatch_from_draft(
+            review_request_id,
+            review_draft,
+            send_enhanced,
+        ) else {
             self.state
                 .set_status_message("enhanced draft is not ready yet");
             return false;
         };
         let prompt = prompt_dispatch.dispatch_prompt_text.clone();
-        self.launch_run_with_options(prompt, prompt_dispatch, None, true)
+        self.launch_run_with_options(
+            prompt,
+            prompt_dispatch,
+            None,
+            Some(prompt_review_to_cancel),
+            expected_active_turn,
+        )
+    }
+
+    #[cfg(test)]
+    fn send_prompt_review(
+        &mut self,
+        review_request_id: u64,
+        send_enhanced: bool,
+        review_draft: String,
+    ) -> bool {
+        self.send_prompt_review_at(
+            review_request_id,
+            send_enhanced,
+            review_draft,
+            self.current_active_turn_expectation(),
+        )
     }
 
     pub(crate) fn load_provider_models(&mut self) -> bool {
@@ -7561,20 +10463,16 @@ impl DesktopController {
     }
 
     pub(crate) fn apply_session_config(&mut self, values: Vec<(String, String)>) -> bool {
-        let candidate = match ConfigEditorState::from_config_values(
+        let startup_overlay_forced = self.state.view.startup_overlay_forced;
+        match build_resolved_config_from_key_values(
             &self.state.provider_config.effective_config,
             values,
         ) {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                self.state
-                    .set_status_message(format!("config error: {error}"));
-                return false;
-            }
-        };
-        match candidate.build_resolved_config(&self.state.provider_config.effective_config) {
             Ok(config) => {
                 self.reset_effective_config_without_network(config);
+                if startup_overlay_forced {
+                    self.state.mark_startup_config_reviewed();
+                }
                 self.state
                     .set_status_message("applied config to this UI session");
                 true
@@ -7591,7 +10489,17 @@ impl DesktopController {
         self.run_lifecycle.root_generation()
     }
 
-    fn last_root_run_epoch(&self) -> u64 {
+    pub(crate) fn root_run_admission_snapshot(
+        &self,
+        generation: u64,
+    ) -> Option<crate::runtime::RootAdmissionSnapshot> {
+        let Some(root_scope_control) = self.run_lifecycle.root_scope_control(generation) else {
+            return None;
+        };
+        Some(root_scope_control.root_admission_snapshot())
+    }
+
+    pub(crate) fn last_root_run_epoch(&self) -> u64 {
         self.next_root_run_generation.saturating_sub(1)
     }
 
@@ -8182,21 +11090,14 @@ impl DesktopController {
         }
     }
 
-    pub(crate) fn prepare_image_attachment_from_input(&mut self) -> Option<Utf8PathBuf> {
+    pub(crate) fn prepare_image_attachment_from_input(&self) -> Result<Utf8PathBuf, String> {
         let input = self
             .state
             .composer
             .image_attachment_input
             .trim()
             .to_string();
-        match normalize_image_attachment_path(&self.app.workspace.cwd, &input) {
-            Ok(path) => Some(path),
-            Err(error) => {
-                self.state
-                    .set_status_message(format!("image attachment failed: {error}"));
-                None
-            }
-        }
+        normalize_image_attachment_path(&self.app.workspace.cwd, &input)
     }
 
     pub(crate) fn browse_image_dialog(&mut self) -> Option<Utf8PathBuf> {
@@ -8559,52 +11460,117 @@ impl DesktopController {
         }
     }
 
-    pub(crate) fn cancel_active_run(&mut self) {
-        let mut requested = false;
-        let session_id = self.state.app_state.current_session_id;
-        let exact_root_target = self.run_lifecycle.root_is_active() || self.state.is_busy();
-        if self.run_lifecycle.request_cancel() {
-            requested = true;
-        }
-        if !exact_root_target
-            && let Some(confirmation_id) = self
-                .pending_permission
-                .as_ref()
-                .map(|permission| permission.confirmation_id)
+    pub(crate) fn cancel_root_run_at_generation(&mut self, generation: u64) -> bool {
+        let (root_stop_attempt, root_scope_control) =
+            match self.run_lifecycle.begin_stop_attempt(generation) {
+                DesktopRootStopAttemptAdmission::Acquired {
+                    attempt,
+                    run_control,
+                } => (attempt, run_control),
+                DesktopRootStopAttemptAdmission::AlreadyPending => {
+                    self.state
+                        .set_status_message("the exact root task Stop is already being validated");
+                    return true;
+                }
+                DesktopRootStopAttemptAdmission::NotOwned => return false,
+                DesktopRootStopAttemptAdmission::Exhausted => {
+                    self.state.set_status_message(
+                        "root Stop attempt identity is exhausted; restart moyAI",
+                    );
+                    return false;
+                }
+            };
+        let stop_plan = match self
+            .app
+            .run_service
+            .seal_root_execution_for_stop(&root_scope_control)
         {
-            let resolution = self.answer_permission(confirmation_id, ReviewDecision::Abort);
-            if matches!(
-                resolution,
-                PendingPermissionResolution::Resolved
-                    | PendingPermissionResolution::AlreadyTerminal(_)
-            ) {
-                return;
+            Ok(crate::app::run_service::RootExecutionStopSealOutcome::Acquired(plan)) => plan,
+            Ok(crate::app::run_service::RootExecutionStopSealOutcome::AlreadySealed) => {
+                self.run_lifecycle.finish_stop_attempt(root_stop_attempt);
+                self.state
+                    .set_status_message("the exact root task Stop is already being validated");
+                return true;
             }
-        }
-        let durable_stop_dispatched = if exact_root_target {
-            if let Some(session_id) = session_id {
-                self.state.mark_post_run_refresh_pending();
-                self.spawn_session_cancel_persist(session_id, requested);
-                true
-            } else {
-                false
+            Ok(crate::app::run_service::RootExecutionStopSealOutcome::Rejected) => {
+                self.run_lifecycle.finish_stop_attempt(root_stop_attempt);
+                return false;
             }
-        } else {
-            false
+            Err(error) => {
+                self.run_lifecycle.finish_stop_attempt(root_stop_attempt);
+                self.state.set_status_message(format!(
+                    "failed to seal the exact root Stop target: {error}"
+                ));
+                return false;
+            }
         };
-        if requested {
-            self.durable_agent_activity_refresh_requests.clear();
-            self.state.mark_run_stop_requested(
-                "run cancellation requested",
-                "停止を要求しました。現在の処理を中断しています。",
-            );
-        } else if durable_stop_dispatched {
+        if !stop_plan.has_durable_owner() {
+            let claim = self
+                .app
+                .run_service
+                .claim_unadmitted_root_execution_stop(&root_scope_control, stop_plan);
+            self.run_lifecycle.finish_stop_attempt(root_stop_attempt);
+            return match claim {
+                Ok(claim)
+                    if claim
+                        .local_stop
+                        .is_some_and(crate::runtime::RootExecutionLocalStop::stop_accepted) =>
+                {
+                    self.durable_agent_activity_refresh_requests.clear();
+                    self.state.mark_run_stop_requested(
+                        "run cancellation requested",
+                        "停止を要求しました。現在の処理を中断しています。",
+                    );
+                    true
+                }
+                Ok(_) => false,
+                Err(error) => {
+                    self.state.set_status_message(format!(
+                        "failed to stop the pre-admission root task: {error}"
+                    ));
+                    false
+                }
+            };
+        }
+        let Some(session_id) = stop_plan.session_id_hint() else {
+            self.run_lifecycle.finish_stop_attempt(root_stop_attempt);
             self.state
-                .set_status_message("stopping the current task...");
-        } else {
+                .set_status_message("the sealed root Stop plan lost its durable session owner");
+            return false;
+        };
+        self.state.mark_post_run_refresh_pending();
+        self.spawn_root_session_cancel_persist(
+            generation,
+            session_id,
+            root_scope_control,
+            stop_plan,
+            root_stop_attempt,
+        );
+        self.state
+            .set_status_message("validating the exact root task Stop target...");
+        true
+    }
+
+    pub(crate) fn cancel_exact_turn_at(
+        &mut self,
+        expected_turn_id: TurnId,
+        expected_admission_revision: u64,
+    ) {
+        let Some(session_id) = self.state.app_state.current_session_id else {
             self.state
                 .set_status_message("停止できる実行中タスクはありません。");
-        }
+            return;
+        };
+        self.state.mark_post_run_refresh_pending();
+        self.spawn_session_cancel_persist(
+            session_id,
+            ActiveTurnExpectation::Turn {
+                turn_id: expected_turn_id,
+                revision: expected_admission_revision,
+            },
+        );
+        self.state
+            .set_status_message("validating the exact task Stop target...");
     }
 
     pub(crate) fn set_window_opacity_percent(&mut self, percent: i32) {
@@ -8620,6 +11586,40 @@ impl DesktopController {
         self.app.workspace.authority_root().to_path_buf()
     }
 
+    fn prompt_review_target(&self, request_id: u64) -> Option<PromptReviewTarget> {
+        self.state
+            .app_state
+            .prompt_review
+            .as_ref()
+            .filter(|review| review.request_id == request_id)?;
+        Some(PromptReviewTarget {
+            request_id,
+            workspace_root: self.app.workspace.root.clone(),
+            composer_workspace_path: self.state.snapshot.workspace_path.clone(),
+            composer_session_id: self.state.app_state.current_session_id,
+            composer_owner_generation: self.state.composer.owner_generation(),
+            expected_active_turn: self.state.prompt_review_expected_active_turn(request_id)?,
+        })
+    }
+
+    fn cancel_prompt_review_if_current(&mut self, target: &PromptReviewTarget) -> bool {
+        if target.workspace_root != self.app.workspace.root
+            || target.composer_owner_generation != self.state.composer.owner_generation()
+            || self
+                .state
+                .prompt_review_expected_active_turn(target.request_id)
+                != Some(target.expected_active_turn)
+            || !self
+                .state
+                .composer
+                .is_owned_by(&target.composer_workspace_path, target.composer_session_id)
+        {
+            return false;
+        }
+        self.state
+            .cancel_prompt_review_if_current(target.request_id)
+    }
+
     fn commit_pending_root_submission(&mut self, run_generation: u64) -> bool {
         let Some(pending) = self
             .pending_root_submission
@@ -8627,6 +11627,9 @@ impl DesktopController {
         else {
             return false;
         };
+        if let Some(target) = pending.prompt_review_to_cancel.as_ref() {
+            self.cancel_prompt_review_if_current(target);
+        }
         self.state
             .apply_durable_prompt_dispatch(&pending.prompt_dispatch);
         let current_session_id = self.state.app_state.current_session_id;
@@ -8643,9 +11646,6 @@ impl DesktopController {
             .image_attachment_paths
             .retain(|path| !pending.image_paths.contains(path));
         self.state.composer.image_attachment_input.clear();
-        if pending.cancel_prompt_review_on_commit {
-            self.state.cancel_prompt_review();
-        }
         self.advance_composer_commit_generation();
         true
     }
@@ -8661,8 +11661,15 @@ impl DesktopController {
         prompt: String,
         prompt_dispatch: crate::session::PromptDispatchPart,
         review_request: Option<ReviewRequest>,
-        cancel_prompt_review_on_commit: bool,
+        prompt_review_to_cancel: Option<PromptReviewTarget>,
+        expected_active_turn: ActiveTurnExpectation,
     ) -> bool {
+        if self.state.app_state.prompt_review.is_some() && prompt_review_to_cancel.is_none() {
+            self.state.set_status_message(
+                "the active Prompt Review must be sent or cancelled through its exact target",
+            );
+            return false;
+        }
         if self.state.background_mutation_pending() {
             self.state
                 .set_status_message("wait for the current owner mutation to finish before sending");
@@ -8673,28 +11680,27 @@ impl DesktopController {
                 .set_status_message("wait for navigation to finish before starting a run");
             return false;
         }
-        if self.run_lifecycle.root_is_active() {
-            if self.run_lifecycle.can_steer_root()
-                && review_request.is_none()
+        if matches!(expected_active_turn, ActiveTurnExpectation::Turn { .. }) {
+            if review_request.is_none()
+                && prompt_review_to_cancel.is_none()
                 && !prompt.trim().is_empty()
             {
-                return self.launch_active_turn_steer(prompt, cancel_prompt_review_on_commit);
-            } else {
-                self.state.set_status_message(
-                    "前回の停止処理を片付けています。状態が更新されてから再度実行してください。",
-                );
+                return self.launch_active_turn_steer(prompt, expected_active_turn);
             }
+            self.state
+                .set_status_message("the captured active turn cannot admit this request");
             return false;
         }
-        if review_request.is_none()
-            && !prompt.trim().is_empty()
-            && self.state.app_state.current_session_id.is_some()
-            && matches!(
+        if self.run_lifecycle.root_is_active()
+            || matches!(
                 self.state.app_state.run_status,
                 crate::tui::state::RunStatus::Running
             )
         {
-            return self.launch_active_turn_steer(prompt, cancel_prompt_review_on_commit);
+            self.state.set_status_message(
+                "the idle run owner changed before submission; refresh and try again",
+            );
+            return false;
         }
         if prompt.trim().is_empty() && review_request.is_none() {
             return false;
@@ -8733,6 +11739,8 @@ impl DesktopController {
             session_access_mode_adoption: None,
             agent_confirmation: None,
             agent_context: None,
+            admission_kind: crate::app::RunAdmissionKind::NewUserRun,
+            expected_active_turn,
         };
         self.run_lifecycle.begin(run_generation, run_control);
         self.pending_root_submission = Some(PendingRootSubmission {
@@ -8741,7 +11749,7 @@ impl DesktopController {
             owner_session_id: request.session_id,
             prompt_dispatch,
             image_paths: self.state.composer.image_attachment_paths.clone(),
-            cancel_prompt_review_on_commit,
+            prompt_review_to_cancel,
         });
         let run_service = self.app.run_service.clone();
         let runtime_tx = self.runtime_tx.clone();
@@ -8758,7 +11766,8 @@ impl DesktopController {
                 let worker_run_control = request.run_control.clone();
                 let root_run_control = request.run_control.clone();
                 let mut renderer = DesktopRenderer {
-                    tx: runtime_tx.clone(),
+                    runtime_tx,
+                    bootstrap_control: control_tx.clone(),
                     run_generation,
                     notification_title: notification_title.clone(),
                     notified_terminal: false,
@@ -8832,8 +11841,13 @@ impl DesktopController {
     fn launch_active_turn_steer(
         &mut self,
         prompt: String,
-        cancel_prompt_review_on_commit: bool,
+        expected_active_turn: ActiveTurnExpectation,
     ) -> bool {
+        if !matches!(expected_active_turn, ActiveTurnExpectation::Turn { .. }) {
+            self.state
+                .set_status_message("the captured session is not an active turn to steer");
+            return false;
+        }
         let Some(session_id) = self.state.app_state.current_session_id else {
             self.state
                 .set_status_message("実行中のセッションが見つからないため steer できません。");
@@ -8849,11 +11863,11 @@ impl DesktopController {
             operation_id: self.state.begin_steer_submission(),
             workspace_root: self.app.workspace.root.clone(),
             session_id,
+            expected_active_turn,
         };
         self.state
             .set_status_message("実行中の turn に追加入力を保存しています。");
         let run_service = self.app.run_service.clone();
-        let runtime_tx = self.runtime_tx.clone();
         let control_tx = self.control_tx.clone();
         let next_permission_request_id = self.next_permission_request_id.clone();
         let cwd = self.app.workspace.cwd.clone();
@@ -8864,7 +11878,7 @@ impl DesktopController {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut renderer = DesktopSteerRenderer;
                 let mut prompt_ui = DesktopConfirmationPrompt {
-                    control: control_tx,
+                    control: control_tx.clone(),
                     next_permission_request_id,
                 };
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -8881,6 +11895,7 @@ impl DesktopController {
                                     cwd,
                                     image_paths: worker_image_paths,
                                     client_user_message_id: Some(steer_client_message_id),
+                                    expected_active_turn,
                                 }),
                                 &mut renderer,
                                 &mut prompt_ui,
@@ -8896,10 +11911,9 @@ impl DesktopController {
                     })
             }))
             .unwrap_or_else(|_| Err("desktop steer worker panicked".to_string()));
-            let _ = runtime_tx.try_send(RuntimeMessage::SteerFinished {
+            let _ = control_tx.send(RuntimeMessage::SteerFinished {
                 target: worker_target,
                 image_paths,
-                cancel_prompt_review_on_commit,
                 result,
             });
         });
@@ -8975,7 +11989,7 @@ impl DesktopController {
                         }
                     });
                 }
-                self.attach_runtime_listener_for_open_running_session();
+                self.reconcile_runtime_listener_with_open_session();
             }
             Err(error) => {
                 finish_navigation_failure(&mut self.state, request_id, error);
@@ -8999,10 +12013,29 @@ impl DesktopController {
         match result {
             Ok(loaded) => {
                 let loaded_status = loaded.read.session.status;
+                let loaded_active_turn_expectation = if loaded_status == SessionStatus::Running {
+                    loaded
+                        .read
+                        .active_turn_id
+                        .map(|turn_id| ActiveTurnExpectation::Turn {
+                            turn_id,
+                            revision: loaded.read.admission_revision,
+                        })
+                        .unwrap_or(ActiveTurnExpectation::Idle {
+                            latest_turn_id: loaded.read.latest_turn_id,
+                            revision: loaded.read.admission_revision,
+                        })
+                } else {
+                    ActiveTurnExpectation::Idle {
+                        latest_turn_id: loaded.read.latest_turn_id,
+                        revision: loaded.read.admission_revision,
+                    }
+                };
                 let page_has_more = loaded.read.turns.has_more;
                 let history_is_contiguous = self
                     .state
                     .load_open_session_preserving_history(&loaded.read);
+                self.reconcile_runtime_listener_with_open_session();
                 if let Some(records) = loaded.agent_activity_records {
                     self.loaded_agent_activity_records = Some((loaded.read.session.id, records));
                     self.durable_agent_activity_refresh_failures = 0;
@@ -9024,15 +12057,32 @@ impl DesktopController {
                     }
                 }
                 self.state.clear_post_run_refresh_pending();
-                if matches!(
-                    purpose,
-                    CurrentSessionRefreshPurpose::StopRequestRefresh { .. }
-                ) {
-                    if loaded_status == SessionStatus::Running
+                if let CurrentSessionRefreshPurpose::StopRequestRefresh {
+                    expected_active_turn,
+                    in_memory_stop_accepted,
+                    durable_outcome,
+                    ..
+                } = purpose
+                {
+                    let durable_stop_applied = matches!(
+                        durable_outcome,
+                        Some(ExactRootExecutionStopOutcome::Applied { .. })
+                    );
+                    let durable_target_changed = matches!(
+                        durable_outcome,
+                        Some(ExactRootExecutionStopOutcome::TargetChanged)
+                    );
+                    if durable_target_changed {
+                        self.state.set_status_message(
+                            "the task changed before Stop was applied; the replacement was not stopped",
+                        );
+                    } else if loaded_status == SessionStatus::Running
                         && matches!(
                             self.state.app_state.run_status,
                             crate::tui::state::RunStatus::Running
                         )
+                        && Some(loaded_active_turn_expectation) == expected_active_turn
+                        && (in_memory_stop_accepted || durable_stop_applied)
                     {
                         self.state.mark_run_stop_requested(
                             "run cancellation requested",
@@ -9183,16 +12233,56 @@ impl DesktopController {
                 == target.selected_model_id
     }
 
+    fn settle_root_finished(&mut self, run_generation: u64, result: Result<RunSummary, String>) {
+        if !self.run_lifecycle.owns(run_generation) {
+            return;
+        }
+        if self.state.app_state.current_session_id.is_none() {
+            self.settle_pending_access_mode_without_session();
+        }
+        match result {
+            Ok(summary) => {
+                self.commit_pending_root_submission(run_generation);
+                self.run_lifecycle.finish_root();
+                self.settle_pending_permission_after_root_finish();
+                self.state.finish_agent_run();
+                self.state.mark_post_run_refresh_pending();
+                self.state.apply_run_summary(summary);
+                self.stop_session_runtime_listener();
+                self.refresh_current_session_after_terminal_run();
+            }
+            Err(error) => {
+                self.discard_pending_root_submission(run_generation);
+                self.run_lifecycle.finish_root();
+                self.settle_pending_permission_after_root_finish();
+                self.state.finish_agent_run();
+                if !matches!(
+                    self.state.app_state.run_status,
+                    crate::tui::state::RunStatus::Cancelled
+                ) {
+                    self.state.app_state.run_status = crate::tui::state::RunStatus::Failed;
+                }
+                if !self.state.status_code.is_terminal_interruption() {
+                    self.state.set_status_message(error);
+                }
+                self.stop_session_runtime_listener();
+                if self.state.app_state.current_session_id.is_some() {
+                    self.state.mark_post_run_refresh_pending();
+                    self.refresh_current_session_after_terminal_run();
+                } else {
+                    self.state.clear_post_run_refresh_pending();
+                }
+            }
+        }
+    }
+
     pub(crate) fn drain_runtime_messages(&mut self) -> bool {
         let mut changed = false;
         for _ in 0..DESKTOP_RUNTIME_DRAIN_BUDGET {
-            let fallback = self
-                .control_terminal_fallback
-                .lock()
+            let message = self
+                .control_rx
+                .try_recv()
                 .ok()
-                .and_then(|mut fallback| fallback.take());
-            let message = fallback
-                .or_else(|| self.control_rx.try_recv().ok())
                 .or_else(|| self.runtime_rx.try_recv().ok());
             let Some(message) = message else {
                 break;
@@ -9242,6 +12332,16 @@ impl DesktopController {
                     if !self.run_lifecycle.owns(run_generation) {
                         continue;
                     }
+                    let admitted_listener_target = match &event {
+                        RunEvent::UserTurnStored { session_id, turn } => {
+                            Some(SessionRuntimeListenerTarget {
+                                workspace_root: self.app.workspace.root.clone(),
+                                session_id: *session_id,
+                                turn_id: turn.turn_id,
+                            })
+                        }
+                        _ => None,
+                    };
                     if matches!(&event, RunEvent::UserTurnStored { .. }) {
                         self.commit_pending_root_submission(run_generation);
                     }
@@ -9266,6 +12366,14 @@ impl DesktopController {
                         self.run_lifecycle.observe_terminal_event();
                     }
                     self.state.apply_run_event(&event);
+                    if let Some(target) = admitted_listener_target
+                        && self.state.app_state.current_session_id == Some(target.session_id)
+                    {
+                        // UserTurnStored is the durable admission receipt available on the
+                        // bootstrap FIFO today. Attach its exact cursor immediately instead of
+                        // waiting for a possibly reordered session snapshot refresh.
+                        self.reconcile_session_runtime_listener(Some(target));
+                    }
                     if let Some(message) = desktop_terminal_status_message(&event) {
                         self.state.set_status_message_preserving_code(message);
                     }
@@ -9293,45 +12401,7 @@ impl DesktopController {
                     run_generation,
                     result,
                 } => {
-                    if !self.run_lifecycle.owns(run_generation) {
-                        continue;
-                    }
-                    if self.state.app_state.current_session_id.is_none() {
-                        self.settle_pending_access_mode_without_session();
-                    }
-                    match result {
-                        Ok(summary) => {
-                            self.commit_pending_root_submission(run_generation);
-                            self.run_lifecycle.finish_root();
-                            self.settle_pending_permission_after_root_finish();
-                            self.state.finish_agent_run();
-                            self.state.mark_post_run_refresh_pending();
-                            self.state.apply_run_summary(summary);
-                            self.refresh_current_session_after_terminal_run();
-                        }
-                        Err(error) => {
-                            self.discard_pending_root_submission(run_generation);
-                            self.run_lifecycle.finish_root();
-                            self.settle_pending_permission_after_root_finish();
-                            self.state.finish_agent_run();
-                            if !matches!(
-                                self.state.app_state.run_status,
-                                crate::tui::state::RunStatus::Cancelled
-                            ) {
-                                self.state.app_state.run_status =
-                                    crate::tui::state::RunStatus::Failed;
-                            }
-                            if !self.state.status_code.is_terminal_interruption() {
-                                self.state.set_status_message(error);
-                            }
-                            if self.state.app_state.current_session_id.is_some() {
-                                self.state.mark_post_run_refresh_pending();
-                                self.refresh_current_session_after_terminal_run();
-                            } else {
-                                self.state.clear_post_run_refresh_pending();
-                            }
-                        }
-                    }
+                    self.settle_root_finished(run_generation, result);
                 }
                 RuntimeMessage::Permission {
                     confirmation_id,
@@ -9363,6 +12433,9 @@ impl DesktopController {
                     if target.workspace_root != self.app.workspace.root
                         || target.session_id != self.state.app_state.current_session_id
                         || target.owner_generation != self.state.composer.owner_generation()
+                        || target.expected_active_turn != self.current_active_turn_expectation()
+                        || self.state.prompt_review_expected_active_turn(request_id)
+                            != Some(target.expected_active_turn)
                     {
                         self.state.fail_prompt_enhance(request_id);
                         continue;
@@ -9385,7 +12458,6 @@ impl DesktopController {
                 RuntimeMessage::SteerFinished {
                     target,
                     image_paths,
-                    cancel_prompt_review_on_commit,
                     result,
                 } => {
                     if !finish_steer_operation_if_current(
@@ -9397,9 +12469,6 @@ impl DesktopController {
                     }
                     let accepted = finish_steer_submission(&mut self.state, &image_paths, result);
                     if accepted {
-                        if cancel_prompt_review_on_commit {
-                            self.state.cancel_prompt_review();
-                        }
                         self.advance_composer_commit_generation();
                         // The acknowledgement says only that the queue owner
                         // accepted the input. Re-read the canonical snapshot:
@@ -9442,6 +12511,13 @@ impl DesktopController {
                     purpose,
                     result,
                 } => {
+                    if let CurrentSessionRefreshPurpose::StopRequestRefresh {
+                        root_stop_attempt: Some(attempt),
+                        ..
+                    } = purpose
+                    {
+                        self.run_lifecycle.finish_stop_attempt(attempt);
+                    }
                     if !self
                         .session_projection_refresh_requests
                         .finish_if_current(request_id, &target)
@@ -9453,6 +12529,7 @@ impl DesktopController {
                         CurrentSessionRefreshPurpose::Refresh => true,
                         CurrentSessionRefreshPurpose::StopRequestRefresh {
                             root_admission_fence,
+                            ..
                         } => root_admission_fence == self.next_root_run_generation,
                     };
                     if !root_admission_is_current {
@@ -9590,6 +12667,7 @@ impl DesktopController {
                             {
                                 let loaded = rolled_back.loaded;
                                 self.state.load_open_session(&loaded.read);
+                                self.reconcile_runtime_listener_with_open_session();
                                 if let Some(records) = loaded.agent_activity_records {
                                     self.loaded_agent_activity_records =
                                         Some((loaded.read.session.id, records));
@@ -9626,6 +12704,7 @@ impl DesktopController {
                             {
                                 let loaded = applied.loaded;
                                 self.state.load_open_session(&loaded.read);
+                                self.reconcile_runtime_listener_with_open_session();
                                 if let Some(records) = loaded.agent_activity_records {
                                     self.loaded_agent_activity_records =
                                         Some((loaded.read.session.id, records));
@@ -9719,6 +12798,7 @@ impl DesktopController {
                         Ok(loaded) => {
                             let has_more = loaded.read.turns.has_more;
                             self.state.refresh_open_session_projection(&loaded.read);
+                            self.reconcile_runtime_listener_with_open_session();
                             if let Some(records) = loaded.agent_activity_records {
                                 self.loaded_agent_activity_records =
                                     Some((loaded.read.session.id, records));
@@ -10031,6 +13111,83 @@ impl DesktopController {
                 RuntimeMessage::WorkspaceSwitchedForNewProjectSession { request_id, result } => {
                     self.apply_new_project_workspace_switched_message(request_id, result)
                 }
+                RuntimeMessage::SideChatDelta {
+                    owner_session_id,
+                    side_chat_id,
+                    run_generation,
+                    delta,
+                } => {
+                    let Some(run) = self.side_chat_runs.get_mut(&owner_session_id) else {
+                        continue;
+                    };
+                    if !run.owns(&side_chat_id, run_generation) {
+                        continue;
+                    }
+                    run.streamed_text.push_str(&delta);
+                }
+                RuntimeMessage::SideChatPhase {
+                    owner_session_id,
+                    side_chat_id,
+                    run_generation,
+                    phase,
+                } => {
+                    let Some(run) = self.side_chat_runs.get_mut(&owner_session_id) else {
+                        continue;
+                    };
+                    if !run.owns(&side_chat_id, run_generation) {
+                        continue;
+                    }
+                    run.phase = phase;
+                }
+                RuntimeMessage::SideChatFinished {
+                    owner_session_id,
+                    side_chat_id,
+                    run_generation,
+                    result,
+                } => {
+                    let owned = self
+                        .side_chat_runs
+                        .get(&owner_session_id)
+                        .is_some_and(|run| run.owns(&side_chat_id, run_generation));
+                    if !owned {
+                        continue;
+                    }
+                    if let Some(run) = self.side_chat_runs.remove(&owner_session_id) {
+                        let delete_after_finish = run.delete_after_finish;
+                        let stop_requested = run.cancel.is_cancelled();
+                        run.worker.detach();
+                        let repository = self.app.store.side_chat_repo();
+                        let durable_delete_requested = repository
+                            .get_by_owner(owner_session_id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|binding| {
+                                binding.id.to_string() == side_chat_id
+                                    && binding.delete_requested_at_ms.is_some()
+                            });
+                        if delete_after_finish || durable_delete_requested {
+                            match repository.finalize_pending_deletions() {
+                                Ok(_) => {
+                                    self.side_chat_errors.remove(&owner_session_id);
+                                }
+                                Err(error) => {
+                                    self.side_chat_errors.insert(
+                                        owner_session_id,
+                                        format!(
+                                            "side chat stopped, but its history was not deleted: {error}"
+                                        ),
+                                    );
+                                }
+                            }
+                        } else if let Err(error) = result {
+                            self.side_chat_errors.insert(owner_session_id, error);
+                        } else if stop_requested {
+                            self.side_chat_errors.remove(&owner_session_id);
+                        } else {
+                            self.side_chat_errors.remove(&owner_session_id);
+                        }
+                    }
+                }
             }
         }
         changed
@@ -10040,6 +13197,9 @@ impl DesktopController {
 impl Drop for DesktopController {
     fn drop(&mut self) {
         self.state.cancel_prompt_review();
+        for run in self.side_chat_runs.values() {
+            run.cancel.cancel();
+        }
     }
 }
 
@@ -10052,7 +13212,10 @@ fn publish_desktop_run_finished(
     run_generation: u64,
     result: Result<RunSummary, String>,
 ) {
-    control.publish_terminal(RuntimeMessage::Finished {
+    // Finished reports worker quiescence. The bootstrap bridge and this
+    // settlement share one FIFO, so SessionStarted/UserTurnStored cannot be
+    // overtaken even while the lossy runtime mailbox is saturated.
+    let _ = control.send(RuntimeMessage::Finished {
         run_generation,
         result,
     });
@@ -10122,6 +13285,26 @@ fn preserve_permission_after_root_finish(pending: Option<&PendingPermission>) ->
     pending.is_some_and(|pending| {
         pending.request.agent_path.is_some() && pending.run_control.cause().is_none()
     })
+}
+
+async fn claim_exact_root_execution_stop(
+    app: &App,
+    session_id: SessionId,
+    expected_active_turn: ActiveTurnExpectation,
+) -> Result<(ExactRootExecutionStopOutcome, bool), String> {
+    let ActiveTurnExpectation::Turn { turn_id, revision } = expected_active_turn else {
+        return Ok((ExactRootExecutionStopOutcome::TargetChanged, false));
+    };
+    let outcome = app
+        .run_service
+        .cancel_exact_root_execution(session_id, turn_id, revision)
+        .await
+        .map_err(|error| error.to_string())?;
+    let local_wake_applied = matches!(
+        outcome,
+        ExactRootExecutionStopOutcome::Applied { cancelled: true }
+    );
+    Ok((outcome, local_wake_applied))
 }
 
 fn loaded_session_from_detail(
@@ -10268,6 +13451,7 @@ fn live_event_requires_canonical_refresh(event: &RunEvent) -> bool {
         event,
         RunEvent::UserTurnStored { .. }
             | RunEvent::ModelRequestPrepared { .. }
+            | RunEvent::AssistantMessageCommitted { .. }
             | RunEvent::WorldStateUpdated { .. }
             | RunEvent::ToolCallPending { .. }
             | RunEvent::ToolCallCompleted { .. }
@@ -10336,7 +13520,10 @@ fn open_transcript_rows_to_markdown(
     let metadata = vec![
         MarkdownMetadataLine::new("Workspace", format!("`{workspace}`")),
         MarkdownMetadataLine::new("Session", format!("`{session_id}`")),
-        MarkdownMetadataLine::new("Provider", format!("`{provider_base_url}`")),
+        MarkdownMetadataLine::new(
+            "Provider",
+            format!("`{}`", sanitize_provider_endpoint(provider_base_url)),
+        ),
         MarkdownMetadataLine::new("Model", format!("`{model}`")),
     ];
     render_codex_turn_block_markdown(title, &events, &metadata)
@@ -10987,6 +14174,7 @@ mod tests {
             operation_id,
             workspace_root: "C:/stale".into(),
             session_id: current_session_id,
+            expected_active_turn: crate::session::ActiveTurnExpectation::initial_idle(),
         };
 
         assert!(!finish_steer_operation_if_current(
@@ -11000,6 +14188,7 @@ mod tests {
             operation_id,
             workspace_root: "C:/current".into(),
             session_id: current_session_id,
+            expected_active_turn: crate::session::ActiveTurnExpectation::initial_idle(),
         };
         assert!(finish_steer_operation_if_current(
             &mut state,
@@ -11332,6 +14521,32 @@ mod tests {
     }
 
     #[test]
+    fn image_attachment_normalization_preserves_nonexistent_path_diagnostic() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 path");
+
+        let error = normalize_image_attachment_path(&workspace, "missing-image.png")
+            .expect_err("a missing image must remain rejected");
+
+        assert!(error.contains("image path is not accessible"));
+        assert!(!error.contains("the image path was not attached"));
+    }
+
+    #[test]
+    fn image_attachment_normalization_preserves_unsupported_extension_diagnostic() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let unsupported = temp.path().join("not-an-image.txt");
+        std::fs::write(&unsupported, b"not an image").expect("unsupported fixture");
+        let workspace = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 path");
+        let unsupported = Utf8PathBuf::from_path_buf(unsupported).expect("utf8 fixture");
+
+        let error = normalize_image_attachment_path(&workspace, unsupported.as_str())
+            .expect_err("an unsupported extension must remain rejected");
+
+        assert_eq!(error, "unsupported image file extension: txt");
+    }
+
+    #[test]
     fn project_delete_selects_only_non_deleted_remaining_project() {
         let deleted_id = ProjectId::new();
         let hidden_id = ProjectId::new();
@@ -11544,6 +14759,72 @@ mod tests {
     }
 
     #[test]
+    fn open_transcript_markdown_exports_a_prior_assistant_before_a_cancelled_later_turn_once() {
+        let session_id = crate::session::SessionId::new();
+        let rows = vec![
+            DesktopTranscriptRow {
+                row_kind: DesktopTranscriptRowKind::User,
+                stable_history_identity: None,
+                step: "01".to_string(),
+                title: "Prompt".to_string(),
+                body: "first request".to_string(),
+                file_changes: Vec::new(),
+            },
+            DesktopTranscriptRow {
+                row_kind: DesktopTranscriptRowKind::WorkSummaryCompleted,
+                stable_history_identity: None,
+                step: "02".to_string(),
+                title: "作業履歴 / 作業サマリ".to_string(),
+                body: "### 作業サマリ\n- 結果: first turn completed".to_string(),
+                file_changes: Vec::new(),
+            },
+            DesktopTranscriptRow {
+                row_kind: DesktopTranscriptRowKind::Assistant,
+                stable_history_identity: None,
+                step: "03".to_string(),
+                title: "Response".to_string(),
+                body: "FIRST_OK".to_string(),
+                file_changes: Vec::new(),
+            },
+            DesktopTranscriptRow {
+                row_kind: DesktopTranscriptRowKind::User,
+                stable_history_identity: None,
+                step: "04".to_string(),
+                title: "Prompt".to_string(),
+                body: "second request".to_string(),
+                file_changes: Vec::new(),
+            },
+            DesktopTranscriptRow {
+                row_kind: DesktopTranscriptRowKind::WorkSummaryCancelled,
+                stable_history_identity: None,
+                step: "05".to_string(),
+                title: "作業履歴 / 作業サマリ".to_string(),
+                body: "### 作業サマリ\n- 結果: second turn cancelled".to_string(),
+                file_changes: Vec::new(),
+            },
+        ];
+
+        let markdown = open_transcript_rows_to_markdown(
+            "Two-turn session",
+            &Utf8PathBuf::from("C:/workspace"),
+            session_id,
+            "http://127.0.0.1:1234",
+            "fixture-model",
+            &rows,
+            &[],
+        );
+
+        let first_user = markdown.find("> first request").unwrap();
+        let assistant = markdown.find("FIRST_OK").unwrap();
+        let second_user = markdown.find("> second request").unwrap();
+        let cancelled = markdown
+            .find("停止しました: second turn cancelled")
+            .unwrap();
+        assert!(first_user < assistant && assistant < second_user && second_user < cancelled);
+        assert_eq!(markdown.matches("FIRST_OK").count(), 1);
+    }
+
+    #[test]
     fn completion_notification_body_summarizes_terminal_run() {
         let summary = completed_run_summary(3, 1, 2);
 
@@ -11560,7 +14841,8 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(DESKTOP_RUNTIME_MAILBOX_CAPACITY);
         let (control, control_rx) = test_desktop_control_plane();
         let mut renderer = DesktopRenderer {
-            tx: tx.clone(),
+            runtime_tx: tx,
+            bootstrap_control: control.clone(),
             run_generation: 12,
             notification_title: "test".to_string(),
             notified_terminal: false,
@@ -11577,6 +14859,47 @@ mod tests {
                 run_generation: 12,
                 result: Ok(received),
             } if received.session_id() == summary.session_id()
+        ));
+    }
+
+    #[test]
+    fn unbounded_control_plane_preserves_multiple_completions_in_order() {
+        let (control, control_rx) = test_desktop_control_plane();
+        let owner_session_id = SessionId::new();
+        control
+            .send(RuntimeMessage::SideChatFinished {
+                owner_session_id,
+                side_chat_id: "first".to_string(),
+                run_generation: 1001,
+                result: Err("first settlement".to_string()),
+            })
+            .expect("first settlement");
+        control
+            .send(RuntimeMessage::SideChatFinished {
+                owner_session_id,
+                side_chat_id: "second".to_string(),
+                run_generation: 1002,
+                result: Err("second settlement".to_string()),
+            })
+            .expect("second settlement");
+
+        assert!(matches!(
+            control_rx.recv().expect("first completion"),
+            RuntimeMessage::SideChatFinished {
+                run_generation: 1001,
+                ..
+            }
+        ));
+        assert!(matches!(
+            control_rx.recv().expect("second completion"),
+            RuntimeMessage::SideChatFinished {
+                run_generation: 1002,
+                ..
+            }
+        ));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
         ));
     }
 
@@ -11610,6 +14933,41 @@ mod tests {
                 .expect("renamed TOML config should be imported");
             assert_eq!(std::fs::read_to_string(target.as_std_path()).unwrap(), text);
         }
+    }
+
+    #[test]
+    fn config_import_validates_canonical_and_legacy_response_timeout_together() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source =
+            Utf8PathBuf::from_path_buf(temp.path().join("config(1).toml")).expect("utf8 source");
+        let target =
+            Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 target");
+        let legacy = "[model]\nstream_idle_timeout_ms = 3600000\n";
+        std::fs::write(source.as_std_path(), legacy).expect("legacy import fixture");
+
+        import_global_config_toml_to(&source, &target)
+            .expect("unambiguous legacy timeout should remain importable");
+        assert_eq!(
+            std::fs::read_to_string(target.as_std_path()).expect("imported config"),
+            legacy
+        );
+
+        let sentinel = "[model]\nrequest_timeout_ms = 1800000\n";
+        std::fs::write(target.as_std_path(), sentinel).expect("target sentinel");
+        std::fs::write(
+            source.as_std_path(),
+            "[model]\nrequest_timeout_ms = 3600000\nstream_idle_timeout_ms = 1800000\n",
+        )
+        .expect("ambiguous import fixture");
+
+        let error = import_global_config_toml_to(&source, &target)
+            .expect_err("mismatched timeout aliases must not replace the active config");
+        assert!(error.contains("model.request_timeout_ms"));
+        assert!(error.contains("model.stream_idle_timeout_ms"));
+        assert_eq!(
+            std::fs::read_to_string(target.as_std_path()).expect("unchanged target"),
+            sentinel
+        );
     }
 
     #[test]
@@ -11859,8 +15217,31 @@ fn deliver_desktop_session_runtime_events(
     DesktopSessionEventDelivery::Complete
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopRunEventDelivery {
+    RuntimeMailbox,
+    BootstrapControl,
+    CanonicalCursor,
+}
+
+fn desktop_run_event_delivery(event: &RunEvent) -> DesktopRunEventDelivery {
+    match event.durability() {
+        RunEventDurability::RuntimeOnly => DesktopRunEventDelivery::RuntimeMailbox,
+        RunEventDurability::Committed => match event {
+            // Temporary bootstrap bridge: a new run needs these identities
+            // before a session-scoped canonical cursor can be attached. The
+            // durable admission receipt will replace this bridge.
+            RunEvent::SessionStarted { .. } | RunEvent::UserTurnStored { .. } => {
+                DesktopRunEventDelivery::BootstrapControl
+            }
+            _ => DesktopRunEventDelivery::CanonicalCursor,
+        },
+    }
+}
+
 struct DesktopRenderer {
-    tx: mpsc::SyncSender<RuntimeMessage>,
+    runtime_tx: mpsc::SyncSender<RuntimeMessage>,
+    bootstrap_control: DesktopControlPlaneSender,
     run_generation: u64,
     notification_title: String,
     notified_terminal: bool,
@@ -11879,14 +15260,26 @@ impl EventRenderer for DesktopRenderer {
                 self.notified_terminal = true;
             }
         }
-        match self.tx.try_send(RuntimeMessage::RunEvent {
-            run_generation: self.run_generation,
-            event: event.clone(),
-        }) {
-            Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
-            Err(mpsc::TrySendError::Disconnected(_)) => Err(CliRenderError::Message(
-                "desktop runtime stream is unavailable".to_string(),
-            )),
+        match desktop_run_event_delivery(event) {
+            DesktopRunEventDelivery::RuntimeMailbox => {
+                match self.runtime_tx.try_send(RuntimeMessage::RunEvent {
+                    run_generation: self.run_generation,
+                    event: event.clone(),
+                }) {
+                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
+                    Err(mpsc::TrySendError::Disconnected(_)) => Err(CliRenderError::Message(
+                        "desktop runtime stream is unavailable".to_string(),
+                    )),
+                }
+            }
+            DesktopRunEventDelivery::BootstrapControl => self
+                .bootstrap_control
+                .send(RuntimeMessage::RunEvent {
+                    run_generation: self.run_generation,
+                    event: event.clone(),
+                })
+                .map_err(CliRenderError::Message),
+            DesktopRunEventDelivery::CanonicalCursor => Ok(()),
         }
     }
 
@@ -12040,7 +15433,7 @@ impl ConfirmationPrompt for DesktopConfirmationPrompt {
             .next_permission_request_id
             .fetch_add(1, Ordering::Relaxed);
         self.control
-            .try_send(RuntimeMessage::Permission {
+            .send(RuntimeMessage::Permission {
                 confirmation_id,
                 request: request.clone(),
                 response: response_tx,
@@ -12071,7 +15464,7 @@ impl ConfirmationPrompt for DesktopConfirmationPrompt {
                 Err(mpsc::RecvTimeoutError::Timeout) if control.is_cancelled() => {
                     let _ = self
                         .control
-                        .try_send(RuntimeMessage::PermissionCancelled { confirmation_id });
+                        .send(RuntimeMessage::PermissionCancelled { confirmation_id });
                     return Ok(ConfirmationOutcome::Interrupted);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -12079,7 +15472,7 @@ impl ConfirmationPrompt for DesktopConfirmationPrompt {
                     if control.is_cancelled() {
                         let _ = self
                             .control
-                            .try_send(RuntimeMessage::PermissionCancelled { confirmation_id });
+                            .send(RuntimeMessage::PermissionCancelled { confirmation_id });
                         return Ok(ConfirmationOutcome::Interrupted);
                     }
                     let message = "desktop permission response channel disconnected".to_string();

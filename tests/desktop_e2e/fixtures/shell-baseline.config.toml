@@ -1,0 +1,28 @@
+[model]
+base_url = "http://127.0.0.1:9"
+model = "e2e/shell-baseline"
+provider_metadata_mode = "openai_compatible_only"
+provider_api_mode = "responses"
+reasoning_summary = "none"
+connect_timeout_ms = 1000
+request_timeout_ms = 5000
+max_retries = 0
+context_window = 65536
+max_output_tokens = 1024
+supports_tools = true
+supports_images = false
+
+[permissions]
+access_mode = "default"
+
+[multi_agent]
+enabled = true
+mode = "explicit_request_only"
+max_concurrent_agents = 2
+max_concurrent_model_requests = 1
+
+[docling]
+enabled = false
+
+[mcp]
+enabled = false

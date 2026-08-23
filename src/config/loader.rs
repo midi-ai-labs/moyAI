@@ -8,7 +8,7 @@ use fs2::FileExt;
 
 use crate::cli::RunArgs;
 use crate::config::ProviderEndpoint;
-use crate::config::merge::apply_patch;
+use crate::config::merge::{apply_patch, normalize_request_timeout_alias};
 use crate::config::model::{
     AccessMode, ChatCompletionsReasoningParameters, PartialDoclingConfig, PartialFileGuardConfig,
     PartialFormatConfig, PartialInspectionConfig, PartialInstructionConfig, PartialLoggingConfig,
@@ -83,7 +83,7 @@ impl ConfigLoader {
         cli: Option<&RunArgs>,
     ) -> Result<ResolvedConfig, ConfigError> {
         validate_env_overrides()?;
-        Self::resolve_config(config_source, global, Some(env_patch()), cli)
+        Self::resolve_config(config_source, global, Some(env_patch()?), cli)
     }
 
     fn resolve_config(
@@ -94,11 +94,27 @@ impl ConfigLoader {
     ) -> Result<ResolvedConfig, ConfigError> {
         let mut resolved = ResolvedConfig::default();
 
-        if let Some(global) = global {
+        if let Some(mut global) = global {
+            normalize_request_timeout_alias(
+                &mut global,
+                "model.request_timeout_ms",
+                "model.stream_idle_timeout_ms",
+            )
+            .map_err(|error| {
+                ConfigError::Message(format!(
+                    "invalid config loaded from `{config_source}`: {error}"
+                ))
+            })?;
             resolved = apply_patch(resolved, global);
         }
 
-        if let Some(environment) = environment {
+        if let Some(mut environment) = environment {
+            normalize_request_timeout_alias(
+                &mut environment,
+                "MOYAI_REQUEST_TIMEOUT_MS",
+                "MOYAI_STREAM_IDLE_TIMEOUT_MS",
+            )
+            .map_err(ConfigError::Message)?;
             resolved = apply_patch(resolved, environment);
         }
 
@@ -228,7 +244,7 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
             api_key_env: config.model.api_key_env.clone().map(Some),
             extra_headers: Some(config.model.extra_headers.clone()),
             request_timeout_ms: Some(config.model.request_timeout_ms),
-            stream_idle_timeout_ms: Some(config.model.stream_idle_timeout_ms),
+            legacy_stream_idle_timeout_ms: None,
             connect_timeout_ms: Some(config.model.connect_timeout_ms),
             max_retries: Some(config.model.max_retries),
             context_window: Some(config.model.context_window),
@@ -470,7 +486,7 @@ fn invalid_env(name: &str) -> ConfigError {
     ))
 }
 
-fn env_patch() -> PartialResolvedConfig {
+fn env_patch() -> Result<PartialResolvedConfig, ConfigError> {
     let mut patch = PartialResolvedConfig::default();
 
     if let Ok(value) = env::var("MOYAI_BASE_URL") {
@@ -535,16 +551,11 @@ fn env_patch() -> PartialResolvedConfig {
             patch.model.get_or_insert_default().extra_headers = Some(parsed);
         }
     }
-    if let Ok(value) = env::var("MOYAI_REQUEST_TIMEOUT_MS") {
-        if let Ok(parsed) = value.parse() {
-            patch.model.get_or_insert_default().request_timeout_ms = Some(parsed);
-        }
-    }
-    if let Ok(value) = env::var("MOYAI_STREAM_IDLE_TIMEOUT_MS") {
-        if let Ok(parsed) = value.parse() {
-            patch.model.get_or_insert_default().stream_idle_timeout_ms = Some(parsed);
-        }
-    }
+    apply_request_timeout_env_overrides(
+        &mut patch,
+        parse_u64_env_override("MOYAI_REQUEST_TIMEOUT_MS")?,
+        parse_u64_env_override("MOYAI_STREAM_IDLE_TIMEOUT_MS")?,
+    )?;
     if let Ok(value) = env::var("MOYAI_CONNECT_TIMEOUT_MS") {
         if let Ok(parsed) = value.parse() {
             patch.model.get_or_insert_default().connect_timeout_ms = Some(parsed);
@@ -739,7 +750,32 @@ fn env_patch() -> PartialResolvedConfig {
             patch.session.get_or_insert_default().overflow_margin_tokens = Some(parsed);
         }
     }
-    patch
+    Ok(patch)
+}
+
+fn parse_u64_env_override(name: &str) -> Result<Option<u64>, ConfigError> {
+    env_utf8(name)?
+        .map(|value| value.parse::<u64>().map_err(|_| invalid_env(name)))
+        .transpose()
+}
+
+fn apply_request_timeout_env_overrides(
+    patch: &mut PartialResolvedConfig,
+    canonical: Option<u64>,
+    legacy: Option<u64>,
+) -> Result<(), ConfigError> {
+    if canonical.is_none() && legacy.is_none() {
+        return Ok(());
+    }
+    let model = patch.model.get_or_insert_default();
+    model.request_timeout_ms = canonical;
+    model.legacy_stream_idle_timeout_ms = legacy;
+    normalize_request_timeout_alias(
+        patch,
+        "MOYAI_REQUEST_TIMEOUT_MS",
+        "MOYAI_STREAM_IDLE_TIMEOUT_MS",
+    )
+    .map_err(ConfigError::Message)
 }
 
 fn apply_reasoning_env_overrides(
@@ -794,8 +830,8 @@ mod tests {
         assert!(text.contains("reasoning_summary = \"none\""));
         assert!(!text.contains("chat_completions_reasoning_parameters"));
         assert!(!text.contains("reasoning_effort"));
-        assert!(text.contains("request_timeout_ms = 1800000"));
-        assert!(text.contains("stream_idle_timeout_ms = 1800000"));
+        assert!(text.contains("request_timeout_ms = 3600000"));
+        assert!(!text.contains("stream_idle_timeout_ms"));
         assert!(text.contains("max_output_tokens = 32768"));
         assert!(!text.contains("prompt_profile"));
         assert!(!text.contains("max_steps_per_turn"));
@@ -881,6 +917,49 @@ mod tests {
     }
 
     #[test]
+    fn legacy_stream_timeout_loads_as_the_canonical_request_timeout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for (name, body) in [
+            ("legacy-only", "[model]\nstream_idle_timeout_ms = 3600000\n"),
+            (
+                "matching-fields",
+                "[model]\nrequest_timeout_ms = 3600000\nstream_idle_timeout_ms = 3600000\n",
+            ),
+        ] {
+            let path = Utf8PathBuf::from_path_buf(temp.path().join(format!("{name}.toml")))
+                .expect("utf8 path");
+            fs::write(&path, body).expect("legacy timeout config");
+
+            let config = ConfigLoader::load_with_global_path(path, None)
+                .expect("unambiguous legacy timeout remains compatible");
+
+            assert_eq!(config.model.request_timeout_ms, 3_600_000);
+        }
+    }
+
+    #[test]
+    fn mismatched_legacy_stream_timeout_reports_the_exact_config_fields() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path =
+            Utf8PathBuf::from_path_buf(temp.path().join("mismatch.toml")).expect("utf8 path");
+        fs::write(
+            &path,
+            "[model]\nrequest_timeout_ms = 3600000\nstream_idle_timeout_ms = 1800000\n",
+        )
+        .expect("mismatched legacy timeout config");
+
+        let error = ConfigLoader::load_with_global_path(path.clone(), None)
+            .expect_err("mismatched timeout fields must not choose a precedence");
+        let diagnostic = error.to_string();
+
+        assert!(diagnostic.contains(path.as_str()));
+        assert!(diagnostic.contains("model.request_timeout_ms"));
+        assert!(diagnostic.contains("model.stream_idle_timeout_ms"));
+        assert!(diagnostic.contains("3600000"));
+        assert!(diagnostic.contains("1800000"));
+    }
+
+    #[test]
     fn removed_agent_section_is_rejected_instead_of_becoming_a_noop_contract() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 path");
@@ -947,18 +1026,24 @@ mod tests {
             Utf8PathBuf::from_path_buf(temp.path().join("canonical-model.toml")).expect("utf8");
         fs::write(
             &canonical_path,
-            "[model]\nmodel = \"  canonical-model  \"\n",
+            "[model]\nmodel = \"  canonical-model  \"\nrequest_timeout_ms = 3600000\n",
         )
         .expect("canonical model config");
         let canonical = ConfigLoader::load_with_global_path(canonical_path, None)
             .expect("canonical provider runtime config");
         assert_eq!(canonical.model.model, "canonical-model");
+        assert_eq!(canonical.model.request_timeout_ms, 3_600_000);
 
         for (name, body, field) in [
             ("blank-model", "[model]\nmodel = \" \\t \"\n", "model.model"),
             (
                 "zero-response-start-timeout",
                 "[model]\nrequest_timeout_ms = 0\n",
+                "model.request_timeout_ms",
+            ),
+            (
+                "request-timeout-above-public-limit",
+                "[model]\nrequest_timeout_ms = 3600001\n",
                 "model.request_timeout_ms",
             ),
             (
@@ -1022,6 +1107,39 @@ mod tests {
                 assert!(error.to_string().contains(name));
             }
         }
+    }
+
+    #[test]
+    fn legacy_request_timeout_environment_override_is_unambiguous() {
+        for (canonical, legacy, expected) in [
+            (None, Some(3_600_000), 3_600_000),
+            (Some(3_600_000), Some(3_600_000), 3_600_000),
+            (Some(3_600_000), None, 3_600_000),
+        ] {
+            let mut patch = PartialResolvedConfig::default();
+
+            apply_request_timeout_env_overrides(&mut patch, canonical, legacy)
+                .expect("compatible timeout environment overrides");
+
+            let model = patch.model.expect("model environment patch");
+            assert_eq!(model.request_timeout_ms, Some(expected));
+            assert_eq!(model.legacy_stream_idle_timeout_ms, None);
+        }
+    }
+
+    #[test]
+    fn mismatched_request_timeout_environment_overrides_are_rejected() {
+        let mut patch = PartialResolvedConfig::default();
+
+        let error =
+            apply_request_timeout_env_overrides(&mut patch, Some(3_600_000), Some(1_800_000))
+                .expect_err("mismatched environment aliases must fail");
+        let diagnostic = error.to_string();
+
+        assert!(diagnostic.contains("MOYAI_REQUEST_TIMEOUT_MS"));
+        assert!(diagnostic.contains("MOYAI_STREAM_IDLE_TIMEOUT_MS"));
+        assert!(diagnostic.contains("3600000"));
+        assert!(diagnostic.contains("1800000"));
     }
 
     #[test]

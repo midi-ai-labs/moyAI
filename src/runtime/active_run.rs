@@ -22,13 +22,19 @@ struct ActiveRunEntry {
     generation: u64,
     control: RunControl,
     steer_activity_tx: watch::Sender<u64>,
-    turn_id: Option<TurnId>,
+    turn_target: Option<ActiveRunTurnTarget>,
 }
 
 pub struct ActiveRunLease {
     registry: ActiveRunRegistry,
     session_id: SessionId,
     generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveRunTurnTarget {
+    pub turn_id: TurnId,
+    pub admission_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +67,7 @@ impl ActiveRunRegistry {
                 generation,
                 control,
                 steer_activity_tx,
-                turn_id: None,
+                turn_target: None,
             },
         );
         drop(state);
@@ -90,7 +96,32 @@ impl ActiveRunRegistry {
         let Some(run) = state.runs.get(&session_id) else {
             return ActiveRunInterruptOutcome::NotActive;
         };
-        if run.turn_id != Some(expected_turn_id) {
+        if run.turn_target.map(|target| target.turn_id) != Some(expected_turn_id) {
+            return ActiveRunInterruptOutcome::TargetChanged;
+        }
+        match run
+            .control
+            .request_cancel(crate::runtime::RunCancellationCause::Interruption(cause))
+        {
+            RunCancelOutcome::Applied => ActiveRunInterruptOutcome::Applied,
+            RunCancelOutcome::Deferred(_) => ActiveRunInterruptOutcome::Deferred,
+            RunCancelOutcome::Rejected => ActiveRunInterruptOutcome::AlreadyClassified,
+        }
+    }
+
+    pub fn cancel_turn_at_target(
+        &self,
+        session_id: SessionId,
+        expected_target: ActiveRunTurnTarget,
+        cause: TurnInterruptionCause,
+    ) -> ActiveRunInterruptOutcome {
+        let Ok(state) = self.lock() else {
+            return ActiveRunInterruptOutcome::NotActive;
+        };
+        let Some(run) = state.runs.get(&session_id) else {
+            return ActiveRunInterruptOutcome::NotActive;
+        };
+        if run.turn_target != Some(expected_target) {
             return ActiveRunInterruptOutcome::TargetChanged;
         }
         match run
@@ -110,9 +141,19 @@ impl ActiveRunRegistry {
     }
 
     pub fn active_turn_id(&self, session_id: SessionId) -> Option<TurnId> {
+        self.lock().ok().and_then(|state| {
+            state
+                .runs
+                .get(&session_id)
+                .and_then(|run| run.turn_target)
+                .map(|target| target.turn_id)
+        })
+    }
+
+    pub fn active_turn_target(&self, session_id: SessionId) -> Option<ActiveRunTurnTarget> {
         self.lock()
             .ok()
-            .and_then(|state| state.runs.get(&session_id).and_then(|run| run.turn_id))
+            .and_then(|state| state.runs.get(&session_id).and_then(|run| run.turn_target))
     }
 
     pub fn active_session_ids(&self) -> Vec<SessionId> {
@@ -137,11 +178,14 @@ impl ActiveRunRegistry {
                 "session {session_id} has no active run to receive steer input"
             ))
         })?;
-        let turn_id = run.turn_id.ok_or_else(|| {
-            RuntimeError::Message(format!(
-                "session {session_id} has not started an active turn yet"
-            ))
-        })?;
+        let turn_id = run
+            .turn_target
+            .map(|target| target.turn_id)
+            .ok_or_else(|| {
+                RuntimeError::Message(format!(
+                    "session {session_id} has not started an active turn yet"
+                ))
+            })?;
         if turn_id != expected_turn_id {
             return Err(RuntimeError::Message(format!(
                 "expected active turn id `{expected_turn_id}` but current active turn id is `{turn_id}`"
@@ -188,11 +232,11 @@ impl ActiveRunRegistry {
         Ok(*activity.borrow_and_update())
     }
 
-    fn set_turn_id(
+    fn set_turn_target(
         &self,
         session_id: SessionId,
         generation: u64,
-        turn_id: TurnId,
+        target: ActiveRunTurnTarget,
     ) -> Result<(), RuntimeError> {
         let mut state = self.lock()?;
         let run = state.runs.get_mut(&session_id).ok_or_else(|| {
@@ -203,7 +247,7 @@ impl ActiveRunRegistry {
                 "active run generation changed for session {session_id}"
             )));
         }
-        run.turn_id = Some(turn_id);
+        run.turn_target = Some(target);
         Ok(())
     }
 
@@ -229,8 +273,22 @@ impl ActiveRunRegistry {
 
 impl ActiveRunLease {
     pub fn set_turn_id(&self, turn_id: TurnId) -> Result<(), RuntimeError> {
-        self.registry
-            .set_turn_id(self.session_id, self.generation, turn_id)
+        self.set_turn_target(turn_id, 0)
+    }
+
+    pub fn set_turn_target(
+        &self,
+        turn_id: TurnId,
+        admission_revision: u64,
+    ) -> Result<(), RuntimeError> {
+        self.registry.set_turn_target(
+            self.session_id,
+            self.generation,
+            ActiveRunTurnTarget {
+                turn_id,
+                admission_revision,
+            },
+        )
     }
 }
 

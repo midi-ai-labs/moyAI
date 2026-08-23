@@ -1,3 +1,5 @@
+#![deny(dead_code)]
+
 use std::sync::Arc;
 
 use tauri::{
@@ -9,29 +11,153 @@ use tokio::sync::Mutex;
 
 use crate::app::App;
 use crate::cli::ReviewDecision;
+use crate::config::{ProviderEndpoint, ProviderMetadataMode, ReasoningSummary, ResolvedConfig};
 use crate::error::AppRunError;
+use crate::llm::{ProviderModelInfo, ProviderModelLoadState, fetch_provider_model_infos};
 use crate::protocol::TurnId;
-use crate::session::{SessionId, SessionSpawnEdge};
+use crate::session::{ActiveTurnExpectation, SessionId, SessionSpawnEdge};
 
 use super::app::{DesktopController, PendingPermissionResolution};
 use super::args::DesktopArgs;
+use super::models::DesktopStopMutationTarget;
 use super::query::{
     DESKTOP_HISTORY_PROJECTION_LIMIT, DESKTOP_TURN_PAGE_LIMIT, build_session_detail_with_roots,
     load_latest_session_detail,
 };
-use super::web_model::{DesktopAgentExecutionProjection, DesktopWebState};
+use super::state::{DesktopOverlay, DesktopStatusCode};
+use super::web_model::{
+    DesktopAgentExecutionProjection, DesktopAgentInterruptTarget, DesktopWebState,
+};
 
 type SharedController = Arc<Mutex<DesktopController>>;
+
+// Keep the wire-visible Desktop command registry in one place. The handler
+// and its contract tests consume this same identifier list, so a renamed or
+// unannotated command fails at compile time instead of becoming a runtime-only
+// IPC failure. The module-level dead-code denial also rejects a new private
+// command function that was omitted from this manifest.
+macro_rules! desktop_command_manifest {
+    ($consumer:ident) => {
+        $consumer! {
+            desktop_state,
+            submit_prompt,
+            cancel_run,
+            configure_side_chat,
+            load_side_chat_models,
+            save_side_chat_draft,
+            submit_side_chat,
+            cancel_side_chat,
+            delete_side_chat,
+            new_chat,
+            new_project_session,
+            review_uncommitted,
+            enhance_prompt,
+            send_prompt_review,
+            cancel_prompt_review,
+            refresh_desktop,
+            select_project,
+            select_session,
+            rejoin_session,
+            load_agent_execution,
+            load_previous_agent_execution_page,
+            interrupt_agent,
+            load_previous_turn_page,
+            load_next_turn_page,
+            select_chat_session,
+            set_session_search,
+            set_session_search_include_archived,
+            archive_session,
+            unarchive_session,
+            rollback_session,
+            fork_session,
+            interrupt_session,
+            delete_project,
+            delete_session,
+            delete_chat_session,
+            select_artifact,
+            export_history_markdown,
+            export_transcript_markdown,
+            attach_image,
+            browse_image,
+            clear_images,
+            remove_image,
+            show_file_menu,
+            show_edit_menu,
+            show_view_menu,
+            show_help_menu,
+            show_about,
+            show_project_menu,
+            create_project_from_picker,
+            show_config_editor,
+            show_provider_editor,
+            show_workspace_picker,
+            show_command_palette,
+            show_shortcuts,
+            close_overlay,
+            switch_workspace,
+            browse_workspace,
+            open_workspace_folder,
+            open_global_config_folder,
+            open_user_data_folder,
+            import_global_config_toml,
+            open_typed_path,
+            open_artifact_folder,
+            set_local_search,
+            insert_command,
+            load_provider_models,
+            apply_provider_session,
+            save_provider_global,
+            reset_config_draft,
+            apply_session_config,
+            save_global_config,
+            toggle_access_mode,
+            preview_window_opacity,
+            set_window_opacity,
+            answer_permission,
+            start_window_drag,
+            minimize_window,
+            is_window_maximized,
+            toggle_maximize_window,
+            hide_to_tray,
+            exit_app,
+        }
+    };
+}
+
+macro_rules! generate_desktop_invoke_handler {
+    ($($command:ident),+ $(,)?) => {
+        tauri::generate_handler![$($command),+]
+    };
+}
+
+#[cfg(test)]
+macro_rules! desktop_command_wire_names {
+    ($($command:ident),+ $(,)?) => {
+        &[$(stringify!($command)),+]
+    };
+}
+
+#[cfg(test)]
+const DESKTOP_COMMAND_WIRE_NAMES: &[&str] = desktop_command_manifest!(desktop_command_wire_names);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DesktopCommandConflict {
     message: String,
+    status_code: DesktopStatusCode,
 }
 
 impl DesktopCommandConflict {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            status_code: DesktopStatusCode::Plain,
+        }
+    }
+
+    fn with_status(code: DesktopStatusCode, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            status_code: code,
         }
     }
 }
@@ -108,6 +234,16 @@ impl DesktopCommandError {
             state: None,
         }
     }
+
+    fn provider_transport(message: impl Into<String>) -> Self {
+        Self {
+            kind: "internal",
+            category: DesktopCommandErrorCategory::Provider,
+            code: DesktopCommandErrorCode::ProviderTransport,
+            message: message.into(),
+            state: None,
+        }
+    }
 }
 
 fn command_conflict_error(
@@ -116,7 +252,7 @@ fn command_conflict_error(
 ) -> DesktopCommandError {
     controller
         .state
-        .set_status_message(conflict.message.clone());
+        .set_typed_status_message(conflict.status_code, conflict.message.clone());
     match controller.next_web_state() {
         Ok(state) => DesktopCommandError {
             kind: "conflict",
@@ -182,82 +318,7 @@ pub async fn run(app: App, args: DesktopArgs) -> Result<(), AppRunError> {
             install_tray(app.handle())?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            desktop_state,
-            submit_prompt,
-            cancel_run,
-            new_chat,
-            new_project_session,
-            review_uncommitted,
-            enhance_prompt,
-            send_prompt_review,
-            cancel_prompt_review,
-            refresh_desktop,
-            select_project,
-            select_session,
-            rejoin_session,
-            load_agent_execution,
-            load_previous_agent_execution_page,
-            interrupt_agent,
-            load_previous_turn_page,
-            load_next_turn_page,
-            select_chat_session,
-            set_session_search,
-            set_session_search_include_archived,
-            archive_session,
-            unarchive_session,
-            rollback_session,
-            fork_session,
-            interrupt_session,
-            delete_project,
-            delete_session,
-            delete_chat_session,
-            select_artifact,
-            export_history_markdown,
-            export_transcript_markdown,
-            attach_image,
-            browse_image,
-            clear_images,
-            remove_image,
-            show_file_menu,
-            show_edit_menu,
-            show_view_menu,
-            show_help_menu,
-            show_project_menu,
-            create_project_from_picker,
-            show_config_editor,
-            show_provider_editor,
-            show_workspace_picker,
-            show_command_palette,
-            show_shortcuts,
-            close_overlay,
-            switch_workspace,
-            browse_workspace,
-            open_workspace_folder,
-            open_global_config_folder,
-            open_user_data_folder,
-            import_global_config_toml,
-            open_typed_path,
-            open_artifact_folder,
-            set_local_search,
-            insert_command,
-            load_provider_models,
-            apply_provider_session,
-            save_provider_global,
-            reset_config_draft,
-            apply_session_config,
-            save_global_config,
-            toggle_access_mode,
-            preview_window_opacity,
-            set_window_opacity,
-            answer_permission,
-            start_window_drag,
-            minimize_window,
-            is_window_maximized,
-            toggle_maximize_window,
-            hide_to_tray,
-            exit_app
-        ])
+        .invoke_handler(desktop_command_manifest!(generate_desktop_invoke_handler))
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -406,21 +467,134 @@ where
         .map_err(DesktopCommandError::internal)
 }
 
+async fn mutate_side_chat_controller_checked<F>(
+    controller: State<'_, SharedController>,
+    owner_session_id: String,
+    action: F,
+) -> Result<DesktopWebState, DesktopCommandError>
+where
+    F: FnOnce(&mut DesktopController) -> Result<(), DesktopCommandConflict>,
+{
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    if let Err(conflict) = action(&mut controller) {
+        if let Ok(owner_session_id) = owner_session_id.parse::<SessionId>() {
+            controller.set_side_chat_command_error(owner_session_id, conflict.message.clone());
+        }
+        let state = controller
+            .next_web_state()
+            .map_err(DesktopCommandError::internal)?;
+        return Err(DesktopCommandError {
+            kind: "conflict",
+            category: DesktopCommandErrorCategory::Unknown,
+            code: DesktopCommandErrorCode::Unknown,
+            message: conflict.message,
+            state: Some(state),
+        });
+    }
+    controller.drain_runtime_messages();
+    controller
+        .next_web_state()
+        .map_err(DesktopCommandError::internal)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DesktopDraftActionTarget {
     workspace_path: String,
     session_id: Option<String>,
-    owner_generation: u64,
+    owner_generation: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DesktopPromptReviewMutationTarget {
+    workspace_path: String,
+    session_id: Option<String>,
+    owner_generation: String,
+    request_id: String,
+    expected_state: DesktopRunExpectedState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum DesktopRunExpectedState {
+    Idle {
+        #[serde(rename = "latestTurnId")]
+        latest_turn_id: Option<String>,
+        #[serde(rename = "admissionRevision")]
+        admission_revision: String,
+    },
+    Turn {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+        #[serde(rename = "admissionRevision")]
+        admission_revision: String,
+    },
+}
+
+impl DesktopRunExpectedState {
+    fn parse(&self) -> Result<ActiveTurnExpectation, DesktopCommandConflict> {
+        let parse_turn_id = |value: &str| {
+            value
+                .parse::<TurnId>()
+                .ok()
+                .filter(|turn_id| turn_id.to_string() == value)
+                .ok_or_else(|| {
+                    DesktopCommandConflict::new(
+                        "the active turn identity is invalid; refresh the current task and try again",
+                    )
+                })
+        };
+        let parse_revision = |value: &str| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|revision| revision.to_string() == value)
+                .ok_or_else(|| {
+                    DesktopCommandConflict::new(
+                        "the admission revision is invalid; refresh the current task and try again",
+                    )
+                })
+        };
+        match self {
+            Self::Idle {
+                latest_turn_id,
+                admission_revision,
+            } => Ok(ActiveTurnExpectation::Idle {
+                latest_turn_id: latest_turn_id.as_deref().map(parse_turn_id).transpose()?,
+                revision: parse_revision(admission_revision)?,
+            }),
+            Self::Turn {
+                turn_id,
+                admission_revision,
+            } => Ok(ActiveTurnExpectation::Turn {
+                turn_id: parse_turn_id(turn_id)?,
+                revision: parse_revision(admission_revision)?,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DesktopRunMutationTarget {
     workspace_path: String,
     session_id: Option<String>,
     runtime_owner_token: String,
     permission_confirmation_id: Option<String>,
+    expected_state: DesktopRunExpectedState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopStopAdmission {
+    Root {
+        generation: u64,
+    },
+    Turn {
+        turn_id: TurnId,
+        admission_revision: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -598,9 +772,10 @@ fn validate_draft_action_target(
     session_id: Option<String>,
     owner_generation: u64,
 ) -> Result<(), DesktopCommandConflict> {
+    let expected_owner_generation = parse_canonical_owner_generation(&expected.owner_generation)?;
     if expected.workspace_path != workspace_path
         || expected.session_id != session_id
-        || expected.owner_generation != owner_generation
+        || expected_owner_generation != owner_generation
     {
         return Err(DesktopCommandConflict::new(
             "the request draft owner changed before the action was applied; review the current chat and try again",
@@ -609,29 +784,137 @@ fn validate_draft_action_target(
     Ok(())
 }
 
+fn ensure_prompt_review_mutation_target(
+    controller: &DesktopController,
+    expected: &DesktopPromptReviewMutationTarget,
+) -> Result<u64, DesktopCommandConflict> {
+    validate_prompt_review_mutation_target(
+        expected,
+        controller.app.workspace.authority_root().as_str(),
+        controller
+            .state
+            .app_state
+            .current_session_id
+            .map(|session_id| session_id.to_string()),
+        controller.state.composer.owner_generation(),
+        controller
+            .state
+            .app_state
+            .prompt_review
+            .as_ref()
+            .map(|review| review.request_id),
+        controller
+            .state
+            .app_state
+            .prompt_review
+            .as_ref()
+            .and_then(|review| {
+                controller
+                    .state
+                    .prompt_review_expected_active_turn(review.request_id)
+            }),
+    )
+}
+
+fn validate_prompt_review_mutation_target(
+    expected: &DesktopPromptReviewMutationTarget,
+    workspace_path: &str,
+    session_id: Option<String>,
+    owner_generation: u64,
+    request_id: Option<u64>,
+    expected_active_turn: Option<ActiveTurnExpectation>,
+) -> Result<u64, DesktopCommandConflict> {
+    let expected_owner_generation = parse_canonical_owner_generation(&expected.owner_generation)?;
+    let expected_request_id = expected.request_id.parse::<u64>().map_err(|_| {
+        DesktopCommandConflict::new(
+            "the prompt review request identity is invalid; refresh the current review and try again",
+        )
+    })?;
+    let parsed_expected_state = expected.expected_state.parse()?;
+    if expected_request_id.to_string() != expected.request_id
+        || expected.workspace_path != workspace_path
+        || expected.session_id != session_id
+        || expected_owner_generation != owner_generation
+        || request_id != Some(expected_request_id)
+        || expected_active_turn != Some(parsed_expected_state)
+    {
+        return Err(DesktopCommandConflict::new(
+            "the prompt review owner changed before the action was applied; review the current prompt and try again",
+        ));
+    }
+    Ok(expected_request_id)
+}
+
+fn parse_canonical_owner_generation(value: &str) -> Result<u64, DesktopCommandConflict> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|generation| generation.to_string() == value)
+        .ok_or_else(|| {
+            DesktopCommandConflict::new(
+                "the request draft owner generation is invalid; refresh the current chat and try again",
+            )
+        })
+}
+
+fn validate_unscoped_overlay_close(overlay: DesktopOverlay) -> Result<(), DesktopCommandConflict> {
+    if overlay == DesktopOverlay::PromptReview {
+        return Err(DesktopCommandConflict::new(
+            "Prompt Review must be closed through its current request target",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_unscoped_prompt_review_action(
+    controller: &mut DesktopController,
+    target: &str,
+) -> Result<(), DesktopCommandConflict> {
+    if controller.ensure_unscoped_prompt_review_action(target) {
+        Ok(())
+    } else {
+        Err(DesktopCommandConflict::new(format!(
+            "{target} cannot replace the active Prompt Review"
+        )))
+    }
+}
+
+fn ensure_attachment_state_mutation(admitted: bool) -> Result<(), DesktopCommandConflict> {
+    if admitted {
+        Ok(())
+    } else {
+        Err(DesktopCommandConflict::new(
+            "image attachment cannot change while Prompt Review owns the composer draft",
+        ))
+    }
+}
+
 fn validate_run_mutation_target(
     expected: &DesktopRunMutationTarget,
     workspace_path: &str,
     session_id: Option<String>,
     runtime_owner_token: String,
     permission_confirmation_id: Option<String>,
-) -> Result<(), DesktopCommandConflict> {
+    active_turn_expectation: ActiveTurnExpectation,
+) -> Result<ActiveTurnExpectation, DesktopCommandConflict> {
+    let parsed_expected_state = expected.expected_state.parse()?;
     if expected.workspace_path != workspace_path
         || expected.session_id != session_id
         || expected.runtime_owner_token != runtime_owner_token
         || expected.permission_confirmation_id != permission_confirmation_id
+        || parsed_expected_state != active_turn_expectation
     {
         return Err(DesktopCommandConflict::new(
             "the active run owner changed before Stop was applied; review the current task and try again",
         ));
     }
-    Ok(())
+    Ok(parsed_expected_state)
 }
 
 fn ensure_run_mutation_target(
     controller: &DesktopController,
     expected: &DesktopRunMutationTarget,
-) -> Result<(), DesktopCommandConflict> {
+) -> Result<ActiveTurnExpectation, DesktopCommandConflict> {
     let (runtime_owner_token, _) = controller.access_mode_mutation_runtime_contract();
     validate_run_mutation_target(
         expected,
@@ -645,35 +928,263 @@ fn ensure_run_mutation_target(
         controller
             .pending_permission_confirmation_id()
             .map(|confirmation_id| confirmation_id.to_string()),
+        controller.current_active_turn_expectation(),
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DesktopAgentInterruptTarget {
-    workspace_path: String,
-    root_session_id: String,
-    agent_path: String,
-    child_session_id: String,
-    expected_turn_id: String,
+async fn ensure_durable_idle_composer_preflight(
+    controller: &SharedController,
+    expected_target: &DesktopDraftActionTarget,
+    expected_run_target: &DesktopRunMutationTarget,
+    action: &str,
+) -> Result<(), DesktopCommandError> {
+    let (session_service, session_id, expected_active_turn) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        let validated = (|| {
+            ensure_draft_action_target(&controller, expected_target)?;
+            let expected_active_turn =
+                ensure_run_mutation_target(&controller, expected_run_target)?;
+            if !matches!(expected_active_turn, ActiveTurnExpectation::Idle { .. }) {
+                return Err(DesktopCommandConflict::new(format!(
+                    "{action} requires the captured idle session owner"
+                )));
+            }
+            Ok(expected_active_turn)
+        })();
+        let expected_active_turn = match validated {
+            Ok(expected) => expected,
+            Err(conflict) => return Err(command_conflict_error(&mut controller, conflict)),
+        };
+        (
+            controller.app.session_service.clone(),
+            controller.state.app_state.current_session_id,
+            expected_active_turn,
+        )
+    };
+    let actual = match session_id {
+        Some(session_id) => session_service
+            .active_turn_expectation_for_session(session_id)
+            .await
+            .map_err(|error| DesktopCommandError::storage(error.to_string()))?,
+        None => None,
+    };
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    let local_validation = (|| {
+        ensure_draft_action_target(&controller, expected_target)?;
+        let current = ensure_run_mutation_target(&controller, expected_run_target)?;
+        if current != expected_active_turn {
+            return Err(DesktopCommandConflict::new(format!(
+                "{action} owner changed during durable validation"
+            )));
+        }
+        if session_id.is_some() && actual != Some(expected_active_turn) {
+            return Err(DesktopCommandConflict::new(format!(
+                "the durable session owner changed before {action} started"
+            )));
+        }
+        Ok(())
+    })();
+    match local_validation {
+        Ok(()) => Ok(()),
+        Err(conflict) => Err(command_conflict_error(&mut controller, conflict)),
+    }
+}
+
+fn validate_stop_mutation_target(
+    expected: &DesktopStopMutationTarget,
+    workspace_path: &str,
+    session_id: Option<String>,
+    root_run_generation: Option<u64>,
+    last_root_run_epoch: u64,
+    permission_confirmation_id: Option<String>,
+    active_turn_expectation: ActiveTurnExpectation,
+    root_admission_snapshot: Option<crate::runtime::RootAdmissionSnapshot>,
+) -> Result<DesktopStopAdmission, DesktopCommandConflict> {
+    let conflict = || {
+        DesktopCommandConflict::new(
+            "the active Stop owner changed before cancellation was applied; review the current task and try again",
+        )
+    };
+    let parse_u64 = |value: &str| {
+        value
+            .parse::<u64>()
+            .ok()
+            .filter(|parsed| parsed.to_string() == value)
+            .ok_or_else(conflict)
+    };
+    let parse_turn = |value: &str| {
+        value
+            .parse::<TurnId>()
+            .ok()
+            .filter(|parsed| parsed.to_string() == value)
+            .ok_or_else(conflict)
+    };
+
+    match expected {
+        DesktopStopMutationTarget::Root {
+            workspace_path: expected_workspace,
+            session_id: expected_session,
+            root_generation,
+            latest_turn_id,
+            admission_revision,
+            permission_confirmation_id: expected_permission,
+        } => {
+            let generation = parse_u64(root_generation)?;
+            let captured_idle = ActiveTurnExpectation::Idle {
+                latest_turn_id: latest_turn_id.as_deref().map(parse_turn).transpose()?,
+                revision: parse_u64(admission_revision)?,
+            };
+            if expected_workspace != workspace_path
+                || root_run_generation != Some(generation)
+                || expected_permission != &permission_confirmation_id
+            {
+                return Err(conflict());
+            }
+            let canonical_owner_session = root_admission_snapshot.and_then(|snapshot| {
+                snapshot
+                    .pending
+                    .map(|pending| pending.session_id)
+                    .or_else(|| snapshot.last_admitted.map(|receipt| receipt.session_id))
+            });
+            if let Some(admitted_session_id) = canonical_owner_session {
+                let admitted_session = admitted_session_id.to_string();
+                let session_matches = match expected_session.as_deref() {
+                    Some(captured_session) => {
+                        captured_session == admitted_session
+                            && session_id.as_deref() == Some(captured_session)
+                    }
+                    None => session_id
+                        .as_deref()
+                        .is_none_or(|session| session == admitted_session),
+                };
+                if !session_matches {
+                    return Err(conflict());
+                }
+                return Ok(DesktopStopAdmission::Root { generation });
+            }
+            if active_turn_expectation == captured_idle && expected_session == &session_id {
+                return Ok(DesktopStopAdmission::Root { generation });
+            }
+            Err(conflict())
+        }
+        DesktopStopMutationTarget::Turn {
+            workspace_path: expected_workspace,
+            session_id: expected_session,
+            turn_id,
+            admission_revision,
+            root_epoch,
+        } => {
+            let turn_id = parse_turn(turn_id)?;
+            let admission_revision = parse_u64(admission_revision)?;
+            let root_epoch = parse_u64(root_epoch)?;
+            if expected_workspace != workspace_path
+                || session_id.as_deref() != Some(expected_session.as_str())
+            {
+                return Err(conflict());
+            }
+            if root_run_generation == Some(root_epoch) {
+                return Ok(DesktopStopAdmission::Root {
+                    generation: root_epoch,
+                });
+            }
+            let current_epoch = root_run_generation.unwrap_or(last_root_run_epoch);
+            let turn_matches = match active_turn_expectation {
+                ActiveTurnExpectation::Turn {
+                    turn_id: actual,
+                    revision,
+                }
+                | ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(actual),
+                    revision,
+                } => actual == turn_id && revision == admission_revision,
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: None,
+                    ..
+                } => false,
+            };
+            if current_epoch != root_epoch || !turn_matches {
+                return Err(conflict());
+            }
+            Ok(DesktopStopAdmission::Turn {
+                turn_id,
+                admission_revision,
+            })
+        }
+    }
+}
+
+fn ensure_stop_mutation_target(
+    controller: &DesktopController,
+    expected: &DesktopStopMutationTarget,
+) -> Result<DesktopStopAdmission, DesktopCommandConflict> {
+    let root_run_generation = controller.root_run_generation();
+    let root_admission_snapshot = root_run_generation
+        .and_then(|generation| controller.root_run_admission_snapshot(generation));
+    validate_stop_mutation_target(
+        expected,
+        controller.app.workspace.authority_root().as_str(),
+        controller
+            .state
+            .app_state
+            .current_session_id
+            .map(|session_id| session_id.to_string()),
+        root_run_generation,
+        controller.last_root_run_epoch(),
+        controller
+            .pending_permission_confirmation_id()
+            .map(|confirmation_id| confirmation_id.to_string()),
+        controller.current_active_turn_expectation(),
+        root_admission_snapshot,
+    )
 }
 
 impl DesktopAgentInterruptTarget {
-    fn execution_target(&self) -> DesktopAgentExecutionTarget {
-        DesktopAgentExecutionTarget {
+    fn execution_target(&self) -> Result<DesktopAgentExecutionTarget, DesktopCommandConflict> {
+        let parse_session_id = |value: &str| {
+            value
+                .parse::<SessionId>()
+                .ok()
+                .filter(|session_id| session_id.to_string() == value)
+                .ok_or_else(|| {
+                    DesktopCommandConflict::new(
+                        "the requested Sub Agent session identity is invalid; refresh the activity list and try again",
+                    )
+                })
+        };
+        parse_session_id(&self.root_session_id)?;
+        parse_session_id(&self.child_session_id)?;
+        Ok(DesktopAgentExecutionTarget {
             workspace_path: self.workspace_path.clone(),
             root_session_id: self.root_session_id.clone(),
             agent_path: self.agent_path.clone(),
             child_session_id: self.child_session_id.clone(),
-        }
+        })
     }
 
     fn expected_turn_id(&self) -> Result<TurnId, DesktopCommandConflict> {
-        self.expected_turn_id.parse::<TurnId>().map_err(|_| {
-            DesktopCommandConflict::new(
-                "the requested Sub Agent turn is invalid; refresh the activity list and try again",
-            )
-        })
+        self.expected_turn_id
+            .parse::<TurnId>()
+            .ok()
+            .filter(|turn_id| turn_id.to_string() == self.expected_turn_id)
+            .ok_or_else(|| {
+                DesktopCommandConflict::new(
+                    "the requested Sub Agent turn is invalid; refresh the activity list and try again",
+                )
+            })
+    }
+
+    fn admission_revision(&self) -> Result<u64, DesktopCommandConflict> {
+        self.admission_revision
+            .parse::<u64>()
+            .ok()
+            .filter(|revision| revision.to_string() == self.admission_revision)
+            .ok_or_else(|| {
+                DesktopCommandConflict::new(
+                    "the requested Sub Agent admission revision is invalid; refresh the activity list and try again",
+                )
+            })
     }
 }
 
@@ -696,6 +1207,13 @@ struct DesktopRowMutationTarget {
     owner_project_id: Option<String>,
     owner_session_id: Option<String>,
     row_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopCommandPaletteInsertionResult {
+    state: DesktopWebState,
+    insertion_text: String,
 }
 
 fn validate_row_mutation_target(
@@ -892,10 +1410,12 @@ async fn submit_prompt(
     controller: State<'_, SharedController>,
     text: String,
     expected_target: DesktopDraftActionTarget,
+    expected_run_target: DesktopRunMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
         ensure_draft_action_target(controller, &expected_target)?;
-        if !controller.start_run(text) {
+        let expected_active_turn = ensure_run_mutation_target(controller, &expected_run_target)?;
+        if !controller.start_run_at(text, expected_active_turn) {
             return Err(rejected_action(controller, "the prompt was not submitted"));
         }
         Ok(())
@@ -906,14 +1426,356 @@ async fn submit_prompt(
 #[tauri::command]
 async fn cancel_run(
     controller: State<'_, SharedController>,
-    expected_target: DesktopRunMutationTarget,
+    expected_target: DesktopStopMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
-        ensure_run_mutation_target(controller, &expected_target)?;
-        controller.cancel_active_run();
-        Ok(())
+        let admission = ensure_stop_mutation_target(controller, &expected_target)?;
+        apply_stop_admission(controller, admission)
     })
     .await
+}
+
+fn apply_stop_admission(
+    controller: &mut DesktopController,
+    admission: DesktopStopAdmission,
+) -> Result<(), DesktopCommandConflict> {
+    match admission {
+        DesktopStopAdmission::Root { generation } => {
+            if !controller.cancel_root_run_at_generation(generation) {
+                return Err(rejected_action(
+                    controller,
+                    "the captured root task was not stopped",
+                ));
+            }
+        }
+        DesktopStopAdmission::Turn {
+            turn_id,
+            admission_revision,
+        } => {
+            controller.cancel_exact_turn_at(turn_id, admission_revision);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn configure_side_chat(
+    controller: State<'_, SharedController>,
+    owner_session_id: String,
+    base_url: String,
+    model: String,
+    expected_config_generation: String,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    let conflict_owner = owner_session_id.clone();
+    mutate_side_chat_controller_checked(controller, conflict_owner, |controller| {
+        let owner_session_id = owner_session_id.parse::<SessionId>().map_err(|error| {
+            DesktopCommandConflict::new(format!("invalid side chat owner: {error}"))
+        })?;
+        validate_side_chat_config_owner(
+            owner_session_id,
+            &expected_config_generation,
+            controller.state.app_state.current_session_id,
+            controller.state.provider_config.config_generation,
+        )?;
+        controller
+            .configure_side_chat(owner_session_id, base_url, model)
+            .map_err(DesktopCommandConflict::new)
+    })
+    .await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SideChatCatalogRequestTarget {
+    owner_session_id: SessionId,
+    base_url: String,
+    metadata_mode: ProviderMetadataMode,
+    config_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SideChatCatalogModelProjection {
+    id: String,
+    label: String,
+    load_state: ProviderModelLoadState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SideChatCatalogProjection {
+    owner_session_id: String,
+    base_url: String,
+    metadata_mode: ProviderMetadataMode,
+    config_generation: String,
+    models: Vec<SideChatCatalogModelProjection>,
+}
+
+#[tauri::command]
+async fn load_side_chat_models(
+    controller: State<'_, SharedController>,
+    owner_session_id: String,
+    base_url: String,
+    expected_config_generation: String,
+) -> Result<SideChatCatalogProjection, DesktopCommandError> {
+    let owner_session_id = owner_session_id.parse::<SessionId>().map_err(|error| {
+        read_only_command_conflict_error(DesktopCommandConflict::new(format!(
+            "invalid side chat owner: {error}"
+        )))
+    })?;
+    let (target, probe_config) = {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        validate_side_chat_config_owner(
+            owner_session_id,
+            &expected_config_generation,
+            controller.state.app_state.current_session_id,
+            controller.state.provider_config.config_generation,
+        )
+        .map_err(read_only_command_conflict_error)?;
+        let (probe_config, canonical_base_url) = side_chat_catalog_probe_config(
+            controller.state.provider_config.effective_config.clone(),
+            &base_url,
+        )
+        .map_err(read_only_command_conflict_error)?;
+        let target = SideChatCatalogRequestTarget {
+            owner_session_id,
+            base_url: canonical_base_url,
+            metadata_mode: probe_config.model.provider_metadata_mode,
+            config_generation: controller.state.provider_config.config_generation,
+        };
+        (target, probe_config)
+    };
+
+    // Provider I/O deliberately runs without the controller mutex. The exact
+    // session/config owner is checked again before any result is returned.
+    let result = fetch_provider_model_infos(&probe_config, &target.base_url).await;
+
+    {
+        let mut controller = controller.lock().await;
+        controller.drain_runtime_messages();
+        validate_side_chat_catalog_target(
+            &target,
+            controller.state.app_state.current_session_id,
+            controller.state.provider_config.config_generation,
+            controller
+                .state
+                .provider_config
+                .effective_config
+                .model
+                .provider_metadata_mode,
+        )
+        .map_err(read_only_command_conflict_error)?;
+    }
+
+    let models = result
+        .map_err(|error| DesktopCommandError::provider_transport(error.to_string()))?
+        .into_iter()
+        .map(side_chat_catalog_model_projection)
+        .collect();
+    Ok(SideChatCatalogProjection {
+        owner_session_id: target.owner_session_id.to_string(),
+        base_url: target.base_url,
+        metadata_mode: target.metadata_mode,
+        config_generation: target.config_generation.to_string(),
+        models,
+    })
+}
+
+fn validate_side_chat_config_owner(
+    expected_owner_session_id: SessionId,
+    expected_config_generation: &str,
+    current_owner_session_id: Option<SessionId>,
+    current_config_generation: u64,
+) -> Result<(), DesktopCommandConflict> {
+    if current_owner_session_id != Some(expected_owner_session_id) {
+        return Err(DesktopCommandConflict::new(
+            "the selected main session changed before the side chat operation",
+        ));
+    }
+    if expected_config_generation != current_config_generation.to_string() {
+        return Err(DesktopCommandConflict::new(
+            "configuration changed before the side chat operation; retry from current settings",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_side_chat_catalog_target(
+    target: &SideChatCatalogRequestTarget,
+    current_owner_session_id: Option<SessionId>,
+    current_config_generation: u64,
+    current_metadata_mode: ProviderMetadataMode,
+) -> Result<(), DesktopCommandConflict> {
+    validate_side_chat_config_owner(
+        target.owner_session_id,
+        &target.config_generation.to_string(),
+        current_owner_session_id,
+        current_config_generation,
+    )?;
+    if target.metadata_mode != current_metadata_mode {
+        return Err(DesktopCommandConflict::new(
+            "provider metadata mode changed before the side chat model load completed",
+        ));
+    }
+    Ok(())
+}
+
+fn side_chat_catalog_probe_config(
+    mut config: ResolvedConfig,
+    base_url: &str,
+) -> Result<(ResolvedConfig, String), DesktopCommandConflict> {
+    let canonical_base_url = ProviderEndpoint::parse(base_url)
+        .map_err(|error| DesktopCommandConflict::new(error.to_string()))?
+        .catalog_root()
+        .as_str()
+        .to_string();
+    config.model.base_url = canonical_base_url.clone();
+
+    // Side Chat has no credential surface and must never inherit the main
+    // provider's authentication material or generation-body customization.
+    config.model.api_key_env = None;
+    config.model.extra_headers.clear();
+    config.model.chat_completions_reasoning_parameters = None;
+    config.model.reasoning_effort = None;
+    config.model.reasoning_summary = ReasoningSummary::None;
+    config.model.temperature = None;
+    config.model.top_p = None;
+    config.model.top_k = None;
+    config.model.presence_penalty = None;
+    config.model.frequency_penalty = None;
+    config.model.seed = None;
+    config.model.stop_sequences.clear();
+    config.model.extra_body_json = None;
+    Ok((config, canonical_base_url))
+}
+
+fn side_chat_catalog_model_projection(info: ProviderModelInfo) -> SideChatCatalogModelProjection {
+    let summary = super::state::provider_model_summary(&info);
+    let label = if summary.is_empty() {
+        info.id.clone()
+    } else {
+        format!("{}  [{}]", info.id, summary)
+    };
+    SideChatCatalogModelProjection {
+        id: info.id,
+        label,
+        load_state: info.load_state,
+    }
+}
+
+#[tauri::command]
+async fn save_side_chat_draft(
+    controller: State<'_, SharedController>,
+    owner_session_id: String,
+    chat_id: String,
+    expected_draft_revision: String,
+    text: String,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    let conflict_owner = owner_session_id.clone();
+    mutate_side_chat_controller_checked(controller, conflict_owner, |controller| {
+        let owner_session_id = owner_session_id.parse::<SessionId>().map_err(|error| {
+            DesktopCommandConflict::new(format!("invalid side chat owner: {error}"))
+        })?;
+        let side_chat_id = chat_id
+            .parse::<crate::storage::SideChatId>()
+            .map_err(|error| {
+                DesktopCommandConflict::new(format!("invalid side chat id: {error}"))
+            })?;
+        let expected_draft_revision = expected_draft_revision.parse::<u64>().map_err(|error| {
+            DesktopCommandConflict::new(format!("invalid side chat draft revision: {error}"))
+        })?;
+        controller
+            .save_side_chat_draft(
+                owner_session_id,
+                side_chat_id,
+                expected_draft_revision,
+                text,
+            )
+            .map_err(DesktopCommandConflict::new)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn submit_side_chat(
+    controller: State<'_, SharedController>,
+    owner_session_id: String,
+    chat_id: String,
+    expected_generation: String,
+    expected_draft_revision: String,
+    text: String,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    let conflict_owner = owner_session_id.clone();
+    mutate_side_chat_controller_checked(controller, conflict_owner, |controller| {
+        let (owner_session_id, side_chat_id, expected_generation) =
+            parse_side_chat_target(&owner_session_id, &chat_id, &expected_generation)?;
+        let expected_draft_revision = expected_draft_revision.parse::<u64>().map_err(|error| {
+            DesktopCommandConflict::new(format!("invalid side chat draft revision: {error}"))
+        })?;
+        controller
+            .start_side_chat(
+                owner_session_id,
+                side_chat_id,
+                expected_generation,
+                expected_draft_revision,
+                text,
+            )
+            .map_err(DesktopCommandConflict::new)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn cancel_side_chat(
+    controller: State<'_, SharedController>,
+    owner_session_id: String,
+    chat_id: String,
+    expected_generation: String,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    let conflict_owner = owner_session_id.clone();
+    mutate_side_chat_controller_checked(controller, conflict_owner, |controller| {
+        let (owner_session_id, side_chat_id, expected_generation) =
+            parse_side_chat_target(&owner_session_id, &chat_id, &expected_generation)?;
+        controller
+            .cancel_side_chat(owner_session_id, side_chat_id, expected_generation)
+            .map_err(DesktopCommandConflict::new)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn delete_side_chat(
+    controller: State<'_, SharedController>,
+    owner_session_id: String,
+    chat_id: String,
+    expected_generation: String,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    let conflict_owner = owner_session_id.clone();
+    mutate_side_chat_controller_checked(controller, conflict_owner, |controller| {
+        let (owner_session_id, side_chat_id, expected_generation) =
+            parse_side_chat_target(&owner_session_id, &chat_id, &expected_generation)?;
+        controller
+            .delete_side_chat(owner_session_id, side_chat_id, expected_generation)
+            .map_err(DesktopCommandConflict::new)
+    })
+    .await
+}
+
+fn parse_side_chat_target(
+    owner_session_id: &str,
+    side_chat_id: &str,
+    expected_generation: &str,
+) -> Result<(SessionId, crate::storage::SideChatId, u64), DesktopCommandConflict> {
+    let owner_session_id = owner_session_id.parse::<SessionId>().map_err(|error| {
+        DesktopCommandConflict::new(format!("invalid side chat owner: {error}"))
+    })?;
+    let side_chat_id = side_chat_id
+        .parse::<crate::storage::SideChatId>()
+        .map_err(|error| DesktopCommandConflict::new(format!("invalid side chat id: {error}")))?;
+    let expected_generation = expected_generation.parse::<u64>().map_err(|error| {
+        DesktopCommandConflict::new(format!("invalid side chat generation: {error}"))
+    })?;
+    Ok((owner_session_id, side_chat_id, expected_generation))
 }
 
 #[tauri::command]
@@ -958,10 +1820,19 @@ async fn review_uncommitted(
     controller: State<'_, SharedController>,
     text: String,
     expected_target: DesktopDraftActionTarget,
+    expected_run_target: DesktopRunMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
+    ensure_durable_idle_composer_preflight(
+        controller.inner(),
+        &expected_target,
+        &expected_run_target,
+        "uncommitted review",
+    )
+    .await?;
     mutate_controller_checked(controller, |controller| {
         ensure_draft_action_target(controller, &expected_target)?;
-        if !controller.start_review_uncommitted(text) {
+        let expected_active_turn = ensure_run_mutation_target(controller, &expected_run_target)?;
+        if !controller.start_review_uncommitted_at(text, expected_active_turn) {
             return Err(rejected_action(controller, "the review was not started"));
         }
         Ok(())
@@ -974,10 +1845,19 @@ async fn enhance_prompt(
     controller: State<'_, SharedController>,
     text: String,
     expected_target: DesktopDraftActionTarget,
+    expected_run_target: DesktopRunMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
+    ensure_durable_idle_composer_preflight(
+        controller.inner(),
+        &expected_target,
+        &expected_run_target,
+        "prompt enhancement",
+    )
+    .await?;
     mutate_controller_checked(controller, |controller| {
         ensure_draft_action_target(controller, &expected_target)?;
-        if !controller.start_prompt_enhance(text) {
+        let expected_active_turn = ensure_run_mutation_target(controller, &expected_run_target)?;
+        if !controller.start_prompt_enhance_at(text, expected_active_turn) {
             return Err(rejected_action(
                 controller,
                 "prompt enhancement was not started",
@@ -993,11 +1873,13 @@ async fn send_prompt_review(
     controller: State<'_, SharedController>,
     enhanced: bool,
     text: String,
-    expected_target: DesktopDraftActionTarget,
+    expected_target: DesktopPromptReviewMutationTarget,
+    expected_run_target: DesktopRunMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
-        ensure_draft_action_target(controller, &expected_target)?;
-        if !controller.send_prompt_review(enhanced, text) {
+        let request_id = ensure_prompt_review_mutation_target(controller, &expected_target)?;
+        let expected_active_turn = ensure_run_mutation_target(controller, &expected_run_target)?;
+        if !controller.send_prompt_review_at(request_id, enhanced, text, expected_active_turn) {
             return Err(rejected_action(
                 controller,
                 "the reviewed prompt was not sent",
@@ -1011,9 +1893,19 @@ async fn send_prompt_review(
 #[tauri::command]
 async fn cancel_prompt_review(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
-        controller.state.cancel_prompt_review();
+    expected_target: DesktopPromptReviewMutationTarget,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        let request_id = ensure_prompt_review_mutation_target(controller, &expected_target)?;
+        if !controller
+            .state
+            .cancel_prompt_review_if_current(request_id)
+        {
+            return Err(DesktopCommandConflict::new(
+                "the prompt review changed before cancellation; review the current prompt and try again",
+            ));
+        }
+        Ok(())
     })
     .await
 }
@@ -1127,9 +2019,14 @@ async fn interrupt_agent(
     controller: State<'_, SharedController>,
     expected_target: DesktopAgentInterruptTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
-    let execution_target = expected_target.execution_target();
+    let execution_target = expected_target
+        .execution_target()
+        .map_err(read_only_command_conflict_error)?;
     let expected_turn_id = expected_target
         .expected_turn_id()
+        .map_err(read_only_command_conflict_error)?;
+    let expected_admission_revision = expected_target
+        .admission_revision()
         .map_err(read_only_command_conflict_error)?;
     let (app, root_session_id, child_session_id) = {
         let mut controller = controller.lock().await;
@@ -1170,6 +2067,7 @@ async fn interrupt_agent(
             &execution_target.agent_path,
             child_session_id,
             expected_turn_id,
+            expected_admission_revision,
         )
         .await
         .map_err(|error| {
@@ -1677,6 +2575,7 @@ async fn interrupt_session(
     controller: State<'_, SharedController>,
     index: usize,
     expected_target: DesktopRowMutationTarget,
+    expected_stop_target: DesktopStopMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
         ensure_indexed_row_mutation_target(
@@ -1686,7 +2585,34 @@ async fn interrupt_session(
             index,
         )?;
         let session_id = validated_session_id(controller, index)?;
-        if !controller.interrupt_session(session_id) {
+        let current_turn = controller
+            .state
+            .snapshot
+            .session_rows
+            .get(index)
+            .and_then(|row| {
+                row.active_turn_id.map(|turn_id| {
+                    row.admission_revision
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|revision| revision.to_string() == row.admission_revision)
+                        .map(|revision| (turn_id, revision))
+                })
+            })
+            .flatten();
+        if controller.state.app_state.current_session_id == Some(session_id) {
+            let admission = ensure_stop_mutation_target(controller, &expected_stop_target)?;
+            return apply_stop_admission(controller, admission);
+        }
+        let (expected_turn_id, expected_admission_revision) =
+            validate_background_session_interrupt_target(
+                &expected_stop_target,
+                controller.app.workspace.authority_root().as_str(),
+                session_id,
+                current_turn,
+            )?;
+        if !controller.interrupt_session(session_id, expected_turn_id, expected_admission_revision)
+        {
             return Err(rejected_action(
                 controller,
                 "chat interrupt was not started",
@@ -1695,6 +2621,61 @@ async fn interrupt_session(
         Ok(())
     })
     .await
+}
+
+fn validate_background_session_interrupt_target(
+    expected: &DesktopStopMutationTarget,
+    workspace_path: &str,
+    session_id: SessionId,
+    current_turn: Option<(TurnId, u64)>,
+) -> Result<(TurnId, u64), DesktopCommandConflict> {
+    let DesktopStopMutationTarget::Turn {
+        workspace_path: expected_workspace,
+        session_id: expected_session,
+        turn_id: expected_turn_id,
+        admission_revision,
+        root_epoch,
+    } = expected
+    else {
+        return Err(DesktopCommandConflict::new(
+            "a background chat interrupt requires an exact turn target",
+        ));
+    };
+    let canonical_epoch = root_epoch
+        .parse::<u64>()
+        .ok()
+        .is_some_and(|epoch| epoch.to_string() == *root_epoch);
+    let session_id_text = session_id.to_string();
+    if expected_workspace != workspace_path
+        || expected_session != &session_id_text
+        || !canonical_epoch
+    {
+        return Err(DesktopCommandConflict::new(
+            "the running chat owner changed before interrupt was applied",
+        ));
+    }
+    let parsed = expected_turn_id
+        .parse::<TurnId>()
+        .ok()
+        .filter(|turn_id| turn_id.to_string() == *expected_turn_id)
+        .ok_or_else(|| {
+            DesktopCommandConflict::new(
+                "the running chat turn identity is invalid; refresh and try again",
+            )
+        })?;
+    let revision = admission_revision
+        .parse::<u64>()
+        .ok()
+        .filter(|parsed| parsed.to_string() == *admission_revision)
+        .ok_or_else(|| {
+            DesktopCommandConflict::new("the running chat admission revision is invalid")
+        })?;
+    if current_turn.is_some_and(|current| current != (parsed, revision)) {
+        return Err(DesktopCommandConflict::new(
+            "the running chat turn changed before interrupt was applied",
+        ));
+    }
+    Ok((parsed, revision))
 }
 
 #[tauri::command]
@@ -1840,17 +2821,39 @@ async fn attach_image(
     if let Err(conflict) = ensure_draft_action_target(&controller, &expected_target) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
-    controller.state.set_image_attachment_input(text);
-    let Some(path) = controller.prepare_image_attachment_from_input() else {
-        return Err(command_conflict_error(
-            &mut controller,
-            DesktopCommandConflict::new("the image path was not attached"),
-        ));
+    if let Err(conflict) = ensure_unscoped_prompt_review_action(&mut controller, "image attachment")
+    {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    if let Err(conflict) =
+        ensure_attachment_state_mutation(controller.state.set_image_attachment_input(text))
+    {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    let path = match controller.prepare_image_attachment_from_input() {
+        Ok(path) => path,
+        Err(error) => {
+            return Err(command_conflict_error(
+                &mut controller,
+                DesktopCommandConflict::with_status(
+                    DesktopStatusCode::ImageAttachmentInvalid,
+                    error,
+                ),
+            ));
+        }
     };
     controller
         .authorize_attachment_asset(&app, &path)
         .map_err(DesktopCommandError::internal)?;
-    controller.state.attach_image_path(path);
+    if let Err(conflict) = ensure_unscoped_prompt_review_action(&mut controller, "image attachment")
+    {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    if let Err(conflict) =
+        ensure_attachment_state_mutation(controller.state.attach_image_path(path))
+    {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
     controller.drain_runtime_messages();
     controller
         .next_web_state()
@@ -1868,6 +2871,10 @@ async fn browse_image(
     if let Err(conflict) = ensure_draft_action_target(&controller, &expected_target) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
+    if let Err(conflict) = ensure_unscoped_prompt_review_action(&mut controller, "image attachment")
+    {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
     let Some(path) = controller.browse_image_dialog() else {
         return controller
             .next_web_state()
@@ -1877,10 +2884,22 @@ async fn browse_image(
     if let Err(conflict) = ensure_draft_action_target(&controller, &expected_target) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
+    if let Err(conflict) = ensure_unscoped_prompt_review_action(&mut controller, "image attachment")
+    {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
     controller
         .authorize_attachment_asset(&app, &path)
         .map_err(DesktopCommandError::internal)?;
-    controller.state.attach_image_path(path);
+    if let Err(conflict) = ensure_unscoped_prompt_review_action(&mut controller, "image attachment")
+    {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    if let Err(conflict) =
+        ensure_attachment_state_mutation(controller.state.attach_image_path(path))
+    {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
     controller.drain_runtime_messages();
     controller
         .next_web_state()
@@ -1894,7 +2913,8 @@ async fn clear_images(
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
         ensure_draft_action_target(controller, &expected_target)?;
-        controller.state.clear_image_attachments();
+        ensure_unscoped_prompt_review_action(controller, "image attachment")?;
+        ensure_attachment_state_mutation(controller.state.clear_image_attachments())?;
         Ok(())
     })
     .await
@@ -1913,7 +2933,8 @@ async fn remove_image(
             DesktopRowCollection::Attachment,
             index,
         )?;
-        controller.state.remove_image_attachment(index);
+        ensure_unscoped_prompt_review_action(controller, "image attachment")?;
+        ensure_attachment_state_mutation(controller.state.remove_image_attachment(index))?;
         Ok(())
     })
     .await
@@ -1922,37 +2943,71 @@ async fn remove_image(
 #[tauri::command]
 async fn show_file_menu(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| controller.state.show_file_menu()).await
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "file menu")?;
+        controller.state.show_file_menu();
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 async fn show_edit_menu(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| controller.state.show_edit_menu()).await
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "edit menu")?;
+        controller.state.show_edit_menu();
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 async fn show_view_menu(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| controller.state.show_view_menu()).await
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "view menu")?;
+        controller.state.show_view_menu();
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 async fn show_help_menu(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| controller.state.show_help_menu()).await
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "help menu")?;
+        controller.state.show_help_menu();
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn show_about(
+    controller: State<'_, SharedController>,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "about dialog")?;
+        controller.state.show_about();
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 async fn show_project_menu(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
-        controller.state.show_project_menu()
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "project menu")?;
+        controller.state.show_project_menu();
+        Ok(())
     })
     .await
 }
@@ -1967,9 +3022,11 @@ async fn create_project_from_picker(
 #[tauri::command]
 async fn show_config_editor(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "configuration editor")?;
         controller.state.show_config_editor();
+        Ok(())
     })
     .await
 }
@@ -1977,9 +3034,11 @@ async fn show_config_editor(
 #[tauri::command]
 async fn show_provider_editor(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "provider editor")?;
         controller.state.show_provider_editor();
+        Ok(())
     })
     .await
 }
@@ -1987,16 +3046,23 @@ async fn show_provider_editor(
 #[tauri::command]
 async fn show_workspace_picker(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, DesktopController::show_workspace_picker).await
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "workspace picker")?;
+        controller.show_workspace_picker();
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 async fn show_command_palette(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "command palette")?;
         controller.state.show_command_palette();
+        Ok(())
     })
     .await
 }
@@ -2004,16 +3070,25 @@ async fn show_command_palette(
 #[tauri::command]
 async fn show_shortcuts(
     controller: State<'_, SharedController>,
-) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| {
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "keyboard shortcuts")?;
         controller.state.show_keyboard_shortcuts();
+        Ok(())
     })
     .await
 }
 
 #[tauri::command]
-async fn close_overlay(controller: State<'_, SharedController>) -> Result<DesktopWebState, String> {
-    mutate_controller(controller, |controller| controller.state.hide_overlay()).await
+async fn close_overlay(
+    controller: State<'_, SharedController>,
+) -> Result<DesktopWebState, DesktopCommandError> {
+    mutate_controller_checked(controller, |controller| {
+        validate_unscoped_overlay_close(controller.state.view.overlay)?;
+        controller.state.hide_overlay();
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2024,6 +3099,7 @@ async fn switch_workspace(
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
         ensure_draft_action_target(controller, &expected_target)?;
+        ensure_unscoped_prompt_review_action(controller, "workspace navigation")?;
         controller.state.set_workspace_input(text);
         if !controller.switch_workspace() {
             return Err(rejected_action(
@@ -2047,10 +3123,20 @@ async fn browse_workspace(
     if let Err(conflict) = ensure_draft_action_target(&controller, &expected_target) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
+    if let Err(conflict) =
+        ensure_unscoped_prompt_review_action(&mut controller, "workspace navigation")
+    {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
     controller.state.set_workspace_input(text);
     let selected = controller.browse_workspace_dialog();
     controller.drain_runtime_messages();
     if let Err(conflict) = ensure_draft_action_target(&controller, &expected_target) {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    if let Err(conflict) =
+        ensure_unscoped_prompt_review_action(&mut controller, "workspace navigation")
+    {
         return Err(command_conflict_error(&mut controller, conflict));
     }
     if let Some(path) = selected {
@@ -2094,6 +3180,11 @@ async fn import_global_config_toml(
 ) -> Result<(DesktopWebState, bool), DesktopCommandError> {
     let mut controller = controller.lock().await;
     controller.drain_runtime_messages();
+    if let Err(conflict) =
+        ensure_unscoped_prompt_review_action(&mut controller, "configuration import")
+    {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
     if let Err(conflict) = ensure_config_mutation_target(&controller, &expected_target) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
@@ -2102,6 +3193,11 @@ async fn import_global_config_toml(
     }
     let selected = controller.pick_global_config_toml_dialog();
     controller.drain_runtime_messages();
+    if let Err(conflict) =
+        ensure_unscoped_prompt_review_action(&mut controller, "configuration import")
+    {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
     if let Err(conflict) = ensure_config_mutation_target(&controller, &expected_target) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
@@ -2174,18 +3270,37 @@ async fn insert_command(
     controller: State<'_, SharedController>,
     index: usize,
     expected_target: DesktopRowMutationTarget,
-) -> Result<DesktopWebState, DesktopCommandError> {
-    mutate_controller_checked(controller, |controller| {
-        ensure_indexed_row_mutation_target(
-            controller,
-            &expected_target,
-            DesktopRowCollection::Command,
-            index,
-        )?;
-        controller.state.insert_command_from_palette(index);
-        Ok(())
+    expected_draft_target: DesktopDraftActionTarget,
+) -> Result<DesktopCommandPaletteInsertionResult, DesktopCommandError> {
+    let mut controller = controller.lock().await;
+    controller.drain_runtime_messages();
+    if let Err(conflict) =
+        ensure_draft_action_target(&controller, &expected_draft_target).and_then(|()| {
+            ensure_indexed_row_mutation_target(
+                &controller,
+                &expected_target,
+                DesktopRowCollection::Command,
+                index,
+            )
+        })
+    {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
+    let Some(insertion_text) = controller.state.select_command_from_palette(index) else {
+        let conflict = rejected_action(
+            &controller,
+            "the command palette selection is no longer available",
+        );
+        return Err(command_conflict_error(&mut controller, conflict));
+    };
+    controller.drain_runtime_messages();
+    let state = controller
+        .next_web_state()
+        .map_err(DesktopCommandError::internal)?;
+    Ok(DesktopCommandPaletteInsertionResult {
+        state,
+        insertion_text,
     })
-    .await
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -2263,6 +3378,7 @@ async fn load_provider_models(
     expected_target: DesktopConfigMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "provider model loading")?;
         ensure_config_mutation_target(controller, &expected_target)?;
         if controller.provider_model_load_pending() {
             return Err(DesktopCommandConflict::new(
@@ -2289,6 +3405,7 @@ async fn apply_provider_session(
     expected_target: DesktopConfigMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "provider configuration")?;
         ensure_config_mutation_target(controller, &expected_target)?;
         ensure_external_config_owner_mutation_open(controller, &draft_values)?;
         accept_provider_action_input(controller, input)?;
@@ -2311,6 +3428,7 @@ async fn save_provider_global(
     expected_target: DesktopConfigMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "provider configuration")?;
         ensure_config_mutation_target(controller, &expected_target)?;
         ensure_external_config_owner_mutation_open(controller, &draft_values)?;
         accept_provider_action_input(controller, input)?;
@@ -2377,7 +3495,7 @@ fn complete_config_draft_is_dirty(
     effective_config: &crate::config::ResolvedConfig,
     values: &[DesktopConfigValueInput],
 ) -> Result<bool, DesktopCommandConflict> {
-    if values.len() != crate::tui::config_editor::ConfigField::ALL.len() {
+    if values.len() != crate::config::ConfigField::ALL.len() {
         return Err(DesktopCommandConflict::new(
             "the complete settings draft must accompany the configuration owner target",
         ));
@@ -2512,6 +3630,9 @@ async fn apply_session_config(
 ) -> Result<(DesktopWebState, bool), DesktopCommandError> {
     let mut controller = controller.lock().await;
     controller.drain_runtime_messages();
+    if let Err(conflict) = ensure_unscoped_prompt_review_action(&mut controller, "configuration") {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
     if let Err(conflict) = ensure_config_mutation_target(&controller, &expected_target) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
@@ -2544,6 +3665,9 @@ async fn save_global_config(
 ) -> Result<(DesktopWebState, bool), DesktopCommandError> {
     let mut controller = controller.lock().await;
     controller.drain_runtime_messages();
+    if let Err(conflict) = ensure_unscoped_prompt_review_action(&mut controller, "configuration") {
+        return Err(command_conflict_error(&mut controller, conflict));
+    }
     if let Err(conflict) = ensure_config_mutation_target(&controller, &expected_target) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
@@ -2575,6 +3699,7 @@ async fn toggle_access_mode(
     expected_target: DesktopAccessModeMutationTarget,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
+        ensure_unscoped_prompt_review_action(controller, "access mode")?;
         ensure_access_mode_mutation_target(controller, &expected_target, &draft_values)?;
         let expected_session_id = expected_target.session_id.clone();
         if !controller.toggle_access_mode_remembered() {
@@ -2716,14 +3841,65 @@ fn parse_permission_confirmation_id(value: &str) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+
+    const TEST_ADMISSION_REVISION: u64 = 7;
+
+    fn root_receipt(
+        session_id: SessionId,
+        turn_id: TurnId,
+        admission_revision: u64,
+    ) -> crate::runtime::RootAdmissionSnapshot {
+        crate::runtime::RootAdmissionSnapshot {
+            last_admitted: Some(crate::runtime::RootAdmissionReceipt {
+                session_id,
+                turn_id,
+                revision: admission_revision,
+            }),
+            pending: None,
+            stop_seal_id: None,
+        }
+    }
+
+    #[test]
+    fn desktop_command_manifest_is_unique_and_matches_the_frontend_guard() {
+        let mut backend_names = BTreeSet::new();
+        for name in DESKTOP_COMMAND_WIRE_NAMES {
+            assert!(
+                name.bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+                "Desktop command wire name must be snake_case: {name}"
+            );
+            assert!(
+                backend_names.insert((*name).to_string()),
+                "duplicate Desktop command registration: {name}"
+            );
+        }
+
+        let frontend_names: Vec<String> = serde_json::from_str(include_str!(
+            "../../ui/desktop-web/src/desktop_commands.json"
+        ))
+        .expect("frontend Desktop command manifest must be valid JSON");
+        let frontend_name_set = frontend_names.iter().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(
+            frontend_name_set.len(),
+            frontend_names.len(),
+            "frontend Desktop command manifest contains a duplicate"
+        );
+        assert_eq!(
+            frontend_name_set, backend_names,
+            "frontend invoke guard and Tauri handler command names drifted"
+        );
+    }
 
     #[test]
     fn draft_action_target_rejects_workspace_and_current_session_drift() {
         let expected = DesktopDraftActionTarget {
             workspace_path: "C:/workspace".to_string(),
             session_id: Some("session-a".to_string()),
-            owner_generation: 7,
+            owner_generation: "7".to_string(),
         };
         assert!(
             validate_draft_action_target(
@@ -2759,12 +3935,236 @@ mod tests {
     }
 
     #[test]
+    fn prompt_review_target_rejects_request_aba_and_every_owner_drift() {
+        let expected: DesktopPromptReviewMutationTarget =
+            serde_json::from_value(serde_json::json!({
+                "workspacePath": "C:/workspace",
+                "sessionId": "session-a",
+                "ownerGeneration": "7",
+                "requestId": "41",
+                "expectedState": {
+                    "kind": "idle",
+                    "latestTurnId": null,
+                    "admissionRevision": "0"
+                },
+            }))
+            .expect("deserialize exact review target");
+        assert_eq!(
+            validate_prompt_review_mutation_target(
+                &expected,
+                "C:/workspace",
+                Some("session-a".to_string()),
+                7,
+                Some(41),
+                Some(ActiveTurnExpectation::initial_idle()),
+            )
+            .expect("current review target"),
+            41
+        );
+        for (workspace, session_id, owner_generation, request_id) in [
+            ("C:/other", Some("session-a".to_string()), 7, Some(41)),
+            ("C:/workspace", Some("session-b".to_string()), 7, Some(41)),
+            ("C:/workspace", Some("session-a".to_string()), 8, Some(41)),
+            ("C:/workspace", Some("session-a".to_string()), 7, Some(42)),
+            ("C:/workspace", Some("session-a".to_string()), 7, None),
+        ] {
+            assert!(
+                validate_prompt_review_mutation_target(
+                    &expected,
+                    workspace,
+                    session_id,
+                    owner_generation,
+                    request_id,
+                    Some(ActiveTurnExpectation::initial_idle()),
+                )
+                .is_err()
+            );
+        }
+
+        let mut noncanonical = expected.clone();
+        noncanonical.request_id = "041".to_string();
+        assert!(
+            validate_prompt_review_mutation_target(
+                &noncanonical,
+                "C:/workspace",
+                Some("session-a".to_string()),
+                7,
+                Some(41),
+                Some(ActiveTurnExpectation::initial_idle()),
+            )
+            .is_err(),
+            "the JS boundary accepts only canonical decimal request identities"
+        );
+        let mut noncanonical_generation = expected.clone();
+        noncanonical_generation.owner_generation = "007".to_string();
+        assert!(
+            validate_prompt_review_mutation_target(
+                &noncanonical_generation,
+                "C:/workspace",
+                Some("session-a".to_string()),
+                7,
+                Some(41),
+                Some(ActiveTurnExpectation::initial_idle()),
+            )
+            .is_err(),
+            "owner generation must use canonical decimal u64 spelling"
+        );
+        assert!(
+            serde_json::from_value::<DesktopPromptReviewMutationTarget>(serde_json::json!({
+                "workspacePath": "C:/workspace",
+                "sessionId": "session-a",
+                "ownerGeneration": 7,
+                "requestId": "41",
+                "expectedState": {
+                    "kind": "idle",
+                    "latestTurnId": null,
+                    "admissionRevision": "0"
+                },
+            }))
+            .is_err(),
+            "JSON numbers must not cross the exact u64 owner boundary"
+        );
+        let mut malformed = expected;
+        malformed.request_id = "not-a-request".to_string();
+        assert!(
+            validate_prompt_review_mutation_target(
+                &malformed,
+                "C:/workspace",
+                Some("session-a".to_string()),
+                7,
+                Some(41),
+                Some(ActiveTurnExpectation::initial_idle()),
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<DesktopPromptReviewMutationTarget>(serde_json::json!({
+                "workspacePath": "C:/workspace",
+                "sessionId": "session-a",
+                "ownerGeneration": "7",
+                "requestId": 41,
+                "expectedState": {
+                    "kind": "idle",
+                    "latestTurnId": null,
+                    "admissionRevision": "0"
+                },
+            }))
+            .is_err(),
+            "review request identity must not cross JavaScript as a number"
+        );
+    }
+
+    #[test]
+    fn run_and_prompt_review_targets_deserialize_exact_nested_expected_state_keys() {
+        let session_id = SessionId::new().to_string();
+        let idle_turn_id = TurnId::new();
+        let active_turn_id = TurnId::new();
+        for (expected_json, expected) in [
+            (
+                serde_json::json!({
+                    "kind": "idle",
+                    "latestTurnId": idle_turn_id.to_string(),
+                    "admissionRevision": "18446744073709551614",
+                }),
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(idle_turn_id),
+                    revision: u64::MAX - 1,
+                },
+            ),
+            (
+                serde_json::json!({
+                    "kind": "turn",
+                    "turnId": active_turn_id.to_string(),
+                    "admissionRevision": "18446744073709551615",
+                }),
+                ActiveTurnExpectation::Turn {
+                    turn_id: active_turn_id,
+                    revision: u64::MAX,
+                },
+            ),
+        ] {
+            let run_json = serde_json::json!({
+                "workspacePath": "C:/workspace",
+                "sessionId": session_id.clone(),
+                "runtimeOwnerToken": "root:9",
+                "permissionConfirmationId": "41",
+                "expectedState": expected_json.clone(),
+            });
+            let run: DesktopRunMutationTarget = serde_json::from_value(run_json.clone())
+                .expect("Tauri accepts exact run target keys");
+            assert_eq!(
+                run.expected_state.parse().expect("parse expected state"),
+                expected
+            );
+
+            let review_json = serde_json::json!({
+                "workspacePath": "C:/workspace",
+                "sessionId": session_id.clone(),
+                "ownerGeneration": "18446744073709551615",
+                "requestId": "42",
+                "expectedState": expected_json,
+            });
+            let review: DesktopPromptReviewMutationTarget =
+                serde_json::from_value(review_json.clone())
+                    .expect("Tauri accepts exact Prompt Review target keys");
+            assert_eq!(
+                review
+                    .expected_state
+                    .parse()
+                    .expect("parse review expected state"),
+                expected
+            );
+
+            let mut malformed_run = run_json;
+            malformed_run
+                .as_object_mut()
+                .expect("run target object")
+                .insert("legacyOwner".to_string(), serde_json::json!(true));
+            assert!(
+                serde_json::from_value::<DesktopRunMutationTarget>(malformed_run).is_err(),
+                "unknown run target keys must fail closed"
+            );
+            let mut malformed_review = review_json;
+            malformed_review
+                .as_object_mut()
+                .expect("review target object")
+                .insert("legacyOwner".to_string(), serde_json::json!(true));
+            assert!(
+                serde_json::from_value::<DesktopPromptReviewMutationTarget>(malformed_review)
+                    .is_err(),
+                "unknown Prompt Review target keys must fail closed"
+            );
+            let missing_revision = serde_json::json!({
+                "workspacePath": "C:/workspace",
+                "sessionId": session_id.clone(),
+                "runtimeOwnerToken": "root:9",
+                "permissionConfirmationId": "41",
+                "expectedState": { "kind": "idle", "latestTurnId": null },
+            });
+            assert!(
+                serde_json::from_value::<DesktopRunMutationTarget>(missing_revision).is_err(),
+                "admissionRevision is required on every expectedState variant"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_overlay_close_cannot_bypass_prompt_review_request_identity() {
+        assert!(validate_unscoped_overlay_close(DesktopOverlay::ConfigEditor).is_ok());
+        assert!(validate_unscoped_overlay_close(DesktopOverlay::PromptReview).is_err());
+    }
+
+    #[test]
     fn stop_target_rejects_workspace_session_and_runtime_owner_drift() {
         let expected = DesktopRunMutationTarget {
             workspace_path: "C:/workspace".to_string(),
             session_id: Some("session-a".to_string()),
             runtime_owner_token: "root:11".to_string(),
             permission_confirmation_id: Some("41".to_string()),
+            expected_state: DesktopRunExpectedState::Idle {
+                latest_turn_id: None,
+                admission_revision: "0".to_string(),
+            },
         };
         assert!(
             validate_run_mutation_target(
@@ -2773,6 +4173,7 @@ mod tests {
                 Some("session-a".to_string()),
                 "root:11".to_string(),
                 Some("41".to_string()),
+                ActiveTurnExpectation::initial_idle(),
             )
             .is_ok()
         );
@@ -2809,6 +4210,7 @@ mod tests {
                     session_id,
                     runtime_owner_token,
                     permission_confirmation_id,
+                    ActiveTurnExpectation::initial_idle(),
                 )
                 .is_err()
             );
@@ -2822,6 +4224,10 @@ mod tests {
             session_id: Some("session-a".to_string()),
             runtime_owner_token: "root:11".to_string(),
             permission_confirmation_id: Some("41".to_string()),
+            expected_state: DesktopRunExpectedState::Idle {
+                latest_turn_id: None,
+                admission_revision: "0".to_string(),
+            },
         };
 
         assert!(
@@ -2831,9 +4237,369 @@ mod tests {
                 Some("session-a".to_string()),
                 "root:11".to_string(),
                 Some("42".to_string()),
+                ActiveTurnExpectation::initial_idle(),
             )
             .is_err(),
             "a stale Stop rendered for permission A must not abort replacement permission B"
+        );
+    }
+
+    #[test]
+    fn stop_target_allows_only_same_turn_terminal_crossing_within_one_runtime_epoch() {
+        let session_a = SessionId::new();
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let expected = DesktopStopMutationTarget::Turn {
+            workspace_path: "C:/workspace".to_string(),
+            session_id: session_a.to_string(),
+            turn_id: turn_a.to_string(),
+            admission_revision: TEST_ADMISSION_REVISION.to_string(),
+            root_epoch: "11".to_string(),
+        };
+
+        assert_eq!(
+            validate_stop_mutation_target(
+                &expected,
+                "C:/workspace",
+                Some(session_a.to_string()),
+                Some(11),
+                11,
+                None,
+                ActiveTurnExpectation::Turn {
+                    turn_id: turn_b,
+                    revision: TEST_ADMISSION_REVISION + 1,
+                },
+                Some(root_receipt(session_a, turn_b, TEST_ADMISSION_REVISION + 1,)),
+            )
+            .expect("a live same-epoch root preserves Stop across continuation A to B"),
+            DesktopStopAdmission::Root { generation: 11 },
+        );
+        assert_eq!(
+            validate_stop_mutation_target(
+                &expected,
+                "C:/workspace",
+                Some(session_a.to_string()),
+                None,
+                11,
+                None,
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(turn_a),
+                    revision: TEST_ADMISSION_REVISION,
+                },
+                None,
+            )
+            .expect("detached descendants retain the exact terminal-latest A Stop"),
+            DesktopStopAdmission::Turn {
+                turn_id: turn_a,
+                admission_revision: TEST_ADMISSION_REVISION,
+            },
+        );
+
+        for (root_generation, last_epoch, active_turn_expectation) in [
+            (
+                None,
+                11,
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(turn_b),
+                    revision: TEST_ADMISSION_REVISION + 1,
+                },
+            ),
+            (
+                None,
+                12,
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(turn_a),
+                    revision: TEST_ADMISSION_REVISION,
+                },
+            ),
+        ] {
+            assert!(
+                validate_stop_mutation_target(
+                    &expected,
+                    "C:/workspace",
+                    Some(session_a.to_string()),
+                    root_generation,
+                    last_epoch,
+                    None,
+                    active_turn_expectation,
+                    None,
+                )
+                .is_err(),
+                "B or a new runtime epoch must reject the captured A Stop"
+            );
+        }
+        assert!(
+            validate_stop_mutation_target(
+                &expected,
+                "C:/other",
+                Some(session_a.to_string()),
+                None,
+                11,
+                None,
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(turn_a),
+                    revision: TEST_ADMISSION_REVISION,
+                },
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_stop_mutation_target(
+                &expected,
+                "C:/workspace",
+                Some(SessionId::new().to_string()),
+                None,
+                11,
+                None,
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(turn_a),
+                    revision: TEST_ADMISSION_REVISION,
+                },
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn root_stop_promotes_only_the_same_generation_admission_receipt() {
+        let session_a = SessionId::new();
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let expected = DesktopStopMutationTarget::Root {
+            workspace_path: "C:/workspace".to_string(),
+            session_id: Some(session_a.to_string()),
+            root_generation: "11".to_string(),
+            latest_turn_id: Some(turn_a.to_string()),
+            admission_revision: TEST_ADMISSION_REVISION.to_string(),
+            permission_confirmation_id: Some("41".to_string()),
+        };
+        assert_eq!(
+            validate_stop_mutation_target(
+                &expected,
+                "C:/workspace",
+                Some(session_a.to_string()),
+                Some(11),
+                11,
+                Some("41".to_string()),
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(turn_a),
+                    revision: TEST_ADMISSION_REVISION,
+                },
+                None,
+            )
+            .expect("root before admission"),
+            DesktopStopAdmission::Root { generation: 11 },
+        );
+        assert!(
+            validate_stop_mutation_target(
+                &expected,
+                "C:/other",
+                Some(session_a.to_string()),
+                Some(11),
+                11,
+                Some("41".to_string()),
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(turn_a),
+                    revision: TEST_ADMISSION_REVISION,
+                },
+                None,
+            )
+            .is_err(),
+            "a pre-admission Root Stop cannot cross its captured workspace"
+        );
+        assert_eq!(
+            validate_stop_mutation_target(
+                &expected,
+                "C:/workspace",
+                Some(session_a.to_string()),
+                Some(11),
+                11,
+                Some("41".to_string()),
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(turn_a),
+                    revision: TEST_ADMISSION_REVISION,
+                },
+                Some(root_receipt(session_a, turn_a, TEST_ADMISSION_REVISION)),
+            )
+            .expect("a canonical receipt must promote terminal-latest A to a durable Turn Stop"),
+            DesktopStopAdmission::Root { generation: 11 },
+        );
+        assert!(
+            validate_stop_mutation_target(
+                &expected,
+                "C:/other",
+                Some(session_a.to_string()),
+                Some(11),
+                11,
+                Some("41".to_string()),
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(turn_a),
+                    revision: TEST_ADMISSION_REVISION,
+                },
+                Some(root_receipt(session_a, turn_a, TEST_ADMISSION_REVISION)),
+            )
+            .is_err(),
+            "a receipt-backed Root Stop cannot cross its captured workspace"
+        );
+        assert_eq!(
+            validate_stop_mutation_target(
+                &expected,
+                "C:/workspace",
+                Some(session_a.to_string()),
+                Some(11),
+                11,
+                Some("41".to_string()),
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(turn_a),
+                    revision: TEST_ADMISSION_REVISION,
+                },
+                Some(root_receipt(session_a, turn_b, TEST_ADMISSION_REVISION + 1,)),
+            )
+            .expect("the same root continuation receipt outranks a lagging Idle(A) projection"),
+            DesktopStopAdmission::Root { generation: 11 },
+        );
+        assert_eq!(
+            validate_stop_mutation_target(
+                &expected,
+                "C:/workspace",
+                Some(session_a.to_string()),
+                Some(11),
+                11,
+                Some("41".to_string()),
+                ActiveTurnExpectation::Turn {
+                    turn_id: turn_b,
+                    revision: TEST_ADMISSION_REVISION + 1,
+                },
+                Some(root_receipt(session_a, turn_b, TEST_ADMISSION_REVISION + 1,)),
+            )
+            .expect("same root UserTurnStored may overtake the queued Stop"),
+            DesktopStopAdmission::Root { generation: 11 },
+        );
+        for (root_generation, permission, receipt) in [
+            (
+                Some(12),
+                Some("41".to_string()),
+                Some(root_receipt(session_a, turn_b, TEST_ADMISSION_REVISION + 1)),
+            ),
+            (
+                Some(11),
+                Some("42".to_string()),
+                Some(root_receipt(session_a, turn_b, TEST_ADMISSION_REVISION + 1)),
+            ),
+            (Some(11), Some("41".to_string()), None),
+        ] {
+            assert!(
+                validate_stop_mutation_target(
+                    &expected,
+                    "C:/workspace",
+                    Some(session_a.to_string()),
+                    root_generation,
+                    root_generation.unwrap_or(11),
+                    permission,
+                    ActiveTurnExpectation::Turn {
+                        turn_id: turn_b,
+                        revision: TEST_ADMISSION_REVISION + 1,
+                    },
+                    receipt,
+                )
+                .is_err()
+            );
+        }
+
+        let new_session_target = DesktopStopMutationTarget::Root {
+            workspace_path: "C:/workspace".to_string(),
+            session_id: None,
+            root_generation: "11".to_string(),
+            latest_turn_id: None,
+            admission_revision: "0".to_string(),
+            permission_confirmation_id: None,
+        };
+        assert!(
+            validate_stop_mutation_target(
+                &new_session_target,
+                "C:/other",
+                None,
+                Some(11),
+                11,
+                None,
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: None,
+                    revision: 0,
+                },
+                Some(root_receipt(session_a, turn_b, 1)),
+            )
+            .is_err(),
+            "a new-session Root Stop cannot adopt a receipt from another workspace"
+        );
+        assert_eq!(
+            validate_stop_mutation_target(
+                &new_session_target,
+                "C:/workspace",
+                Some(session_a.to_string()),
+                Some(11),
+                11,
+                None,
+                ActiveTurnExpectation::Turn {
+                    turn_id: turn_b,
+                    revision: 1,
+                },
+                Some(root_receipt(session_a, turn_b, 1)),
+            )
+            .expect("the exact root receipt owns new-session adoption"),
+            DesktopStopAdmission::Root { generation: 11 },
+        );
+        assert_eq!(
+            validate_stop_mutation_target(
+                &new_session_target,
+                "C:/workspace",
+                None,
+                Some(11),
+                11,
+                None,
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: None,
+                    revision: 0,
+                },
+                Some(root_receipt(session_a, turn_b, 1)),
+            )
+            .expect("same-control receipt owns admission before new-session projection arrives"),
+            DesktopStopAdmission::Root { generation: 11 },
+        );
+        assert!(
+            validate_stop_mutation_target(
+                &new_session_target,
+                "C:/workspace",
+                Some(SessionId::new().to_string()),
+                Some(11),
+                11,
+                None,
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: None,
+                    revision: 0,
+                },
+                Some(root_receipt(session_a, turn_b, 1)),
+            )
+            .is_err(),
+            "a same-generation receipt cannot adopt a different projected session"
+        );
+        assert!(
+            validate_stop_mutation_target(
+                &expected,
+                "C:/workspace",
+                None,
+                Some(11),
+                11,
+                Some("41".to_string()),
+                ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(turn_a),
+                    revision: TEST_ADMISSION_REVISION,
+                },
+                Some(root_receipt(session_a, turn_b, TEST_ADMISSION_REVISION + 1,)),
+            )
+            .is_err(),
+            "an existing-session Root target cannot be adopted through a missing projection"
         );
     }
 
@@ -2913,11 +4679,35 @@ mod tests {
             "agentPath": "/root/review",
             "childSessionId": child_session_id.to_string(),
             "expectedTurnId": turn_id.to_string(),
+            "admissionRevision": "7",
         }))
         .expect("deserialize exact interrupt target");
-        assert_eq!(target.expected_turn_id().expect("turn id"), turn_id);
+        let serialized = serde_json::to_value(&target).expect("serialize exact interrupt target");
         assert_eq!(
-            target.execution_target(),
+            serialized
+                .as_object()
+                .expect("interrupt target object")
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            [
+                "admissionRevision",
+                "agentPath",
+                "childSessionId",
+                "expectedTurnId",
+                "rootSessionId",
+                "workspacePath",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>(),
+        );
+        assert_eq!(target.expected_turn_id().expect("turn id"), turn_id);
+        assert_eq!(target.admission_revision().expect("revision"), 7);
+        assert_eq!(
+            target
+                .execution_target()
+                .expect("canonical execution target"),
             DesktopAgentExecutionTarget {
                 workspace_path: "C:/workspace".to_string(),
                 root_session_id: root_session_id.to_string(),
@@ -2931,10 +4721,220 @@ mod tests {
                 "rootSessionId": root_session_id.to_string(),
                 "agentPath": "/root/review",
                 "childSessionId": child_session_id.to_string(),
+                "expectedTurnId": turn_id.to_string(),
             }))
             .is_err(),
-            "a child interrupt without an exact turn must fail closed"
+            "a child interrupt without an exact admission revision must fail closed"
         );
+        for invalid in [
+            serde_json::json!({
+                "workspacePath": "C:/workspace",
+                "rootSessionId": root_session_id.to_string().to_lowercase(),
+                "agentPath": "/root/review",
+                "childSessionId": child_session_id.to_string(),
+                "expectedTurnId": turn_id.to_string(),
+                "admissionRevision": "7",
+            }),
+            serde_json::json!({
+                "workspacePath": "C:/workspace",
+                "rootSessionId": root_session_id.to_string(),
+                "agentPath": "/root/review",
+                "childSessionId": child_session_id.to_string(),
+                "expectedTurnId": turn_id.to_string().to_lowercase(),
+                "admissionRevision": "7",
+            }),
+            serde_json::json!({
+                "workspacePath": "C:/workspace",
+                "rootSessionId": root_session_id.to_string(),
+                "agentPath": "/root/review",
+                "childSessionId": child_session_id.to_string(),
+                "expectedTurnId": turn_id.to_string(),
+                "admissionRevision": "007",
+            }),
+        ] {
+            let invalid: DesktopAgentInterruptTarget =
+                serde_json::from_value(invalid).expect("deserialize wire shape");
+            assert!(
+                invalid.execution_target().is_err()
+                    || invalid.expected_turn_id().is_err()
+                    || invalid.admission_revision().is_err(),
+                "noncanonical identities and decimal owners must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn background_session_interrupt_requires_the_exact_turn_stop_target() {
+        let session_id = SessionId::new();
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let target = DesktopStopMutationTarget::Turn {
+            workspace_path: "C:/workspace".to_string(),
+            session_id: session_id.to_string(),
+            turn_id: turn_a.to_string(),
+            admission_revision: TEST_ADMISSION_REVISION.to_string(),
+            root_epoch: "11".to_string(),
+        };
+        assert_eq!(
+            validate_background_session_interrupt_target(
+                &target,
+                "C:/workspace",
+                session_id,
+                Some((turn_a, TEST_ADMISSION_REVISION)),
+            )
+            .expect("current A target"),
+            (turn_a, TEST_ADMISSION_REVISION)
+        );
+        assert!(
+            validate_background_session_interrupt_target(
+                &target,
+                "C:/workspace",
+                session_id,
+                Some((turn_b, TEST_ADMISSION_REVISION + 1)),
+            )
+            .is_err(),
+            "an interrupt captured for A must not retarget replacement B"
+        );
+        assert_eq!(
+            validate_background_session_interrupt_target(
+                &target,
+                "C:/workspace",
+                session_id,
+                None,
+            )
+                .expect("terminal crossing defers latest-turn CAS to storage"),
+            (turn_a, TEST_ADMISSION_REVISION)
+        );
+        for stale_target in [
+            DesktopStopMutationTarget::Turn {
+                workspace_path: "C:/other".to_string(),
+                session_id: session_id.to_string(),
+                turn_id: turn_a.to_string(),
+                admission_revision: TEST_ADMISSION_REVISION.to_string(),
+                root_epoch: "11".to_string(),
+            },
+            DesktopStopMutationTarget::Turn {
+                workspace_path: "C:/workspace".to_string(),
+                session_id: SessionId::new().to_string(),
+                turn_id: turn_a.to_string(),
+                admission_revision: TEST_ADMISSION_REVISION.to_string(),
+                root_epoch: "11".to_string(),
+            },
+            DesktopStopMutationTarget::Turn {
+                workspace_path: "C:/workspace".to_string(),
+                session_id: session_id.to_string(),
+                turn_id: "not-a-turn".to_string(),
+                admission_revision: TEST_ADMISSION_REVISION.to_string(),
+                root_epoch: "11".to_string(),
+            },
+            DesktopStopMutationTarget::Turn {
+                workspace_path: "C:/workspace".to_string(),
+                session_id: session_id.to_string(),
+                turn_id: turn_a.to_string(),
+                admission_revision: TEST_ADMISSION_REVISION.to_string(),
+                root_epoch: "011".to_string(),
+            },
+        ] {
+            assert!(
+                validate_background_session_interrupt_target(
+                    &stale_target,
+                    "C:/workspace",
+                    session_id,
+                    Some((turn_a, TEST_ADMISSION_REVISION)),
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            validate_background_session_interrupt_target(
+                &DesktopStopMutationTarget::Root {
+                    workspace_path: "C:/workspace".to_string(),
+                    session_id: Some(session_id.to_string()),
+                    root_generation: "11".to_string(),
+                    latest_turn_id: Some(turn_a.to_string()),
+                    admission_revision: TEST_ADMISSION_REVISION.to_string(),
+                    permission_confirmation_id: None,
+                },
+                "C:/workspace",
+                session_id,
+                Some((turn_a, TEST_ADMISSION_REVISION)),
+            )
+            .is_err()
+        );
+        for invalid in [
+            serde_json::json!({
+                "kind": "turn",
+                "workspacePath": "C:/workspace",
+                "sessionId": null,
+                "turnId": turn_a.to_string(),
+                "admissionRevision": TEST_ADMISSION_REVISION.to_string(),
+                "rootEpoch": "11",
+            }),
+            serde_json::json!({
+                "kind": "turn",
+                "workspacePath": "C:/workspace",
+                "turnId": turn_a.to_string(),
+                "admissionRevision": TEST_ADMISSION_REVISION.to_string(),
+                "rootEpoch": "11",
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<DesktopStopMutationTarget>(invalid).is_err(),
+                "an admitted Turn Stop must require one concrete session owner"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_target_wire_roundtrips_exact_camel_case_for_both_variants() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let targets = [
+            DesktopStopMutationTarget::Root {
+                workspace_path: "C:/workspace".to_string(),
+                session_id: Some(session_id.to_string()),
+                root_generation: "11".to_string(),
+                latest_turn_id: Some(turn_id.to_string()),
+                admission_revision: "7".to_string(),
+                permission_confirmation_id: Some("41".to_string()),
+            },
+            DesktopStopMutationTarget::Turn {
+                workspace_path: "C:/workspace".to_string(),
+                session_id: session_id.to_string(),
+                turn_id: turn_id.to_string(),
+                admission_revision: "7".to_string(),
+                root_epoch: "11".to_string(),
+            },
+        ];
+        for target in &targets {
+            let value = serde_json::to_value(target).expect("serialize exact Stop target");
+            let object = value.as_object().expect("Stop target object");
+            assert!(object.contains_key("workspacePath"));
+            assert!(object.contains_key("sessionId"));
+            assert!(object.contains_key("admissionRevision"));
+            assert!(!object.contains_key("workspace_path"));
+            assert!(!object.contains_key("session_id"));
+            assert!(!object.contains_key("admission_revision"));
+            let parsed = serde_json::from_value::<DesktopStopMutationTarget>(value)
+                .expect("deserialize exact Stop target");
+            assert_eq!(&parsed, target);
+        }
+
+        let legacy_snake_case = serde_json::json!({
+            "kind": "turn",
+            "workspace_path": "C:/workspace",
+            "session_id": session_id.to_string(),
+            "turn_id": turn_id.to_string(),
+            "admission_revision": "7",
+            "root_epoch": "11",
+        });
+        assert!(serde_json::from_value::<DesktopStopMutationTarget>(legacy_snake_case).is_err());
+        let mut unknown = serde_json::to_value(&targets[1]).expect("serialize Turn target");
+        unknown.as_object_mut().expect("Turn target object").insert(
+            "compatibilityFlag".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        assert!(serde_json::from_value::<DesktopStopMutationTarget>(unknown).is_err());
     }
 
     #[test]
@@ -3325,6 +5325,157 @@ mod tests {
             Ok(u64::MAX)
         );
         assert!(parse_permission_confirmation_id("9007199254740993.0").is_err());
+    }
+
+    #[test]
+    fn side_chat_target_requires_exact_ulids_and_decimal_generation() {
+        let owner = SessionId::new();
+        let side_chat = crate::storage::SideChatId::new();
+        assert_eq!(
+            parse_side_chat_target(
+                &owner.to_string(),
+                &side_chat.to_string(),
+                "18446744073709551615",
+            ),
+            Ok((owner, side_chat, u64::MAX))
+        );
+        assert!(parse_side_chat_target("owner", &side_chat.to_string(), "0").is_err());
+        assert!(parse_side_chat_target(&owner.to_string(), "chat", "0").is_err());
+        assert!(parse_side_chat_target(&owner.to_string(), &side_chat.to_string(), "1.0").is_err());
+    }
+
+    #[test]
+    fn side_chat_config_owner_and_catalog_target_reject_owner_generation_and_mode_drift() {
+        let owner = SessionId::new();
+        let other_owner = SessionId::new();
+        assert!(validate_side_chat_config_owner(owner, "7", Some(owner), 7).is_ok());
+        assert!(validate_side_chat_config_owner(owner, "7", Some(other_owner), 7).is_err());
+        assert!(validate_side_chat_config_owner(owner, "7", None, 7).is_err());
+        let generation_conflict = validate_side_chat_config_owner(owner, "8", Some(owner), 7)
+            .expect_err("stale config generation");
+        assert_eq!(
+            generation_conflict.message,
+            "configuration changed before the side chat operation; retry from current settings"
+        );
+        assert!(validate_side_chat_config_owner(owner, "07", Some(owner), 7).is_err());
+
+        let target = SideChatCatalogRequestTarget {
+            owner_session_id: owner,
+            base_url: "http://127.0.0.1:1234".to_string(),
+            metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+            config_generation: 7,
+        };
+        assert!(
+            validate_side_chat_catalog_target(
+                &target,
+                Some(owner),
+                7,
+                ProviderMetadataMode::LmStudioNativeRequired,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_side_chat_catalog_target(
+                &target,
+                Some(owner),
+                7,
+                ProviderMetadataMode::OpenAiCompatibleOnly,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn side_chat_catalog_probe_is_canonical_and_credential_free() {
+        let mut config = ResolvedConfig::default();
+        let metadata_mode = config.model.provider_metadata_mode;
+        let connect_timeout_ms = config.model.connect_timeout_ms;
+        config.model.api_key_env = Some("MAIN_PROVIDER_SECRET".to_string());
+        config
+            .model
+            .extra_headers
+            .insert("X-Main-Secret".to_string(), "secret".to_string());
+        config.model.chat_completions_reasoning_parameters =
+            Some(crate::config::ChatCompletionsReasoningParameters::EffortAndSummary);
+        config.model.reasoning_effort = Some(crate::config::ReasoningEffort::High);
+        config.model.reasoning_summary = ReasoningSummary::Detailed;
+        config.model.temperature = Some(0.5);
+        config.model.top_p = Some(0.8);
+        config.model.top_k = Some(20);
+        config.model.presence_penalty = Some(0.1);
+        config.model.frequency_penalty = Some(0.2);
+        config.model.seed = Some(42);
+        config.model.stop_sequences = vec!["stop".to_string()];
+        config.model.extra_body_json = Some(serde_json::json!({
+            "reasoning": { "effort": "high" },
+            "api_key": "must-not-leak"
+        }));
+
+        let (probe, canonical) =
+            side_chat_catalog_probe_config(config, " http://127.0.0.1:1234/v1/ ")
+                .expect("valid side chat provider endpoint");
+        assert_eq!(canonical, "http://127.0.0.1:1234");
+        assert_eq!(probe.model.base_url, canonical);
+        assert_eq!(probe.model.provider_metadata_mode, metadata_mode);
+        assert_eq!(probe.model.connect_timeout_ms, connect_timeout_ms);
+        assert_eq!(probe.model.api_key_env, None);
+        assert!(probe.model.extra_headers.is_empty());
+        assert_eq!(probe.model.chat_completions_reasoning_parameters, None);
+        assert_eq!(probe.model.reasoning_effort, None);
+        assert_eq!(probe.model.reasoning_summary, ReasoningSummary::None);
+        assert_eq!(probe.model.temperature, None);
+        assert_eq!(probe.model.top_p, None);
+        assert_eq!(probe.model.top_k, None);
+        assert_eq!(probe.model.presence_penalty, None);
+        assert_eq!(probe.model.frequency_penalty, None);
+        assert_eq!(probe.model.seed, None);
+        assert!(probe.model.stop_sequences.is_empty());
+        assert_eq!(probe.model.extra_body_json, None);
+        assert!(
+            side_chat_catalog_probe_config(
+                ResolvedConfig::default(),
+                "http://user:password@127.0.0.1:1234",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn side_chat_catalog_result_uses_main_model_labels_and_typed_load_state() {
+        let owner = SessionId::new();
+        let model = side_chat_catalog_model_projection(ProviderModelInfo {
+            id: "google/gemma-4-12b-qat".to_string(),
+            display_name: Some("Gemma 4 12B QAT".to_string()),
+            context_window: Some(131_072),
+            max_output_tokens: Some(8_192),
+            supports_images: Some(false),
+            supports_tools: Some(false),
+            supports_reasoning: Some(false),
+            max_parallel_predictions: Some(4),
+            load_state: ProviderModelLoadState::Loaded,
+            source: "lm_studio_native".to_string(),
+        });
+        assert_eq!(model.id, "google/gemma-4-12b-qat");
+        assert!(
+            model
+                .label
+                .starts_with("google/gemma-4-12b-qat  [ctx=131072")
+        );
+        assert_eq!(model.load_state, ProviderModelLoadState::Loaded);
+
+        let projection = SideChatCatalogProjection {
+            owner_session_id: owner.to_string(),
+            base_url: "http://127.0.0.1:1234".to_string(),
+            metadata_mode: ProviderMetadataMode::LmStudioNativeRequired,
+            config_generation: "7".to_string(),
+            models: vec![model],
+        };
+        let json = serde_json::to_value(projection).expect("serialize side chat catalog");
+        assert_eq!(json["ownerSessionId"], owner.to_string());
+        assert_eq!(json["baseUrl"], "http://127.0.0.1:1234");
+        assert_eq!(json["metadataMode"], "lm_studio_native_required");
+        assert_eq!(json["configGeneration"], "7");
+        assert_eq!(json["models"][0]["loadState"], "loaded");
     }
 
     #[test]

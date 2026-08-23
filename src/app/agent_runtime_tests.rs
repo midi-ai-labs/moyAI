@@ -316,7 +316,6 @@ fn child_approval_abort_preserves_root_success_commit_and_sibling() {
             max_concurrent_model_requests: 2,
         },
         model_request_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        active_root_turn_owner: Mutex::new(None),
         metadata: Mutex::new(HashMap::new()),
     };
     let confirmation =
@@ -387,7 +386,6 @@ fn detached_child_approval_abort_preserves_sealed_root_success_and_sibling() {
             max_concurrent_model_requests: 2,
         },
         model_request_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-        active_root_turn_owner: Mutex::new(None),
         metadata: Mutex::new(HashMap::new()),
     };
     assert!(root_turn_control.seal_success());
@@ -461,7 +459,6 @@ fn child_approval_abort_remains_exact_despite_a_competing_root_terminal_cause() 
                 max_concurrent_model_requests: 2,
             },
             model_request_gate: Arc::new(tokio::sync::Semaphore::new(2)),
-            active_root_turn_owner: Mutex::new(None),
             metadata: Mutex::new(HashMap::new()),
         };
         assert!(root_turn_control.cancel(existing_cause.clone()));
@@ -571,6 +568,7 @@ async fn wait_agent_returns_immediately_for_steer_queued_before_wait_starts() {
         .session_repo()
         .accept_active_turn_steer(
             root_session.session.id,
+            owner.admission_revision,
             &crate::protocol::SteerTurn {
                 expected_turn_id: owner.turn_id,
                 items: vec![crate::protocol::UserInputItem::Text {
@@ -703,6 +701,7 @@ async fn wait_agent_polls_cross_store_steer_and_delivers_it_to_the_prompt_once()
             .session_repo()
             .accept_active_turn_steer(
                 root_session.session.id,
+                owner.admission_revision,
                 &crate::protocol::SteerTurn {
                     expected_turn_id: owner.turn_id,
                     items: vec![crate::protocol::UserInputItem::Text {
@@ -817,6 +816,7 @@ async fn wait_agent_final_recheck_observes_cross_store_steer_near_timeout() {
             .session_repo()
             .accept_active_turn_steer(
                 owner.session_id,
+                owner.admission_revision,
                 &crate::protocol::SteerTurn {
                     expected_turn_id: owner.turn_id,
                     items: vec![crate::protocol::UserInputItem::Text {
@@ -2506,12 +2506,17 @@ async fn bind_test_root_turn(
         .expect("test root turn admission");
     execution
         .context
-        .bind_durable_turn_owner(admission.admission_id, turn_id)
+        .bind_durable_turn_owner(
+            admission.admission_id,
+            turn_id,
+            admission.admission_revision,
+        )
         .expect("bind test durable turn owner");
     AgentDurableTurnOwner {
         session_id: execution.context.session_id(),
         admission_id: admission.admission_id,
         turn_id,
+        admission_revision: admission.admission_revision,
     }
 }
 
@@ -3294,7 +3299,11 @@ async fn explicit_tree_shutdown_terminalizes_active_child_without_a_completion_h
         .expect("admit child before parent Stop")
         .expect("child admitted");
     context
-        .bind_durable_turn_owner(child_admission.admission_id, child_turn_id)
+        .bind_durable_turn_owner(
+            child_admission.admission_id,
+            child_turn_id,
+            child_admission.admission_revision,
+        )
         .expect("bind child durable owner");
     child_lease
         .set_status(ActiveAgentStatus::Running)
@@ -4539,7 +4548,11 @@ async fn process_restart_rehydrates_durable_child_for_listing_followup_and_name_
         run_service: execution.context.run_service.clone(),
     };
     child_context
-        .bind_durable_turn_owner(child_admission.admission_id, child_turn_id)
+        .bind_durable_turn_owner(
+            child_admission.admission_id,
+            child_turn_id,
+            child_admission.admission_revision,
+        )
         .expect("bind restored child follow-up");
     assert_eq!(
         child_context
@@ -4913,7 +4926,7 @@ async fn durable_running_projection_carries_the_exact_active_turn_from_its_statu
         .expect("running child projection");
     assert_eq!(record.status, AgentStatus::Running);
     assert_eq!(record.active_turn_id, Some(turn_id));
-    assert!(record.can_interrupt);
+    assert!(record.interrupt_target.is_some());
 }
 
 #[tokio::test]
@@ -4992,7 +5005,11 @@ async fn nested_unbound_launch_retains_one_atomically_settled_failed_grandchild(
         .expect("child admission")
         .expect("child admitted");
     child_context
-        .bind_durable_turn_owner(child_admission.admission_id, child_turn_id)
+        .bind_durable_turn_owner(
+            child_admission.admission_id,
+            child_turn_id,
+            child_admission.admission_revision,
+        )
         .expect("bind child durable turn owner");
     let agents_before = tree.control.snapshot().expect("tree before").agents.len();
 
@@ -5537,6 +5554,201 @@ async fn hard_abort_drops_the_whole_exact_worker_before_durable_interruption() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn root_tree_stop_settles_the_remaining_sibling_without_overwriting_an_exact_interrupt() {
+    let (runtime, session, config) = direct_runtime_fixture("root-tree-stop-two-children", 3).await;
+    let root_scope = RunControl::new();
+    let root_execution = runtime
+        .begin_root(
+            &session,
+            captured_turn_config(config),
+            SharedConfirmationPrompt::new(AllowPrompt),
+            root_scope.clone(),
+        )
+        .await
+        .expect("root execution");
+    let _root_owner = bind_test_root_turn(&runtime, &root_execution).await;
+    let tree = root_execution.context.tree.clone();
+    let (child_a, child_a_lease) = tree
+        .control
+        .register_child_with_order(
+            &AgentPath::root(),
+            "child_a",
+            SessionId::new(),
+            Some("already interrupted".to_string()),
+            Some(2),
+        )
+        .expect("child A");
+    let child_a_path = child_a.path.clone();
+    let child_a_control = child_a_lease.run_control();
+    tree.control
+        .cancel_agent(&child_a_path)
+        .expect("exact child A interrupt");
+    tree.control
+        .complete_execution(child_a_lease, InactiveAgentStatus::Interrupted, None)
+        .expect("settle child A locally");
+
+    let (child_b_path, child_b_session, child_b_trigger, child_b_lease) =
+        commit_atomic_child_trigger_without_launch(&runtime, &root_execution.context, "child_b")
+            .await;
+    let child_b_turn = TurnId::new();
+    runtime
+        .store
+        .session_repo()
+        .admit_agent_triggered_turn(child_b_session, child_b_turn, child_b_trigger)
+        .await
+        .expect("child B admission")
+        .expect("child B trigger admitted");
+    let child_b_control = child_b_lease.run_control();
+    let repository = runtime.store.session_repo();
+    let wake_cause = child_b_lease
+        .wake_cause()
+        .expect("child B worker retains its exact trigger owner");
+    let terminal_owner = AgentWorkerTerminalOwner {
+        session_id: child_b_session,
+        wake_cause,
+        lease: Arc::new(Mutex::new(Some(child_b_lease))),
+    };
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let worker = runtime
+        .worker_runtime
+        .spawn(102, move || async move {
+            started_tx.send(()).expect("signal child B worker start");
+            std::future::pending::<()>().await;
+        })
+        .expect("owned child B worker");
+    runtime
+        .install_worker(
+            session.session.id,
+            child_b_path.clone(),
+            worker,
+            terminal_owner,
+        )
+        .unwrap_or_else(|(error, _worker)| panic!("install child B worker: {error}"));
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("child B worker started");
+
+    assert!(
+        repository
+            .durable_terminal_for_turn(child_b_session, child_b_turn)
+            .await
+            .expect("child B terminal lookup")
+            .is_none(),
+        "the exact child A interrupt must leave its live sibling running"
+    );
+    assert!(
+        repository
+            .has_fresh_run_admission(child_b_session)
+            .await
+            .expect("child B admission lookup")
+    );
+
+    assert!(tree.control.interrupt_tree(TurnInterruptionCause::UserStop));
+    root_execution.context.schedule_cancelled_worker_abort();
+    assert!(
+        runtime
+            .session_service
+            .cancel_running_session_tree(session.session.id, TurnInterruptionCause::UserStop,)
+            .await
+            .expect("durable tree Stop")
+    );
+    assert_eq!(
+        child_a_control.cause(),
+        Some(RunCancellationCause::Interruption(
+            TurnInterruptionCause::AgentInterrupted,
+        )),
+        "tree Stop must preserve the exact child first-writer"
+    );
+    assert_eq!(
+        child_b_control.cause(),
+        Some(RunCancellationCause::Interruption(
+            TurnInterruptionCause::TreeStopped,
+        ))
+    );
+    assert_eq!(
+        root_execution.run_control().cause(),
+        Some(RunCancellationCause::Interruption(
+            TurnInterruptionCause::UserStop,
+        ))
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let child_b_settled = repository
+                .durable_terminal_for_turn(child_b_session, child_b_turn)
+                .await
+                .expect("child B terminal lookup")
+                .is_some();
+            let workers_released = runtime
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .tasks
+                .keys()
+                .all(|(root_session_id, path)| {
+                    *root_session_id != session.session.id
+                        || (path != &child_a_path && path != &child_b_path)
+                });
+            if child_b_settled && workers_released {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("tree Stop did not settle the held sibling worker");
+    assert_eq!(
+        repository
+            .durable_terminal_for_turn(child_b_session, child_b_turn)
+            .await
+            .expect("child B terminal lookup")
+            .expect("child B settled terminal")
+            .outcome,
+        TurnTerminalOutcome::Interrupted {
+            cause: TurnInterruptionCause::TreeStopped,
+        }
+    );
+    assert!(
+        !repository
+            .has_fresh_run_admission(child_b_session)
+            .await
+            .expect("child B admission released")
+    );
+    assert!(
+        runtime
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .tasks
+            .keys()
+            .all(|(root_session_id, path)| {
+                *root_session_id != session.session.id || path != &child_b_path
+            }),
+        "tree Stop must not leave the held sibling worker in the registry"
+    );
+
+    let root_result = Ok(terminal_summary(
+        session.session.id,
+        TurnTerminalOutcome::Interrupted {
+            cause: TurnInterruptionCause::UserStop,
+        },
+    ));
+    runtime.complete_root(
+        root_execution,
+        &root_result,
+        Some(RunCancellationCause::Interruption(
+            TurnInterruptionCause::UserStop,
+        )),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.wait_for_tree_quiescence(session.session.id),
+    )
+    .await
+    .expect("tree did not become quiescent")
+    .expect("tree quiescence");
+}
+
 #[tokio::test]
 async fn cancellation_before_admission_settles_interrupted_without_handoff_or_restart_replay() {
     let (runtime, session, config) =
@@ -5833,7 +6045,11 @@ async fn pending_init_child_accepts_mail_before_durable_admission() {
         .expect("child admission")
         .expect("child admission owner");
     child_context
-        .bind_durable_turn_owner(admission.admission_id, child_turn_id)
+        .bind_durable_turn_owner(
+            admission.admission_id,
+            child_turn_id,
+            admission.admission_revision,
+        )
         .expect("bind admitted child owner");
     let delivered = child_context
         .commit_pending_mailbox_delivery(AgentMailboxDeliverySelector::AllPending, 128)
@@ -5958,6 +6174,7 @@ async fn completed_root_exact_stop_is_rejected_before_explicit_tree_stop() {
         )
         .await
         .expect("root execution");
+    let _root_owner = bind_test_root_turn(&runtime, &execution).await;
     let root_turn_control = execution.run_control();
     let tree = execution.context.tree.clone();
     let (_, child_lease) = tree
@@ -5994,7 +6211,7 @@ async fn completed_root_exact_stop_is_rejected_before_explicit_tree_stop() {
     assert_eq!(root_control.cause(), None);
     assert!(!child_cancel.is_cancelled());
     assert!(!tree.control.tree_is_cancelled());
-    assert!(runtime.cancel_tree_for_session(session.session.id, TurnInterruptionCause::UserStop,));
+    assert!(tree.control.interrupt_tree(TurnInterruptionCause::UserStop));
     tokio::time::timeout(Duration::from_secs(1), child_cancel.cancelled())
         .await
         .expect("explicit tree Stop reached the active child while preserving sealed turn success");
@@ -6008,7 +6225,7 @@ async fn completed_root_exact_stop_is_rejected_before_explicit_tree_stop() {
         .is_err(),
         "the stopped child must retain its execution until terminal settlement"
     );
-    assert!(!runtime.cancel_tree_for_session(session.session.id, TurnInterruptionCause::UserStop,));
+    assert!(!tree.control.interrupt_tree(TurnInterruptionCause::UserStop));
     tree.control
         .complete_execution(child_lease, InactiveAgentStatus::Interrupted, None)
         .expect("complete stopped detached child");
@@ -6219,6 +6436,7 @@ async fn durable_root_success_rejects_exact_deferred_stop_before_explicit_tree_s
         )
         .await
         .expect("root execution");
+    let _root_owner = bind_test_root_turn(&runtime, &execution).await;
     let root_turn_control = execution.run_control();
     let tree = execution.context.tree.clone();
     let (_, child_lease) = tree
@@ -6269,7 +6487,7 @@ async fn durable_root_success_rejects_exact_deferred_stop_before_explicit_tree_s
             .expect("root status"),
         AgentStatus::Completed(_)
     ));
-    assert!(runtime.cancel_tree_for_session(session.session.id, TurnInterruptionCause::UserStop,));
+    assert!(tree.control.interrupt_tree(TurnInterruptionCause::UserStop));
     assert!(tree.control.tree_is_cancelled());
     assert!(child_cancel.is_cancelled());
     tree.control
@@ -6657,6 +6875,8 @@ struct DetachedGoalScriptState {
     child_calls: AtomicUsize,
     first_root_turn_finished: AtomicBool,
     child_finished: AtomicBool,
+    defer_child_until_root_terminal: AtomicBool,
+    root_terminal_observed: AtomicBool,
     continuation_saw_child_result: AtomicBool,
     child_waits_for_interrupt: AtomicBool,
     goal_update_emitted: AtomicBool,
@@ -6693,6 +6913,20 @@ impl LlmClient for DetachedGoalScriptClient {
                 if Instant::now() >= deadline {
                     return Err(LlmError::Message(
                         "detached child timed out waiting for the first root turn".to_string(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            while self
+                .state
+                .defer_child_until_root_terminal
+                .load(Ordering::SeqCst)
+                && !self.state.root_terminal_observed.load(Ordering::SeqCst)
+            {
+                if Instant::now() >= deadline {
+                    return Err(LlmError::Message(
+                        "detached child timed out waiting for the durable root terminal"
+                            .to_string(),
                     ));
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7248,7 +7482,6 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
     config.model.supports_tools = true;
     config.model.connect_timeout_ms = 2_000;
     config.model.request_timeout_ms = 5_000;
-    config.model.stream_idle_timeout_ms = 5_000;
     config.model.max_retries = 0;
     config.permissions.access_mode = AccessMode::FullAccess;
     config.multi_agent.enabled = true;
@@ -7338,6 +7571,8 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
                 session_access_mode_adoption: None,
                 agent_confirmation: Some(shared_confirmation.clone()),
                 agent_context: None,
+                admission_kind: crate::app::RunAdmissionKind::NewUserRun,
+                expected_active_turn: crate::session::ActiveTurnExpectation::initial_idle(),
             }),
             &mut renderer,
             &mut prompt,
@@ -7389,6 +7624,8 @@ async fn root_tree_mutation_follows_admission_and_setup_failure_releases_owner()
                 session_access_mode_adoption: None,
                 agent_confirmation: Some(shared_confirmation),
                 agent_context: None,
+                admission_kind: crate::app::RunAdmissionKind::NewUserRun,
+                expected_active_turn: crate::session::ActiveTurnExpectation::initial_idle(),
             }),
             &mut renderer,
             &mut prompt,
@@ -7451,7 +7688,6 @@ async fn goal_less_root_terminal_does_not_implicitly_resume_for_detached_child()
     config.model.supports_tools = true;
     config.model.connect_timeout_ms = 2_000;
     config.model.request_timeout_ms = 5_000;
-    config.model.stream_idle_timeout_ms = 5_000;
     config.model.max_retries = 0;
     config.permissions.access_mode = AccessMode::FullAccess;
     config.multi_agent.enabled = true;
@@ -7497,6 +7733,9 @@ async fn goal_less_root_terminal_does_not_implicitly_resume_for_detached_child()
     };
     let registry = ToolRegistry::core_agent_for_config(&config);
     let script = Arc::new(DetachedGoalScriptState::default());
+    script
+        .defer_child_until_root_terminal
+        .store(true, Ordering::SeqCst);
     let agent_loop = AgentLoop::new(
         Arc::new(DetachedGoalScriptClient {
             state: Arc::clone(&script),
@@ -7550,6 +7789,8 @@ async fn goal_less_root_terminal_does_not_implicitly_resume_for_detached_child()
                     session_access_mode_adoption: None,
                     agent_confirmation: Some(shared_confirmation),
                     agent_context: None,
+                    admission_kind: crate::app::RunAdmissionKind::NewUserRun,
+                    expected_active_turn: crate::session::ActiveTurnExpectation::initial_idle(),
                 }),
                 &mut renderer,
                 &mut prompt,
@@ -7559,6 +7800,7 @@ async fn goal_less_root_terminal_does_not_implicitly_resume_for_detached_child()
         .expect("bounded goal-less continuation")
         .expect("goal-less detached run"),
     );
+    script.root_terminal_observed.store(true, Ordering::SeqCst);
 
     assert_eq!(
         summary.status(),
@@ -7658,7 +7900,6 @@ async fn root_terminal_is_not_recalled_or_rewritten_by_late_child_interrupt() {
     config.model.supports_tools = true;
     config.model.connect_timeout_ms = 2_000;
     config.model.request_timeout_ms = 5_000;
-    config.model.stream_idle_timeout_ms = 5_000;
     config.model.max_retries = 0;
     config.permissions.access_mode = AccessMode::FullAccess;
     config.multi_agent.enabled = true;
@@ -7756,6 +7997,8 @@ async fn root_terminal_is_not_recalled_or_rewritten_by_late_child_interrupt() {
             session_access_mode_adoption: None,
             agent_confirmation: Some(shared_confirmation),
             agent_context: None,
+            admission_kind: crate::app::RunAdmissionKind::NewUserRun,
+            expected_active_turn: crate::session::ActiveTurnExpectation::initial_idle(),
         }),
         &mut renderer,
         &mut prompt,
@@ -7833,7 +8076,6 @@ async fn idle_goal_continuation_uses_explicit_wait_agent_for_detached_child() {
     config.model.supports_tools = true;
     config.model.connect_timeout_ms = 2_000;
     config.model.request_timeout_ms = 5_000;
-    config.model.stream_idle_timeout_ms = 5_000;
     config.model.max_retries = 0;
     config.permissions.access_mode = AccessMode::FullAccess;
     config.multi_agent.enabled = true;
@@ -7931,6 +8173,8 @@ async fn idle_goal_continuation_uses_explicit_wait_agent_for_detached_child() {
                     session_access_mode_adoption: None,
                     agent_confirmation: Some(shared_confirmation),
                     agent_context: None,
+                    admission_kind: crate::app::RunAdmissionKind::NewUserRun,
+                    expected_active_turn: crate::session::ActiveTurnExpectation::initial_idle(),
                 }),
                 &mut renderer,
                 &mut prompt,
@@ -8031,7 +8275,6 @@ async fn proactive_nested_owner_explicitly_waits_and_keeps_tool_parity() {
     config.model.parallel_tool_calls = false;
     config.model.connect_timeout_ms = 2_000;
     config.model.request_timeout_ms = 5_000;
-    config.model.stream_idle_timeout_ms = 5_000;
     config.model.max_retries = 0;
     config.permissions.access_mode = AccessMode::FullAccess;
     config.multi_agent.enabled = true;
@@ -8082,6 +8325,11 @@ async fn proactive_nested_owner_explicitly_waits_and_keeps_tool_parity() {
             source_activity.turn_item.as_ref(),
         )
         .expect("seed source activity");
+    let expected_active_turn = session_service
+        .active_turn_expectation_for_session(root_session.session.id)
+        .await
+        .expect("read exact root admission expectation")
+        .expect("precreated root session");
     let agent_runtime = Arc::new(AgentRuntime::new(store.clone(), session_service.clone()));
     let tool_services = ToolServices {
         edit_safety: crate::edit::EditSafety::default(),
@@ -8144,6 +8392,8 @@ async fn proactive_nested_owner_explicitly_waits_and_keeps_tool_parity() {
                     session_access_mode_adoption: None,
                     agent_confirmation: Some(shared_confirmation),
                     agent_context: None,
+                    admission_kind: crate::app::RunAdmissionKind::NewUserRun,
+                    expected_active_turn,
                 }),
                 &mut renderer,
                 &mut execute_prompt,

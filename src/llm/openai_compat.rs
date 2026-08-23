@@ -42,6 +42,11 @@ pub struct OpenAiCompatClient {
     api_key: Option<String>,
 }
 
+struct StartedResponse {
+    response: reqwest::Response,
+    deadline: OperationDeadline,
+}
+
 impl OpenAiCompatClient {
     pub fn new(api_key: Option<String>) -> Self {
         Self { api_key }
@@ -98,7 +103,7 @@ impl OpenAiCompatClient {
         )?;
         let body = bytes::Bytes::from(body);
 
-        let Some(response) = self
+        let Some(StartedResponse { response, deadline }) = self
             .send_request(&request, "v1/chat/completions", body, &cancel, sink)
             .await?
         else {
@@ -112,16 +117,16 @@ impl OpenAiCompatClient {
         let stream_limits = request.provider_target().stream_limits();
         let mut stream =
             bounded_response_bytes(response, stream_limits.max_raw_bytes).eventsource();
-        let mut stream_budget = ProviderStreamBudget::new(stream_limits);
+        let mut stream_budget = ProviderStreamBudget::new(stream_limits, deadline);
         let mut usage = None;
         let mut saw_terminal_signal = false;
         let mut ended_by_eof = false;
         let mut accumulator = ChatStreamAccumulator::default();
 
         loop {
-            let idle_timeout_ms = request.provider_target().deadlines().stream_idle_timeout_ms;
-            let next_event = if let Some(timeout) = stream_budget.wait_timeout(idle_timeout_ms) {
+            let next_event = if let Some(timeout) = stream_budget.wait_timeout() {
                 tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => {
                         return Ok(LlmResponseSummary {
                             finish_reason: FinishReason::Cancelled,
@@ -133,13 +138,14 @@ impl OpenAiCompatClient {
                         match result {
                             Ok(event) => event,
                             Err(_) => {
-                                return Err(stream_budget.timeout_error(idle_timeout_ms));
+                                return Err(stream_budget.timeout_error());
                             }
                         }
                     }
                 }
             } else {
                 tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => {
                         return Ok(LlmResponseSummary {
                             finish_reason: FinishReason::Cancelled,
@@ -250,7 +256,7 @@ impl OpenAiCompatClient {
             &body,
         )?;
         let body = bytes::Bytes::from(body);
-        let Some(response) = self
+        let Some(StartedResponse { response, deadline }) = self
             .send_request(&request, "v1/responses", body, &cancel, sink)
             .await?
         else {
@@ -264,14 +270,14 @@ impl OpenAiCompatClient {
         let stream_limits = request.provider_target().stream_limits();
         let mut stream =
             bounded_response_bytes(response, stream_limits.max_raw_bytes).eventsource();
-        let mut stream_budget = ProviderStreamBudget::new(stream_limits);
+        let mut stream_budget = ProviderStreamBudget::new(stream_limits, deadline);
         let mut accumulator =
             ResponsesStreamAccumulator::new(stream_limits.max_tool_call_argument_bytes);
 
         loop {
-            let idle_timeout_ms = request.provider_target().deadlines().stream_idle_timeout_ms;
-            let next_event = if let Some(timeout) = stream_budget.wait_timeout(idle_timeout_ms) {
+            let next_event = if let Some(timeout) = stream_budget.wait_timeout() {
                 tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => {
                         return Ok(LlmResponseSummary {
                             finish_reason: FinishReason::Cancelled,
@@ -283,13 +289,14 @@ impl OpenAiCompatClient {
                         match result {
                             Ok(event) => event,
                             Err(_) => {
-                                return Err(stream_budget.timeout_error(idle_timeout_ms));
+                                return Err(stream_budget.timeout_error());
                             }
                         }
                     }
                 }
             } else {
                 tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => {
                         return Ok(LlmResponseSummary {
                             finish_reason: FinishReason::Cancelled,
@@ -380,12 +387,11 @@ impl OpenAiCompatClient {
         body: bytes::Bytes,
         cancel: &CancellationToken,
         trace: &mut ProviderTraceSink<'_>,
-    ) -> Result<Option<reqwest::Response>, LlmError> {
+    ) -> Result<Option<StartedResponse>, LlmError> {
         // Header parsing is a local request preflight. Complete it before an
         // attempt exists so invalid configuration cannot project provider lifecycle.
         let headers = self.request_headers(request)?;
         let deadlines = request.provider_target().deadlines();
-        let deadline = OperationDeadline::new(deadlines.response_start_timeout_ms);
         let client_builder = reqwest::Client::builder();
         let client_builder = if deadlines.connect_timeout_ms > 0 {
             client_builder.connect_timeout(Duration::from_millis(deadlines.connect_timeout_ms))
@@ -399,6 +405,7 @@ impl OpenAiCompatClient {
             .join_api_path(endpoint_path)
             .map_err(|error| LlmError::Message(error.to_string()))?;
         let mut attempt = 1u16;
+        let deadline = OperationDeadline::new(deadlines.request_timeout_ms);
         loop {
             trace.begin_attempt(attempt)?;
             let request_builder = client
@@ -410,18 +417,20 @@ impl OpenAiCompatClient {
 
             let result = if let Some(timeout) = deadline.remaining() {
                 match tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => return Ok(None),
                     result = tokio::time::timeout(timeout, request_builder.send()) => result,
                 } {
                     Ok(result) => result,
                     Err(_) => {
-                        return Err(LlmError::ProviderResponseStartTimeout {
-                            timeout_ms: deadlines.response_start_timeout_ms,
+                        return Err(LlmError::ProviderRequestTimeout {
+                            timeout_ms: deadlines.request_timeout_ms,
                         });
                     }
                 }
             } else {
                 tokio::select! {
+                    biased;
                     _ = cancel.cancelled() => return Ok(None),
                     result = request_builder.send() => result,
                 }
@@ -431,16 +440,10 @@ impl OpenAiCompatClient {
                 Ok(response) => {
                     trace.phase(ProviderPhase::HeadersReceived)?;
                     if response.status().is_success() {
-                        return Ok(Some(response));
+                        return Ok(Some(StartedResponse { response, deadline }));
                     }
-                    let stream_limits = request.provider_target().stream_limits();
-                    let Some(failure) = parse_response_failure_until_cancelled(
-                        response,
-                        cancel,
-                        deadlines.stream_idle_timeout_ms,
-                        stream_limits.max_duration_ms,
-                    )
-                    .await
+                    let Some(failure) =
+                        parse_response_failure_until_cancelled(response, cancel, &deadline).await?
                     else {
                         return Ok(None);
                     };
@@ -460,8 +463,8 @@ impl OpenAiCompatClient {
                         if cancel.is_cancelled() {
                             return Ok(None);
                         }
-                        return Err(LlmError::ProviderResponseStartTimeout {
-                            timeout_ms: deadlines.response_start_timeout_ms,
+                        return Err(LlmError::ProviderRequestTimeout {
+                            timeout_ms: deadlines.request_timeout_ms,
                         });
                     }
                     attempt += 1;
@@ -685,6 +688,9 @@ impl<'a> ProviderTraceSink<'a> {
                 LlmError::Http(error) if error.is_connect() => {
                     (ProviderFailureKind::Connect, None, None)
                 }
+                LlmError::ProviderRequestTimeout { .. } => {
+                    (ProviderFailureKind::RequestTimeout, None, None)
+                }
                 LlmError::ProviderResponseStartTimeout { .. } => {
                     (ProviderFailureKind::ResponseStartTimeout, None, None)
                 }
@@ -740,19 +746,24 @@ impl LlmEventSink for ProviderTraceSink<'_> {
 
 #[derive(Debug, Clone, Copy)]
 struct OperationDeadline {
-    deadline: Option<Instant>,
+    started_at: Instant,
+    timeout: Option<Duration>,
+    timeout_ms: u64,
 }
 
 impl OperationDeadline {
     fn new(timeout_ms: u64) -> Self {
+        let started_at = Instant::now();
         Self {
-            deadline: (timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms)),
+            started_at,
+            timeout: (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms)),
+            timeout_ms,
         }
     }
 
     fn remaining(self) -> Option<Duration> {
-        self.deadline
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        self.timeout
+            .map(|timeout| timeout.saturating_sub(self.started_at.elapsed()))
     }
 }
 
@@ -796,52 +807,54 @@ fn parse_response_failure_body(
 async fn read_provider_failure_body_bounded(
     response: reqwest::Response,
     cancel: &CancellationToken,
-    idle_timeout_ms: u64,
-    max_duration_ms: u64,
-) -> Option<(Vec<u8>, bool)> {
+    deadline: &OperationDeadline,
+) -> Result<Option<(Vec<u8>, bool)>, LlmError> {
     let declared_length = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok());
     let mut stream = response.bytes_stream();
     let mut body = Vec::with_capacity(PROVIDER_FAILURE_BODY_LIMIT_BYTES.min(8 * 1024));
-    let started_at = Instant::now();
     loop {
-        let next = if let Some(timeout) =
-            bounded_wait_timeout(started_at, idle_timeout_ms, max_duration_ms)
-        {
+        let next = if let Some(timeout) = deadline.remaining() {
             tokio::select! {
-                _ = cancel.cancelled() => return None,
+                biased;
+                _ = cancel.cancelled() => return Ok(None),
                 result = tokio::time::timeout(timeout, stream.next()) => match result {
                     Ok(next) => next,
-                    Err(_) => return Some((body, true)),
+                    Err(_) => {
+                        return Err(LlmError::ProviderRequestTimeout {
+                            timeout_ms: deadline.timeout_ms,
+                        });
+                    }
                 },
             }
         } else {
             tokio::select! {
-                _ = cancel.cancelled() => return None,
+                biased;
+                _ = cancel.cancelled() => return Ok(None),
                 next = stream.next() => next,
             }
         };
         let Some(chunk) = next else {
-            return Some((body, false));
+            return Ok(Some((body, false)));
         };
         let Ok(chunk) = chunk else {
-            return Some((body, true));
+            return Ok(Some((body, true)));
         };
         let remaining = PROVIDER_FAILURE_BODY_LIMIT_BYTES.saturating_sub(body.len());
         if remaining == 0 {
-            return Some((body, true));
+            return Ok(Some((body, true)));
         }
         let retained = remaining.min(chunk.len());
         body.extend_from_slice(&chunk[..retained]);
         if retained < chunk.len() {
-            return Some((body, true));
+            return Ok(Some((body, true)));
         }
         if declared_length == Some(body.len()) {
-            return Some((body, false));
+            return Ok(Some((body, false)));
         }
         if body.len() == PROVIDER_FAILURE_BODY_LIMIT_BYTES {
-            return Some((body, true));
+            return Ok(Some((body, true)));
         }
     }
 }
@@ -849,38 +862,19 @@ async fn read_provider_failure_body_bounded(
 async fn parse_response_failure_until_cancelled(
     response: reqwest::Response,
     cancel: &CancellationToken,
-    idle_timeout_ms: u64,
-    max_duration_ms: u64,
-) -> Option<ResponseFailure> {
+    deadline: &OperationDeadline,
+) -> Result<Option<ResponseFailure>, LlmError> {
     let status = response.status();
-    let (body, body_was_truncated) =
-        read_provider_failure_body_bounded(response, cancel, idle_timeout_ms, max_duration_ms)
-            .await?;
-    Some(parse_response_failure_body(
+    let Some((body, body_was_truncated)) =
+        read_provider_failure_body_bounded(response, cancel, deadline).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(parse_response_failure_body(
         status,
         &body,
         body_was_truncated,
-    ))
-}
-
-fn bounded_wait_timeout(
-    started_at: Instant,
-    idle_timeout_ms: u64,
-    max_duration_ms: u64,
-) -> Option<Duration> {
-    let idle = (idle_timeout_ms > 0).then(|| Duration::from_millis(idle_timeout_ms));
-    let absolute = (max_duration_ms > 0)
-        .then(|| Duration::from_millis(max_duration_ms).saturating_sub(started_at.elapsed()));
-    match (idle, absolute) {
-        (Some(idle), Some(absolute)) => Some(idle.min(absolute)),
-        (Some(idle), None) => Some(idle),
-        (None, Some(absolute)) => Some(absolute),
-        (None, None) => None,
-    }
-}
-
-fn stream_idle_timeout_error(timeout_ms: u64) -> LlmError {
-    LlmError::ProviderStreamIdleTimeout { timeout_ms }
+    )))
 }
 
 fn bounded_response_bytes(
@@ -904,45 +898,31 @@ fn bounded_response_bytes(
 
 struct ProviderStreamBudget {
     limits: crate::config::ProviderStreamLimits,
-    started_at: Instant,
+    deadline: OperationDeadline,
     event_count: u64,
     tool_calls: HashSet<String>,
     tool_argument_bytes: HashMap<String, u64>,
 }
 
 impl ProviderStreamBudget {
-    fn new(limits: crate::config::ProviderStreamLimits) -> Self {
+    fn new(limits: crate::config::ProviderStreamLimits, deadline: OperationDeadline) -> Self {
+        debug_assert_eq!(limits.max_duration_ms, deadline.timeout_ms);
         Self {
             limits,
-            started_at: Instant::now(),
+            deadline,
             event_count: 0,
             tool_calls: HashSet::new(),
             tool_argument_bytes: HashMap::new(),
         }
     }
 
-    fn wait_timeout(&self, idle_timeout_ms: u64) -> Option<Duration> {
-        bounded_wait_timeout(
-            self.started_at,
-            idle_timeout_ms,
-            self.limits.max_duration_ms,
-        )
+    fn wait_timeout(&self) -> Option<Duration> {
+        self.deadline.remaining()
     }
 
-    fn timeout_error(&self, idle_timeout_ms: u64) -> LlmError {
-        let elapsed_ms = self
-            .started_at
-            .elapsed()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
-        if self.limits.max_duration_ms > 0 && elapsed_ms >= self.limits.max_duration_ms {
-            LlmError::ProviderStreamLimitExceeded {
-                surface: ProviderStreamLimit::DurationMs,
-                actual: elapsed_ms,
-                maximum: self.limits.max_duration_ms,
-            }
-        } else {
-            stream_idle_timeout_error(idle_timeout_ms)
+    fn timeout_error(&self) -> LlmError {
+        LlmError::ProviderRequestTimeout {
+            timeout_ms: self.limits.max_duration_ms,
         }
     }
 
@@ -1141,8 +1121,11 @@ async fn sleep_retry_delay_until_deadline(
         return false;
     }
     tokio::select! {
+        biased;
         _ = cancel.cancelled() => false,
-        _ = tokio::time::sleep(sleep_for) => deadline.deadline.is_none_or(|end| Instant::now() < end),
+        _ = tokio::time::sleep(sleep_for) => deadline
+            .remaining()
+            .is_none_or(|remaining| !remaining.is_zero()),
     }
 }
 
@@ -1956,14 +1939,15 @@ mod tests {
     use axum::response::Response;
     use axum::routing::post;
     use axum::{Json, Router};
+    use futures_util::StreamExt;
     use serde_json::{Value, json};
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        ChatStreamAccumulator, OpenAiCompatClient, PartialToolCall, ProviderStreamBudget,
-        ProviderStreamBudgetStage, parse_finish_reason, resolve_finish_reason, retry_delay_ms,
-        to_openai_request, to_openai_request_with_reasoning, to_usage,
-        validate_streamed_tool_calls,
+        ChatStreamAccumulator, OpenAiCompatClient, OperationDeadline, PartialToolCall,
+        ProviderStreamBudget, ProviderStreamBudgetStage, parse_finish_reason,
+        resolve_finish_reason, retry_delay_ms, to_openai_request, to_openai_request_with_reasoning,
+        to_usage, validate_streamed_tool_calls,
     };
     use crate::config::model::{
         ChatCompletionsReasoningParameters, ProviderApiMode, ProviderReasoningCapability,
@@ -1991,6 +1975,10 @@ mod tests {
     ) -> ProviderTarget {
         ProviderTarget::new(endpoint, model, metadata_mode, api_mode, deadlines)
             .expect("provider target")
+    }
+
+    fn fresh_stream_budget(limits: ProviderStreamLimits) -> ProviderStreamBudget {
+        ProviderStreamBudget::new(limits, OperationDeadline::new(limits.max_duration_ms))
     }
 
     fn replace_provider_endpoint(request: &mut ChatRequest, endpoint: &str) {
@@ -2040,8 +2028,7 @@ mod tests {
             model.provider_metadata_mode,
             ProviderApiMode::ChatCompletions,
             ProviderDeadlines {
-                response_start_timeout_ms: 30_000,
-                stream_idle_timeout_ms: 300_000,
+                request_timeout_ms: 30_000,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 0,
             },
@@ -2082,8 +2069,7 @@ mod tests {
             model.provider_metadata_mode,
             ProviderApiMode::ChatCompletions,
             ProviderDeadlines {
-                response_start_timeout_ms: 30_000,
-                stream_idle_timeout_ms: 300_000,
+                request_timeout_ms: 30_000,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 0,
             },
@@ -2213,8 +2199,7 @@ mod tests {
             model.provider_metadata_mode,
             ProviderApiMode::ChatCompletions,
             ProviderDeadlines {
-                response_start_timeout_ms: 30_000,
-                stream_idle_timeout_ms: 300_000,
+                request_timeout_ms: 30_000,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 0,
             },
@@ -2361,6 +2346,19 @@ mod tests {
         assert_eq!(typed_body["reasoning_effort"], "medium");
         assert!(typed_body.get("reasoning_summary").is_none());
         assert_eq!(typed_body["num_ctx"], 8192);
+
+        let disabled_thinking_body = to_openai_request_with_reasoning(
+            &request,
+            Some(&ReasoningRequest {
+                effort: Some(ReasoningEffort::None),
+                summary: ReasoningSummary::None,
+            }),
+            ProviderReasoningCapability::ChatCompletions {
+                parameters: ChatCompletionsReasoningParameters::EffortOnly,
+            },
+        )
+        .expect("typed none reasoning effort owns the disable wire field");
+        assert_eq!(disabled_thinking_body["reasoning_effort"], "none");
     }
 
     #[test]
@@ -2411,7 +2409,7 @@ mod tests {
     #[test]
     fn invalid_terminal_chat_chunks_restore_accumulator_and_budget_state() {
         let mut accumulator = ChatStreamAccumulator::default();
-        let mut budget = ProviderStreamBudget::new(ProviderStreamLimits::product_default());
+        let mut budget = fresh_stream_budget(ProviderStreamLimits::product_default());
         let initial = serde_json::from_value(json!({
             "choices": [{
                 "index": 0,
@@ -2461,8 +2459,7 @@ mod tests {
         assert_eq!(budget.tool_argument_bytes.get("chat:0"), Some(&2));
 
         let mut incomplete_accumulator = ChatStreamAccumulator::default();
-        let mut incomplete_budget =
-            ProviderStreamBudget::new(ProviderStreamLimits::product_default());
+        let mut incomplete_budget = fresh_stream_budget(ProviderStreamLimits::product_default());
         let invalid_tool_terminal = serde_json::from_value(json!({
             "choices": [{
                 "index": 0,
@@ -2496,7 +2493,7 @@ mod tests {
         const DELTA_COUNT: usize = 1_024;
         let mut limits = ProviderStreamLimits::product_default();
         limits.max_tool_call_argument_bytes = DELTA_COUNT as u64;
-        let mut budget = ProviderStreamBudget::new(limits);
+        let mut budget = fresh_stream_budget(limits);
         let mut accumulator = ChatStreamAccumulator::default();
         let initial = serde_json::from_value(json!({
             "choices": [{
@@ -2823,8 +2820,7 @@ mod tests {
         replace_provider_deadlines(
             &mut request,
             ProviderDeadlines {
-                response_start_timeout_ms: 500,
-                stream_idle_timeout_ms: 5_000,
+                request_timeout_ms: 500,
                 connect_timeout_ms: 200,
                 max_connect_retries: 0,
             },
@@ -4187,11 +4183,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_http_failure_body_uses_post_header_budget_not_response_start_timeout() {
-        let (base_url, request_count, server) = start_delayed_fixture_with_status(
+    async fn stalled_http_failure_body_consumes_the_shared_request_deadline() {
+        let (base_url, request_count, server) = start_split_delayed_fixture_with_status(
             "late failure details".to_string(),
-            Duration::from_secs(1),
-            false,
+            Duration::from_millis(300),
+            Duration::from_millis(300),
             StatusCode::INTERNAL_SERVER_ERROR,
         )
         .await;
@@ -4204,8 +4200,7 @@ mod tests {
         replace_provider_deadlines(
             &mut request,
             ProviderDeadlines {
-                response_start_timeout_ms: 500,
-                stream_idle_timeout_ms: 30,
+                request_timeout_ms: 500,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 2,
             },
@@ -4216,14 +4211,15 @@ mod tests {
         let error = client
             .stream_chat(request, CancellationToken::new(), &mut sink)
             .await
-            .expect_err("received HTTP failure must remain a status rejection");
+            .expect_err("the shared deadline must include HTTP failure body reading");
         server.abort();
 
         let failure = error.provider_failure().expect("typed provider failure");
-        assert_eq!(failure.kind, ProviderFailureKind::HttpStatus);
+        assert_eq!(failure.kind, ProviderFailureKind::RequestTimeout);
         assert_eq!(failure.phase, ProviderPhase::HeadersReceived);
-        assert_eq!(failure.status, Some(500));
-        assert!(!error.to_string().contains("response-start deadline"));
+        assert_eq!(failure.status, None);
+        assert!(!failure.message.contains("late failure details"));
+        assert!(error.to_string().contains("request timed out after 500ms"));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert!(sink.events.is_empty());
         assert_eq!(
@@ -4257,8 +4253,7 @@ mod tests {
         replace_provider_deadlines(
             &mut request,
             ProviderDeadlines {
-                response_start_timeout_ms: 30,
-                stream_idle_timeout_ms: 1_000,
+                request_timeout_ms: 30,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 2,
             },
@@ -4274,7 +4269,7 @@ mod tests {
 
         assert_eq!(
             error.provider_failure().map(|failure| failure.kind),
-            Some(ProviderFailureKind::ResponseStartTimeout)
+            Some(ProviderFailureKind::RequestTimeout)
         );
         assert_eq!(
             error.provider_failure().map(|failure| failure.phase),
@@ -4299,7 +4294,210 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_idle_timeout_is_not_retried() {
+    async fn chat_completions_reuses_response_start_deadline_until_stream_terminal() {
+        assert_response_start_time_is_charged_to_stream_deadline(ProviderApiMode::ChatCompletions)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn responses_reuses_response_start_deadline_until_stream_terminal() {
+        assert_response_start_time_is_charged_to_stream_deadline(ProviderApiMode::Responses).await;
+    }
+
+    #[tokio::test]
+    async fn responses_cancellation_preempts_the_remaining_request_deadline() {
+        let response = responses_sse([json!({
+            "type": "response.completed",
+            "response": { "id": "cancelled_before_terminal" }
+        })]);
+        let (base_url, request_count, server) =
+            start_delayed_fixture(response, Duration::from_millis(500), false).await;
+        let mut request = responses_fixture_request(
+            &base_url,
+            vec![ModelMessage::User {
+                content: "Cancel before the deadline".to_string(),
+            }],
+        );
+        replace_provider_deadlines(
+            &mut request,
+            ProviderDeadlines {
+                request_timeout_ms: 200,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 2,
+            },
+        );
+        let cancel = CancellationToken::new();
+        let cancel_after_headers = cancel.clone();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_after_headers.cancel();
+        });
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let summary = client
+            .stream_chat(request, cancel, &mut sink)
+            .await
+            .expect("cancellation must win over the remaining deadline");
+        cancel_task.await.expect("cancel task");
+        server.abort();
+
+        assert_eq!(summary.finish_reason, FinishReason::Cancelled);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert!(sink.events.is_empty());
+        assert!(
+            sink.phases
+                .iter()
+                .any(|event| event.phase == ProviderPhase::HeadersReceived)
+        );
+        assert!(matches!(
+            sink.phases.last(),
+            Some(ProviderPhaseEvent {
+                phase: ProviderPhase::ProviderTerminal,
+                terminal_status: Some(ProviderTerminalStatus::Cancelled),
+                failure: None,
+                ..
+            })
+        ));
+    }
+
+    async fn assert_response_start_time_is_charged_to_stream_deadline(api_mode: ProviderApiMode) {
+        const REQUEST_TIMEOUT_MS: u64 = 400;
+        let (first_progress, terminal) = match api_mode {
+            ProviderApiMode::ChatCompletions => (
+                format!(
+                    "data: {}\n\n",
+                    json!({
+                        "choices": [{
+                            "index": 0,
+                            "delta": { "content": "too late" },
+                            "finish_reason": null
+                        }]
+                    })
+                ),
+                [
+                    format!(
+                        "data: {}\n\n",
+                        json!({
+                            "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop"
+                            }]
+                        })
+                    ),
+                    "data: [DONE]\n\n".to_string(),
+                ]
+                .concat(),
+            ),
+            ProviderApiMode::Responses => (
+                responses_sse([json!({
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_too_late",
+                    "output_index": 0,
+                    "delta": "too late"
+                })]),
+                responses_sse([
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "type": "message",
+                            "id": "msg_too_late",
+                            "role": "assistant",
+                            "content": [{ "type": "output_text", "text": "too late" }]
+                        }
+                    }),
+                    json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_too_late",
+                            "output": [{
+                                "type": "message",
+                                "id": "msg_too_late",
+                                "role": "assistant",
+                                "content": [{ "type": "output_text", "text": "too late" }]
+                            }]
+                        }
+                    }),
+                ]),
+            ),
+        };
+        let (base_url, request_count, server) = start_staged_delayed_fixture(
+            vec![
+                (Duration::from_millis(100), first_progress),
+                (Duration::from_millis(250), terminal),
+            ],
+            Duration::from_millis(100),
+        )
+        .await;
+        let mut request = match api_mode {
+            ProviderApiMode::ChatCompletions => {
+                let mut request = reasoning_fixture_request();
+                replace_provider_endpoint(&mut request, &base_url);
+                request
+            }
+            ProviderApiMode::Responses => responses_fixture_request(
+                &base_url,
+                vec![ModelMessage::User {
+                    content: "Use one request deadline".to_string(),
+                }],
+            ),
+        };
+        replace_provider_deadlines(
+            &mut request,
+            ProviderDeadlines {
+                request_timeout_ms: REQUEST_TIMEOUT_MS,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 2,
+            },
+        );
+        assert_eq!(
+            request.provider_target().stream_limits().max_duration_ms,
+            REQUEST_TIMEOUT_MS
+        );
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("streaming must consume the response-start portion of the same deadline");
+        server.abort();
+
+        let failure = error.provider_failure().expect("typed provider failure");
+        assert_eq!(failure.kind, ProviderFailureKind::RequestTimeout);
+        assert_eq!(failure.phase, ProviderPhase::FirstProgress);
+        assert!(matches!(
+            error,
+            LlmError::ProviderFailure { source, .. }
+                if matches!(
+                    *source,
+                    LlmError::ProviderRequestTimeout {
+                        timeout_ms: REQUEST_TIMEOUT_MS,
+                    }
+                )
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert!(!sink.events.is_empty());
+        assert_eq!(
+            sink.phases
+                .iter()
+                .map(|event| event.phase)
+                .collect::<Vec<_>>(),
+            vec![
+                ProviderPhase::AttemptStarted,
+                ProviderPhase::RequestInFlight,
+                ProviderPhase::HeadersReceived,
+                ProviderPhase::FirstProgress,
+                ProviderPhase::LastProgress,
+                ProviderPhase::ProviderTerminal,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn post_header_request_deadline_is_not_retried() {
         let response = responses_sse([json!({
             "type": "response.completed",
             "response": { "id": "resp_too_late" }
@@ -4315,8 +4513,7 @@ mod tests {
         replace_provider_deadlines(
             &mut request,
             ProviderDeadlines {
-                response_start_timeout_ms: 1_000,
-                stream_idle_timeout_ms: 30,
+                request_timeout_ms: 30,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 2,
             },
@@ -4327,12 +4524,12 @@ mod tests {
         let error = client
             .stream_chat(request, CancellationToken::new(), &mut sink)
             .await
-            .expect_err("stream idle timeout must terminate the generation request");
+            .expect_err("the shared request deadline must terminate the generation request");
         server.abort();
 
         assert_eq!(
             error.provider_failure().map(|failure| failure.kind),
-            Some(ProviderFailureKind::StreamIdleTimeout)
+            Some(ProviderFailureKind::RequestTimeout)
         );
         assert_eq!(
             error.provider_failure().map(|failure| failure.phase),
@@ -4340,6 +4537,14 @@ mod tests {
         );
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert!(sink.events.is_empty());
+        assert!(matches!(
+            error,
+            LlmError::ProviderFailure { source, .. }
+                if matches!(
+                    *source,
+                    LlmError::ProviderRequestTimeout { timeout_ms: 30 }
+                )
+        ));
         assert_eq!(
             sink.phases
                 .iter()
@@ -4360,7 +4565,7 @@ mod tests {
         limits.max_events = 1;
         limits.max_tool_calls = 1;
         limits.max_tool_call_argument_bytes = 4;
-        let mut budget = super::ProviderStreamBudget::new(limits);
+        let mut budget = fresh_stream_budget(limits);
 
         budget.record_event().expect("first event");
         assert!(matches!(
@@ -4482,7 +4687,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn absolute_stream_duration_terminates_active_operation_without_reposting() {
+    async fn shared_request_deadline_terminates_active_stream_without_reposting() {
         let response = responses_sse([json!({
             "type": "response.completed",
             "response": { "id": "too_late" }
@@ -4498,24 +4703,18 @@ mod tests {
         replace_provider_deadlines(
             &mut request,
             ProviderDeadlines {
-                response_start_timeout_ms: 1_000,
-                stream_idle_timeout_ms: 1_000,
+                request_timeout_ms: 30,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 2,
             },
         );
-        let mut provider = request.provider_target().clone();
-        let mut limits = ProviderStreamLimits::product_default();
-        limits.max_duration_ms = 30;
-        provider.replace_stream_limits(limits);
-        request.replace_provider_target(provider);
         let client = OpenAiCompatClient::new(None);
         let mut sink = RecordingLlmEventSink::default();
 
         let error = client
             .stream_chat(request, CancellationToken::new(), &mut sink)
             .await
-            .expect_err("absolute stream duration must be bounded");
+            .expect_err("the shared request deadline must bound the active stream");
         server.abort();
 
         assert!(matches!(
@@ -4523,10 +4722,7 @@ mod tests {
             LlmError::ProviderFailure { source, .. }
                 if matches!(
                     *source,
-                    LlmError::ProviderStreamLimitExceeded {
-                        surface: ProviderStreamLimit::DurationMs,
-                        ..
-                    }
+                    LlmError::ProviderRequestTimeout { timeout_ms: 30 }
                 )
         ));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
@@ -4641,9 +4837,8 @@ mod tests {
     #[derive(Clone)]
     struct DelayedFixtureState {
         request_count: Arc<AtomicUsize>,
-        response: Arc<String>,
-        delay: Duration,
-        delay_before_headers: bool,
+        response_chunks: Arc<Vec<(Duration, String)>>,
+        header_delay: Duration,
         status: StatusCode,
     }
 
@@ -4786,12 +4981,42 @@ mod tests {
         delay_before_headers: bool,
         status: StatusCode,
     ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let (header_delay, body_delay) = if delay_before_headers {
+            (delay, Duration::ZERO)
+        } else {
+            (Duration::ZERO, delay)
+        };
+        start_split_delayed_fixture_with_status(response, header_delay, body_delay, status).await
+    }
+
+    async fn start_split_delayed_fixture_with_status(
+        response: String,
+        header_delay: Duration,
+        body_delay: Duration,
+        status: StatusCode,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        start_staged_delayed_fixture_with_status(vec![(body_delay, response)], header_delay, status)
+            .await
+    }
+
+    async fn start_staged_delayed_fixture(
+        response_chunks: Vec<(Duration, String)>,
+        header_delay: Duration,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        start_staged_delayed_fixture_with_status(response_chunks, header_delay, StatusCode::OK)
+            .await
+    }
+
+    async fn start_staged_delayed_fixture_with_status(
+        response_chunks: Vec<(Duration, String)>,
+        header_delay: Duration,
+        status: StatusCode,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let request_count = Arc::new(AtomicUsize::new(0));
         let state = DelayedFixtureState {
             request_count: request_count.clone(),
-            response: Arc::new(response),
-            delay,
-            delay_before_headers,
+            response_chunks: Arc::new(response_chunks),
+            header_delay,
             status,
         };
         let app = Router::new()
@@ -4815,21 +5040,19 @@ mod tests {
         Json(_request): Json<Value>,
     ) -> Response {
         state.request_count.fetch_add(1, Ordering::SeqCst);
-        if state.delay_before_headers {
-            tokio::time::sleep(state.delay).await;
-            return Response::builder()
-                .status(state.status)
-                .header(CONTENT_TYPE, "text/event-stream")
-                .body(Body::from(state.response.as_str().to_string()))
-                .expect("delayed-header fixture response");
+        if !state.header_delay.is_zero() {
+            tokio::time::sleep(state.header_delay).await;
         }
 
-        let response = state.response.as_str().to_string();
-        let delay = state.delay;
-        let body = Body::from_stream(futures_util::stream::once(async move {
-            tokio::time::sleep(delay).await;
-            Ok::<Bytes, Infallible>(Bytes::from(response))
-        }));
+        let response_chunks = state.response_chunks.as_ref().clone();
+        let body = Body::from_stream(futures_util::stream::iter(response_chunks).then(
+            |(delay, response)| async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                Ok::<Bytes, Infallible>(Bytes::from(response))
+            },
+        ));
         Response::builder()
             .status(state.status)
             .header(CONTENT_TYPE, "text/event-stream")
@@ -4863,8 +5086,7 @@ mod tests {
             model.provider_metadata_mode,
             ProviderApiMode::Responses,
             ProviderDeadlines {
-                response_start_timeout_ms: 5_000,
-                stream_idle_timeout_ms: 5_000,
+                request_timeout_ms: 5_000,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 0,
             },
@@ -4901,8 +5123,7 @@ mod tests {
             model.provider_metadata_mode,
             ProviderApiMode::ChatCompletions,
             ProviderDeadlines {
-                response_start_timeout_ms: 30_000,
-                stream_idle_timeout_ms: 300_000,
+                request_timeout_ms: 30_000,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 0,
             },

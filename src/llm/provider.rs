@@ -105,6 +105,8 @@ pub enum ProviderTerminalStatus {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFailureKind {
     Connect,
+    RequestTimeout,
+    // Kept for decoding provider traces written before the unified request deadline.
     ResponseStartTimeout,
     StreamIdleTimeout,
     HttpStatus,
@@ -199,6 +201,18 @@ mod tests {
             serde_json::from_str::<ProviderFailureKind>(&encoded)
                 .expect("deserialize generation failure kind"),
             ProviderFailureKind::Generation
+        );
+    }
+
+    #[test]
+    fn unified_request_timeout_failure_kind_has_a_stable_wire_name() {
+        let encoded = serde_json::to_string(&ProviderFailureKind::RequestTimeout)
+            .expect("serialize request timeout failure kind");
+        assert_eq!(encoded, "\"request_timeout\"");
+        assert_eq!(
+            serde_json::from_str::<ProviderFailureKind>(&encoded)
+                .expect("deserialize request timeout failure kind"),
+            ProviderFailureKind::RequestTimeout
         );
     }
 }

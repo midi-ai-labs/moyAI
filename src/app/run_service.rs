@@ -18,7 +18,7 @@ use crate::agent::{AgentLoop, AgentRunRequest};
 use crate::app::agent_runtime::{AgentRuntimeContinuationOutcome, AgentRuntimeExecution};
 use crate::app::session_title::{derive_session_title, is_placeholder_session_title};
 use crate::app::{
-    AppCommand, ReviewRequest, RunConfigInput, RunRequest, SessionArchiveRequest,
+    AppCommand, ReviewRequest, RunAdmissionKind, RunConfigInput, RunRequest, SessionArchiveRequest,
     SessionEventsRequest, SessionForkRequest, SessionGoalClearRequest, SessionGoalGetRequest,
     SessionGoalSetRequest, SessionHistoryRequest, SessionIdleAdmissionRequest,
     SessionInterruptRequest, SessionListRequest, SessionLoadedRequest, SessionReadRequest,
@@ -40,14 +40,18 @@ use crate::protocol::{
     ProtocolEventStore, ProtocolRecordingSink, SteerTurn, UserInputItem, UserTurn,
 };
 use crate::runtime::{
-    GRACEFUL_TASK_ABORT_TIMEOUT, LocalTaskExecutor, OwnedTaskHandle, RunCancellationCause,
-    RunControl, RunEventSink, SessionRuntimeEventHub,
+    ActiveRunInterruptOutcome, GRACEFUL_TASK_ABORT_TIMEOUT, LocalTaskExecutor, OwnedTaskHandle,
+    RootAdmissionReceipt, RootAdmissionSettlement, RootAdmissionStopPlan,
+    RootAdmissionStopSealOutcome, RootExecutionLocalStop, RootExecutionStopDisposition,
+    RunCancelOutcome, RunCancellationCause, RunControl, RunEventSink, SessionRuntimeEventHub,
 };
 use crate::session::{
-    AdmissionId, DispatchTransformKind, ImagePart, PromptDispatchPart, RunSummary,
-    SessionModelParameters, SessionRecord, SessionRepository, SessionSelector,
-    SessionSettingsPatch, SessionStartRequest, SessionStatus, ThreadGoalClearResult,
-    ThreadGoalGetResult, ThreadGoalSetResult, ThreadGoalStatus, validate_thread_goal_objective,
+    ActiveTurnExpectation, AdmissionId, DispatchTransformKind,
+    ExactExecutionInterruptRequestOutcome, ExactRootExecutionValidation, ImagePart,
+    PromptDispatchPart, RunSummary, SessionModelParameters, SessionRecord, SessionRepository,
+    SessionSelector, SessionSettingsPatch, SessionStartRequest, SessionStatus,
+    ThreadGoalClearResult, ThreadGoalGetResult, ThreadGoalSetResult, ThreadGoalStatus,
+    validate_thread_goal_objective,
 };
 use crate::storage::{
     StoreBundle,
@@ -67,6 +71,91 @@ enum SingleRunOutcome {
     Turn(RunSummary),
     ControlCompleted,
     IdleGoalInactive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RootExecutionStopPlan {
+    admission: RootAdmissionStopPlan,
+}
+
+impl RootExecutionStopPlan {
+    pub(crate) fn session_id_hint(self) -> Option<crate::session::SessionId> {
+        self.admission
+            .pending
+            .map(|pending| pending.session_id)
+            .or_else(|| {
+                self.admission
+                    .last_admitted
+                    .map(|receipt| receipt.session_id)
+            })
+    }
+
+    pub(crate) fn has_durable_owner(self) -> bool {
+        self.admission.pending.is_some() || self.admission.last_admitted.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootExecutionStopSealOutcome {
+    Acquired(RootExecutionStopPlan),
+    AlreadySealed,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootExecutionStopRequestOutcome {
+    Accepted,
+    AlreadyPending,
+    Rejected,
+    TargetChanged,
+}
+
+/// Application-level settlement for dispatching an ordinary exact-root Stop request.
+///
+/// `Applied` means the durable request or an exact already-settled local root was accepted; the
+/// worker remains the sole terminal owner while commit reservations drain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExactRootExecutionStopOutcome {
+    Applied { cancelled: bool },
+    TargetChanged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RootExecutionStopClaim {
+    pub(crate) session_id: Option<crate::session::SessionId>,
+    pub(crate) expected_active_turn: Option<ActiveTurnExpectation>,
+    pub(crate) durable_outcome: Option<ExactRootExecutionStopOutcome>,
+    pub(crate) local_stop: Option<RootExecutionLocalStop>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalRootExecutionStopOutcome {
+    Applied,
+    Rejected,
+    TargetChanged,
+    NotOwned,
+}
+
+struct RootExecutionStopLeaseGuard<'a> {
+    control: &'a RunControl,
+    plan: RootExecutionStopPlan,
+    committed: bool,
+}
+
+impl RootExecutionStopLeaseGuard<'_> {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for RootExecutionStopLeaseGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        self.control
+            .release_root_admission_stop_seal(self.plan.admission.seal_id);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -213,14 +302,380 @@ impl RunService {
             .map_err(AppRunError::Message)
     }
 
-    pub fn cancel_agent_tree(
+    /// Acquires the canonical admission seal for one exact logical root execution.
+    ///
+    /// The returned plan is the only Stop candidate authority. Read-only projections may decide
+    /// which UI action to route here, but they are never reused as the durable cancellation plan.
+    pub(crate) fn seal_root_execution_for_stop(
+        &self,
+        expected_root_scope_control: &RunControl,
+    ) -> Result<RootExecutionStopSealOutcome, AppRunError> {
+        let admission = match expected_root_scope_control.seal_root_admission_for_stop() {
+            RootAdmissionStopSealOutcome::Acquired(plan) => plan,
+            RootAdmissionStopSealOutcome::AlreadySealed => {
+                return Ok(RootExecutionStopSealOutcome::AlreadySealed);
+            }
+            RootAdmissionStopSealOutcome::RejectedClosed
+            | RootAdmissionStopSealOutcome::SequenceExhausted => {
+                return Ok(RootExecutionStopSealOutcome::Rejected);
+            }
+        };
+        Ok(RootExecutionStopSealOutcome::Acquired(
+            RootExecutionStopPlan { admission },
+        ))
+    }
+
+    /// Resolves one sealed root task through pending admission settlement, durable exact CAS, and
+    /// only then process-local cancellation. No scheduler retry or target re-sampling is used.
+    pub(crate) async fn claim_root_execution_stop(
+        &self,
+        expected_root_scope_control: &RunControl,
+        plan: RootExecutionStopPlan,
+    ) -> Result<RootExecutionStopClaim, AppRunError> {
+        let mut lease = RootExecutionStopLeaseGuard {
+            control: expected_root_scope_control,
+            plan,
+            committed: false,
+        };
+        let selected_receipt = match plan.admission.pending {
+            Some(_) => match expected_root_scope_control
+                .wait_root_admission_settlement(plan.admission)
+                .await
+                .map_err(|error| {
+                    AppRunError::Message(format!(
+                        "the exact root admission Stop plan became stale: {error:?}"
+                    ))
+                })? {
+                RootAdmissionSettlement::Admitted(receipt) => Some(receipt),
+                RootAdmissionSettlement::Aborted => plan.admission.last_admitted,
+            },
+            None => plan.admission.last_admitted,
+        };
+        let session_id = selected_receipt
+            .map(|receipt| receipt.session_id)
+            .or_else(|| plan.admission.pending.map(|pending| pending.session_id));
+        if plan
+            .admission
+            .pending
+            .is_some_and(|pending| Some(pending.session_id) != session_id)
+            || plan
+                .admission
+                .last_admitted
+                .is_some_and(|receipt| Some(receipt.session_id) != session_id)
+        {
+            return Err(AppRunError::Message(
+                "one root Stop plan contained admissions from different sessions".to_string(),
+            ));
+        }
+
+        let Some(receipt) = selected_receipt else {
+            let local_stop =
+                self.commit_local_root_execution_stop(expected_root_scope_control, false)?;
+            if !local_stop.stop_accepted()
+                || !expected_root_scope_control
+                    .commit_root_admission_stop_seal(plan.admission.seal_id)
+            {
+                return Ok(RootExecutionStopClaim {
+                    session_id,
+                    expected_active_turn: None,
+                    durable_outcome: None,
+                    local_stop: None,
+                });
+            }
+            lease.commit();
+            return Ok(RootExecutionStopClaim {
+                session_id,
+                expected_active_turn: None,
+                durable_outcome: None,
+                local_stop: Some(local_stop),
+            });
+        };
+
+        let session_id = session_id.expect("a durable root Stop candidate owns a session");
+        let expected = ActiveTurnExpectation::Turn {
+            turn_id: receipt.turn_id,
+            revision: receipt.revision,
+        };
+        let validation = self
+            .session_service
+            .validate_root_execution_at_expectation(session_id, receipt.turn_id, receipt.revision)
+            .await?;
+        if matches!(validation, ExactRootExecutionValidation::TargetChanged) {
+            return Ok(RootExecutionStopClaim {
+                session_id: Some(session_id),
+                expected_active_turn: Some(expected),
+                durable_outcome: Some(ExactRootExecutionStopOutcome::TargetChanged),
+                local_stop: None,
+            });
+        }
+        let terminal_already_settled = matches!(validation, ExactRootExecutionValidation::Terminal);
+        if !terminal_already_settled
+            && matches!(
+                self.session_service
+                    .request_exact_execution_interrupt(
+                        session_id,
+                        receipt.turn_id,
+                        receipt.revision,
+                        crate::protocol::TurnInterruptionCause::UserStop,
+                    )
+                    .await?,
+                ExactExecutionInterruptRequestOutcome::TargetChanged
+            )
+        {
+            return Ok(RootExecutionStopClaim {
+                session_id: Some(session_id),
+                expected_active_turn: Some(expected),
+                durable_outcome: Some(ExactRootExecutionStopOutcome::TargetChanged),
+                local_stop: None,
+            });
+        }
+        let local_stop = self.commit_local_root_execution_stop(
+            expected_root_scope_control,
+            terminal_already_settled,
+        )?;
+        if !expected_root_scope_control.commit_root_admission_stop_seal(plan.admission.seal_id) {
+            return Err(AppRunError::Message(
+                "the exact root admission Stop lease was lost before local commit".to_string(),
+            ));
+        }
+        let outcome = ExactRootExecutionStopOutcome::Applied {
+            cancelled: !terminal_already_settled,
+        };
+        lease.commit();
+        Ok(RootExecutionStopClaim {
+            session_id: Some(session_id),
+            expected_active_turn: Some(expected),
+            durable_outcome: Some(outcome),
+            local_stop: Some(local_stop),
+        })
+    }
+
+    /// Commits an exact root Stop that won before this task published any durable admission.
+    ///
+    /// The acquired admission seal remains installed and the stable outer control is cancelled,
+    /// so a later `begin_root_admission` cannot cross this pre-admission Stop.
+    pub(crate) fn claim_unadmitted_root_execution_stop(
+        &self,
+        expected_root_scope_control: &RunControl,
+        plan: RootExecutionStopPlan,
+    ) -> Result<RootExecutionStopClaim, AppRunError> {
+        if plan.has_durable_owner() {
+            return Err(AppRunError::Message(
+                "a durable root admission must be settled by the async Stop coordinator"
+                    .to_string(),
+            ));
+        }
+        let mut lease = RootExecutionStopLeaseGuard {
+            control: expected_root_scope_control,
+            plan,
+            committed: false,
+        };
+        let local_stop =
+            self.commit_local_root_execution_stop(expected_root_scope_control, false)?;
+        if !local_stop.stop_accepted()
+            || !expected_root_scope_control.commit_root_admission_stop_seal(plan.admission.seal_id)
+        {
+            return Ok(RootExecutionStopClaim {
+                session_id: None,
+                expected_active_turn: None,
+                durable_outcome: None,
+                local_stop: None,
+            });
+        }
+        lease.commit();
+        Ok(RootExecutionStopClaim {
+            session_id: None,
+            expected_active_turn: None,
+            durable_outcome: None,
+            local_stop: Some(local_stop),
+        })
+    }
+
+    fn commit_local_root_execution_stop(
+        &self,
+        expected_root_scope_control: &RunControl,
+        terminal_already_settled: bool,
+    ) -> Result<RootExecutionLocalStop, AppRunError> {
+        let cause =
+            RunCancellationCause::Interruption(crate::protocol::TurnInterruptionCause::UserStop);
+        if let Some(runtime) = self.agent_runtime.upgrade()
+            && let Some(accepted) = runtime
+                .cancel_root_execution_at_scope_control(
+                    expected_root_scope_control,
+                    crate::protocol::TurnInterruptionCause::UserStop,
+                    terminal_already_settled,
+                )
+                .map_err(AppRunError::Message)?
+        {
+            return Ok(accepted);
+        }
+        let disposition = if terminal_already_settled {
+            RootExecutionStopDisposition::TerminalAlreadySettled
+        } else {
+            match expected_root_scope_control.request_cancel_local(cause.clone()) {
+                RunCancelOutcome::Applied => RootExecutionStopDisposition::Applied,
+                RunCancelOutcome::Deferred(_) => RootExecutionStopDisposition::Deferred,
+                RunCancelOutcome::Rejected
+                    if expected_root_scope_control.cause().as_ref() == Some(&cause) =>
+                {
+                    RootExecutionStopDisposition::AlreadyUserStopped
+                }
+                RunCancelOutcome::Rejected => RootExecutionStopDisposition::AlreadyClassified,
+            }
+        };
+        Ok(RootExecutionLocalStop { disposition })
+    }
+
+    /// Applies ordinary User Stop to one stable logical root task on every interactive surface.
+    ///
+    /// The admission seal prevents a retained continuation from crossing the request. Only the
+    /// exact current root execution is classified; descendants retain their independent controls.
+    pub async fn request_root_execution_stop(
+        &self,
+        root_scope_control: &RunControl,
+    ) -> Result<RootExecutionStopRequestOutcome, AppRunError> {
+        let plan = match self.seal_root_execution_for_stop(root_scope_control)? {
+            RootExecutionStopSealOutcome::Acquired(plan) => plan,
+            RootExecutionStopSealOutcome::AlreadySealed => {
+                return Ok(RootExecutionStopRequestOutcome::AlreadyPending);
+            }
+            RootExecutionStopSealOutcome::Rejected => {
+                return Ok(RootExecutionStopRequestOutcome::Rejected);
+            }
+        };
+        let claim = if plan.has_durable_owner() {
+            self.claim_root_execution_stop(root_scope_control, plan)
+                .await?
+        } else {
+            self.claim_unadmitted_root_execution_stop(root_scope_control, plan)?
+        };
+        if matches!(
+            claim.durable_outcome,
+            Some(ExactRootExecutionStopOutcome::Applied { .. })
+        ) || claim
+            .local_stop
+            .is_some_and(RootExecutionLocalStop::stop_accepted)
+        {
+            Ok(RootExecutionStopRequestOutcome::Accepted)
+        } else if matches!(
+            claim.durable_outcome,
+            Some(ExactRootExecutionStopOutcome::TargetChanged)
+        ) {
+            Ok(RootExecutionStopRequestOutcome::TargetChanged)
+        } else {
+            Ok(RootExecutionStopRequestOutcome::Rejected)
+        }
+    }
+
+    /// Wakes one exact process-local root turn after its durable UserStop CAS applied.
+    ///
+    /// This is used by non-current session rows and CLI-style exact-turn commands that do not
+    /// own a stable retained root-scope capability. It never classifies descendants.
+    pub(crate) fn cancel_local_root_execution_at_turn(
         &self,
         session_id: crate::session::SessionId,
-        root_cause: crate::protocol::TurnInterruptionCause,
-    ) -> bool {
-        self.agent_runtime
+        expected_turn_id: crate::protocol::TurnId,
+        expected_revision: u64,
+        cause: crate::protocol::TurnInterruptionCause,
+    ) -> LocalRootExecutionStopOutcome {
+        let expected_cause = RunCancellationCause::Interruption(cause);
+        let control = self.store.active_runs().run_control(session_id);
+        match self.store.active_runs().cancel_turn_at_target(
+            session_id,
+            crate::runtime::ActiveRunTurnTarget {
+                turn_id: expected_turn_id,
+                admission_revision: expected_revision,
+            },
+            cause,
+        ) {
+            ActiveRunInterruptOutcome::Applied | ActiveRunInterruptOutcome::Deferred => {
+                LocalRootExecutionStopOutcome::Applied
+            }
+            ActiveRunInterruptOutcome::AlreadyClassified => {
+                if control.is_some_and(|control| control.cause().as_ref() == Some(&expected_cause))
+                {
+                    LocalRootExecutionStopOutcome::Applied
+                } else {
+                    LocalRootExecutionStopOutcome::Rejected
+                }
+            }
+            ActiveRunInterruptOutcome::TargetChanged => {
+                LocalRootExecutionStopOutcome::TargetChanged
+            }
+            ActiveRunInterruptOutcome::NotActive => LocalRootExecutionStopOutcome::NotOwned,
+        }
+    }
+
+    /// Stops one exact captured root execution without granting same-scope continuation
+    /// promotion. This is the shared boundary for background rows and CLI session interrupt.
+    pub(crate) async fn cancel_exact_root_execution(
+        &self,
+        session_id: crate::session::SessionId,
+        expected_turn_id: crate::protocol::TurnId,
+        expected_revision: u64,
+    ) -> Result<ExactRootExecutionStopOutcome, AppRunError> {
+        let expected_receipt = RootAdmissionReceipt {
+            session_id,
+            turn_id: expected_turn_id,
+            revision: expected_revision,
+        };
+        match self
+            .session_service
+            .request_exact_execution_interrupt(
+                session_id,
+                expected_turn_id,
+                expected_revision,
+                crate::protocol::TurnInterruptionCause::UserStop,
+            )
+            .await?
+        {
+            ExactExecutionInterruptRequestOutcome::Recorded
+            | ExactExecutionInterruptRequestOutcome::AlreadyRequested => {}
+            ExactExecutionInterruptRequestOutcome::TargetChanged => {
+                return Ok(ExactRootExecutionStopOutcome::TargetChanged);
+            }
+        }
+        let local_scope = self
+            .agent_runtime
             .upgrade()
-            .is_some_and(|runtime| runtime.cancel_tree_for_session(session_id, root_cause))
+            .map(|runtime| runtime.root_scope_control_for_session(session_id))
+            .transpose()
+            .map_err(AppRunError::Message)?
+            .flatten();
+        if let Some(root_scope_control) = local_scope {
+            let plan = match self.seal_root_execution_for_stop(&root_scope_control)? {
+                RootExecutionStopSealOutcome::Acquired(plan) => plan,
+                RootExecutionStopSealOutcome::AlreadySealed
+                | RootExecutionStopSealOutcome::Rejected => {
+                    return Ok(ExactRootExecutionStopOutcome::Applied { cancelled: true });
+                }
+            };
+            let mut lease = RootExecutionStopLeaseGuard {
+                control: &root_scope_control,
+                plan,
+                committed: false,
+            };
+            if plan.admission.pending.is_some()
+                || plan.admission.last_admitted != Some(expected_receipt)
+            {
+                return Ok(ExactRootExecutionStopOutcome::Applied { cancelled: true });
+            }
+            let _ = self.commit_local_root_execution_stop(&root_scope_control, false)?;
+            if !root_scope_control.commit_root_admission_stop_seal(plan.admission.seal_id) {
+                return Err(AppRunError::Message(
+                    "the exact root admission Stop lease was lost before local commit".to_string(),
+                ));
+            }
+            lease.commit();
+            return Ok(ExactRootExecutionStopOutcome::Applied { cancelled: true });
+        }
+        let _ = self.cancel_local_root_execution_at_turn(
+            session_id,
+            expected_turn_id,
+            expected_revision,
+            crate::protocol::TurnInterruptionCause::UserStop,
+        );
+        Ok(ExactRootExecutionStopOutcome::Applied { cancelled: true })
     }
 
     /// Interrupts one exact retained child turn, mirroring Codex's `(thread_id, turn_id)`
@@ -231,6 +686,7 @@ impl RunService {
         agent_path: &str,
         child_session_id: crate::session::SessionId,
         expected_turn_id: crate::protocol::TurnId,
+        expected_admission_revision: u64,
     ) -> Result<bool, AppRunError> {
         let path = crate::runtime::AgentPath::try_from(agent_path)
             .map_err(|error| AppRunError::Message(format!("invalid Sub Agent path: {error}")))?;
@@ -257,15 +713,31 @@ impl RunService {
                 "the exact Sub Agent lineage changed before interrupt was applied".to_string(),
             ));
         }
-        let accepted = self
+        let request_outcome = self
             .session_service
-            .cancel_running_session_turn(
+            .request_exact_execution_interrupt(
                 child_session_id,
                 expected_turn_id,
+                expected_admission_revision,
                 crate::protocol::TurnInterruptionCause::AgentInterrupted,
             )
             .await?;
-        if accepted && let Ok(runtime) = self.agent_runtime() {
+        if request_outcome == ExactExecutionInterruptRequestOutcome::TargetChanged {
+            return Ok(false);
+        }
+        let local_outcome = self.store.active_runs().cancel_turn_at_target(
+            child_session_id,
+            crate::runtime::ActiveRunTurnTarget {
+                turn_id: expected_turn_id,
+                admission_revision: expected_admission_revision,
+            },
+            crate::protocol::TurnInterruptionCause::AgentInterrupted,
+        );
+        if matches!(
+            local_outcome,
+            ActiveRunInterruptOutcome::Applied | ActiveRunInterruptOutcome::Deferred
+        ) && let Ok(runtime) = self.agent_runtime()
+        {
             runtime.schedule_cancelled_agent_worker_abort(
                 root_session_id,
                 path.as_str(),
@@ -273,7 +745,7 @@ impl RunService {
                 expected_turn_id,
             );
         }
-        Ok(accepted)
+        Ok(true)
     }
 
     pub async fn wait_for_agent_tree_quiescence(
@@ -468,6 +940,7 @@ impl RunService {
         renderer: &mut dyn EventRenderer,
         prompt: &mut dyn ConfirmationPrompt,
     ) -> Result<AppCommandOutcome, AppRunError> {
+        ensure_run_admission_contract(&request, None)?;
         let allow_idle_goal_continuation = request.agent_context.is_none()
             && allows_goal_idle_continuation_after_run(&request.prompt)?;
         let mut summary = match self
@@ -526,6 +999,14 @@ impl RunService {
                 session_access_mode_adoption: None,
                 agent_confirmation: request.agent_confirmation.clone(),
                 agent_context: request.agent_context.clone(),
+                admission_kind: RunAdmissionKind::RootContinuation {
+                    predecessor_turn_id: summary.turn_id(),
+                    predecessor_revision: summary.admission_revision(),
+                },
+                expected_active_turn: ActiveTurnExpectation::Idle {
+                    latest_turn_id: Some(summary.turn_id()),
+                    revision: summary.admission_revision(),
+                },
             };
             match self
                 .execute_single_run(
@@ -561,6 +1042,7 @@ impl RunService {
                 request,
                 renderer,
                 prompt,
+                &root_scope_control,
                 &mut root_agent_execution,
                 &mut turn_run_control,
             )
@@ -620,9 +1102,11 @@ impl RunService {
         mut request: RunRequest,
         renderer: &mut dyn EventRenderer,
         prompt: &mut dyn ConfirmationPrompt,
+        root_scope_control: &RunControl,
         root_agent_execution: &mut Option<AgentRuntimeExecution>,
         turn_run_control: &mut Option<RunControl>,
     ) -> Result<SingleRunOutcome, AppRunError> {
+        ensure_run_admission_contract(&request, root_agent_execution.as_ref())?;
         let continuation_has_agent_updates = root_agent_execution
             .as_ref()
             .map(|execution| execution.context.has_pending_mailbox_input())
@@ -681,7 +1165,12 @@ impl RunService {
                             )
                         })?;
                     return self
-                        .execute_goal_slash_control(session_id, command, renderer)
+                        .execute_goal_slash_control(
+                            session_id,
+                            command,
+                            request.expected_active_turn,
+                            renderer,
+                        )
                         .await
                         .map(|()| SingleRunOutcome::ControlCompleted);
                 }
@@ -700,35 +1189,6 @@ impl RunService {
             && !request.prompt.trim().is_empty();
         let image_parts = load_image_attachments(&request.cwd, &request.image_paths)?;
         let prepared = prepare_run_turn(&self.workspace, &request)?;
-        let existing_fresh_running_turn = if let Some(existing) = session_settings.as_ref() {
-            self.store
-                .session_repo()
-                .fresh_running_turn_for_session(existing.id)
-                .await?
-        } else {
-            None
-        };
-        if let Some(existing) = session_settings.as_ref()
-            && existing_fresh_running_turn.is_some()
-            && request.review_request.is_none()
-            && !prepared.prompt.trim().is_empty()
-        {
-            return self
-                .store_active_turn_steer_from_parts(
-                    SessionSteerRequest {
-                        session_id: existing.id,
-                        prompt: prepared.prompt.clone(),
-                        cwd: request.cwd.clone(),
-                        image_paths: request.image_paths.clone(),
-                        client_user_message_id: None,
-                    },
-                    image_parts,
-                    Some("run request against active session".to_string()),
-                    renderer,
-                )
-                .await
-                .map(|()| SingleRunOutcome::ControlCompleted);
-        }
         if !image_parts.is_empty() && !effective_config.model.supports_images {
             return Err(AppRunError::Message(format!(
                 "configured model `{}` does not advertise image support; choose a vision-capable model before sending images",
@@ -802,40 +1262,14 @@ impl RunService {
             &image_parts,
             request.editor_context.clone(),
         );
-        let agent_trigger_history_item_id = provided_agent_context
-            .as_ref()
-            .filter(|context| context.is_sub_agent())
-            .and_then(|context| context.trigger_history_item_id());
-        let agent_owner_resume_request_id = provided_agent_context
-            .as_ref()
-            .filter(|context| context.is_sub_agent())
-            .and_then(|context| context.owner_resume_request_id());
-        if provided_agent_context
-            .as_ref()
-            .is_some_and(|context| context.is_sub_agent())
-            && agent_trigger_history_item_id.is_none()
-            && agent_owner_resume_request_id.is_none()
-        {
-            return Err(AppRunError::Message(
-                provided_agent_context
-                    .as_ref()
-                    .map(|context| {
-                        format!(
-                            "sub-agent `{}` has no canonical execution wake identity",
-                            context.path()
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        "sub-agent has no canonical execution wake identity".to_string()
-                    }),
-            ));
-        }
-        if agent_trigger_history_item_id.is_some() && agent_owner_resume_request_id.is_some() {
-            return Err(AppRunError::Message(
-                "a sub-agent execution cannot combine an explicit task with OwnerResume"
-                    .to_string(),
-            ));
-        }
+        let agent_trigger_history_item_id = match request.admission_kind {
+            RunAdmissionKind::AgentTrigger { history_item_id } => Some(history_item_id),
+            _ => None,
+        };
+        let agent_owner_resume_request_id = match request.admission_kind {
+            RunAdmissionKind::OwnerResume { request_id } => Some(request_id),
+            _ => None,
+        };
         if (agent_trigger_history_item_id.is_some() || agent_owner_resume_request_id.is_some())
             && initial_user_turn.is_some()
         {
@@ -846,69 +1280,124 @@ impl RunService {
         let process_run_lease = self
             .store
             .try_acquire_run_process_lease(session_context.session.id)?;
-        let admission = if let Some(expected_history_item_id) = agent_trigger_history_item_id {
-            self.store
-                .session_repo()
-                .admit_agent_triggered_turn(
-                    session_context.session.id,
-                    protocol_turn_id,
-                    expected_history_item_id,
-                )
-                .await?
-        } else if let Some(expected_owner_resume_request_id) = agent_owner_resume_request_id {
-            self.store
-                .session_repo()
-                .admit_owner_resume_turn(
-                    session_context.session.id,
-                    protocol_turn_id,
-                    expected_owner_resume_request_id,
-                )
-                .await?
-        } else {
-            match slash_goal_command.as_ref() {
-                Some(GoalSlashCommand::SetObjective(objective)) => {
-                    self.store
-                        .session_repo()
-                        .admit_session_turn_with_goal_objective_and_initial_user_turn(
-                            session_context.session.id,
-                            protocol_turn_id,
-                            objective,
-                            initial_user_turn.as_ref(),
-                        )
-                        .await?
+        let mut root_admission_guard = match request.admission_kind {
+            RunAdmissionKind::NewUserRun | RunAdmissionKind::RootContinuation { .. } => Some(
+                root_scope_control
+                    .begin_root_admission(session_context.session.id, protocol_turn_id)
+                    .map_err(|error| {
+                        AppRunError::Message(format!(
+                            "the exact root task could not publish its durable admission plan: {error:?}"
+                        ))
+                    })?,
+            ),
+            RunAdmissionKind::AgentTrigger { .. } | RunAdmissionKind::OwnerResume { .. } => None,
+        };
+        let admission = match request.admission_kind {
+            RunAdmissionKind::AgentTrigger { history_item_id } => {
+                self.store
+                    .session_repo()
+                    .admit_agent_triggered_turn(
+                        session_context.session.id,
+                        protocol_turn_id,
+                        history_item_id,
+                    )
+                    .await?
+            }
+            RunAdmissionKind::OwnerResume { request_id } => {
+                self.store
+                    .session_repo()
+                    .admit_owner_resume_turn(
+                        session_context.session.id,
+                        protocol_turn_id,
+                        request_id,
+                    )
+                    .await?
+            }
+            RunAdmissionKind::RootContinuation {
+                predecessor_turn_id,
+                predecessor_revision,
+            } => {
+                if slash_goal_command.is_some() {
+                    return Err(AppRunError::Message(
+                        "an automatic root continuation cannot execute a slash command".to_string(),
+                    ));
                 }
-                None if requires_active_goal => {
-                    match self
-                        .store
-                        .session_repo()
-                        .admit_active_goal_continuation_turn_with_initial_user_turn(
-                            session_context.session.id,
-                            protocol_turn_id,
-                            initial_user_turn.as_ref(),
-                        )
-                        .await?
-                    {
-                        ActiveGoalTurnAdmission::Admitted(snapshot) => Some(snapshot),
-                        ActiveGoalTurnAdmission::GoalInactive => {
-                            drop(process_run_lease);
-                            return Ok(SingleRunOutcome::IdleGoalInactive);
-                        }
-                        ActiveGoalTurnAdmission::Unavailable => None,
+                match self
+                    .store
+                    .session_repo()
+                    .admit_root_continuation_turn_with_initial_user_turn(
+                        session_context.session.id,
+                        protocol_turn_id,
+                        initial_user_turn.as_ref(),
+                        predecessor_turn_id,
+                        predecessor_revision,
+                        requires_active_goal,
+                    )
+                    .await?
+                {
+                    ActiveGoalTurnAdmission::Admitted(snapshot) => Some(snapshot),
+                    ActiveGoalTurnAdmission::GoalInactive => {
+                        drop(root_admission_guard.take());
+                        drop(process_run_lease);
+                        return Ok(SingleRunOutcome::IdleGoalInactive);
                     }
-                }
-                _ => {
-                    self.store
-                        .session_repo()
-                        .admit_session_turn_with_initial_user_turn(
-                            session_context.session.id,
-                            protocol_turn_id,
-                            initial_user_turn.as_ref(),
-                        )
-                        .await?
+                    ActiveGoalTurnAdmission::Unavailable => None,
                 }
             }
+            RunAdmissionKind::NewUserRun => match slash_goal_command.as_ref() {
+                Some(GoalSlashCommand::SetObjective(objective)) => {
+                    match request.expected_active_turn {
+                        ActiveTurnExpectation::Idle {
+                            latest_turn_id,
+                            revision,
+                        } => {
+                            self.store
+                                .session_repo()
+                                .admit_session_turn_with_goal_objective_and_initial_user_turn_after_latest(
+                                    session_context.session.id,
+                                    protocol_turn_id,
+                                    objective,
+                                    initial_user_turn.as_ref(),
+                                    latest_turn_id,
+                                    revision,
+                                )
+                                .await?
+                        }
+                        ActiveTurnExpectation::Turn { .. } => unreachable!(
+                            "active-turn Run requests are rejected before admission"
+                        ),
+                    }
+                }
+                _ => match request.expected_active_turn {
+                    ActiveTurnExpectation::Idle {
+                        latest_turn_id,
+                        revision,
+                    } => {
+                        self.store
+                            .session_repo()
+                            .admit_session_turn_with_initial_user_turn_after_latest(
+                                session_context.session.id,
+                                protocol_turn_id,
+                                initial_user_turn.as_ref(),
+                                latest_turn_id,
+                                revision,
+                            )
+                            .await?
+                    }
+                    ActiveTurnExpectation::Turn { .. } => {
+                        unreachable!("active-turn Run requests are rejected before admission")
+                    }
+                },
+            },
         };
         let Some(admission) = admission else {
+            if let Some(guard) = root_admission_guard.take() {
+                guard.abort().map_err(|error| {
+                    AppRunError::Message(format!(
+                        "the rejected root admission could not settle its exact plan: {error:?}"
+                    ))
+                })?;
+            }
             let current = self
                 .store
                 .session_repo()
@@ -920,6 +1409,39 @@ impl RunService {
                 current.status.key()
             )));
         };
+        let admission_revision = admission.admission_revision;
+        if let Some(guard) = root_admission_guard.take() {
+            guard.commit(admission_revision).map_err(|error| {
+                AppRunError::Message(format!(
+                    "the admitted root turn could not publish its canonical receipt: {error:?}"
+                ))
+            })?;
+        }
+        let root_admission_owner = matches!(
+            request.admission_kind,
+            RunAdmissionKind::NewUserRun | RunAdmissionKind::RootContinuation { .. }
+        )
+        .then(|| root_scope_control.clone());
+        let post_admission_control = turn_run_control
+            .as_ref()
+            .unwrap_or(root_scope_control)
+            .clone();
+        renew_admitted_run_lease_with_terminal_cancel(
+            self.store.session_repo(),
+            session_context.session.id,
+            admission.admission_id.clone(),
+            protocol_turn_id,
+            root_admission_owner.clone(),
+            post_admission_control,
+            provided_agent_context.clone(),
+        )
+        .await?;
+        let root_admission_stop_cancelled = matches!(
+            root_scope_control
+                .wait_for_root_admission_stop_resolution()
+                .await,
+            crate::runtime::RootAdmissionStopResolution::Cancelled
+        );
         let slash_goal_result =
             matches!(slash_goal_command, Some(GoalSlashCommand::SetObjective(_)))
                 .then(|| {
@@ -973,6 +1495,29 @@ impl RunService {
             self.store.harness_run_store(),
             self.session_event_hub.publisher(),
         ));
+        if root_admission_stop_cancelled {
+            let stop_terminal_control = turn_run_control.as_ref().unwrap_or(root_scope_control);
+            let result = finish_admitted_run_with_terminal_fanout(
+                &self.store,
+                session_id,
+                admission_id,
+                protocol_turn_id,
+                stop_terminal_control,
+                Err(AppRunError::Message(
+                    "root admission was stopped before post-admission execution began".to_string(),
+                )),
+                Ok(()),
+                &mut sink,
+            )
+            .await;
+            drop(sink);
+            drop(harness_sink);
+            drop(renderer_sink);
+            drop(process_run_lease);
+            return result.map(|summary| {
+                SingleRunOutcome::Turn(summary.with_admission_revision(admission_revision))
+            });
+        }
         if let Err(error) = slash_goal_result {
             let result = finish_admitted_run_with_terminal_fanout(
                 &self.store,
@@ -989,7 +1534,9 @@ impl RunService {
             drop(harness_sink);
             drop(renderer_sink);
             drop(process_run_lease);
-            return result.map(SingleRunOutcome::Turn);
+            return result.map(|summary| {
+                SingleRunOutcome::Turn(summary.with_admission_revision(admission_revision))
+            });
         }
         let agent_context = if let Some(context) = provided_agent_context {
             if turn_run_control.is_none() {
@@ -1025,7 +1572,9 @@ impl RunService {
                     drop(harness_sink);
                     drop(renderer_sink);
                     drop(process_run_lease);
-                    return result.map(SingleRunOutcome::Turn);
+                    return result.map(|summary| {
+                        SingleRunOutcome::Turn(summary.with_admission_revision(admission_revision))
+                    });
                 }
             };
             let admitted_turn_control = execution.run_control();
@@ -1054,7 +1603,9 @@ impl RunService {
             drop(harness_sink);
             drop(renderer_sink);
             drop(process_run_lease);
-            return result.map(SingleRunOutcome::Turn);
+            return result.map(|summary| {
+                SingleRunOutcome::Turn(summary.with_admission_revision(admission_revision))
+            });
         };
         request.run_control = admitted_run_control;
         let heartbeat_stop = CancellationToken::new();
@@ -1062,6 +1613,7 @@ impl RunService {
         let heartbeat_admission_id = admission_id.clone();
         let heartbeat_run_control = request.run_control.clone();
         let heartbeat_agent_context = agent_context.clone();
+        let heartbeat_root_admission_owner = root_admission_owner.clone();
         let heartbeat_task = spawn_run_admission_heartbeat(
             session_id,
             admission_id.clone(),
@@ -1073,12 +1625,14 @@ impl RunService {
                 let admission_id = heartbeat_admission_id.clone();
                 let run_control = heartbeat_run_control.clone();
                 let agent_context = heartbeat_agent_context.clone();
+                let root_admission_owner = heartbeat_root_admission_owner.clone();
                 async move {
                     renew_admitted_run_lease_with_terminal_cancel(
                         repo,
                         session_id,
                         admission_id,
                         protocol_turn_id,
+                        root_admission_owner,
                         run_control,
                         agent_context,
                     )
@@ -1099,7 +1653,7 @@ impl RunService {
             run_admitted_inner_with_cancel_grace(&request.run_control, async {
                 if let Some(context) = agent_context.as_ref() {
                     context
-                        .bind_durable_turn_owner(admission_id, protocol_turn_id)
+                        .bind_durable_turn_owner(admission_id, protocol_turn_id, admission_revision)
                         .map_err(AppRunError::Message)?;
                 }
                 if let Some(context) = agent_context
@@ -1123,7 +1677,7 @@ impl RunService {
                     .store
                     .active_runs()
                     .try_start(session_id, request.run_control.clone())?;
-                active_run.set_turn_id(protocol_turn_id)?;
+                active_run.set_turn_target(protocol_turn_id, admission.admission_revision)?;
                 sink.emit_committed(crate::session::RunEvent::SessionStarted {
                     session_id,
                     title: session_context.session.title.clone(),
@@ -1215,7 +1769,9 @@ impl RunService {
                 .await;
         }
         drop(process_run_lease);
-        result.map(SingleRunOutcome::Turn)
+        result.map(|summary| {
+            SingleRunOutcome::Turn(summary.with_admission_revision(admission_revision))
+        })
     }
 
     async fn session_id_for_goal_slash_control(
@@ -1238,6 +1794,7 @@ impl RunService {
         &self,
         session_id: crate::session::SessionId,
         command: GoalSlashCommand,
+        expected_active_turn: ActiveTurnExpectation,
         renderer: &mut dyn EventRenderer,
     ) -> Result<(), AppRunError> {
         match command {
@@ -1246,20 +1803,52 @@ impl RunService {
                     .await
             }
             GoalSlashCommand::Clear => {
-                self.execute_session_goal_clear(SessionGoalClearRequest { session_id }, renderer)
-                    .await
+                let ActiveTurnExpectation::Idle {
+                    latest_turn_id,
+                    revision,
+                } = expected_active_turn
+                else {
+                    return Err(AppRunError::Message(
+                        "goal mutation requires a captured idle session owner".to_string(),
+                    ));
+                };
+                let result = ThreadGoalClearResult {
+                    thread_id: session_id,
+                    cleared: self
+                        .store
+                        .session_repo()
+                        .delete_thread_goal_at_idle_expectation(
+                            session_id,
+                            latest_turn_id,
+                            revision,
+                        )
+                        .await?,
+                };
+                renderer.render_thread_goal_clear(&result)?;
+                Ok(())
             }
             GoalSlashCommand::SetStatus(status) => {
-                self.execute_session_goal_set(
-                    SessionGoalSetRequest {
+                let ActiveTurnExpectation::Idle {
+                    latest_turn_id,
+                    revision,
+                } = expected_active_turn
+                else {
+                    return Err(AppRunError::Message(
+                        "goal mutation requires a captured idle session owner".to_string(),
+                    ));
+                };
+                let goal = self
+                    .store
+                    .session_repo()
+                    .update_thread_goal_status_at_idle_expectation(
                         session_id,
-                        objective: None,
-                        status: Some(status),
-                        token_budget: None,
-                    },
-                    renderer,
-                )
-                .await
+                        status,
+                        latest_turn_id,
+                        revision,
+                    )
+                    .await?;
+                renderer.render_thread_goal_set(&ThreadGoalSetResult { goal })?;
+                Ok(())
             }
             GoalSlashCommand::SetObjective(_) => unreachable!("objective goal slash starts a run"),
         }
@@ -1338,10 +1927,21 @@ impl RunService {
         request: SessionInterruptRequest,
         renderer: &mut dyn EventRenderer,
     ) -> Result<(), AppRunError> {
-        let session = self
-            .session_service
-            .interrupt_running_session(request.session_id)
-            .await?;
+        if matches!(
+            self.cancel_exact_root_execution(
+                request.session_id,
+                request.expected_turn_id,
+                request.expected_admission_revision,
+            )
+            .await?,
+            ExactRootExecutionStopOutcome::TargetChanged
+        ) {
+            return Err(AppRunError::Message(format!(
+                "session {} no longer owns the captured root turn {}",
+                request.session_id, request.expected_turn_id
+            )));
+        }
+        let session = self.session_service.get_session(request.session_id).await?;
         renderer.render_session_list(std::slice::from_ref(&session))?;
         Ok(())
     }
@@ -1371,50 +1971,34 @@ impl RunService {
         request: SessionGoalSetRequest,
         renderer: &mut dyn EventRenderer,
     ) -> Result<(), AppRunError> {
-        self.store
-            .session_repo()
-            .get_session(request.session_id)
-            .await?;
         if request.objective.is_none() && request.status.is_none() && request.token_budget.is_none()
         {
             return Err(AppRunError::Message(
                 "session goal set requires objective, --status, --token-budget, or --clear-token-budget".to_string(),
             ));
         }
-        let repo = self.store.session_repo();
-        let current = account_goal_before_external_mutation(&repo, request.session_id).await?;
-        let goal = if let Some(objective) = request.objective.as_deref() {
-            let objective = objective.trim();
-            validate_thread_goal_objective(objective).map_err(AppRunError::Message)?;
-            match current {
-                Some(_) => repo
-                    .update_thread_goal(
-                        request.session_id,
-                        Some(objective),
-                        request.status,
-                        request.token_budget,
-                    )
-                    .await?
-                    .ok_or_else(|| {
-                        AppRunError::Message("thread goal disappeared during update".to_string())
-                    })?,
-                None => {
-                    let token_budget = request.token_budget.unwrap_or(None);
-                    repo.replace_thread_goal(
-                        request.session_id,
-                        objective,
-                        request.status.unwrap_or(ThreadGoalStatus::Active),
-                        token_budget,
-                    )
-                    .await?
-                }
-            }
-        } else {
-            repo.update_thread_goal(
+        if let Some(objective) = request.objective.as_deref() {
+            validate_thread_goal_objective(objective.trim()).map_err(AppRunError::Message)?;
+        }
+        let ActiveTurnExpectation::Idle {
+            latest_turn_id,
+            revision,
+        } = request.expected_active_turn
+        else {
+            return Err(AppRunError::Message(
+                "goal mutation requires a captured idle session owner".to_string(),
+            ));
+        };
+        let goal = self
+            .store
+            .session_repo()
+            .set_thread_goal_at_idle_expectation(
                 request.session_id,
-                None,
+                request.objective.as_deref(),
                 request.status,
                 request.token_budget,
+                latest_turn_id,
+                revision,
             )
             .await?
             .ok_or_else(|| {
@@ -1422,8 +2006,7 @@ impl RunService {
                     "session {} has no goal to update",
                     request.session_id
                 ))
-            })?
-        };
+            })?;
         let result = ThreadGoalSetResult { goal };
         renderer.render_thread_goal_set(&result)?;
         Ok(())
@@ -1434,18 +2017,25 @@ impl RunService {
         request: SessionGoalClearRequest,
         renderer: &mut dyn EventRenderer,
     ) -> Result<(), AppRunError> {
-        self.store
-            .session_repo()
-            .get_session(request.session_id)
-            .await?;
-        account_goal_before_external_mutation(&self.store.session_repo(), request.session_id)
-            .await?;
+        let ActiveTurnExpectation::Idle {
+            latest_turn_id,
+            revision,
+        } = request.expected_active_turn
+        else {
+            return Err(AppRunError::Message(
+                "goal mutation requires a captured idle session owner".to_string(),
+            ));
+        };
         let result = ThreadGoalClearResult {
             thread_id: request.session_id,
             cleared: self
                 .store
                 .session_repo()
-                .delete_thread_goal(request.session_id)
+                .delete_thread_goal_at_idle_expectation(
+                    request.session_id,
+                    latest_turn_id,
+                    revision,
+                )
                 .await?,
         };
         renderer.render_thread_goal_clear(&result)?;
@@ -1676,17 +2266,15 @@ impl RunService {
         source_label: Option<String>,
         _renderer: &mut dyn EventRenderer,
     ) -> Result<(), AppRunError> {
-        let active_turn_id = self
-            .store
-            .session_repo()
-            .fresh_running_turn_for_session(request.session_id)
-            .await?
-            .ok_or_else(|| {
-                AppRunError::Message(format!(
-                    "session {} has no published active turn to steer",
+        let (active_turn_id, admission_revision) = match request.expected_active_turn {
+            ActiveTurnExpectation::Turn { turn_id, revision } => (turn_id, revision),
+            ActiveTurnExpectation::Idle { .. } => {
+                return Err(AppRunError::Message(format!(
+                    "session {} was captured as idle and cannot be steered",
                     request.session_id
-                ))
-            })?;
+                )));
+            }
+        };
         let mut items = Vec::new();
         if !request.prompt.trim().is_empty() {
             items.push(UserInputItem::Text {
@@ -1716,6 +2304,7 @@ impl RunService {
         self.session_service
             .store_active_turn_steer(
                 request.session_id,
+                admission_revision,
                 &SteerTurn {
                     expected_turn_id: active_turn_id,
                     items,
@@ -1745,6 +2334,7 @@ async fn renew_admitted_run_lease_with_terminal_cancel(
     session_id: crate::session::SessionId,
     admission_id: AdmissionId,
     turn_id: crate::protocol::TurnId,
+    root_admission_owner: Option<RunControl>,
     run_control: RunControl,
     agent_context: Option<crate::app::AgentRunContext>,
 ) -> Result<RunAdmissionLeaseRenewalOutcome, crate::error::StorageError> {
@@ -1753,6 +2343,17 @@ async fn renew_admitted_run_lease_with_terminal_cancel(
         .await?;
     match &outcome {
         RunAdmissionLeaseRenewalOutcome::Renewed => {}
+        RunAdmissionLeaseRenewalOutcome::InterruptRequested(cause) => {
+            if let Some(root_admission_owner) = root_admission_owner.as_ref() {
+                commit_root_admission_stop_from_durable_request(root_admission_owner)?;
+            }
+            run_control.request_cancel(RunCancellationCause::Interruption(*cause));
+            if *cause == crate::protocol::TurnInterruptionCause::AgentInterrupted
+                && let Some(agent_context) = agent_context.as_ref()
+            {
+                agent_context.schedule_cancelled_worker_abort();
+            }
+        }
         RunAdmissionLeaseRenewalOutcome::StopFenced(outcome) => {
             classify_run_control_for_terminal_outcome(&run_control, outcome);
             if let Some(agent_context) = agent_context {
@@ -1772,6 +2373,31 @@ async fn renew_admitted_run_lease_with_terminal_cancel(
         }
     }
     Ok(outcome)
+}
+
+fn commit_root_admission_stop_from_durable_request(
+    root_admission_owner: &RunControl,
+) -> Result<(), crate::error::StorageError> {
+    match root_admission_owner.seal_root_admission_for_stop() {
+        RootAdmissionStopSealOutcome::Acquired(plan) => {
+            if root_admission_owner.commit_root_admission_stop_seal(plan.seal_id) {
+                Ok(())
+            } else {
+                Err(crate::error::StorageError::Message(
+                    "the durable exact root Stop request lost its admission seal before commit"
+                        .to_string(),
+                ))
+            }
+        }
+        RootAdmissionStopSealOutcome::AlreadySealed
+        | RootAdmissionStopSealOutcome::RejectedClosed => Ok(()),
+        RootAdmissionStopSealOutcome::SequenceExhausted => {
+            Err(crate::error::StorageError::Message(
+                "root Stop admission seal identity was exhausted while applying a durable request"
+                    .to_string(),
+            ))
+        }
+    }
 }
 
 fn classify_run_control_for_terminal_outcome(
@@ -1921,6 +2547,7 @@ where
             _ = tokio::time::sleep(heartbeat_interval) => {
                 match renew().await? {
                     RunAdmissionLeaseRenewalOutcome::Renewed => {}
+                    RunAdmissionLeaseRenewalOutcome::InterruptRequested(_) => return Ok(()),
                     RunAdmissionLeaseRenewalOutcome::StopFenced(_) => return Ok(()),
                     RunAdmissionLeaseRenewalOutcome::Terminal(_) => return Ok(()),
                     RunAdmissionLeaseRenewalOutcome::SupersededOrExpired => {
@@ -2186,15 +2813,13 @@ async fn settle_admitted_run_result(
             metrics: Default::default(),
         },
     };
-    let fallback_summary =
-        RunSummary::from_terminal(session_id, protocol_turn_id, terminal.clone());
     let event = crate::session::RunEvent::TurnTerminal {
         session_id,
         terminal: Box::new(terminal),
     };
     let repo = store.session_repo();
-    let terminalized = repo
-        .terminalize_admitted_turn_with_protocol_event(
+    let settlement = repo
+        .settle_admitted_turn_with_protocol_event(
             session_id,
             admission_id,
             &event,
@@ -2208,24 +2833,34 @@ async fn settle_admitted_run_result(
                 "{error}; additionally failed to settle admitted run {admission_id}: {cleanup_error}"
             ))
         })?;
-    if terminalized != crate::storage::session_repo::AdmittedTerminalCommit::Applied
-        && let Some(summary) = durable_run_summary_for_turn(store, session_id, protocol_turn_id)
+    match settlement {
+        crate::storage::session_repo::AdmittedTerminalSettlement::Applied { terminal }
+        | crate::storage::session_repo::AdmittedTerminalSettlement::AlreadyTerminalizedBySameAdmission {
+            terminal,
+        } => {
+            // The terminal transaction is the final linearization owner. A committed exact
+            // execution interrupt may replace this caller's requested Failure with Interrupted;
+            // never fan out or return the stale requested outcome.
+            Ok(RunSummary::from_terminal(
+                session_id,
+                protocol_turn_id,
+                terminal,
+            ))
+        }
+        crate::storage::session_repo::AdmittedTerminalSettlement::NotOwned => {
+            if let Some(summary) = durable_run_summary_for_turn(store, session_id, protocol_turn_id)
             .await
             .map_err(|authority_error| {
                 AppRunError::Message(format!(
                     "{error}; additionally failed to verify durable terminal truth after losing terminalization: {authority_error}"
                 ))
             })?
-    {
-        return Ok(summary);
+            {
+                return Ok(summary);
+            }
+            Err(error)
+        }
     }
-    if terminalized == crate::storage::session_repo::AdmittedTerminalCommit::Applied {
-        // Post-admission execution has a typed durable terminal, including setup failures and
-        // explicit interruptions. Surface that exact owner to clients; operational Err is now
-        // reserved for cases where terminal truth could not be committed or recovered.
-        return Ok(fallback_summary);
-    }
-    Err(error)
 }
 
 async fn durable_run_summary_for_turn(
@@ -2238,27 +2873,6 @@ async fn durable_run_summary_for_turn(
         .durable_terminal_for_turn(session_id, protocol_turn_id)
         .await?;
     Ok(terminal.map(|terminal| RunSummary::from_terminal(session_id, protocol_turn_id, terminal)))
-}
-
-async fn account_goal_before_external_mutation(
-    repo: &crate::storage::SqliteSessionRepository,
-    session_id: crate::session::SessionId,
-) -> Result<Option<crate::session::ThreadGoal>, AppRunError> {
-    let current = repo.get_thread_goal_with_id(session_id).await?;
-    if current.as_ref().is_some_and(|(goal, _goal_id)| {
-        matches!(
-            goal.status,
-            crate::session::ThreadGoalStatus::Active
-                | crate::session::ThreadGoalStatus::BudgetLimited
-        )
-    }) {
-        let (_goal, goal_id) = current.expect("current goal checked above");
-        repo.account_thread_goal_usage_for_goal(session_id, 0, Some(goal_id.as_str()))
-            .await
-            .map_err(AppRunError::from)
-    } else {
-        Ok(current.map(|(goal, _goal_id)| goal))
-    }
 }
 
 fn apply_session_model_parameters(model: &mut ModelConfig, parameters: &SessionModelParameters) {
@@ -2634,6 +3248,95 @@ fn prepare_run_turn(
         prompt,
         prompt_dispatch: Some(prompt_dispatch),
     })
+}
+
+fn ensure_new_run_operation_kind(
+    expected_active_turn: ActiveTurnExpectation,
+) -> Result<(), AppRunError> {
+    if let ActiveTurnExpectation::Turn { turn_id, .. } = expected_active_turn {
+        return Err(AppRunError::Message(format!(
+            "run request captured active turn {turn_id}; use the exact session-steer command",
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_run_admission_contract(
+    request: &RunRequest,
+    preclaimed_root_execution: Option<&AgentRuntimeExecution>,
+) -> Result<(), AppRunError> {
+    ensure_new_run_operation_kind(request.expected_active_turn)?;
+    let supplied_context = request.agent_context.as_ref();
+    let preclaimed_context = preclaimed_root_execution.map(|execution| &execution.context);
+    if !matches!(request.admission_kind, RunAdmissionKind::NewUserRun)
+        && (!request.prompt.is_empty()
+            || request.continue_last
+            || request.title.is_some()
+            || request.prompt_dispatch.is_some()
+            || request.editor_context.is_some()
+            || request.review_request.is_some()
+            || !request.image_paths.is_empty()
+            || request.session_access_mode_adoption.is_some())
+    {
+        return Err(AppRunError::Message(
+            "an internal run admission cannot carry a direct user mutation payload".to_string(),
+        ));
+    }
+    match request.admission_kind {
+        RunAdmissionKind::NewUserRun => {
+            if supplied_context.is_some() || preclaimed_context.is_some() {
+                return Err(AppRunError::Message(
+                    "a new user run cannot borrow an agent execution owner".to_string(),
+                ));
+            }
+        }
+        RunAdmissionKind::RootContinuation {
+            predecessor_turn_id,
+            predecessor_revision,
+        } => {
+            if supplied_context.is_some()
+                || preclaimed_context.is_none_or(|context| context.is_sub_agent())
+                || request.session_id != preclaimed_context.map(|context| context.session_id())
+                || request.expected_active_turn
+                    != (ActiveTurnExpectation::Idle {
+                        latest_turn_id: Some(predecessor_turn_id),
+                        revision: predecessor_revision,
+                    })
+            {
+                return Err(AppRunError::Message(
+                    "a root continuation requires its preclaimed root owner and exact completed predecessor"
+                        .to_string(),
+                ));
+            }
+        }
+        RunAdmissionKind::AgentTrigger { history_item_id } => {
+            let exact_context = supplied_context.is_some_and(|context| {
+                context.is_sub_agent()
+                    && context.trigger_history_item_id() == Some(history_item_id)
+                    && context.owner_resume_request_id().is_none()
+                    && request.session_id == Some(context.session_id())
+            });
+            if !exact_context || preclaimed_context.is_some() {
+                return Err(AppRunError::Message(
+                    "an agent-triggered run requires its exact supplied wake identity".to_string(),
+                ));
+            }
+        }
+        RunAdmissionKind::OwnerResume { request_id } => {
+            let exact_context = supplied_context.is_some_and(|context| {
+                context.is_sub_agent()
+                    && context.owner_resume_request_id() == Some(request_id)
+                    && context.trigger_history_item_id().is_none()
+                    && request.session_id == Some(context.session_id())
+            });
+            if !exact_context || preclaimed_context.is_some() {
+                return Err(AppRunError::Message(
+                    "an owner-resume run requires its exact supplied wake identity".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3482,6 +4185,8 @@ mod tests {
             session_access_mode_adoption: None,
             agent_confirmation: None,
             agent_context: None,
+            admission_kind: crate::app::RunAdmissionKind::NewUserRun,
+            expected_active_turn: crate::session::ActiveTurnExpectation::initial_idle(),
         }
     }
 
@@ -3530,6 +4235,327 @@ mod tests {
             .expect("admitted")
             .admission_id;
         (store, session.id, admission_id, turn_id)
+    }
+
+    #[tokio::test]
+    async fn root_stop_targets_the_admitted_pending_turn_instead_of_terminal_last_turn() {
+        let config = ResolvedConfig::default();
+        let (run_service, store, workspace, _agent_runtime) =
+            run_service_fixture(config.clone()).await;
+        let session = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id: workspace.project_id,
+                title: "pending root Stop target".to_string(),
+                cwd: workspace.cwd.clone(),
+                model: config.model.model.clone(),
+                base_url: config.model.base_url.clone(),
+                access_mode: config.permissions.access_mode,
+            })
+            .await
+            .expect("session");
+        let root_scope_control = crate::runtime::RunControl::new();
+
+        let turn_a = crate::protocol::TurnId::new();
+        let plan_a = root_scope_control
+            .begin_root_admission(session.id, turn_a)
+            .expect("publish A plan");
+        let admission_a = store
+            .session_repo()
+            .admit_session_turn(session.id, turn_a)
+            .await
+            .expect("admit A")
+            .expect("A admitted");
+        plan_a
+            .commit(admission_a.admission_revision)
+            .expect("publish A receipt");
+        assert_eq!(
+            commit_completed_turn(&store, session.id, admission_a.admission_id, turn_a).await,
+            crate::storage::session_repo::AdmittedTerminalCommit::Applied
+        );
+        let turn_b = crate::protocol::TurnId::new();
+        let plan_b = root_scope_control
+            .begin_root_admission(session.id, turn_b)
+            .expect("publish pending B plan");
+        let stop_plan = match run_service
+            .seal_root_execution_for_stop(&root_scope_control)
+            .expect("seal root Stop")
+        {
+            super::RootExecutionStopSealOutcome::Acquired(plan) => plan,
+            outcome => panic!("expected acquired Stop plan, got {outcome:?}"),
+        };
+        let claim_service = Arc::clone(&run_service);
+        let claim_control = root_scope_control.clone();
+        let claim_task = tokio::spawn(async move {
+            claim_service
+                .claim_root_execution_stop(&claim_control, stop_plan)
+                .await
+        });
+        let admission_b = match store
+            .session_repo()
+            .admit_root_continuation_turn_with_initial_user_turn(
+                session.id,
+                turn_b,
+                None,
+                turn_a,
+                admission_a.admission_revision,
+                false,
+            )
+            .await
+            .expect("admit B")
+        {
+            crate::storage::session_repo::ActiveGoalTurnAdmission::Admitted(snapshot) => snapshot,
+            outcome => panic!("expected admitted B, got {outcome:?}"),
+        };
+        plan_b
+            .commit(admission_b.admission_revision)
+            .expect("publish B receipt");
+
+        let claim = claim_task
+            .await
+            .expect("claim task")
+            .expect("root Stop claim");
+        assert_eq!(
+            claim.expected_active_turn,
+            Some(crate::session::ActiveTurnExpectation::Turn {
+                turn_id: turn_b,
+                revision: admission_b.admission_revision,
+            })
+        );
+        assert!(matches!(
+            store
+                .session_repo()
+                .renew_admitted_run_lease(session.id, admission_b.admission_id, turn_b)
+                .await
+                .expect("B renewal observes request"),
+            crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::InterruptRequested(
+                crate::protocol::TurnInterruptionCause::UserStop
+            )
+        ));
+        assert_eq!(
+            run_service
+                .session_service
+                .request_exact_execution_interrupt(
+                    session.id,
+                    turn_a,
+                    admission_a.admission_revision,
+                    crate::protocol::TurnInterruptionCause::UserStop,
+                )
+                .await
+                .expect("stale A request"),
+            crate::session::ExactExecutionInterruptRequestOutcome::TargetChanged,
+            "the settled pending B must be the only durable Stop request target"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_process_root_stop_waits_for_every_local_commit_reservation() {
+        enum HeldReservation {
+            Effect(crate::runtime::ToolEffectCommitReservation),
+            Settlement(crate::runtime::ToolSettlementReservation),
+            Success(crate::runtime::SuccessCommitReservation),
+        }
+
+        impl HeldReservation {
+            fn release(self) {
+                match self {
+                    Self::Effect(reservation) => reservation.release(),
+                    Self::Settlement(reservation) => reservation.release(),
+                    Self::Success(reservation) => reservation.release(),
+                }
+            }
+        }
+
+        for phase in ["effect_committing", "tool_settling", "success_committing"] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let data_dir =
+                Utf8PathBuf::from_path_buf(temp.keep().join(phase)).expect("utf8 data dir");
+            std::fs::create_dir_all(data_dir.as_std_path()).expect("data dir");
+            let paths = StoragePaths {
+                database_path: data_dir.join("moyai.sqlite3"),
+                truncation_dir: data_dir.join("truncation"),
+                data_dir: data_dir.clone(),
+            };
+            let owner_sqlite = SqliteStore::open(&paths).expect("owner store");
+            owner_sqlite.migrate().expect("owner migration");
+            let requester_sqlite = SqliteStore::open(&paths).expect("requester store");
+            requester_sqlite.migrate().expect("requester migration");
+            let owner = StoreBundle::new(owner_sqlite);
+            let requester = StoreBundle::new(requester_sqlite);
+            let project_id = ProjectId::new();
+            owner
+                .project_repo()
+                .upsert_project(project_id, &data_dir, "test", "none")
+                .await
+                .expect("project");
+            let session = owner
+                .session_repo()
+                .create_session(NewSession {
+                    project_id,
+                    title: phase.to_string(),
+                    cwd: data_dir.clone(),
+                    model: "model".to_string(),
+                    base_url: "http://localhost:1234".to_string(),
+                    access_mode: crate::config::AccessMode::Default,
+                })
+                .await
+                .expect("session");
+            let turn_a = crate::protocol::TurnId::new();
+            let admission_a = owner
+                .session_repo()
+                .admit_session_turn(session.id, turn_a)
+                .await
+                .expect("admit A")
+                .expect("A admitted");
+            let root_scope = crate::runtime::RunControl::new();
+            root_scope
+                .begin_root_admission(session.id, turn_a)
+                .expect("publish root admission")
+                .commit(admission_a.admission_revision)
+                .expect("publish root receipt");
+            let turn_control = crate::runtime::RunControl::new();
+            let reservation = match phase {
+                "effect_committing" => HeldReservation::Effect(
+                    turn_control
+                        .begin_tool_effect_commit()
+                        .expect("effect commit reservation"),
+                ),
+                "tool_settling" => HeldReservation::Settlement(
+                    turn_control
+                        .begin_tool_settlement()
+                        .expect("tool settlement reservation"),
+                ),
+                "success_committing" => HeldReservation::Success(
+                    turn_control
+                        .begin_success_commit()
+                        .expect("success commit reservation"),
+                ),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                crate::session::SessionService::new(requester.clone())
+                    .request_exact_execution_interrupt(
+                        session.id,
+                        turn_a,
+                        admission_a.admission_revision,
+                        crate::protocol::TurnInterruptionCause::UserStop,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{phase} request: {error}")),
+                crate::session::ExactExecutionInterruptRequestOutcome::Recorded
+            );
+            assert_eq!(
+                owner
+                    .session_repo()
+                    .get_session(session.id)
+                    .await
+                    .unwrap_or_else(|error| panic!("{phase} running session: {error}"))
+                    .status,
+                crate::session::SessionStatus::Running
+            );
+            assert!(
+                owner
+                    .session_repo()
+                    .durable_terminal_for_turn(session.id, turn_a)
+                    .await
+                    .unwrap_or_else(|error| panic!("{phase} pre-renew terminal: {error}"))
+                    .is_none()
+            );
+
+            assert!(matches!(
+                super::renew_admitted_run_lease_with_terminal_cancel(
+                    owner.session_repo(),
+                    session.id,
+                    admission_a.admission_id,
+                    turn_a,
+                    Some(root_scope.clone()),
+                    turn_control.clone(),
+                    None,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{phase} renewal: {error}")),
+                crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::InterruptRequested(
+                    crate::protocol::TurnInterruptionCause::UserStop
+                )
+            ));
+            assert!(root_scope.root_admission_stop_is_sealed());
+            assert_eq!(
+                turn_control.cause(),
+                None,
+                "{phase} must defer UserStop behind the exact local reservation"
+            );
+            assert_eq!(
+                owner
+                    .session_repo()
+                    .get_session(session.id)
+                    .await
+                    .unwrap_or_else(|error| panic!("{phase} deferred session: {error}"))
+                    .status,
+                crate::session::SessionStatus::Running
+            );
+            assert!(
+                owner
+                    .session_repo()
+                    .durable_terminal_for_turn(session.id, turn_a)
+                    .await
+                    .unwrap_or_else(|error| panic!("{phase} deferred terminal: {error}"))
+                    .is_none(),
+                "durable terminal must not overtake {phase}"
+            );
+
+            reservation.release();
+            let user_stop = crate::runtime::RunCancellationCause::Interruption(
+                crate::protocol::TurnInterruptionCause::UserStop,
+            );
+            assert_eq!(turn_control.cause(), Some(user_stop.clone()));
+            let terminal_a = super::settle_admitted_run_result(
+                &owner,
+                session.id,
+                admission_a.admission_id,
+                turn_a,
+                Some(user_stop),
+                Err(crate::error::AppRunError::Message(
+                    "worker observed durable exact root Stop".to_string(),
+                )),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{phase} terminal settlement: {error}"));
+            assert!(matches!(
+                terminal_a.terminal().outcome,
+                crate::protocol::TurnTerminalOutcome::Interrupted {
+                    cause: crate::protocol::TurnInterruptionCause::UserStop
+                }
+            ));
+
+            let turn_b = crate::protocol::TurnId::new();
+            let admission_b = owner
+                .session_repo()
+                .admit_session_turn(session.id, turn_b)
+                .await
+                .expect("admit replacement B")
+                .expect("B admitted after exact A request was consumed");
+            assert!(matches!(
+                owner
+                    .session_repo()
+                    .renew_admitted_run_lease(session.id, admission_b.admission_id, turn_b)
+                    .await
+                    .unwrap_or_else(|error| panic!("{phase} B renewal: {error}")),
+                crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::Renewed
+            ));
+            assert_eq!(
+                crate::session::SessionService::new(requester.clone())
+                    .request_exact_execution_interrupt(
+                        session.id,
+                        turn_a,
+                        admission_a.admission_revision,
+                        crate::protocol::TurnInterruptionCause::UserStop,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{phase} stale A request: {error}")),
+                crate::session::ExactExecutionInterruptRequestOutcome::TargetChanged,
+                "a stale A request must not classify replacement B during {phase}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3669,6 +4695,8 @@ mod tests {
                     session_access_mode_adoption: None,
                     agent_confirmation: None,
                     agent_context: None,
+                    admission_kind: crate::app::RunAdmissionKind::NewUserRun,
+                    expected_active_turn: crate::session::ActiveTurnExpectation::initial_idle(),
                 }),
                 &mut renderer,
                 &mut prompt,
@@ -3774,6 +4802,8 @@ mod tests {
                     session_access_mode_adoption: None,
                     agent_confirmation: None,
                     agent_context: None,
+                    admission_kind: crate::app::RunAdmissionKind::NewUserRun,
+                    expected_active_turn: crate::session::ActiveTurnExpectation::initial_idle(),
                 }),
                 &mut renderer,
                 &mut prompt,
@@ -3799,7 +4829,7 @@ mod tests {
             run_service_fixture(config.clone()).await;
         let (root, child) = retained_child_fixture(&run_service, &store, &workspace, &config).await;
         let child_turn_id = crate::protocol::TurnId::new();
-        store
+        let child_admission = store
             .session_repo()
             .admit_session_turn(child.id, child_turn_id)
             .await
@@ -3816,6 +4846,10 @@ mod tests {
                     cwd: workspace.cwd.clone(),
                     image_paths: Vec::new(),
                     client_user_message_id: None,
+                    expected_active_turn: crate::session::ActiveTurnExpectation::Turn {
+                        turn_id: child_turn_id,
+                        revision: child_admission.admission_revision,
+                    },
                 }),
                 &mut renderer,
                 &mut prompt,
@@ -3840,6 +4874,8 @@ mod tests {
             .execute(
                 crate::app::AppCommand::SessionInterrupt(crate::app::SessionInterruptRequest {
                     session_id: child.id,
+                    expected_turn_id: child_turn_id,
+                    expected_admission_revision: child_admission.admission_revision,
                 }),
                 &mut renderer,
                 &mut prompt,
@@ -3869,6 +4905,7 @@ mod tests {
                         forged_path,
                         forged_child,
                         child_turn_id,
+                        child_admission.admission_revision,
                     )
                     .await
                     .is_err(),
@@ -3886,22 +4923,35 @@ mod tests {
 
         assert!(
             run_service
-                .interrupt_agent_turn_exact(root.id, "/root/worker", child.id, child_turn_id,)
+                .interrupt_agent_turn_exact(
+                    root.id,
+                    "/root/worker",
+                    child.id,
+                    child_turn_id,
+                    child_admission.admission_revision,
+                )
                 .await
                 .expect("exact child interrupt")
         );
-        assert_eq!(
+        assert!(
             store
                 .session_repo()
                 .durable_terminal_for_turn(child.id, child_turn_id)
                 .await
                 .expect("exact child terminal")
-                .expect("interrupted child terminal")
-                .outcome,
-            crate::protocol::TurnTerminalOutcome::Interrupted {
-                cause: crate::protocol::TurnInterruptionCause::AgentInterrupted,
-            }
+                .is_none(),
+            "the interrupt request must not terminalize ahead of the retained child owner"
         );
+        assert!(matches!(
+            store
+                .session_repo()
+                .renew_admitted_run_lease(child.id, child_admission.admission_id, child_turn_id,)
+                .await
+                .expect("child owner observes exact interrupt"),
+            crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::InterruptRequested(
+                crate::protocol::TurnInterruptionCause::AgentInterrupted
+            )
+        ));
     }
 
     #[tokio::test]
@@ -3960,6 +5010,7 @@ mod tests {
             .execute(
                 crate::app::AppCommand::SessionGoalSet(crate::app::SessionGoalSetRequest {
                     session_id: child.id,
+                    expected_active_turn: crate::session::ActiveTurnExpectation::initial_idle(),
                     objective: Some("external replacement".to_string()),
                     status: None,
                     token_budget: None,
@@ -4005,6 +5056,348 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_goal_set_and_clear_reject_stale_idle_turn_and_revision_owners() {
+        let config = ResolvedConfig::default();
+        let (run_service, store, workspace, _agent_runtime) =
+            run_service_fixture(config.clone()).await;
+        let (root, _child) =
+            retained_child_fixture(&run_service, &store, &workspace, &config).await;
+        store
+            .session_repo()
+            .replace_thread_goal(
+                root.id,
+                "preserve exact goal",
+                ThreadGoalStatus::Active,
+                None,
+            )
+            .await
+            .expect("initial goal");
+        let stale_idle = run_service
+            .session_service
+            .active_turn_expectation_for_session(root.id)
+            .await
+            .expect("initial expectation")
+            .expect("persisted session expectation");
+        let turn_id = crate::protocol::TurnId::new();
+        let admission = store
+            .session_repo()
+            .admit_session_turn(root.id, turn_id)
+            .await
+            .expect("replacement turn admission")
+            .expect("replacement turn admitted");
+        let mut renderer = crate::cli::HumanRenderer::new();
+        let mut prompt = NoPrompt;
+
+        let set_error = run_service
+            .execute(
+                crate::app::AppCommand::SessionGoalSet(crate::app::SessionGoalSetRequest {
+                    session_id: root.id,
+                    expected_active_turn: stale_idle,
+                    objective: Some("must not replace".to_string()),
+                    status: None,
+                    token_budget: None,
+                }),
+                &mut renderer,
+                &mut prompt,
+            )
+            .await
+            .expect_err("Idle(A) cannot mutate the goal while Turn(B) is running");
+        assert!(set_error.to_string().contains("active-turn owner changed"));
+        assert_eq!(
+            store
+                .session_repo()
+                .get_thread_goal(root.id)
+                .await
+                .expect("goal after rejected set")
+                .expect("preserved goal")
+                .objective,
+            "preserve exact goal"
+        );
+
+        let completed = terminal_event(root.id, crate::protocol::TurnTerminalOutcome::Completed);
+        assert!(matches!(
+            store
+                .session_repo()
+                .settle_admitted_turn_with_protocol_event(
+                    root.id,
+                    admission.admission_id,
+                    &completed,
+                    turn_id,
+                    None,
+                    None,
+                )
+                .await
+                .expect("complete replacement turn"),
+            crate::storage::session_repo::AdmittedTerminalSettlement::Applied { .. }
+        ));
+        let clear_error = run_service
+            .execute(
+                crate::app::AppCommand::SessionGoalClear(crate::app::SessionGoalClearRequest {
+                    session_id: root.id,
+                    expected_active_turn: stale_idle,
+                }),
+                &mut renderer,
+                &mut prompt,
+            )
+            .await
+            .expect_err("Idle(A) cannot clear the goal after terminal Idle(B) wins");
+        assert!(
+            clear_error
+                .to_string()
+                .contains("active-turn owner changed")
+        );
+        assert_eq!(
+            store
+                .session_repo()
+                .get_thread_goal(root.id)
+                .await
+                .expect("goal after rejected clear")
+                .expect("preserved goal")
+                .objective,
+            "preserve exact goal"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_kind_rejects_active_turn_before_every_goal_slash_shortcut() {
+        let config = ResolvedConfig::default();
+        let (run_service, store, workspace, _process_agent_runtime) =
+            run_service_fixture(config.clone()).await;
+        let session = run_service
+            .session_service
+            .start_or_resume(
+                crate::session::SessionStartRequest {
+                    selector: crate::session::SessionSelector::New,
+                    title: Some("run-kind goal guard".to_string()),
+                    cwd: workspace.cwd.clone(),
+                    model: config.model.model.clone(),
+                    base_url: config.model.base_url.clone(),
+                    access_mode: config.permissions.access_mode,
+                },
+                workspace.clone(),
+            )
+            .await
+            .expect("session");
+        store
+            .session_repo()
+            .replace_thread_goal(
+                session.session.id,
+                "unchanged goal",
+                ThreadGoalStatus::Active,
+                None,
+            )
+            .await
+            .expect("goal");
+        let captured_turn_id = crate::protocol::TurnId::new();
+        let mut renderer = crate::cli::HumanRenderer::new();
+        let mut prompt = NoPrompt;
+
+        for slash_prompt in ["/goal", "/goal clear", "/goal pause", "/goal resume"] {
+            let mut request =
+                control_run_request(config.clone(), &workspace, session.session.id, slash_prompt);
+            request.expected_active_turn = crate::session::ActiveTurnExpectation::Turn {
+                turn_id: captured_turn_id,
+                revision: 0,
+            };
+            let error = run_service
+                .execute(
+                    crate::app::AppCommand::Run(request),
+                    &mut renderer,
+                    &mut prompt,
+                )
+                .await
+                .expect_err("Run with an active-turn owner must reject before slash handling");
+            assert!(error.to_string().contains("exact session-steer command"));
+
+            let goal = store
+                .session_repo()
+                .get_thread_goal(session.session.id)
+                .await
+                .expect("unchanged goal")
+                .expect("goal remains");
+            assert_eq!(goal.objective, "unchanged goal");
+            assert_eq!(goal.status, ThreadGoalStatus::Active);
+        }
+    }
+
+    #[tokio::test]
+    async fn external_stop_and_steer_commands_reject_a_captured_turn_after_replacement() {
+        let config = ResolvedConfig::default();
+        let (run_service, store, workspace, _process_agent_runtime) =
+            run_service_fixture(config.clone()).await;
+        let session = run_service
+            .session_service
+            .start_or_resume(
+                crate::session::SessionStartRequest {
+                    selector: crate::session::SessionSelector::New,
+                    title: Some("exact external mutation target".to_string()),
+                    cwd: workspace.cwd.clone(),
+                    model: config.model.model.clone(),
+                    base_url: config.model.base_url.clone(),
+                    access_mode: config.permissions.access_mode,
+                },
+                workspace.clone(),
+            )
+            .await
+            .expect("session");
+        let repository = store.session_repo();
+        repository
+            .replace_thread_goal(
+                session.session.id,
+                "goal must remain unchanged",
+                ThreadGoalStatus::Active,
+                None,
+            )
+            .await
+            .expect("goal");
+        let turn_a = crate::protocol::TurnId::new();
+        let admitted_a = repository
+            .admit_session_turn(session.session.id, turn_a)
+            .await
+            .expect("admit A")
+            .expect("A admitted");
+        let admission_a = admitted_a.admission_id;
+        let revision_a = admitted_a.admission_revision;
+        assert_eq!(
+            commit_completed_turn(&store, session.session.id, admission_a, turn_a).await,
+            crate::storage::session_repo::AdmittedTerminalCommit::Applied
+        );
+        let turn_b = crate::protocol::TurnId::new();
+        let admitted_b = repository
+            .admit_session_turn(session.session.id, turn_b)
+            .await
+            .expect("admit B")
+            .expect("B admitted");
+        let admission_b = admitted_b.admission_id;
+
+        let mut renderer = crate::cli::HumanRenderer::new();
+        let mut prompt = NoPrompt;
+        let stop_error = run_service
+            .execute(
+                crate::app::AppCommand::SessionInterrupt(crate::app::SessionInterruptRequest {
+                    session_id: session.session.id,
+                    expected_turn_id: turn_a,
+                    expected_admission_revision: revision_a,
+                }),
+                &mut renderer,
+                &mut prompt,
+            )
+            .await
+            .expect_err("stale A Stop must reject replacement B");
+        assert!(
+            stop_error
+                .to_string()
+                .contains("no longer owns the captured root turn")
+        );
+
+        let steer_error = run_service
+            .execute(
+                crate::app::AppCommand::SessionSteer(crate::app::SessionSteerRequest {
+                    session_id: session.session.id,
+                    prompt: "stale steer".to_string(),
+                    cwd: workspace.cwd.clone(),
+                    image_paths: Vec::new(),
+                    client_user_message_id: Some("stale-a".to_string()),
+                    expected_active_turn: crate::session::ActiveTurnExpectation::Turn {
+                        turn_id: turn_a,
+                        revision: revision_a,
+                    },
+                }),
+                &mut renderer,
+                &mut prompt,
+            )
+            .await
+            .expect_err("stale A steer must reject replacement B");
+        assert!(
+            steer_error.to_string().contains("expected active turn"),
+            "the exact steer owner must reject replacement B"
+        );
+        assert_eq!(
+            repository
+                .fresh_running_turn_for_session(session.session.id)
+                .await
+                .expect("replacement remains readable"),
+            Some(turn_b)
+        );
+        assert!(
+            repository
+                .durable_terminal_for_turn(session.session.id, turn_b)
+                .await
+                .expect("replacement terminal lookup")
+                .is_none(),
+            "neither stale command may terminalize replacement B"
+        );
+        assert!(
+            store
+                .protocol_event_store()
+                .list_history_items_for_session(session.session.id)
+                .expect("history")
+                .iter()
+                .all(|item| !matches!(
+                    item.payload,
+                    crate::protocol::HistoryItemPayload::SteerTurn { .. }
+                )),
+            "the stale steer must not be stored against replacement B"
+        );
+
+        for slash_prompt in ["/goal clear", "/goal pause", "/goal resume"] {
+            let mut request =
+                control_run_request(config.clone(), &workspace, session.session.id, slash_prompt);
+            request.expected_active_turn = crate::session::ActiveTurnExpectation::Idle {
+                latest_turn_id: Some(turn_a),
+                revision: revision_a,
+            };
+            let error = run_service
+                .execute(
+                    crate::app::AppCommand::Run(request),
+                    &mut renderer,
+                    &mut prompt,
+                )
+                .await
+                .expect_err("stale Idle(A) goal mutation must reject running B");
+            assert!(error.to_string().contains("active-turn owner changed"));
+        }
+        assert_eq!(
+            repository
+                .get_thread_goal(session.session.id)
+                .await
+                .expect("goal after running replacement")
+                .expect("goal remains")
+                .status,
+            ThreadGoalStatus::Active
+        );
+
+        assert_eq!(
+            commit_completed_turn(&store, session.session.id, admission_b, turn_b).await,
+            crate::storage::session_repo::AdmittedTerminalCommit::Applied
+        );
+        for slash_prompt in ["/goal clear", "/goal pause", "/goal resume"] {
+            let mut request =
+                control_run_request(config.clone(), &workspace, session.session.id, slash_prompt);
+            request.expected_active_turn = crate::session::ActiveTurnExpectation::Idle {
+                latest_turn_id: Some(turn_a),
+                revision: revision_a,
+            };
+            let error = run_service
+                .execute(
+                    crate::app::AppCommand::Run(request),
+                    &mut renderer,
+                    &mut prompt,
+                )
+                .await
+                .expect_err("stale Idle(A) goal mutation must reject terminal Idle(B)");
+            assert!(error.to_string().contains("active-turn owner changed"));
+        }
+        let goal = repository
+            .get_thread_goal(session.session.id)
+            .await
+            .expect("goal after terminal replacement")
+            .expect("goal remains");
+        assert_eq!(goal.objective, "goal must remain unchanged");
+        assert_eq!(goal.status, ThreadGoalStatus::Active);
+    }
+
+    #[tokio::test]
     async fn inactive_goal_ends_preclaimed_continuation_without_admission_or_failure() {
         let config = ResolvedConfig::default();
         let (run_service, store, workspace, _process_agent_runtime) =
@@ -4039,16 +5432,17 @@ mod tests {
             .await
             .expect("first root execution");
         let turn_id = crate::protocol::TurnId::new();
-        let admission_id = store
+        let admission = store
             .session_repo()
             .admit_session_turn(session.session.id, turn_id)
             .await
             .expect("durable first-turn admission")
-            .expect("first turn admitted")
-            .admission_id;
+            .expect("first turn admitted");
+        let admission_id = admission.admission_id;
+        let admission_revision = admission.admission_revision;
         first_execution
             .context
-            .bind_durable_turn_owner(admission_id, turn_id)
+            .bind_durable_turn_owner(admission_id, turn_id, admission_revision)
             .expect("bind durable first-turn owner");
         assert_eq!(
             commit_completed_turn(&store, session.session.id, admission_id, turn_id).await,
@@ -4079,30 +5473,54 @@ mod tests {
         };
         let mut renderer = crate::cli::HumanRenderer::new();
         let mut prompt = NoPrompt;
+        let mut continuation_request = crate::app::RunRequest {
+            prompt: "/goal clear".to_string(),
+            session_id: Some(session.session.id),
+            continue_last: false,
+            title: None,
+            cwd: workspace.cwd.clone(),
+            config: crate::app::RunConfigInput::Layered {
+                model: String::new(),
+                base_url: String::new(),
+                config_override: None,
+            },
+            output_mode: crate::cli::OutputMode::Human,
+            show_reasoning_summary: false,
+            prompt_dispatch: None,
+            editor_context: None,
+            review_request: None,
+            image_paths: Vec::new(),
+            run_control: root_scope.clone(),
+            session_access_mode_adoption: None,
+            agent_confirmation: Some(confirmation),
+            agent_context: None,
+            admission_kind: crate::app::RunAdmissionKind::RootContinuation {
+                predecessor_turn_id: turn_id,
+                predecessor_revision: admission_revision,
+            },
+            expected_active_turn: crate::session::ActiveTurnExpectation::Idle {
+                latest_turn_id: Some(turn_id),
+                revision: admission_revision,
+            },
+        };
+        assert!(
+            super::ensure_run_admission_contract(&continuation_request, Some(&continuation),)
+                .expect_err("an internal continuation cannot reinterpret slash text")
+                .to_string()
+                .contains("direct user mutation payload")
+        );
+        assert!(
+            store
+                .session_repo()
+                .get_thread_goal(session.session.id)
+                .await
+                .expect("goal remains untouched")
+                .is_none()
+        );
+        continuation_request.prompt.clear();
         let outcome = run_service
             .execute_single_run(
-                crate::app::RunRequest {
-                    prompt: String::new(),
-                    session_id: Some(session.session.id),
-                    continue_last: false,
-                    title: None,
-                    cwd: workspace.cwd.clone(),
-                    config: crate::app::RunConfigInput::Layered {
-                        model: String::new(),
-                        base_url: String::new(),
-                        config_override: None,
-                    },
-                    output_mode: crate::cli::OutputMode::Human,
-                    show_reasoning_summary: false,
-                    prompt_dispatch: None,
-                    editor_context: None,
-                    review_request: None,
-                    image_paths: Vec::new(),
-                    run_control: root_scope.clone(),
-                    session_access_mode_adoption: None,
-                    agent_confirmation: Some(confirmation),
-                    agent_context: None,
-                },
+                continuation_request,
                 &mut renderer,
                 &mut prompt,
                 Some(continuation),
@@ -4440,6 +5858,103 @@ mod tests {
                     .expect("readmission")
                     .is_some(),
                 "{setup_stage} must release durable admission ownership"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_interrupt_request_replaces_unrelated_fallback_failure_for_root_and_child() {
+        let config = ResolvedConfig::default();
+        let (run_service, store, workspace, _agent_runtime) =
+            run_service_fixture(config.clone()).await;
+        let (root, child) = retained_child_fixture(&run_service, &store, &workspace, &config).await;
+
+        for (session_id, cause) in [
+            (root.id, crate::protocol::TurnInterruptionCause::UserStop),
+            (
+                child.id,
+                crate::protocol::TurnInterruptionCause::AgentInterrupted,
+            ),
+        ] {
+            let turn_id = crate::protocol::TurnId::new();
+            let admission = store
+                .session_repo()
+                .admit_session_turn(session_id, turn_id)
+                .await
+                .expect("admission")
+                .expect("admitted turn");
+            assert_eq!(
+                run_service
+                    .session_service
+                    .request_exact_execution_interrupt(
+                        session_id,
+                        turn_id,
+                        admission.admission_revision,
+                        cause,
+                    )
+                    .await
+                    .expect("record exact interrupt before fallback settlement"),
+                crate::session::ExactExecutionInterruptRequestOutcome::Recorded
+            );
+
+            let summary = super::settle_admitted_run_result(
+                &store,
+                session_id,
+                admission.admission_id,
+                turn_id,
+                Some(crate::runtime::RunCancellationCause::Failure(
+                    "unrelated setup failure".to_string(),
+                )),
+                Err(crate::error::AppRunError::Message(
+                    "unrelated setup failure".to_string(),
+                )),
+            )
+            .await
+            .expect("the terminal transaction returns its authoritative interrupt");
+            assert!(matches!(
+                summary.terminal().outcome,
+                crate::protocol::TurnTerminalOutcome::Interrupted { cause: actual }
+                    if actual == cause
+            ));
+            assert!(matches!(
+                store
+                    .session_repo()
+                    .durable_terminal_for_turn(session_id, turn_id)
+                    .await
+                    .expect("durable terminal read")
+                    .expect("durable terminal")
+                    .outcome,
+                crate::protocol::TurnTerminalOutcome::Interrupted { cause: actual }
+                    if actual == cause
+            ));
+            let runtime_terminals = store
+                .protocol_event_store()
+                .list_runtime_events(session_id, turn_id)
+                .expect("canonical runtime events")
+                .into_iter()
+                .filter_map(|event| match event.msg {
+                    crate::protocol::RuntimeEventMsg::TurnTerminal { terminal } => Some(terminal),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(runtime_terminals.len(), 1);
+            assert!(matches!(
+                runtime_terminals[0].outcome,
+                crate::protocol::TurnTerminalOutcome::Interrupted { cause: actual }
+                    if actual == cause
+            ));
+            assert_eq!(
+                run_service
+                    .session_service
+                    .request_exact_execution_interrupt(
+                        session_id,
+                        turn_id,
+                        admission.admission_revision,
+                        cause,
+                    )
+                    .await
+                    .expect("terminal-first request loses"),
+                crate::session::ExactExecutionInterruptRequestOutcome::TargetChanged
             );
         }
     }
@@ -4845,6 +6360,7 @@ mod tests {
                 session_id,
                 admission_id,
                 turn_id,
+                None,
                 run_control.clone(),
                 None,
             )
@@ -4882,6 +6398,7 @@ mod tests {
                 session_id,
                 admission_id,
                 turn_id,
+                None,
                 run_control.clone(),
                 None,
             )
@@ -4917,6 +6434,7 @@ mod tests {
                 session_id,
                 admission_id,
                 turn_id,
+                None,
                 run_control.clone(),
                 None,
             )

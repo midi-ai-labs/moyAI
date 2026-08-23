@@ -1,6 +1,7 @@
 import type { DesktopWebState, RowMutationTarget } from "./types.ts";
 import type { PermissionDecisionState } from "./decision_state.ts";
 import { renderPermissionAgentIdentity } from "./render_agent_activity.ts";
+import { runCanBeCancelled } from "./run_control.ts";
 import { escapeHtml } from "./utils.ts";
 
 export type LocalConfirmation = {
@@ -35,7 +36,9 @@ export function renderConfirmation(
   const status = currentDecision.phase === "submitting"
     ? currentDecision.decision === "approved"
       ? "承認を反映しています。"
-      : "現在のタスクを停止しています。"
+      : currentDecision.decision === "abort"
+        ? "現在のタスクを停止しています。"
+        : "実行停止を要求しています。"
     : currentDecision.phase === "failed"
       ? currentDecision.error
       : "実行しない場合、現在のタスクを停止し、次の指示を待ちます。";
@@ -45,6 +48,12 @@ export function renderConfirmation(
   const approveLabel = pending && currentDecision.decision === "approved"
     ? "承認しています…"
     : "実行する";
+  const stopLabel = pending && currentDecision.decision === "stop"
+    ? "停止しています…"
+    : "実行停止";
+  const stopAction = runCanBeCancelled(state)
+    ? `<button class="danger-button" data-action="cancel-run" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:stop" title="現在のタスクへ実行停止を要求" ${pending ? "disabled" : ""}>${stopLabel}</button>`
+    : "";
   return `
     <div class="modal-backdrop">
       <section class="modal confirmation" role="alertdialog" aria-modal="true" aria-labelledby="permission-title" aria-describedby="permission-summary" tabindex="-1" data-permission-id="${escapeHtml(requestId)}" ${pending ? 'aria-busy="true"' : ""}>
@@ -60,6 +69,7 @@ export function renderConfirmation(
         <div class="permission-decision-status" role="status" aria-live="polite" tabindex="-1" data-focus-key="permission:${escapeHtml(requestId)}:status">${escapeHtml(status)}</div>
         <div class="modal-actions">
           <button data-action="abort-permission" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:abort" ${pending ? "disabled" : "autofocus"}>${abortLabel}</button>
+          ${stopAction}
           <button class="send wide-send" data-action="approve-permission" data-permission-action data-focus-key="permission:${escapeHtml(requestId)}:approve" ${pending ? "disabled" : ""}>${approveLabel}</button>
         </div>
       </section>

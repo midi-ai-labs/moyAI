@@ -15,7 +15,9 @@ import {
   renderSubAgentSummaryTrigger,
 } from "../src/render_agent_activity.ts";
 import { actionById, type ActionContext } from "../src/actions.ts";
-import { renderArtifactPane, setRenderContext } from "../src/render.ts";
+import { isExactAgentInterruptTarget } from "../src/agent_interrupt_contract.ts";
+import { renderArtifactPane } from "../src/render.ts";
+import { DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION } from "../src/render_projection.ts";
 import { renderConfirmation } from "../src/render_overlays.ts";
 import { runCanBeCancelled, runSurfaceActive } from "../src/run_control.ts";
 import type {
@@ -24,6 +26,7 @@ import type {
   AgentStatus,
   DesktopWebState,
 } from "../src/types.ts";
+import { turnStopTarget } from "./stop_target_fixture.ts";
 import {
   agentExecutionSnapshotOwnerIdentity,
   agentExecutionRequestNeedsRefresh,
@@ -165,7 +168,7 @@ test("agent execution snapshots persist only for the same root, path, and child 
   const second = agentRow("/root/second", 2, "running");
   const state = {
     workspace_path: "C:/workspace",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: "1" },
     agent_activity_rows: [first, second],
   } as DesktopWebState;
   const firstOwner = agentExecutionSnapshotOwnerIdentity(state, first.agent_path);
@@ -211,11 +214,31 @@ test("agent execution snapshots persist only for the same root, path, and child 
 
 test("agent inspector separates ordered list and selected execution detail", () => {
   const completedLater = agentRow("/root/completed-later", 3, "completed");
+  const longTaskName = "C029 長名タスク & <unbroken_agent_name_abcdefghijklmnopqrstuvwxyz0123456789>";
+  completedLater.task_name = longTaskName;
   completedLater.result_preview = "later result";
   const completedFirst = agentRow("/root/completed-first", 1, "completed");
   const active = agentRow("/root/active", 2, "running");
   const attention = agentRow("/root/attention", 4, "interrupted");
   const state = {
+    draft_target: { workspacePath: "C:/workspace", sessionId: "session-a", ownerGeneration: "1" },
+    side_chat: {
+      configured: false,
+      deleting: false,
+      chat_id: null,
+      owner_session_id: "session-a",
+      model: "",
+      base_url: "",
+      status: "idle",
+      phase: "idle",
+      last_error: "",
+      generation: "0",
+      draft_text: "",
+      draft_revision: "0",
+      messages: [],
+      can_send: false,
+      can_cancel: false,
+    },
     agent_tree_active: true,
     agent_activity_rows: [completedLater, attention, active, completedFirst],
   } as DesktopWebState;
@@ -225,6 +248,14 @@ test("agent inspector separates ordered list and selected execution detail", () 
   assert.ok(list.indexOf('id="sub-agent-group-attention"') < list.indexOf('id="sub-agent-group-completed"'));
   assert.ok(list.indexOf("/root/completed-first") < list.indexOf("/root/completed-later"));
   assert.match(list, /data-action="show-agent-pane" data-agent-path="\/root\/completed-later"/);
+  assert.match(
+    list,
+    /title="C029 長名タスク &amp; &lt;unbroken_agent_name_abcdefghijklmnopqrstuvwxyz0123456789&gt;"/,
+  );
+  assert.match(
+    list,
+    /<strong>C029 長名タスク &amp; &lt;unbroken_agent_name_abcdefghijklmnopqrstuvwxyz0123456789&gt;<\/strong><small>later result<\/small>/,
+  );
   assert.equal(list.match(/data-action="interrupt-agent"/g)?.length, 1);
   assert.match(list, /data-action="interrupt-agent" data-agent-path="\/root\/active"/);
 
@@ -270,47 +301,44 @@ test("agent inspector separates ordered list and selected execution detail", () 
   assert.match(boundedDetail, />\s*以前の実行履歴\s*</);
   assert.doesNotMatch(boundedDetail, /1\/160件/);
 
-  setRenderContext({
-    artifactPaneCollapsed: false,
-    artifactPaneMode: "agents",
-    selectedAgentPath: "/root/completed-later",
-    selectedAgentExecution: {
-      status: "ready",
-      generation: 1,
-      expectedTarget: executionTarget(completedLater),
-      projection,
-      error: "",
+  const detailLocal = {
+    ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
+    artifactPane: {
+      ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.artifactPane,
+      collapsed: false,
+      mode: "agents" as const,
+      selectedAgentPath: "/root/completed-later",
+      selectedAgentExecution: {
+        status: "ready" as const,
+        generation: 1,
+        expectedTarget: executionTarget(completedLater),
+        projection,
+        error: "",
+      },
     },
-    attachmentTrayOpen: false,
-    configDirty: false,
-    configMutationPending: false,
-    configOwnerMutationOpen: true,
-    configDraftEditOpen: true,
-    configDraftDiscardOpen: false,
-    configDraftCommitOpen: false,
-  });
-  const pane = renderArtifactPane(state);
+  };
+  const pane = renderArtifactPane(state, detailLocal);
   assert.match(pane, /data-pane-mode="sub-agents"/);
   assert.match(pane, /id="sub-agent-inspector"/);
   assert.match(pane, /data-action="show-agent-list"[\s\S]*?aria-label="Sub Agent一覧に戻る"/);
   assert.match(pane, /data-focus-key="agent-pane-back" aria-label="Sub Agent一覧に戻る"/);
-  assert.match(pane, /completed-later/);
+  assert.match(
+    pane,
+    /class="agent-pane-identity[^>]*>[\s\S]*?<strong>C029 長名タスク &amp; &lt;unbroken_agent_name_abcdefghijklmnopqrstuvwxyz0123456789&gt;<\/strong>/,
+  );
   assert.match(pane, /data-action="toggle-artifact-pane"[^>]+aria-label="Sub Agentペインを閉じる"/);
 
-  setRenderContext({
-    artifactPaneCollapsed: false,
-    artifactPaneMode: "agents",
-    selectedAgentPath: null,
-    selectedAgentExecution: null,
-    attachmentTrayOpen: false,
-    configDirty: false,
-    configMutationPending: false,
-    configOwnerMutationOpen: true,
-    configDraftEditOpen: true,
-    configDraftDiscardOpen: true,
-    configDraftCommitOpen: true,
-  });
-  const listPane = renderArtifactPane(state);
+  const listLocal = {
+    ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
+    artifactPane: {
+      ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.artifactPane,
+      collapsed: false,
+      mode: "agents" as const,
+      selectedAgentPath: null,
+      selectedAgentExecution: null,
+    },
+  };
+  const listPane = renderArtifactPane(state, listLocal);
   assert.match(listPane, /data-action="show-output-pane"/);
   assert.match(listPane, /data-focus-key="agent-pane-back" aria-label="出力ペインに戻る"/);
 });
@@ -320,7 +348,7 @@ test("agent pane selection is frontend-local and resets at owner or row boundari
   const active = agentRow("/root/active", 2, "running");
   const state = {
     workspace_path: "C:/workspace",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: "1" },
     agent_activity_rows: [first, active],
   } as DesktopWebState;
   const ui = createUiLocalState();
@@ -366,7 +394,7 @@ test("agent pane selection is frontend-local and resets at owner or row boundari
   openAgentPane(ui, state, "/root/first");
   reconcileAgentPaneState(ui, {
     ...state,
-    draft_target: { workspacePath: "C:/workspace", sessionId: "other-root-session", ownerGeneration: 2 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "other-root-session", ownerGeneration: "2" },
   });
   assert.equal(ui.artifactPaneMode, "output");
   assert.equal(ui.selectedAgentPath, null);
@@ -376,7 +404,7 @@ test("agent pane back actions request stable focus targets across each rerender"
   const first = agentRow("/root/first", 1, "completed");
   const state = {
     workspace_path: "C:/workspace",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: "1" },
     agent_activity_rows: [first],
   } as DesktopWebState;
   const ui = createUiLocalState();
@@ -403,7 +431,7 @@ test("agent execution cache accepts only the selected generation and current own
   const second = agentRow("/root/second", 2, "running");
   const state = {
     workspace_path: "C:/workspace",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: "1" },
     agent_activity_rows: [first, second],
   } as DesktopWebState;
   const ui = createUiLocalState();
@@ -430,7 +458,7 @@ test("agent execution cache accepts only the selected generation and current own
   const ownerStaleRequest = beginAgentExecutionLoad(ui, state, first);
   const nextOwner = {
     ...state,
-    draft_target: { workspacePath: "C:/workspace", sessionId: "other-root", ownerGeneration: 2 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "other-root", ownerGeneration: "2" },
   };
   reconcileAgentPaneState(ui, nextOwner);
   assert.equal(finishAgentExecutionLoad(ui, ownerStaleRequest, executionProjection(first)), false);
@@ -441,7 +469,7 @@ test("a selected agent activity change during a read requires an immediate lates
   const running = agentRow("/root/reviewer", 1, "running");
   const state = {
     workspace_path: "C:/workspace",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: "1" },
     agent_activity_rows: [running],
   } as DesktopWebState;
   const ui = createUiLocalState();
@@ -472,7 +500,7 @@ test("agent execution previous pages replace with one contiguous reprojected ran
   const row = agentRow("/root/history", 1, "completed");
   const state = {
     workspace_path: "C:/workspace",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: "1" },
     agent_activity_rows: [row],
   } as DesktopWebState;
   const ui = createUiLocalState();
@@ -539,7 +567,7 @@ test("agent execution rejects a non-contiguous previous page and preserves the l
   const row = agentRow("/root/history", 1, "completed");
   const state = {
     workspace_path: "C:/workspace",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: "1" },
     agent_activity_rows: [row],
   } as DesktopWebState;
   const ui = createUiLocalState();
@@ -590,6 +618,8 @@ test("permission confirmation identifies the requesting Sub Agent and stays comp
     confirmation_visible: true,
     confirmation_id: "request-42",
     confirmation_text: "",
+    can_cancel_run: true,
+    stop_target: turnStopTarget(),
     confirmation: {
       summary: "shellを実行します",
       details: ["npm test"],
@@ -606,6 +636,7 @@ test("permission confirmation identifies the requesting Sub Agent and stays comp
   assert.match(rendered, /\/root\/review/);
   assert.doesNotMatch(rendered, /<Review Agent>/);
   assert.match(rendered, /data-action="abort-permission"[^>]+autofocus>実行せず、指示を変更する/);
+  assert.match(rendered, /data-action="cancel-run"[^>]*>実行停止<\/button>/);
   assert.match(rendered, /data-action="approve-permission"[^>]*>実行する/);
   assert.match(rendered, /現在のタスクを停止し、次の指示を待ちます/);
   assert.match(rendered, /data-permission-id="request-42"/);
@@ -625,6 +656,8 @@ test("permission rendering is declarative, request-owned, and gives each new req
     confirmation_visible: true,
     confirmation_id: "B",
     confirmation_text: "確認",
+    can_cancel_run: true,
+    stop_target: turnStopTarget(),
     confirmation: {
       summary: "shellを実行します",
       details: ["npm test"],
@@ -641,10 +674,21 @@ test("permission rendering is declarative, request-owned, and gives each new req
     decision: "abort",
   });
   assert.match(submitting, /data-permission-id="B"[^>]+aria-busy="true"/);
-  assert.equal(submitting.match(/data-permission-action[^>]+disabled/g)?.length, 2);
+  assert.equal(submitting.match(/data-permission-action[^>]+disabled/g)?.length, 3);
   assert.match(submitting, /現在のタスクを停止しています/);
   assert.match(submitting, /停止しています…/);
   assert.doesNotMatch(submitting, /data-permission-action[^>]+autofocus/);
+
+  const stopping = renderConfirmation(state, {
+    phase: "submitting",
+    requestId: "B",
+    submissionId: 8,
+    decision: "stop",
+  });
+  assert.match(stopping, /実行停止を要求しています/);
+  assert.match(stopping, /data-action="cancel-run"[^>]+disabled[^>]*>停止しています…<\/button>/);
+  assert.equal(stopping.match(/data-permission-action[^>]+disabled/g)?.length, 3);
+  assert.doesNotMatch(stopping, /data-permission-action[^>]+autofocus/);
 
   const failed = renderConfirmation(state, {
     phase: "failed",
@@ -665,33 +709,72 @@ test("permission rendering is declarative, request-owned, and gives each new req
   assert.match(newRequest, /現在のタスクを停止し、次の指示を待ちます/);
 });
 
-test("permission actions send typed approve and abort decisions", async () => {
-  const state = { confirmation_visible: true } as DesktopWebState;
+test("permission actions keep typed decisions distinct from canonical Stop", async () => {
+  const state = {
+    confirmation_visible: true,
+    can_cancel_run: true,
+    stop_target: turnStopTarget(),
+  } as DesktopWebState;
   const decisions: string[] = [];
+  const stops: DesktopWebState[] = [];
   const context = {
     submitPermissionDecision: async (decision: string) => {
       decisions.push(decision);
+    },
+    submitRunStop: async (target: DesktopWebState) => {
+      stops.push(target);
     },
   } as unknown as ActionContext;
 
   await actionById("approve-permission")?.run(state, context, { index: -1, value: "" });
   await actionById("abort-permission")?.run(state, context, { index: -1, value: "" });
+  await actionById("cancel-run")?.run(state, context, { index: -1, value: "" });
 
   assert.deepEqual(decisions, ["approved", "abort"]);
+  assert.deepEqual(stops, [state]);
 });
 
 test("ordinary Stop remains root-only while exact child interrupt carries lineage and turn", async () => {
-  assert.equal(runCanBeCancelled({ can_cancel_run: false }), false);
-  assert.equal(runCanBeCancelled({ can_cancel_run: true }), true);
-  assert.equal(runSurfaceActive({ busy: false, agent_tree_active: true }), true);
-  assert.equal(runSurfaceActive({ busy: false, agent_tree_active: false }), false);
+  assert.equal(runCanBeCancelled({ can_cancel_run: false, stop_target: turnStopTarget() }), false);
+  assert.equal(runCanBeCancelled({ can_cancel_run: true, stop_target: null }), false);
+  assert.equal(runCanBeCancelled({ can_cancel_run: true, stop_target: turnStopTarget() }), true);
+  assert.equal(runSurfaceActive({ task_activity_state: "running" }), true);
+  assert.equal(runSurfaceActive({ task_activity_state: "finalizing" }), true);
+  assert.equal(runSurfaceActive({ task_activity_state: "attention" }), true);
+  assert.equal(runSurfaceActive({ task_activity_state: "idle" }), false);
 
-  const row = agentRow("/root/review", 1, "running");
+  const rootSessionId = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+  const childSessionId = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+  const turnId = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+  const row = {
+    ...agentRow("/root/review", 1, "running"),
+    session_id: childSessionId,
+    active_turn_id: turnId,
+    interrupt_target: {
+      workspacePath: "C:/workspace",
+      rootSessionId,
+      agentPath: "/root/review",
+      childSessionId,
+      expectedTurnId: turnId,
+      admissionRevision: "7",
+    },
+  };
+  assert.equal(isExactAgentInterruptTarget(row.interrupt_target), true);
+  for (const invalid of [
+    { ...row.interrupt_target, rootSessionId: rootSessionId.toLowerCase() },
+    { ...row.interrupt_target, childSessionId: "00000000-0000-0000-0000-000000000010" },
+    { ...row.interrupt_target, expectedTurnId: turnId.toLowerCase() },
+    { ...row.interrupt_target, admissionRevision: "07" },
+    { ...row.interrupt_target, admissionRevision: 7 },
+    { ...row.interrupt_target, compatibilityFlag: false },
+  ]) {
+    assert.equal(isExactAgentInterruptTarget(invalid), false, JSON.stringify(invalid));
+  }
   let dispatched: { name: string; args?: Record<string, unknown> } | null = null;
   await actionById("interrupt-agent")?.run(
     {
       workspace_path: "C:/workspace",
-      draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: 1 },
+      draft_target: { workspacePath: "C:/workspace", sessionId: rootSessionId, ownerGeneration: "1" },
       agent_activity_rows: [row],
     } as DesktopWebState,
     {
@@ -706,10 +789,11 @@ test("ordinary Stop remains root-only while exact child interrupt carries lineag
     args: {
       expectedTarget: {
         workspacePath: "C:/workspace",
-        rootSessionId: "root-session",
+        rootSessionId,
         agentPath: "/root/review",
-        childSessionId: "session-1",
-        expectedTurnId: "turn-1",
+        childSessionId,
+        expectedTurnId: turnId,
+        admissionRevision: "7",
       },
     },
   });
@@ -718,8 +802,8 @@ test("ordinary Stop remains root-only while exact child interrupt carries lineag
   await actionById("interrupt-agent")?.run(
     {
       workspace_path: "C:/workspace",
-      draft_target: { workspacePath: "C:/workspace", sessionId: "root-session", ownerGeneration: 1 },
-      agent_activity_rows: [{ ...row, active_turn_id: null, can_interrupt: false }],
+      draft_target: { workspacePath: "C:/workspace", sessionId: rootSessionId, ownerGeneration: "1" },
+      agent_activity_rows: [{ ...row, active_turn_id: null, interrupt_target: null }],
     } as DesktopWebState,
     {
       mutate: async (name: string, args?: Record<string, unknown>) => {
@@ -748,7 +832,16 @@ function agentRow(
     started_order: startedOrder,
     updated,
     active_turn_id: status === "running" ? `turn-${startedOrder}` : null,
-    can_interrupt: status === "running",
+    interrupt_target: status === "running"
+      ? {
+        workspacePath: "C:/workspace",
+        rootSessionId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        agentPath,
+        childSessionId: "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        expectedTurnId: "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        admissionRevision: "1",
+      }
+      : null,
   };
 }
 

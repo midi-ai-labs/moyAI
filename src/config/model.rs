@@ -9,8 +9,8 @@ pub const DEFAULT_MODEL_BASE_URL: &str = "http://127.0.0.1:1234";
 pub const DEFAULT_MODEL_NAME: &str = "qwen/qwen3.6-27b";
 pub const DEFAULT_MODEL_CONTEXT_WINDOW: u32 = 131_072;
 pub const DEFAULT_MODEL_MAX_OUTPUT_TOKENS: u32 = 32_768;
-pub const DEFAULT_MODEL_REQUEST_TIMEOUT_MS: u64 = 1_800_000;
-pub const DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS: u64 = 1_800_000;
+pub const DEFAULT_MODEL_REQUEST_TIMEOUT_MS: u64 = 3_600_000;
+pub const MAX_MODEL_REQUEST_TIMEOUT_MS: u64 = 3_600_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -262,7 +262,6 @@ pub struct ModelConfig {
     pub api_key_env: Option<String>,
     pub extra_headers: BTreeMap<String, String>,
     pub request_timeout_ms: u64,
-    pub stream_idle_timeout_ms: u64,
     pub connect_timeout_ms: u64,
     pub max_retries: u8,
     pub context_window: u32,
@@ -299,7 +298,6 @@ impl std::fmt::Debug for ModelConfig {
             .field("api_key_env", &self.api_key_env)
             .field("extra_header_count", &self.extra_headers.len())
             .field("request_timeout_ms", &self.request_timeout_ms)
-            .field("stream_idle_timeout_ms", &self.stream_idle_timeout_ms)
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("max_retries", &self.max_retries)
             .field("context_window", &self.context_window)
@@ -465,10 +463,10 @@ impl ResolvedConfig {
         }
         self.model.model = model.to_string();
 
-        if self.model.request_timeout_ms == 0 {
-            return Err(
-                "config field `model.request_timeout_ms` must be greater than zero".to_string(),
-            );
+        if !(1..=MAX_MODEL_REQUEST_TIMEOUT_MS).contains(&self.model.request_timeout_ms) {
+            return Err(format!(
+                "config field `model.request_timeout_ms` must be between 1 and {MAX_MODEL_REQUEST_TIMEOUT_MS} milliseconds inclusive"
+            ));
         }
         if self.model.context_window == 0 {
             return Err(
@@ -579,7 +577,6 @@ impl Default for ResolvedConfig {
                 api_key_env: None,
                 extra_headers: BTreeMap::new(),
                 request_timeout_ms: DEFAULT_MODEL_REQUEST_TIMEOUT_MS,
-                stream_idle_timeout_ms: DEFAULT_MODEL_STREAM_IDLE_TIMEOUT_MS,
                 connect_timeout_ms: 10_000,
                 max_retries: 2,
                 context_window: DEFAULT_MODEL_CONTEXT_WINDOW,
@@ -730,7 +727,9 @@ pub struct PartialModelConfig {
     pub api_key_env: Option<Option<String>>,
     pub extra_headers: Option<BTreeMap<String, String>>,
     pub request_timeout_ms: Option<u64>,
-    pub stream_idle_timeout_ms: Option<u64>,
+    /// Deserialize-only compatibility input. Normalize it into `request_timeout_ms` before merge.
+    #[serde(rename = "stream_idle_timeout_ms", skip_serializing)]
+    pub(crate) legacy_stream_idle_timeout_ms: Option<u64>,
     pub connect_timeout_ms: Option<u64>,
     pub max_retries: Option<u8>,
     pub context_window: Option<u32>,
@@ -779,7 +778,10 @@ impl std::fmt::Debug for PartialModelConfig {
                     .map(|headers| format!("<redacted; {} entries>", headers.len())),
             )
             .field("request_timeout_ms", &self.request_timeout_ms)
-            .field("stream_idle_timeout_ms", &self.stream_idle_timeout_ms)
+            .field(
+                "legacy_stream_idle_timeout_ms",
+                &self.legacy_stream_idle_timeout_ms,
+            )
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("max_retries", &self.max_retries)
             .field("context_window", &self.context_window)

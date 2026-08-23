@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "moyai.desktop-e2e.execution-result.v1",
+  "title": "moyAI Desktop E2E execution result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "execution_id",
+    "scenario_id",
+    "started_at",
+    "finished_at",
+    "elapsed_ms",
+    "classification",
+    "product_failure",
+    "harness_failure",
+    "environment_blocked",
+    "manual_pending",
+    "inputs",
+    "reasons"
+  ],
+  "properties": {
+    "schema_version": { "const": "desktop-e2e.execution-result.v1" },
+    "execution_id": { "type": "string", "pattern": "^e2e-[a-z0-9][a-z0-9._-]{7,127}$" },
+    "scenario_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,127}$" },
+    "started_at": { "type": "string", "format": "date-time" },
+    "finished_at": { "type": "string", "format": "date-time" },
+    "elapsed_ms": { "type": ["integer", "null"], "minimum": 0 },
+    "classification": {
+      "enum": ["pass", "product_fail", "harness_ng", "environment_blocked", "manual_pending"]
+    },
+    "product_failure": { "type": "boolean" },
+    "harness_failure": { "type": "boolean" },
+    "environment_blocked": { "type": "boolean" },
+    "manual_pending": { "type": "boolean" },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["preflight", "acquisition", "oracle", "manual", "cleanup"],
+      "properties": {
+        "preflight": { "enum": ["pass", "fail", "blocked"] },
+        "acquisition": { "enum": ["pass", "fail", "not_run"] },
+        "oracle": { "enum": ["pass", "fail", "not_run", "not_required"] },
+        "manual": { "enum": ["pass", "fail", "pending", "not_required", "not_run"] },
+        "cleanup": { "enum": ["pass", "fail"] }
+      }
+    },
+    "reasons": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1
+    },
+    "lifecycle": { "type": "array", "items": { "type": "object" } },
+    "graceful_exit": { "type": "object" },
+    "cleanup": { "type": "object" },
+    "diagnostics": { "type": "array", "items": { "type": "object" } }
+  }
+}

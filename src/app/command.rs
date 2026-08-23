@@ -3,8 +3,26 @@ use camino::Utf8PathBuf;
 use crate::cli::OutputMode;
 use crate::config::AccessMode;
 use crate::error::StorageError;
+use crate::protocol::{HistoryItemId, TurnId};
 use crate::runtime::{SessionRuntimeEventHub, SessionRuntimeEventSubscription};
-use crate::session::{EditorContext, PromptDispatchPart, SessionId, ThreadGoalStatus};
+use crate::session::{
+    ActiveTurnExpectation, EditorContext, PromptDispatchPart, SessionId, ThreadGoalStatus,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunAdmissionKind {
+    NewUserRun,
+    RootContinuation {
+        predecessor_turn_id: TurnId,
+        predecessor_revision: u64,
+    },
+    AgentTrigger {
+        history_item_id: HistoryItemId,
+    },
+    OwnerResume {
+        request_id: crate::storage::session_repo::OwnerResumeRequestId,
+    },
+}
 
 /// Process-lifetime owner for runtime state that must survive workspace/view replacement.
 ///
@@ -172,6 +190,13 @@ pub struct RunRequest {
     pub agent_confirmation: Option<crate::cli::SharedConfirmationPrompt>,
     /// Internal identity for a child turn. User-owned surface requests always leave this unset.
     pub agent_context: Option<crate::app::AgentRunContext>,
+    /// Exact semantic admission route. This cannot be inferred from goal state or a later
+    /// runtime snapshot because root continuations and new user runs have different durable
+    /// predecessor/tree-Stop fences.
+    pub admission_kind: RunAdmissionKind,
+    /// Surface-captured durable turn fence. A Run is admitted only from `Idle`; callers must use
+    /// `SessionSteerRequest` for an explicitly captured running turn.
+    pub expected_active_turn: ActiveTurnExpectation,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +249,8 @@ pub struct SessionTitleUpdateRequest {
 #[derive(Debug, Clone)]
 pub struct SessionInterruptRequest {
     pub session_id: SessionId,
+    pub expected_turn_id: crate::protocol::TurnId,
+    pub expected_admission_revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +261,7 @@ pub struct SessionGoalGetRequest {
 #[derive(Debug, Clone)]
 pub struct SessionGoalSetRequest {
     pub session_id: SessionId,
+    pub expected_active_turn: crate::session::ActiveTurnExpectation,
     pub objective: Option<String>,
     pub status: Option<ThreadGoalStatus>,
     pub token_budget: Option<Option<i64>>,
@@ -242,6 +270,7 @@ pub struct SessionGoalSetRequest {
 #[derive(Debug, Clone)]
 pub struct SessionGoalClearRequest {
     pub session_id: SessionId,
+    pub expected_active_turn: crate::session::ActiveTurnExpectation,
 }
 
 #[derive(Debug, Clone)]
@@ -300,6 +329,7 @@ impl std::fmt::Debug for RunRequest {
                 &self.agent_confirmation.is_some(),
             )
             .field("agent_context", &self.agent_context)
+            .field("admission_kind", &self.admission_kind)
             .finish()
     }
 }
@@ -375,6 +405,9 @@ pub struct SessionSteerRequest {
     pub cwd: Utf8PathBuf,
     pub image_paths: Vec<Utf8PathBuf>,
     pub client_user_message_id: Option<String>,
+    /// Exact surface-captured turn. Session steer never resolves a replacement target at
+    /// execution time.
+    pub expected_active_turn: ActiveTurnExpectation,
 }
 
 #[derive(Debug, Clone)]

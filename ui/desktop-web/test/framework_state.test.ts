@@ -1,26 +1,49 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { actionById, paletteActions, type ActionContext } from "../src/actions.ts";
+import {
+  actionById as registryActionById,
+  beginConfigImportMutation,
+  dispatchAction,
+  paletteActions as registryPaletteActions,
+  type ActionContext,
+  type ActionPayload,
+} from "../src/actions.ts";
 import {
   discardConfigDraft,
   sameConfigMutationTarget,
   updateConfigDraftValue,
 } from "../src/config_mutation.ts";
 import {
+  CommandPaletteInsertionAsyncOwner,
+  dispatchCommandPaletteInsertion,
+  replaceUtf16Selection,
+  type CommandPaletteInsertionRequest,
+} from "../src/command_palette_insertion.ts";
+import {
   InteractionLifecycle,
   installInteractionEventGate,
   shouldBeginKeyboardInteraction,
   shouldBeginPointerInteraction,
 } from "../src/interaction_lifecycle.ts";
+import { dispatchNewSessionMutation } from "../src/new_session_mutation.ts";
 import {
-  beginConfigImportMutation,
   shouldDispatchDelegatedKeyboardAction,
+  shouldInvalidateCommandPaletteInsertionForKeydown,
+  synchronizeProviderOverlayFeedback,
   wireEvents,
 } from "../src/events.ts";
 import { transcriptAnchors } from "../src/history_navigation.ts";
-import { globalShortcutAction } from "../src/keyboard_shortcut.ts";
+import {
+  globalShortcutAction,
+  modalShortcutShouldPreventDefault,
+} from "../src/keyboard_shortcut.ts";
 import { autoRefreshAllowed, runtimePollingRequired } from "../src/polling_state.ts";
+import { PostRenderFocusArbiter } from "../src/focus_arbiter.ts";
+import {
+  settingsActionFocusCandidates,
+  settingsActionFocusStillTargets,
+} from "../src/settings_surface.ts";
 import {
   renderArtifactPane,
   renderComposer,
@@ -28,14 +51,46 @@ import {
   renderSidebar,
   renderThreadContent,
   renderTopbar,
-  setRenderContext,
 } from "../src/render.ts";
-import type { DesktopViewState, DesktopWebState, RunMutationTarget } from "../src/types.ts";
-import { createUiLocalState } from "../src/ui_state.ts";
-import { displayAccessLabel, validateConfigInput } from "../src/utils.ts";
+import {
+  createDesktopRenderModel,
+  DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
+  type DesktopRenderLocalPresentation,
+} from "../src/render_projection.ts";
+import type {
+  ConfigFieldProjection,
+  DesktopViewState,
+  DesktopWebState,
+  PromptReviewMutationTarget,
+  RunMutationTarget,
+} from "../src/types.ts";
+import { createUiLocalState, type UiLocalState } from "../src/ui_state.ts";
+import {
+  agentInterruptTarget,
+  childSessionIdForOrder,
+  childTurnIdForOrder,
+  QUICK_A,
+  SESSION_A,
+  SESSION_B,
+  TURN_A,
+  TURN_B,
+} from "./canonical_wire_fixture.ts";
+import { rootStopTarget, turnStopTarget } from "./stop_target_fixture.ts";
+import {
+  configCommitControlState,
+  displayAccessLabel,
+  providerOverlayFeedback,
+  validateConfigFieldValues,
+  validateConfigInput,
+  validateProviderBaseUrl,
+  validateSideChatProviderSettings,
+} from "../src/utils.ts";
 import {
   acknowledgeDraftMutation,
+  beginProviderCatalogRequest,
   captureDraftMutation,
+  composerOwner,
+  composerSessionOwner,
   configDraftEditOpen,
   deriveUiCapabilities,
   mutationAdmissionOpen,
@@ -44,6 +99,61 @@ import {
   rejectDraftMutation,
   sessionSearchMutationTarget,
 } from "../src/view_state.ts";
+
+function actionTestModel(
+  state: DesktopViewState,
+  uiState: UiLocalState = createUiLocalState(),
+) {
+  return createDesktopRenderModel(state, {
+    ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
+    artifactPane: {
+      collapsed: uiState.artifactPaneCollapsed,
+      mode: uiState.artifactPaneMode,
+      selectedAgentPath: uiState.selectedAgentPath,
+      selectedAgentExecution: null,
+    },
+    attachmentTrayOpen: uiState.attachmentTrayOpen,
+    configMutationPending: uiState.activeConfigMutationGeneration !== null
+      || uiState.externalConfigMutationPending,
+    modal: {
+      localConfirmation: uiState.pendingLocalConfirmation,
+      localDecisionPending: uiState.localConfirmationDecisionPending,
+      localDecisionError: uiState.localConfirmationDecisionError,
+      permissionDecision: uiState.permissionDecision,
+    },
+    recoverableError: uiState.recoverableError,
+    windowMaximized: uiState.windowMaximized,
+  });
+}
+
+function actionById(id: string) {
+  const action = registryActionById(id);
+  return action
+    ? {
+      ...action,
+      enabled: (state: DesktopViewState, payload: ActionPayload) =>
+        action.enabled(actionTestModel(state), payload),
+    }
+    : undefined;
+}
+
+function paletteActions(state: DesktopViewState, _configDraftAvailable = false) {
+  return registryPaletteActions(actionTestModel(state));
+}
+
+async function dispatchGuiAction(
+  action: string,
+  index: number,
+  value: string,
+  state: DesktopViewState,
+  context: ActionContext,
+): Promise<boolean> {
+  const currentContext = {
+    ...context,
+    getRenderModel: () => actionTestModel(context.getViewState?.() ?? state, context.uiState),
+  } as ActionContext;
+  return dispatchAction(action, currentContext, { index, value });
+}
 
 function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState {
   return {
@@ -57,7 +167,7 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
     access_label: "default",
     access_target: {
       workspacePath: "C:/workspace",
-      sessionId: "session-a",
+      sessionId: SESSION_A,
       configGeneration: "1",
       accessMode: "default",
       runtimeOwnerToken: "idle:0",
@@ -94,7 +204,7 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
     selected_session_index: 0,
     project_rows: [{ project_id: "project-a", label: "Project A", path: "C:/workspace" }],
     session_rows: [{
-      session_id: "session-a",
+      session_id: SESSION_A,
       label: "Session A",
       title: "Session A",
       status: "idle",
@@ -102,16 +212,41 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
       archived: false,
       pending_permission_requests: 0,
       pending_user_input_requests: 0,
-      short_id: "session-a",
+      admission_revision: "4",
+      short_id: SESSION_A,
     }],
     chat_session_rows: [],
     draft_prompt: "server prompt",
     image_input: "server.png",
     workspace_input: "C:/workspace",
+    review_target: null,
     review_draft_text: "server review",
     local_search_text: "",
     session_search_text: "",
     overlay: "none",
+    about: {
+      product_name: "moyAI",
+      version: "test-version",
+      license_identifier: "test-license",
+      copyright_notice: "Copyright test notice",
+    },
+    side_chat: {
+      configured: false,
+      deleting: false,
+      chat_id: null,
+      owner_session_id: SESSION_A,
+      model: "",
+      base_url: "",
+      status: "idle",
+      phase: "idle",
+      last_error: "",
+      generation: "0",
+      draft_text: "",
+      draft_revision: "0",
+      messages: [],
+      can_send: false,
+      can_cancel: false,
+    },
     startup: {
       status: "ready",
       title: "Ready",
@@ -122,8 +257,9 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
       checks: [],
     },
     composer_commit_generation: "0",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "session-a", ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: SESSION_A, ownerGeneration: "1" },
     busy: false,
+    task_activity_state: "idle",
     navigation_loading: false,
     navigation_admission_open: true,
     turn_page_admission_open: true,
@@ -134,10 +270,12 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
     can_cancel_run: false,
     run_target: {
       workspacePath: "C:/workspace",
-      sessionId: "session-a",
+      sessionId: SESSION_A,
       runtimeOwnerToken: "idle:0",
       permissionConfirmationId: null,
+      expectedState: { kind: "idle", latestTurnId: TURN_A, admissionRevision: "4" },
     } satisfies RunMutationTarget,
+    stop_target: null,
     enhance_enabled: true,
     image_input_enabled: true,
     send_enhanced_enabled: true,
@@ -162,7 +300,7 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
     provider_apply_enabled: true,
     config_target: {
       workspacePath: "C:/workspace",
-      sessionId: "session-a",
+      sessionId: SESSION_A,
       configGeneration: "1",
     },
     config_fields: [{
@@ -193,6 +331,37 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
     history_export_enabled: true,
     ...overrides,
   } as DesktopViewState;
+}
+
+function reviewTarget(
+  overrides: Partial<PromptReviewMutationTarget> = {},
+): PromptReviewMutationTarget {
+  return {
+    workspacePath: "C:/workspace",
+    sessionId: SESSION_A,
+    ownerGeneration: "1",
+    requestId: "9007199254740993",
+    expectedState: { kind: "idle", latestTurnId: TURN_A, admissionRevision: "4" },
+    ...overrides,
+  };
+}
+
+function renderLocal(overrides: {
+  configMutationPending?: boolean;
+  sideChat?: Partial<DesktopRenderLocalPresentation["sideChat"]>;
+} = {}): DesktopRenderLocalPresentation {
+  return {
+    ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
+    configMutationPending: overrides.configMutationPending ?? false,
+    sideChat: {
+      ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.sideChat,
+      ...overrides.sideChat,
+    },
+  };
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 test("local drafts produce a view without mutating the Rust projection", () => {
@@ -246,11 +415,11 @@ test("child-only activity preserves the authoritative Rust new-request gate", ()
       baseSession,
       {
         ...baseSession,
-        session_id: "session-b",
+        session_id: SESSION_B,
         label: "Session B",
         title: "Session B",
         loaded_status: "active",
-        active_turn_id: "turn-b",
+        active_turn_id: TURN_B,
         active_turn_sequence_no: 2,
       },
     ],
@@ -259,7 +428,7 @@ test("child-only activity preserves the authoritative Rust new-request gate", ()
   for (const [label, pattern] of [
     ["session search", /<input id="session-search"[^>]*>/],
     ["new root chat", /<button class="row-action add-session" data-action="new-project-session"[^>]*>/],
-    ["new quick chat", /<button class="tiny-button icon-only" data-action="new-chat"[^>]*>/],
+    ["new quick chat", /<button class="tiny-button icon-only" data-action="new-chat" data-focus-key="quick-chat:new-session"[^>]*>/],
     ["open session", /<button class="nav-row" data-action="session" data-index="1"[^>]*>/],
     ["rejoin session", /<button class="row-action row-rejoin" data-action="rejoin-session" data-index="1"[^>]*>/],
   ] as const) {
@@ -329,9 +498,35 @@ test("active root steering with an empty draft asks for input instead of claimin
   }
 });
 
-test("the installed prompt input handler refreshes the steer send title and aria label", () => {
+test("installed prompt and delegated Settings handlers update capability state synchronously", () => {
   class FakeHtmlElement {
     hidden = false;
+  }
+  class FakeInput extends FakeHtmlElement {
+    value = "3600000";
+    type = "text";
+    checked = false;
+    disabled = false;
+    dataset = { configKey: "model.request_timeout_ms" };
+    readonly attributes = new Map<string, string>();
+
+    matches(selector: string): boolean {
+      return selector === ".settings-control";
+    }
+
+    setAttribute(name: string, value: string): void {
+      this.attributes.set(name, value);
+    }
+
+    removeAttribute(name: string): void {
+      this.attributes.delete(name);
+    }
+
+    getAttribute(name: string): string | null {
+      return this.attributes.get(name) ?? null;
+    }
+
+    focus(): void {}
   }
   class FakePrompt extends FakeHtmlElement {
     value = "";
@@ -352,6 +547,12 @@ test("the installed prompt input handler refreshes the steer send title and aria
     disabled = true;
     title = "依頼文を入力してください";
     readonly attributes = new Map<string, string>([["aria-label", this.title]]);
+    readonly dataset: Record<string, string>;
+
+    constructor(action: string) {
+      super();
+      this.dataset = { action };
+    }
 
     setAttribute(name: string, value: string): void {
       this.attributes.set(name, value);
@@ -362,17 +563,41 @@ test("the installed prompt input handler refreshes the steer send title and aria
     }
   }
 
+  class FakeValidation extends FakeHtmlElement {
+    textContent = "";
+    readonly classes = new Map<string, boolean>();
+    classList = { toggle: (name: string, active: boolean) => this.classes.set(name, active) };
+  }
+
   const prompt = new FakePrompt();
-  const send = new FakeButton();
+  const send = new FakeButton("send");
+  const settingsInput = new FakeInput();
+  const apply = new FakeButton("apply-session-config");
+  const save = new FakeButton("save-global-config");
+  const validation = new FakeValidation();
+  const documentListeners = new Map<string, Array<(event: { target: unknown }) => void>>();
   const fakeDocument = {
     activeElement: null,
-    addEventListener: () => undefined,
+    body: {},
+    documentElement: {},
+    addEventListener: (name: string, listener: (event: { target: unknown }) => void) => {
+      const listeners = documentListeners.get(name) ?? [];
+      listeners.push(listener);
+      documentListeners.set(name, listeners);
+    },
     querySelector: (selector: string) => {
       if (selector === "#prompt") return prompt;
       if (selector === '[data-action="send"]') return send;
+      if (selector === "#settings-validation") return validation;
       return null;
     },
-    querySelectorAll: () => [],
+    querySelectorAll: (selector: string) => {
+      if (selector === ".settings-control") return [settingsInput];
+      if (selector.includes("apply-session-config") && selector.includes("save-global-config")) {
+        return [apply, save];
+      }
+      return [];
+    },
   };
   const fakeWindow = {
     getComputedStyle: () => ({ maxHeight: "200" }),
@@ -391,7 +616,7 @@ test("the installed prompt input handler refreshes the steer send title and aria
     defineGlobal("document", fakeDocument);
     defineGlobal("window", fakeWindow);
     defineGlobal("HTMLElement", FakeHtmlElement);
-    defineGlobal("HTMLInputElement", FakeHtmlElement);
+    defineGlobal("HTMLInputElement", FakeInput);
     defineGlobal("HTMLTextAreaElement", FakePrompt);
     defineGlobal("HTMLSelectElement", FakeHtmlElement);
     defineGlobal("HTMLButtonElement", FakeButton);
@@ -404,6 +629,16 @@ test("the installed prompt input handler refreshes the steer send title and aria
       can_submit: true,
       enhance_enabled: false,
       draft_prompt: "",
+      config_fields: [{
+        key: "model.request_timeout_ms",
+        value: "3600000",
+        env_override: "MOYAI_REQUEST_TIMEOUT_MS",
+        value_type: "integer",
+        required: true,
+        min_value: 1,
+        max_value: 3600000,
+        options: [],
+      }],
     });
     const ui = createUiLocalState();
     reconcileUiDrafts(ui, null, rustProjection, null);
@@ -411,6 +646,9 @@ test("the installed prompt input handler refreshes the steer send title and aria
     const context = {
       uiState: ui,
       getProjection: () => rustProjection,
+      getViewState: () => projectViewState(rustProjection, ui),
+      getRenderModel: () => actionTestModel(projectViewState(rustProjection, ui), ui),
+      invalidateCommandPaletteInsertion: () => undefined,
     } as unknown as ActionContext;
 
     wireEvents(view, context);
@@ -419,6 +657,25 @@ test("the installed prompt input handler refreshes the steer send title and aria
     assert.equal(send.disabled, false);
     assert.equal(send.title, "実行中のタスクへ追加指示を送信");
     assert.equal(send.getAttribute("aria-label"), "実行中のタスクへ追加指示を送信");
+
+    const dispatchSettings = (name: "input" | "change", value: string) => {
+      settingsInput.value = value;
+      for (const listener of documentListeners.get(name) ?? []) listener({ target: settingsInput });
+    };
+    dispatchSettings("input", "3599000");
+    assert.equal(apply.disabled, false);
+    assert.equal(save.disabled, false);
+    assert.equal(apply.getAttribute("aria-disabled"), "false");
+
+    dispatchSettings("input", "0");
+    assert.equal(apply.disabled, true);
+    assert.equal(save.disabled, true);
+    assert.equal(settingsInput.getAttribute("aria-invalid"), "true");
+    assert.match(validation.textContent, /model\.request_timeout_ms: 1 以上/);
+
+    dispatchSettings("change", "3598000");
+    assert.equal(apply.disabled, false);
+    assert.equal(settingsInput.getAttribute("aria-invalid"), null);
   } finally {
     for (const [name, descriptor] of previousGlobals) {
       if (descriptor) Object.defineProperty(globalThis, name, descriptor);
@@ -466,8 +723,17 @@ test("a run-start command is single-flight in local capability projection", () =
     false,
     "only Rust may publish the cancel capability",
   );
-  const admitted = projectViewState(projection({ can_cancel_run: true }), ui);
+  const admitted = projectViewState(projection({
+    can_cancel_run: true,
+    stop_target: turnStopTarget(),
+  }), ui);
   assert.equal(actionById("cancel-run")?.enabled?.(admitted, { index: -1, value: "" }), true);
+  const targetless = projectViewState(projection({ can_cancel_run: true, stop_target: null }), ui);
+  assert.equal(
+    actionById("cancel-run")?.enabled?.(targetless, { index: -1, value: "" }),
+    false,
+    "the exact Stop target is part of the Rust-published cancellation capability",
+  );
 });
 
 test("an external config owner mutation immediately rejects submit and review dispatch", () => {
@@ -504,26 +770,334 @@ test("an external config owner mutation immediately rejects submit and review di
   );
 });
 
-test("draft ownership resets only when its durable target changes", () => {
+test("durable sessions across projects restore their isolated unsent composer drafts", () => {
   const ui = createUiLocalState();
-  const initial = projection();
+  const initial = projection({
+    selected_session_title: "Session A",
+    selected_session_index: 0,
+    session_rows: [{ session_id: SESSION_A, label: "Session A" }],
+    draft_target: { workspacePath: "C:/workspace", sessionId: SESSION_A, ownerGeneration: "1" },
+    config_target: { workspacePath: "C:/workspace", sessionId: SESSION_A, configGeneration: 1 },
+  });
   reconcileUiDrafts(ui, null, initial, null);
-  ui.drafts.prompt = "unsaved local text";
+  ui.drafts.prompt = "session A draft";
+  ui.drafts.imageInput = "session-a.png";
+  ui.drafts.composerRevision += 1;
+  ui.drafts.imageRevision += 1;
 
   const poll = projection({ projection_revision: "2", status_message: "poll" });
-  reconcileUiDrafts(ui, initial, poll, null);
-  assert.equal(ui.drafts.prompt, "unsaved local text");
+  const sameOwnerPoll = {
+    ...poll,
+    selected_session_title: "Session A",
+    selected_session_index: 0,
+    session_rows: [{ session_id: SESSION_A, label: "Session A" }],
+    draft_target: { workspacePath: "C:/workspace", sessionId: SESSION_A, ownerGeneration: "1" },
+    config_target: { workspacePath: "C:/workspace", sessionId: SESSION_A, configGeneration: "1" },
+  };
+  reconcileUiDrafts(ui, initial, sameOwnerPoll, null);
+  assert.equal(ui.drafts.prompt, "session A draft");
 
   const switched = projection({
     projection_revision: "3",
+    workspace_path: "C:/project-b",
     selected_session_title: "Session B",
-    session_rows: [{ session_id: "session-b", label: "Session B" }],
-    draft_target: { workspacePath: "C:/workspace", sessionId: "session-b", ownerGeneration: 2 },
+    selected_project_index: 0,
+    selected_session_index: 0,
+    project_rows: [{ project_id: "project-b", label: "Project B", path: "C:/project-b" }],
+    session_rows: [{ session_id: SESSION_B, label: "Session B" }],
+    draft_target: { workspacePath: "C:/project-b", sessionId: SESSION_B, ownerGeneration: "2" },
     draft_prompt: "",
-    config_target: { workspacePath: "C:/workspace", sessionId: "session-b", configGeneration: 1 },
+    image_input: "",
+    config_target: { workspacePath: "C:/project-b", sessionId: SESSION_B, configGeneration: 1 },
   });
-  reconcileUiDrafts(ui, poll, switched, null);
+  reconcileUiDrafts(ui, sameOwnerPoll, switched, null);
   assert.equal(ui.drafts.prompt, "");
+  assert.equal(ui.drafts.imageInput, "");
+
+  ui.drafts.prompt = "session B draft!";
+  ui.drafts.imageInput = "session-b.png";
+  ui.drafts.composerRevision += 1;
+  ui.drafts.imageRevision += 1;
+
+  const returnedA = projection({
+    projection_revision: "4",
+    selected_session_title: "Session A",
+    selected_project_index: 0,
+    selected_session_index: 0,
+    project_rows: [{ project_id: "project-a", label: "Project A", path: "C:/workspace" }],
+    session_rows: [{ session_id: SESSION_A, label: "Session A" }],
+    draft_target: { workspacePath: "C:/workspace", sessionId: SESSION_A, ownerGeneration: "3" },
+    draft_prompt: "",
+    image_input: "",
+    config_target: { workspacePath: "C:/workspace", sessionId: SESSION_A, configGeneration: 1 },
+  });
+  reconcileUiDrafts(ui, switched, returnedA, null);
+  assert.equal(ui.drafts.prompt, "session A draft");
+  assert.equal(ui.drafts.imageInput, "session-a.png");
+  assert.equal(projectViewState(returnedA, ui).draft_prompt, "session A draft");
+
+  const returnedB = projection({
+    projection_revision: "5",
+    workspace_path: "C:/project-b",
+    selected_session_title: "Session B",
+    selected_project_index: 0,
+    selected_session_index: 0,
+    project_rows: [{ project_id: "project-b", label: "Project B", path: "C:/project-b" }],
+    session_rows: [{ session_id: SESSION_B, label: "Session B" }],
+    draft_target: { workspacePath: "C:/project-b", sessionId: SESSION_B, ownerGeneration: "4" },
+    draft_prompt: "",
+    image_input: "",
+    config_target: { workspacePath: "C:/project-b", sessionId: SESSION_B, configGeneration: 1 },
+  });
+  reconcileUiDrafts(ui, returnedA, returnedB, null);
+  assert.equal(ui.drafts.prompt, "session B draft!");
+  assert.equal(ui.drafts.imageInput, "session-b.png");
+  assert.equal(projectViewState(returnedB, ui).draft_prompt, "session B draft!");
+});
+
+test("one local new-session owner closes stale navigation, run, and config admission", () => {
+  const rustProjection = projection({
+    navigation_admission_open: true,
+    background_mutation_pending: false,
+  });
+  const ui = createUiLocalState();
+  const request = { mutationName: "new_chat" as const, token: {} };
+  ui.activeNewSessionMutation = request;
+
+  const pending = projectViewState(rustProjection, ui);
+  assert.equal(pending.navigation_admission_open, false);
+  assert.equal(pending.background_mutation_pending, true);
+  assert.equal(actionById("new-chat")?.enabled?.(pending, { index: -1, value: "" }), false);
+  for (const mutation of [
+    "new_chat",
+    "new_project_session",
+    "select_session",
+    "submit_prompt",
+    "toggle_access_mode",
+  ]) {
+    assert.equal(mutationAdmissionOpen(ui, mutation), false, mutation);
+  }
+
+  ui.activeNewSessionMutation = null;
+  assert.equal(projectViewState(rustProjection, ui).navigation_admission_open, true);
+  assert.equal(mutationAdmissionOpen(ui, "new_project_session"), true);
+});
+
+test("slow pointer and Enter new-session commands disable the old composer after release and reopen on error", async () => {
+  for (const activation of ["pointer", "Enter"] as const) {
+    const rustProjection = projection({
+      draft_prompt: "keep this draft",
+      token_meter_label: "",
+    });
+    const ui = createUiLocalState();
+    reconcileUiDrafts(ui, null, rustProjection, null);
+    const lifecycle = new InteractionLifecycle<string>(() => true);
+    const end = activation === "pointer"
+      ? (lifecycle.beginPointer(41), lifecycle.capturePointerEnd(41))
+      : (lifecycle.beginKey("Enter"), lifecycle.captureKeyEnd("Enter"));
+    assert.notEqual(end, null);
+
+    let composerHtml = renderComposer(projectViewState(rustProjection, ui));
+    const renderCurrent = (): void => {
+      composerHtml = renderComposer(projectViewState(rustProjection, ui));
+    };
+    let rejectCommand!: (reason?: unknown) => void;
+    const slowFailure = new Promise<string>((_resolve, reject) => {
+      rejectCommand = reject;
+    });
+    let commandCount = 0;
+    const pending = dispatchNewSessionMutation(
+      ui,
+      "new_chat",
+      lifecycle,
+      () => {
+        if (!lifecycle.defer("pending-render", true, true)) renderCurrent();
+      },
+      () => {
+        commandCount += 1;
+        return slowFailure;
+      },
+      () => renderCurrent(),
+      () => renderCurrent(),
+    );
+    await Promise.resolve();
+    assert.equal(commandCount, 1);
+    assert.doesNotMatch(
+      composerHtml,
+      /<textarea id="prompt"[^>]* disabled>/,
+      `${activation} keeps its initiating DOM connected until release`,
+    );
+
+    assert.equal(await dispatchNewSessionMutation(
+      ui,
+      "new_project_session",
+      lifecycle,
+      () => assert.fail("a repeated activation must not publish another owner"),
+      async () => {
+        commandCount += 1;
+        return "duplicate";
+      },
+      () => assert.fail("a repeated activation has no response"),
+      () => assert.fail("a repeated activation has no error owner"),
+    ), false);
+    assert.equal(commandCount, 1);
+
+    const release = end!();
+    if (release?.renderCurrent) renderCurrent();
+    assert.match(
+      composerHtml,
+      /<textarea id="prompt"[^>]* disabled>/,
+      `${activation} release renders the pending navigation owner before command settlement`,
+    );
+    assert.equal(ui.drafts.prompt, "keep this draft", "a disabled old textarea cannot edit the local draft");
+    assert.equal(projectViewState(rustProjection, ui).navigation_admission_open, false);
+
+    rejectCommand(new Error(`${activation} slow failure`));
+    await assert.rejects(pending, /slow failure/);
+    assert.equal(ui.activeNewSessionMutation, null);
+    assert.doesNotMatch(
+      composerHtml,
+      /<textarea id="prompt"[^>]* disabled>/,
+      `${activation} exact error cleanup re-enables the composer`,
+    );
+    assert.equal(projectViewState(rustProjection, ui).navigation_admission_open, true);
+  }
+});
+
+test("Quick Chat interaction owners use exact durable session identity", () => {
+  const quickChatA = projection({
+    workspace_path: "C:/quick-chat",
+    selected_project_index: -1,
+    draft_target: {
+      workspacePath: "C:/quick-chat",
+      sessionId: QUICK_A,
+      ownerGeneration: "17",
+    },
+  });
+  const sameQuickChatAfterPoll = projection({
+    workspace_path: "C:/quick-chat",
+    selected_project_index: -1,
+    draft_target: {
+      workspacePath: "C:/quick-chat",
+      sessionId: QUICK_A,
+      ownerGeneration: "18",
+    },
+  });
+  const quickChatB = projection({
+    workspace_path: "C:/quick-chat",
+    selected_project_index: -1,
+    draft_target: {
+      workspacePath: "C:/quick-chat",
+      sessionId: "quick-b",
+      ownerGeneration: "19",
+    },
+  });
+
+  assert.equal(
+    composerSessionOwner(quickChatA),
+    composerSessionOwner(sameQuickChatAfterPoll),
+    "command-owner generations do not split the same durable Quick Chat viewport",
+  );
+  assert.notEqual(
+    composerSessionOwner(quickChatA),
+    composerSessionOwner(quickChatB),
+    "neighboring Quick Chat rows cannot share a viewport owner",
+  );
+});
+
+test("composer command owner rejects an owner-generation ABA on the same new-session surface", () => {
+  const ownerGenerationOne = projection({
+    selected_session_index: -1,
+    session_rows: [],
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: "1" },
+  });
+  const ownerGenerationThree = projection({
+    selected_session_index: -1,
+    session_rows: [],
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: "3" },
+  });
+
+  assert.equal(
+    composerSessionOwner(ownerGenerationOne),
+    composerSessionOwner(ownerGenerationThree),
+    "the stable interaction owner still identifies the same new-session surface",
+  );
+  assert.notEqual(
+    composerOwner(ownerGenerationOne),
+    composerOwner(ownerGenerationThree),
+    "a deferred focus request must reject the newer command owner after A-B-A navigation",
+  );
+});
+
+test("synchronous new Quick Chat settlement exposes one canonical empty unowned composer", () => {
+  const quickRow = {
+    session_id: QUICK_A,
+    label: "Quick A",
+    title: "Quick A",
+    status: "completed" as const,
+    loaded_status: "idle" as const,
+    archived: false,
+    pending_permission_requests: 0,
+    pending_user_input_requests: 0,
+    short_id: QUICK_A,
+  };
+  const previous = projection({
+    workspace_path: "C:/quick-chat",
+    selected_project_index: -1,
+    selected_session_index: 0,
+    session_rows: [quickRow],
+    chat_session_rows: [quickRow],
+    draft_prompt: "previous quick draft",
+    image_input: "",
+    draft_target: { workspacePath: "C:/quick-chat", sessionId: QUICK_A, ownerGeneration: "7" },
+  });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, previous, null);
+  ui.drafts.prompt = "unsent previous quick edit";
+  ui.drafts.composerRevision += 1;
+
+  const emptyRow = {
+    row_kind: "empty_placeholder" as const,
+    step: "00",
+    title: "チャットはありません",
+    body: "下の入力欄から依頼を送ると、通常チャットが作成されます。",
+    file_changes: [],
+  };
+  const settled = projection({
+    projection_revision: "2",
+    workspace_path: "C:/quick-chat",
+    selected_project_index: -1,
+    selected_session_index: -1,
+    selected_session_title: "セッション未選択",
+    current_session_label: "新規チャット",
+    session_rows: [],
+    chat_session_rows: [quickRow],
+    draft_prompt: "",
+    image_input: "",
+    draft_target: { workspacePath: "C:/quick-chat", sessionId: null, ownerGeneration: "8" },
+    thread_empty: true,
+    transcript_rows: [emptyRow],
+    navigation_loading: false,
+  });
+  reconcileUiDrafts(ui, previous, settled, null);
+  const view = projectViewState(settled, ui);
+
+  assert.equal(view.selected_project_index, -1);
+  assert.equal(view.selected_session_index, -1);
+  assert.deepEqual(view.draft_target, {
+    workspacePath: "C:/quick-chat",
+    sessionId: null,
+    ownerGeneration: "8",
+  });
+  assert.equal(ui.drafts.composerOwner, "C:/quick-chat\u00008\u0000new");
+  assert.equal(view.draft_prompt, "");
+  assert.equal(view.thread_empty, true);
+  assert.deepEqual(view.transcript_rows, [emptyRow]);
+  assert.notEqual(
+    composerOwner(previous),
+    composerOwner(settled),
+    "the scheduled focus request must reject the previous durable Quick Chat owner",
+  );
 });
 
 test("an action response does not clear text entered after dispatch", () => {
@@ -575,7 +1149,7 @@ test("new-session binding preserves follow-up text typed after send", () => {
   const ui = createUiLocalState();
   const initial = projection({
     draft_prompt: "first request",
-    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: "1" },
   });
   reconcileUiDrafts(ui, null, initial, null);
   const snapshot = captureDraftMutation(ui, "submit_prompt");
@@ -585,7 +1159,7 @@ test("new-session binding preserves follow-up text typed after send", () => {
   const response = projection({
     projection_revision: "2",
     draft_prompt: "",
-    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: "1" },
     busy: true,
   });
   acknowledgeDraftMutation(ui, response, "submit_prompt", snapshot);
@@ -594,7 +1168,7 @@ test("new-session binding preserves follow-up text typed after send", () => {
     projection_revision: "3",
     composer_commit_generation: "1",
     draft_prompt: "",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "created-session", ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "created-session", ownerGeneration: "1" },
     busy: true,
   });
   reconcileUiDrafts(ui, response, bound, null);
@@ -608,7 +1182,7 @@ test("new-session binding is registered before a newer poll can beat the command
   const ui = createUiLocalState();
   const initial = projection({
     draft_prompt: "first request",
-    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: "1" },
   });
   reconcileUiDrafts(ui, null, initial, null);
   const snapshot = captureDraftMutation(ui, "submit_prompt");
@@ -619,14 +1193,14 @@ test("new-session binding is registered before a newer poll can beat the command
     projection_revision: "3",
     composer_commit_generation: "1",
     draft_prompt: "",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "created-before-response", ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: "created-before-response", ownerGeneration: "1" },
     busy: true,
   });
   reconcileUiDrafts(ui, initial, boundPoll, null);
   const olderResponse = projection({
     projection_revision: "2",
     draft_prompt: "",
-    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 2 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: "2" },
     busy: true,
   });
   acknowledgeDraftMutation(ui, olderResponse, "submit_prompt", snapshot);
@@ -639,7 +1213,7 @@ test("same-owner generation reset discards stale local composer text", () => {
   const ui = createUiLocalState();
   const initial = projection({
     draft_prompt: "server draft",
-    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 4 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: "4" },
   });
   reconcileUiDrafts(ui, null, initial, null);
   ui.drafts.prompt = "stale local draft";
@@ -648,9 +1222,42 @@ test("same-owner generation reset discards stale local composer text", () => {
   const reset = projection({
     projection_revision: "2",
     draft_prompt: "",
-    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 5 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: "5" },
   });
   reconcileUiDrafts(ui, initial, reset, null);
+
+  assert.equal(ui.drafts.prompt, "");
+});
+
+test("an explicit new-session surface never resurrects an abandoned unowned draft", () => {
+  const ui = createUiLocalState();
+  const firstNew = projection({
+    draft_prompt: "",
+    image_input: "",
+    selected_session_index: -1,
+    session_rows: [],
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: "1" },
+  });
+  reconcileUiDrafts(ui, null, firstNew, null);
+  ui.drafts.prompt = "abandoned new-session draft";
+  ui.drafts.composerRevision += 1;
+
+  const durable = projection({
+    projection_revision: "2",
+    draft_prompt: "",
+    image_input: "",
+    draft_target: { workspacePath: "C:/workspace", sessionId: SESSION_A, ownerGeneration: "2" },
+  });
+  reconcileUiDrafts(ui, firstNew, durable, null);
+  const explicitNew = projection({
+    projection_revision: "3",
+    draft_prompt: "",
+    image_input: "",
+    selected_session_index: -1,
+    session_rows: [],
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: "3" },
+  });
+  reconcileUiDrafts(ui, durable, explicitNew, null);
 
   assert.equal(ui.drafts.prompt, "");
 });
@@ -658,7 +1265,7 @@ test("same-owner generation reset discards stale local composer text", () => {
 test("failed run start releases an unconsumed pending submission", () => {
   const ui = createUiLocalState();
   const initial = projection({
-    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: null, ownerGeneration: "1" },
   });
   reconcileUiDrafts(ui, null, initial, null);
   const snapshot = captureDraftMutation(ui, "submit_prompt");
@@ -666,6 +1273,138 @@ test("failed run start releases an unconsumed pending submission", () => {
 
   rejectDraftMutation(ui, "submit_prompt", snapshot);
   assert.equal(ui.drafts.pendingRunSubmission, null);
+  assert.equal(snapshot?.runSettlement, "rejected");
+});
+
+test("deferred run-target conflict retains drafts across exact owner-generation drift", () => {
+  const target = reviewTarget();
+  const initial = projection({
+    overlay: "prompt_review",
+    review_target: target,
+    draft_prompt: "rust prompt before dispatch",
+    image_input: "rust-image-before.png",
+    review_draft_text: "rust review before dispatch",
+    composer_commit_generation: "0",
+  });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, initial, null);
+  ui.drafts.prompt = "local prompt A";
+  ui.drafts.imageInput = "local-image-a.png";
+  ui.drafts.reviewDraft = "local review A";
+  ui.drafts.composerRevision += 1;
+  ui.drafts.imageRevision += 1;
+  ui.drafts.reviewRevision += 1;
+  const snapshot = captureDraftMutation(ui, "send_prompt_review");
+  assert.notEqual(snapshot, null);
+
+  const conflict = projection({
+    projection_revision: "2",
+    overlay: "prompt_review",
+    review_target: target,
+    draft_prompt: "rust replacement B",
+    image_input: "rust-image-b.png",
+    review_draft_text: "rust review B",
+    composer_commit_generation: "1",
+    draft_target: {
+      workspacePath: "C:/workspace",
+      sessionId: SESSION_A,
+      ownerGeneration: "2",
+    },
+  });
+  const lifecycle = new InteractionLifecycle<{
+    previous: DesktopWebState;
+    state: DesktopWebState;
+    snapshot: typeof snapshot;
+  }>(() => true);
+  lifecycle.beginKey("Enter");
+  const end = lifecycle.captureKeyEnd("Enter");
+  assert.notEqual(end, null);
+  assert.equal(lifecycle.defer({ previous: initial, state: conflict, snapshot }, false, true), true);
+
+  rejectDraftMutation(ui, "send_prompt_review", snapshot);
+  assert.equal(snapshot?.runSettlement, "rejected");
+  assert.equal(ui.drafts.pendingRunSubmission, null);
+
+  const release = end?.();
+  assert.notEqual(release?.deferred, null);
+  const deferred = release?.deferred;
+  assert.ok(deferred);
+  reconcileUiDrafts(ui, deferred.previous, deferred.state, deferred.snapshot);
+
+  assert.equal(ui.drafts.prompt, "local prompt A");
+  assert.equal(ui.drafts.imageInput, "local-image-a.png");
+  assert.equal(ui.drafts.reviewDraft, "local review A");
+  assert.equal(ui.drafts.composerCommitGeneration, "1");
+  assert.equal(ui.drafts.composerOwner, `C:/workspace\u00002\u0000${SESSION_A}`);
+});
+
+test("synchronous run-target conflict retains same-owner local drafts", () => {
+  const initial = projection({
+    draft_prompt: "rust prompt A",
+    image_input: "rust-image-a.png",
+    composer_commit_generation: "0",
+  });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, initial, null);
+  ui.drafts.prompt = "local prompt A";
+  ui.drafts.imageInput = "local-image-a.png";
+  ui.drafts.composerRevision += 1;
+  ui.drafts.imageRevision += 1;
+  const snapshot = captureDraftMutation(ui, "submit_prompt");
+
+  rejectDraftMutation(ui, "submit_prompt", snapshot);
+  const conflict = projection({
+    projection_revision: "2",
+    draft_prompt: "rust prompt B",
+    image_input: "rust-image-b.png",
+    composer_commit_generation: "1",
+  });
+  reconcileUiDrafts(ui, initial, conflict, snapshot);
+
+  assert.equal(ui.drafts.prompt, "local prompt A");
+  assert.equal(ui.drafts.imageInput, "local-image-a.png");
+  assert.equal(ui.drafts.composerCommitGeneration, "1");
+});
+
+test("rejected new-session conflict retains the unowned draft across owner-generation drift", () => {
+  const initial = projection({
+    draft_prompt: "rust new-session draft",
+    image_input: "rust-new.png",
+    selected_session_index: -1,
+    session_rows: [],
+    draft_target: {
+      workspacePath: "C:/workspace",
+      sessionId: null,
+      ownerGeneration: "7",
+    },
+  });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, initial, null);
+  ui.drafts.prompt = "local unowned request";
+  ui.drafts.imageInput = "local-unowned.png";
+  ui.drafts.composerRevision += 1;
+  ui.drafts.imageRevision += 1;
+  const snapshot = captureDraftMutation(ui, "submit_prompt");
+  rejectDraftMutation(ui, "submit_prompt", snapshot);
+
+  const conflict = projection({
+    projection_revision: "2",
+    composer_commit_generation: "1",
+    draft_prompt: "rust replacement",
+    image_input: "rust-replacement.png",
+    selected_session_index: -1,
+    session_rows: [],
+    draft_target: {
+      workspacePath: "C:/workspace",
+      sessionId: null,
+      ownerGeneration: "8",
+    },
+  });
+  reconcileUiDrafts(ui, initial, conflict, snapshot);
+
+  assert.equal(ui.drafts.prompt, "local unowned request");
+  assert.equal(ui.drafts.imageInput, "local-unowned.png");
+  assert.equal(ui.drafts.composerOwner, "C:/workspace\u00008\u0000new");
 });
 
 test("pre-admission runtime failure preserves the retryable prompt and image", () => {
@@ -726,8 +1465,10 @@ test("successful admission clears only the dispatched image and prompt revisions
 
 test("review draft is retained until the reviewed run is durably admitted", () => {
   const ui = createUiLocalState();
+  const target = reviewTarget();
   const initial = projection({
     overlay: "prompt_review",
+    review_target: target,
     review_draft_text: "edited enhanced request",
   });
   reconcileUiDrafts(ui, null, initial, null);
@@ -735,6 +1476,7 @@ test("review draft is retained until the reviewed run is durably admitted", () =
   const launchAccepted = projection({
     projection_revision: "2",
     overlay: "prompt_review",
+    review_target: target,
     review_draft_text: "edited enhanced request",
     busy: true,
     can_submit: false,
@@ -747,6 +1489,7 @@ test("review draft is retained until the reviewed run is durably admitted", () =
     projection_revision: "3",
     composer_commit_generation: "1",
     overlay: "none",
+    review_target: null,
     review_draft_text: "",
     busy: true,
     can_submit: false,
@@ -757,8 +1500,10 @@ test("review draft is retained until the reviewed run is durably admitted", () =
 
 test("same-overlay prompt enhancement completion hydrates an untouched local review draft", () => {
   const ui = createUiLocalState();
+  const target = reviewTarget();
   const enhancing = projection({
     overlay: "prompt_review",
+    review_target: target,
     review_draft_text: "",
     review_status_text: "Enhancing",
   });
@@ -767,6 +1512,7 @@ test("same-overlay prompt enhancement completion hydrates an untouched local rev
   const reviewing = projection({
     projection_revision: "2",
     overlay: "prompt_review",
+    review_target: target,
     review_draft_text: "enhanced request",
     review_status_text: "Reviewing",
   });
@@ -778,8 +1524,10 @@ test("same-overlay prompt enhancement completion hydrates an untouched local rev
 
 test("late same-owner enhancement cannot overwrite a local review edit", () => {
   const ui = createUiLocalState();
+  const target = reviewTarget();
   const enhancing = projection({
     overlay: "prompt_review",
+    review_target: target,
     review_draft_text: "",
     review_status_text: "Enhancing",
   });
@@ -790,6 +1538,7 @@ test("late same-owner enhancement cannot overwrite a local review edit", () => {
   const staleCompletion = projection({
     projection_revision: "2",
     overlay: "prompt_review",
+    review_target: target,
     review_draft_text: "late enhanced request",
     review_status_text: "Reviewing",
   });
@@ -803,8 +1552,9 @@ test("prompt review owner change replaces an old owner's local edit", () => {
   const ui = createUiLocalState();
   const ownerA = projection({
     overlay: "prompt_review",
+    review_target: reviewTarget(),
     review_draft_text: "owner A review",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "session-a", ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: SESSION_A, ownerGeneration: "1" },
   });
   reconcileUiDrafts(ui, null, ownerA, null);
   ui.drafts.reviewDraft = "owner A local edit";
@@ -813,8 +1563,9 @@ test("prompt review owner change replaces an old owner's local edit", () => {
   const ownerB = projection({
     projection_revision: "2",
     overlay: "prompt_review",
+    review_target: reviewTarget({ sessionId: SESSION_B, ownerGeneration: "2", requestId: "9007199254740994" }),
     review_draft_text: "owner B review",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "session-b", ownerGeneration: 2 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: SESSION_B, ownerGeneration: "2" },
   });
   reconcileUiDrafts(ui, ownerA, ownerB, null);
 
@@ -822,12 +1573,145 @@ test("prompt review owner change replaces an old owner's local edit", () => {
   assert.equal(projectViewState(ownerB, ui).review_draft_text, "owner B review");
 });
 
+test("every exact prompt-review target field rebases a dirty local draft and its revisions", async () => {
+  const idleTargetA = reviewTarget();
+  const turnTargetA = reviewTarget({
+    expectedState: { kind: "turn", turnId: TURN_A, admissionRevision: "4" },
+  });
+  const targetVariants: Array<[
+    string,
+    PromptReviewMutationTarget,
+    PromptReviewMutationTarget,
+  ]> = [
+    ["workspacePath", idleTargetA, reviewTarget({ workspacePath: "D:/other-workspace" })],
+    ["sessionId", idleTargetA, reviewTarget({ sessionId: SESSION_B })],
+    ["ownerGeneration", idleTargetA, reviewTarget({ ownerGeneration: "2" })],
+    ["requestId", idleTargetA, reviewTarget({ requestId: "9007199254740994" })],
+    [
+      "expectedState.kind",
+      idleTargetA,
+      reviewTarget({
+        expectedState: { kind: "turn", turnId: TURN_A, admissionRevision: "4" },
+      }),
+    ],
+    [
+      "expectedState.latestTurnId",
+      idleTargetA,
+      reviewTarget({
+        expectedState: { kind: "idle", latestTurnId: TURN_B, admissionRevision: "4" },
+      }),
+    ],
+    [
+      "expectedState.turnId",
+      turnTargetA,
+      reviewTarget({
+        expectedState: { kind: "turn", turnId: TURN_B, admissionRevision: "4" },
+      }),
+    ],
+    [
+      "expectedState.idle.admissionRevision",
+      idleTargetA,
+      reviewTarget({
+        expectedState: { kind: "idle", latestTurnId: TURN_A, admissionRevision: "5" },
+      }),
+    ],
+    [
+      "expectedState.turn.admissionRevision",
+      turnTargetA,
+      reviewTarget({
+        expectedState: { kind: "turn", turnId: TURN_A, admissionRevision: "5" },
+      }),
+    ],
+  ];
+
+  for (const [changedField, targetA, targetB] of targetVariants) {
+    const ui = createUiLocalState();
+    const ownerA = projection({
+      overlay: "prompt_review",
+      review_target: targetA,
+      review_draft_text: "canonical A review",
+    });
+    reconcileUiDrafts(ui, null, ownerA, null);
+    ui.drafts.reviewDraft = "dirty local A review";
+    ui.drafts.reviewRevision += 1;
+    const dirtyRevision = ui.drafts.reviewRevision;
+    const staleSnapshot = captureDraftMutation(ui, "cancel_prompt_review");
+
+    const ownerB = projection({
+      projection_revision: "2",
+      workspace_path: targetB.workspacePath,
+      draft_target: {
+        workspacePath: targetB.workspacePath,
+        sessionId: targetB.sessionId,
+        ownerGeneration: targetB.ownerGeneration,
+      },
+      overlay: "prompt_review",
+      review_target: targetB,
+      review_draft_text: `canonical B review: ${changedField}`,
+    });
+    reconcileUiDrafts(ui, ownerA, ownerB, null);
+
+    assert.deepEqual(ui.drafts.reviewTarget, targetB, changedField);
+    assert.notEqual(ui.drafts.reviewTarget, targetB, changedField);
+    assert.notEqual(ui.drafts.reviewTarget?.expectedState, targetB.expectedState, changedField);
+    assert.equal(ui.drafts.reviewDraft, `canonical B review: ${changedField}`, changedField);
+    assert.ok(ui.drafts.reviewRevision > dirtyRevision, changedField);
+    assert.equal(ui.drafts.reviewSyncedRevision, ui.drafts.reviewRevision, changedField);
+    assert.equal(
+      projectViewState(ownerB, ui).review_draft_text,
+      `canonical B review: ${changedField}`,
+      changedField,
+    );
+    if (changedField === "requestId") {
+      assert.equal(
+        composerOwner(ownerA),
+        composerOwner(ownerB),
+        "request replacement is distinct even when the composer owner is unchanged",
+      );
+    }
+
+    const staleResponse = projection({
+      projection_revision: "1",
+      overlay: "prompt_review",
+      review_target: targetA,
+      review_draft_text: "stale A acknowledgement",
+    });
+    acknowledgeDraftMutation(ui, staleResponse, "cancel_prompt_review", staleSnapshot);
+    assert.equal(ui.drafts.reviewDraft, `canonical B review: ${changedField}`, changedField);
+
+    if (changedField === "requestId") {
+      const sends: Array<{ name: string; args?: Record<string, unknown> }> = [];
+      const currentView = projectViewState(ownerB, ui);
+      await dispatchGuiAction(
+        "send-review-enhanced",
+        -1,
+        "",
+        currentView,
+        {
+          uiState: ui,
+          mutate: async (name, args) => { sends.push({ name, args }); },
+        } as unknown as ActionContext,
+      );
+      assert.deepEqual(sends, [{
+        name: "send_prompt_review",
+        args: {
+          enhanced: true,
+          text: "canonical B review: requestId",
+          expectedTarget: targetB,
+          expectedRunTarget: currentView.run_target,
+        },
+      }]);
+    }
+  }
+});
+
 test("stale prompt review acknowledgement cannot cross an owner change", () => {
   const ui = createUiLocalState();
   const ownerA = projection({
     overlay: "prompt_review",
+    review_target: reviewTarget(),
     review_draft_text: "owner A review",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "session-a", ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: SESSION_A, ownerGeneration: "1" },
   });
   reconcileUiDrafts(ui, null, ownerA, null);
   const staleSnapshot = captureDraftMutation(ui, "cancel_prompt_review");
@@ -835,16 +1719,18 @@ test("stale prompt review acknowledgement cannot cross an owner change", () => {
   const ownerB = projection({
     projection_revision: "3",
     overlay: "prompt_review",
+    review_target: reviewTarget({ sessionId: SESSION_B, ownerGeneration: "2", requestId: "9007199254740994" }),
     review_draft_text: "owner B review",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "session-b", ownerGeneration: 2 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: SESSION_B, ownerGeneration: "2" },
   });
   reconcileUiDrafts(ui, ownerA, ownerB, null);
 
   const staleResponse = projection({
     projection_revision: "2",
     overlay: "none",
+    review_target: null,
     review_draft_text: "",
-    draft_target: { workspacePath: "C:/workspace", sessionId: "session-a", ownerGeneration: 1 },
+    draft_target: { workspacePath: "C:/workspace", sessionId: SESSION_A, ownerGeneration: "1" },
   });
   acknowledgeDraftMutation(ui, staleResponse, "cancel_prompt_review", staleSnapshot);
 
@@ -997,7 +1883,7 @@ interface InteractionGateHarness {
   dispose: () => void;
 }
 
-function withInteractionGate(run: (harness: InteractionGateHarness) => void): void {
+function openInteractionGate(): { harness: InteractionGateHarness; close: () => void } {
   const elementDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Element");
   Object.defineProperty(globalThis, "Element", {
     configurable: true,
@@ -1033,28 +1919,327 @@ function withInteractionGate(run: (harness: InteractionGateHarness) => void): vo
     },
   });
 
-  try {
-    run({
-      documentTarget,
-      windowTarget,
-      documentElement,
-      body,
-      appRoot,
-      input,
-      unrelated,
-      disabledInput,
-      lifecycle,
-      applied,
-      queueProjection: (revision) => {
-        if (!lifecycle.defer(revision, false, true)) applyProjection(revision);
-      },
-      dispose,
-    });
-  } finally {
+  const harness = {
+    documentTarget,
+    windowTarget,
+    documentElement,
+    body,
+    appRoot,
+    input,
+    unrelated,
+    disabledInput,
+    lifecycle,
+    applied,
+    queueProjection: (revision: number) => {
+      if (!lifecycle.defer(revision, false, true)) applyProjection(revision);
+    },
+    dispose,
+  };
+  return {
+    harness,
+    close: () => {
     dispose();
     if (elementDescriptor) Object.defineProperty(globalThis, "Element", elementDescriptor);
     else delete (globalThis as Record<string, unknown>).Element;
+    },
+  };
+}
+
+function withInteractionGate(run: (harness: InteractionGateHarness) => void): void {
+  const gate = openInteractionGate();
+  try {
+    run(gate.harness);
+  } finally {
+    gate.close();
   }
+}
+
+async function withInteractionGateAsync(
+  run: (harness: InteractionGateHarness) => Promise<void>,
+): Promise<void> {
+  const gate = openInteractionGate();
+  try {
+    await run(gate.harness);
+  } finally {
+    gate.close();
+  }
+}
+
+function createFastCommandPaletteActivation(
+  lifecycle: InteractionLifecycle<number>,
+  interactionGeneration: () => bigint,
+  failure: Error | null = null,
+): {
+  activate: () => Promise<void>;
+  readonly commandCalls: number;
+  readonly insertions: number;
+  readonly value: string;
+} {
+  const source = "左😀選択右";
+  const prefix = "左😀";
+  const selected = "選択";
+  const insertionText = "/case ";
+  let value = source;
+  let commandCalls = 0;
+  let insertions = 0;
+  let nextRequestId = 1;
+  let completion: Promise<void> | null = null;
+  const owner = new CommandPaletteInsertionAsyncOwner();
+  return {
+    activate(): Promise<void> {
+      const request = { requestId: nextRequestId++ } as CommandPaletteInsertionRequest;
+      const capturedGeneration = interactionGeneration();
+      const dispatched = dispatchCommandPaletteInsertion(
+        owner,
+        request,
+        lifecycle,
+        async () => {
+          commandCalls += 1;
+          if (failure) throw failure;
+          return insertionText;
+        },
+        (canonicalInsertionText) => {
+          if (interactionGeneration() !== capturedGeneration) return null;
+          const replacement = replaceUtf16Selection(
+            value,
+            prefix.length,
+            prefix.length + selected.length,
+            canonicalInsertionText,
+          );
+          if (!replacement) return null;
+          value = replacement.value;
+          insertions += 1;
+          return replacement;
+        },
+      ).then(() => undefined);
+      if (owner.activeRequest === request) completion = dispatched;
+      return completion ?? dispatched;
+    },
+    get commandCalls(): number {
+      return commandCalls;
+    },
+    get insertions(): number {
+      return insertions;
+    },
+    get value(): string {
+      return value;
+    },
+  };
+}
+
+test("pointer activation starts one command before the deferred release and settles a fast response once", async () => {
+  await withInteractionGateAsync(async ({ documentTarget, windowTarget, input, lifecycle }) => {
+    let interactionGeneration = 0n;
+    documentTarget.addEventListener("pointerdown", () => { interactionGeneration += 1n; }, true);
+    const activation = createFastCommandPaletteActivation(lifecycle, () => interactionGeneration);
+
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 7 });
+    documentTarget.dispatch("pointerup", { target: input, pointerId: 7 });
+    assert.equal(lifecycle.active, true, "pointerup defers release until its zero-delay callback");
+    const completion = activation.activate();
+    void activation.activate();
+    assert.equal(activation.commandCalls, 1);
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(activation.insertions, 0, "the fast response cannot settle during capture ownership");
+
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    await completion;
+    assert.equal(activation.commandCalls, 1);
+    assert.equal(activation.insertions, 1);
+    assert.equal(activation.value, "左😀/case 右");
+  });
+});
+
+for (const code of ["Enter", "Space"] as const) {
+  test(`${code} activation starts one command while key capture is active and settles after release`, async () => {
+    await withInteractionGateAsync(async ({ documentTarget, windowTarget, input, lifecycle }) => {
+      let interactionGeneration = 0n;
+      documentTarget.addEventListener("keydown", (event) => {
+        if (shouldInvalidateCommandPaletteInsertionForKeydown(
+          (event as unknown as { repeat?: boolean }).repeat ?? false,
+        )) interactionGeneration += 1n;
+      }, true);
+      const activation = createFastCommandPaletteActivation(lifecycle, () => interactionGeneration);
+
+      documentTarget.dispatch("keydown", { target: input, code, isComposing: false, repeat: false });
+      assert.equal(lifecycle.active, true);
+      let completion: Promise<void>;
+      if (code === "Enter") {
+        completion = activation.activate();
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+      documentTarget.dispatch("keyup", { target: input, code });
+      assert.equal(lifecycle.active, true, "keyup keeps capture until its zero-delay callback");
+      if (code === "Space") {
+        completion = activation.activate();
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+      void activation.activate();
+      assert.equal(activation.commandCalls, 1);
+      assert.equal(activation.insertions, 0);
+
+      windowTarget.advanceBy(0);
+      assert.equal(lifecycle.active, false);
+      await completion!;
+      assert.equal(activation.commandCalls, 1);
+      assert.equal(activation.insertions, 1);
+      assert.equal(activation.value, "左😀/case 右");
+    });
+  });
+}
+
+test("a new unrelated interaction invalidates a fast response waiting on the initiating release", async () => {
+  await withInteractionGateAsync(async ({ documentTarget, windowTarget, input, lifecycle }) => {
+    let interactionGeneration = 0n;
+    documentTarget.addEventListener("pointerdown", () => { interactionGeneration += 1n; }, true);
+    documentTarget.addEventListener("keydown", (event) => {
+      if (shouldInvalidateCommandPaletteInsertionForKeydown(
+        (event as unknown as { repeat?: boolean }).repeat ?? false,
+      )) interactionGeneration += 1n;
+    }, true);
+    const activation = createFastCommandPaletteActivation(lifecycle, () => interactionGeneration);
+
+    documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 7 });
+    const completion = activation.activate();
+    await Promise.resolve();
+    await Promise.resolve();
+    documentTarget.dispatch("keydown", { target: input, code: "KeyA", isComposing: false, repeat: false });
+    documentTarget.dispatch("pointerup", { target: input, pointerId: 7 });
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, true, "the unrelated key still owns the lifecycle");
+    assert.equal(activation.insertions, 0);
+
+    documentTarget.dispatch("keyup", { target: input, code: "KeyA" });
+    windowTarget.advanceBy(0);
+    assert.equal(lifecycle.active, false);
+    await completion;
+    assert.equal(activation.commandCalls, 1);
+    assert.equal(activation.insertions, 0);
+    assert.equal(activation.value, "左😀選択右");
+  });
+});
+
+test("held Enter repeats stay within one activation and produce one insertion", async () => {
+  await withInteractionGateAsync(async ({ documentTarget, windowTarget, input, lifecycle }) => {
+    let interactionGeneration = 0n;
+    documentTarget.addEventListener("keydown", (event) => {
+      if (shouldInvalidateCommandPaletteInsertionForKeydown(
+        (event as unknown as { repeat?: boolean }).repeat ?? false,
+      )) interactionGeneration += 1n;
+    }, true);
+    const activation = createFastCommandPaletteActivation(lifecycle, () => interactionGeneration);
+
+    documentTarget.dispatch("keydown", {
+      target: input,
+      code: "Enter",
+      isComposing: false,
+      repeat: false,
+    });
+    const completion = activation.activate();
+    await Promise.resolve();
+    await Promise.resolve();
+    for (let repeat = 0; repeat < 3; repeat += 1) {
+      documentTarget.dispatch("keydown", {
+        target: input,
+        code: "Enter",
+        isComposing: false,
+        repeat: true,
+      });
+      void activation.activate();
+    }
+    assert.equal(interactionGeneration, 1n, "repeat keydowns belong to the initiating key hold");
+    assert.equal(activation.commandCalls, 1, "native repeat clicks remain single-flight");
+
+    documentTarget.dispatch("keyup", { target: input, code: "Enter" });
+    windowTarget.advanceBy(0);
+    await completion;
+    assert.equal(activation.commandCalls, 1);
+    assert.equal(activation.insertions, 1);
+    assert.equal(activation.value, "左😀/case 右");
+  });
+});
+
+test("a fast command error stays single-flight through held Enter release", async () => {
+  await withInteractionGateAsync(async ({ documentTarget, windowTarget, input, lifecycle }) => {
+    let interactionGeneration = 0n;
+    documentTarget.addEventListener("keydown", (event) => {
+      if (shouldInvalidateCommandPaletteInsertionForKeydown(
+        (event as unknown as { repeat?: boolean }).repeat ?? false,
+      )) interactionGeneration += 1n;
+    }, true);
+    const activation = createFastCommandPaletteActivation(
+      lifecycle,
+      () => interactionGeneration,
+      new Error("fast command failure"),
+    );
+
+    documentTarget.dispatch("keydown", {
+      target: input,
+      code: "Enter",
+      isComposing: false,
+      repeat: false,
+    });
+    const completion = activation.activate();
+    const rejected = assert.rejects(completion, /fast command failure/);
+    await Promise.resolve();
+    await Promise.resolve();
+    for (let repeat = 0; repeat < 3; repeat += 1) {
+      documentTarget.dispatch("keydown", {
+        target: input,
+        code: "Enter",
+        isComposing: false,
+        repeat: true,
+      });
+      void activation.activate();
+    }
+    assert.equal(activation.commandCalls, 1);
+
+    documentTarget.dispatch("keyup", { target: input, code: "Enter" });
+    windowTarget.advanceBy(0);
+    await rejected;
+    assert.equal(activation.commandCalls, 1);
+    assert.equal(activation.insertions, 0);
+  });
+});
+
+for (const recovery of ["blur", "pagehide", "hidden"] as const) {
+  test(`${recovery} invalidates a fast response after lifecycle recovery resolves its idle wait`, async () => {
+    await withInteractionGateAsync(async ({ documentTarget, windowTarget, input, lifecycle }) => {
+      let interactionGeneration = 0n;
+      documentTarget.addEventListener("pointerdown", () => { interactionGeneration += 1n; }, true);
+      if (recovery === "hidden") {
+        documentTarget.addEventListener("visibilitychange", () => {
+          if (documentTarget.hidden) interactionGeneration += 1n;
+        });
+      } else {
+        windowTarget.addEventListener(recovery, () => { interactionGeneration += 1n; });
+      }
+      const activation = createFastCommandPaletteActivation(lifecycle, () => interactionGeneration);
+
+      documentTarget.dispatch("pointerdown", { target: input, button: 0, pointerId: 7 });
+      const completion = activation.activate();
+      await Promise.resolve();
+      await Promise.resolve();
+      assert.equal(lifecycle.active, true);
+      assert.equal(activation.insertions, 0);
+
+      if (recovery === "hidden") {
+        documentTarget.hidden = true;
+        documentTarget.dispatch("visibilitychange");
+      } else {
+        windowTarget.dispatch(recovery);
+      }
+      assert.equal(lifecycle.active, false, "the recovery listener releases capture ownership first");
+      await completion;
+      assert.equal(activation.commandCalls, 1);
+      assert.equal(activation.insertions, 0, "the later invalidator in the same event wins before settlement");
+      assert.equal(activation.value, "左😀選択右");
+    });
+  });
 }
 
 test("interaction lifecycle holds one newest projection across pointer, keyboard, and IME", () => {
@@ -1318,11 +2503,169 @@ test("frontend config validation matches integer and floating-point field shapes
     options: [],
   };
   const number = { ...integer, key: "model.temperature", value_type: "number", min_value: null };
+  const responseTimeout = {
+    ...integer,
+    key: "model.request_timeout_ms",
+    value: "3600000",
+    max_value: 3600000,
+  };
+  const requiredModel = {
+    ...integer,
+    key: "model.model",
+    value_type: "string",
+    required: true,
+    min_value: null,
+  };
   assert.equal(validateConfigInput(integer, "1.5").ok, false);
   assert.equal(validateConfigInput(integer, "0").ok, false);
   assert.equal(validateConfigInput(integer, "4").ok, true);
-  assert.equal(validateConfigInput(number, "0.2").ok, true);
-  assert.equal(validateConfigInput(number, "NaN").ok, false);
+  for (const valid of ["0.2", "+1", "-1.25", ".5", "1.", "6.02e23", "-2E-3"]) {
+    assert.equal(validateConfigInput(number, valid).ok, true, valid);
+  }
+  for (const invalid of ["0x10", "0b10", "0o10", "Infinity", "-Infinity", "NaN"]) {
+    assert.equal(validateConfigInput(number, invalid).ok, false, invalid);
+  }
+  assert.equal(validateConfigInput(responseTimeout, "0").ok, false);
+  assert.equal(validateConfigInput(responseTimeout, "3600000").ok, true);
+  assert.equal(validateConfigInput(responseTimeout, "3600001").ok, false);
+  assert.equal(validateConfigInput(requiredModel, "").ok, false);
+  assert.equal(validateConfigInput(number, "").ok, true, "optional floating values may be cleared");
+  assert.deepEqual(
+    validateConfigFieldValues([responseTimeout], [{ key: responseTimeout.key, text: "0" }]),
+    {
+      ok: false,
+      invalidKey: "model.request_timeout_ms",
+      message: "1 以上の数値を入力してください。",
+    },
+  );
+  assert.deepEqual(
+    configCommitControlState(true, false),
+    { disabled: true, ariaDisabled: "true" },
+    "local validation closes an otherwise-open Rust commit capability",
+  );
+  assert.deepEqual(configCommitControlState(true, true), { disabled: false, ariaDisabled: "false" });
+  assert.deepEqual(configCommitControlState(false, true), { disabled: true, ariaDisabled: "true" });
+});
+
+test("frontend provider URL validation mirrors the Rust ProviderEndpoint boundary", () => {
+  for (const valid of [
+    "http://localhost:1234",
+    "HTTP://LOCALHOST:80/v1/",
+    "https://provider.example/proxy/openai/v1",
+  ]) {
+    assert.equal(validateProviderBaseUrl(valid).ok, true, valid);
+    const raw = projection({ provider_base_url: valid });
+    const ui = createUiLocalState();
+    reconcileUiDrafts(ui, null, raw, null);
+    assert.equal(deriveUiCapabilities(raw, ui).canLoadProviderModels, true, valid);
+  }
+  for (const invalid of [
+    "",
+    "file:///tmp/provider.sock",
+    "https://user:secret@provider.example/v1",
+    "https://provider.example/v1?api_key=hidden",
+    "https://provider.example/v1#hidden",
+  ]) {
+    const validation = validateProviderBaseUrl(invalid);
+    assert.equal(validation.ok, false, invalid);
+    assert.equal(validation.canonicalBaseUrl, "", invalid);
+    assert.equal(validation.message.includes("secret"), false);
+    assert.equal(validation.message.includes("hidden"), false);
+    const raw = projection({ provider_base_url: invalid });
+    const ui = createUiLocalState();
+    reconcileUiDrafts(ui, null, raw, null);
+    const view = projectViewState(raw, ui);
+    assert.equal(deriveUiCapabilities(raw, ui).canLoadProviderModels, false, invalid);
+    assert.equal(view.provider_apply_enabled, false, invalid);
+    assert.equal(paletteActions(view).some((action) => action.id === "load-provider-models"), false, invalid);
+  }
+  assert.equal(validateSideChatProviderSettings("http://localhost/v1", " model ").ok, true);
+  assert.equal(validateSideChatProviderSettings("http://localhost/v1", "   ").ok, false);
+});
+
+test("local full-draft validation owns Settings actions and command-palette admission", () => {
+  const timeoutField: ConfigFieldProjection = {
+    key: "model.request_timeout_ms",
+    value: "3600000",
+    env_override: "MOYAI_REQUEST_TIMEOUT_MS",
+    value_type: "integer",
+    required: true,
+    min_value: 1,
+    max_value: 3600000,
+    options: [],
+  };
+  const rustProjection = projection({ config_fields: [timeoutField] });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, rustProjection, null);
+  const setDraft = (text: string) => updateConfigDraftValue(
+    ui,
+    rustProjection.config_target,
+    rustProjection.config_fields.map((field) => ({ key: field.key, text: field.value })),
+    timeoutField.key,
+    text,
+  );
+
+  setDraft("0");
+  const invalid = projectViewState(rustProjection, ui);
+  assert.equal(invalid.config_draft.commit_enabled, false);
+  assert.equal(invalid.config_draft.external_owner_mutation_open, false);
+  assert.equal(invalid.config_draft.access_mode_mutation_enabled, false);
+  assert.equal(invalid.provider_apply_enabled, false);
+  for (const id of [
+    "apply-session-config",
+    "save-global-config",
+    "toggle-access",
+    "apply-provider-session",
+    "save-provider-global",
+  ]) {
+    assert.equal(actionById(id)?.enabled?.(invalid, { index: -1, value: "" }), false, id);
+    assert.equal(paletteActions(invalid, true).some((action) => action.id === id), false, id);
+  }
+
+  setDraft("3599000");
+  const valid = projectViewState(rustProjection, ui);
+  assert.equal(valid.config_draft.commit_enabled, true);
+  assert.equal(valid.config_draft.external_owner_mutation_open, false);
+  assert.equal(valid.config_draft.access_mode_mutation_enabled, false);
+  assert.equal(valid.provider_apply_enabled, false);
+  for (const id of ["apply-session-config", "save-global-config"]) {
+    assert.equal(actionById(id)?.enabled?.(valid, { index: -1, value: "" }), true, id);
+    assert.equal(paletteActions(valid, true).some((action) => action.id === id), true, id);
+  }
+  for (const id of ["toggle-access", "apply-provider-session", "save-provider-global"]) {
+    assert.equal(actionById(id)?.enabled?.(valid, { index: -1, value: "" }), false, id);
+    assert.equal(paletteActions(valid, true).some((action) => action.id === id), false, id);
+  }
+
+  setDraft("3600000");
+  const revertedClean = projectViewState(rustProjection, ui);
+  assert.equal(revertedClean.config_draft.commit_enabled, false);
+  assert.equal(revertedClean.config_draft.external_owner_mutation_open, true);
+  assert.equal(revertedClean.config_draft.access_mode_mutation_enabled, true);
+  assert.equal(revertedClean.provider_apply_enabled, true);
+  for (const id of ["toggle-access", "apply-provider-session", "save-provider-global"]) {
+    assert.equal(actionById(id)?.enabled?.(revertedClean, { index: -1, value: "" }), true, id);
+    assert.equal(paletteActions(revertedClean, true).some((action) => action.id === id), true, id);
+  }
+
+  const invalidRustBaseline = projection({
+    config_fields: [{ ...timeoutField, value: "0" }],
+  });
+  const invalidCleanUi = createUiLocalState();
+  reconcileUiDrafts(invalidCleanUi, null, invalidRustBaseline, null);
+  const invalidClean = projectViewState(invalidRustBaseline, invalidCleanUi);
+  assert.equal(invalidClean.config_draft.dirty, false);
+  assert.equal(invalidClean.config_draft.external_owner_mutation_open, false);
+  assert.equal(invalidClean.config_draft.access_mode_mutation_enabled, false);
+  assert.equal(invalidClean.provider_apply_enabled, false);
+  for (const id of ["toggle-access", "apply-provider-session", "save-provider-global"]) {
+    assert.equal(actionById(id)?.enabled?.(invalidClean, { index: -1, value: "" }), false, id);
+    assert.equal(paletteActions(invalidClean).some((action) => action.id === id), false, id);
+  }
+
+  ui.activeConfigMutationGeneration = 1n;
+  const pending = projectViewState(rustProjection, ui);
+  assert.equal(pending.config_draft.commit_enabled, false);
 });
 
 test("global action shortcuts ignore key-repeat activation", () => {
@@ -1331,6 +2674,33 @@ test("global action shortcuts ignore key-repeat activation", () => {
   assert.equal(globalShortcutAction({ ...f8, repeat: true }), null);
   assert.equal(globalShortcutAction({ key: "Enter", ctrlKey: true, metaKey: false, repeat: false }), "send");
   assert.equal(globalShortcutAction({ key: "Enter", ctrlKey: true, metaKey: false, repeat: true }), null);
+  const ctrlN = { key: "n", ctrlKey: true, metaKey: false, repeat: false };
+  assert.equal(globalShortcutAction(ctrlN), "new-chat");
+  assert.equal(globalShortcutAction({ ...ctrlN, repeat: true }), null);
+});
+
+test("every visible new-chat route exposes one exact typed focus identity", () => {
+  assert.match(
+    renderSidebar(projection()),
+    /data-action="new-chat" data-focus-key="quick-chat:new-session"/,
+  );
+  assert.match(
+    renderOverlay(projection({ overlay: "file_menu" })),
+    /data-action="new-chat" data-focus-key="titlebar-menu:file:new-chat" data-titlebar-menu-action/,
+  );
+  assert.match(
+    renderOverlay(projection({
+      overlay: "command_palette",
+      local_search_text: "",
+      local_search_results_text: "",
+      command_rows: [],
+    })),
+    /data-action="new-chat" data-focus-key="palette-action:new-chat"/,
+  );
+  assert.match(
+    renderOverlay(projection({ overlay: "shortcuts" })),
+    /data-action="new-chat" data-focus-key="shortcut-action:new-chat"/,
+  );
 });
 
 test("access modes use the Codex-aligned Japanese labels", () => {
@@ -1369,8 +2739,8 @@ test("workspace browser submits its local draft with the authoritative draft own
       text: "D:/next-workspace",
       expectedTarget: {
         workspacePath: "C:/workspace",
-        sessionId: "session-a",
-        ownerGeneration: 1,
+        sessionId: SESSION_A,
+        ownerGeneration: "1",
       },
     },
   });
@@ -1410,8 +2780,8 @@ test("search and attachment actions carry their authoritative owners", async () 
       args: {
         expectedTarget: {
           workspacePath: "C:/workspace",
-          sessionId: "session-a",
-          ownerGeneration: 1,
+          sessionId: SESSION_A,
+          ownerGeneration: "1",
         },
       },
     },
@@ -1420,7 +2790,7 @@ test("search and attachment actions carry their authoritative owners", async () 
       args: {
         expectedTarget: {
           workspacePath: "C:/workspace",
-          sessionId: "session-a",
+          sessionId: SESSION_A,
           configGeneration: "1",
           accessMode: "default",
           runtimeOwnerToken: "idle:0",
@@ -1448,19 +2818,129 @@ test("search and attachment actions carry their authoritative owners", async () 
   );
 });
 
+test("session-row interrupt carries the exact active turn and fails closed without it", async () => {
+  const base = projection();
+  const activeRow = {
+    ...base.session_rows[0]!,
+    loaded_status: "active" as const,
+    active_turn_id: TURN_A,
+    active_turn_sequence_no: 4,
+    interrupt_target: rootStopTarget(),
+  };
+  const state = projection({ session_rows: [activeRow] });
+  const invocations: Array<{ name: string; args?: Record<string, unknown> }> = [];
+  const context = {
+    mutate: async (name: string, args?: Record<string, unknown>) => {
+      invocations.push({ name, args });
+    },
+  } as unknown as ActionContext;
+
+  await actionById("interrupt-session")?.run(state, context, { index: 0, value: "" });
+  assert.deepEqual(invocations, [{
+    name: "interrupt_session",
+    args: {
+      index: 0,
+      expectedTarget: {
+        workspacePath: "C:/workspace",
+        ownerProjectId: "project-a",
+        ownerSessionId: SESSION_A,
+        rowId: SESSION_A,
+      },
+      expectedStopTarget: activeRow.interrupt_target,
+    },
+  }]);
+
+  invocations.length = 0;
+  const missingTarget = projection({
+    session_rows: [{ ...activeRow, interrupt_target: null }],
+  });
+  await actionById("interrupt-session")?.run(missingTarget, context, { index: 0, value: "" });
+  assert.deepEqual(invocations, []);
+});
+
 test("stable row identity and selected-state semantics survive list reordering", () => {
   const state = projection();
   const sidebar = renderSidebar(state);
   assert.match(sidebar, /data-focus-key="project:project-a:select" aria-current="page"/);
-  assert.match(sidebar, /data-focus-key="session:session-a:select" aria-current="page"/);
-  const childOnlyActive = renderSidebar(projection({ busy: false, agent_tree_active: true }));
-  assert.match(childOnlyActive, /data-focus-key="session:session-a:select"[^>]*>[\s\S]*?busy-spinner/);
+  assert.match(sidebar, new RegExp(`data-focus-key="session:${SESSION_A}:select" aria-current="page"`));
+  const childOnlyActive = renderSidebar(projection({
+    busy: false,
+    agent_tree_active: true,
+    task_activity_state: "running",
+  }));
+  assert.match(
+    childOnlyActive,
+    new RegExp(`data-focus-key="session:${SESSION_A}:select"[^>]*>[\\s\\S]*?task-activity-indicator`),
+  );
+  assert.doesNotMatch(childOnlyActive, /busy-spinner/);
 
   const artifact = renderArtifactPane(projection({
     artifact_rows: [{ label: "report", path: "C:/workspace/report.md", kind: "file", action: "created" }],
     selected_artifact_index: 0,
   }));
   assert.match(artifact, /data-focus-key="artifact:C:\/workspace\/report\.md" aria-current="true"/);
+});
+
+test("project and quick-chat rows expose selected and background task activity", () => {
+  const buttonFor = (html: string, focusKey: string): string => {
+    const marker = `data-focus-key="${focusKey}:select"`;
+    const start = html.indexOf(marker);
+    assert.notEqual(start, -1, `missing ${focusKey}`);
+    const end = html.indexOf("</button>", start);
+    assert.notEqual(end, -1, `unterminated ${focusKey}`);
+    return html.slice(start, end + "</button>".length);
+  };
+  const base = projection().session_rows[0]!;
+  const selected = {
+    ...base,
+    loaded_status: "active" as const,
+    pending_permission_requests: 1,
+  };
+  const background = {
+    ...base,
+    session_id: SESSION_B,
+    short_id: SESSION_B,
+    label: "Session B",
+    title: "Session B",
+    loaded_status: "active" as const,
+  };
+  const attention = {
+    ...background,
+    session_id: "session-c",
+    short_id: "session-c",
+    label: "Session C",
+    title: "Session C",
+    pending_user_input_requests: 1,
+  };
+  const inactive = {
+    ...base,
+    session_id: "session-d",
+    short_id: "session-d",
+    label: "Session D",
+    title: "Session D",
+  };
+  const projectSidebar = renderSidebar(projection({
+    agent_tree_active: true,
+    task_activity_state: "finalizing",
+    session_rows: [selected, background, attention, inactive],
+  }));
+
+  assert.match(buttonFor(projectSidebar, `session:${SESSION_A}`), /data-task-activity="finalizing"/);
+  assert.match(buttonFor(projectSidebar, `session:${SESSION_B}`), /data-task-activity="running"/);
+  assert.match(buttonFor(projectSidebar, "session:session-c"), /data-task-activity="attention"/);
+  assert.doesNotMatch(buttonFor(projectSidebar, "session:session-d"), /task-activity-indicator/);
+
+  const quickSidebar = renderSidebar(projection({
+    selected_project_index: -1,
+    selected_session_index: 0,
+    agent_tree_active: true,
+    task_activity_state: "running",
+    session_rows: [selected],
+    chat_session_rows: [selected, attention, inactive],
+  }));
+  assert.match(buttonFor(quickSidebar, `chat-session:${SESSION_A}`), /data-task-activity="running"/);
+  assert.match(buttonFor(quickSidebar, "chat-session:session-c"), /data-task-activity="attention"/);
+  assert.doesNotMatch(buttonFor(quickSidebar, "chat-session:session-d"), /task-activity-indicator/);
 });
 
 test("access-mode control consumes the Rust mutation capability", () => {
@@ -1598,16 +3078,6 @@ test("a closed dirty settings draft blocks every external config owner mutation"
     "catalog loading does not replace the config owner",
   );
 
-  setRenderContext({
-    artifactPaneCollapsed: false,
-    attachmentTrayOpen: false,
-    configDirty: true,
-    configMutationPending: false,
-    configOwnerMutationOpen: false,
-    configDraftEditOpen: true,
-    configDraftDiscardOpen: true,
-    configDraftCommitOpen: true,
-  });
   const setup = {
     ...dirtyView,
     overlay: "config",
@@ -1617,20 +3087,9 @@ test("a closed dirty settings draft blocks every external config owner mutation"
       action_overlay: "config",
     },
   };
-  const dirtySettings = renderOverlay(setup);
+  const dirtySettings = renderOverlay(setup, renderLocal());
   assert.match(dirtySettings, /data-action="import-config-toml" disabled>/);
   assert.match(dirtySettings, /data-action="discard-config-draft"(?![^>]*hidden)/);
-  setRenderContext({
-    artifactPaneCollapsed: false,
-    attachmentTrayOpen: false,
-    configDirty: false,
-    configMutationPending: false,
-    configOwnerMutationOpen: true,
-    configDraftEditOpen: true,
-    configDraftDiscardOpen: false,
-    configDraftCommitOpen: false,
-  });
-
   const after = projection({
     access_label: "full_access",
     access_target: { ...before.access_target, accessMode: "full_access" },
@@ -1695,32 +3154,14 @@ test("local config and run-start mutations close external config owner admission
   );
   assert.equal(configCommands, 0, "direct repeated dispatch is rejected before a second request");
 
-  setRenderContext({
-    artifactPaneCollapsed: false,
-    attachmentTrayOpen: false,
-    configDirty: true,
-    configMutationPending: true,
-    configOwnerMutationOpen: false,
-    configDraftEditOpen: false,
-    configDraftDiscardOpen: false,
-    configDraftCommitOpen: false,
-  });
-  const pendingHtml = renderOverlay({ ...configPendingView, overlay: "config" });
+  const pendingHtml = renderOverlay(
+    { ...configPendingView, overlay: "config" },
+    renderLocal({ configMutationPending: true }),
+  );
   assert.match(pendingHtml, /data-action="discard-config-draft"[^>]*disabled/);
   assert.match(pendingHtml, /data-action="apply-session-config" disabled/);
   assert.match(pendingHtml, /data-action="save-global-config" disabled/);
   assert.match(pendingHtml, /class="settings-control"[^>]*disabled/);
-  setRenderContext({
-    artifactPaneCollapsed: false,
-    attachmentTrayOpen: false,
-    configDirty: false,
-    configMutationPending: false,
-    configOwnerMutationOpen: true,
-    configDraftEditOpen: true,
-    configDraftDiscardOpen: false,
-    configDraftCommitOpen: false,
-  });
-
   configPending.activeConfigMutationGeneration = null;
   const rustOwnedDirty = projection();
   const resumed = projectViewState(rustOwnedDirty, configPending);
@@ -1743,6 +3184,161 @@ test("local config and run-start mutations close external config owner admission
   assert.equal(runPendingView.provider_apply_enabled, false);
   assert.equal(runPendingView.config_draft.external_owner_mutation_open, false);
   assert.equal(runPendingView.config_draft.commit_enabled, false);
+});
+
+test("a successful Discard click keeps an owner-fenced focus continuation through async settlement", async () => {
+  const timeoutField = {
+    key: "model.request_timeout_ms",
+    value: "3600000",
+    env_override: null,
+    value_type: "integer",
+    required: false,
+    min_value: 1,
+    max_value: 3600000,
+    options: [],
+  };
+  const rustProjection = projection({
+    overlay: "config",
+    config_fields: [timeoutField],
+  });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, rustProjection, null);
+  updateConfigDraftValue(
+    ui,
+    rustProjection.config_target,
+    [{ key: timeoutField.key, text: timeoutField.value }],
+    timeoutField.key,
+    "3599000",
+  );
+  const dirtyView = projectViewState(rustProjection, ui);
+
+  let activeElement: FakeFocusTarget | null = null;
+  class FakeFocusTarget {
+    readonly isConnected = true;
+    hidden = false;
+    disabled = false;
+    inert = false;
+    readonly id: string;
+    constructor(id: string) { this.id = id; }
+    getAttribute(): string | null { return null; }
+    matches(selector: string): boolean { return selector === ":disabled" && this.disabled; }
+    closest(): null { return null; }
+    focus(): void { activeElement = this; }
+  }
+  class ManualFocusScheduler {
+    private callback: (() => void) | null = null;
+
+    schedule(callback: () => void): number {
+      this.callback = callback;
+      return 1;
+    }
+
+    cancel(): void {
+      this.callback = null;
+    }
+
+    flush(): void {
+      const callback = this.callback;
+      this.callback = null;
+      callback?.();
+    }
+  }
+  const body = new FakeFocusTarget("body");
+  const documentElement = new FakeFocusTarget("html");
+  const discard = new FakeFocusTarget("discard");
+  const close = new FakeFocusTarget("close");
+  const dialog = new FakeFocusTarget("dialog");
+  activeElement = discard;
+  const focusScheduler = new ManualFocusScheduler();
+  const focusArbiter = new PostRenderFocusArbiter(focusScheduler, {
+    currentRenderCommit: () => 1,
+    currentInteractionEpoch: () => 1n,
+    interactionActive: () => false,
+    activeElement: () => activeElement,
+    bodyElement: () => body,
+    documentElement: () => documentElement,
+  });
+
+  let resolveReset!: (value: DesktopViewState) => void;
+  const resetResponse = new Promise<DesktopViewState>((resolve) => { resolveReset = resolve; });
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    writable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: (name: string, args: Record<string, unknown>) => {
+          assert.equal(name, "reset_config_draft");
+          assert.deepEqual(args.expectedTarget, rustProjection.config_target);
+          return resetResponse;
+        },
+      },
+    },
+  });
+
+  let rerenders = 0;
+  let accepted = false;
+  const context = {
+    uiState: ui,
+    getProjection: () => rustProjection,
+    getViewState: () => projectViewState(rustProjection, ui),
+    prepareConfigSnapshot: () => [{ key: timeoutField.key, text: "3599000" }],
+    rerender: () => { rerenders += 1; },
+    recoverCommandConflict: () => false,
+    reportError: (error: unknown) => { throw error; },
+    acceptProjection: (settled: DesktopViewState) => {
+      accepted = true;
+      discard.hidden = true;
+      discard.disabled = true;
+      const pendingFocus = ui.settingsActionFocusContinuation;
+      assert.ok(pendingFocus);
+      const cleanView = projectViewState(settled, ui);
+      activeElement = body;
+      ui.settingsActionFocusContinuation = null;
+      const focusResults: unknown[] = [];
+      focusArbiter.schedule({
+        renderCommit: 1,
+        interactionEpoch: 1n,
+        intents: [{
+          source: "settings-action",
+          priority: "explicit-transfer",
+          claim: { kind: "unowned" },
+          candidates: settingsActionFocusCandidates(pendingFocus, (selector) => {
+          if (selector === '[data-action="discard-config-draft"]') return discard as unknown as HTMLElement;
+          if (selector === '[data-action="close-overlay"]') return close as unknown as HTMLElement;
+          if (selector === ".settings-modal") return dialog as unknown as HTMLElement;
+          return null;
+          }),
+          isCurrent: () => settingsActionFocusStillTargets(pendingFocus, cleanView),
+        }],
+        onResult: (result) => focusResults.push(result),
+      });
+      assert.equal(activeElement, body, "candidate generation does not write focus");
+      focusScheduler.flush();
+      assert.deepEqual(focusResults, [{ kind: "focused", source: "settings-action" }]);
+    },
+  } as unknown as ActionContext;
+
+  try {
+    const action = actionById("discard-config-draft");
+    assert.ok(action);
+    const pending = Promise.resolve(action.run(dirtyView, context, { index: -1, value: "" }));
+
+    assert.equal(activeElement, discard, "the pointer-clicked Discard remains the interaction origin");
+    assert.equal(rerenders, 1, "the pending projection disables Settings immediately");
+    assert.notEqual(ui.activeConfigMutationGeneration, null);
+
+    resolveReset({ ...rustProjection, projection_revision: "2" });
+    await pending;
+
+    assert.equal(accepted, true);
+    assert.equal(ui.configDirty, false);
+    assert.equal(activeElement, close, "clean Settings continues at the adjacent safe Close action");
+    assert.equal(ui.settingsActionFocusContinuation, null);
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+    else delete (globalThis as Record<string, unknown>).window;
+  }
 });
 
 test("hidden settings draft can be reopened, discarded, and release external mutations", async () => {
@@ -1807,35 +3403,18 @@ test("external config mutation roundtrip prevents a settings draft from starting
   );
   assert.equal(configCommands, 0);
 
-  setRenderContext({
-    artifactPaneCollapsed: false,
-    attachmentTrayOpen: false,
-    configDirty: false,
-    configMutationPending: false,
-    configOwnerMutationOpen: false,
-    configDraftEditOpen: false,
-    configDraftDiscardOpen: false,
-    configDraftCommitOpen: false,
-  });
   assert.match(
-    renderOverlay(pending),
+    renderOverlay(pending, renderLocal()),
     /class="settings-control"[^>]*disabled/,
   );
-  setRenderContext({
-    artifactPaneCollapsed: false,
-    attachmentTrayOpen: false,
-    configDirty: false,
-    configMutationPending: false,
-    configOwnerMutationOpen: true,
-    configDraftEditOpen: true,
-    configDraftDiscardOpen: false,
-    configDraftCommitOpen: false,
-  });
 });
 
 test("provider overlay consumes typed status and exposes control selection semantics", () => {
   const html = renderOverlay(projection({ overlay: "provider" }));
   assert.match(html, /<label class="field-label" for="provider-url">/);
+  assert.match(html, /id="provider-url"[^>]*aria-describedby="provider-url-help provider-status"[^>]*aria-invalid="false"/);
+  assert.match(html, /id="provider-url-help"/);
+  assert.match(html, /id="provider-status"[^>]*role="status"[^>]*aria-live="polite"/);
   assert.match(html, /data-mode="openai_compatible_only" aria-pressed="true"/);
   assert.match(html, /data-focus-key="provider-model:model-a" aria-pressed="true"/);
   assert.match(html, /Typed idle/);
@@ -1846,7 +3425,107 @@ test("provider overlay consumes typed status and exposes control selection seman
     provider_base_url: "",
     provider_context_window: "0",
   }));
+  assert.match(invalid, /id="provider-url"[^>]*aria-invalid="true"/);
+  assert.match(invalid, /provider-status error/);
+  assert.match(invalid, /ベースURLを確認してください/);
+  assert.match(invalid, /URL を入力してください。/);
   assert.match(invalid, /data-action="load-provider-models" disabled>モデル読込<\/button>/);
+});
+
+test("provider overlay renders actionable URL feedback without replacing valid typed status", () => {
+  const typedStatus = projection().provider_status;
+  const cases = [
+    ["", "URL を入力してください。"],
+    ["file:///tmp/provider.sock", "http:// または https://"],
+    ["https://user:secret@provider.example/v1", "認証情報を含めず"],
+    ["https://provider.example/v1?api_key=hidden", "query stringは指定できません"],
+    ["https://provider.example/v1#hidden", "fragmentは指定できません"],
+  ] as const;
+  for (const [baseUrl, reason] of cases) {
+    const feedback = providerOverlayFeedback(baseUrl, typedStatus);
+    assert.equal(feedback.baseUrl.ok, false, baseUrl);
+    assert.equal(feedback.status.kind, "error", baseUrl);
+    assert.match(feedback.status.hint, new RegExp(reason), baseUrl);
+
+    const html = renderOverlay(projection({ overlay: "provider", provider_base_url: baseUrl }));
+    assert.match(html, /id="provider-url"[^>]*aria-describedby="provider-url-help provider-status"[^>]*aria-invalid="true"/, baseUrl);
+    assert.match(html, /id="provider-status" class="provider-status error"/, baseUrl);
+    assert.match(html, new RegExp(reason), baseUrl);
+  }
+
+  for (const baseUrl of [
+    "http://localhost:1234/v1/",
+    "https://provider.example/proxy/openai/v1",
+  ]) {
+    const feedback = providerOverlayFeedback(baseUrl, typedStatus);
+    assert.equal(feedback.baseUrl.ok, true, baseUrl);
+    assert.equal(feedback.status, typedStatus, baseUrl);
+    const html = renderOverlay(projection({ overlay: "provider", provider_base_url: baseUrl }));
+    assert.match(html, /id="provider-url"[^>]*aria-invalid="false"/, baseUrl);
+    assert.match(html, /Typed idle/, baseUrl);
+    assert.doesNotMatch(html, /ベースURLを確認してください/, baseUrl);
+  }
+});
+
+test("provider URL typing updates accessible feedback and restores the current typed status", () => {
+  const attributes = new Map<string, string>();
+  const input = {
+    setAttribute: (name: string, value: string) => attributes.set(name, value),
+  };
+  const title = { textContent: "" };
+  const hint = { textContent: "" };
+  const details = { hidden: false };
+  const detailsText = { textContent: "" };
+  const status = {
+    className: "",
+    querySelector: (selector: string) => {
+      if (selector === "[data-provider-status-title]") return title;
+      if (selector === "[data-provider-status-hint]") return hint;
+      if (selector === "[data-details-key='provider-status-details']") return details;
+      if (selector === "[data-provider-status-details]") return detailsText;
+      return null;
+    },
+  };
+  const fakeDocument = {
+    querySelector: (selector: string) => {
+      if (selector === "#provider-url") return input;
+      if (selector === "#provider-status") return status;
+      return null;
+    },
+  };
+  const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  Object.defineProperty(globalThis, "document", {
+    configurable: true,
+    writable: true,
+    value: fakeDocument,
+  });
+
+  try {
+    synchronizeProviderOverlayFeedback(projection({
+      provider_base_url: "https://user:secret@provider.example/v1",
+      provider_status: { kind: "loading", title: "読込中", hint: "接続中", details: "pending" },
+    }));
+    assert.equal(attributes.get("aria-invalid"), "true");
+    assert.equal(status.className, "provider-status error");
+    assert.equal(title.textContent, "ベースURLを確認してください");
+    assert.match(hint.textContent, /認証情報を含めず/);
+    assert.equal(details.hidden, true);
+    assert.equal(detailsText.textContent, "");
+
+    synchronizeProviderOverlayFeedback(projection({
+      provider_base_url: "https://provider.example/proxy/openai/v1",
+      provider_status: { kind: "error", title: "接続できません", hint: "Providerを確認", details: "timeout" },
+    }));
+    assert.equal(attributes.get("aria-invalid"), "false");
+    assert.equal(status.className, "provider-status error");
+    assert.equal(title.textContent, "接続できません");
+    assert.equal(hint.textContent, "Providerを確認");
+    assert.equal(details.hidden, false);
+    assert.equal(detailsText.textContent, "timeout");
+  } finally {
+    if (previousDocument) Object.defineProperty(globalThis, "document", previousDocument);
+    else delete (globalThis as Record<string, unknown>).document;
+  }
 });
 
 test("provider limit-only edits can be committed without reloading the current catalog", () => {
@@ -1958,6 +3637,420 @@ test("provider catalog evidence remains bound to the local URL and mode", () => 
   assert.equal(projectViewState(loaded, ui).provider_apply_enabled, false);
 });
 
+test("provider catalog completion is rejected after a mid-flight URL edit", () => {
+  const initial = projection({
+    overlay: "provider",
+    provider_base_url: "http://127.0.0.1:9763/slow",
+    provider_catalog_base_url: null,
+    provider_catalog_metadata_mode: null,
+    provider_model_ids: ["model-a"],
+    provider_models: ["Model A"],
+    provider_selected_index: 0,
+    provider_loading: false,
+  });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, initial, null);
+  beginProviderCatalogRequest(ui, initial);
+  const dispatched = captureDraftMutation(ui, "load_provider_models");
+  const loading = projection({
+    ...initial,
+    projection_revision: "2",
+    provider_loading: true,
+    provider_status: { kind: "loading", title: "Loading", hint: "Waiting", details: "" },
+  });
+  acknowledgeDraftMutation(ui, loading, "load_provider_models", dispatched);
+  reconcileUiDrafts(ui, initial, loading, dispatched);
+
+  ui.drafts.provider.baseUrl = "http://192.168.10.101:1234";
+  ui.drafts.providerRevision += 1;
+  const completion = projection({
+    ...initial,
+    projection_revision: "3",
+    provider_catalog_base_url: "http://127.0.0.1:9763/slow",
+    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_model_ids: ["uat/fast-model", "model-a"],
+    provider_models: ["uat/fast-model", "Model A"],
+    provider_selected_index: 1,
+    provider_selected_model_summary: ["Model: uat/fast-model"],
+    provider_status: { kind: "success", title: "Loaded", hint: "Apply", details: "1 model" },
+    provider_loading: false,
+  });
+  reconcileUiDrafts(ui, loading, completion, null);
+  const view = projectViewState(completion, ui);
+
+  assert.equal(view.provider_base_url, "http://192.168.10.101:1234");
+  assert.deepEqual(view.provider_model_ids, []);
+  assert.deepEqual(view.provider_models, []);
+  assert.equal(view.provider_selected_index, -1);
+  assert.equal(view.provider_catalog_base_url, null);
+  assert.equal(view.provider_apply_enabled, false);
+  assert.equal(view.provider_status.kind, "warning");
+  assert.equal(ui.drafts.provider.baseUrl, "http://192.168.10.101:1234");
+});
+
+test("provider catalog completion is rejected after an ABA draft edit", () => {
+  const initial = projection({
+    overlay: "provider",
+    provider_base_url: "http://127.0.0.1:9763/slow",
+    provider_catalog_base_url: null,
+    provider_catalog_metadata_mode: null,
+    provider_model_ids: ["configured-model"],
+    provider_models: ["Configured model"],
+    provider_selected_index: 0,
+    provider_loading: false,
+    provider_apply_enabled: false,
+  });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, initial, null);
+  const request = beginProviderCatalogRequest(ui, initial);
+  assert.ok(request);
+  assert.equal(request.providerRevision, ui.drafts.providerRevision);
+  const dispatched = captureDraftMutation(ui, "load_provider_models");
+  const loading = projection({
+    ...initial,
+    projection_revision: "2",
+    provider_loading: true,
+    provider_status: { kind: "loading", title: "Loading", hint: "Waiting", details: "" },
+  });
+  acknowledgeDraftMutation(ui, loading, "load_provider_models", dispatched);
+  reconcileUiDrafts(ui, initial, loading, dispatched);
+
+  ui.drafts.provider.baseUrl = "http://192.168.10.101:1234";
+  ui.drafts.providerRevision += 1;
+  ui.drafts.provider.baseUrl = "http://127.0.0.1:9763/slow";
+  ui.drafts.providerRevision += 1;
+  const loadingView = projectViewState(loading, ui);
+  assert.equal(loadingView.provider_loading, true, "the Rust-owned request remains in flight");
+  assert.equal(loadingView.provider_base_url, "http://127.0.0.1:9763/slow");
+  assert.equal(loadingView.provider_status.kind, "warning");
+
+  const completion = projection({
+    ...initial,
+    projection_revision: "3",
+    provider_catalog_base_url: "http://127.0.0.1:9763/slow",
+    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_model_ids: ["configured-model", "stale-model"],
+    provider_models: ["Configured model", "Stale model"],
+    provider_selected_index: 0,
+    provider_loading: false,
+    provider_apply_enabled: true,
+  });
+  reconcileUiDrafts(ui, loading, completion, null);
+  const view = projectViewState(completion, ui);
+
+  assert.deepEqual(view.provider_model_ids, []);
+  assert.equal(view.provider_selected_index, -1);
+  assert.equal(view.provider_catalog_base_url, null);
+  assert.equal(view.provider_status.kind, "warning");
+  assert.equal(ui.rejectedProviderCatalogRequest, request);
+  assert.equal(ui.drafts.provider.baseUrl, "http://127.0.0.1:9763/slow");
+  assert.equal(ui.drafts.provider.selectedModelId, "configured-model");
+  assert.equal(deriveUiCapabilities(completion, ui).canApplyProvider, false);
+  assert.equal(view.provider_apply_enabled, false);
+  const rejectedHtml = renderOverlay(view);
+  assert.match(
+    rejectedHtml,
+    /data-action="apply-provider-session" disabled>UIセッションに適用/,
+  );
+  assert.match(
+    rejectedHtml,
+    /data-action="save-provider-global" disabled>設定ファイルに保存/,
+  );
+
+  const reloadRequest = beginProviderCatalogRequest(ui, completion);
+  assert.ok(reloadRequest);
+  const reloadDispatched = captureDraftMutation(ui, "load_provider_models");
+  const reloadLoading = projection({
+    ...completion,
+    projection_revision: "4",
+    provider_catalog_base_url: null,
+    provider_catalog_metadata_mode: null,
+    provider_loading: true,
+    provider_apply_enabled: false,
+    provider_status: { kind: "loading", title: "Loading", hint: "Waiting", details: "" },
+  });
+  acknowledgeDraftMutation(ui, reloadLoading, "load_provider_models", reloadDispatched);
+  reconcileUiDrafts(ui, completion, reloadLoading, reloadDispatched);
+
+  const reloadCompletion = projection({
+    ...completion,
+    projection_revision: "5",
+    provider_model_ids: ["configured-model", "fresh-model"],
+    provider_models: ["Configured model", "Fresh model"],
+    provider_selected_index: 0,
+    provider_loading: false,
+    provider_apply_enabled: true,
+    provider_status: { kind: "success", title: "Loaded", hint: "Apply", details: "2 models" },
+  });
+  reconcileUiDrafts(ui, reloadLoading, reloadCompletion, null);
+  const reloadedView = projectViewState(reloadCompletion, ui);
+
+  assert.equal(ui.rejectedProviderCatalogRequest, null);
+  assert.deepEqual(
+    reloadedView.provider_model_ids,
+    ["configured-model", "fresh-model"],
+    "a successful reload retains the configured/manual model fallback beside returned models",
+  );
+  assert.equal(ui.drafts.provider.baseUrl, "http://127.0.0.1:9763/slow");
+  assert.equal(ui.drafts.provider.selectedModelId, "configured-model");
+  assert.equal(deriveUiCapabilities(reloadCompletion, ui).canApplyProvider, true);
+  assert.equal(reloadedView.provider_apply_enabled, true);
+  const reloadedHtml = renderOverlay(reloadedView);
+  assert.match(
+    reloadedHtml,
+    /data-action="apply-provider-session" >UIセッションに適用/,
+  );
+  assert.match(
+    reloadedHtml,
+    /data-action="save-provider-global" >設定ファイルに保存/,
+  );
+});
+
+test("provider catalog rapid double dispatch preserves one owner through ABA settlement", async () => {
+  const initial = projection({
+    overlay: "provider",
+    provider_base_url: "http://127.0.0.1:9763/slow",
+    provider_catalog_base_url: null,
+    provider_catalog_metadata_mode: null,
+    provider_model_ids: [],
+    provider_models: [],
+    provider_selected_index: -1,
+    provider_loading: false,
+  });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, initial, null);
+
+  let current: DesktopViewState = initial;
+  let currentView = projectViewState(current, ui);
+  let commandCount = 0;
+  let releaseCommand!: () => void;
+  const commandDeferred = new Promise<void>((resolve) => { releaseCommand = resolve; });
+  const context = {
+    uiState: ui,
+    getProjection: () => current,
+    getViewState: () => currentView,
+    rerender: () => { currentView = projectViewState(current, ui); },
+    mutate: async (name: string) => {
+      assert.equal(name, "load_provider_models");
+      commandCount += 1;
+      const dispatched = captureDraftMutation(ui, name);
+      await commandDeferred;
+      const loading = projection({
+        ...initial,
+        projection_revision: "2",
+        provider_loading: true,
+        provider_status: { kind: "loading", title: "Loading", hint: "Waiting", details: "" },
+      });
+      acknowledgeDraftMutation(ui, loading, name, dispatched);
+      reconcileUiDrafts(ui, current, loading, dispatched);
+      current = loading;
+      currentView = projectViewState(current, ui);
+    },
+  } as unknown as ActionContext;
+  const staleEnabledView = currentView;
+
+  const firstDispatch = dispatchGuiAction(
+    "load-provider-models",
+    -1,
+    "",
+    staleEnabledView,
+    context,
+  );
+  const request = ui.providerCatalogTransaction.active;
+  assert.ok(request);
+  const secondDispatch = dispatchGuiAction(
+    "load-provider-models",
+    -1,
+    "",
+    staleEnabledView,
+    context,
+  );
+  await secondDispatch;
+
+  assert.equal(commandCount, 1, "a stale queued activation cannot submit a second command");
+  assert.equal(ui.providerCatalogTransaction.active, request, "the first request token remains the owner");
+  assert.equal(ui.providerCatalogTransaction.nextId, request.token + 1);
+  assert.equal(currentView.provider_loading, true, "local pending projects before the Rust response");
+  assert.equal(deriveUiCapabilities(current, ui).canLoadProviderModels, false);
+  assert.match(
+    renderOverlay(currentView),
+    /data-action="load-provider-models" disabled>読込中<\/button>/,
+  );
+
+  releaseCommand();
+  await firstDispatch;
+  assert.equal(ui.providerCatalogTransaction.active, request);
+  assert.equal(request.admitted, true);
+
+  ui.drafts.provider.baseUrl = "http://192.168.10.101:1234";
+  ui.drafts.providerRevision += 1;
+  ui.drafts.provider.baseUrl = "http://127.0.0.1:9763/slow";
+  ui.drafts.providerRevision += 1;
+  const completion = projection({
+    ...initial,
+    projection_revision: "3",
+    provider_catalog_base_url: "http://127.0.0.1:9763/slow",
+    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_model_ids: ["stale-model"],
+    provider_models: ["Stale model"],
+    provider_selected_index: 0,
+    provider_loading: false,
+  });
+  reconcileUiDrafts(ui, current, completion, null);
+  current = completion;
+  currentView = projectViewState(current, ui);
+
+  assert.equal(ui.providerCatalogTransaction.active, null);
+  assert.equal(ui.rejectedProviderCatalogRequest, request);
+  assert.equal(currentView.provider_loading, false);
+  assert.deepEqual(currentView.provider_model_ids, []);
+  assert.equal(currentView.provider_catalog_base_url, null);
+  assert.equal(currentView.provider_status.kind, "warning");
+});
+
+test("provider catalog completion is accepted for the exact dispatched draft target", () => {
+  const initial = projection({
+    overlay: "provider",
+    provider_base_url: "http://127.0.0.1:9763/slow",
+    provider_catalog_base_url: null,
+    provider_catalog_metadata_mode: null,
+    provider_model_ids: ["model-a"],
+    provider_models: ["Model A"],
+    provider_selected_index: 0,
+    provider_loading: false,
+  });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, initial, null);
+  const request = beginProviderCatalogRequest(ui, initial);
+  assert.ok(request);
+  assert.equal(request.providerRevision, ui.drafts.providerRevision);
+  const dispatched = captureDraftMutation(ui, "load_provider_models");
+  const loading = projection({
+    ...initial,
+    projection_revision: "2",
+    provider_loading: true,
+  });
+  acknowledgeDraftMutation(ui, loading, "load_provider_models", dispatched);
+  reconcileUiDrafts(ui, initial, loading, dispatched);
+
+  const completion = projection({
+    ...initial,
+    projection_revision: "3",
+    provider_catalog_base_url: "http://127.0.0.1:9763/slow",
+    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_model_ids: ["uat/fast-model", "model-a"],
+    provider_models: ["uat/fast-model", "Model A"],
+    provider_selected_index: 1,
+    provider_loading: false,
+  });
+  reconcileUiDrafts(ui, loading, completion, null);
+  const view = projectViewState(completion, ui);
+
+  assert.deepEqual(view.provider_model_ids, ["uat/fast-model", "model-a"]);
+  assert.equal(view.provider_selected_index, 1);
+  assert.equal(view.provider_catalog_base_url, "http://127.0.0.1:9763/slow");
+  assert.equal(ui.rejectedProviderCatalogRequest, null);
+});
+
+test("provider catalog completion is rejected after a mid-flight mode edit", () => {
+  const initial = projection({
+    overlay: "provider",
+    provider_base_url: "http://127.0.0.1:9763/slow",
+    provider_metadata_mode: "openai_compatible_only",
+    provider_catalog_base_url: null,
+    provider_catalog_metadata_mode: null,
+    provider_model_ids: [],
+    provider_models: [],
+    provider_selected_index: -1,
+    provider_loading: false,
+  });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, initial, null);
+  beginProviderCatalogRequest(ui, initial);
+  const dispatched = captureDraftMutation(ui, "load_provider_models");
+  const loading = projection({
+    ...initial,
+    projection_revision: "2",
+    provider_loading: true,
+    provider_status: { kind: "loading", title: "Loading", hint: "Waiting", details: "" },
+  });
+  acknowledgeDraftMutation(ui, loading, "load_provider_models", dispatched);
+  reconcileUiDrafts(ui, initial, loading, dispatched);
+
+  ui.drafts.provider.metadataMode = "lm_studio_native_required";
+  ui.drafts.providerRevision += 1;
+  const completion = projection({
+    ...initial,
+    projection_revision: "3",
+    provider_catalog_base_url: "http://127.0.0.1:9763/slow",
+    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_model_ids: ["uat/fast-model"],
+    provider_models: ["uat/fast-model"],
+    provider_selected_index: 0,
+    provider_selected_model_summary: ["Model: uat/fast-model"],
+    provider_status: { kind: "success", title: "Loaded", hint: "Apply", details: "1 model" },
+    provider_loading: false,
+  });
+  reconcileUiDrafts(ui, loading, completion, null);
+  const view = projectViewState(completion, ui);
+
+  assert.equal(view.provider_metadata_mode, "lm_studio_native_required");
+  assert.deepEqual(view.provider_model_ids, []);
+  assert.deepEqual(view.provider_models, []);
+  assert.equal(view.provider_selected_index, -1);
+  assert.equal(view.provider_catalog_metadata_mode, null);
+  assert.equal(view.provider_apply_enabled, false);
+  assert.equal(view.provider_status.kind, "warning");
+  assert.equal(ui.drafts.provider.metadataMode, "lm_studio_native_required");
+});
+
+test("provider catalog completion is rejected after its config target changes", () => {
+  const initial = projection({
+    overlay: "provider",
+    provider_base_url: "http://127.0.0.1:9763/slow",
+    provider_catalog_base_url: null,
+    provider_catalog_metadata_mode: null,
+    provider_model_ids: [],
+    provider_models: [],
+    provider_selected_index: -1,
+    provider_loading: false,
+  });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, initial, null);
+  beginProviderCatalogRequest(ui, initial);
+  const dispatched = captureDraftMutation(ui, "load_provider_models");
+  const loading = projection({
+    ...initial,
+    projection_revision: "2",
+    provider_loading: true,
+  });
+  acknowledgeDraftMutation(ui, loading, "load_provider_models", dispatched);
+  reconcileUiDrafts(ui, initial, loading, dispatched);
+
+  const completion = projection({
+    ...initial,
+    projection_revision: "3",
+    config_target: {
+      workspacePath: "C:/workspace",
+      sessionId: SESSION_A,
+      configGeneration: "2",
+    },
+    provider_catalog_base_url: "http://127.0.0.1:9763/slow",
+    provider_catalog_metadata_mode: "openai_compatible_only",
+    provider_model_ids: ["uat/fast-model"],
+    provider_models: ["uat/fast-model"],
+    provider_selected_index: 0,
+    provider_loading: false,
+  });
+  reconcileUiDrafts(ui, loading, completion, null);
+  const view = projectViewState(completion, ui);
+
+  assert.deepEqual(view.provider_model_ids, []);
+  assert.equal(view.provider_selected_index, -1);
+  assert.equal(view.provider_catalog_base_url, null);
+  assert.equal(view.provider_status.kind, "warning");
+});
+
 test("settings exposes separate config and user data folder actions", () => {
   const state = projection({ overlay: "config" });
   const html = renderOverlay(state);
@@ -2008,6 +4101,58 @@ test("initial setup renders typed config import failures inside the active modal
   assert.doesNotMatch(renderOverlay(preferences), /role="alert"/);
 });
 
+test("initial setup makes durable save primary and explains its blocking alternatives", () => {
+  const local = renderLocal();
+  for (const overlay of ["config", "provider"] as const) {
+    const state = projection({ overlay });
+    state.config_draft = { ...state.config_draft, commit_enabled: true };
+    state.startup = {
+      ...state.startup,
+      status: "requires_config",
+      action_overlay: overlay,
+      initial_setup_required: true,
+    };
+
+    const html = renderOverlay(state, local);
+    const saveAction = overlay === "config" ? "save-global-config" : "save-provider-global";
+    const applyAction = overlay === "config" ? "apply-session-config" : "apply-provider-session";
+    assert.match(
+      html,
+      new RegExp(`class="setup-primary-action" data-action="${saveAction}"(?![^>]*\\sdisabled(?:\\s|>))[^>]*>設定を保存して開始</button>`),
+    );
+    assert.match(
+      html,
+      new RegExp(`class="setup-secondary-action" data-action="${applyAction}"[^>]*>この起動中だけ適用</button>`),
+    );
+    assert.match(html, /role="group" aria-label="初期設定の完了方法" aria-describedby="initial-setup-action-help"/);
+    assert.match(html, /TOMLのファイル選択をキャンセルしても設定は変わりません。/);
+    assert.match(html, /保存または一時適用が完了するまで閉じません。/);
+    assert.doesNotMatch(html, /data-action="close-overlay"/);
+  }
+
+  const preferences = renderOverlay(projection({ overlay: "config" }), local);
+  assert.match(preferences, /data-action="apply-session-config"[^>]*>UIセッションに適用</);
+  assert.match(preferences, /data-action="save-global-config"[^>]*>設定ファイルに保存</);
+  assert.doesNotMatch(preferences, /setup-primary-action/);
+
+  const provider = renderOverlay(projection({ overlay: "provider" }), local);
+  assert.match(provider, /data-action="apply-provider-session"[^>]*>UIセッションに適用</);
+  assert.match(provider, /data-action="save-provider-global"[^>]*>設定ファイルに保存</);
+  assert.doesNotMatch(provider, /setup-primary-action/);
+
+  const blocked = projection({ overlay: "config" });
+  blocked.startup = {
+    ...blocked.startup,
+    status: "requires_config",
+    action_overlay: "config",
+    initial_setup_required: true,
+  };
+  assert.match(
+    renderOverlay(blocked, local),
+    /class="setup-primary-action" data-action="save-global-config" disabled aria-disabled="true">設定を保存して開始</,
+  );
+});
+
 test("initial setup replaces an old import failure with current mutation progress", () => {
   const state = projection({
     overlay: "config",
@@ -2020,31 +4165,10 @@ test("initial setup replaces an old import failure with current mutation progres
     action_overlay: "config",
     initial_setup_required: true,
   };
-  setRenderContext({
-    artifactPaneCollapsed: false,
-    attachmentTrayOpen: false,
-    configDirty: false,
-    configMutationPending: true,
-    configOwnerMutationOpen: false,
-    configDraftEditOpen: false,
-    configDraftDiscardOpen: false,
-    configDraftCommitOpen: false,
-  });
-
-  const html = renderOverlay(state);
+  const html = renderOverlay(state, renderLocal({ configMutationPending: true }));
   assert.match(html, /role="status" aria-live="polite">設定を確認しています…/);
   assert.doesNotMatch(html, /stale import failure/);
 
-  setRenderContext({
-    artifactPaneCollapsed: false,
-    attachmentTrayOpen: false,
-    configDirty: false,
-    configMutationPending: false,
-    configOwnerMutationOpen: true,
-    configDraftEditOpen: true,
-    configDraftDiscardOpen: false,
-    configDraftCommitOpen: false,
-  });
 });
 
 test("config import begins its mutation owner before the pending rerender", () => {
@@ -2060,6 +4184,59 @@ test("config import begins its mutation owner before the pending rerender", () =
   });
 
   assert.deepEqual(observations, [{ external: true, generation: request.generation }]);
+});
+
+test("cancelled config file selection settles as a no-op and keeps initial setup open", async () => {
+  const state = projection({ overlay: "config" });
+  state.startup = {
+    ...state.startup,
+    status: "requires_config",
+    action_overlay: "config",
+    initial_setup_required: true,
+  };
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, state, null);
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    writable: true,
+    value: {
+      __TAURI_INTERNALS__: {
+        invoke: (name: string) => {
+          assert.equal(name, "import_global_config_toml");
+          return Promise.resolve([state, false]);
+        },
+      },
+    },
+  });
+  let accepted: DesktopViewState | null = null;
+  let errors = 0;
+  const context = {
+    uiState: ui,
+    getProjection: () => state,
+    getViewState: () => state,
+    prepareConfigSnapshot: () => state.config_fields.map((field) => ({
+      key: field.key,
+      text: field.value,
+    })),
+    acceptProjection: (next: DesktopViewState) => { accepted = next; },
+    rerender: () => {},
+    recoverCommandConflict: () => false,
+    reportError: () => { errors += 1; },
+  } as unknown as ActionContext;
+
+  try {
+    assert.equal(await dispatchGuiAction("import-config-toml", -1, "", state, context), true);
+    assert.equal(accepted?.overlay, "config");
+    assert.equal(accepted?.startup.initial_setup_required, true);
+    assert.equal(ui.externalConfigMutationPending, false);
+    assert.equal(ui.activeConfigMutationGeneration, null);
+    assert.equal(ui.configDirty, false);
+    assert.equal(errors, 0);
+  } finally {
+    if (previousWindow) Object.defineProperty(globalThis, "window", previousWindow);
+    else delete (globalThis as Record<string, unknown>).window;
+  }
 });
 
 test("settings enum controls render only Rust-projected option values", () => {
@@ -2078,6 +4255,296 @@ test("settings enum controls render only Rust-projected option values", () => {
   }));
   assert.match(html, /<option value="future_mode" selected>future_mode<\/option>/);
   assert.doesNotMatch(html, /<option value="proactive"/);
+});
+
+test("regular modals preserve native text editing shortcuts only for editable controls", () => {
+  const sample = {
+    key: "c",
+    ctrlKey: true,
+    metaKey: false,
+    altKey: false,
+    repeat: false,
+  };
+  for (const key of ["a", "c", "v", "x", "y", "z", "Backspace", "Delete", "ArrowLeft", "ArrowRight", "Home", "End"]) {
+    assert.equal(modalShortcutShouldPreventDefault({ ...sample, key }, true), false, key);
+    assert.equal(modalShortcutShouldPreventDefault({ ...sample, key }, false), true, key);
+  }
+  for (const key of ["k", "n", "i", "Enter"]) {
+    assert.equal(modalShortcutShouldPreventDefault({ ...sample, key }, true), true, key);
+  }
+  assert.equal(modalShortcutShouldPreventDefault({ ...sample, key: "v", altKey: true }, true), true);
+  assert.equal(modalShortcutShouldPreventDefault({ ...sample, key: "F8", ctrlKey: false }, true), true);
+  assert.equal(modalShortcutShouldPreventDefault({ ...sample, key: "Tab", ctrlKey: false }, true), false);
+});
+
+test("Help exposes a Rust-owned accessible About dialog", () => {
+  const state = projection({
+    overlay: "about",
+    about: {
+      product_name: "moyAI Next",
+      version: "9.8.7-test",
+      license_identifier: "License-ID",
+      copyright_notice: "Copyright notice from the bundled license",
+    },
+  });
+  const html = renderOverlay(state);
+
+  assert.equal(actionById("show-about")?.menu, "help");
+  assert.match(html, /role="dialog"/);
+  assert.match(html, /aria-labelledby="about-dialog-title"/);
+  assert.match(html, /aria-describedby="about-dialog-description"/);
+  assert.match(html, /moyAI Nextについて/);
+  assert.match(html, /9\.8\.7-test/);
+  assert.match(html, /License-ID/);
+  assert.match(html, /Copyright notice from the bundled license/);
+  assert.match(html, /class="about-logo"[^>]*alt=""[^>]*aria-hidden="true"/);
+  assert.equal((html.match(/data-action="close-overlay"/g) ?? []).length, 3);
+});
+
+test("settings renders one typed LLM response timeout with total-response help", () => {
+  const html = renderOverlay(projection({
+    overlay: "config",
+    config_fields: [{
+      key: "model.request_timeout_ms",
+      value: "3600000",
+      env_override: "MOYAI_REQUEST_TIMEOUT_MS",
+      value_type: "integer",
+      required: false,
+      min_value: 1,
+      max_value: 3600000,
+      options: [],
+    }],
+  }));
+
+  assert.match(html, /LLM応答タイムアウト/);
+  assert.match(html, /最初の送信開始からstream完了までのLLM応答全体に適用する総上限です（ms）。/);
+  assert.match(html, /data-config-key="model\.request_timeout_ms"[^>]+value="3600000"/);
+  assert.doesNotMatch(html, /model\.stream_idle_timeout_ms/);
+  assert.doesNotMatch(html, /settings-raw-value[^>]+model\.request_timeout_ms/);
+});
+
+test("invalid local Settings values close Apply and Save while valid dirty values reopen them", () => {
+  const timeoutField: ConfigFieldProjection = {
+    key: "model.request_timeout_ms",
+    value: "0",
+    env_override: "MOYAI_REQUEST_TIMEOUT_MS",
+    value_type: "integer",
+    required: false,
+    min_value: 1,
+    max_value: 3600000,
+    options: [],
+  };
+  const renderSettings = (field: ConfigFieldProjection, commitOpen: boolean) => {
+    const state = projection({ overlay: "config", config_fields: [field] });
+    state.config_draft = {
+      ...state.config_draft,
+      dirty: true,
+      edit_enabled: commitOpen,
+      discard_enabled: commitOpen,
+      commit_enabled: commitOpen,
+      external_owner_mutation_open: commitOpen,
+    };
+    return renderOverlay(state, renderLocal({
+      configMutationPending: !commitOpen,
+    }));
+  };
+
+  const invalid = renderSettings(timeoutField, true);
+  assert.match(invalid, /id="settings-validation" class="validation error"[^>]*>model\.request_timeout_ms: 1 以上の数値を入力してください。/);
+  assert.match(invalid, /data-config-key="model\.request_timeout_ms"[^>]*aria-invalid="true"/);
+  for (const action of ["apply-session-config", "save-global-config"]) {
+    assert.match(invalid, new RegExp(`data-action="${action}"[^>]*disabled[^>]*aria-disabled="true"`));
+  }
+
+  const valid = renderSettings({ ...timeoutField, value: "3600000" }, true);
+  assert.match(valid, /id="settings-validation" class="validation ok"[^>]*>未保存の設定があります。/);
+  assert.doesNotMatch(valid, /data-config-key="model\.request_timeout_ms"[^>]*aria-invalid="true"/);
+  for (const action of ["apply-session-config", "save-global-config"]) {
+    assert.match(valid, new RegExp(`data-action="${action}"(?![^>]*\\sdisabled(?:\\s|>))[^>]*aria-disabled="false"`));
+  }
+
+  const pending = renderSettings({ ...timeoutField, value: "3600000" }, false);
+  for (const action of ["apply-session-config", "save-global-config"]) {
+    assert.match(pending, new RegExp(`data-action="${action}"[^>]*disabled[^>]*aria-disabled="true"`));
+  }
+});
+
+test("every Preferences field has unique connected help, validation, and explicit label ownership", () => {
+  const configFields: ConfigFieldProjection[] = [
+    {
+      key: "model.base_url",
+      value: "http://127.0.0.1:1234",
+      env_override: "MOYAI_BASE_URL",
+      value_type: "string",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.model",
+      value: "model-a",
+      env_override: "MOYAI_MODEL",
+      value_type: "string",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.provider_metadata_mode",
+      value: "openai_compatible_only",
+      env_override: "MOYAI_PROVIDER_METADATA_MODE",
+      value_type: "enum",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: ["lm_studio_native_required", "openai_compatible_only"],
+    },
+    {
+      key: "model.context_window",
+      value: "131072",
+      env_override: "MOYAI_CONTEXT_WINDOW",
+      value_type: "integer",
+      required: false,
+      min_value: 0,
+      max_value: 4294967295,
+      options: [],
+    },
+    {
+      key: "model.temperature",
+      value: "0.2",
+      env_override: null,
+      value_type: "number",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.supports_tools",
+      value: "true",
+      env_override: "MOYAI_SUPPORTS_TOOLS",
+      value_type: "boolean",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "permissions.access_mode",
+      value: "default",
+      env_override: "MOYAI_ACCESS_MODE",
+      value_type: "enum",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: ["default", "auto_review", "full_access"],
+    },
+    {
+      key: "docling.headers_json",
+      value: "{}",
+      env_override: "MOYAI_DOCLING_HEADERS",
+      value_type: "json",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: 'future.<unsafe>&"',
+      value: "raw value",
+      env_override: "ENV<unsafe>",
+      value_type: "future<type>",
+      required: true,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+  ];
+  const settingsState = projection({ overlay: "config", config_fields: configFields });
+  settingsState.config_draft = {
+    ...settingsState.config_draft,
+    dirty: true,
+    discard_enabled: true,
+    commit_enabled: true,
+  };
+  const local = renderLocal({
+    sideChat: {
+      setupBaseUrl: "http://127.0.0.1:1234",
+      setupModel: "side-model",
+      catalog: {
+        status: "ready",
+        source: "side",
+        ownerSessionId: SESSION_A,
+        baseUrl: "http://127.0.0.1:1234",
+        models: [{ id: "side-model", label: "Side Model" }],
+        error: "",
+      },
+      catalogLoadEnabled: true,
+      mutationPending: false,
+      operationsOpen: true,
+    },
+  });
+  const html = renderOverlay(settingsState, local);
+
+  const idCounts = new Map<string, number>();
+  for (const match of html.matchAll(/\bid="([^"]+)"/g)) {
+    idCounts.set(match[1], (idCounts.get(match[1]) ?? 0) + 1);
+  }
+  assert.deepEqual(
+    [...idCounts.entries()].filter(([, count]) => count !== 1),
+    [],
+    "every Settings id must be unique",
+  );
+
+  const controls = Array.from(
+    html.matchAll(/<(?:input|select|textarea)\b[^>]*class="[^"]*(?:settings-control|side-chat-settings-control)[^"]*"[^>]*>/g),
+    (match) => match[0],
+  );
+  assert.equal(controls.length, 13, "nine fields, duplicate Main model controls, and three Side controls");
+  for (const control of controls) {
+    const id = /\bid="([^"]+)"/.exec(control)?.[1];
+    const describedBy = /\baria-describedby="([^"]+)"/.exec(control)?.[1];
+    assert.ok(id, `Settings control lacks a stable id: ${control}`);
+    assert.ok(describedBy, `Settings control lacks described help: ${control}`);
+    assert.match(html, new RegExp(`<label[^>]+for="${escapeRegExp(id)}"`));
+    for (const reference of describedBy.split(/\s+/)) {
+      assert.equal(idCounts.get(reference), 1, `${id} references one existing unique #${reference}`);
+    }
+  }
+
+  const mainControls = controls.filter((control) => control.includes("data-config-key="));
+  assert.equal(mainControls.length, 10);
+  for (const control of mainControls) assert.match(control, /aria-describedby="[^"]*settings-validation/);
+  const modelHelpReferences = mainControls
+    .filter((control) => control.includes('data-config-key="model.model"'))
+    .map((control) => /aria-describedby="([^"]+)"/.exec(control)?.[1].split(/\s+/)
+      .find((id) => id.startsWith("settings-config-help-")));
+  assert.equal(modelHelpReferences.length, 2);
+  assert.equal(modelHelpReferences[0], modelHelpReferences[1]);
+
+  const contextControl = mainControls.find((control) => control.includes('data-config-key="model.context_window"'))!;
+  const contextHelpId = /aria-describedby="([^"]+)"/.exec(contextControl)![1]
+    .split(/\s+/)
+    .find((id) => id.startsWith("settings-config-help-"))!;
+  const contextHelp = new RegExp(`<small id="${escapeRegExp(contextHelpId)}"[^>]*>([^<]+)</small>`)
+    .exec(html)?.[1] ?? "";
+  assert.match(contextHelp, /設定キー: model\.context_window/);
+  assert.match(contextHelp, /形式: 整数/);
+  assert.match(contextHelp, /範囲: 0以上4294967295以下/);
+  assert.match(contextHelp, /環境変数: MOYAI_CONTEXT_WINDOW/);
+  assert.match(html, /id="settings-validation"[^>]*role="status"[^>]*aria-live="polite"/);
+  for (const section of ["provider", "model", "side-chat", "permissions", "agents", "tools", "files", "advanced"]) {
+    assert.match(
+      html,
+      new RegExp(`<section id="settings-${section}"[^>]*aria-labelledby="settings-${section}-title"[^>]*aria-describedby="[^"]+"`),
+    );
+  }
+  assert.doesNotMatch(html, /<unsafe>|future<type>|ENV<unsafe>/);
+  assert.match(html, /future\.&lt;unsafe&gt;&amp;&quot;/);
+  assert.match(html, /future&lt;type&gt;/);
+  assert.match(html, /ENV&lt;unsafe&gt;/);
 });
 
 test("canonical row_kind selects specialized transcript rendering", () => {
@@ -2106,6 +4573,8 @@ test("canonical row_kind selects specialized transcript rendering", () => {
   }));
 
   assert.match(running, /message work-summary work_summary_running/);
+  assert.match(running, new RegExp(`data-history-identity="${stableHistoryIdentity}"`));
+  assert.match(completed, new RegExp(`data-history-identity="${stableHistoryIdentity}"`));
   assert.match(running, /<details[^>]+open>/);
   assert.doesNotMatch(completed, /<details[^>]+open>/);
   const runningFocusKey = running.match(/<summary data-focus-key="([^"]+)"/)?.[1];
@@ -2392,7 +4861,7 @@ test("durable Sub Agent events stay inside their turn history and the root final
       started_order: 1,
       updated: false,
       active_turn_id: null,
-      can_interrupt: false,
+      interrupt_target: null,
     }],
   }));
 
@@ -2431,7 +4900,7 @@ test("Sub Agent lifecycle events coalesce to one described card per path in spaw
     started_order: order,
     updated: true,
     active_turn_id: null,
-    can_interrupt: false,
+    interrupt_target: null,
   });
   const html = renderThreadContent(projection({
     thread_empty: false,
@@ -2461,19 +4930,25 @@ test("Sub Agent lifecycle events coalesce to one described card per path in spaw
 });
 
 test("live Sub Agent fallback is owned by the current turn and survives child quiescence", () => {
-  const agent = (path: string, status: "running" | "completed", order: number) => ({
-    agent_path: path,
-    session_id: `child-${order}`,
-    task_name: path.split("/").at(-1) ?? "agent",
-    task_preview: "bounded review",
-    status,
-    current_activity: "",
-    result_preview: status === "completed" ? "done" : "",
-    started_order: order,
-    updated: false,
-    active_turn_id: status === "running" ? `turn-${order}` : null,
-    can_interrupt: status === "running",
-  });
+  const agent = (path: string, status: "running" | "completed", order: number) => {
+    const childSessionId = childSessionIdForOrder(order);
+    const expectedTurnId = childTurnIdForOrder(order);
+    return {
+      agent_path: path,
+      session_id: childSessionId,
+      task_name: path.split("/").at(-1) ?? "agent",
+      task_preview: "bounded review",
+      status,
+      current_activity: "",
+      result_preview: status === "completed" ? "done" : "",
+      started_order: order,
+      updated: false,
+      active_turn_id: status === "running" ? expectedTurnId : null,
+      interrupt_target: status === "running"
+        ? agentInterruptTarget({ agentPath: path, childSessionId, expectedTurnId })
+        : null,
+    };
+  };
   const oldAgent = agent("/root/old_agent", "completed", 1);
   const currentAgent = agent("/root/current_agent", "completed", 2);
   const html = renderThreadContent(projection({
@@ -2502,9 +4977,11 @@ test("live Sub Agent fallback is owned by the current turn and survives child qu
 });
 
 test("a current Sub Agent remains visible before the live WorkSummary is projected", () => {
+  const childSessionId = childSessionIdForOrder(3);
+  const expectedTurnId = childTurnIdForOrder(3);
   const currentAgent = {
     agent_path: "/root/early_agent",
-    session_id: "child-early",
+    session_id: childSessionId,
     task_name: "Early review",
     task_preview: "review while the turn starts",
     status: "running" as const,
@@ -2512,8 +4989,12 @@ test("a current Sub Agent remains visible before the live WorkSummary is project
     result_preview: "",
     started_order: 1,
     updated: false,
-    active_turn_id: "turn-early",
-    can_interrupt: true,
+    active_turn_id: expectedTurnId,
+    interrupt_target: agentInterruptTarget({
+      agentPath: "/root/early_agent",
+      childSessionId,
+      expectedTurnId,
+    }),
   };
   const html = renderThreadContent(projection({
     thread_empty: false,
@@ -2541,7 +5022,7 @@ test("interleaved legacy communication markers coalesce to one card per Sub Agen
     started_order: order,
     updated: true,
     active_turn_id: null,
-    can_interrupt: false,
+    interrupt_target: null,
   });
   const html = renderThreadContent(projection({
     thread_empty: false,
@@ -2572,7 +5053,7 @@ test("a started-only detached Sub Agent uses terminal status only at its latest 
     started_order: 1,
     updated: true,
     active_turn_id: null,
-    can_interrupt: false,
+    interrupt_target: null,
   };
   const html = renderThreadContent(projection({
     thread_empty: false,
@@ -2612,7 +5093,7 @@ test("a bounded canonical suffix keeps unmatched durable Sub Agents visible as c
     started_order: 1,
     updated: false,
     active_turn_id: null,
-    can_interrupt: false,
+    interrupt_target: null,
   };
   const html = renderThreadContent(projection({
     thread_empty: false,
@@ -2651,14 +5132,32 @@ test("config owner generation remains exact beyond JavaScript's safe integer ran
   assert.equal(sameConfigMutationTarget(current, newerFence), false);
 });
 
-test("run target mirrors the exact Rust Stop owner projection", () => {
-  const target = projection().run_target;
+test("Stop target is a distinct tagged Rust owner projection", () => {
+  const target = projection({
+    can_cancel_run: true,
+    stop_target: rootStopTarget({
+      rootGeneration: "9007199254740993",
+      admissionRevision: "9007199254740994",
+      permissionConfirmationId: "41",
+    }),
+  }).stop_target!;
 
   assert.deepEqual(
     Object.keys(target).sort(),
-    ["permissionConfirmationId", "runtimeOwnerToken", "sessionId", "workspacePath"],
+    [
+      "admissionRevision",
+      "kind",
+      "latestTurnId",
+      "permissionConfirmationId",
+      "rootGeneration",
+      "sessionId",
+      "workspacePath",
+    ],
   );
-  assert.equal("ownerGeneration" in target, false);
+  assert.equal(target.kind, "root");
+  assert.equal(target.rootGeneration, "9007199254740993");
+  assert.equal(target.admissionRevision, "9007199254740994");
+  assert.equal("runtimeOwnerToken" in target, false);
 });
 
 test("incomplete canonical turn is rendered as nonterminal evidence", () => {

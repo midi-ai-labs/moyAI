@@ -25,6 +25,7 @@ export class InteractionLifecycle<T> {
   private nextGeneration = 1n;
   private deferred: T | null = null;
   private renderCurrent = false;
+  private readonly idleWaiters = new Set<() => void>();
   private readonly preferCandidate: (current: T, candidate: T) => boolean;
 
   constructor(preferCandidate: (current: T, candidate: T) => boolean) {
@@ -33,6 +34,11 @@ export class InteractionLifecycle<T> {
 
   get active(): boolean {
     return this.pointers.size > 0 || this.keys.size > 0 || this.compositionGeneration !== null;
+  }
+
+  whenIdle(): Promise<void> {
+    if (!this.active) return Promise.resolve();
+    return new Promise((resolve) => this.idleWaiters.add(resolve));
   }
 
   beginPointer(pointerId: number): void {
@@ -94,7 +100,9 @@ export class InteractionLifecycle<T> {
     this.pointers.clear();
     this.keys.clear();
     this.compositionGeneration = null;
-    return this.takeRelease();
+    const release = this.takeRelease();
+    this.resolveIdleWaiters();
+    return release;
   }
 
   private issueGeneration(): bigint {
@@ -104,7 +112,10 @@ export class InteractionLifecycle<T> {
   }
 
   private releaseIfIdle(): InteractionRelease<T> | null {
-    return this.active ? null : this.takeRelease();
+    if (this.active) return null;
+    const release = this.takeRelease();
+    this.resolveIdleWaiters();
+    return release;
   }
 
   private takeRelease(): InteractionRelease<T> {
@@ -112,6 +123,12 @@ export class InteractionLifecycle<T> {
     this.deferred = null;
     this.renderCurrent = false;
     return release;
+  }
+
+  private resolveIdleWaiters(): void {
+    const waiters = Array.from(this.idleWaiters);
+    this.idleWaiters.clear();
+    for (const resolve of waiters) resolve();
   }
 }
 

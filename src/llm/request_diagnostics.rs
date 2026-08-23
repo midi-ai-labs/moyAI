@@ -399,8 +399,7 @@ mod tests {
             model.provider_metadata_mode,
             api_mode,
             ProviderDeadlines {
-                response_start_timeout_ms: 30_000,
-                stream_idle_timeout_ms: 30_000,
+                request_timeout_ms: 30_000,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 0,
             },

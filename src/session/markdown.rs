@@ -88,6 +88,7 @@ pub async fn canonical_markdown_export_read(
             latest_turn_id: final_snapshot.read.latest_turn_id,
             active_turn_id: final_snapshot.read.active_turn_id,
             active_turn_sequence_no: final_snapshot.read.active_turn_sequence_no,
+            admission_revision: final_snapshot.read.admission_revision,
             session,
         });
     }
@@ -779,13 +780,8 @@ fn push_request_diagnostics(output: &mut String, value: &RequestDiagnosticsPart)
     );
     push_metadata_line(
         output,
-        "Request Timeout (ms)",
+        "LLM Response Timeout (ms)",
         &value.request_timeout_ms.to_string(),
-    );
-    push_metadata_line(
-        output,
-        "Stream Idle Timeout (ms)",
-        &value.stream_idle_timeout_ms.to_string(),
     );
     if let Some(supports_tools) = value.supports_tools {
         push_metadata_line(output, "Supports Tools", &supports_tools.to_string());
@@ -983,6 +979,8 @@ mod tests {
 
         push_request_diagnostics(&mut markdown, &diagnostics);
 
+        assert!(markdown.contains("LLM Response Timeout (ms): 30000"));
+        assert!(!markdown.contains("Stream Idle Timeout"));
         assert!(markdown.contains("Prepared Model Message Count: 19"));
         assert!(
             markdown.contains("Active Context Token Source: provider_usage_with_local_estimate")
@@ -1291,6 +1289,7 @@ mod tests {
             latest_turn_id,
             active_turn_id: None,
             active_turn_sequence_no: None,
+            admission_revision: u64::from(latest_turn_id.is_some()),
         }
     }
 

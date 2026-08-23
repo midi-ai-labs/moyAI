@@ -124,35 +124,18 @@ impl HarnessEventStore for SqliteHarnessEventStore {
                 payload_sha256,
                 created_at_ms,
             ) = row?;
-            if let Some(recorded_envelope_hash) =
-                payload_sha256.strip_prefix(EVENT_ENVELOPE_HASH_PREFIX)
-            {
-                let expected = event_envelope_sha256(
-                    &id,
-                    &run_id.to_string(),
-                    sequence_no,
-                    &kind_json,
-                    &payload_json,
-                    &contract_refs_json,
-                    &artifact_refs_json,
-                    parent.as_deref(),
-                    created_at_ms,
-                )?;
-                let expected = expected
-                    .strip_prefix(EVENT_ENVELOPE_HASH_PREFIX)
-                    .expect("current event hash prefix");
-                if recorded_envelope_hash != expected {
-                    return Err(StorageError::Message(format!(
-                        "harness event envelope hash mismatch for event `{id}`"
-                    )));
-                }
-            } else if hash_bytes(payload_json.as_bytes()) != payload_sha256 {
-                // V14 artifacts used a payload-only hash. Keep those readable, while every
-                // event written by the current store is protected by the versioned envelope.
-                return Err(StorageError::Message(format!(
-                    "legacy harness event payload hash mismatch for event `{id}`"
-                )));
-            }
+            validate_stored_event_hash(
+                &id,
+                &run_id.to_string(),
+                sequence_no,
+                &kind_json,
+                &payload_json,
+                &contract_refs_json,
+                &artifact_refs_json,
+                parent.as_deref(),
+                &payload_sha256,
+                created_at_ms,
+            )?;
             events.push(HarnessEvent {
                 id: id.parse::<HarnessEventId>().map_err(|error| {
                     StorageError::Message(format!("invalid harness event id `{id}`: {error}"))
@@ -180,7 +163,50 @@ impl HarnessEventStore for SqliteHarnessEventStore {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn event_envelope_sha256(
+pub(crate) fn validate_stored_event_hash(
+    id: &str,
+    run_id: &str,
+    sequence_no: i64,
+    kind_json: &str,
+    payload_json: &str,
+    contract_refs_json: &str,
+    artifact_refs_json: &str,
+    parent_event_id: Option<&str>,
+    recorded_hash: &str,
+    created_at_ms: i64,
+) -> Result<(), StorageError> {
+    if let Some(recorded_envelope_hash) = recorded_hash.strip_prefix(EVENT_ENVELOPE_HASH_PREFIX) {
+        let expected = event_envelope_sha256(
+            id,
+            run_id,
+            sequence_no,
+            kind_json,
+            payload_json,
+            contract_refs_json,
+            artifact_refs_json,
+            parent_event_id,
+            created_at_ms,
+        )?;
+        let expected = expected
+            .strip_prefix(EVENT_ENVELOPE_HASH_PREFIX)
+            .expect("current event hash prefix");
+        if recorded_envelope_hash != expected {
+            return Err(StorageError::Message(format!(
+                "harness event envelope hash mismatch for event `{id}`"
+            )));
+        }
+    } else if hash_bytes(payload_json.as_bytes()) != recorded_hash {
+        // V14 artifacts used a payload-only hash. Keep those readable, while every
+        // event written by the current store is protected by the versioned envelope.
+        return Err(StorageError::Message(format!(
+            "legacy harness event payload hash mismatch for event `{id}`"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn event_envelope_sha256(
     id: &str,
     run_id: &str,
     sequence_no: i64,

@@ -103,7 +103,7 @@ async fn execute_admitted_patch_operations(
     let first_no_content_update_path = admission.first_no_content_update_path.clone();
     let planned_operations = admission.planned_operations;
     let commit = stage_admitted_patch_commit(ctx, planned_operations)?;
-    let change_ids = commit_admitted_patch(ctx, &commit).await?;
+    let change_ids = commit_admitted_patch(ctx, &commit, &effect_admission).await?;
 
     if commit.changes.is_empty() {
         let path = all_update_operations_no_content_path
@@ -276,6 +276,7 @@ fn stage_admitted_patch_commit(
 async fn commit_admitted_patch(
     ctx: &mut ToolContext<'_>,
     commit: &StagedPatchCommit,
+    effect_admission: &ToolEffectAdmission,
 ) -> Result<Vec<crate::session::ChangeId>, ToolError> {
     let session_id = ctx.session.session.id;
     let mut baseline_paths = commit.removed_paths.clone();
@@ -286,6 +287,7 @@ async fn commit_admitted_patch(
         .snapshot_path_stamps(session_id, &baseline_paths);
 
     ctx.run_mutation_fence.assert_owned().await?;
+    effect_admission.admit()?;
     let _effect_commit = ctx.run_mutation_fence.begin_effect_commit()?;
     let applied =
         match apply_patch_mutations(&ctx.services.edit_safety, &commit.mutations, ctx.workspace) {

@@ -1,5 +1,6 @@
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use camino::Utf8PathBuf;
 use moyai::app::{
@@ -26,8 +27,8 @@ use moyai::harness::{
 };
 use moyai::protocol::TurnInterruptionCause;
 use moyai::runtime::SystemClock;
-use moyai::session::EditorContext;
 use moyai::session::SessionStatus;
+use moyai::session::{ActiveTurnExpectation, EditorContext};
 use moyai::storage::{SqliteStore, StoragePaths};
 use moyai::tui;
 use tempfile::NamedTempFile;
@@ -175,7 +176,25 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
         return Ok(());
     }
     let expects_turn = matches!(&command, CliCommand::Run(_));
-    let mut app_command = to_app_command(&command, &app);
+    let mutation_session_id = match &command {
+        CliCommand::Run(args) => app.resolved_run_session_id().or(args.session_id),
+        CliCommand::SessionSteer(args) => Some(args.session_id),
+        CliCommand::SessionInterrupt(args) => Some(args.session_id),
+        CliCommand::SessionGoalSet(args) => Some(args.session_id),
+        CliCommand::SessionGoalClear(args) => Some(args.session_id),
+        _ => None,
+    };
+    let expected_active_turn = match mutation_session_id {
+        Some(session_id) => app
+            .session_service
+            .active_turn_expectation_for_session(session_id)
+            .await
+            .map_err(|error| (4, error.to_string()))?
+            .ok_or_else(|| (4, format!("session {session_id} was not found")))?,
+        None => ActiveTurnExpectation::initial_idle(),
+    };
+    let mut app_command =
+        to_app_command(&command, &app, expected_active_turn).map_err(|error| (4, error))?;
     let root_run_control = match &app_command {
         AppCommand::Run(request) => Some(request.run_control.clone()),
         _ => None,
@@ -189,7 +208,7 @@ async fn run_command(command: CliCommand) -> Result<(), (u8, String)> {
     if let AppCommand::Run(request) = &mut app_command {
         request.agent_confirmation = Some(prompt.clone());
     }
-    install_cli_interrupt_handler(&app_command);
+    install_cli_interrupt_handler(&app_command, Arc::clone(&app.run_service));
     let output_mode = command_output_mode(&command);
     let mut renderer = build_renderer(output_mode, &app);
     let outcome = app
@@ -238,15 +257,30 @@ fn cancelled_run_exit(cause: Option<TurnInterruptionCause>) -> (u8, String) {
     (130, message.to_string())
 }
 
-fn install_cli_interrupt_handler(command: &AppCommand) {
+fn install_cli_interrupt_handler(command: &AppCommand, run_service: Arc<moyai::app::RunService>) {
     let AppCommand::Run(request) = command else {
         return;
     };
     let run_control = request.run_control.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            run_control.interrupt(moyai::protocol::TurnInterruptionCause::UserStop);
-            eprintln!("interrupt requested; cancelling active run...");
+            match run_service.request_root_execution_stop(&run_control).await {
+                Ok(moyai::app::RootExecutionStopRequestOutcome::Accepted) => {
+                    eprintln!("interrupt requested; cancelling active run...");
+                }
+                Ok(moyai::app::RootExecutionStopRequestOutcome::AlreadyPending) => {
+                    eprintln!("interrupt already requested; waiting for the active run...");
+                }
+                Ok(moyai::app::RootExecutionStopRequestOutcome::Rejected) => {
+                    eprintln!("interrupt arrived after the active run was already settled");
+                }
+                Ok(moyai::app::RootExecutionStopRequestOutcome::TargetChanged) => {
+                    eprintln!(
+                        "interrupt target changed before cancellation; replacement left running"
+                    );
+                }
+                Err(error) => eprintln!("failed to apply interrupt: {error}"),
+            }
         }
     });
 }
@@ -292,8 +326,12 @@ fn read_stdin_if_piped() -> Result<Option<String>, String> {
     Ok(Some(buffer))
 }
 
-fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
-    match command {
+fn to_app_command(
+    command: &CliCommand,
+    app: &moyai::app::App,
+    expected_active_turn: ActiveTurnExpectation,
+) -> Result<AppCommand, String> {
+    Ok(match command {
         CliCommand::Run(args) => AppCommand::Run(RunRequest {
             prompt: args.prompt.clone().unwrap_or_default(),
             session_id: app.resolved_run_session_id().or(args.session_id),
@@ -333,6 +371,8 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
             session_access_mode_adoption: None,
             agent_confirmation: None,
             agent_context: None,
+            admission_kind: moyai::app::RunAdmissionKind::NewUserRun,
+            expected_active_turn,
         }),
         CliCommand::SessionList(args) => AppCommand::SessionList(SessionListRequest {
             project_id: app.workspace.project_id,
@@ -374,8 +414,16 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
             })
         }
         CliCommand::SessionInterrupt(args) => {
+            let ActiveTurnExpectation::Turn { turn_id, revision } = expected_active_turn else {
+                return Err(format!(
+                    "session {} has no captured running turn to interrupt",
+                    args.session_id
+                ));
+            };
             AppCommand::SessionInterrupt(SessionInterruptRequest {
                 session_id: args.session_id,
+                expected_turn_id: turn_id,
+                expected_admission_revision: revision,
             })
         }
         CliCommand::SessionGoalGet(args) => AppCommand::SessionGoalGet(SessionGoalGetRequest {
@@ -383,6 +431,7 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
         }),
         CliCommand::SessionGoalSet(args) => AppCommand::SessionGoalSet(SessionGoalSetRequest {
             session_id: args.session_id,
+            expected_active_turn,
             objective: args.objective.clone(),
             status: args.status,
             token_budget: args.token_budget,
@@ -390,6 +439,7 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
         CliCommand::SessionGoalClear(args) => {
             AppCommand::SessionGoalClear(SessionGoalClearRequest {
                 session_id: args.session_id,
+                expected_active_turn,
             })
         }
         CliCommand::SessionShow(args) => AppCommand::SessionShow(SessionShowRequest {
@@ -449,6 +499,7 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
                 .unwrap_or_else(|| app.workspace.cwd.clone()),
             image_paths: args.image_paths.clone(),
             client_user_message_id: None,
+            expected_active_turn,
         }),
         CliCommand::ReplayRun(_)
         | CliCommand::ReplayReport(_)
@@ -460,7 +511,7 @@ fn to_app_command(command: &CliCommand, app: &moyai::app::App) -> AppCommand {
         CliCommand::Tui(_) | CliCommand::Desktop(_) => {
             unreachable!("interactive command is handled before renderer dispatch")
         }
-    }
+    })
 }
 
 fn command_output_mode(command: &CliCommand) -> OutputMode {

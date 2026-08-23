@@ -784,6 +784,7 @@ pub fn cli_session_read_payload_preserves_metadata_pages_fixture_passes() -> boo
         latest_turn_id: Some(active_turn_id),
         active_turn_id: Some(active_turn_id),
         active_turn_sequence_no: Some(42),
+        admission_revision: 1,
     };
     let encoded = serde_json::to_string(&read).unwrap_or_default();
 

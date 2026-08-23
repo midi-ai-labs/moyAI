@@ -5,6 +5,7 @@ const REGULAR_MODAL_OVERLAYS = new Set([
   "prompt_review",
   "command_palette",
   "shortcuts",
+  "about",
 ]);
 
 export function isRegularModalOverlay(overlay: string): boolean {
@@ -13,9 +14,28 @@ export function isRegularModalOverlay(overlay: string): boolean {
 
 export function modalIsOpen(
   state: { confirmation_visible: boolean; overlay: string },
-  localConfirmationOpen: boolean,
+  localModalOpen: boolean,
 ): boolean {
-  return state.confirmation_visible || localConfirmationOpen || isRegularModalOverlay(state.overlay);
+  return state.confirmation_visible || localModalOpen || isRegularModalOverlay(state.overlay);
+}
+
+export interface SideChatDeleteModalTarget {
+  ownerSessionId: string;
+  chatId: string;
+  expectedGeneration: string;
+}
+
+export function localModalIdentity(
+  localConfirmationOpen: boolean,
+  sideChatDeleteTarget: SideChatDeleteModalTarget | null,
+): string | null {
+  if (localConfirmationOpen) return "local-confirm";
+  if (!sideChatDeleteTarget) return null;
+  return `side-chat-delete:${JSON.stringify([
+    sideChatDeleteTarget.ownerSessionId,
+    sideChatDeleteTarget.chatId,
+    sideChatDeleteTarget.expectedGeneration,
+  ])}`;
 }
 
 export function modalIdentity(state: {
@@ -36,6 +56,31 @@ export function nextDialogFocusIndex(currentIndex: number, focusableCount: numbe
   return currentIndex < 0 || currentIndex >= focusableCount - 1 ? 0 : currentIndex + 1;
 }
 
+export function overlayPrimaryFocusRequired(
+  overlay: string,
+  focusOwner: string,
+  lastFocusedOverlay: string,
+  confirmationOverlay: boolean,
+  hasMeaningfulActiveElement: boolean,
+): boolean {
+  if (hasMeaningfulActiveElement) return false;
+  if (!confirmationOverlay && overlay === "config" && focusOwner === lastFocusedOverlay) return false;
+  return true;
+}
+
+export function overlayPrimaryFocusSelectors(overlay: string): readonly string[] {
+  if (overlay === "command_palette") return ["#local-search"];
+  if (overlay === "provider") return ["#provider-url"];
+  if (overlay === "config") return [".settings-control"];
+  if (overlay === "workspace") return ["#workspace-input"];
+  if (overlay === "prompt_review") return ["#review-draft"];
+  if (!isRegularModalOverlay(overlay)) return [];
+  return [
+    ".modal button:not(:disabled)",
+    ".modal[role='dialog']",
+  ];
+}
+
 export function confirmationFocusSelectors(pending: boolean): readonly string[] {
   if (pending) return [".permission-decision-status"];
   return [
@@ -43,4 +88,8 @@ export function confirmationFocusSelectors(pending: boolean): readonly string[] 
     ".modal-actions button:not(:disabled)",
     ".permission-decision-status",
   ];
+}
+
+export function confirmationFocusIsMeaningful(pending: boolean, statusFocused: boolean): boolean {
+  return !statusFocused || pending;
 }

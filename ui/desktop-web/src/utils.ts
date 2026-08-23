@@ -1,5 +1,109 @@
 import { commandErrorInfo } from "./command_error.ts";
-import type { ConfigFieldProjection } from "./types.ts";
+import type { ConfigFieldProjection, ProviderStatusProjection } from "./types.ts";
+
+export interface ProviderBaseUrlValidation {
+  ok: boolean;
+  message: string;
+  canonicalBaseUrl: string;
+}
+
+/** Mirrors Rust's ProviderEndpoint parser without returning rejected endpoint text. */
+export function validateProviderBaseUrl(rawValue: string): ProviderBaseUrlValidation {
+  const value = rawValue.trim();
+  if (value.length === 0) {
+    return { ok: false, message: "URL を入力してください。", canonicalBaseUrl: "" };
+  }
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return {
+        ok: false,
+        message: "URL は http:// または https:// で始めてください。",
+        canonicalBaseUrl: "",
+      };
+    }
+    if (!url.hostname) {
+      return { ok: false, message: "URL にはホスト名が必要です。", canonicalBaseUrl: "" };
+    }
+    const schemeBoundary = value.indexOf("://");
+    const remainder = schemeBoundary >= 0 ? value.slice(schemeBoundary + 3) : "";
+    const authorityEnd = remainder.search(/[/?#]/);
+    const authority = authorityEnd >= 0 ? remainder.slice(0, authorityEnd) : remainder;
+    const suffix = authorityEnd >= 0 ? remainder.slice(authorityEnd) : "";
+    if (url.username || url.password || authority.includes("@")) {
+      return {
+        ok: false,
+        message: "URL に認証情報を含めず、API key またはheader設定を使用してください。",
+        canonicalBaseUrl: "",
+      };
+    }
+    if (url.search || suffix.includes("?")) {
+      return { ok: false, message: "URL にquery stringは指定できません。", canonicalBaseUrl: "" };
+    }
+    if (url.hash || suffix.includes("#")) {
+      return { ok: false, message: "URL にfragmentは指定できません。", canonicalBaseUrl: "" };
+    }
+
+    const path = url.pathname.replace(/\/+$/, "");
+    url.pathname = path || "/";
+    return {
+      ok: true,
+      message: "URL の形式は問題ありません。",
+      canonicalBaseUrl: url.toString().replace(/\/+$/, ""),
+    };
+  } catch {
+    return { ok: false, message: "URL として解釈できません。", canonicalBaseUrl: "" };
+  }
+}
+
+export interface ProviderOverlayFeedback {
+  baseUrl: ProviderBaseUrlValidation;
+  status: ProviderStatusProjection;
+}
+
+/** Keeps the Provider overlay's visible feedback and action gate on the same URL parser result. */
+export function providerOverlayFeedback(
+  rawBaseUrl: string,
+  providerStatus: ProviderStatusProjection,
+): ProviderOverlayFeedback {
+  const baseUrl = validateProviderBaseUrl(rawBaseUrl);
+  return {
+    baseUrl,
+    status: baseUrl.ok
+      ? providerStatus
+      : {
+        kind: "error",
+        title: "ベースURLを確認してください",
+        hint: baseUrl.message,
+        details: "",
+      },
+  };
+}
+
+export interface SideChatProviderSettingsValidation {
+  ok: boolean;
+  baseUrl: ProviderBaseUrlValidation;
+  modelOk: boolean;
+  message: string;
+}
+
+export function validateSideChatProviderSettings(
+  baseUrl: string,
+  model: string,
+): SideChatProviderSettingsValidation {
+  const baseUrlValidation = validateProviderBaseUrl(baseUrl);
+  const modelOk = model.trim().length > 0;
+  return {
+    ok: baseUrlValidation.ok && modelOk,
+    baseUrl: baseUrlValidation,
+    modelOk,
+    message: !baseUrlValidation.ok
+      ? baseUrlValidation.message
+      : modelOk
+        ? "サイドチャットLLMの入力形式は問題ありません。"
+        : "モデルIDを入力してください。",
+  };
+}
 
 export function fileName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
@@ -23,7 +127,10 @@ export function validateConfigInput(
     if (field.required) return { ok: false, message: "値を入力してください。" };
     return { ok: true, message: "空欄は継承または削除として扱います。" };
   }
-  if (field.key.endsWith("base_url")) {
+  if (field.key === "model.base_url") {
+    const validation = validateProviderBaseUrl(value);
+    if (!validation.ok) return { ok: false, message: validation.message };
+  } else if (field.key.endsWith("base_url")) {
     try {
       const url = new URL(value);
       if (url.protocol !== "http:" && url.protocol !== "https:") {
@@ -51,7 +158,8 @@ export function validateConfigInput(
     }
   }
   if (field.value_type === "number") {
-    if (!Number.isFinite(Number(value))) {
+    const decimal = /^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?$/;
+    if (!decimal.test(value) || !Number.isFinite(Number(value))) {
       return { ok: false, message: "有限の数値を入力してください。" };
     }
   }
@@ -69,6 +177,52 @@ export function validateConfigInput(
     }
   }
   return { ok: true, message: "入力形式は問題ありません。" };
+}
+
+export interface ConfigFieldValue {
+  key: string;
+  text: string;
+}
+
+export interface ConfigFieldValidationResult {
+  ok: boolean;
+  invalidKey: string | null;
+  message: string;
+}
+
+/** Use the same field parser metadata for live DOM validation and render-time commit gating. */
+export function validateConfigFieldValues(
+  fields: ConfigFieldProjection[],
+  values: ConfigFieldValue[] = fields.map((field) => ({ key: field.key, text: field.value })),
+): ConfigFieldValidationResult {
+  const fieldsByKey = new Map(fields.map((field) => [field.key, field]));
+  for (const value of values) {
+    const field = fieldsByKey.get(value.key);
+    if (!field) {
+      return {
+        ok: false,
+        invalidKey: value.key,
+        message: "設定項目が見つかりません。",
+      };
+    }
+    const validation = validateConfigInput(field, value.text);
+    if (!validation.ok) {
+      return {
+        ok: false,
+        invalidKey: value.key,
+        message: validation.message,
+      };
+    }
+  }
+  return { ok: true, invalidKey: null, message: "入力形式は問題ありません。" };
+}
+
+export function configCommitControlState(
+  capabilityOpen: boolean,
+  validationOk: boolean,
+): { disabled: boolean; ariaDisabled: "true" | "false" } {
+  const disabled = !capabilityOpen || !validationOk;
+  return { disabled, ariaDisabled: disabled ? "true" : "false" };
 }
 
 export function shortenPath(path: string): string {

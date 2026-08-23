@@ -4,15 +4,33 @@ import {
   reconcileConfigDraftTarget,
   type ConfigValueInput,
 } from "./config_mutation.ts";
+import {
+  beginAsyncTransaction,
+  clearAsyncTransaction,
+} from "./async_transaction.ts";
 import type {
   ConfigMutationTarget,
   ConfigDraftCapabilityProjection,
   DesktopWebState,
   DesktopViewState,
   DraftActionTarget,
+  PromptReviewMutationTarget,
+  RunExpectedState,
   SessionSearchTarget,
 } from "./types.ts";
-import type { ProviderDraft, UiLocalState } from "./ui_state.ts";
+import type {
+  ProviderCatalogRequest,
+  ProviderCatalogTarget,
+  ProviderDraft,
+  UiLocalState,
+} from "./ui_state.ts";
+import { mutationStartsNewSession } from "./new_session_mutation.ts";
+import { taskActivityStateForView } from "./task_activity_indicator.ts";
+import { validateConfigFieldValues, validateProviderBaseUrl } from "./utils.ts";
+import {
+  snapshotDraftActionTarget,
+  snapshotPromptReviewMutationTarget,
+} from "./composer_target_contract.ts";
 
 const COMPOSER_INVALIDATING_MUTATIONS = new Set([
   "submit_prompt",
@@ -56,15 +74,24 @@ export function mutationChangesConfigOwner(mutationName: string): boolean {
 }
 
 export function runOwnerMutationOpen(
-  uiState: Pick<UiLocalState, "runStartMutationPending" | "externalConfigMutationPending">,
+  uiState: Pick<
+    UiLocalState,
+    "runStartMutationPending" | "externalConfigMutationPending" | "activeNewSessionMutation"
+  >,
 ): boolean {
-  return !uiState.runStartMutationPending && !uiState.externalConfigMutationPending;
+  return !uiState.runStartMutationPending
+    && !uiState.externalConfigMutationPending
+    && uiState.activeNewSessionMutation === null;
 }
 
 export function mutationAdmissionOpen(
   uiState: UiLocalState,
   mutationName: string,
 ): boolean {
+  if (uiState.activeNewSessionMutation !== null) return false;
+  if (mutationStartsNewSession(mutationName)) {
+    return runOwnerMutationOpen(uiState) && configOwnerMutationOpen(uiState);
+  }
   if (mutationConsumesRunOwner(mutationName)) return runOwnerMutationOpen(uiState);
   if (mutationChangesConfigOwner(mutationName)) return configOwnerMutationOpen(uiState);
   return true;
@@ -84,7 +111,8 @@ export interface UiCapabilities {
 export function configOwnerMutationOpen(uiState: UiLocalState): boolean {
   return !configMutationPending(uiState)
     && !uiState.externalConfigMutationPending
-    && !uiState.runStartMutationPending;
+    && !uiState.runStartMutationPending
+    && uiState.activeNewSessionMutation === null;
 }
 
 export function configDraftEditOpen(uiState: UiLocalState): boolean {
@@ -134,9 +162,10 @@ export function providerCapabilities(
   >,
   options: {
     currentProviderLimitDraftDirty?: boolean;
+    providerCatalogReloadRequired?: boolean;
   } = {},
 ): Pick<UiCapabilities, "canLoadProviderModels" | "canApplyProvider"> {
-  const urlValid = /^https?:\/\/\S+$/i.test(state.provider_base_url.trim());
+  const urlValid = validateProviderBaseUrl(state.provider_base_url).ok;
   const limitsValid = positiveInteger(state.provider_context_window)
     && positiveInteger(state.provider_max_output_tokens);
   const catalogOwnerMatches = state.provider_catalog_base_url !== null
@@ -144,7 +173,8 @@ export function providerCapabilities(
     && state.provider_metadata_mode === state.provider_catalog_metadata_mode;
   return {
     canLoadProviderModels: !state.provider_loading && urlValid && limitsValid,
-    canApplyProvider: state.config_draft.external_owner_mutation_open
+    canApplyProvider: options.providerCatalogReloadRequired !== true
+      && state.config_draft.external_owner_mutation_open
       && !state.provider_loading
       && urlValid
       && limitsValid
@@ -156,21 +186,24 @@ export function providerCapabilities(
   };
 }
 
-function normalizeProviderBaseUrl(input: string): string {
-  const trimmed = input.trim().replace(/\/+$/, "");
-  return trimmed.endsWith("/v1") && trimmed.length > 3
-    ? trimmed.slice(0, -3)
-    : trimmed;
+export function normalizeProviderBaseUrl(input: string): string {
+  const canonical = validateProviderBaseUrl(input).canonicalBaseUrl;
+  return canonical.endsWith("/v1") && canonical.length > 3
+    ? canonical.slice(0, -3)
+    : canonical;
 }
 
 export interface DraftMutationSnapshot {
   runStart?: boolean;
+  runSettlement?: "pending" | "accepted" | "rejected";
   composerRevision?: number;
   composerOwner?: string;
   imageRevision?: number;
   workspaceRevision?: number;
   reviewRevision?: number;
+  reviewTarget?: PromptReviewMutationTarget | null;
   providerRevision?: number;
+  providerCatalogRequestToken?: number;
 }
 
 export function captureDraftMutation(
@@ -191,15 +224,21 @@ export function captureDraftMutation(
   if (mutationName === "send_prompt_review" || mutationName === "cancel_prompt_review") {
     snapshot.composerOwner = drafts.composerOwner;
     snapshot.reviewRevision = drafts.reviewRevision;
+    snapshot.reviewTarget = snapshotPromptReviewTarget(drafts.reviewTarget);
   }
   if (PROVIDER_COMMIT_MUTATIONS.has(mutationName)) snapshot.providerRevision = drafts.providerRevision;
+  if (mutationName === "load_provider_models") {
+    snapshot.providerCatalogRequestToken = uiState.providerCatalogTransaction.active?.token;
+  }
   if (RUN_START_MUTATIONS.has(mutationName)) {
     snapshot.runStart = true;
+    snapshot.runSettlement = "pending";
     drafts.pendingRunSubmission = {
       owner: drafts.composerOwner,
       workspacePath: drafts.composerOwner.slice(0, drafts.composerOwner.indexOf("\u0000")),
       composerRevision: drafts.composerRevision,
       imageRevision: drafts.imageRevision,
+      reviewTarget: snapshot.reviewTarget ?? null,
       reviewRevision: snapshot.reviewRevision ?? null,
       baseCommitGeneration: drafts.composerCommitGeneration,
       commandAccepted: false,
@@ -213,8 +252,24 @@ export function rejectDraftMutation(
   mutationName: string,
   snapshot: DraftMutationSnapshot | null,
 ): void {
+  const providerCatalogRequest = uiState.providerCatalogTransaction.active;
+  if (
+    mutationName === "load_provider_models"
+    && providerCatalogRequest !== null
+    && snapshot?.providerCatalogRequestToken !== undefined
+    && providerCatalogRequest.token === snapshot.providerCatalogRequestToken
+  ) {
+    clearAsyncTransaction(uiState.providerCatalogTransaction, providerCatalogRequest);
+  }
   if (!RUN_START_MUTATIONS.has(mutationName) || !snapshot?.composerOwner) return;
-  if (uiState.drafts.pendingRunSubmission?.owner === snapshot.composerOwner) {
+  snapshot.runSettlement = "rejected";
+  if (
+    uiState.drafts.pendingRunSubmission?.owner === snapshot.composerOwner
+    && samePromptReviewTarget(
+      uiState.drafts.pendingRunSubmission.reviewTarget,
+      snapshot.reviewTarget ?? null,
+    )
+  ) {
     uiState.drafts.pendingRunSubmission = null;
   }
 }
@@ -227,6 +282,28 @@ export function acknowledgeDraftMutation(
 ): void {
   if (!snapshot) return;
   const drafts = uiState.drafts;
+  const providerCatalogRequest = uiState.providerCatalogTransaction.active;
+  if (
+    mutationName === "load_provider_models"
+    && providerCatalogRequest !== null
+    && snapshot.providerCatalogRequestToken !== undefined
+    && providerCatalogRequest.token === snapshot.providerCatalogRequestToken
+  ) {
+    if (state.provider_loading) {
+      providerCatalogRequest.admitted = true;
+      uiState.rejectedProviderCatalogRequest = null;
+    } else {
+      const completionAccepted = providerCatalogRequestTargetsCurrentDraft(
+        providerCatalogRequest,
+        state,
+        uiState,
+      ) && providerCatalogResultTargetsRequest(providerCatalogRequest, state);
+      uiState.rejectedProviderCatalogRequest = completionAccepted
+        ? null
+        : providerCatalogRequest;
+      clearAsyncTransaction(uiState.providerCatalogTransaction, providerCatalogRequest);
+    }
+  }
   const startsRun = RUN_START_MUTATIONS.has(mutationName);
   if (startsRun) {
     const pending = drafts.pendingRunSubmission;
@@ -235,8 +312,10 @@ export function acknowledgeDraftMutation(
       && pending.owner === snapshot.composerOwner
       && pending.composerRevision === snapshot.composerRevision
       && pending.imageRevision === snapshot.imageRevision
+      && samePromptReviewTarget(pending.reviewTarget, snapshot.reviewTarget ?? null)
     ) {
       pending.commandAccepted = true;
+      snapshot.runSettlement = "accepted";
     }
   } else {
     if (snapshot.composerRevision === drafts.composerRevision) drafts.prompt = state.draft_prompt;
@@ -248,6 +327,9 @@ export function acknowledgeDraftMutation(
     && snapshot.reviewRevision === drafts.reviewRevision
     && snapshot.composerOwner === drafts.composerOwner
     && snapshot.composerOwner === composerOwner(state)
+    && snapshot.reviewTarget !== undefined
+    && samePromptReviewTarget(snapshot.reviewTarget, drafts.reviewTarget)
+    && samePromptReviewTarget(snapshot.reviewTarget, state.review_target)
   ) {
     synchronizeReviewDraft(drafts, state.review_draft_text);
   }
@@ -256,6 +338,18 @@ export function acknowledgeDraftMutation(
 
 export function composerOwner(state: DesktopWebState): string {
   return `${state.draft_target.workspacePath}\u0000${state.draft_target.ownerGeneration}\u0000${state.draft_target.sessionId ?? "new"}`;
+}
+
+/**
+ * Stable in-memory owner for an unsent composer draft.
+ *
+ * `ownerGeneration` intentionally remains part of `composerOwner` for command conflict
+ * detection, but it cannot identify a local draft that the user expects to find again after
+ * switching away from and back to the same durable session.
+ */
+export function composerSessionOwner(state: DesktopWebState): string {
+  const selectedProjectId = state.project_rows[state.selected_project_index]?.project_id ?? "quick-chat";
+  return `${state.draft_target.workspacePath}\u0000${selectedProjectId}\u0000${state.draft_target.sessionId ?? "new"}`;
 }
 
 export function sessionSearchOwner(state: DesktopWebState): string {
@@ -279,8 +373,24 @@ export function providerOwner(state: DesktopWebState): string {
   return `${target.workspacePath}\u0000${target.sessionId ?? "global"}\u0000${target.configGeneration}`;
 }
 
+export function beginProviderCatalogRequest(
+  uiState: UiLocalState,
+  state: DesktopWebState,
+): ProviderCatalogRequest | null {
+  return beginAsyncTransaction(uiState.providerCatalogTransaction, {
+    providerOwner: providerOwner(state),
+    providerRevision: uiState.drafts.providerRevision,
+    baseUrl: normalizeProviderBaseUrl(uiState.drafts.provider.baseUrl),
+    metadataMode: uiState.drafts.provider.metadataMode,
+  } satisfies ProviderCatalogTarget, "single-flight", (token, target) => ({
+    token,
+    ...target,
+    admitted: false,
+  }));
+}
+
 export function draftMutationTarget(state: DesktopWebState): DraftActionTarget {
-  return state.draft_target;
+  return snapshotDraftActionTarget(state.draft_target);
 }
 
 export function providerDraftPayload(
@@ -311,10 +421,14 @@ export function reconcileUiDrafts(
   reconcileConfigDraftTarget(uiState, state.config_target);
   const drafts = uiState.drafts;
   const nextComposerOwner = composerOwner(state);
+  const nextComposerSessionOwner = composerSessionOwner(state);
   const nextSearchOwner = sessionSearchOwner(state);
   const nextProviderOwner = providerOwner(state);
+  const nextReviewTarget = snapshotPromptReviewTarget(state.review_target);
   const firstProjection = !drafts.initialized;
   const composerOwnerChanged = !firstProjection && drafts.composerOwner !== nextComposerOwner;
+  const composerSessionOwnerChanged = !firstProjection
+    && drafts.composerSessionOwner !== nextComposerSessionOwner;
   const commitGenerationChanged = !firstProjection
     && drafts.composerCommitGeneration !== state.composer_commit_generation;
   const pendingRun = drafts.pendingRunSubmission;
@@ -323,39 +437,78 @@ export function reconcileUiDrafts(
     && pendingRun.owner.endsWith("\u0000new")
     && pendingRun.workspacePath === state.draft_target.workspacePath
     && state.draft_target.sessionId !== null;
-  const reviewOwnerChanged = composerOwnerChanged && !bindsCreatedSession;
+  const reviewTargetChanged = !firstProjection
+    && !samePromptReviewTarget(drafts.reviewTarget, nextReviewTarget);
   const providerOwnerChanged = drafts.providerOwner !== nextProviderOwner;
   const providerCommitHasNewerDraft = mutationSnapshot?.providerRevision !== undefined
     && mutationSnapshot.providerRevision !== drafts.providerRevision;
   const providerScopeUnchanged = previous !== null
     && previous.config_target.workspacePath === state.config_target.workspacePath
     && previous.config_target.sessionId === state.config_target.sessionId;
+  const rejectedRunMutationOwnsCurrentDraft = mutationSnapshot?.runSettlement === "rejected"
+    && mutationSnapshot.composerOwner === drafts.composerOwner
+    && !composerSessionOwnerChanged;
 
   if (firstProjection) {
     drafts.composerOwner = nextComposerOwner;
+    drafts.composerSessionOwner = nextComposerSessionOwner;
     drafts.composerCommitGeneration = state.composer_commit_generation;
     drafts.prompt = state.draft_prompt;
     drafts.imageInput = state.image_input;
   } else {
+    if (composerOwnerChanged) {
+      rememberCurrentComposerDraft(uiState);
+    }
     if (commitGenerationChanged) {
       drafts.composerCommitGeneration = state.composer_commit_generation;
       if (pendingRun) {
-        if (pendingRun.composerRevision === drafts.composerRevision) drafts.prompt = state.draft_prompt;
-        if (pendingRun.imageRevision === drafts.imageRevision) drafts.imageInput = state.image_input;
-        if (pendingRun.reviewRevision === drafts.reviewRevision) {
-          synchronizeReviewDraft(drafts, state.review_draft_text);
+        if (!rejectedRunMutationOwnsCurrentDraft) {
+          if (pendingRun.composerRevision === drafts.composerRevision) drafts.prompt = state.draft_prompt;
+          if (pendingRun.imageRevision === drafts.imageRevision) drafts.imageInput = state.image_input;
+          if (
+            pendingRun.reviewRevision === drafts.reviewRevision
+            && samePromptReviewTarget(pendingRun.reviewTarget, drafts.reviewTarget)
+            && samePromptReviewTarget(pendingRun.reviewTarget, nextReviewTarget)
+          ) {
+            synchronizeReviewDraft(drafts, state.review_draft_text);
+          }
         }
         drafts.pendingRunSubmission = null;
-      } else {
+      } else if (!rejectedRunMutationOwnsCurrentDraft) {
         drafts.prompt = state.draft_prompt;
         drafts.imageInput = state.image_input;
       }
     }
     if (drafts.composerOwner !== nextComposerOwner) {
+      const previousComposerSessionOwner = drafts.composerSessionOwner;
       drafts.composerOwner = nextComposerOwner;
-      if (!bindsCreatedSession) {
+      drafts.composerSessionOwner = nextComposerSessionOwner;
+      if (bindsCreatedSession) {
+        const adopted = uiState.mainComposerDrafts.get(previousComposerSessionOwner);
+        if (adopted) {
+          uiState.mainComposerDrafts.set(nextComposerSessionOwner, adopted);
+          uiState.mainComposerDrafts.delete(previousComposerSessionOwner);
+        }
+      } else if (
+        state.draft_target.sessionId === null
+        && !rejectedRunMutationOwnsCurrentDraft
+      ) {
+        // There is no row to navigate back to an unowned draft. Re-entering a project/quick-chat
+        // new-session surface therefore means an explicit reset even when an older local `new`
+        // key exists for that workspace.
+        uiState.mainComposerDrafts.delete(nextComposerSessionOwner);
         drafts.prompt = state.draft_prompt;
         drafts.imageInput = state.image_input;
+        drafts.composerRevision += 1;
+        drafts.imageRevision += 1;
+      } else if (composerSessionOwnerChanged) {
+        const remembered = uiState.mainComposerDrafts.get(nextComposerSessionOwner);
+        drafts.prompt = remembered?.prompt ?? state.draft_prompt;
+        drafts.imageInput = remembered?.imageInput ?? state.image_input;
+        // A response captured for the previous screen must not match the restored screen's
+        // local revision, even when both happen to contain the same text.
+        drafts.composerRevision += 1;
+        drafts.imageRevision += 1;
       }
     }
     const pending = drafts.pendingRunSubmission;
@@ -379,22 +532,28 @@ export function reconcileUiDrafts(
     hydrateProviderDraft(drafts.provider, state);
   } else if (mutationSnapshot?.providerRevision === drafts.providerRevision) {
     hydrateProviderDraft(drafts.provider, state);
-  } else if (
+  }
+  rememberCurrentComposerDraft(uiState);
+  reconcileProviderCatalogRequest(uiState, state);
+  if (
     drafts.provider.selectedModelId.length > 0
+    && providerCatalogOwnsCurrentDraft(state, uiState)
     && !state.provider_model_ids.includes(drafts.provider.selectedModelId)
   ) {
     drafts.provider.selectedModelId = selectedProviderModelId(state);
   }
   if (firstProjection || workspaceOverlayOpened(previous, state)) drafts.workspaceInput = state.workspace_input;
-  const reviewProjectionAdvanced = state.overlay === "prompt_review"
-    && previous?.overlay === "prompt_review"
+  const reviewProjectionAdvanced = previous !== null
+    && samePromptReviewTarget(previous.review_target, nextReviewTarget)
     && previous.review_draft_text !== state.review_draft_text;
-  if (
-    firstProjection
-    || reviewOwnerChanged
-    || promptReviewOpened(previous, state)
-    || (reviewProjectionAdvanced && drafts.reviewRevision === drafts.reviewSyncedRevision)
-  ) {
+  if (firstProjection) {
+    drafts.reviewTarget = nextReviewTarget;
+    synchronizeReviewDraft(drafts, state.review_draft_text);
+  } else if (reviewTargetChanged) {
+    drafts.reviewTarget = nextReviewTarget;
+    drafts.reviewRevision += 1;
+    synchronizeReviewDraft(drafts, state.review_draft_text);
+  } else if (reviewProjectionAdvanced && drafts.reviewRevision === drafts.reviewSyncedRevision) {
     synchronizeReviewDraft(drafts, state.review_draft_text);
   }
   if (firstProjection || commandPaletteOpened(previous, state)) drafts.localSearch = state.local_search_text;
@@ -407,10 +566,22 @@ export function reconcileUiDrafts(
     && mutationSnapshot?.reviewRevision === drafts.reviewRevision
     && mutationSnapshot.composerOwner === drafts.composerOwner
     && mutationSnapshot.composerOwner === nextComposerOwner
+    && mutationSnapshot.reviewTarget !== undefined
+    && samePromptReviewTarget(mutationSnapshot.reviewTarget, drafts.reviewTarget)
+    && samePromptReviewTarget(mutationSnapshot.reviewTarget, nextReviewTarget)
   ) {
     synchronizeReviewDraft(drafts, state.review_draft_text);
   }
   drafts.initialized = true;
+}
+
+function rememberCurrentComposerDraft(uiState: UiLocalState): void {
+  const owner = uiState.drafts.composerSessionOwner;
+  if (!owner) return;
+  uiState.mainComposerDrafts.set(owner, {
+    prompt: uiState.drafts.prompt,
+    imageInput: uiState.drafts.imageInput,
+  });
 }
 
 export function deriveUiCapabilities(state: DesktopWebState, uiState: UiLocalState): UiCapabilities {
@@ -429,7 +600,7 @@ export function deriveUiCapabilities(state: DesktopWebState, uiState: UiLocalSta
     provider,
   );
   const providerActions = providerCapabilities({
-    provider_loading: state.provider_loading,
+    provider_loading: state.provider_loading || uiState.providerCatalogTransaction.active !== null,
     provider_base_url: provider.baseUrl,
     provider_metadata_mode: provider.metadataMode,
     provider_catalog_base_url: state.provider_catalog_base_url,
@@ -441,6 +612,7 @@ export function deriveUiCapabilities(state: DesktopWebState, uiState: UiLocalSta
     config_draft: configDraft,
   }, {
     currentProviderLimitDraftDirty,
+    providerCatalogReloadRequired: uiState.rejectedProviderCatalogRequest !== null,
   });
   return {
     ...composer,
@@ -460,13 +632,24 @@ export function projectViewState(state: DesktopWebState, uiState: UiLocalState):
   const capabilities = deriveUiCapabilities(state, uiState);
   const configDraft = activeConfigDraftProjection(state, uiState);
   const runStartPending = uiState.runStartMutationPending;
-  const providerIndex = state.provider_model_ids.indexOf(uiState.drafts.provider.selectedModelId);
-  const configFields = state.config_fields.map((field) => ({
-    ...field,
-    value: configDraftAppliesTo(uiState, state.config_target)
-      ? (uiState.configDraftValues.get(field.key) ?? field.value)
-      : field.value,
-  }));
+  const newSessionPending = uiState.activeNewSessionMutation !== null;
+  const providerCatalogAccepted = providerCatalogOwnsCurrentDraft(state, uiState);
+  const providerLoading = state.provider_loading || uiState.providerCatalogTransaction.active !== null;
+  const providerModelIds = providerCatalogAccepted ? state.provider_model_ids : [];
+  const providerModels = providerCatalogAccepted ? state.provider_models : [];
+  const providerIndex = providerModelIds.indexOf(uiState.drafts.provider.selectedModelId);
+  const providerTargetChangedDuringLoad = providerCatalogTargetChangedDuringLoad(state, uiState);
+  const providerCompletionRejected = uiState.rejectedProviderCatalogRequest !== null;
+  const providerCatalogMismatch = state.provider_catalog_base_url !== null && !providerCatalogAccepted;
+  const providerStatus = providerTargetChangedDuringLoad || providerCompletionRejected || providerCatalogMismatch
+    ? {
+      kind: "warning" as const,
+      title: "モデル一覧の対象が変更されました",
+      hint: "現在のBase URLとProvider modeで、もう一度モデル一覧を読み込んでください。",
+      details: "編集中の接続先と一致しないモデル一覧は表示・適用されません。",
+    }
+    : state.provider_status;
+  const configFields = activeConfigFields(state, uiState);
   return {
     ...state,
     draft_prompt: uiState.drafts.prompt,
@@ -479,12 +662,23 @@ export function projectViewState(state: DesktopWebState, uiState: UiLocalState):
     provider_metadata_mode: uiState.drafts.provider.metadataMode,
     provider_context_window: uiState.drafts.provider.contextWindow,
     provider_max_output_tokens: uiState.drafts.provider.maxOutputTokens,
-    provider_selected_index: providerIndex >= 0 ? providerIndex : state.provider_selected_index,
+    provider_loading: providerLoading,
+    provider_catalog_base_url: providerCatalogAccepted ? state.provider_catalog_base_url : null,
+    provider_catalog_metadata_mode: providerCatalogAccepted ? state.provider_catalog_metadata_mode : null,
+    provider_models: providerModels,
+    provider_model_ids: providerModelIds,
+    provider_selected_index: providerCatalogAccepted && providerIndex >= 0 ? providerIndex : -1,
+    provider_status: providerStatus,
+    provider_selected_model_summary: providerCatalogAccepted
+      ? state.provider_selected_model_summary
+      : [],
     config_draft: configDraft,
     access_target: state.access_target,
-    navigation_admission_open: state.navigation_admission_open && !runStartPending,
-    background_mutation_pending: state.background_mutation_pending || runStartPending,
+    navigation_loading: state.navigation_loading || newSessionPending,
+    navigation_admission_open: state.navigation_admission_open && !runStartPending && !newSessionPending,
+    background_mutation_pending: state.background_mutation_pending || runStartPending || newSessionPending,
     busy: state.busy || runStartPending,
+    task_activity_state: taskActivityStateForView(state.task_activity_state, runStartPending),
     async_polling_required: state.async_polling_required || runStartPending,
     can_submit: capabilities.canSubmit,
     enhance_enabled: capabilities.canEnhance,
@@ -496,6 +690,62 @@ export function projectViewState(state: DesktopWebState, uiState: UiLocalState):
   };
 }
 
+function providerCatalogRequestTargetsCurrentDraft(
+  request: ProviderCatalogRequest,
+  state: DesktopWebState,
+  uiState: UiLocalState,
+): boolean {
+  return request.providerOwner === providerOwner(state)
+    && request.providerRevision === uiState.drafts.providerRevision
+    && request.baseUrl === normalizeProviderBaseUrl(uiState.drafts.provider.baseUrl)
+    && request.metadataMode === uiState.drafts.provider.metadataMode;
+}
+
+function providerCatalogResultTargetsRequest(
+  request: ProviderCatalogRequest,
+  state: DesktopWebState,
+): boolean {
+  return state.provider_catalog_base_url === null
+    || (
+      normalizeProviderBaseUrl(state.provider_catalog_base_url) === request.baseUrl
+      && state.provider_catalog_metadata_mode === request.metadataMode
+    );
+}
+
+function reconcileProviderCatalogRequest(uiState: UiLocalState, state: DesktopWebState): void {
+  const request = uiState.providerCatalogTransaction.active;
+  if (!request?.admitted || state.provider_loading) return;
+  const completionAccepted = providerCatalogRequestTargetsCurrentDraft(request, state, uiState)
+    && providerCatalogResultTargetsRequest(request, state);
+  uiState.rejectedProviderCatalogRequest = completionAccepted ? null : request;
+  clearAsyncTransaction(uiState.providerCatalogTransaction, request);
+}
+
+function providerCatalogTargetChangedDuringLoad(
+  state: DesktopWebState,
+  uiState: UiLocalState,
+): boolean {
+  const request = uiState.providerCatalogTransaction.active;
+  return Boolean(
+    request?.admitted
+    && state.provider_loading
+    && !providerCatalogRequestTargetsCurrentDraft(request, state, uiState),
+  );
+}
+
+function providerCatalogOwnsCurrentDraft(
+  state: DesktopWebState,
+  uiState: UiLocalState,
+): boolean {
+  const draft = uiState.drafts.provider;
+  return uiState.drafts.providerOwner === providerOwner(state)
+    && uiState.rejectedProviderCatalogRequest === null
+    && state.provider_catalog_base_url !== null
+    && normalizeProviderBaseUrl(state.provider_catalog_base_url)
+      === normalizeProviderBaseUrl(draft.baseUrl)
+    && state.provider_catalog_metadata_mode === draft.metadataMode;
+}
+
 export function activeConfigDraftProjection(
   state: DesktopWebState,
   uiState: UiLocalState,
@@ -505,15 +755,29 @@ export function activeConfigDraftProjection(
     : state.config_draft_capabilities.clean;
   const editOpen = configDraftEditOpen(uiState);
   const ownerMutationOpen = configOwnerMutationOpen(uiState);
+  const completeDraftValid = validateConfigFieldValues(activeConfigFields(state, uiState)).ok;
   return {
     ...projected,
     edit_enabled: projected.edit_enabled && editOpen,
     discard_enabled: projected.discard_enabled && configDraftDiscardOpen(uiState),
     commit_enabled: projected.commit_enabled
-      && configDraftCommitOpen(uiState, state.startup.initial_setup_required),
-    external_owner_mutation_open: projected.external_owner_mutation_open && ownerMutationOpen,
-    access_mode_mutation_enabled: projected.access_mode_mutation_enabled && ownerMutationOpen,
+      && configDraftCommitOpen(uiState, state.startup.initial_setup_required)
+      && completeDraftValid,
+    external_owner_mutation_open: projected.external_owner_mutation_open
+      && ownerMutationOpen
+      && completeDraftValid,
+    access_mode_mutation_enabled: projected.access_mode_mutation_enabled
+      && ownerMutationOpen
+      && completeDraftValid,
   };
+}
+
+function activeConfigFields(state: DesktopWebState, uiState: UiLocalState) {
+  const draftApplies = configDraftAppliesTo(uiState, state.config_target);
+  return state.config_fields.map((field) => ({
+    ...field,
+    value: draftApplies ? (uiState.configDraftValues.get(field.key) ?? field.value) : field.value,
+  }));
 }
 
 export function operationInvalidatesComposer(name: string | null): boolean {
@@ -553,6 +817,34 @@ function synchronizeReviewDraft(
   drafts.reviewSyncedRevision = drafts.reviewRevision;
 }
 
+function snapshotPromptReviewTarget(
+  target: PromptReviewMutationTarget | null | undefined,
+): PromptReviewMutationTarget | null {
+  return snapshotPromptReviewMutationTarget(target);
+}
+
+function samePromptReviewTarget(
+  left: PromptReviewMutationTarget | null | undefined,
+  right: PromptReviewMutationTarget | null | undefined,
+): boolean {
+  if (left === null || left === undefined || right === null || right === undefined) {
+    return (left === null || left === undefined) && (right === null || right === undefined);
+  }
+  return left.workspacePath === right.workspacePath
+    && left.sessionId === right.sessionId
+    && left.ownerGeneration === right.ownerGeneration
+    && left.requestId === right.requestId
+    && sameRunExpectedState(left.expectedState, right.expectedState);
+}
+
+function sameRunExpectedState(left: RunExpectedState, right: RunExpectedState): boolean {
+  if (left.kind !== right.kind) return false;
+  if (left.admissionRevision !== right.admissionRevision) return false;
+  return left.kind === "turn"
+    ? right.kind === "turn" && left.turnId === right.turnId
+    : right.kind === "idle" && left.latestTurnId === right.latestTurnId;
+}
+
 function positiveInteger(value: string): boolean {
   return /^[1-9]\d*$/.test(value.trim());
 }
@@ -563,10 +855,6 @@ function providerOverlayOpened(previous: DesktopWebState | null, state: DesktopW
 
 function workspaceOverlayOpened(previous: DesktopWebState | null, state: DesktopWebState): boolean {
   return state.overlay === "workspace" && previous?.overlay !== "workspace";
-}
-
-function promptReviewOpened(previous: DesktopWebState | null, state: DesktopWebState): boolean {
-  return state.overlay === "prompt_review" && previous?.overlay !== "prompt_review";
 }
 
 function commandPaletteOpened(previous: DesktopWebState | null, state: DesktopWebState): boolean {

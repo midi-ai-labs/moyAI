@@ -185,6 +185,8 @@ pub enum LlmError {
     ProviderResponseStartTimeout { timeout_ms: u64 },
     #[error("provider stream was idle for {timeout_ms}ms")]
     ProviderStreamIdleTimeout { timeout_ms: u64 },
+    #[error("provider request timed out after {timeout_ms}ms")]
+    ProviderRequestTimeout { timeout_ms: u64 },
     #[error("provider request {surface} {actual} exceeds the admitted limit {maximum}")]
     ProviderRequestLimitExceeded {
         surface: ProviderRequestLimit,

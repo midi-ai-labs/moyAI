@@ -190,6 +190,7 @@ impl Tool for WriteTool {
                 commit_write_change(
                     &services,
                     &run_mutation_fence,
+                    &effect_admission,
                     session_id,
                     maximum_edit_read_bytes,
                     &guarded_in_task,
@@ -270,6 +271,7 @@ fn validate_final_write_content(
 async fn commit_write_change(
     services: &crate::tool::context::ToolServices,
     run_mutation_fence: &crate::tool::context::RunMutationFence,
+    effect_admission: &crate::tool::context::ToolEffectAdmission,
     session_id: crate::session::SessionId,
     maximum_edit_read_bytes: u64,
     guarded: &crate::workspace::GuardedPath,
@@ -290,6 +292,7 @@ async fn commit_write_change(
     validate_write_commit_precondition(&services.edit_safety, path, expected_identity.as_ref())?;
     PathGuard::revalidate(guarded)?;
     run_mutation_fence.assert_owned().await?;
+    effect_admission.admit()?;
     let _effect_commit = run_mutation_fence.begin_effect_commit()?;
 
     let write_result =

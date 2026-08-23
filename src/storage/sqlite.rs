@@ -8,8 +8,8 @@ use rusqlite::Connection;
 
 use crate::error::StorageError;
 use crate::storage::{
-    InternalFileMaintenanceLease, SqliteChangeRepository, SqliteProjectRepository,
-    SqliteSessionRepository, StoragePaths,
+    InternalFileMaintenanceLease, SqliteChangeRepository, SqlitePermissionRetryFenceStore,
+    SqliteProjectRepository, SqliteSessionRepository, SqliteSideChatRepository, StoragePaths,
 };
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -180,7 +180,9 @@ impl SqliteStore {
     }
 
     pub fn migrate(&self) -> Result<(), StorageError> {
-        crate::storage::migration::run(&self.connection.lock().expect("sqlite mutex poisoned"))
+        crate::storage::migration::run_to_current(
+            &self.connection.lock().expect("sqlite mutex poisoned"),
+        )
     }
 
     pub fn session_repo(&self) -> SqliteSessionRepository {
@@ -189,6 +191,14 @@ impl SqliteStore {
 
     pub fn project_repo(&self) -> SqliteProjectRepository {
         SqliteProjectRepository::new(self.connection.clone())
+    }
+
+    pub fn permission_retry_fence_store(&self) -> SqlitePermissionRetryFenceStore {
+        SqlitePermissionRetryFenceStore::new(self.connection.clone())
+    }
+
+    pub fn side_chat_repo(&self) -> SqliteSideChatRepository {
+        SqliteSideChatRepository::new(self.connection.clone())
     }
 
     pub fn change_repo(&self) -> SqliteChangeRepository {

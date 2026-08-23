@@ -1,6 +1,7 @@
 use crate::protocol::{HistoryItem, HistoryItemPayload, TurnInterruptionCause, TurnItemPayload};
 use crate::session::{
-    CanonicalSessionRead, ProjectId, PromptDispatchPart, SessionId, SessionStatus,
+    ActiveTurnExpectation, CanonicalSessionRead, ProjectId, PromptDispatchPart, SessionId,
+    SessionStatus,
 };
 use crate::tui::state::{AppState, RunProgressPhase, RunStatus};
 
@@ -31,6 +32,7 @@ pub enum DesktopStatusCode {
     ProviderTransport,
     ModelUnavailable,
     ImageUnsupported,
+    ImageAttachmentInvalid,
     PermissionPolicyDenied,
     ConfigImportFailed,
     ApprovalAborted,
@@ -71,6 +73,14 @@ pub enum DesktopOverlay {
     PromptReview,
     CommandPalette,
     KeyboardShortcuts,
+    About,
+}
+
+#[derive(Debug, Clone)]
+struct PromptReviewDesktopOwner {
+    request_id: u64,
+    expected_active_turn: ActiveTurnExpectation,
+    cancellation: Option<CancellationToken>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,7 +97,7 @@ pub struct DesktopState {
     pub status_code: DesktopStatusCode,
     file_change_storage_root: Option<camino::Utf8PathBuf>,
     file_change_display_root: Option<camino::Utf8PathBuf>,
-    prompt_enhance_cancellation: Option<(u64, CancellationToken)>,
+    prompt_review_owner: Option<PromptReviewDesktopOwner>,
 }
 
 impl DesktopState {
@@ -106,7 +116,7 @@ impl DesktopState {
             status_code: DesktopStatusCode::Plain,
             file_change_storage_root: None,
             file_change_display_root: None,
-            prompt_enhance_cancellation: None,
+            prompt_review_owner: None,
         }
         .with_provider_fields()
     }
@@ -755,11 +765,28 @@ impl DesktopState {
         }
     }
 
-    pub fn set_image_attachment_input(&mut self, input: String) {
-        self.composer.image_attachment_input = input;
+    fn image_attachment_mutation_admission_open(&mut self) -> bool {
+        if self.app_state.prompt_review.is_none() {
+            return true;
+        }
+        self.set_status_message(
+            "image attachment cannot change while Prompt Review owns the composer draft",
+        );
+        false
     }
 
-    pub fn attach_image_path(&mut self, path: camino::Utf8PathBuf) {
+    pub fn set_image_attachment_input(&mut self, input: String) -> bool {
+        if !self.image_attachment_mutation_admission_open() {
+            return false;
+        }
+        self.composer.image_attachment_input = input;
+        true
+    }
+
+    pub fn attach_image_path(&mut self, path: camino::Utf8PathBuf) -> bool {
+        if !self.image_attachment_mutation_admission_open() {
+            return false;
+        }
         if self
             .composer
             .image_attachment_paths
@@ -767,26 +794,35 @@ impl DesktopState {
             .any(|existing| existing == &path)
         {
             self.set_status_message("Image is already attached.");
-            return;
+            return true;
         }
         self.composer.image_attachment_paths.push(path);
         self.composer.image_attachment_input.clear();
         self.set_status_message("Image attached to the next prompt.");
+        true
     }
 
-    pub fn clear_image_attachments(&mut self) {
+    pub fn clear_image_attachments(&mut self) -> bool {
+        if !self.image_attachment_mutation_admission_open() {
+            return false;
+        }
         self.composer.image_attachment_paths.clear();
         self.composer.image_attachment_input.clear();
         self.set_status_message("Image attachments cleared.");
+        true
     }
 
-    pub fn remove_image_attachment(&mut self, index: usize) {
+    pub fn remove_image_attachment(&mut self, index: usize) -> bool {
+        if !self.image_attachment_mutation_admission_open() {
+            return false;
+        }
         if index >= self.composer.image_attachment_paths.len() {
             self.set_status_message("Image attachment is no longer available.");
-            return;
+            return true;
         }
         let removed = self.composer.image_attachment_paths.remove(index);
         self.set_status_message(format!("Removed image attachment {}", removed));
+        true
     }
 
     pub fn image_attachment_summary(&self) -> String {
@@ -847,7 +883,6 @@ impl DesktopState {
 
     pub fn load_open_session(&mut self, read: &CanonicalSessionRead) {
         let session = &read.session;
-        let turn_items = &read.turns.items;
         self.provider_config.update_access_mode(session.access_mode);
         self.bind_composer_to_loaded_session(session.id);
         let open_session = match (
@@ -859,8 +894,7 @@ impl DesktopState {
             }
             _ => OpenSessionView::from_loaded(read),
         };
-        self.app_state
-            .load_turn_items_with_active_turn(session, turn_items, read.active_turn_id);
+        self.app_state.load_canonical_session_read(read);
         self.status_code = self
             .app_state
             .interruption_cause
@@ -915,6 +949,7 @@ impl DesktopState {
                 open_session.active_turn_id(),
             );
         }
+        self.app_state.active_turn_expectation = open_session.active_turn_expectation();
         self.status_code = self
             .app_state
             .interruption_cause
@@ -1067,7 +1102,7 @@ impl DesktopState {
     }
 
     pub fn apply_run_event(&mut self, event: &crate::session::RunEvent) {
-        self.app_state.apply_run_event(event);
+        crate::tui::reducer::reduce_run_event(&mut self.app_state, event);
         self.status_code = match event {
             crate::session::RunEvent::TurnTerminal { terminal, .. } => terminal
                 .interruption_cause()
@@ -1137,20 +1172,39 @@ impl DesktopState {
             .apply_durable_prompt_dispatch(prompt_dispatch);
     }
 
+    pub fn begin_prompt_enhance_at(
+        &mut self,
+        request_id: u64,
+        raw_prompt: &str,
+        cancellation: CancellationToken,
+        expected_active_turn: ActiveTurnExpectation,
+    ) {
+        self.cancel_prompt_enhance_transport();
+        self.prompt_review_owner = Some(PromptReviewDesktopOwner {
+            request_id,
+            expected_active_turn,
+            cancellation: Some(cancellation),
+        });
+        self.view
+            .async_operations
+            .begin_unique(DesktopAsyncOperationKind::PromptEnhance);
+        self.app_state.begin_prompt_enhance(request_id, raw_prompt);
+        self.view.overlay = DesktopOverlay::PromptReview;
+    }
+
+    #[cfg(test)]
     pub fn begin_prompt_enhance(
         &mut self,
         request_id: u64,
         raw_prompt: &str,
         cancellation: CancellationToken,
     ) {
-        self.cancel_prompt_enhance_transport();
-        self.prompt_enhance_cancellation = Some((request_id, cancellation));
-        self.view
-            .async_operations
-            .begin_unique(DesktopAsyncOperationKind::PromptEnhance);
-        self.app_state.begin_prompt_enhance(request_id, raw_prompt);
-        self.composer.review_draft_text.clear();
-        self.view.overlay = DesktopOverlay::PromptReview;
+        self.begin_prompt_enhance_at(
+            request_id,
+            raw_prompt,
+            cancellation,
+            ActiveTurnExpectation::initial_idle(),
+        );
     }
 
     pub fn finish_prompt_enhance(&mut self, request_id: u64, draft: String) -> bool {
@@ -1162,7 +1216,6 @@ impl DesktopState {
             self.view
                 .async_operations
                 .finish_kind(DesktopAsyncOperationKind::PromptEnhance);
-            self.composer.review_draft_text = draft;
             self.view.overlay = DesktopOverlay::PromptReview;
         }
         finished
@@ -1184,25 +1237,52 @@ impl DesktopState {
         active
     }
 
-    pub fn set_review_draft(&mut self, draft: String) {
-        self.composer.review_draft_text = draft.clone();
-        self.app_state.update_prompt_review_draft(draft);
-    }
-
     pub fn cancel_prompt_review(&mut self) {
         self.cancel_prompt_enhance_transport();
         self.view
             .async_operations
             .finish_kind(DesktopAsyncOperationKind::PromptEnhance);
         self.app_state.cancel_prompt_review();
-        self.composer.review_draft_text.clear();
         if self.view.overlay == DesktopOverlay::PromptReview {
             self.view.overlay = DesktopOverlay::None;
         }
     }
 
+    pub fn cancel_prompt_review_if_current(&mut self, request_id: u64) -> bool {
+        if !self
+            .app_state
+            .prompt_review
+            .as_ref()
+            .is_some_and(|review| review.request_id == request_id)
+        {
+            return false;
+        }
+        self.cancel_prompt_review();
+        true
+    }
+
     pub fn build_prompt_dispatch(&self, send_enhanced: bool) -> Option<PromptDispatchPart> {
         self.app_state.build_prompt_dispatch(send_enhanced)
+    }
+
+    pub fn build_prompt_dispatch_from_draft(
+        &mut self,
+        request_id: u64,
+        review_draft: String,
+        send_enhanced: bool,
+    ) -> Option<PromptDispatchPart> {
+        self.app_state
+            .build_prompt_dispatch_from_draft(request_id, review_draft, send_enhanced)
+    }
+
+    pub fn prompt_review_expected_active_turn(
+        &self,
+        request_id: u64,
+    ) -> Option<ActiveTurnExpectation> {
+        self.prompt_review_owner
+            .as_ref()
+            .filter(|owner| owner.request_id == request_id)
+            .map(|owner| owner.expected_active_turn)
     }
 
     pub fn set_status_message(&mut self, message: impl Into<String>) {
@@ -1240,17 +1320,19 @@ impl DesktopState {
     }
 
     fn finish_prompt_enhance_transport(&mut self, request_id: u64) {
-        if self
-            .prompt_enhance_cancellation
-            .as_ref()
-            .is_some_and(|(active_request_id, _)| *active_request_id == request_id)
+        if let Some(owner) = self
+            .prompt_review_owner
+            .as_mut()
+            .filter(|owner| owner.request_id == request_id)
         {
-            self.prompt_enhance_cancellation = None;
+            owner.cancellation = None;
         }
     }
 
     fn cancel_prompt_enhance_transport(&mut self) {
-        if let Some((_, cancellation)) = self.prompt_enhance_cancellation.take() {
+        if let Some(owner) = self.prompt_review_owner.take()
+            && let Some(cancellation) = owner.cancellation
+        {
             cancellation.cancel();
         }
     }
@@ -1259,12 +1341,31 @@ impl DesktopState {
         self.provider_config.replace_effective_config(config);
     }
 
-    pub fn show_config_editor(&mut self) {
-        self.view.startup_overlay_forced = false;
-        self.view.overlay = DesktopOverlay::ConfigEditor;
+    fn prompt_review_owns_overlay(&self) -> bool {
+        self.app_state.prompt_review.is_some() || self.prompt_review_owner.is_some()
     }
 
-    pub fn show_provider_editor(&mut self) {
+    fn begin_unscoped_overlay_transition(&mut self) -> bool {
+        if self.prompt_review_owns_overlay() {
+            self.view.overlay = DesktopOverlay::PromptReview;
+            return false;
+        }
+        true
+    }
+
+    pub fn show_config_editor(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
+        self.view.startup_overlay_forced = false;
+        self.view.overlay = DesktopOverlay::ConfigEditor;
+        true
+    }
+
+    pub fn show_provider_editor(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
         self.provider_config.provider_base_url_input =
             self.provider_config.effective_config.model.base_url.clone();
         self.provider_config.provider_metadata_mode_input = self
@@ -1303,46 +1404,79 @@ impl DesktopState {
             .unwrap_or(-1);
         self.view.startup_overlay_forced = false;
         self.view.overlay = DesktopOverlay::ProviderEditor;
+        true
     }
 
-    pub fn show_workspace_picker(&mut self, current_path: &str) {
+    pub fn show_workspace_picker(&mut self, current_path: &str) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
         self.workspace_input = current_path.to_string();
         self.view.overlay = DesktopOverlay::WorkspacePicker;
+        true
     }
 
-    pub fn show_file_menu(&mut self) {
+    pub fn show_file_menu(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
         self.view.overlay = DesktopOverlay::FileMenu;
+        true
     }
 
-    pub fn show_edit_menu(&mut self) {
+    pub fn show_edit_menu(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
         self.view.overlay = DesktopOverlay::EditMenu;
+        true
     }
 
-    pub fn show_view_menu(&mut self) {
+    pub fn show_view_menu(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
         self.view.overlay = DesktopOverlay::ViewMenu;
+        true
     }
 
-    pub fn show_help_menu(&mut self) {
+    pub fn show_help_menu(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
         self.view.overlay = DesktopOverlay::HelpMenu;
+        true
     }
 
-    pub fn show_project_menu(&mut self) {
+    pub fn show_about(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
+        self.view.overlay = DesktopOverlay::About;
+        true
+    }
+
+    pub fn show_project_menu(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
         self.view.overlay = DesktopOverlay::ProjectMenu;
+        true
     }
 
-    pub fn hide_overlay(&mut self) {
+    pub fn hide_overlay(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
         if self.startup_requires_overlay(self.view.overlay) {
             self.set_status_message(
-                "初期設定が必要です。保存または config.toml Import で設定を完了してください。",
+                "初期設定が必要です。設定ファイルへの保存、UIセッションへの適用、または config.toml Import で設定を完了してください。",
             );
-            return;
-        }
-        if self.view.overlay == DesktopOverlay::PromptReview {
-            self.cancel_prompt_review();
-            return;
+            return false;
         }
         self.view.startup_overlay_forced = false;
         self.view.overlay = DesktopOverlay::None;
+        true
     }
 
     pub fn mark_startup_config_reviewed(&mut self) {
@@ -1556,22 +1690,39 @@ impl DesktopState {
         }
     }
 
-    pub fn show_command_palette(&mut self) {
+    pub fn show_command_palette(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
         self.view.overlay = DesktopOverlay::CommandPalette;
+        true
     }
 
-    pub fn show_keyboard_shortcuts(&mut self) {
+    pub fn show_keyboard_shortcuts(&mut self) -> bool {
+        if !self.begin_unscoped_overlay_transition() {
+            return false;
+        }
         self.view.overlay = DesktopOverlay::KeyboardShortcuts;
+        true
     }
 
-    pub fn insert_command_from_palette(&mut self, index: usize) {
-        let Some(command) = self.snapshot.command_rows.get(index) else {
+    pub fn select_command_from_palette(&mut self, index: usize) -> Option<String> {
+        if self.view.overlay != DesktopOverlay::CommandPalette {
+            return None;
+        }
+        let Some(command_name) = self
+            .snapshot
+            .command_rows
+            .get(index)
+            .map(|command| command.name.clone())
+        else {
             self.set_status_message("command palette selection is no longer available");
-            return;
+            return None;
         };
-        self.composer.draft_prompt = format!("/{} ", command.name);
+        let insertion_text = format!("/{command_name} ");
         self.view.overlay = DesktopOverlay::None;
-        self.set_status_message(format!("inserted command /{}", command.name));
+        self.set_status_message(format!("selected command /{command_name}"));
+        Some(insertion_text)
     }
 
     pub fn is_busy(&self) -> bool {
@@ -1667,6 +1818,9 @@ impl DesktopState {
     }
 
     fn apply_startup_overlay(&mut self) {
+        if !self.begin_unscoped_overlay_transition() {
+            return;
+        }
         if let Some(overlay) = self.startup.action_overlay {
             self.view.overlay = overlay;
             if overlay == DesktopOverlay::ProviderEditor {
@@ -1794,7 +1948,7 @@ mod tests {
 
     use super::*;
     use crate::config::AccessMode;
-    use crate::desktop::models::{DesktopProjectRow, DesktopSessionRow};
+    use crate::desktop::models::{DesktopCommandRow, DesktopProjectRow, DesktopSessionRow};
     use crate::session::ProjectId;
     use crate::session::{
         CanonicalHistoryPage, CanonicalTurnPage, RequestDiagnosticsPart, SessionModelParameters,
@@ -1892,6 +2046,7 @@ mod tests {
             latest_turn_id,
             active_turn_id: None,
             active_turn_sequence_no: None,
+            admission_revision: u64::from(latest_turn_id.is_some()),
         }
     }
 
@@ -2843,6 +2998,57 @@ mod tests {
     }
 
     #[test]
+    fn about_overlay_uses_the_rust_owner_and_closes_without_changing_run_state() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        let run_status = state.app_state.run_status;
+
+        state.show_help_menu();
+        assert_eq!(state.view.overlay, DesktopOverlay::HelpMenu);
+
+        state.show_about();
+        assert_eq!(state.view.overlay, DesktopOverlay::About);
+        assert_eq!(state.app_state.run_status, run_status);
+
+        state.hide_overlay();
+        assert_eq!(state.view.overlay, DesktopOverlay::None);
+        assert_eq!(state.app_state.run_status, run_status);
+    }
+
+    #[test]
+    fn command_palette_selection_returns_canonical_text_without_editing_the_draft() {
+        let mut initial_snapshot = snapshot(Vec::new(), 0);
+        initial_snapshot.command_rows.push(DesktopCommandRow {
+            name: "case".to_string(),
+            label: "Case".to_string(),
+            path: "builtin:case".to_string(),
+        });
+        let mut state = DesktopState::new(initial_snapshot, ResolvedConfig::default());
+        state.composer.draft_prompt = "left 😀 selected right".to_string();
+        let run_status = state.app_state.run_status;
+        let owner_generation = state.composer.owner_generation();
+        state.show_command_palette();
+
+        assert_eq!(
+            state.select_command_from_palette(0),
+            Some("/case ".to_string())
+        );
+        assert_eq!(state.composer.draft_prompt, "left 😀 selected right");
+        assert_eq!(state.composer.owner_generation(), owner_generation);
+        assert_eq!(state.app_state.run_status, run_status);
+        assert_eq!(state.view.overlay, DesktopOverlay::None);
+
+        state.show_command_palette();
+        assert_eq!(state.select_command_from_palette(1), None);
+        assert_eq!(state.composer.draft_prompt, "left 😀 selected right");
+        assert_eq!(state.view.overlay, DesktopOverlay::CommandPalette);
+
+        state.show_keyboard_shortcuts();
+        assert_eq!(state.select_command_from_palette(0), None);
+        assert_eq!(state.composer.draft_prompt, "left 😀 selected right");
+        assert_eq!(state.view.overlay, DesktopOverlay::KeyboardShortcuts);
+    }
+
+    #[test]
     fn configured_provider_startup_overlay_can_be_closed() {
         let mut config = ResolvedConfig::default();
         config.model.base_url = String::new();
@@ -2882,6 +3088,13 @@ mod tests {
 
         assert_eq!(state.view.overlay, DesktopOverlay::ConfigEditor);
         assert!(state.view.startup_overlay_forced);
+        assert!(
+            state
+                .app_state
+                .status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("UIセッションへの適用"))
+        );
     }
 
     #[test]
@@ -3263,6 +3476,103 @@ mod tests {
     }
 
     #[test]
+    fn prompt_review_cancel_requires_the_current_request_identity() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        state.begin_prompt_enhance(2, "current", CancellationToken::new());
+
+        assert!(!state.cancel_prompt_review_if_current(1));
+        assert_eq!(
+            state
+                .app_state
+                .prompt_review
+                .as_ref()
+                .map(|review| review.request_id),
+            Some(2)
+        );
+        assert_eq!(state.view.overlay, DesktopOverlay::PromptReview);
+        assert!(state.cancel_prompt_review_if_current(2));
+        assert!(state.app_state.prompt_review.is_none());
+        assert_eq!(state.view.overlay, DesktopOverlay::None);
+    }
+
+    #[test]
+    fn prompt_review_owner_blocks_every_attachment_mutation_at_the_state_boundary() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        let original = camino::Utf8PathBuf::from("C:/workspace/original.png");
+        assert!(state.attach_image_path(original.clone()));
+        assert!(state.set_image_attachment_input("typed-before-review.png".to_string()));
+        state.begin_prompt_enhance(31, "review owner", CancellationToken::new());
+
+        assert!(!state.set_image_attachment_input("replacement.png".to_string()));
+        assert!(
+            !state.attach_image_path(camino::Utf8PathBuf::from("C:/workspace/replacement.png"))
+        );
+        assert!(!state.clear_image_attachments());
+        assert!(!state.remove_image_attachment(0));
+
+        assert_eq!(
+            state.composer.image_attachment_input,
+            "typed-before-review.png"
+        );
+        assert_eq!(state.composer.image_attachment_paths, vec![original]);
+        assert_eq!(
+            state
+                .app_state
+                .prompt_review
+                .as_ref()
+                .map(|review| review.request_id),
+            Some(31)
+        );
+    }
+
+    #[test]
+    fn prompt_review_owner_is_the_state_level_overlay_transition_boundary() {
+        let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
+        state.begin_prompt_enhance(32, "review source", CancellationToken::new());
+        assert!(state.finish_prompt_enhance(32, "review draft".to_string()));
+        let original_provider_input = state.provider_config.provider_base_url_input.clone();
+        let original_workspace_input = state.workspace_input.clone();
+
+        assert!(!state.show_config_editor());
+        assert!(!state.show_provider_editor());
+        assert!(!state.show_workspace_picker("C:/other"));
+        assert!(!state.show_file_menu());
+        assert!(!state.show_edit_menu());
+        assert!(!state.show_view_menu());
+        assert!(!state.show_help_menu());
+        assert!(!state.show_about());
+        assert!(!state.show_project_menu());
+        assert!(!state.show_command_palette());
+        assert!(!state.show_keyboard_shortcuts());
+        assert!(!state.hide_overlay());
+        state.startup.action_overlay = Some(DesktopOverlay::ConfigEditor);
+        state.apply_startup_overlay();
+
+        assert_eq!(state.view.overlay, DesktopOverlay::PromptReview);
+        assert_eq!(
+            state.provider_config.provider_base_url_input,
+            original_provider_input
+        );
+        assert_eq!(state.workspace_input, original_workspace_input);
+        assert_eq!(
+            state.app_state.prompt_review.as_ref().map(|review| (
+                review.request_id,
+                review.raw_prompt_text.as_str(),
+                review.current_draft_text.as_str(),
+            )),
+            Some((32, "review source", "review draft")),
+        );
+        assert_eq!(
+            state.prompt_review_expected_active_turn(32),
+            Some(ActiveTurnExpectation::initial_idle()),
+        );
+
+        assert!(state.cancel_prompt_review_if_current(32));
+        assert!(state.show_config_editor());
+        assert_eq!(state.view.overlay, DesktopOverlay::ConfigEditor);
+    }
+
+    #[test]
     fn same_owner_new_chat_cancels_prompt_enhance_and_advances_owner() {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
         let cancellation = CancellationToken::new();
@@ -3307,12 +3617,15 @@ mod tests {
     }
 
     #[test]
-    fn closing_prompt_review_is_terminal_and_late_result_cannot_reopen_it() {
+    fn generic_close_preserves_prompt_review_and_exact_cancel_is_terminal() {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
         state.begin_prompt_enhance(7, "draft me", CancellationToken::new());
         assert_eq!(state.view.overlay, DesktopOverlay::PromptReview);
 
-        state.hide_overlay();
+        assert!(!state.hide_overlay());
+        assert_eq!(state.view.overlay, DesktopOverlay::PromptReview);
+        assert!(state.app_state.prompt_review.is_some());
+        assert!(state.cancel_prompt_review_if_current(7));
 
         assert_eq!(state.view.overlay, DesktopOverlay::None);
         assert!(state.app_state.prompt_review.is_none());
@@ -3330,7 +3643,7 @@ mod tests {
     fn closed_prompt_review_does_not_leak_async_owner_across_navigation() {
         let mut state = DesktopState::new(snapshot(Vec::new(), 0), ResolvedConfig::default());
         state.begin_prompt_enhance(9, "draft before navigation", CancellationToken::new());
-        state.hide_overlay();
+        assert!(state.cancel_prompt_review_if_current(9));
         let session_id = SessionId::new();
         let navigation_id = state.begin_session_load(session_id);
 

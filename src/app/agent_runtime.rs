@@ -69,7 +69,13 @@ pub struct AgentActivityRecord {
     pub updated: bool,
     pub is_current_turn: bool,
     pub active_turn_id: Option<TurnId>,
-    pub can_interrupt: bool,
+    pub interrupt_target: Option<AgentInterruptTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInterruptTarget {
+    pub turn_id: TurnId,
+    pub admission_revision: u64,
 }
 
 #[derive(Clone)]
@@ -92,6 +98,7 @@ struct AgentDurableTurnOwner {
     session_id: SessionId,
     admission_id: AdmissionId,
     turn_id: TurnId,
+    admission_revision: u64,
 }
 
 impl fmt::Debug for AgentRunContext {
@@ -112,6 +119,11 @@ impl AgentRunContext {
 
     pub fn session_id(&self) -> SessionId {
         self.session_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tree_control_for_test(&self) -> AgentControl {
+        self.tree.control.clone()
     }
 
     pub(crate) fn trigger_history_item_id(&self) -> Option<HistoryItemId> {
@@ -228,6 +240,10 @@ impl AgentRunContext {
         Ok(())
     }
 
+    pub(crate) fn schedule_cancelled_worker_abort(&self) {
+        self.runtime.schedule_cancelled_worker_abort(&self.tree);
+    }
+
     pub async fn spawn_agent(
         &self,
         task_name: &str,
@@ -318,11 +334,19 @@ impl AgentRunContext {
         &self,
         admission_id: AdmissionId,
         turn_id: TurnId,
+        admission_revision: u64,
     ) -> Result<(), String> {
+        if self.path.is_root() {
+            self.tree
+                .control
+                .publish_root_execution_plan(&self.execution, turn_id, admission_revision)
+                .map_err(agent_control_error)?;
+        }
         let owner = AgentDurableTurnOwner {
             session_id: self.session_id,
             admission_id,
             turn_id,
+            admission_revision,
         };
         self.turn_owner.set(owner).map_err(|_| {
             format!(
@@ -331,15 +355,10 @@ impl AgentRunContext {
             )
         })?;
         if self.path.is_root() {
-            *self
-                .tree
-                .active_root_turn_owner
-                .lock()
-                .map_err(|_| "active root turn owner lock was poisoned".to_string())? = Some(owner);
             let scheduled = self
                 .tree
                 .control
-                .schedule_pending_triggered_executions()
+                .mark_root_execution_admitted(&self.execution, turn_id, admission_revision)
                 .map_err(agent_control_error)?;
             self.runtime.launch_scheduled_turns(&self.tree, scheduled);
         }
@@ -511,7 +530,6 @@ struct AgentTreeRuntime {
     control: AgentControl,
     limits: AgentTreeLimits,
     model_request_gate: Arc<tokio::sync::Semaphore>,
-    active_root_turn_owner: Mutex<Option<AgentDurableTurnOwner>>,
     metadata: Mutex<HashMap<AgentPath, AgentNodeMetadata>>,
 }
 
@@ -567,6 +585,7 @@ struct DurableAgentChild {
     session_id: SessionId,
     session_status: SessionStatus,
     active_turn_id: Option<TurnId>,
+    admission_revision: u64,
     pending_deferred_turn_id: Option<TurnId>,
     pending_trigger_history_item_id: Option<HistoryItemId>,
     pending_trigger_schedule_ready: bool,
@@ -1196,7 +1215,6 @@ impl AgentRuntime {
                     model_request_gate: Arc::new(tokio::sync::Semaphore::new(
                         limits.max_concurrent_model_requests,
                     )),
-                    active_root_turn_owner: Mutex::new(None),
                     metadata: Mutex::new(HashMap::new()),
                 });
                 self.restore_durable_children(
@@ -1388,6 +1406,7 @@ impl AgentRuntime {
                 session_id,
                 session_status,
                 active_turn_id: _,
+                admission_revision: _,
                 pending_deferred_turn_id,
                 pending_trigger_history_item_id,
                 pending_trigger_schedule_ready,
@@ -1499,8 +1518,13 @@ impl AgentRuntime {
                 } else {
                     status
                 };
-                let can_interrupt =
-                    matches!(&status, AgentStatus::Running) && child.active_turn_id.is_some();
+                let interrupt_target = match (&status, child.active_turn_id) {
+                    (AgentStatus::Running, Some(turn_id)) => Some(AgentInterruptTarget {
+                        turn_id,
+                        admission_revision: child.admission_revision,
+                    }),
+                    _ => None,
+                };
                 Ok(AgentActivityRecord {
                     agent_path: child.edge.agent_path,
                     session_id: child.session_id,
@@ -1513,10 +1537,66 @@ impl AgentRuntime {
                     updated: false,
                     is_current_turn: false,
                     active_turn_id: child.active_turn_id,
-                    can_interrupt,
+                    interrupt_target,
                 })
             })
             .collect()
+    }
+
+    /// Cancels only the current root execution for an exact retained task capability.
+    ///
+    /// `None` means this process has no retained tree for the supplied scope, so callers may
+    /// classify the pre-tree outer RunControl directly. Descendant controls are never changed.
+    pub(crate) fn cancel_root_execution_at_scope_control(
+        self: &Arc<Self>,
+        expected_root_scope_control: &RunControl,
+        root_cause: TurnInterruptionCause,
+        terminal_already_settled: bool,
+    ) -> Result<Option<crate::runtime::RootExecutionLocalStop>, String> {
+        let trees = self
+            .trees
+            .lock()
+            .map_err(|_| "agent tree registry lock was poisoned".to_string())?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for tree in trees {
+            let outcome = tree
+                .control
+                .cancel_root_execution_at_scope_control(
+                    expected_root_scope_control,
+                    root_cause,
+                    terminal_already_settled,
+                )
+                .map_err(agent_control_error)?;
+            let Some(local_stop) = outcome else {
+                continue;
+            };
+            if local_stop.stop_accepted() {
+                self.schedule_cancelled_worker_abort(&tree);
+            }
+            return Ok(Some(local_stop));
+        }
+        Ok(None)
+    }
+
+    /// Returns the stable local root-task capability for one exact root session, if retained.
+    pub(crate) fn root_scope_control_for_session(
+        &self,
+        root_session_id: SessionId,
+    ) -> Result<Option<RunControl>, String> {
+        let tree = self
+            .trees
+            .lock()
+            .map_err(|_| "agent tree registry lock was poisoned".to_string())?
+            .get(&root_session_id)
+            .cloned();
+        tree.map(|tree| {
+            tree.control
+                .root_scope_control()
+                .map_err(agent_control_error)
+        })
+        .transpose()
     }
 
     pub(crate) fn complete_root(
@@ -1553,11 +1633,11 @@ impl AgentRuntime {
         let Ok(snapshot) = tree.control.snapshot() else {
             return Vec::new();
         };
-        let active_owner = tree
-            .active_root_turn_owner
-            .lock()
+        let active_root_turn_id = tree
+            .control
+            .active_or_awaiting_root_turn_id()
             .ok()
-            .and_then(|owner| *owner);
+            .flatten();
         let Ok(metadata) = tree.metadata.lock() else {
             return Vec::new();
         };
@@ -1575,9 +1655,18 @@ impl AgentRuntime {
                 } else {
                     agent.status.clone()
                 };
-                let active_turn_id = self.store.active_runs().active_turn_id(agent.session_id);
-                let can_interrupt =
-                    matches!(&projected_status, AgentStatus::Running) && active_turn_id.is_some();
+                let active_turn_target = self
+                    .store
+                    .active_runs()
+                    .active_turn_target(agent.session_id);
+                let active_turn_id = active_turn_target.map(|target| target.turn_id);
+                let interrupt_target = match (&projected_status, active_turn_target) {
+                    (AgentStatus::Running, Some(target)) => Some(AgentInterruptTarget {
+                        turn_id: target.turn_id,
+                        admission_revision: target.admission_revision,
+                    }),
+                    _ => None,
+                };
                 AgentActivityRecord {
                     agent_path: agent.path.to_string(),
                     session_id: agent.session_id,
@@ -1590,40 +1679,17 @@ impl AgentRuntime {
                     result_preview: agent_status_result(&agent.status),
                     started_order: agent.spawn_order,
                     updated: node.is_some_and(|node| node.updated),
-                    is_current_turn: node
-                        .and_then(|node| node.activity_owner)
-                        .is_some_and(|owner| Some(owner) == active_owner),
+                    is_current_turn: node.and_then(|node| node.activity_owner).is_some_and(
+                        |owner| {
+                            owner.session_id == tree.root_session_id
+                                && Some(owner.turn_id) == active_root_turn_id
+                        },
+                    ),
                     active_turn_id,
-                    can_interrupt,
+                    interrupt_target,
                 }
             })
             .collect()
-    }
-
-    pub fn cancel_tree_for_session(
-        self: &Arc<Self>,
-        session_id: SessionId,
-        root_cause: TurnInterruptionCause,
-    ) -> bool {
-        let Ok(trees) = self.trees.lock() else {
-            return false;
-        };
-        let tree = trees.get(&session_id).cloned().or_else(|| {
-            trees.values().find_map(|tree| {
-                tree.control
-                    .path_for_session(session_id)
-                    .ok()
-                    .flatten()
-                    .map(|_| tree.clone())
-            })
-        });
-        if let Some(tree) = tree {
-            let accepted = tree.control.interrupt_tree(root_cause);
-            self.schedule_cancelled_worker_abort(&tree);
-            accepted
-        } else {
-            false
-        }
     }
 
     /// Reuses the ordinary cancelled-worker grace monitor for one exact UI-selected child.
@@ -2333,6 +2399,69 @@ impl AgentRuntime {
                         }
                         return;
                     }
+                    let expected_active_turn = match runtime
+                        .session_service
+                        .active_turn_expectation_for_session(run_context.session_id)
+                        .await
+                    {
+                        Ok(Some(expected)) => expected,
+                        Ok(None) => {
+                            if let Some(lease) = worker_lease
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .take()
+                                && let Ok(scheduled) = runtime.settle_pre_admission_execution(
+                                    &context.tree,
+                                    lease,
+                                    Some(
+                                        "session disappeared before exact turn admission"
+                                            .to_string(),
+                                    ),
+                                )
+                            {
+                                runtime.launch_scheduled_turns(&context.tree, scheduled);
+                            }
+                            return;
+                        }
+                        Err(error) => {
+                            if let Some(lease) = worker_lease
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .take()
+                                && let Ok(scheduled) = runtime.settle_pre_admission_execution(
+                                    &context.tree,
+                                    lease,
+                                    Some(error.to_string()),
+                                )
+                            {
+                                runtime.launch_scheduled_turns(&context.tree, scheduled);
+                            }
+                            return;
+                        }
+                    };
+                    let admission_kind =
+                        if let Some(history_item_id) = run_context.trigger_history_item_id() {
+                            crate::app::RunAdmissionKind::AgentTrigger { history_item_id }
+                        } else if let Some(request_id) = run_context.owner_resume_request_id() {
+                            crate::app::RunAdmissionKind::OwnerResume { request_id }
+                        } else {
+                            if let Some(lease) = worker_lease
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .take()
+                                && let Ok(scheduled) = runtime.settle_pre_admission_execution(
+                                    &context.tree,
+                                    lease,
+                                    Some(
+                                        "scheduled agent execution lost its exact wake identity"
+                                            .to_string(),
+                                    ),
+                                )
+                            {
+                                runtime.launch_scheduled_turns(&context.tree, scheduled);
+                            }
+                            return;
+                        };
                     let request = RunRequest {
                         prompt,
                         session_id: Some(run_context.session_id),
@@ -2350,6 +2479,8 @@ impl AgentRuntime {
                         session_access_mode_adoption: None,
                         agent_confirmation: Some(run_context.confirmation_prompt()),
                         agent_context: Some(run_context),
+                        admission_kind,
+                        expected_active_turn,
                     };
                     match run_service
                         .execute(AppCommand::Run(request), &mut renderer, &mut confirmation)
@@ -3222,6 +3353,7 @@ fn load_durable_agent_children(
             edge: child.edge,
             session_status,
             active_turn_id: child.active_turn_id,
+            admission_revision: child.admission_revision,
             pending_deferred_turn_id: child.pending_deferred_turn_id,
             pending_trigger_history_item_id: child.pending_trigger_history_item_id,
             pending_trigger_schedule_ready: child.pending_trigger_schedule_ready,

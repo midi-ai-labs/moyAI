@@ -4063,18 +4063,22 @@ mod integration_tests {
             )
             .await
         });
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !victim_pid_file.exists() {
+        let victim_pid = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(value) = std::fs::read_to_string(&victim_pid_file) {
+                    if let Ok(pid) = value.trim().parse::<u32>() {
+                        break pid;
+                    }
+                }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
-        .await
-        .expect("victim process must publish PID");
-        let victim_pid = std::fs::read_to_string(&victim_pid_file)
-            .expect("victim PID")
-            .trim()
-            .parse::<u32>()
-            .expect("numeric victim PID");
+        .await;
+        let Ok(victim_pid) = victim_pid else {
+            victim_cancel.cancel();
+            let _ = tokio::time::timeout(Duration::from_secs(10), victim).await;
+            panic!("victim process must publish a readable numeric PID");
+        };
         let attacker_script = format!(
             concat!(
                 "Add-Type -TypeDefinition @'\n",
@@ -4109,14 +4113,14 @@ mod integration_tests {
                 cancel: CancellationToken::new(),
             },
         )
-        .await
-        .expect("attacker sandbox execution");
+        .await;
         victim_cancel.cancel();
         let victim_result = tokio::time::timeout(Duration::from_secs(10), victim)
             .await
             .expect("victim cleanup timeout")
             .expect("victim task")
             .expect("victim sandbox result");
+        let attacker = attacker.expect("attacker sandbox execution");
 
         assert!(victim_result.cancelled);
         assert!(

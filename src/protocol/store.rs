@@ -330,6 +330,8 @@ pub(crate) struct RetainedDescendantProjection {
     pub session_status: String,
     /// Exact active turn owned by the child in the same read snapshot as its status.
     pub active_turn_id: Option<TurnId>,
+    /// Monotonic admission fence captured in the same transaction as `active_turn_id`.
+    pub admission_revision: u64,
     /// Exact pending deferred-completion turn from the same read snapshot as trigger readiness and
     /// OwnerResume ownership.
     pub pending_deferred_turn_id: Option<TurnId>,
@@ -406,7 +408,7 @@ fn retained_descendant_page_in_transaction(
     let mut statement = transaction.prepare(
         "SELECT edge.root_session_id, edge.parent_session_id, edge.child_session_id,
                 edge.agent_path, edge.task_name, edge.spawn_order, edge.created_at_ms,
-                child.status, child.active_turn_id,
+                child.status, child.active_turn_id, child_revision.revision,
                 (
                     SELECT mailbox.id
                     FROM agent_mailbox_messages AS mailbox
@@ -512,6 +514,8 @@ fn retained_descendant_page_in_transaction(
                 )
          FROM session_spawn_edges AS edge
          INNER JOIN sessions AS child ON child.id = edge.child_session_id
+         INNER JOIN session_admission_revisions AS child_revision
+           ON child_revision.session_id = child.id
          WHERE edge.root_session_id = ?1
          ORDER BY edge.spawn_order ASC, edge.child_session_id ASC
          LIMIT ?2 OFFSET ?3",
@@ -533,15 +537,16 @@ fn retained_descendant_page_in_transaction(
                 row.get::<_, i64>(6)?,
                 row.get::<_, String>(7)?,
                 row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<String>>(9)?,
+                row.get::<_, i64>(9)?,
                 row.get::<_, Option<String>>(10)?,
-                row.get::<_, bool>(11)?,
-                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, bool>(12)?,
                 row.get::<_, Option<String>>(13)?,
                 row.get::<_, Option<String>>(14)?,
                 row.get::<_, Option<String>>(15)?,
                 row.get::<_, Option<String>>(16)?,
                 row.get::<_, Option<String>>(17)?,
+                row.get::<_, Option<String>>(18)?,
             ))
         },
     )?;
@@ -557,6 +562,7 @@ fn retained_descendant_page_in_transaction(
             created_at_ms,
             session_status,
             active_turn_id,
+            admission_revision,
             pending_trigger_history_item_id,
             pending_owner_resume_request_id,
             pending_trigger_schedule_ready,
@@ -607,6 +613,11 @@ fn retained_descendant_page_in_transaction(
                     })
                 })
                 .transpose()?,
+            admission_revision: u64::try_from(admission_revision).map_err(|_| {
+                StorageError::Message(format!(
+                    "retained child {child} has invalid admission revision {admission_revision}"
+                ))
+            })?,
             pending_deferred_turn_id,
             #[cfg(test)]
             pending_deferred_completion_kind: _pending_deferred_completion_kind,
@@ -1071,6 +1082,15 @@ impl SqliteProtocolEventStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn seed_session_for_test(&self, session_id: SessionId) -> Result<(), StorageError> {
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_protocol_test_session_in_transaction(&transaction, session_id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn seed_runtime_event_for_test(
         &self,
         event: &RuntimeEvent,
@@ -1087,6 +1107,7 @@ impl SqliteProtocolEventStore {
     ) -> Result<(), StorageError> {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_protocol_test_session_in_transaction(&transaction, event.session_id)?;
         insert_event_bundle_unchecked(&transaction, event, history_item, turn_item)?;
         transaction.commit()?;
         Ok(())
@@ -1099,6 +1120,7 @@ impl SqliteProtocolEventStore {
     ) -> Result<(), StorageError> {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_protocol_test_session_in_transaction(&transaction, item.session_id)?;
         let sequence_no = match item.scope {
             HistoryScope::Turn { turn_id } => claim_protocol_sequence_in_transaction(
                 &transaction,
@@ -1123,6 +1145,7 @@ impl SqliteProtocolEventStore {
     pub(crate) fn seed_turn_item_for_test(&self, item: &TurnItem) -> Result<(), StorageError> {
         let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_protocol_test_session_in_transaction(&transaction, item.session_id)?;
         let sequence_no = claim_protocol_sequence_in_transaction(
             &transaction,
             item.session_id,
@@ -4025,6 +4048,40 @@ fn claim_protocol_sequence_in_transaction(
     Ok(claimed)
 }
 
+#[cfg(test)]
+fn ensure_protocol_test_session_in_transaction(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<(), StorageError> {
+    let session_id = session_id.to_string();
+    let session_exists = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+        [&session_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if session_exists {
+        return Ok(());
+    }
+
+    connection.execute(
+        "INSERT INTO projects
+         (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, 'protocol test fixture', 'none', 1, 1)
+         ON CONFLICT(id) DO NOTHING",
+        params![session_id, format!("C:/protocol-test/{session_id}")],
+    )?;
+    connection.execute(
+        "INSERT INTO sessions
+         (id, project_id, title, status, cwd_path, model_name, base_url,
+          created_at_ms, updated_at_ms, completed_at_ms)
+         VALUES (?1, ?1, 'protocol test fixture', 'idle', ?2, 'model',
+                 'http://localhost', 1, 1, NULL)
+         ON CONFLICT(id) DO NOTHING",
+        params![session_id, format!("C:/protocol-test/{session_id}")],
+    )?;
+    Ok(())
+}
+
 fn claim_session_history_sequence_in_transaction(
     transaction: &Transaction<'_>,
     session_id: SessionId,
@@ -4363,6 +4420,14 @@ mod tests {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .expect("history batch transaction");
+        for session_id in items
+            .iter()
+            .map(|item| item.session_id)
+            .collect::<HashSet<_>>()
+        {
+            ensure_protocol_test_session_in_transaction(&transaction, session_id)
+                .expect("history batch session owner");
+        }
         for item in items {
             let sequence_no = match item.turn_id() {
                 Some(turn_id) => claim_protocol_sequence_in_transaction(
@@ -4386,6 +4451,14 @@ mod tests {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .expect("turn batch transaction");
+        for session_id in items
+            .iter()
+            .map(|item| item.session_id)
+            .collect::<HashSet<_>>()
+        {
+            ensure_protocol_test_session_in_transaction(&transaction, session_id)
+                .expect("turn batch session owner");
+        }
         for item in items {
             let sequence_no = claim_protocol_sequence_in_transaction(
                 &transaction,
@@ -6609,6 +6682,9 @@ mod tests {
         let second_store = open_store(&database_path);
         let session_id = SessionId::new();
         let turn_id = TurnId::new();
+        first_store
+            .seed_session_for_test(session_id)
+            .expect("session revision owner");
         let first_event = warning_event(session_id, turn_id, 0, "first");
         let second_event = warning_event(session_id, turn_id, 0, "second");
         let expected_ids = [first_event.id, second_event.id];
@@ -6715,6 +6791,20 @@ mod tests {
                 .expect("events")[0]
                 .sequence_no,
             2
+        );
+        assert_eq!(
+            store
+                .connection
+                .lock()
+                .expect("sqlite mutex")
+                .query_row(
+                    "SELECT revision FROM session_admission_revisions WHERE session_id = ?1",
+                    params![session_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("session admission revision"),
+            1,
+            "one shared turn allocator must advance the session revision exactly once"
         );
     }
 

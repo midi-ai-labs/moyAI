@@ -1,9 +1,11 @@
+pub mod field;
 pub mod loader;
 pub mod merge;
 pub mod model;
 pub mod permission_profile_catalog;
 pub mod turn;
 
+pub use field::ConfigField;
 pub use loader::ConfigLoader;
 pub use model::{
     AccessMode, ChatCompletionsReasoningParameters, DEFAULT_MODEL_BASE_URL,

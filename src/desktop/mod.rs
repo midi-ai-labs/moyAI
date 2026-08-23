@@ -20,6 +20,8 @@ pub mod provider_config_state;
 #[cfg(feature = "tauri-desktop")]
 pub mod query;
 #[cfg(feature = "tauri-desktop")]
+pub mod side_chat;
+#[cfg(feature = "tauri-desktop")]
 pub mod single_instance;
 #[cfg(feature = "tauri-desktop")]
 pub mod startup;

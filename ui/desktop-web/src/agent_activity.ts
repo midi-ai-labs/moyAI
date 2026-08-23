@@ -157,6 +157,6 @@ export function agentActivityRowIdentity(row: AgentActivityRow): string {
     String(row.started_order),
     String(row.updated),
     row.active_turn_id ?? "",
-    String(row.can_interrupt),
+    JSON.stringify(row.interrupt_target),
   ].join("\u0000");
 }

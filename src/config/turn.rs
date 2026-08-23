@@ -4,15 +4,14 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::model::{DEFAULT_MODEL_REQUEST_TIMEOUT_MS, MAX_MODEL_REQUEST_TIMEOUT_MS};
 use super::{ProviderApiMode, ProviderMetadataMode, ResolvedConfig};
 
 /// Immutable provider timing policy captured together with a turn admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderDeadlines {
-    /// One budget shared by connection attempts, retry delays, and response headers.
-    pub response_start_timeout_ms: u64,
-    /// Rolling timeout after a streaming response has started.
-    pub stream_idle_timeout_ms: u64,
+    /// One budget shared by connection attempts, retry delays, response headers, and the stream.
+    pub request_timeout_ms: u64,
     pub connect_timeout_ms: u64,
     pub max_connect_retries: u8,
 }
@@ -78,24 +77,29 @@ impl Default for ProviderRequestLimits {
     }
 }
 
-/// Aggregate bounds for a provider stream after response headers are received.
+/// Aggregate bounds observed while consuming a provider stream after response headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderStreamLimits {
     pub max_raw_bytes: u64,
     pub max_events: u64,
     pub max_tool_calls: u64,
     pub max_tool_call_argument_bytes: u64,
+    /// Projection of the canonical request deadline for limit diagnostics; it does not restart.
     pub max_duration_ms: u64,
 }
 
 impl ProviderStreamLimits {
     pub const fn product_default() -> Self {
+        Self::for_request_timeout(DEFAULT_MODEL_REQUEST_TIMEOUT_MS)
+    }
+
+    pub const fn for_request_timeout(request_timeout_ms: u64) -> Self {
         Self {
             max_raw_bytes: 16 * 1024 * 1024,
             max_events: 100_000,
             max_tool_calls: 256,
             max_tool_call_argument_bytes: 1024 * 1024,
-            max_duration_ms: 30 * 60 * 1_000,
+            max_duration_ms: request_timeout_ms,
         }
     }
 }
@@ -287,10 +291,11 @@ impl ProviderTarget {
                 message: "config field `model.model` must not be empty".to_string(),
             });
         }
-        if deadlines.response_start_timeout_ms == 0 {
+        if !(1..=MAX_MODEL_REQUEST_TIMEOUT_MS).contains(&deadlines.request_timeout_ms) {
             return Err(ResolvedTurnConfigError::ProviderRuntime {
-                message: "config field `model.request_timeout_ms` must be greater than zero"
-                    .to_string(),
+                message: format!(
+                    "config field `model.request_timeout_ms` must be between 1 and {MAX_MODEL_REQUEST_TIMEOUT_MS} milliseconds inclusive"
+                ),
             });
         }
         Ok(Self {
@@ -300,7 +305,7 @@ impl ProviderTarget {
             api_mode,
             deadlines,
             request_limits: ProviderRequestLimits::product_default(),
-            stream_limits: ProviderStreamLimits::product_default(),
+            stream_limits: ProviderStreamLimits::for_request_timeout(deadlines.request_timeout_ms),
         })
     }
 
@@ -311,8 +316,7 @@ impl ProviderTarget {
             config.model.provider_metadata_mode,
             config.model.provider_api_mode,
             ProviderDeadlines {
-                response_start_timeout_ms: config.model.request_timeout_ms,
-                stream_idle_timeout_ms: config.model.stream_idle_timeout_ms,
+                request_timeout_ms: config.model.request_timeout_ms,
                 connect_timeout_ms: config.model.connect_timeout_ms,
                 max_connect_retries: config.model.max_retries,
             },
@@ -357,7 +361,8 @@ impl ProviderTarget {
     }
 
     #[cfg(test)]
-    pub(crate) fn replace_stream_limits(&mut self, stream_limits: ProviderStreamLimits) {
+    pub(crate) fn replace_stream_limits(&mut self, mut stream_limits: ProviderStreamLimits) {
+        stream_limits.max_duration_ms = self.deadlines.request_timeout_ms;
         self.stream_limits = stream_limits;
     }
 }
@@ -514,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_turn_capture_owns_canonical_model_and_response_start_deadline() {
+    fn complete_turn_capture_owns_canonical_model_and_request_deadline() {
         let mut canonical = ResolvedConfig::default();
         canonical.model.model = "  canonical-model  ".to_string();
         let turn = ResolvedTurnConfig::capture(canonical).expect("canonical turn config");
@@ -617,7 +622,6 @@ mod tests {
     fn turn_capture_owns_the_complete_provider_deadline_policy() {
         let mut config = ResolvedConfig::default();
         config.model.request_timeout_ms = 91_000;
-        config.model.stream_idle_timeout_ms = 17_000;
         config.model.connect_timeout_ms = 3_000;
         config.model.max_retries = 4;
 
@@ -626,19 +630,26 @@ mod tests {
         assert_eq!(
             turn.provider().deadlines(),
             ProviderDeadlines {
-                response_start_timeout_ms: 91_000,
-                stream_idle_timeout_ms: 17_000,
+                request_timeout_ms: 91_000,
                 connect_timeout_ms: 3_000,
                 max_connect_retries: 4,
             }
         );
+        assert_eq!(turn.provider().stream_limits().max_duration_ms, 91_000);
+
+        let mut provider = turn.provider().clone();
+        let mut replacement = ProviderStreamLimits::product_default();
+        replacement.max_events = 7;
+        replacement.max_duration_ms = 1;
+        provider.replace_stream_limits(replacement);
+        assert_eq!(provider.stream_limits().max_events, 7);
+        assert_eq!(provider.stream_limits().max_duration_ms, 91_000);
     }
 
     #[test]
-    fn provider_target_constructor_rejects_blank_model_and_zero_response_start_deadline() {
+    fn provider_target_constructor_rejects_blank_model_and_invalid_request_deadline() {
         let deadlines = ProviderDeadlines {
-            response_start_timeout_ms: 1_000,
-            stream_idle_timeout_ms: 1_000,
+            request_timeout_ms: 1_000,
             connect_timeout_ms: 100,
             max_connect_retries: 0,
         };
@@ -658,15 +669,28 @@ mod tests {
             ProviderMetadataMode::OpenAiCompatibleOnly,
             ProviderApiMode::Responses,
             ProviderDeadlines {
-                response_start_timeout_ms: 0,
+                request_timeout_ms: 0,
                 ..deadlines
             },
         )
-        .expect_err("zero response-start deadline must fail closed");
+        .expect_err("zero request deadline must fail closed");
         assert!(
             zero_deadline
                 .to_string()
                 .contains("model.request_timeout_ms")
         );
+
+        let excessive_deadline = ProviderTarget::new(
+            "http://provider.local",
+            "configured-model",
+            ProviderMetadataMode::OpenAiCompatibleOnly,
+            ProviderApiMode::Responses,
+            ProviderDeadlines {
+                request_timeout_ms: MAX_MODEL_REQUEST_TIMEOUT_MS + 1,
+                ..deadlines
+            },
+        )
+        .expect_err("request deadline above the public maximum must fail closed");
+        assert!(excessive_deadline.to_string().contains("3600000"));
     }
 }

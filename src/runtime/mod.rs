@@ -7,13 +7,21 @@ mod local_task_executor;
 mod run_process_lease;
 mod task_owner;
 
-pub use active_run::{ActiveRunInterruptOutcome, ActiveRunLease, ActiveRunRegistry};
-pub(crate) use agent_control::PendingTriggerTerminalCommit;
+pub use active_run::{
+    ActiveRunInterruptOutcome, ActiveRunLease, ActiveRunRegistry, ActiveRunTurnTarget,
+};
 pub use agent_control::{
     ActiveAgentStatus, AgentControl, AgentControlError, AgentExecutionLease, AgentExecutionScope,
     AgentMailCommit, AgentMailDeliveryOutcome, AgentMailboxDeliveryCommit, AgentMailboxNotice,
     AgentPath, AgentRootContinuationOutcome, AgentSnapshot, AgentStatus, AgentTreeSnapshot,
     InactiveAgentStatus,
+};
+pub(crate) use agent_control::{
+    PendingTriggerTerminalCommit, RootExecutionLocalStop, RootExecutionStopDisposition,
+};
+pub(crate) use cancel::{
+    RootAdmissionReceipt, RootAdmissionSettlement, RootAdmissionSnapshot, RootAdmissionStopPlan,
+    RootAdmissionStopResolution, RootAdmissionStopSealOutcome,
 };
 pub use cancel::{
     RunCancelDeferral, RunCancelOutcome, RunCancellationCause, RunControl, RunReservationKind,

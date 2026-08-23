@@ -49,7 +49,7 @@ use crate::session::{
 use crate::storage::{
     StoreBundle,
     session_repo::{
-        AdmittedRunState, AdmittedTerminalCommit, ModelResponseWrite, PendingToolCallWrite,
+        AdmittedRunState, AdmittedTerminalSettlement, ModelResponseWrite, PendingToolCallWrite,
         RunAdmissionLeaseRenewalOutcome,
     },
 };
@@ -191,6 +191,8 @@ pub struct AgentLoop {
     prompt_builder: PromptBuilder,
     tool_services: ToolServices,
     model_request_gate: Option<Arc<tokio::sync::Semaphore>>,
+    #[cfg(test)]
+    before_success_terminal_commit: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl AgentLoop {
@@ -208,7 +210,15 @@ impl AgentLoop {
             prompt_builder,
             tool_services,
             model_request_gate: None,
+            #[cfg(test)]
+            before_success_terminal_commit: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_before_success_terminal_commit(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.before_success_terminal_commit = Some(hook);
+        self
     }
 
     pub fn with_model_request_concurrency(mut self, max_concurrent_requests: usize) -> Self {
@@ -732,8 +742,12 @@ impl AgentLoop {
                             )
                             .await;
                     };
-                    let terminal_commit = match repo
-                        .terminalize_admitted_turn_with_protocol_event_and_mailbox_phase(
+                    #[cfg(test)]
+                    if let Some(hook) = self.before_success_terminal_commit.as_ref() {
+                        hook();
+                    }
+                    let terminal_settlement = match repo
+                        .settle_admitted_turn_with_protocol_event_and_mailbox_phase(
                             request.session.session.id,
                             request.admission_id(),
                             &event,
@@ -744,7 +758,7 @@ impl AgentLoop {
                         )
                         .await
                     {
-                        Ok(commit) => commit,
+                        Ok(settlement) => settlement,
                         Err(error) => {
                             match self
                                 .durable_terminal_summary(&request)
@@ -778,11 +792,7 @@ impl AgentLoop {
                             }
                         }
                     };
-                    if matches!(
-                        terminal_commit,
-                        AdmittedTerminalCommit::NotOwned
-                            | AdmittedTerminalCommit::AlreadyTerminalizedBySameAdmission
-                    ) {
+                    if matches!(&terminal_settlement, AdmittedTerminalSettlement::NotOwned) {
                         let durable_summary = match self
                             .durable_terminal_summary(&request)
                             .await
@@ -809,12 +819,24 @@ impl AgentLoop {
                             .abandon_with_cancellation(RunCancellationCause::Superseded);
                         return Err(run_superseded_error(&request));
                     }
-                    success_commit.seal();
-                    // The repository transaction above is the terminal owner. Event delivery is
-                    // a recoverable projection path and must not turn durable success into a
-                    // synthetic supersession/failure.
-                    let _ = sink.emit_committed(event);
-                    return Ok(run_summary_from_terminal(&request, terminal));
+                    let applied = matches!(
+                        &terminal_settlement,
+                        AdmittedTerminalSettlement::Applied { .. }
+                    );
+                    let effective_terminal = terminal_settlement
+                        .into_terminal()
+                        .expect("owned admitted settlement carries its durable terminal");
+                    let summary = run_summary_from_terminal(&request, effective_terminal.clone());
+                    resolve_success_commit_from_durable_summary(success_commit, &summary);
+                    if applied {
+                        // Storage may replace stale Completed with a committed exact interrupt.
+                        // Emit the same authoritative terminal that the transaction selected.
+                        let _ = sink.emit_committed(RunEvent::TurnTerminal {
+                            session_id: request.session.session.id,
+                            terminal: Box::new(effective_terminal),
+                        });
+                    }
+                    return Ok(summary);
                 }
 
                 mailbox_delivery_phase = mailbox_delivery_phase.after_model_tool_call();
@@ -1026,22 +1048,34 @@ impl AgentLoop {
                         &failed_tool_calls_by_name,
                     ),
                 };
-                let terminal_commit = self
-                    .commit_terminal(
+                let terminal_settlement = self
+                    .settle_terminal(
                         &request,
                         &terminal,
                         active_goal_id_for_turn.as_deref(),
                         sink,
                     )
                     .await?;
-                if terminal_commit != AdmittedTerminalCommit::Applied {
-                    if let Some(summary) = self.durable_terminal_summary(&request).await? {
-                        return Ok(summary);
+                let applied = matches!(
+                    &terminal_settlement,
+                    AdmittedTerminalSettlement::Applied { .. }
+                );
+                if let Some(effective_terminal) = terminal_settlement.into_terminal() {
+                    if applied
+                        && matches!(
+                            effective_terminal.outcome,
+                            crate::protocol::TurnTerminalOutcome::Failed { .. }
+                        )
+                    {
+                        return Err(error);
                     }
-                    request.run_control.supersede();
-                    return Err(run_superseded_error(&request));
+                    return Ok(run_summary_from_terminal(&request, effective_terminal));
                 }
-                Err(error)
+                if let Some(summary) = self.durable_terminal_summary(&request).await? {
+                    return Ok(summary);
+                }
+                request.run_control.supersede();
+                Err(run_superseded_error(&request))
             }
         }
     }
@@ -1259,10 +1293,12 @@ impl AgentLoop {
         // publisher/UI projection cannot revoke it; the next loop iteration reloads the durable
         // append through ContextManager.
         let _ = sink.emit_committed(event);
-        let _ = sink.emit_runtime_only(RunEvent::RecoverableRuntimeFeedback {
+        // This accuracy warning is a canonical history fact. Route it through the recording
+        // owner so it cannot be mistaken for lossy display telemetry and silently disappear.
+        sink.emit(RunEvent::RecoverableRuntimeFeedback {
             session_id: request.session.session.id,
             message: COMPACTION_ACCURACY_WARNING.to_string(),
-        });
+        })?;
         Ok(true)
     }
 
@@ -1454,6 +1490,8 @@ impl AgentLoop {
             prior_committed_tool_results,
             model_request_count,
             sink,
+            pending_retry_lease: None,
+            approved_retry_lease: None,
         };
         let ctx = crate::tool::context::ToolContext {
             session: &request.session,
@@ -1902,9 +1940,10 @@ impl AgentLoop {
                         &failed_tool_calls_by_name,
                     ),
                 };
-                let terminal_commit = self.commit_terminal(request, &terminal, None, sink).await?;
-                if terminal_commit == AdmittedTerminalCommit::Applied {
-                    return Ok(run_summary_from_terminal(request, terminal));
+                let terminal_settlement =
+                    self.settle_terminal(request, &terminal, None, sink).await?;
+                if let Some(effective_terminal) = terminal_settlement.into_terminal() {
+                    return Ok(run_summary_from_terminal(request, effective_terminal));
                 }
                 if let Some(summary) = self.durable_terminal_summary(request).await? {
                     return Ok(summary);
@@ -1935,11 +1974,11 @@ impl AgentLoop {
                         &failed_tool_calls_by_name,
                     ),
                 };
-                let terminal_commit = self
-                    .commit_terminal(request, &terminal, expected_active_goal_id, sink)
+                let terminal_settlement = self
+                    .settle_terminal(request, &terminal, expected_active_goal_id, sink)
                     .await?;
-                if terminal_commit == AdmittedTerminalCommit::Applied {
-                    return Ok(run_summary_from_terminal(request, terminal));
+                if let Some(effective_terminal) = terminal_settlement.into_terminal() {
+                    return Ok(run_summary_from_terminal(request, effective_terminal));
                 }
                 if let Some(summary) = self.durable_terminal_summary(request).await? {
                     return Ok(summary);
@@ -1965,21 +2004,21 @@ impl AgentLoop {
         Ok(terminal.map(|terminal| run_summary_from_terminal(request, terminal)))
     }
 
-    async fn commit_terminal(
+    async fn settle_terminal(
         &self,
         request: &AgentRunRequest,
         terminal: &DurableTurnTerminal,
         expected_active_goal_id: Option<&str>,
         sink: &mut dyn RunEventSink,
-    ) -> Result<AdmittedTerminalCommit, AgentError> {
+    ) -> Result<AdmittedTerminalSettlement, AgentError> {
         let event = RunEvent::TurnTerminal {
             session_id: request.session.session.id,
             terminal: Box::new(terminal.clone()),
         };
-        let terminal_commit = self
+        let terminal_settlement = self
             .store
             .session_repo()
-            .terminalize_admitted_turn_with_protocol_event(
+            .settle_admitted_turn_with_protocol_event(
                 request.session.session.id,
                 request.admission_id(),
                 &event,
@@ -1988,12 +2027,15 @@ impl AgentLoop {
                 expected_active_goal_id,
             )
             .await?;
-        if terminal_commit == AdmittedTerminalCommit::Applied {
+        if let AdmittedTerminalSettlement::Applied { terminal } = &terminal_settlement {
             // Durable terminal state has already committed. Projection delivery is best effort
             // and can be recovered from the canonical runtime-event stream.
-            let _ = sink.emit_committed(event);
+            let _ = sink.emit_committed(RunEvent::TurnTerminal {
+                session_id: request.session.session.id,
+                terminal: Box::new(terminal.clone()),
+            });
         }
-        Ok(terminal_commit)
+        Ok(terminal_settlement)
     }
 }
 
@@ -2228,6 +2270,12 @@ async fn renew_admission_lease(
         .await?;
     match renewed {
         RunAdmissionLeaseRenewalOutcome::Renewed => Ok(()),
+        RunAdmissionLeaseRenewalOutcome::InterruptRequested(cause) => {
+            request
+                .run_control
+                .request_cancel(RunCancellationCause::Interruption(cause));
+            Err(run_superseded_error(request))
+        }
         RunAdmissionLeaseRenewalOutcome::StopFenced(outcome) => {
             classify_run_control_for_terminal_outcome(&request.run_control, &outcome);
             Err(run_superseded_error(request))
@@ -2521,6 +2569,8 @@ struct AgentPermissionGuardian<'a> {
     prior_committed_tool_results: &'a [PermissionGuardianPriorToolResult],
     model_request_count: &'a mut usize,
     sink: &'a mut dyn RunEventSink,
+    pending_retry_lease: Option<crate::storage::PermissionReviewLease>,
+    approved_retry_lease: Option<crate::storage::PermissionReviewLease>,
 }
 
 impl AgentPermissionGuardian<'_> {
@@ -2533,13 +2583,64 @@ impl AgentPermissionGuardian<'_> {
         crate::tool::permission_guardian::PermissionGuardianError,
     > {
         use crate::tool::permission_guardian::PermissionGuardianError;
-        let task_context = permission_guardian_context(&self.agent_loop.store, self.request)
-            .await
-            .map_err(|reason| {
-                PermissionGuardianError::Request(format!(
-                    "canonical user authorization context is incomplete: {reason}"
-                ))
-            })?;
+        let authority =
+            permission_guardian_authority_snapshot(&self.agent_loop.store, self.request)
+                .await
+                .map_err(|reason| {
+                    PermissionGuardianError::Request(format!(
+                        "canonical user authorization context is incomplete: {reason}"
+                    ))
+                })?;
+        let task_context = &authority.context;
+        let effect_keys = crate::tool::permission_guardian::permission_retry_effect_keys(
+            permission_request,
+            action_evidence,
+            self.committed_tool_request,
+            &self.request.session.workspace.root,
+        )?;
+        let fence_key = crate::storage::PermissionRetryFenceKey::new(
+            authority.root_session_id,
+            effect_keys.family_version,
+            effect_keys.family_sha256,
+        )
+        .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+        match self
+            .agent_loop
+            .store
+            .permission_retry_fence_store()
+            .begin_review(fence_key, authority.generation, effect_keys.identity_sha256)
+            .map_err(|error| PermissionGuardianError::Request(error.to_string()))?
+        {
+            crate::storage::BeginPermissionReview::Claimed(lease) => {
+                self.pending_retry_lease = Some(lease);
+            }
+            crate::storage::BeginPermissionReview::Blocked(record) => {
+                return Err(PermissionGuardianError::RetryFenced(format!(
+                    "root session {} already has {:?} review {} for authority generation {} (outcome={:?})",
+                    record.key.root_session_id(),
+                    record.state,
+                    record.review_id,
+                    record.authority_history_item_id,
+                    record.outcome,
+                )));
+            }
+            crate::storage::BeginPermissionReview::AuthorityChanged {
+                current_authority_history_item_id,
+            } => {
+                return Err(PermissionGuardianError::Request(format!(
+                    "canonical user authorization changed before permission review admission (current generation: {current_authority_history_item_id:?})"
+                )));
+            }
+        }
+
+        if resolved_guardian_isolation_transport(self.request)
+            != GuardianIsolationTransport::LmStudioResponses
+        {
+            return Err(PermissionGuardianError::Request(
+                "non-thinking automatic permission review is only verified for the LM Studio native Responses transport; this provider/API mode was not contacted"
+                    .to_string(),
+            ));
+        }
 
         let input = serde_json::to_string_pretty(&serde_json::json!({
             "trusted_world_state": &self.trusted_world_state.snapshot,
@@ -2560,7 +2661,29 @@ impl AgentPermissionGuardian<'_> {
         .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
         let mut model = self.request.model_profile();
         model.max_output_tokens = model.max_output_tokens.clamp(1, 512);
+        // The task profile may intentionally suppress typed reasoning. The Guardian owns one
+        // explicit `none` request instead: the current LM Studio Responses contract was live-
+        // verified to turn a host-default 17-token reasoning response into zero reasoning tokens.
+        // A provider that rejects this explicit disable fails the review closed after the durable
+        // claim is established; it must never silently inherit task-generation Thinking.
+        model.capabilities.supports_reasoning = true;
         let resolved_model = &self.request.turn.resolved_config().runtime_config().model;
+        let guardian_reasoning = crate::llm::ReasoningRequest {
+            effort: Some(crate::config::ReasoningEffort::None),
+            summary: crate::config::ReasoningSummary::None,
+        };
+        let guardian_reasoning_capability = match resolved_model.provider_api_mode {
+            crate::config::ProviderApiMode::Responses => {
+                crate::config::ProviderReasoningCapability::Responses {
+                    supports_summary: false,
+                }
+            }
+            crate::config::ProviderApiMode::ChatCompletions => {
+                crate::config::ProviderReasoningCapability::ChatCompletions {
+                    parameters: crate::config::ChatCompletionsReasoningParameters::EffortOnly,
+                }
+            }
+        };
         let mut guardian_request = ChatRequest::new(
             self.request.turn.provider_target().clone(),
             model,
@@ -2569,8 +2692,8 @@ impl AgentPermissionGuardian<'_> {
                 .to_string(),
             vec![ModelMessage::User { content: input }],
             Vec::new(),
-            None,
-            crate::config::ProviderReasoningCapability::Unsupported,
+            Some(guardian_reasoning),
+            guardian_reasoning_capability,
             resolved_model.extra_headers.clone(),
         );
         guardian_request.extra_body =
@@ -2618,9 +2741,7 @@ impl AgentPermissionGuardian<'_> {
                             ))?);
                         }
                         _ = cancel.cancelled() => {
-                            return Err(PermissionGuardianError::Request(
-                                "permission review was cancelled".to_string()
-                            ));
+                            return Err(PermissionGuardianError::Cancelled);
                         }
                         _ = tokio::time::sleep(Duration::from_millis(100)) => {
                             ensure_admission_active(&self.agent_loop.store, self.request)
@@ -2653,9 +2774,7 @@ impl AgentPermissionGuardian<'_> {
                 tokio::select! {
                     response = &mut generation => break response,
                     _ = cancel.cancelled() => {
-                        return Err(PermissionGuardianError::Request(
-                            "permission review was cancelled".to_string()
-                        ));
+                        return Err(PermissionGuardianError::Cancelled);
                     }
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {
                         ensure_admission_active(&self.agent_loop.store, self.request)
@@ -2667,6 +2786,9 @@ impl AgentPermissionGuardian<'_> {
         };
         let response = match response_result {
             Ok(response) => {
+                if response.finish_reason == FinishReason::Cancelled {
+                    return Err(PermissionGuardianError::Cancelled);
+                }
                 account_permission_guardian_goal_usage(
                     &guardian_store,
                     guardian_session_id,
@@ -2688,6 +2810,17 @@ impl AgentPermissionGuardian<'_> {
             }
         };
         let collector = collector.into_inner();
+        if response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.reasoning_tokens)
+            .is_some_and(|tokens| tokens > 0)
+            || collector.reasoning_summary_seen
+        {
+            return Err(PermissionGuardianError::Request(
+                "provider did not honor the Guardian's explicit non-thinking request".to_string(),
+            ));
+        }
         crate::llm::validate_toolless_text_response(
             "automatic permission review",
             &response,
@@ -2713,33 +2846,162 @@ impl crate::tool::permission_guardian::PermissionGuardian for AgentPermissionGua
     > {
         use crate::tool::permission_guardian::PermissionGuardianError;
         let cancel = self.request.cancel_token();
-        tokio::select! {
-            _ = cancel.cancelled() => Err(PermissionGuardianError::Request(
-                "permission review was cancelled".to_string()
-            )),
-            result = tokio::time::timeout(
-                PERMISSION_GUARDIAN_TOTAL_DEADLINE,
-                self.review_inner(permission_request, action_evidence),
-            ) => match result {
-                Ok(result) => result,
-                Err(_) => Err(PermissionGuardianError::Request(format!(
-                    "permission review exceeded its total deadline of {} seconds",
-                    PERMISSION_GUARDIAN_TOTAL_DEADLINE.as_secs()
-                ))),
-            },
+        let result = permission_guardian_review_with_deadline(
+            cancel,
+            PERMISSION_GUARDIAN_TOTAL_DEADLINE,
+            self.review_inner(permission_request, action_evidence),
+        )
+        .await;
+
+        let Some(lease) = self.pending_retry_lease.take() else {
+            return match result {
+                Err(
+                    PermissionGuardianError::Cancelled | PermissionGuardianError::RetryFenced(_),
+                ) => result,
+                Err(PermissionGuardianError::UnfencedAdmission(_)) => result,
+                Err(error) => Err(PermissionGuardianError::UnfencedAdmission(
+                    error.to_string(),
+                )),
+                Ok(_) => Err(PermissionGuardianError::UnfencedAdmission(
+                    "Guardian returned a decision without a durable retry-fence claim".to_string(),
+                )),
+            };
+        };
+        let fence_outcome = permission_retry_fence_outcome(&result);
+        match &result {
+            Ok(crate::tool::permission_guardian::PermissionGuardianDecision::Allow { .. }) => {
+                require_owned_permission_fence_transition(
+                    lease.mark_allowed_pending(),
+                    "recording Guardian Allow",
+                )?;
+                self.approved_retry_lease = Some(lease);
+            }
+            _ if fence_outcome.is_some() => {
+                require_owned_permission_fence_transition(
+                    lease.mark_denied(fence_outcome.expect("guarded by is_some")),
+                    "recording Guardian non-allow",
+                )?;
+            }
+            _ => {
+                lease
+                    .release()
+                    .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+            }
         }
+        result
+    }
+
+    fn take_approved_retry_lease(&mut self) -> Option<crate::storage::PermissionReviewLease> {
+        self.approved_retry_lease.take()
+    }
+}
+
+async fn permission_guardian_review_with_deadline<F>(
+    cancel: CancellationToken,
+    deadline: Duration,
+    review: F,
+) -> Result<
+    crate::tool::permission_guardian::PermissionGuardianDecision,
+    crate::tool::permission_guardian::PermissionGuardianError,
+>
+where
+    F: std::future::Future<
+            Output = Result<
+                crate::tool::permission_guardian::PermissionGuardianDecision,
+                crate::tool::permission_guardian::PermissionGuardianError,
+            >,
+        >,
+{
+    use crate::tool::permission_guardian::PermissionGuardianError;
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(PermissionGuardianError::Cancelled),
+        result = tokio::time::timeout(deadline, review) => match result {
+            Ok(result) => result,
+            Err(_) => Err(PermissionGuardianError::TotalDeadline {
+                seconds: deadline.as_secs(),
+            }),
+        },
+    }
+}
+
+fn require_owned_permission_fence_transition(
+    transition: Result<crate::storage::PermissionReviewTransition, crate::error::StorageError>,
+    operation: &str,
+) -> Result<(), crate::tool::permission_guardian::PermissionGuardianError> {
+    use crate::storage::PermissionReviewTransition;
+    use crate::tool::permission_guardian::PermissionGuardianError;
+    match transition {
+        Ok(PermissionReviewTransition::Applied) => Ok(()),
+        Ok(PermissionReviewTransition::NotOwned) => {
+            Err(PermissionGuardianError::UnfencedAdmission(format!(
+                "permission retry fence lost durable ownership while {operation}"
+            )))
+        }
+        Err(error) => Err(PermissionGuardianError::UnfencedAdmission(format!(
+            "could not prove durable permission retry-fence ownership while {operation}: {error}"
+        ))),
+    }
+}
+
+fn permission_retry_fence_outcome(
+    result: &Result<
+        crate::tool::permission_guardian::PermissionGuardianDecision,
+        crate::tool::permission_guardian::PermissionGuardianError,
+    >,
+) -> Option<crate::storage::PermissionRetryFenceOutcome> {
+    use crate::storage::PermissionRetryFenceOutcome;
+    use crate::tool::permission_guardian::{PermissionGuardianDecision, PermissionGuardianError};
+    match result {
+        Ok(PermissionGuardianDecision::Allow { .. }) => None,
+        Ok(PermissionGuardianDecision::Deny { .. }) => {
+            Some(PermissionRetryFenceOutcome::GuardianDenied)
+        }
+        Err(PermissionGuardianError::InvalidDecision(_)) => {
+            Some(PermissionRetryFenceOutcome::InvalidDecision)
+        }
+        Err(PermissionGuardianError::TotalDeadline { .. }) => {
+            Some(PermissionRetryFenceOutcome::DeadlineExceeded)
+        }
+        Err(PermissionGuardianError::Request(_)) => {
+            Some(PermissionRetryFenceOutcome::GuardianError)
+        }
+        Err(
+            PermissionGuardianError::Cancelled
+            | PermissionGuardianError::RetryFenced(_)
+            | PermissionGuardianError::UnfencedAdmission(_),
+        ) => None,
     }
 }
 
 fn permission_guardian_context_extra_body(configured: Option<&Value>) -> Option<Value> {
-    let configured = configured?.as_object()?;
-    let (key, value) = ["num_ctx", "numCtx"]
-        .into_iter()
-        .find_map(|key| configured.get(key).map(|value| (key, value)))?;
-    value.as_u64()?;
     let mut isolated = serde_json::Map::new();
-    isolated.insert(key.to_string(), value.clone());
-    Some(Value::Object(isolated))
+    if let Some(configured) = configured.and_then(Value::as_object)
+        && let Some((key, value)) = ["num_ctx", "numCtx"]
+            .into_iter()
+            .find_map(|key| configured.get(key).map(|value| (key, value)))
+        && value.as_u64().is_some()
+    {
+        isolated.insert(key.to_string(), value.clone());
+    }
+    (!isolated.is_empty()).then_some(Value::Object(isolated))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardianIsolationTransport {
+    LmStudioResponses,
+    Unsupported,
+}
+
+fn resolved_guardian_isolation_transport(request: &AgentRunRequest) -> GuardianIsolationTransport {
+    let model = &request.turn.resolved_config().runtime_config().model;
+    if model.provider_metadata_mode == crate::config::ProviderMetadataMode::LmStudioNativeRequired
+        && model.provider_api_mode == crate::config::ProviderApiMode::Responses
+    {
+        GuardianIsolationTransport::LmStudioResponses
+    } else {
+        GuardianIsolationTransport::Unsupported
+    }
 }
 
 async fn account_permission_guardian_goal_usage(
@@ -2851,10 +3113,16 @@ impl Drop for PermissionAuthorityWorkerInterrupt {
     }
 }
 
-async fn permission_guardian_context(
+struct PermissionGuardianAuthoritySnapshot {
+    root_session_id: crate::session::SessionId,
+    generation: HistoryItemId,
+    context: String,
+}
+
+async fn permission_guardian_authority_snapshot(
     store: &StoreBundle,
     request: &AgentRunRequest,
-) -> Result<String, String> {
+) -> Result<PermissionGuardianAuthoritySnapshot, String> {
     let authority_session_id = permission_guardian_authority_session_id(
         request.session.session.id,
         request.agent_context.as_ref(),
@@ -2899,12 +3167,13 @@ pub(crate) fn permission_guardian_authority_session_id(
 fn permission_guardian_context_from_items(
     authority_session_id: crate::session::SessionId,
     items: Vec<crate::protocol::HistoryItem>,
-) -> Result<String, String> {
+) -> Result<PermissionGuardianAuthoritySnapshot, String> {
     const MAX_ITEM_CHARS: usize = 8_000;
     const MAX_TOTAL_CHARS: usize = 16_000;
 
     let mut total_chars = 0usize;
     let mut authority = Vec::new();
+    let mut generation = None;
     for item in items {
         let (kind, content) = match &item.payload {
             HistoryItemPayload::UserTurn { content, .. } => ("user_turn", content),
@@ -2942,6 +3211,7 @@ fn permission_guardian_context_from_items(
             ));
         }
         total_chars = total_chars.saturating_add(chars);
+        generation = Some(item.id);
         authority.push(serde_json::json!({
             "kind": kind,
             "history_item_id": item.id,
@@ -2953,11 +3223,17 @@ fn permission_guardian_context_from_items(
             "no canonical text UserTurn or SteerTurn is available in durable root session {authority_session_id}"
         ));
     }
-    serde_json::to_string(&serde_json::json!({
+    let generation = generation.expect("non-empty authority has a generation");
+    let context = serde_json::to_string(&serde_json::json!({
         "authority_session_id": authority_session_id,
         "canonical_user_authority": authority,
     }))
-    .map_err(|error| format!("canonical user authority could not be serialized: {error}"))
+    .map_err(|error| format!("canonical user authority could not be serialized: {error}"))?;
+    Ok(PermissionGuardianAuthoritySnapshot {
+        root_session_id: authority_session_id,
+        generation,
+        context,
+    })
 }
 
 #[derive(Default)]
@@ -2968,6 +3244,7 @@ struct ResponseCollector {
     tool_call_args: HashMap<String, String>,
     tool_call_names: HashMap<String, String>,
     provider_phases: Vec<crate::llm::ProviderPhaseEvent>,
+    reasoning_summary_seen: bool,
 }
 
 impl LlmEventSink for ResponseCollector {
@@ -2976,7 +3253,9 @@ impl LlmEventSink for ResponseCollector {
             LlmEvent::TextDelta(delta) => {
                 self.text.push_str(&delta);
             }
-            LlmEvent::ReasoningSummaryDelta(_) => {}
+            LlmEvent::ReasoningSummaryDelta(_) => {
+                self.reasoning_summary_seen = true;
+            }
             LlmEvent::ToolCallStart { call_id, tool_name } => {
                 if !self.tool_call_order.iter().any(|seen| seen == &call_id) {
                     self.tool_call_order.push(call_id.clone());
@@ -3167,15 +3446,13 @@ fn request_diagnostics(
 ) -> RequestDiagnosticsPart {
     let context_window = context_window
         .unwrap_or_else(|| ContextWindowTokenStatus::for_request(request, overflow_margin_tokens));
+    let request_timeout_ms = request.provider_target().deadlines().request_timeout_ms;
     RequestDiagnosticsPart {
         provider: "openai_compat".to_string(),
         model_name: request.model.name.clone(),
         base_url: request.provider_target().sanitized_endpoint().to_string(),
-        request_timeout_ms: request
-            .provider_target()
-            .deadlines()
-            .response_start_timeout_ms,
-        stream_idle_timeout_ms: request.provider_target().deadlines().stream_idle_timeout_ms,
+        request_timeout_ms,
+        stream_idle_timeout_ms: request_timeout_ms,
         configured_max_output_tokens: Some(request.model.max_output_tokens),
         effective_max_output_tokens: Some(request.effective_max_output_tokens()),
         output_budget_reason: Some(request.output_budget_reason().to_string()),
@@ -3527,7 +3804,7 @@ mod tests {
     use crate::llm::LlmResponseSummary;
     use crate::protocol::{
         ContentPart, HistoryItem, HistoryScope, ProtocolEventStore, SteerTurn, ToolLifecycleStatus,
-        UserInputItem, UserTurn,
+        TurnInterruptionCause, TurnTerminalOutcome, UserInputItem, UserTurn,
     };
     use crate::runtime::SystemClock;
     use crate::session::{
@@ -4202,6 +4479,10 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 ScriptedOutcome::Response(response) => response,
                 ScriptedOutcome::Error(error) => return Err(error),
             };
+            let scripted_usage = response.events.iter().find_map(|event| match event {
+                LlmEvent::Finished { usage, .. } => usage.clone(),
+                _ => None,
+            });
             let transport_error_usage = if response.finish_reason == FinishReason::Error {
                 response.events.iter().find_map(|event| match event {
                     LlmEvent::Finished {
@@ -4224,12 +4505,12 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             }
             Ok(LlmResponseSummary {
                 finish_reason: response.finish_reason,
-                usage: Some(TokenUsage {
+                usage: scripted_usage.or(Some(TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
                     total_tokens: 15,
                     reasoning_tokens: None,
-                }),
+                })),
                 response_id: None,
             })
         }
@@ -4301,8 +4582,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             model.provider_metadata_mode,
             crate::config::model::ProviderApiMode::ChatCompletions,
             crate::config::ProviderDeadlines {
-                response_start_timeout_ms: 1,
-                stream_idle_timeout_ms: 1,
+                request_timeout_ms: 1,
                 connect_timeout_ms: 1,
                 max_connect_retries: 0,
             },
@@ -4829,6 +5109,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             None,
             false,
             Some(prior_user_text.clone()),
+            None,
         )
         .await
         .expect("pre-turn compaction run");
@@ -6222,6 +6503,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             "num_ctx": 8_192,
             "response_format": {"type": "text"},
             "task_generation_override": true,
+            "previous_response_id": "must-not-reach-the-guardian",
         }));
         config.model.extra_headers.insert(
             "x-required-provider-header".to_string(),
@@ -6259,7 +6541,19 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         let guardian_request = &run.requests[1];
         assert!(guardian_request.tools.is_empty());
         assert!(!guardian_request.parallel_tool_calls);
-        assert!(guardian_request.reasoning.is_none());
+        assert_eq!(
+            guardian_request.reasoning,
+            Some(crate::llm::ReasoningRequest {
+                effort: Some(crate::config::ReasoningEffort::None),
+                summary: crate::config::ReasoningSummary::None,
+            })
+        );
+        assert_eq!(
+            guardian_request.reasoning_capability,
+            crate::config::ProviderReasoningCapability::Responses {
+                supports_summary: false,
+            }
+        );
         assert!(guardian_request.temperature.is_none());
         assert!(guardian_request.top_p.is_none());
         assert!(guardian_request.top_k.is_none());
@@ -6269,9 +6563,12 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert!(guardian_request.stop_sequences.is_empty());
         assert_eq!(
             guardian_request.extra_body,
-            Some(serde_json::json!({"num_ctx": 8_192}))
+            Some(serde_json::json!({
+                "num_ctx": 8_192,
+            }))
         );
         assert_eq!(guardian_request.model.max_output_tokens, 512);
+        assert!(guardian_request.model.capabilities.supports_reasoning);
         assert_eq!(
             guardian_request
                 .extra_headers()
@@ -6283,6 +6580,22 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             guardian_request
                 .system_prompt
                 .contains("independent permission guardian")
+        );
+    }
+
+    #[test]
+    fn permission_guardian_extra_body_only_preserves_context_size() {
+        assert_eq!(permission_guardian_context_extra_body(None), None);
+        assert_eq!(
+            permission_guardian_context_extra_body(Some(&serde_json::json!({
+                "enable_thinking": true,
+                "numCtx": 16_384,
+                "previous_response_id": "must-not-reach-the-guardian",
+                "temperature": 0.9,
+            }))),
+            Some(serde_json::json!({
+                "numCtx": 16_384,
+            }))
         );
     }
 
@@ -6393,6 +6706,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             })),
             false,
             Some(USER_SCOPE.to_string()),
+            None,
         )
         .await
         .expect("scripted Guardian context run");
@@ -6474,6 +6788,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             })),
             false,
             Some(USER_SCOPE.to_string()),
+            None,
         )
         .await
         .expect("scripted post-compaction Guardian context run");
@@ -6561,27 +6876,24 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             None,
             false,
             Some("x".repeat(8_001)),
+            None,
         )
         .await
         .expect("scripted incomplete authority run");
-        run.summary
-            .expect("denied tool still permits final response");
+        let summary = run.summary.expect("typed fail-fast summary");
 
         assert_eq!(
             run.requests.len(),
-            2,
-            "incomplete authority must deny before a Guardian model request"
+            1,
+            "incomplete authority must terminate before a Guardian or follow-up model request"
         );
+        assert_eq!(summary.status(), SessionStatus::Failed);
         assert!(run.requests.iter().all(|request| {
             !request
                 .system_prompt
                 .contains("independent permission guardian")
         }));
-        assert_canonical_tool_statuses(
-            &run.store,
-            run.session_id,
-            &[ToolLifecycleStatus::Declined],
-        );
+        assert_canonical_tool_statuses(&run.store, run.session_id, &[ToolLifecycleStatus::Failed]);
     }
 
     #[test]
@@ -6713,6 +7025,76 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
+    async fn auto_review_timeout_path_returns_the_typed_total_deadline() {
+        let result = permission_guardian_review_with_deadline(
+            CancellationToken::new(),
+            Duration::from_millis(5),
+            std::future::pending(),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(
+                crate::tool::permission_guardian::PermissionGuardianError::TotalDeadline {
+                    seconds: 0
+                }
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn auto_review_pre_cancelled_token_wins_over_a_ready_review_error() {
+        use crate::tool::permission_guardian::PermissionGuardianError;
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result =
+            permission_guardian_review_with_deadline(cancel, Duration::from_secs(90), async {
+                Err(PermissionGuardianError::Request(
+                    "ready request error".to_string(),
+                ))
+            })
+            .await;
+
+        assert!(matches!(result, Err(PermissionGuardianError::Cancelled)));
+    }
+
+    #[test]
+    fn auto_review_retry_fence_classifies_owned_deadline_invalid_and_cancel_paths() {
+        use crate::storage::PermissionRetryFenceOutcome;
+        use crate::tool::permission_guardian::PermissionGuardianError;
+
+        assert_eq!(
+            permission_retry_fence_outcome(&Err(PermissionGuardianError::TotalDeadline {
+                seconds: 90
+            }),),
+            Some(PermissionRetryFenceOutcome::DeadlineExceeded)
+        );
+        assert_eq!(
+            permission_retry_fence_outcome(&Err(PermissionGuardianError::InvalidDecision(
+                "EOF while parsing an object".to_string(),
+            )),),
+            Some(PermissionRetryFenceOutcome::InvalidDecision)
+        );
+        assert_eq!(
+            permission_retry_fence_outcome(&Err(PermissionGuardianError::Cancelled),),
+            None,
+            "operator Stop must release an in-flight claim rather than leave a retry denial"
+        );
+    }
+
+    #[test]
+    fn auto_review_fails_terminally_when_fence_settlement_is_not_owned() {
+        assert!(matches!(
+            require_owned_permission_fence_transition(
+                Ok(crate::storage::PermissionReviewTransition::NotOwned),
+                "recording test decision",
+            ),
+            Err(crate::tool::permission_guardian::PermissionGuardianError::UnfencedAdmission(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn auto_review_mcp_guardian_receives_full_arguments_beyond_human_preview() {
         let mut config = ResolvedConfig::default();
         config.permissions.access_mode = AccessMode::AutoReview;
@@ -6784,7 +7166,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             (
                 "deny",
                 r#"{"decision":"deny","rationale":"not authorized"}"#,
-                crate::config::model::ProviderApiMode::ChatCompletions,
+                crate::config::model::ProviderApiMode::Responses,
             ),
             (
                 "invalid",
@@ -6826,6 +7208,201 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 &[ToolLifecycleStatus::Declined],
             );
         }
+    }
+
+    #[tokio::test]
+    async fn auto_review_retry_fence_blocks_varied_shell_workarounds_until_new_authority() {
+        for (label, guardian_output) in [
+            (
+                "deny",
+                r#"{"decision":"deny","rationale":"not authorized"}"#,
+            ),
+            ("invalid", &"x".repeat(512)),
+        ] {
+            let mut config = ResolvedConfig::default();
+            config.permissions.access_mode = AccessMode::AutoReview;
+            let run = run_scripted(
+                config,
+                vec![
+                    scripted_escalated_shell_call(
+                        &format!("guardian_retry_{label}_first"),
+                        "python -m pytest -q",
+                    ),
+                    ScriptedResponse {
+                        events: vec![LlmEvent::TextDelta(guardian_output.to_string())],
+                        finish_reason: FinishReason::Stop,
+                    },
+                    scripted_escalated_shell_call(
+                        &format!("guardian_retry_{label}_workaround"),
+                        "python -c \"import shutil; shutil.rmtree('.pytest-tmp')\"",
+                    ),
+                    ScriptedResponse {
+                        events: vec![LlmEvent::TextDelta(
+                            "reported the blocked operation without retrying".to_string(),
+                        )],
+                        finish_reason: FinishReason::Stop,
+                    },
+                ],
+            )
+            .await
+            .expect(label);
+            let summary = run.summary.expect(label);
+
+            assert_eq!(summary.status(), SessionStatus::Completed, "{label}");
+            assert_eq!(summary.metrics().model_request_count, 4, "{label}");
+            assert_eq!(run.confirmations.len(), 0, "{label}");
+            assert_eq!(
+                run.requests
+                    .iter()
+                    .filter(|request| request
+                        .system_prompt
+                        .contains("independent permission guardian"))
+                    .count(),
+                1,
+                "the equivalent workaround must be declined without a second Guardian request ({label})"
+            );
+            assert_canonical_tool_statuses(
+                &run.store,
+                run.session_id,
+                &[ToolLifecycleStatus::Declined, ToolLifecycleStatus::Declined],
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_review_unverified_transport_is_fenced_without_a_guardian_provider_request() {
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::AutoReview;
+        config.model.provider_api_mode = crate::config::ProviderApiMode::ChatCompletions;
+        let run = run_scripted(
+            config,
+            vec![
+                scripted_escalated_shell_call("guardian_unverified_transport", "echo must-not-run"),
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        "reported that the Guardian transport is unsupported".to_string(),
+                    )],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("unverified Guardian transport run");
+        let summary = run.summary.expect("completed summary");
+
+        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_eq!(run.requests.len(), 2);
+        assert!(run.requests.iter().all(|request| {
+            !request
+                .system_prompt
+                .contains("independent permission guardian")
+        }));
+        assert_canonical_tool_statuses(
+            &run.store,
+            run.session_id,
+            &[ToolLifecycleStatus::Declined],
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_review_rejects_nonzero_reasoning_after_explicit_none() {
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::AutoReview;
+        let run = run_scripted(
+            config,
+            vec![
+                scripted_escalated_shell_call(
+                    "guardian_reasoning_not_disabled",
+                    "echo must-not-run",
+                ),
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::TextDelta(
+                            r#"{"decision":"allow","rationale":"looks scoped"}"#.to_string(),
+                        ),
+                        LlmEvent::Finished {
+                            finish_reason: FinishReason::Stop,
+                            usage: Some(TokenUsage {
+                                prompt_tokens: 20,
+                                completion_tokens: 18,
+                                total_tokens: 38,
+                                reasoning_tokens: Some(17),
+                            }),
+                        },
+                    ],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        "reported failed Thinking isolation".to_string(),
+                    )],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("reasoning isolation failure run");
+        let summary = run.summary.expect("completed summary");
+
+        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_canonical_tool_statuses(
+            &run.store,
+            run.session_id,
+            &[ToolLifecycleStatus::Declined],
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_review_cancelled_provider_finish_releases_claim_for_a_new_review() {
+        let mut config = ResolvedConfig::default();
+        config.permissions.access_mode = AccessMode::AutoReview;
+        let run = run_scripted(
+            config,
+            vec![
+                scripted_escalated_shell_call(
+                    "guardian_cancelled_finish_first",
+                    "python -m pytest -q",
+                ),
+                ScriptedResponse {
+                    events: Vec::new(),
+                    finish_reason: FinishReason::Cancelled,
+                },
+                scripted_escalated_shell_call(
+                    "guardian_cancelled_finish_second",
+                    "python -c \"print('new review')\"",
+                ),
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        r#"{"decision":"deny","rationale":"not authorized"}"#.to_string(),
+                    )],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("reported cancellation".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("cancelled Guardian finish run");
+        let summary = run.summary.expect("completed summary");
+
+        assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_eq!(
+            run.requests
+                .iter()
+                .filter(|request| request
+                    .system_prompt
+                    .contains("independent permission guardian"))
+                .count(),
+            2,
+            "a provider-level Cancelled finish must release the in-flight fence claim"
+        );
+        assert_canonical_tool_statuses(
+            &run.store,
+            run.session_id,
+            &[ToolLifecycleStatus::Declined, ToolLifecycleStatus::Declined],
+        );
     }
 
     #[tokio::test]
@@ -6890,6 +7467,10 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                     }],
                     finish_reason: FinishReason::Error,
                 },
+                scripted_escalated_shell_call(
+                    "guardian_provider_error_workaround",
+                    "python -c \"print('varied retry')\"",
+                ),
                 ScriptedResponse {
                     events: vec![LlmEvent::TextDelta("used a safer route".to_string())],
                     finish_reason: FinishReason::Stop,
@@ -6904,7 +7485,17 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert_canonical_tool_statuses(
             &run.store,
             run.session_id,
-            &[ToolLifecycleStatus::Declined],
+            &[ToolLifecycleStatus::Declined, ToolLifecycleStatus::Declined],
+        );
+        assert_eq!(
+            run.requests
+                .iter()
+                .filter(|request| request
+                    .system_prompt
+                    .contains("independent permission guardian"))
+                .count(),
+            1,
+            "a provider error must durably fence a varied elevated retry"
         );
         let goal = run
             .store
@@ -6913,7 +7504,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             .await
             .expect("goal")
             .expect("stored goal");
-        assert_eq!(goal.tokens_used, 67);
+        assert_eq!(goal.tokens_used, 82);
     }
 
     #[tokio::test]
@@ -7484,31 +8075,65 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert!(started_at.elapsed() < Duration::from_secs(1));
     }
 
-    #[tokio::test]
-    async fn permission_abort_origin_is_declined_while_same_root_observer_is_cancelled() {
+    #[test]
+    fn permission_abort_origin_is_declined_while_same_root_observer_is_cancelled() {
         let mut config = ResolvedConfig::default();
         config.permissions.access_mode = AccessMode::FullAccess;
         let run_control = RunControl::new();
         let start_barrier = Arc::new(tokio::sync::Barrier::new(2));
-        let origin = run_scripted_with_control_and_tool(
-            config.clone(),
-            vec![scripted_write_call("abort_origin")],
-            run_control.clone(),
-            Arc::new(TerminalRaceTool {
-                behavior: TerminalRaceToolBehavior::PermissionAbortOrigin,
-                start_barrier: Some(Arc::clone(&start_barrier)),
-            }),
-        );
-        let observer = run_scripted_with_control_and_tool(
-            config,
-            vec![scripted_write_call("abort_observer")],
-            run_control,
-            Arc::new(TerminalRaceTool {
-                behavior: TerminalRaceToolBehavior::ApprovalAbortObserver,
-                start_barrier: Some(start_barrier),
-            }),
-        );
-        let (origin, observer) = tokio::join!(origin, observer);
+        let thread_start = Arc::new(std::sync::Barrier::new(3));
+        let (origin, observer) = std::thread::scope(|scope| {
+            let origin_start = Arc::clone(&thread_start);
+            let origin_thread = scope.spawn({
+                let start_barrier = Arc::clone(&start_barrier);
+                let run_control = run_control.clone();
+                let config = config.clone();
+                move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("origin fixture runtime");
+                    origin_start.wait();
+                    runtime.block_on(run_scripted_with_control_and_tool(
+                        config,
+                        vec![scripted_write_call("abort_origin")],
+                        run_control,
+                        Arc::new(TerminalRaceTool {
+                            behavior: TerminalRaceToolBehavior::PermissionAbortOrigin,
+                            start_barrier: Some(start_barrier),
+                        }),
+                    ))
+                }
+            });
+            let observer_start = Arc::clone(&thread_start);
+            let observer_thread = scope.spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("observer fixture runtime");
+                observer_start.wait();
+                runtime.block_on(run_scripted_with_control_and_tool(
+                    config,
+                    vec![scripted_write_call("abort_observer")],
+                    run_control,
+                    Arc::new(TerminalRaceTool {
+                        behavior: TerminalRaceToolBehavior::ApprovalAbortObserver,
+                        start_barrier: Some(start_barrier),
+                    }),
+                ))
+            });
+
+            thread_start.wait();
+            let origin = match origin_thread.join() {
+                Ok(origin) => origin,
+                Err(panic) => std::panic::resume_unwind(panic),
+            };
+            let observer = match observer_thread.join() {
+                Ok(observer) => observer,
+                Err(panic) => std::panic::resume_unwind(panic),
+            };
+            (origin, observer)
+        });
         let origin = origin.expect("origin run setup");
         let observer = observer.expect("observer run setup");
 
@@ -7988,13 +8613,14 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             .expect("session");
         let session_id = session.session.id;
         let turn_id = TurnId::new();
-        let admission_id = store
+        let admission = store
             .session_repo()
             .admit_session_turn(session_id, turn_id)
             .await
             .expect("admit turn")
-            .expect("turn owner")
-            .admission_id;
+            .expect("turn owner");
+        let admission_id = admission.admission_id;
+        let admission_revision = admission.admission_revision;
         let user_turn = UserTurn {
             turn_id,
             items: vec![UserInputItem::Text {
@@ -8029,6 +8655,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                     .session_repo()
                     .accept_active_turn_steer(
                         session_id,
+                        admission_revision,
                         &SteerTurn {
                             expected_turn_id: turn_id,
                             items: vec![UserInputItem::Text {
@@ -8083,6 +8710,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             .session_repo()
             .accept_active_turn_steer(
                 session_id,
+                admission_revision,
                 &SteerTurn {
                     expected_turn_id: turn_id,
                     items: vec![UserInputItem::Text {
@@ -8335,6 +8963,67 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 .expect("terminal lookup")
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn success_commit_returns_and_emits_the_exact_request_terminal_for_root_and_child() {
+        for cause in [
+            TurnInterruptionCause::UserStop,
+            TurnInterruptionCause::AgentInterrupted,
+        ] {
+            let run = run_scripted_internal_with_prior_user(
+                ResolvedConfig::default(),
+                vec![ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                })],
+                None,
+                Vec::new(),
+                crate::cli::ReviewDecision::Approved,
+                RunControl::new(),
+                None,
+                false,
+                None,
+                Some(cause),
+            )
+            .await
+            .expect("scripted success-race setup");
+
+            let summary = run
+                .summary
+                .expect("the authoritative exact interrupt replaces stale success");
+            assert!(matches!(
+                summary.terminal().outcome,
+                TurnTerminalOutcome::Interrupted { cause: actual } if actual == cause
+            ));
+            assert_eq!(
+                run.run_control.cause(),
+                Some(RunCancellationCause::Interruption(cause))
+            );
+            let emitted = run
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    RunEvent::TurnTerminal { terminal, .. } => Some(terminal.as_ref()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(emitted.len(), 1);
+            assert!(matches!(
+                emitted[0].outcome,
+                TurnTerminalOutcome::Interrupted { cause: actual } if actual == cause
+            ));
+            assert!(matches!(
+                run.store
+                    .session_repo()
+                    .durable_terminal_for_turn(run.session_id, summary.turn_id())
+                    .await
+                    .expect("durable terminal read")
+                    .expect("durable terminal")
+                    .outcome,
+                TurnTerminalOutcome::Interrupted { cause: actual } if actual == cause
+            ));
+        }
     }
 
     #[tokio::test]
@@ -9057,6 +9746,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             replacement_tool,
             fail_committed_terminal_delivery,
             None,
+            None,
         )
         .await
     }
@@ -9072,6 +9762,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         replacement_tool: Option<Arc<dyn crate::tool::registry::Tool>>,
         fail_committed_terminal_delivery: bool,
         prior_user_text: Option<String>,
+        success_commit_interrupt: Option<TurnInterruptionCause>,
     ) -> Result<ScriptedRun, AgentError> {
         let run_control_observer = run_control.clone();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -9101,11 +9792,38 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                     base_url: "http://local".to_string(),
                     access_mode: config.permissions.access_mode,
                 },
-                workspace,
+                workspace.clone(),
             )
             .await
             .expect("session");
         let session_id = session.session.id;
+        if success_commit_interrupt == Some(TurnInterruptionCause::AgentInterrupted) {
+            let owner = session_service
+                .start_or_resume(
+                    SessionStartRequest {
+                        selector: SessionSelector::New,
+                        title: Some("test owner".to_string()),
+                        cwd: root.clone(),
+                        model: "scripted".to_string(),
+                        base_url: "http://local".to_string(),
+                        access_mode: config.permissions.access_mode,
+                    },
+                    workspace,
+                )
+                .await
+                .expect("retained child owner session");
+            store
+                .session_repo()
+                .insert_session_spawn_edge(
+                    owner.session.id,
+                    owner.session.id,
+                    session_id,
+                    "/root/worker",
+                    "worker",
+                )
+                .await
+                .expect("retained child edge");
+        }
         if let Some((objective, status, token_budget)) = goal {
             store
                 .session_repo()
@@ -9125,6 +9843,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             .as_ref()
             .map(|goal| goal_steering::GoalSnapshot::capture(goal.goal_id.clone(), &goal.goal));
         let admission_id = admission.admission_id;
+        let admission_revision = admission.admission_revision;
         let user_turn = UserTurn {
             turn_id,
             items: vec![UserInputItem::Text {
@@ -9197,10 +9916,11 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             steer.expected_turn_id = turn_id;
             store
                 .session_repo()
-                .accept_active_turn_steer(session_id, &steer)
+                .accept_active_turn_steer(session_id, admission_revision, &steer)
                 .await
                 .expect("persist pending steer");
         }
+        let interrupt_request_paths = storage_paths.clone();
         let tool_services = test_tool_services(&config, &store, storage_paths);
         let mut registry = ToolRegistry::builtin(tool_services.clone());
         if let Some(tool) = replacement_tool {
@@ -9212,6 +9932,39 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             requests: Arc::clone(&requests),
         });
         let agent = AgentLoop::new(llm, registry, store.clone(), PromptBuilder, tool_services);
+        let agent = if let Some(cause) = success_commit_interrupt {
+            agent.with_before_success_terminal_commit(Arc::new(move || {
+                let request_paths = interrupt_request_paths.clone();
+                std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("interrupt request runtime");
+                    runtime.block_on(async move {
+                        let sqlite = SqliteStore::open(&request_paths)
+                            .expect("cross-process interrupt request store");
+                        let requester =
+                            crate::session::SessionService::new(StoreBundle::new(sqlite));
+                        assert_eq!(
+                            requester
+                                .request_exact_execution_interrupt(
+                                    session_id,
+                                    turn_id,
+                                    admission_revision,
+                                    cause,
+                                )
+                                .await
+                                .expect("record exact request during success reservation"),
+                            crate::session::ExactExecutionInterruptRequestOutcome::Recorded
+                        );
+                    });
+                })
+                .join()
+                .expect("interrupt request worker");
+            }))
+        } else {
+            agent
+        };
         let next_protocol_sequence_no = store
             .protocol_event_store()
             .latest_turn_position_for_session(session_id)

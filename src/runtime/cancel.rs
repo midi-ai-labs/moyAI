@@ -1,9 +1,11 @@
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use crate::protocol::TurnInterruptionCause;
+use crate::protocol::{TurnId, TurnInterruptionCause};
+use crate::session::SessionId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunCancellationCause {
@@ -59,6 +61,134 @@ struct RunControlInner {
     wake: CancellationToken,
     classification: Mutex<RunClassification>,
     terminal_router: Mutex<Option<RunTerminalRouter>>,
+    root_admission: Mutex<RootAdmissionState>,
+    root_admission_activity: watch::Sender<u64>,
+}
+
+/// Opaque identity for one pre-database root admission attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RootAdmissionPlanId(u64);
+
+/// Exact root admission identity published before the database call starts.
+///
+/// The durable revision is intentionally absent until the database accepts the admission. The
+/// plan id prevents a delayed guard from settling a later attempt for the same session and turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RootAdmissionPlan {
+    pub(crate) plan_id: RootAdmissionPlanId,
+    pub(crate) session_id: SessionId,
+    pub(crate) turn_id: TurnId,
+}
+
+/// Exact durable identity returned by a successful root admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RootAdmissionReceipt {
+    pub(crate) session_id: SessionId,
+    pub(crate) turn_id: TurnId,
+    pub(crate) revision: u64,
+}
+
+/// Opaque identity for one single-flight root Stop seal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RootAdmissionStopSealId(u64);
+
+/// Immutable root-admission state captured at the Stop linearization point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RootAdmissionStopPlan {
+    pub(crate) seal_id: RootAdmissionStopSealId,
+    pub(crate) last_admitted: Option<RootAdmissionReceipt>,
+    pub(crate) pending: Option<RootAdmissionPlan>,
+}
+
+/// Read-only canonical owner projection for non-mutating routing decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RootAdmissionSnapshot {
+    pub(crate) last_admitted: Option<RootAdmissionReceipt>,
+    pub(crate) pending: Option<RootAdmissionPlan>,
+    pub(crate) stop_seal_id: Option<RootAdmissionStopSealId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootAdmissionStopSealOutcome {
+    Acquired(RootAdmissionStopPlan),
+    AlreadySealed,
+    RejectedClosed,
+    SequenceExhausted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootAdmissionSettlement {
+    Admitted(RootAdmissionReceipt),
+    Aborted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootAdmissionStopResolution {
+    Continue,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootAdmissionBeginError {
+    RunClosed,
+    StopSealed,
+    AdmissionPending,
+    SessionMismatch {
+        expected: SessionId,
+        actual: SessionId,
+    },
+    SequenceExhausted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootAdmissionSettleError {
+    StalePlan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootAdmissionWaitError {
+    StaleStopPlan,
+    NoPendingAdmission,
+    SettlementLost,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RootAdmissionStopLease {
+    plan: RootAdmissionStopPlan,
+    pending_settlement: Option<RootAdmissionSettlement>,
+    committed: bool,
+}
+
+#[derive(Debug)]
+struct RootAdmissionState {
+    next_plan_id: u64,
+    next_stop_seal_id: u64,
+    pending: Option<RootAdmissionPlan>,
+    last_admitted: Option<RootAdmissionReceipt>,
+    stop_lease: Option<RootAdmissionStopLease>,
+}
+
+impl Default for RootAdmissionState {
+    fn default() -> Self {
+        Self {
+            next_plan_id: 1,
+            next_stop_seal_id: 1,
+            pending: None,
+            last_admitted: None,
+            stop_lease: None,
+        }
+    }
+}
+
+/// RAII owner for one exact pre-database root admission.
+///
+/// Dropping an unsettled guard aborts only its own plan and wakes an exact Stop waiter.
+#[must_use = "a root admission must be committed after the database accepts it or aborted"]
+#[derive(Debug)]
+pub(crate) struct RootAdmissionGuard {
+    control: RunControl,
+    plan: RootAdmissionPlan,
+    settled: bool,
 }
 
 pub(crate) type RunTerminalRoute = dyn Fn(&RunControl, RunTerminalRouteKind, RunCancellationCause) -> Option<RunCancelOutcome>
@@ -143,11 +273,14 @@ impl Default for RunControl {
 
 impl RunControl {
     pub fn new() -> Self {
+        let (root_admission_activity, _) = watch::channel(0);
         Self {
             inner: Arc::new(RunControlInner {
                 wake: CancellationToken::new(),
                 classification: Mutex::new(RunClassification::default()),
                 terminal_router: Mutex::new(None),
+                root_admission: Mutex::new(RootAdmissionState::default()),
+                root_admission_activity,
             }),
         }
     }
@@ -179,6 +312,314 @@ impl RunControl {
 
     pub fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Publishes one exact root admission before its database call starts.
+    ///
+    /// Admission publication and terminal classification share the classification lock order. A
+    /// cancellation or sealed success that wins first rejects publication; publication that wins
+    /// first remains visible to a later Stop snapshot until its guard settles.
+    pub(crate) fn begin_root_admission(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Result<RootAdmissionGuard, RootAdmissionBeginError> {
+        let classification = self
+            .inner
+            .classification
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(*classification, RunClassification::Open) {
+            return Err(RootAdmissionBeginError::RunClosed);
+        }
+
+        let mut admission = self
+            .inner
+            .root_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if admission.stop_lease.is_some() {
+            return Err(RootAdmissionBeginError::StopSealed);
+        }
+        if admission.pending.is_some() {
+            return Err(RootAdmissionBeginError::AdmissionPending);
+        }
+        if let Some(last_admitted) = admission.last_admitted {
+            if last_admitted.session_id != session_id {
+                return Err(RootAdmissionBeginError::SessionMismatch {
+                    expected: last_admitted.session_id,
+                    actual: session_id,
+                });
+            }
+        }
+        let Some(next_plan_id) = admission.next_plan_id.checked_add(1) else {
+            return Err(RootAdmissionBeginError::SequenceExhausted);
+        };
+        let plan = RootAdmissionPlan {
+            plan_id: RootAdmissionPlanId(admission.next_plan_id),
+            session_id,
+            turn_id,
+        };
+        admission.next_plan_id = next_plan_id;
+        admission.pending = Some(plan);
+        drop(admission);
+        drop(classification);
+
+        Ok(RootAdmissionGuard {
+            control: self.clone(),
+            plan,
+            settled: false,
+        })
+    }
+
+    /// Returns the current canonical root admission owner without acquiring a Stop seal.
+    pub(crate) fn root_admission_snapshot(&self) -> RootAdmissionSnapshot {
+        let admission = self
+            .inner
+            .root_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        RootAdmissionSnapshot {
+            last_admitted: admission.last_admitted,
+            pending: admission.pending,
+            stop_seal_id: admission.stop_lease.map(|lease| lease.plan.seal_id),
+        }
+    }
+
+    pub(crate) fn root_admission_stop_is_sealed(&self) -> bool {
+        self.inner
+            .root_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop_lease
+            .is_some()
+    }
+
+    /// Acquires the one Stop coordinator lease and snapshots all finite durable candidates.
+    pub(crate) fn seal_root_admission_for_stop(&self) -> RootAdmissionStopSealOutcome {
+        let classification = self
+            .inner
+            .classification
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut admission = self
+            .inner
+            .root_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if admission.stop_lease.is_some() {
+            return RootAdmissionStopSealOutcome::AlreadySealed;
+        }
+        if matches!(
+            *classification,
+            RunClassification::SuccessSealed | RunClassification::Cancelled(_)
+        ) {
+            return RootAdmissionStopSealOutcome::RejectedClosed;
+        }
+        let Some(next_stop_seal_id) = admission.next_stop_seal_id.checked_add(1) else {
+            return RootAdmissionStopSealOutcome::SequenceExhausted;
+        };
+        let plan = RootAdmissionStopPlan {
+            seal_id: RootAdmissionStopSealId(admission.next_stop_seal_id),
+            last_admitted: admission.last_admitted,
+            pending: admission.pending,
+        };
+        admission.next_stop_seal_id = next_stop_seal_id;
+        admission.stop_lease = Some(RootAdmissionStopLease {
+            plan,
+            pending_settlement: None,
+            committed: false,
+        });
+        RootAdmissionStopSealOutcome::Acquired(plan)
+    }
+
+    /// Waits for the exact pending admission captured by one still-owned Stop plan.
+    ///
+    /// The watch subscription is created before inspecting state, so settlement cannot be missed.
+    /// The settlement remains stored in the Stop lease until exact release, allowing delayed or
+    /// multiple waiters to observe the same result without polling or sleeping.
+    pub(crate) async fn wait_root_admission_settlement(
+        &self,
+        stop_plan: RootAdmissionStopPlan,
+    ) -> Result<RootAdmissionSettlement, RootAdmissionWaitError> {
+        let expected_pending = stop_plan
+            .pending
+            .ok_or(RootAdmissionWaitError::NoPendingAdmission)?;
+        let mut activity = self.inner.root_admission_activity.subscribe();
+
+        loop {
+            {
+                let admission = self
+                    .inner
+                    .root_admission
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let Some(stop_lease) = admission.stop_lease else {
+                    return Err(RootAdmissionWaitError::StaleStopPlan);
+                };
+                if stop_lease.plan != stop_plan {
+                    return Err(RootAdmissionWaitError::StaleStopPlan);
+                }
+                if let Some(settlement) = stop_lease.pending_settlement {
+                    return Ok(settlement);
+                }
+                if admission.pending != Some(expected_pending) {
+                    return Err(RootAdmissionWaitError::SettlementLost);
+                }
+            }
+
+            activity
+                .changed()
+                .await
+                .expect("RunControl retains its root-admission activity sender");
+        }
+    }
+
+    /// Holds post-admission execution behind any Stop seal that already owns this root control.
+    ///
+    /// Durable Stop success is published through the outer cancellation token and returns
+    /// `Cancelled`. Exact seal release after a target-change result returns `Continue`. If a new
+    /// Stop seal wins immediately after a release, execution remains blocked behind that newer
+    /// owner as well.
+    pub(crate) async fn wait_for_root_admission_stop_resolution(
+        &self,
+    ) -> RootAdmissionStopResolution {
+        let mut activity = self.inner.root_admission_activity.subscribe();
+        loop {
+            let stop_state = self
+                .inner
+                .root_admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .stop_lease
+                .map(|lease| lease.committed);
+            if stop_state == Some(true) || self.is_cancelled() {
+                return RootAdmissionStopResolution::Cancelled;
+            }
+            if stop_state.is_none() {
+                return RootAdmissionStopResolution::Continue;
+            }
+
+            tokio::select! {
+                _ = self.inner.wake.cancelled() => {
+                    return RootAdmissionStopResolution::Cancelled;
+                }
+                changed = activity.changed() => {
+                    changed.expect("RunControl retains its root-admission activity sender");
+                }
+            }
+        }
+    }
+
+    /// Commits only the exact root-admission Stop lease and wakes its post-admission waiter.
+    ///
+    /// This deliberately does not classify the stable outer `RunControl`: ordinary User Stop
+    /// closes future root admissions but must not make independently-owned descendants inherit a
+    /// tree-wide cancellation. The current root turn is classified separately by its exact local
+    /// owner.
+    pub(crate) fn commit_root_admission_stop_seal(
+        &self,
+        expected_seal_id: RootAdmissionStopSealId,
+    ) -> bool {
+        let mut admission = self
+            .inner
+            .root_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(stop_lease) = admission.stop_lease.as_mut() else {
+            return false;
+        };
+        if stop_lease.plan.seal_id != expected_seal_id {
+            return false;
+        }
+        stop_lease.committed = true;
+        drop(admission);
+        self.notify_root_admission_activity();
+        true
+    }
+
+    /// Releases only the currently-owned Stop seal. A delayed release cannot open a newer seal.
+    pub(crate) fn release_root_admission_stop_seal(
+        &self,
+        expected_seal_id: RootAdmissionStopSealId,
+    ) -> bool {
+        let mut admission = self
+            .inner
+            .root_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if admission
+            .stop_lease
+            .is_none_or(|lease| lease.plan.seal_id != expected_seal_id || lease.committed)
+        {
+            return false;
+        }
+        admission.stop_lease = None;
+        drop(admission);
+        self.notify_root_admission_activity();
+        true
+    }
+
+    fn commit_root_admission(
+        &self,
+        expected_plan: RootAdmissionPlan,
+        revision: u64,
+    ) -> Result<RootAdmissionReceipt, RootAdmissionSettleError> {
+        let mut admission = self
+            .inner
+            .root_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if admission.pending != Some(expected_plan) {
+            return Err(RootAdmissionSettleError::StalePlan);
+        }
+        // The database result is authoritative once admission commits. Even an unexpected
+        // revision must be published to Stop; rejecting it here would leave a durable B hidden
+        // behind the older process-local A receipt.
+        let receipt = RootAdmissionReceipt {
+            session_id: expected_plan.session_id,
+            turn_id: expected_plan.turn_id,
+            revision,
+        };
+        admission.pending = None;
+        admission.last_admitted = Some(receipt);
+        if let Some(stop_lease) = &mut admission.stop_lease {
+            if stop_lease.plan.pending == Some(expected_plan) {
+                stop_lease.pending_settlement = Some(RootAdmissionSettlement::Admitted(receipt));
+            }
+        }
+        drop(admission);
+        self.notify_root_admission_activity();
+        Ok(receipt)
+    }
+
+    fn abort_root_admission(
+        &self,
+        expected_plan: RootAdmissionPlan,
+    ) -> Result<(), RootAdmissionSettleError> {
+        let mut admission = self
+            .inner
+            .root_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if admission.pending != Some(expected_plan) {
+            return Err(RootAdmissionSettleError::StalePlan);
+        }
+        admission.pending = None;
+        if let Some(stop_lease) = &mut admission.stop_lease {
+            if stop_lease.plan.pending == Some(expected_plan) {
+                stop_lease.pending_settlement = Some(RootAdmissionSettlement::Aborted);
+            }
+        }
+        drop(admission);
+        self.notify_root_admission_activity();
+        Ok(())
+    }
+
+    fn notify_root_admission_activity(&self) {
+        self.inner
+            .root_admission_activity
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 
     /// Classifies two run owners as one logical terminal action.
@@ -754,6 +1195,36 @@ fn linked_cancellation_locked(
     (outcome, wake_primary, wake_secondary)
 }
 
+impl RootAdmissionGuard {
+    /// Settles this exact plan with the durable revision returned by the database.
+    pub(crate) fn commit(
+        mut self,
+        actual_revision: u64,
+    ) -> Result<RootAdmissionReceipt, RootAdmissionSettleError> {
+        let result = self
+            .control
+            .commit_root_admission(self.plan, actual_revision);
+        self.settled = true;
+        result
+    }
+
+    /// Explicitly aborts this exact plan while retaining the prior admitted receipt.
+    pub(crate) fn abort(mut self) -> Result<(), RootAdmissionSettleError> {
+        let result = self.control.abort_root_admission(self.plan);
+        self.settled = true;
+        result
+    }
+}
+
+impl Drop for RootAdmissionGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            let _ = self.control.abort_root_admission(self.plan);
+            self.settled = true;
+        }
+    }
+}
+
 impl SuccessCommitReservation {
     pub fn seal(mut self) -> bool {
         let sealed = self.control.seal_reserved_success();
@@ -1106,5 +1577,380 @@ mod tests {
             ))
         );
         assert!(stop_during_admission.is_cancelled());
+    }
+
+    #[test]
+    fn root_admission_guard_commits_exact_receipts_and_continuation_replaces_last() {
+        let control = RunControl::new();
+        let session_id = SessionId::new();
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+
+        let admission_a = control
+            .begin_root_admission(session_id, turn_a)
+            .expect("begin A before its database admission");
+        let plan_a = admission_a.plan;
+        assert_eq!(control.root_admission_snapshot().pending, Some(plan_a));
+        let receipt_a = admission_a.commit(11).expect("commit admitted A");
+        assert_eq!(
+            receipt_a,
+            RootAdmissionReceipt {
+                session_id,
+                turn_id: turn_a,
+                revision: 11,
+            }
+        );
+        assert_eq!(
+            control.root_admission_snapshot(),
+            RootAdmissionSnapshot {
+                last_admitted: Some(receipt_a),
+                pending: None,
+                stop_seal_id: None,
+            }
+        );
+
+        let receipt_b = control
+            .begin_root_admission(session_id, turn_b)
+            .expect("begin continuation B")
+            .commit(12)
+            .expect("commit admitted B");
+        let stop_plan = match control.seal_root_admission_for_stop() {
+            RootAdmissionStopSealOutcome::Acquired(plan) => plan,
+            outcome => panic!("expected Stop seal after B, got {outcome:?}"),
+        };
+        assert_eq!(stop_plan.last_admitted, Some(receipt_b));
+        assert_eq!(stop_plan.pending, None);
+        assert!(control.release_root_admission_stop_seal(stop_plan.seal_id));
+    }
+
+    #[tokio::test]
+    async fn dropped_root_admission_guard_aborts_exact_pending_and_preserves_last() {
+        let control = RunControl::new();
+        let session_id = SessionId::new();
+        let receipt_a = control
+            .begin_root_admission(session_id, TurnId::new())
+            .expect("begin A")
+            .commit(1)
+            .expect("commit A");
+        let admission_b = control
+            .begin_root_admission(session_id, TurnId::new())
+            .expect("begin B");
+        let stop_plan = match control.seal_root_admission_for_stop() {
+            RootAdmissionStopSealOutcome::Acquired(plan) => plan,
+            outcome => panic!("expected Stop seal over pending B, got {outcome:?}"),
+        };
+        assert_eq!(stop_plan.last_admitted, Some(receipt_a));
+        assert_eq!(stop_plan.pending, Some(admission_b.plan));
+
+        let waiting_control = control.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_control
+                .wait_root_admission_settlement(stop_plan)
+                .await
+        });
+        tokio::task::yield_now().await;
+        drop(admission_b);
+
+        assert_eq!(
+            waiter.await.expect("settlement waiter task"),
+            Ok(RootAdmissionSettlement::Aborted)
+        );
+        let snapshot = control.root_admission_snapshot();
+        assert_eq!(snapshot.last_admitted, Some(receipt_a));
+        assert_eq!(snapshot.pending, None);
+        assert_eq!(snapshot.stop_seal_id, Some(stop_plan.seal_id));
+        assert!(control.release_root_admission_stop_seal(stop_plan.seal_id));
+    }
+
+    #[tokio::test]
+    async fn root_admission_wait_retains_actual_commit_even_before_waiter_subscribes() {
+        let control = RunControl::new();
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let admission = control
+            .begin_root_admission(session_id, turn_id)
+            .expect("begin admission");
+        let stop_plan = match control.seal_root_admission_for_stop() {
+            RootAdmissionStopSealOutcome::Acquired(plan) => plan,
+            outcome => panic!("expected Stop seal, got {outcome:?}"),
+        };
+        let receipt = admission.commit(41).expect("database accepted admission");
+
+        assert_eq!(
+            control.wait_root_admission_settlement(stop_plan).await,
+            Ok(RootAdmissionSettlement::Admitted(receipt))
+        );
+        assert!(control.release_root_admission_stop_seal(stop_plan.seal_id));
+    }
+
+    #[tokio::test]
+    async fn stale_root_admission_stop_plan_fails_closed_after_exact_release() {
+        let control = RunControl::new();
+        let session_id = SessionId::new();
+        let admission_a = control
+            .begin_root_admission(session_id, TurnId::new())
+            .expect("begin A");
+        let stop_a = match control.seal_root_admission_for_stop() {
+            RootAdmissionStopSealOutcome::Acquired(plan) => plan,
+            outcome => panic!("expected Stop seal A, got {outcome:?}"),
+        };
+        admission_a.abort().expect("abort A");
+        assert!(control.release_root_admission_stop_seal(stop_a.seal_id));
+
+        let admission_b = control
+            .begin_root_admission(session_id, TurnId::new())
+            .expect("begin B");
+        let stop_b = match control.seal_root_admission_for_stop() {
+            RootAdmissionStopSealOutcome::Acquired(plan) => plan,
+            outcome => panic!("expected Stop seal B, got {outcome:?}"),
+        };
+        assert_ne!(stop_a.seal_id, stop_b.seal_id);
+        assert_eq!(
+            control.wait_root_admission_settlement(stop_a).await,
+            Err(RootAdmissionWaitError::StaleStopPlan)
+        );
+        admission_b.abort().expect("abort B");
+        assert!(control.release_root_admission_stop_seal(stop_b.seal_id));
+    }
+
+    #[tokio::test]
+    async fn post_admission_stop_resolution_waits_for_exact_release() {
+        let control = RunControl::new();
+        let stop_plan = match control.seal_root_admission_for_stop() {
+            RootAdmissionStopSealOutcome::Acquired(plan) => plan,
+            outcome => panic!("expected Stop seal, got {outcome:?}"),
+        };
+        let waiting_control = control.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_control
+                .wait_for_root_admission_stop_resolution()
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(control.release_root_admission_stop_seal(stop_plan.seal_id));
+
+        assert_eq!(
+            waiter.await.expect("Stop resolution waiter task"),
+            RootAdmissionStopResolution::Continue
+        );
+    }
+
+    #[tokio::test]
+    async fn post_admission_stop_resolution_observes_outer_cancellation() {
+        let control = RunControl::new();
+        assert!(matches!(
+            control.seal_root_admission_for_stop(),
+            RootAdmissionStopSealOutcome::Acquired(_)
+        ));
+        let waiting_control = control.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_control
+                .wait_for_root_admission_stop_resolution()
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(control.interrupt(TurnInterruptionCause::UserStop));
+
+        assert_eq!(
+            waiter.await.expect("Stop resolution waiter task"),
+            RootAdmissionStopResolution::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_root_admission_stop_wakes_waiter_without_cancelling_outer_scope() {
+        let control = RunControl::new();
+        let stop_plan = match control.seal_root_admission_for_stop() {
+            RootAdmissionStopSealOutcome::Acquired(plan) => plan,
+            outcome => panic!("expected Stop seal, got {outcome:?}"),
+        };
+        let waiting_control = control.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_control
+                .wait_for_root_admission_stop_resolution()
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        assert!(control.commit_root_admission_stop_seal(stop_plan.seal_id));
+        assert_eq!(
+            waiter.await.expect("Stop resolution waiter task"),
+            RootAdmissionStopResolution::Cancelled
+        );
+        assert_eq!(control.cause(), None);
+        assert!(!control.is_cancelled());
+        assert!(control.root_admission_stop_is_sealed());
+        assert!(!control.release_root_admission_stop_seal(stop_plan.seal_id));
+        assert!(matches!(
+            control.begin_root_admission(SessionId::new(), TurnId::new()),
+            Err(RootAdmissionBeginError::StopSealed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_admission_stop_resolution_is_immediate_without_a_seal() {
+        let control = RunControl::new();
+        assert_eq!(
+            control.wait_for_root_admission_stop_resolution().await,
+            RootAdmissionStopResolution::Continue
+        );
+        assert!(control.interrupt(TurnInterruptionCause::UserStop));
+        assert_eq!(
+            control.wait_for_root_admission_stop_resolution().await,
+            RootAdmissionStopResolution::Cancelled
+        );
+    }
+
+    #[test]
+    fn root_admission_stop_seal_is_single_flight_and_release_is_exact() {
+        let control = RunControl::new();
+        let stop_a = match control.seal_root_admission_for_stop() {
+            RootAdmissionStopSealOutcome::Acquired(plan) => plan,
+            outcome => panic!("expected first Stop seal, got {outcome:?}"),
+        };
+        assert_eq!(
+            control.seal_root_admission_for_stop(),
+            RootAdmissionStopSealOutcome::AlreadySealed
+        );
+        assert!(matches!(
+            control.begin_root_admission(SessionId::new(), TurnId::new()),
+            Err(RootAdmissionBeginError::StopSealed)
+        ));
+        assert!(
+            !control
+                .release_root_admission_stop_seal(RootAdmissionStopSealId(stop_a.seal_id.0 + 1))
+        );
+        assert_eq!(
+            control.seal_root_admission_for_stop(),
+            RootAdmissionStopSealOutcome::AlreadySealed
+        );
+        assert!(control.release_root_admission_stop_seal(stop_a.seal_id));
+
+        let stop_b = match control.seal_root_admission_for_stop() {
+            RootAdmissionStopSealOutcome::Acquired(plan) => plan,
+            outcome => panic!("expected replacement Stop seal, got {outcome:?}"),
+        };
+        assert_ne!(stop_a.seal_id, stop_b.seal_id);
+        assert!(!control.release_root_admission_stop_seal(stop_a.seal_id));
+        assert!(control.release_root_admission_stop_seal(stop_b.seal_id));
+    }
+
+    #[test]
+    fn cancelled_or_success_sealed_control_rejects_new_root_admission() {
+        let cancelled = RunControl::new();
+        assert!(cancelled.interrupt(TurnInterruptionCause::UserStop));
+        assert!(matches!(
+            cancelled.begin_root_admission(SessionId::new(), TurnId::new()),
+            Err(RootAdmissionBeginError::RunClosed)
+        ));
+
+        let success_sealed = RunControl::new();
+        assert!(success_sealed.seal_success());
+        assert!(matches!(
+            success_sealed.begin_root_admission(SessionId::new(), TurnId::new()),
+            Err(RootAdmissionBeginError::RunClosed)
+        ));
+    }
+
+    #[test]
+    fn root_admission_settlement_is_exact_to_plan_id() {
+        let control = RunControl::new();
+        let guard = control
+            .begin_root_admission(SessionId::new(), TurnId::new())
+            .expect("begin admission");
+        let exact = guard.plan;
+        let stale = RootAdmissionPlan {
+            plan_id: RootAdmissionPlanId(exact.plan_id.0 + 1),
+            ..exact
+        };
+
+        assert_eq!(
+            control.abort_root_admission(stale),
+            Err(RootAdmissionSettleError::StalePlan)
+        );
+        assert_eq!(control.root_admission_snapshot().pending, Some(exact));
+        guard.abort().expect("exact guard aborts its pending plan");
+        assert_eq!(control.root_admission_snapshot().pending, None);
+    }
+
+    #[test]
+    fn root_admission_rejects_cross_session_continuation() {
+        let control = RunControl::new();
+        let owned_session = SessionId::new();
+        let other_session = SessionId::new();
+        let receipt = control
+            .begin_root_admission(owned_session, TurnId::new())
+            .expect("begin owned session")
+            .commit(7)
+            .expect("commit owned session");
+
+        assert!(matches!(
+            control.begin_root_admission(other_session, TurnId::new()),
+            Err(RootAdmissionBeginError::SessionMismatch { expected, actual })
+                if expected == owned_session && actual == other_session
+        ));
+        assert_eq!(
+            control.root_admission_snapshot(),
+            RootAdmissionSnapshot {
+                last_admitted: Some(receipt),
+                pending: None,
+                stop_seal_id: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn root_admission_publishes_non_monotonic_durable_receipt_to_stop_waiter() {
+        let control = RunControl::new();
+        let session_id = SessionId::new();
+        let receipt_a = control
+            .begin_root_admission(session_id, TurnId::new())
+            .expect("begin A")
+            .commit(20)
+            .expect("commit A");
+        let admission_b = control
+            .begin_root_admission(session_id, TurnId::new())
+            .expect("begin B");
+        let stop_plan = match control.seal_root_admission_for_stop() {
+            RootAdmissionStopSealOutcome::Acquired(plan) => plan,
+            outcome => panic!("expected Stop seal over pending B, got {outcome:?}"),
+        };
+        assert_eq!(stop_plan.last_admitted, Some(receipt_a));
+        assert_eq!(stop_plan.pending, Some(admission_b.plan));
+
+        let receipt_b = admission_b
+            .commit(19)
+            .expect("durable B must remain canonical even with a non-monotonic revision");
+        assert_eq!(
+            control.root_admission_snapshot(),
+            RootAdmissionSnapshot {
+                last_admitted: Some(receipt_b),
+                pending: None,
+                stop_seal_id: Some(stop_plan.seal_id),
+            }
+        );
+        assert_eq!(
+            control.wait_root_admission_settlement(stop_plan).await,
+            Ok(RootAdmissionSettlement::Admitted(receipt_b))
+        );
+        assert!(control.release_root_admission_stop_seal(stop_plan.seal_id));
+    }
+
+    #[test]
+    fn root_admission_value_types_are_copy_debug_and_eq() {
+        fn assert_copy_debug_eq<T: Copy + fmt::Debug + Eq>() {}
+
+        assert_copy_debug_eq::<RootAdmissionPlanId>();
+        assert_copy_debug_eq::<RootAdmissionPlan>();
+        assert_copy_debug_eq::<RootAdmissionReceipt>();
+        assert_copy_debug_eq::<RootAdmissionStopSealId>();
+        assert_copy_debug_eq::<RootAdmissionStopPlan>();
+        assert_copy_debug_eq::<RootAdmissionSnapshot>();
+        assert_copy_debug_eq::<RootAdmissionStopSealOutcome>();
+        assert_copy_debug_eq::<RootAdmissionSettlement>();
+        assert_copy_debug_eq::<RootAdmissionStopResolution>();
+        assert_copy_debug_eq::<RootAdmissionBeginError>();
+        assert_copy_debug_eq::<RootAdmissionSettleError>();
+        assert_copy_debug_eq::<RootAdmissionWaitError>();
     }
 }

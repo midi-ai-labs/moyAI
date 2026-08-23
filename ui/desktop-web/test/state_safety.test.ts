@@ -16,11 +16,14 @@ import {
   updateConfigDraftValue,
 } from "../src/config_mutation.ts";
 import {
+  confirmationFocusIsMeaningful,
   confirmationFocusSelectors,
   isRegularModalOverlay,
+  localModalIdentity,
   modalIdentity,
   modalIsOpen,
   nextDialogFocusIndex,
+  overlayPrimaryFocusSelectors,
 } from "../src/modal_state.ts";
 import {
   configCommitEnabled,
@@ -377,6 +380,7 @@ test("a repeated-click conflict wins over the earlier command response by Rust r
 test("regular modal detection excludes menu popovers and contains focus cyclically", () => {
   assert.equal(isRegularModalOverlay("provider"), true);
   assert.equal(isRegularModalOverlay("shortcuts"), true);
+  assert.equal(isRegularModalOverlay("about"), true);
   assert.equal(isRegularModalOverlay("file_menu"), false);
   assert.equal(modalIsOpen({ confirmation_visible: false, overlay: "config" }, false), true);
   assert.equal(modalIsOpen({ confirmation_visible: false, overlay: "none" }, true), true);
@@ -387,6 +391,38 @@ test("regular modal detection excludes menu popovers and contains focus cyclical
   assert.equal(nextDialogFocusIndex(0, 3, true), 2);
   assert.equal(nextDialogFocusIndex(1, 3, true), 0);
   assert.equal(nextDialogFocusIndex(-1, 0, false), -1);
+
+  assert.deepEqual(overlayPrimaryFocusSelectors("shortcuts"), [
+    ".modal button:not(:disabled)",
+    ".modal[role='dialog']",
+  ]);
+  assert.deepEqual(overlayPrimaryFocusSelectors("about"), [
+    ".modal button:not(:disabled)",
+    ".modal[role='dialog']",
+  ]);
+  assert.deepEqual(overlayPrimaryFocusSelectors("provider"), ["#provider-url"]);
+  assert.deepEqual(overlayPrimaryFocusSelectors("none"), []);
+});
+
+test("local modal identity preserves the exact side-chat delete owner and local-confirm priority", () => {
+  const sideTarget = {
+    ownerSessionId: "session:a",
+    chatId: "side:b",
+    expectedGeneration: "7",
+  };
+  assert.equal(
+    localModalIdentity(false, sideTarget),
+    'side-chat-delete:["session:a","side:b","7"]',
+  );
+  assert.equal(
+    modalIsOpen(
+      { confirmation_visible: false, overlay: "none" },
+      localModalIdentity(false, sideTarget) !== null,
+    ),
+    true,
+  );
+  assert.equal(localModalIdentity(true, sideTarget), "local-confirm");
+  assert.equal(localModalIdentity(false, null), null);
 });
 
 test("permission modal identity changes by request without changing outer modal lifecycle", () => {
@@ -407,6 +443,9 @@ test("pending permission focus targets the live status instead of disabled actio
     ".modal-actions button:not(:disabled)",
     ".permission-decision-status",
   ]);
+  assert.equal(confirmationFocusIsMeaningful(true, true), true);
+  assert.equal(confirmationFocusIsMeaningful(false, true), false);
+  assert.equal(confirmationFocusIsMeaningful(false, false), true);
 });
 
 test("navigation admission consumes the single Rust capability projection", () => {

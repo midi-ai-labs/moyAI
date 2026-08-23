@@ -109,6 +109,15 @@ const V52_HARNESS_TURN_IDENTITY: &str =
     include_str!("../../migrations/V52__harness_turn_identity.sql");
 const V53_AGENT_TRIGGER_TURN_CLAIMS: &str =
     include_str!("../../migrations/V53__agent_trigger_turn_claims.sql");
+const V54_PERMISSION_RETRY_FENCES: &str =
+    include_str!("../../migrations/V54__permission_retry_fences.sql");
+const V55_DURABLE_SIDE_CHATS: &str = include_str!("../../migrations/V55__durable_side_chats.sql");
+const V56_ROLLBACK_HARNESS_ORPHAN_RECOVERY: &str =
+    include_str!("../../migrations/V56__rollback_harness_orphan_recovery.sql");
+const V57_SESSION_ADMISSION_REVISIONS: &str =
+    include_str!("../../migrations/V57__session_admission_revisions.sql");
+const V58_EXACT_EXECUTION_INTERRUPT_REQUESTS: &str =
+    include_str!("../../migrations/V58__exact_execution_interrupt_requests.sql");
 const LEGACY_PLANNER_CUTOVER_VERSION: i64 = 32;
 const CANONICAL_PROTOCOL_STORAGE_VERSION: i64 = 33;
 const DROP_SESSIONS_MEMORY_MODE_VERSION: i64 = 34;
@@ -131,6 +140,11 @@ const DURABLE_AGENT_MAILBOX_VERSION: i64 = 50;
 const DURABLE_TURN_INPUT_QUEUE_VERSION: i64 = 51;
 const HARNESS_TURN_IDENTITY_VERSION: i64 = 52;
 const AGENT_TRIGGER_TURN_CLAIMS_VERSION: i64 = 53;
+const PERMISSION_RETRY_FENCES_VERSION: i64 = 54;
+const DURABLE_SIDE_CHATS_VERSION: i64 = 55;
+const ROLLBACK_HARNESS_ORPHAN_RECOVERY_VERSION: i64 = 56;
+const SESSION_ADMISSION_REVISIONS_VERSION: i64 = 57;
+const EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION: i64 = 58;
 const CODEX_COMPACTION_CHECKPOINT_NAME: &str = "codex_compaction_checkpoint";
 const RECURSIVE_SESSION_SPAWN_EDGES_NAME: &str = "recursive_session_spawn_edges";
 const AGENT_OWNER_RESUME_REQUESTS_NAME: &str = "agent_owner_resume_requests";
@@ -139,6 +153,11 @@ const DURABLE_AGENT_MAILBOX_NAME: &str = "durable_agent_mailbox";
 const DURABLE_TURN_INPUT_QUEUE_NAME: &str = "durable_turn_input_queue";
 const HARNESS_TURN_IDENTITY_NAME: &str = "harness_turn_identity";
 const AGENT_TRIGGER_TURN_CLAIMS_NAME: &str = "agent_trigger_turn_claims";
+const PERMISSION_RETRY_FENCES_NAME: &str = "permission_retry_fences";
+const DURABLE_SIDE_CHATS_NAME: &str = "durable_side_chats";
+const ROLLBACK_HARNESS_ORPHAN_RECOVERY_NAME: &str = "rollback_harness_orphan_recovery";
+const SESSION_ADMISSION_REVISIONS_NAME: &str = "session_admission_revisions";
+const EXACT_EXECUTION_INTERRUPT_REQUESTS_NAME: &str = "exact_execution_interrupt_requests";
 const COMPACTION_CHECKPOINT_MIGRATION_PAGE_SIZE: usize = 200;
 const SESSION_STATUS_DOMAIN: &[&str] = &["idle", "running", "completed", "cancelled", "failed"];
 const SESSION_ACCESS_MODE_DOMAIN: &[&str] = &["default", "auto_review", "full_access"];
@@ -160,7 +179,84 @@ const TOOL_CALL_STATUS_DOMAIN: &[&str] = &[
 ];
 
 pub fn run(connection: &Connection) -> Result<(), StorageError> {
+    if schema_migration_applied(connection, EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION)? {
+        validate_canonical_protocol_schema(connection)?;
+        validate_durable_agent_mailbox_data(connection)?;
+        validate_durable_turn_input_queue_data(connection)?;
+        validate_harness_turn_identity_schema(connection)?;
+        validate_harness_turn_identity_data(connection)?;
+        validate_agent_trigger_turn_claims_schema(connection)?;
+        validate_agent_trigger_turn_claims_data(connection)?;
+        validate_permission_retry_fences_schema(connection)?;
+        validate_permission_retry_fences_data(connection)?;
+        validate_durable_side_chats_schema(connection)?;
+        validate_durable_side_chats_data(connection)?;
+        validate_rollback_harness_orphan_recovery_marker(connection)?;
+        validate_session_admission_revisions_schema(connection)?;
+        validate_session_admission_revisions_data(connection)?;
+        validate_exact_execution_interrupt_requests_schema(connection)?;
+        validate_exact_execution_interrupt_requests_data(connection)?;
+        return Ok(());
+    }
+    if schema_migration_applied(connection, SESSION_ADMISSION_REVISIONS_VERSION)? {
+        validate_canonical_protocol_schema(connection)?;
+        validate_durable_agent_mailbox_data(connection)?;
+        validate_durable_turn_input_queue_data(connection)?;
+        validate_harness_turn_identity_schema(connection)?;
+        validate_harness_turn_identity_data(connection)?;
+        validate_agent_trigger_turn_claims_schema(connection)?;
+        validate_agent_trigger_turn_claims_data(connection)?;
+        validate_permission_retry_fences_schema(connection)?;
+        validate_permission_retry_fences_data(connection)?;
+        validate_durable_side_chats_schema(connection)?;
+        validate_durable_side_chats_data(connection)?;
+        validate_rollback_harness_orphan_recovery_marker(connection)?;
+        validate_session_admission_revisions_schema(connection)?;
+        validate_session_admission_revisions_data(connection)?;
+        return run_exact_execution_interrupt_requests(connection);
+    }
+    if schema_migration_applied(connection, ROLLBACK_HARNESS_ORPHAN_RECOVERY_VERSION)? {
+        validate_canonical_protocol_schema(connection)?;
+        validate_durable_agent_mailbox_data(connection)?;
+        validate_durable_turn_input_queue_data(connection)?;
+        validate_harness_turn_identity_schema(connection)?;
+        validate_harness_turn_identity_data(connection)?;
+        validate_agent_trigger_turn_claims_schema(connection)?;
+        validate_agent_trigger_turn_claims_data(connection)?;
+        validate_permission_retry_fences_schema(connection)?;
+        validate_permission_retry_fences_data(connection)?;
+        validate_durable_side_chats_schema(connection)?;
+        validate_durable_side_chats_data(connection)?;
+        validate_rollback_harness_orphan_recovery_marker(connection)?;
+        return run_session_admission_revisions(connection);
+    }
+    if schema_migration_applied(connection, DURABLE_SIDE_CHATS_VERSION)? {
+        return run_rollback_harness_orphan_recovery(connection);
+    }
+    if schema_migration_applied(connection, PERMISSION_RETRY_FENCES_VERSION)? {
+        validate_canonical_protocol_schema(connection)?;
+        validate_durable_agent_mailbox_data(connection)?;
+        validate_durable_turn_input_queue_data(connection)?;
+        validate_harness_turn_identity_schema(connection)?;
+        validate_harness_turn_identity_data(connection)?;
+        validate_agent_trigger_turn_claims_schema(connection)?;
+        validate_agent_trigger_turn_claims_data(connection)?;
+        validate_permission_retry_fences_schema(connection)?;
+        validate_permission_retry_fences_data(connection)?;
+        run_durable_side_chats(connection)?;
+        validate_durable_side_chats_schema(connection)?;
+        validate_durable_side_chats_data(connection)?;
+        return Ok(());
+    }
     if schema_migration_applied(connection, AGENT_TRIGGER_TURN_CLAIMS_VERSION)? {
+        validate_canonical_protocol_schema(connection)?;
+        validate_durable_agent_mailbox_data(connection)?;
+        validate_durable_turn_input_queue_data(connection)?;
+        validate_harness_turn_identity_schema(connection)?;
+        validate_harness_turn_identity_data(connection)?;
+        validate_agent_trigger_turn_claims_schema(connection)?;
+        validate_agent_trigger_turn_claims_data(connection)?;
+        run_permission_retry_fences(connection)?;
         validate_canonical_protocol_schema(connection)?;
         validate_durable_agent_mailbox_data(connection)?;
         validate_durable_turn_input_queue_data(connection)?;
@@ -416,6 +512,21 @@ pub fn run(connection: &Connection) -> Result<(), StorageError> {
     run_agent_owner_resume_requests(connection)?;
     validate_canonical_protocol_storage(connection)?;
     Ok(())
+}
+
+pub(crate) fn run_to_current(connection: &Connection) -> Result<(), StorageError> {
+    // Recent migrations deliberately validate and commit one authority boundary at a time.
+    // A product startup is nevertheless one user-visible migration attempt, so keep advancing
+    // until the current endpoint is present instead of requiring one app restart per version.
+    for _ in 0..=EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION {
+        run(connection)?;
+        if schema_migration_applied(connection, EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION)? {
+            return Ok(());
+        }
+    }
+    Err(StorageError::Message(format!(
+        "storage migration did not reach current endpoint V{EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION}"
+    )))
 }
 
 fn run_indexed_collaboration_mode_lookup(connection: &Connection) -> Result<(), StorageError> {
@@ -1344,7 +1455,844 @@ fn run_agent_trigger_turn_claims(connection: &Connection) -> Result<(), StorageE
             let _ = connection.execute_batch("ROLLBACK");
             Err(error)
         }
+    }?;
+    run_permission_retry_fences(connection)
+}
+
+fn run_permission_retry_fences(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if !schema_migration_applied(connection, PERMISSION_RETRY_FENCES_VERSION)? {
+            connection.execute_batch(V54_PERMISSION_RETRY_FENCES)?;
+        }
+        if !schema_migration_has_exact_name(
+            connection,
+            PERMISSION_RETRY_FENCES_VERSION,
+            PERMISSION_RETRY_FENCES_NAME,
+        )? {
+            return Err(StorageError::Message(
+                "V54 permission retry-fence migration did not record its exact schema marker"
+                    .to_string(),
+            ));
+        }
+        validate_permission_retry_fences_schema(connection)?;
+        validate_permission_retry_fences_data(connection)?;
+        let foreign_key_errors =
+            connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        if foreign_key_errors != 0 {
+            return Err(StorageError::Message(format!(
+                "V54 permission retry-fence migration produced {foreign_key_errors} foreign-key violation(s)"
+            )));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(StorageError::from),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }?;
+    run_durable_side_chats(connection)
+}
+
+fn run_durable_side_chats(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        if !schema_migration_applied(connection, DURABLE_SIDE_CHATS_VERSION)? {
+            connection.execute_batch(V55_DURABLE_SIDE_CHATS)?;
+        }
+        if !schema_migration_has_exact_name(
+            connection,
+            DURABLE_SIDE_CHATS_VERSION,
+            DURABLE_SIDE_CHATS_NAME,
+        )? {
+            return Err(StorageError::Message(
+                "V55 durable side-chat migration did not record its exact schema marker"
+                    .to_string(),
+            ));
+        }
+        validate_durable_side_chats_schema(connection)?;
+        validate_durable_side_chats_data(connection)?;
+        let foreign_key_errors =
+            connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        if foreign_key_errors != 0 {
+            return Err(StorageError::Message(format!(
+                "V55 durable side-chat migration produced {foreign_key_errors} foreign-key violation(s)"
+            )));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(StorageError::from),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }?;
+    run_rollback_harness_orphan_recovery(connection)
+}
+
+fn run_rollback_harness_orphan_recovery(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        validate_canonical_protocol_schema(connection)?;
+        validate_durable_agent_mailbox_data(connection)?;
+        validate_durable_turn_input_queue_data(connection)?;
+        validate_harness_turn_identity_schema(connection)?;
+        validate_agent_trigger_turn_claims_schema(connection)?;
+        validate_agent_trigger_turn_claims_data(connection)?;
+        validate_permission_retry_fences_schema(connection)?;
+        validate_permission_retry_fences_data(connection)?;
+        validate_durable_side_chats_schema(connection)?;
+        validate_durable_side_chats_data(connection)?;
+
+        if !schema_migration_applied(connection, ROLLBACK_HARNESS_ORPHAN_RECOVERY_VERSION)? {
+            repair_exact_rollback_harness_orphans(connection)?;
+            connection.execute_batch(V56_ROLLBACK_HARNESS_ORPHAN_RECOVERY)?;
+        }
+        validate_rollback_harness_orphan_recovery_marker(connection)?;
+        validate_harness_turn_identity_data(connection)?;
+        let foreign_key_errors =
+            connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        if foreign_key_errors != 0 {
+            return Err(StorageError::Message(format!(
+                "V56 rollback harness-orphan recovery produced {foreign_key_errors} foreign-key violation(s)"
+            )));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(StorageError::from),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }?;
+    run_session_admission_revisions(connection)
+}
+
+fn run_session_admission_revisions(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        validate_canonical_protocol_schema(connection)?;
+        validate_rollback_harness_orphan_recovery_marker(connection)?;
+        if !schema_migration_applied(connection, SESSION_ADMISSION_REVISIONS_VERSION)? {
+            connection.execute_batch(V57_SESSION_ADMISSION_REVISIONS)?;
+        }
+        if !schema_migration_has_exact_name(
+            connection,
+            SESSION_ADMISSION_REVISIONS_VERSION,
+            SESSION_ADMISSION_REVISIONS_NAME,
+        )? {
+            return Err(StorageError::Message(
+                "V57 session-admission revision migration did not record its exact schema marker"
+                    .to_string(),
+            ));
+        }
+        validate_session_admission_revisions_schema(connection)?;
+        validate_session_admission_revisions_data(connection)?;
+        let foreign_key_errors =
+            connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        if foreign_key_errors != 0 {
+            return Err(StorageError::Message(format!(
+                "V57 session-admission revision migration produced {foreign_key_errors} foreign-key violation(s)"
+            )));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(StorageError::from),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }?;
+    run_exact_execution_interrupt_requests(connection)
+}
+
+fn run_exact_execution_interrupt_requests(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        validate_canonical_protocol_schema(connection)?;
+        validate_rollback_harness_orphan_recovery_marker(connection)?;
+        validate_session_admission_revisions_schema(connection)?;
+        validate_session_admission_revisions_data(connection)?;
+        if !schema_migration_applied(connection, EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION)? {
+            connection.execute_batch(V58_EXACT_EXECUTION_INTERRUPT_REQUESTS)?;
+        }
+        if !schema_migration_has_exact_name(
+            connection,
+            EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION,
+            EXACT_EXECUTION_INTERRUPT_REQUESTS_NAME,
+        )? {
+            return Err(StorageError::Message(
+                "V58 exact execution interrupt request migration did not record its exact schema marker"
+                    .to_string(),
+            ));
+        }
+        validate_exact_execution_interrupt_requests_schema(connection)?;
+        validate_exact_execution_interrupt_requests_data(connection)?;
+        let foreign_key_errors =
+            connection.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        if foreign_key_errors != 0 {
+            return Err(StorageError::Message(format!(
+                "V58 exact execution interrupt request migration produced {foreign_key_errors} foreign-key violation(s)"
+            )));
+        }
+        Ok::<_, StorageError>(())
+    })();
+    match result {
+        Ok(()) => connection
+            .execute_batch("COMMIT")
+            .map_err(StorageError::from),
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK");
+            Err(error)
+        }
     }
+}
+
+fn validate_rollback_harness_orphan_recovery_marker(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    if !schema_migration_has_exact_name(
+        connection,
+        ROLLBACK_HARNESS_ORPHAN_RECOVERY_VERSION,
+        ROLLBACK_HARNESS_ORPHAN_RECOVERY_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V56 rollback harness-orphan recovery marker has a name other than `{ROLLBACK_HARNESS_ORPHAN_RECOVERY_NAME}`"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_session_admission_revisions_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    if !schema_migration_has_exact_name(
+        connection,
+        SESSION_ADMISSION_REVISIONS_VERSION,
+        SESSION_ADMISSION_REVISIONS_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V57 session-admission revision marker has a name other than `{SESSION_ADMISSION_REVISIONS_NAME}`"
+        )));
+    }
+    let expected_connection = canonical_session_admission_revisions_connection()?;
+    let expected_table =
+        normalized_schema_objects_for_table(&expected_connection, "session_admission_revisions")?;
+    let observed_table =
+        normalized_schema_objects_for_table(connection, "session_admission_revisions")?;
+    if observed_table != expected_table {
+        return Err(StorageError::Message(
+            "V57 marker exists but the session-admission revision table has stale SQL".to_string(),
+        ));
+    }
+    let expected_triggers = normalized_named_schema_objects(
+        &expected_connection,
+        "trigger",
+        "session_admission_revisions_%",
+    )?;
+    let observed_triggers =
+        normalized_named_schema_objects(connection, "trigger", "session_admission_revisions_%")?;
+    if observed_triggers != expected_triggers {
+        return Err(StorageError::Message(
+            "V57 marker exists but the session-admission revision triggers have stale SQL"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_session_admission_revisions_connection() -> Result<Connection, StorageError> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE sessions (id TEXT PRIMARY KEY);
+         CREATE TABLE protocol_turn_sequence_allocators (
+             session_id TEXT NOT NULL,
+             turn_id TEXT NOT NULL,
+             next_sequence_no INTEGER NOT NULL,
+             PRIMARY KEY (session_id, turn_id)
+         );
+         CREATE TABLE protocol_runtime_events (
+             session_id TEXT NOT NULL,
+             turn_id TEXT NOT NULL,
+             sequence_no INTEGER NOT NULL
+         );
+         CREATE TABLE protocol_history_items (
+             session_id TEXT NOT NULL,
+             turn_id TEXT,
+             scope_kind TEXT NOT NULL,
+             sequence_no INTEGER NOT NULL
+         );
+         CREATE TABLE protocol_turn_items (
+             session_id TEXT NOT NULL,
+             turn_id TEXT NOT NULL,
+             sequence_no INTEGER NOT NULL
+         );
+         CREATE TABLE moyai_schema_migrations (
+             version INTEGER PRIMARY KEY NOT NULL,
+             name TEXT NOT NULL
+         );",
+    )?;
+    connection.execute_batch(V57_SESSION_ADMISSION_REVISIONS)?;
+    Ok(connection)
+}
+
+fn normalized_named_schema_objects(
+    connection: &Connection,
+    object_type: &str,
+    name_pattern: &str,
+) -> Result<BTreeMap<String, String>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT name, sql
+         FROM sqlite_master
+         WHERE type = ?1 AND name LIKE ?2 AND sql IS NOT NULL
+         ORDER BY name ASC",
+    )?;
+    Ok(statement
+        .query_map((object_type, name_pattern), |row| {
+            let name = row.get::<_, String>(0)?;
+            let sql = row.get::<_, String>(1)?;
+            Ok((
+                name,
+                sql.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase(),
+            ))
+        })?
+        .collect::<Result<BTreeMap<_, _>, _>>()?)
+}
+
+fn validate_session_admission_revisions_data(connection: &Connection) -> Result<(), StorageError> {
+    let invalid_rows = connection.query_row(
+        "SELECT COUNT(*)
+         FROM sessions AS session
+         LEFT JOIN session_admission_revisions AS revision
+           ON revision.session_id = session.id
+         WHERE revision.session_id IS NULL
+            OR typeof(revision.revision) <> 'integer'
+            OR revision.revision < 0
+            OR revision.revision < (
+                SELECT COUNT(*)
+                FROM protocol_turn_sequence_allocators AS allocator
+                WHERE allocator.session_id = session.id
+            )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let orphan_rows = connection.query_row(
+        "SELECT COUNT(*)
+         FROM session_admission_revisions AS revision
+         LEFT JOIN sessions AS session ON session.id = revision.session_id
+         WHERE session.id IS NULL",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let orphan_allocators = connection.query_row(
+        "SELECT COUNT(*)
+         FROM protocol_turn_sequence_allocators AS allocator
+         LEFT JOIN sessions AS session ON session.id = allocator.session_id
+         LEFT JOIN session_admission_revisions AS revision
+           ON revision.session_id = allocator.session_id
+         WHERE session.id IS NULL OR revision.session_id IS NULL",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let canonical_turns_without_allocator = connection.query_row(
+        "SELECT COUNT(*)
+         FROM (
+             SELECT session_id, turn_id FROM protocol_runtime_events
+             UNION
+             SELECT session_id, turn_id FROM protocol_history_items
+             WHERE scope_kind = 'turn' AND turn_id IS NOT NULL
+             UNION
+             SELECT session_id, turn_id FROM protocol_turn_items
+         ) AS canonical_turn
+         LEFT JOIN protocol_turn_sequence_allocators AS allocator
+           ON allocator.session_id = canonical_turn.session_id
+          AND allocator.turn_id = canonical_turn.turn_id
+         WHERE allocator.turn_id IS NULL",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_rows != 0
+        || orphan_rows != 0
+        || orphan_allocators != 0
+        || canonical_turns_without_allocator != 0
+    {
+        return Err(StorageError::Message(format!(
+            "V57 marker exists but {invalid_rows} session(s) lack a valid revision, {orphan_rows} revision row(s) are orphaned, {orphan_allocators} turn allocator row(s) lack a revision owner, and {canonical_turns_without_allocator} canonical turn(s) lack an allocator"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_exact_execution_interrupt_requests_schema(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    if !schema_migration_has_exact_name(
+        connection,
+        EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION,
+        EXACT_EXECUTION_INTERRUPT_REQUESTS_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V58 exact execution interrupt request marker has a name other than `{EXACT_EXECUTION_INTERRUPT_REQUESTS_NAME}`"
+        )));
+    }
+    let expected_connection = canonical_exact_execution_interrupt_requests_connection()?;
+    let expected_table = normalized_schema_objects_for_table(
+        &expected_connection,
+        "exact_execution_interrupt_requests",
+    )?;
+    let observed_table =
+        normalized_schema_objects_for_table(connection, "exact_execution_interrupt_requests")?;
+    if observed_table != expected_table {
+        return Err(StorageError::Message(
+            "V58 marker exists but the exact execution interrupt request table has stale SQL"
+                .to_string(),
+        ));
+    }
+    let expected_triggers = normalized_named_schema_objects(
+        &expected_connection,
+        "trigger",
+        "exact_execution_interrupt_requests_%",
+    )?;
+    let observed_triggers = normalized_named_schema_objects(
+        connection,
+        "trigger",
+        "exact_execution_interrupt_requests_%",
+    )?;
+    if observed_triggers != expected_triggers {
+        return Err(StorageError::Message(
+            "V58 marker exists but the exact execution interrupt request triggers have stale SQL"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_exact_execution_interrupt_requests_connection() -> Result<Connection, StorageError> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE sessions (
+             id TEXT PRIMARY KEY,
+             status TEXT NOT NULL,
+             active_run_id TEXT,
+             active_turn_id TEXT,
+             active_run_lease_expires_at_ms INTEGER
+         );
+         CREATE TABLE session_admission_revisions (
+             session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+             revision INTEGER NOT NULL
+         );
+         CREATE TABLE session_spawn_edges (child_session_id TEXT PRIMARY KEY);
+         CREATE TABLE protocol_item_append_order (
+             append_position INTEGER PRIMARY KEY AUTOINCREMENT,
+             session_id TEXT NOT NULL,
+             turn_id TEXT
+         );
+         CREATE TABLE protocol_turn_sequence_allocators (
+             session_id TEXT NOT NULL,
+             turn_id TEXT NOT NULL,
+             PRIMARY KEY (session_id, turn_id)
+         );
+         CREATE TABLE protocol_runtime_events (
+             session_id TEXT NOT NULL,
+             turn_id TEXT NOT NULL,
+             msg_json TEXT NOT NULL
+         );
+         CREATE TABLE moyai_schema_migrations (
+             version INTEGER PRIMARY KEY NOT NULL,
+             name TEXT NOT NULL
+         );",
+    )?;
+    connection.execute_batch(V58_EXACT_EXECUTION_INTERRUPT_REQUESTS)?;
+    Ok(connection)
+}
+
+fn validate_exact_execution_interrupt_requests_data(
+    connection: &Connection,
+) -> Result<(), StorageError> {
+    let invalid_rows = connection.query_row(
+        "SELECT COUNT(*)
+         FROM exact_execution_interrupt_requests AS request
+         LEFT JOIN sessions AS session ON session.id = request.session_id
+         LEFT JOIN session_admission_revisions AS revision
+           ON revision.session_id = request.session_id
+         WHERE session.id IS NULL
+            OR revision.session_id IS NULL
+            OR typeof(request.admission_revision) <> 'integer'
+            OR request.admission_revision <= 0
+            OR typeof(request.requested_at_ms) <> 'integer'
+            OR request.requested_at_ms < 0
+            OR request.cause NOT IN ('user_stop', 'agent_interrupted')
+            OR session.status <> 'running'
+            OR session.active_run_id IS NOT request.admission_id
+            OR session.active_turn_id IS NOT request.turn_id
+            OR session.active_run_lease_expires_at_ms IS NULL
+            OR revision.revision IS NOT request.admission_revision
+            OR (
+                request.cause = 'user_stop'
+                AND EXISTS (
+                    SELECT 1
+                    FROM session_spawn_edges AS edge
+                    WHERE edge.child_session_id = request.session_id
+                )
+            )
+            OR (
+                request.cause = 'agent_interrupted'
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM session_spawn_edges AS edge
+                    WHERE edge.child_session_id = request.session_id
+                )
+            )
+            OR NOT EXISTS (
+                SELECT 1
+                FROM protocol_turn_sequence_allocators AS allocator
+                WHERE allocator.session_id = request.session_id
+                  AND allocator.turn_id = request.turn_id
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM protocol_runtime_events AS terminal
+                WHERE terminal.session_id = request.session_id
+                  AND terminal.turn_id = request.turn_id
+                  AND json_extract(terminal.msg_json, '$.kind') = 'turn_terminal'
+            )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let mut invalid_identities = 0usize;
+    let mut statement = connection.prepare(
+        "SELECT session_id, admission_id, turn_id
+         FROM exact_execution_interrupt_requests
+         ORDER BY session_id ASC",
+    )?;
+    let identities = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for identity in identities {
+        let (session_id, admission_id, turn_id) = identity?;
+        let canonical_ulid =
+            |value: &str| Ulid::from_string(value).is_ok_and(|parsed| parsed.to_string() == value);
+        if !canonical_ulid(&session_id)
+            || !canonical_ulid(&admission_id)
+            || !canonical_ulid(&turn_id)
+        {
+            invalid_identities += 1;
+        }
+    }
+    if invalid_rows != 0 || invalid_identities != 0 {
+        return Err(StorageError::Message(format!(
+            "V58 marker exists but {invalid_rows} exact execution interrupt request row(s) have stale ownership and {invalid_identities} row(s) have invalid typed identities"
+        )));
+    }
+    Ok(())
+}
+
+fn repair_exact_rollback_harness_orphans(connection: &Connection) -> Result<(), StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT run.id, run.session_id, run.protocol_turn_id,
+                run.canonical_terminal_runtime_event_id
+         FROM harness_runs AS run
+         INNER JOIN sessions AS session ON session.id = run.session_id
+         WHERE run.mode = 'native_runtime'
+           AND run.session_id IS NOT NULL
+           AND run.protocol_turn_id IS NOT NULL
+           AND session.status <> 'running'
+           AND session.active_turn_id IS NOT run.protocol_turn_id
+           AND NOT EXISTS (
+               SELECT 1 FROM turn_steer_inputs AS input
+               WHERE input.session_id = run.session_id AND input.turn_id = run.protocol_turn_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM protocol_history_items AS history
+               WHERE history.session_id = run.session_id AND history.turn_id = run.protocol_turn_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM protocol_runtime_events AS event
+               WHERE event.session_id = run.session_id AND event.turn_id = run.protocol_turn_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM protocol_turn_items AS item
+               WHERE item.session_id = run.session_id AND item.turn_id = run.protocol_turn_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM protocol_item_append_order AS append_order
+               WHERE append_order.session_id = run.session_id
+                 AND append_order.turn_id = run.protocol_turn_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM protocol_turn_sequence_allocators AS allocator
+               WHERE allocator.session_id = run.session_id AND allocator.turn_id = run.protocol_turn_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM agent_mailbox_messages AS mailbox
+               WHERE mailbox.recipient_session_id = run.session_id
+                 AND mailbox.delivered_turn_id = run.protocol_turn_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM agent_completion_handoffs AS handoff
+               WHERE handoff.child_session_id = run.session_id
+                 AND handoff.child_turn_id = run.protocol_turn_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM agent_deferred_completions AS deferred
+               WHERE deferred.agent_session_id = run.session_id
+                 AND deferred.agent_turn_id = run.protocol_turn_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM agent_owner_resume_requests AS resume
+               WHERE resume.owner_session_id = run.session_id
+                 AND resume.claimed_turn_id = run.protocol_turn_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM agent_trigger_turn_claims AS claim
+               WHERE claim.recipient_session_id = run.session_id
+                 AND claim.turn_id = run.protocol_turn_id
+           )
+           AND (
+               (
+                   run.status = '\"started\"'
+                   AND run.completed_at_ms IS NULL
+                   AND run.canonical_terminal_runtime_event_id IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM harness_events AS terminalized
+                       WHERE terminalized.run_id = run.id
+                         AND json_extract(terminalized.kind, '$') = 'run_terminalized'
+                   )
+               )
+               OR
+               (
+                   run.status IN ('\"pass\"', '\"fail\"', '\"blocked\"')
+                   AND run.completed_at_ms IS NOT NULL
+                   AND run.canonical_terminal_runtime_event_id IS NOT NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM protocol_runtime_events AS terminal
+                       WHERE terminal.id = run.canonical_terminal_runtime_event_id
+                   )
+                   AND (
+                       SELECT COUNT(*)
+                       FROM harness_events AS terminalized
+                       WHERE terminalized.run_id = run.id
+                         AND json_extract(terminalized.kind, '$') = 'run_terminalized'
+                         AND terminalized.created_at_ms = run.completed_at_ms
+                         AND json_extract(terminalized.payload_json, '$.type') = 'generic'
+                         AND json_extract(terminalized.payload_json, '$.data.kind') = 'turn_terminal'
+                         AND json_extract(terminalized.payload_json, '$.data.session_id') = run.session_id
+                         AND run.status = CASE json_extract(
+                             terminalized.payload_json,
+                             '$.data.terminal.outcome.kind'
+                         )
+                             WHEN 'completed' THEN '\"pass\"'
+                             WHEN 'failed' THEN '\"fail\"'
+                             WHEN 'interrupted' THEN '\"blocked\"'
+                             ELSE NULL
+                         END
+                   ) = 1
+               )
+           )
+         ORDER BY run.id ASC",
+    )?;
+    let candidates = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    for (run_id, session_id, turn_id, terminal_event_id) in &candidates {
+        run_id
+            .parse::<crate::harness::HarnessRunId>()
+            .map_err(|error| {
+                StorageError::Message(format!(
+                    "V56 recovery candidate has invalid harness run id `{run_id}`: {error}"
+                ))
+            })?;
+        let parsed_session_id = session_id.parse::<crate::session::SessionId>().map_err(
+            |error| {
+                StorageError::Message(format!(
+                    "V56 recovery candidate {run_id} has invalid session id `{session_id}`: {error}"
+                ))
+            },
+        )?;
+        turn_id
+            .parse::<crate::protocol::TurnId>()
+            .map_err(|error| {
+                StorageError::Message(format!(
+                    "V56 recovery candidate {run_id} has invalid turn id `{turn_id}`: {error}"
+                ))
+            })?;
+        if let Some(terminal_event_id) = terminal_event_id {
+            terminal_event_id
+                .parse::<crate::protocol::RuntimeEventId>()
+                .map_err(|error| {
+                    StorageError::Message(format!(
+                        "V56 recovery candidate {run_id} has invalid terminal event id `{terminal_event_id}`: {error}"
+                    ))
+                })?;
+            validate_v56_terminalized_harness_event(connection, run_id, parsed_session_id)?;
+        }
+    }
+
+    for (run_id, _, _, _) in candidates {
+        for table_name in [
+            "harness_replay_reports",
+            "harness_gate_results",
+            "harness_contracts",
+            "harness_artifacts",
+            "harness_events",
+        ] {
+            connection.execute(
+                &format!("DELETE FROM {table_name} WHERE run_id = ?1"),
+                [&run_id],
+            )?;
+        }
+        connection.execute("DELETE FROM harness_runs WHERE id = ?1", [&run_id])?;
+    }
+    Ok(())
+}
+
+fn validate_v56_terminalized_harness_event(
+    connection: &Connection,
+    run_id: &str,
+    expected_session_id: crate::session::SessionId,
+) -> Result<(), StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id, run_id, sequence_no, kind, payload_json,
+                contract_refs_json, artifact_refs_json, parent_event_id,
+                payload_sha256, created_at_ms
+         FROM harness_events
+         WHERE run_id = ?1
+           AND json_extract(kind, '$') = 'run_terminalized'
+         ORDER BY sequence_no ASC, id ASC",
+    )?;
+    let events = statement
+        .query_map([run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let [
+        (
+            event_id,
+            stored_run_id,
+            sequence_no,
+            kind_json,
+            payload_json,
+            contract_refs_json,
+            artifact_refs_json,
+            parent_event_id,
+            payload_sha256,
+            created_at_ms,
+        ),
+    ] = events.as_slice()
+    else {
+        return Err(StorageError::Message(format!(
+            "V56 recovery candidate {run_id} has no exact terminalized harness payload"
+        )));
+    };
+    event_id
+        .parse::<crate::harness::HarnessEventId>()
+        .map_err(|error| {
+            StorageError::Message(format!(
+                "V56 recovery candidate {run_id} has invalid harness event id `{event_id}`: {error}"
+            ))
+        })?;
+    crate::harness::event_store::validate_stored_event_hash(
+        event_id,
+        stored_run_id,
+        *sequence_no,
+        kind_json,
+        payload_json,
+        contract_refs_json,
+        artifact_refs_json,
+        parent_event_id.as_deref(),
+        payload_sha256,
+        *created_at_ms,
+    )
+    .map_err(|error| {
+        StorageError::Message(format!(
+            "V56 recovery candidate {run_id} has a stale terminalized harness payload hash: {error}"
+        ))
+    })?;
+    let payload = serde_json::from_str::<crate::harness::HarnessEventPayload>(payload_json)
+        .map_err(|error| {
+            StorageError::Message(format!(
+                "V56 recovery candidate {run_id} has an invalid typed terminalized harness payload: {error}"
+            ))
+        })?;
+    let crate::harness::HarnessEventPayload::Generic(run_event) = payload else {
+        return Err(StorageError::Message(format!(
+            "V56 recovery candidate {run_id} terminalized payload is not generic"
+        )));
+    };
+    let run_event =
+        serde_json::from_value::<crate::session::RunEvent>(run_event).map_err(|error| {
+            StorageError::Message(format!(
+                "V56 recovery candidate {run_id} has an invalid typed terminal run event: {error}"
+            ))
+        })?;
+    let crate::session::RunEvent::TurnTerminal {
+        session_id: event_session_id,
+        ..
+    } = run_event
+    else {
+        return Err(StorageError::Message(format!(
+            "V56 recovery candidate {run_id} payload is not a terminal run event"
+        )));
+    };
+    if event_session_id != expected_session_id {
+        return Err(StorageError::Message(format!(
+            "V56 recovery candidate {run_id} terminalized payload names a different session"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -3946,6 +4894,309 @@ fn validate_agent_trigger_turn_claims_data(connection: &Connection) -> Result<()
         return Err(StorageError::Message(format!(
             "V53 marker exists but {invalid_claims} explicit agent wake claim(s) do not own an exact active or terminal turn"
         )));
+    }
+    Ok(())
+}
+
+fn validate_permission_retry_fences_schema(connection: &Connection) -> Result<(), StorageError> {
+    if !schema_migration_applied(connection, PERMISSION_RETRY_FENCES_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V54 permission retry-fence marker".to_string(),
+        ));
+    }
+    if !schema_migration_has_exact_name(
+        connection,
+        PERMISSION_RETRY_FENCES_VERSION,
+        PERMISSION_RETRY_FENCES_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V54 permission retry-fence marker has a name other than `{PERMISSION_RETRY_FENCES_NAME}`"
+        )));
+    }
+    let expected_connection = canonical_permission_retry_fences_connection()?;
+    let expected =
+        normalized_schema_objects_for_table(&expected_connection, "permission_retry_fences")?;
+    let observed = normalized_schema_objects_for_table(connection, "permission_retry_fences")?;
+    for ((object_type, object_name), expected_sql) in &expected {
+        let Some(observed_sql) = observed.get(&(object_type.clone(), object_name.clone())) else {
+            return Err(StorageError::Message(format!(
+                "V54 marker exists but required {object_type} `{object_name}` is missing"
+            )));
+        };
+        if observed_sql != expected_sql {
+            return Err(StorageError::Message(format!(
+                "V54 marker exists but {object_type} `{object_name}` has stale SQL"
+            )));
+        }
+    }
+    for (object_type, object_name) in observed.keys() {
+        if !expected.contains_key(&(object_type.clone(), object_name.clone())) {
+            return Err(StorageError::Message(format!(
+                "V54 marker exists but unexpected {object_type} `{object_name}` owns `permission_retry_fences`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn canonical_permission_retry_fences_connection() -> Result<Connection, StorageError> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE sessions (id TEXT PRIMARY KEY);
+         CREATE TABLE protocol_history_items (
+             id TEXT PRIMARY KEY,
+             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+             payload_json TEXT NOT NULL
+         );
+         CREATE TABLE protocol_item_append_order (
+             session_id TEXT NOT NULL,
+             source_kind TEXT NOT NULL,
+             source_id TEXT NOT NULL,
+             append_position INTEGER NOT NULL
+         );
+         CREATE TABLE moyai_schema_migrations (
+             version INTEGER PRIMARY KEY NOT NULL,
+             name TEXT NOT NULL
+         );",
+    )?;
+    connection.execute_batch(V54_PERMISSION_RETRY_FENCES)?;
+    Ok(connection)
+}
+
+fn validate_permission_retry_fences_data(connection: &Connection) -> Result<(), StorageError> {
+    let invalid_rows = connection.query_row(
+        "SELECT COUNT(*)
+         FROM permission_retry_fences AS fence
+         LEFT JOIN sessions AS root
+           ON root.id = fence.root_session_id
+         LEFT JOIN protocol_history_items AS authority
+           ON authority.id = fence.authority_history_item_id
+          AND authority.session_id = fence.root_session_id
+         LEFT JOIN protocol_item_append_order AS append_order
+           ON append_order.session_id = fence.root_session_id
+          AND append_order.source_kind = 'history_item'
+          AND append_order.source_id = fence.authority_history_item_id
+         WHERE root.id IS NULL
+            OR authority.id IS NULL
+            OR append_order.source_id IS NULL
+            OR json_extract(authority.payload_json, '$.kind')
+                NOT IN ('user_turn', 'steer_turn')
+            OR fence.family_version <= 0
+            OR fence.family_version > 4294967295
+            OR length(fence.family_sha256) <> 64
+            OR fence.family_sha256 GLOB '*[^0-9a-f]*'
+            OR length(fence.identity_sha256) <> 64
+            OR fence.identity_sha256 GLOB '*[^0-9a-f]*'
+            OR fence.state NOT IN ('reviewing', 'allowed_pending', 'admitted', 'denied')
+            OR fence.created_at_ms < 0
+            OR fence.updated_at_ms < fence.created_at_ms
+            OR NOT (
+                (fence.state = 'denied' AND fence.outcome IN (
+                    'guardian_denied',
+                    'invalid_decision',
+                    'deadline_exceeded',
+                    'guardian_error'
+                ))
+                OR (fence.state <> 'denied' AND fence.outcome IS NULL)
+            )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_rows != 0 {
+        return Err(StorageError::Message(format!(
+            "V54 marker exists but {invalid_rows} permission retry fence row(s) violate authority, identity, or lifecycle constraints"
+        )));
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT root_session_id, authority_history_item_id, review_id
+         FROM permission_retry_fences",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (root_session_id, authority_history_item_id, review_id) = row?;
+        root_session_id
+            .parse::<crate::session::SessionId>()
+            .map_err(|error| {
+                StorageError::Message(format!(
+                    "V54 permission retry fence has invalid root session id `{root_session_id}`: {error}"
+                ))
+            })?;
+        authority_history_item_id
+            .parse::<crate::protocol::HistoryItemId>()
+            .map_err(|error| {
+                StorageError::Message(format!(
+                    "V54 permission retry fence has invalid authority item id `{authority_history_item_id}`: {error}"
+                ))
+            })?;
+        review_id
+            .parse::<crate::storage::PermissionReviewId>()
+            .map_err(|error| {
+                StorageError::Message(format!(
+                    "V54 permission retry fence has invalid review id `{review_id}`: {error}"
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+fn validate_durable_side_chats_schema(connection: &Connection) -> Result<(), StorageError> {
+    if !schema_migration_applied(connection, DURABLE_SIDE_CHATS_VERSION)? {
+        return Err(StorageError::Message(
+            "current storage is missing the V55 durable side-chat marker".to_string(),
+        ));
+    }
+    if !schema_migration_has_exact_name(
+        connection,
+        DURABLE_SIDE_CHATS_VERSION,
+        DURABLE_SIDE_CHATS_NAME,
+    )? {
+        return Err(StorageError::Message(format!(
+            "V55 durable side-chat marker has a name other than `{DURABLE_SIDE_CHATS_NAME}`"
+        )));
+    }
+    let expected_connection = canonical_durable_side_chats_connection()?;
+    let expected = normalized_schema_objects_for_table(&expected_connection, "side_chat_bindings")?;
+    let observed = normalized_schema_objects_for_table(connection, "side_chat_bindings")?;
+    for ((object_type, object_name), expected_sql) in &expected {
+        let Some(observed_sql) = observed.get(&(object_type.clone(), object_name.clone())) else {
+            return Err(StorageError::Message(format!(
+                "V55 marker exists but required {object_type} `{object_name}` is missing"
+            )));
+        };
+        if observed_sql != expected_sql {
+            return Err(StorageError::Message(format!(
+                "V55 marker exists but {object_type} `{object_name}` has stale SQL"
+            )));
+        }
+    }
+    for (object_type, object_name) in observed.keys() {
+        if !expected.contains_key(&(object_type.clone(), object_name.clone())) {
+            return Err(StorageError::Message(format!(
+                "V55 marker exists but unexpected {object_type} `{object_name}` owns `side_chat_bindings`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn canonical_durable_side_chats_connection() -> Result<Connection, StorageError> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE sessions (
+             id TEXT PRIMARY KEY,
+             project_id TEXT NOT NULL,
+             status TEXT NOT NULL,
+             model_name TEXT NOT NULL,
+             base_url TEXT NOT NULL,
+             active_run_id TEXT,
+             active_turn_id TEXT,
+             active_run_lease_expires_at_ms INTEGER
+         );
+         CREATE TABLE session_spawn_edges (
+             root_session_id TEXT NOT NULL,
+             parent_session_id TEXT NOT NULL,
+             child_session_id TEXT NOT NULL
+         );
+         CREATE TABLE moyai_schema_migrations (
+             version INTEGER PRIMARY KEY NOT NULL,
+             name TEXT NOT NULL
+         );",
+    )?;
+    connection.execute_batch(V55_DURABLE_SIDE_CHATS)?;
+    Ok(connection)
+}
+
+fn validate_durable_side_chats_data(connection: &Connection) -> Result<(), StorageError> {
+    let invalid_rows = connection.query_row(
+        "SELECT COUNT(*)
+         FROM side_chat_bindings AS binding
+         LEFT JOIN sessions AS owner ON owner.id = binding.owner_session_id
+         LEFT JOIN sessions AS conversation
+           ON conversation.id = binding.conversation_session_id
+         WHERE owner.id IS NULL
+            OR conversation.id IS NULL
+            OR binding.owner_session_id = binding.conversation_session_id
+            OR owner.project_id <> conversation.project_id
+            OR conversation.model_name <> binding.model
+            OR conversation.base_url <> binding.base_url
+            OR EXISTS (
+                SELECT 1 FROM side_chat_bindings AS parent_binding
+                WHERE parent_binding.conversation_session_id = binding.owner_session_id
+            )
+            OR EXISTS (
+                SELECT 1 FROM session_spawn_edges AS edge
+                WHERE edge.root_session_id = binding.conversation_session_id
+                   OR edge.parent_session_id = binding.conversation_session_id
+                   OR edge.child_session_id = binding.conversation_session_id
+            )
+            OR binding.context_scope <> 'general'
+            OR binding.context_window <= 0
+            OR binding.context_window > 4294967295
+            OR binding.max_output_tokens <= 0
+            OR binding.max_output_tokens > 4294967295
+            OR binding.request_timeout_ms <= 0
+            OR binding.connect_timeout_ms <= 0
+            OR binding.max_retries < 0
+            OR binding.max_retries > 255
+            OR binding.supports_images NOT IN (0, 1)
+            OR binding.supports_tools NOT IN (0, 1)
+            OR binding.supports_reasoning NOT IN (0, 1)
+            OR length(CAST(binding.persisted_draft AS BLOB)) > 1048576
+            OR binding.draft_revision < 0
+            OR binding.request_generation < 0
+            OR binding.delete_requested_at_ms < 0
+            OR binding.created_at_ms < 0
+            OR binding.updated_at_ms < binding.created_at_ms",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if invalid_rows != 0 {
+        return Err(StorageError::Message(format!(
+            "V55 marker exists but {invalid_rows} side chat binding row(s) violate canonical ownership, provider, or revision constraints"
+        )));
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT id, owner_session_id, conversation_session_id
+         FROM side_chat_bindings",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, owner_session_id, conversation_session_id) = row?;
+        id.parse::<crate::storage::SideChatId>().map_err(|error| {
+            StorageError::Message(format!(
+                "V55 side chat binding has invalid id `{id}`: {error}"
+            ))
+        })?;
+        owner_session_id
+            .parse::<crate::session::SessionId>()
+            .map_err(|error| {
+                StorageError::Message(format!(
+                    "V55 side chat binding has invalid owner session id `{owner_session_id}`: {error}"
+                ))
+            })?;
+        conversation_session_id
+            .parse::<crate::session::SessionId>()
+            .map_err(|error| {
+                StorageError::Message(format!(
+                    "V55 side chat binding has invalid conversation session id `{conversation_session_id}`: {error}"
+                ))
+            })?;
     }
     Ok(())
 }
@@ -7378,6 +8629,12 @@ mod tests {
         payload_json: &str,
         payload_sha256: &str,
     ) {
+        seed_fixture_turn_allocator(
+            connection,
+            "v46-session",
+            "01J00000000000000000000000",
+            sequence_no.saturating_add(1),
+        );
         connection
             .execute(
                 "INSERT INTO protocol_history_items
@@ -7485,6 +8742,12 @@ mod tests {
         status: &str,
         sequence_no: i64,
     ) -> rusqlite::Result<usize> {
+        seed_fixture_turn_allocator(
+            connection,
+            "tool-session",
+            "turn",
+            sequence_no.saturating_add(1),
+        );
         let history_item_id = format!("history-{id}");
         let payload = format!(
             "{{\"kind\":\"tool_call\",\"call_id\":\"{id}\",\"response_id\":\"response-{id}\",\"tool_name\":\"shell\",\"arguments_json\":\"{{}}\"}}"
@@ -7515,6 +8778,27 @@ mod tests {
                 sequence_no + 1,
             ],
         )
+    }
+
+    fn seed_fixture_turn_allocator(
+        connection: &Connection,
+        session_id: &str,
+        turn_id: &str,
+        next_sequence_no: i64,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO protocol_turn_sequence_allocators
+                 (session_id, turn_id, next_sequence_no)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id, turn_id) DO UPDATE SET
+                     next_sequence_no = MAX(
+                         protocol_turn_sequence_allocators.next_sequence_no,
+                         excluded.next_sequence_no
+                     )",
+                params![session_id, turn_id, next_sequence_no],
+            )
+            .expect("fixture turn allocator");
     }
 
     fn foreign_key_violations(connection: &Connection) -> Vec<(String, i64, String, i64)> {
@@ -8261,7 +9545,16 @@ mod tests {
         run_through_v38(&connection);
         connection
             .execute_batch(
-                r#"INSERT INTO protocol_runtime_events
+                r#"INSERT INTO projects
+                   (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                   VALUES ('project', 'C:/workspace', 'workspace', 'none', 1, 1);
+                   INSERT INTO sessions
+                   (id, project_id, title, status, cwd_path, model_name, base_url,
+                    created_at_ms, updated_at_ms, completed_at_ms)
+                   VALUES ('session', 'project', 'terminal migration fixture', 'idle',
+                           'C:/workspace', 'model', 'http://localhost', 1, 1, NULL);
+
+                   INSERT INTO protocol_runtime_events
                    (id, session_id, turn_id, sequence_no, msg_json, payload_sha256, created_at_ms)
                    VALUES
                    ('runtime-completed', 'session', 'completed-turn', 1,
@@ -12673,6 +13966,242 @@ mod tests {
             .expect("restore foreign keys");
     }
 
+    fn run_through_exact_v55_endpoint(connection: &Connection) {
+        run_through_exact_v51_endpoint(connection);
+        connection
+            .execute_batch(V52_HARNESS_TURN_IDENTITY)
+            .expect("V52 endpoint");
+        connection
+            .execute_batch(V53_AGENT_TRIGGER_TURN_CLAIMS)
+            .expect("V53 endpoint");
+        connection
+            .execute_batch(V54_PERMISSION_RETRY_FENCES)
+            .expect("V54 endpoint");
+        connection
+            .execute_batch(V55_DURABLE_SIDE_CHATS)
+            .expect("V55 endpoint");
+    }
+
+    fn run_through_exact_v56_endpoint(connection: &Connection) {
+        run_through_exact_v55_endpoint(connection);
+        connection
+            .execute_batch(V56_ROLLBACK_HARNESS_ORPHAN_RECOVERY)
+            .expect("V56 endpoint");
+    }
+
+    fn run_through_exact_v57_endpoint(connection: &Connection) {
+        run_through_exact_v56_endpoint(connection);
+        connection
+            .execute_batch(V57_SESSION_ADMISSION_REVISIONS)
+            .expect("V57 endpoint");
+    }
+
+    fn insert_v56_session(connection: &Connection) -> String {
+        let session_id = crate::session::SessionId::new().to_string();
+        insert_v56_session_with_id(connection, &session_id);
+        session_id
+    }
+
+    fn insert_v56_session_with_id(connection: &Connection, session_id: &str) {
+        let project_id = crate::session::ProjectId::new().to_string();
+        connection
+            .execute(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, 'v56', 'none', 1, 1)",
+                params![project_id, format!("C:/v56/{project_id}")],
+            )
+            .expect("V56 project");
+        connection
+            .execute(
+                "INSERT INTO sessions
+                 (id, project_id, title, status, cwd_path, model_name, base_url,
+                  created_at_ms, updated_at_ms, completed_at_ms)
+                 VALUES (?1, ?2, 'session', 'idle', 'C:/v56', 'model',
+                         'http://localhost', 1, 1, NULL)",
+                params![session_id, project_id],
+            )
+            .expect("V56 session");
+    }
+
+    fn insert_v58_running_root(connection: &Connection) -> (String, String, String, i64) {
+        let session_id = insert_v56_session(connection);
+        let admission_id = crate::session::AdmissionId::new().to_string();
+        let turn_id = crate::protocol::TurnId::new().to_string();
+        connection
+            .execute(
+                "INSERT INTO protocol_turn_sequence_allocators
+                 (session_id, turn_id, next_sequence_no)
+                 VALUES (?1, ?2, 1)",
+                params![session_id, turn_id],
+            )
+            .expect("V58 root turn allocator");
+        let revision = connection
+            .query_row(
+                "SELECT revision FROM session_admission_revisions WHERE session_id = ?1",
+                [&session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("V58 root revision");
+        connection
+            .execute(
+                "UPDATE sessions
+                 SET status = 'running', active_run_id = ?2, active_turn_id = ?3,
+                     active_run_lease_expires_at_ms = 100, updated_at_ms = 2
+                 WHERE id = ?1",
+                params![session_id, admission_id, turn_id],
+            )
+            .expect("V58 running root");
+        (session_id, admission_id, turn_id, revision)
+    }
+
+    fn insert_v58_exact_execution_interrupt_request(
+        connection: &Connection,
+        session_id: &str,
+        admission_id: &str,
+        turn_id: &str,
+        revision: i64,
+        cause: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO exact_execution_interrupt_requests
+                 (session_id, admission_id, turn_id, admission_revision, cause, requested_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 3)",
+                params![session_id, admission_id, turn_id, revision, cause],
+            )
+            .expect("V58 exact execution interrupt request");
+    }
+
+    fn insert_v58_raw_completed_terminal(
+        connection: &Connection,
+        session_id: &str,
+        turn_id: &str,
+    ) -> rusqlite::Result<usize> {
+        let terminal = crate::protocol::RuntimeEventMsg::TurnTerminal {
+            terminal: Box::new(crate::session::DurableTurnTerminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                final_response_id: None,
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            }),
+        };
+        let msg_json = serde_json::to_string(&terminal).expect("V58 terminal JSON");
+        connection.execute(
+            "INSERT INTO protocol_runtime_events
+             (id, session_id, turn_id, sequence_no, msg_json, payload_sha256, created_at_ms)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, 4)",
+            params![
+                crate::protocol::RuntimeEventId::new().to_string(),
+                session_id,
+                turn_id,
+                msg_json,
+                sha256_text(&msg_json),
+            ],
+        )
+    }
+
+    fn insert_v56_exact_terminalized_orphan(
+        connection: &Connection,
+        run_id: &str,
+        session_id: &str,
+        turn_id: &str,
+        terminal_event_id: &str,
+        with_all_children: bool,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO harness_runs
+                 (id, session_id, workspace_root, artifact_root, mode,
+                  started_at_ms, completed_at_ms, status, protocol_turn_id,
+                  canonical_terminal_runtime_event_id)
+                 VALUES (?1, ?2, 'C:/v56', 'C:/v56/artifacts', 'native_runtime',
+                         10, 20, '\"pass\"', ?3, ?4)",
+                params![run_id, session_id, turn_id, terminal_event_id],
+            )
+            .expect("V56 orphan run");
+        let terminalized_id = crate::harness::HarnessEventId::new().to_string();
+        let payload_json = serde_json::json!({
+            "type": "generic",
+            "data": {
+                "kind": "turn_terminal",
+                "session_id": session_id,
+                "terminal": {
+                    "outcome": { "kind": "completed" }
+                }
+            }
+        })
+        .to_string();
+        let payload_sha256 = crate::harness::event_store::event_envelope_sha256(
+            &terminalized_id,
+            run_id,
+            0,
+            "\"run_terminalized\"",
+            &payload_json,
+            "[]",
+            "[]",
+            None,
+            20,
+        )
+        .expect("V56 terminalized harness event envelope hash");
+        connection
+            .execute(
+                "INSERT INTO harness_events
+                 (id, run_id, sequence_no, kind, payload_json,
+                  contract_refs_json, artifact_refs_json, parent_event_id,
+                  payload_sha256, created_at_ms)
+                 VALUES (?1, ?2, 0, '\"run_terminalized\"', ?3,
+                         '[]', '[]', NULL, ?4, 20)",
+                params![terminalized_id, run_id, payload_json, payload_sha256],
+            )
+            .expect("V56 terminalized harness event");
+        if !with_all_children {
+            return;
+        }
+        connection
+            .execute(
+                "INSERT INTO harness_artifacts
+                 (id, run_id, kind, relative_path, sha256, size_bytes, tags_json,
+                  created_by_event_id, contract_refs_json, created_at_ms)
+                 VALUES (?1, ?2, 'log', 'run.log', 'sha', 1, '[]', ?3, '[]', 20)",
+                params![
+                    crate::harness::ArtifactId::new().to_string(),
+                    run_id,
+                    terminalized_id
+                ],
+            )
+            .expect("V56 harness artifact");
+        connection
+            .execute(
+                "INSERT INTO harness_contracts
+                 (run_id, contract_id, kind, version, source_path, content_sha256,
+                  schema_ref, model_visible_summary)
+                 VALUES (?1, 'contract', 'test', '1', 'contract.md', 'sha', NULL, NULL)",
+                [run_id],
+            )
+            .expect("V56 harness contract");
+        connection
+            .execute(
+                "INSERT INTO harness_gate_results
+                 (id, run_id, sequence_no, gate_kind, status, severity, owner,
+                  summary, payload_json, created_at_ms)
+                 VALUES (?1, ?2, 0, 'test', 'pass', 'info', NULL, 'ok', '{}', 20)",
+                params![crate::harness::GateId::new().to_string(), run_id],
+            )
+            .expect("V56 harness gate");
+        connection
+            .execute(
+                "INSERT INTO harness_replay_reports
+                 (run_id, schema_version, status, primary_owner, summary,
+                  restart_point, next_actions_json, report_json, created_at_ms)
+                 VALUES (?1, '1', 'pass', NULL, 'ok', NULL, '[]', '{}', 20)",
+                [run_id],
+            )
+            .expect("V56 harness replay report");
+    }
+
     fn insert_v51_history_fixture(
         connection: &Connection,
         id: &str,
@@ -13129,6 +14658,1207 @@ mod tests {
                 .to_string()
                 .contains("canonical terminal linkage"),
             "unexpected V52 linkage audit error: {linkage_error}"
+        );
+    }
+
+    #[test]
+    fn v56_valid_v55_is_noop_preserves_legacy_unmapped_and_reopens() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v55_endpoint(&connection);
+        let session_id = insert_v56_session(&connection);
+        let legacy_run_id = crate::harness::HarnessRunId::new().to_string();
+        connection
+            .execute(
+                "INSERT INTO harness_runs
+                 (id, session_id, workspace_root, artifact_root, mode,
+                  started_at_ms, completed_at_ms, status, protocol_turn_id,
+                  canonical_terminal_runtime_event_id)
+                 VALUES (?1, ?2, 'C:/v56', 'C:/v56/artifacts', 'manual',
+                         10, 20, '\"pass\"', NULL, NULL)",
+                params![legacy_run_id, session_id],
+            )
+            .expect("legacy unmapped harness run");
+
+        run(&connection).expect("V55 to V56 no-op upgrade");
+        run(&connection).expect("V56 idempotent reopen");
+
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                ROLLBACK_HARNESS_ORPHAN_RECOVERY_VERSION,
+                ROLLBACK_HARNESS_ORPHAN_RECOVERY_NAME,
+            )
+            .expect("V56 marker")
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM harness_runs WHERE id = ?1",
+                    [&legacy_run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("legacy run count"),
+            1
+        );
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v57_backfills_allocator_count_and_ignores_session_scoped_history_turn_null() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v56_endpoint(&connection);
+        let session_id = insert_v56_session(&connection);
+        let turn_a = crate::protocol::TurnId::new().to_string();
+        let turn_b = crate::protocol::TurnId::new().to_string();
+        connection
+            .execute(
+                "INSERT INTO protocol_turn_sequence_allocators
+                 (session_id, turn_id, next_sequence_no)
+                 VALUES (?1, ?2, 1), (?1, ?3, 1)",
+                params![session_id, turn_a, turn_b],
+            )
+            .expect("two legacy turn allocators");
+
+        let history_id = crate::protocol::HistoryItemId::new().to_string();
+        let payload_json = serde_json::to_string(
+            &crate::protocol::HistoryItemPayload::CollaborationModeInstruction {
+                mode: crate::agent::mode::ModeKind::Plan,
+            },
+        )
+        .expect("session-scoped payload");
+        connection
+            .execute(
+                "INSERT INTO protocol_history_items
+                 (id, session_id, scope_kind, turn_id, sequence_no,
+                  payload_json, payload_sha256, created_at_ms)
+                 VALUES (?1, ?2, 'session', NULL, 0, ?3, ?4, 2)",
+                params![
+                    history_id,
+                    session_id,
+                    payload_json,
+                    sha256_text(&payload_json),
+                ],
+            )
+            .expect("V42 session-scoped history fixture");
+        connection
+            .execute(
+                "INSERT INTO protocol_item_append_order
+                 (session_id, scope_kind, turn_id, sequence_no,
+                  source_kind, source_id, created_at_ms)
+                 VALUES (?1, 'session', NULL, 0, 'history_item', ?2, 2)",
+                params![session_id, history_id],
+            )
+            .expect("session-scoped append order");
+
+        run(&connection).expect("V56 to V57 upgrade");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT revision FROM session_admission_revisions WHERE session_id = ?1",
+                    [&session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("V57 baseline revision"),
+            2,
+            "only the two canonical turn allocators contribute to the baseline"
+        );
+        run(&connection).expect("V57 idempotent reopen");
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v57_reopen_rejects_revision_below_current_allocator_count() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run(&connection).expect("fresh V57 schema");
+        let session_id = insert_v56_session(&connection);
+        connection
+            .execute(
+                "INSERT INTO protocol_turn_sequence_allocators
+                 (session_id, turn_id, next_sequence_no)
+                 VALUES (?1, ?2, 1), (?1, ?3, 1)",
+                params![
+                    session_id,
+                    crate::protocol::TurnId::new().to_string(),
+                    crate::protocol::TurnId::new().to_string(),
+                ],
+            )
+            .expect("two current turn allocators");
+        connection
+            .execute(
+                "UPDATE session_admission_revisions SET revision = 1 WHERE session_id = ?1",
+                [&session_id],
+            )
+            .expect("inject regressed revision");
+
+        let error = run(&connection).expect_err("regressed admission revision must fail closed");
+        assert!(
+            error.to_string().contains("lack a valid revision"),
+            "unexpected V57 data-audit error: {error}"
+        );
+    }
+
+    #[test]
+    fn v58_upgrades_v57_reopens_pending_request_and_cascades_with_parent_session() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v57_endpoint(&connection);
+        run_to_current(&connection).expect("V57 to V58 current-endpoint upgrade");
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                EXACT_EXECUTION_INTERRUPT_REQUESTS_VERSION,
+                EXACT_EXECUTION_INTERRUPT_REQUESTS_NAME,
+            )
+            .expect("V58 marker")
+        );
+        let (session_id, admission_id, turn_id, revision) = insert_v58_running_root(&connection);
+        insert_v58_exact_execution_interrupt_request(
+            &connection,
+            &session_id,
+            &admission_id,
+            &turn_id,
+            revision,
+            "user_stop",
+        );
+
+        run(&connection).expect("V58 pending request reopen");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM exact_execution_interrupt_requests WHERE session_id = ?1",
+                    [&session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("pending request count"),
+            1
+        );
+        let raw_terminal_error =
+            insert_v58_raw_completed_terminal(&connection, &session_id, &turn_id)
+                .expect_err("raw terminal must not bypass a pending exact interrupt request");
+        assert!(
+            raw_terminal_error
+                .to_string()
+                .contains("must be consumed before TurnTerminal"),
+            "unexpected raw-terminal guard error: {raw_terminal_error}"
+        );
+        connection
+            .execute(
+                "UPDATE sessions
+                 SET status = 'completed', completed_at_ms = 4,
+                     active_run_id = NULL, active_turn_id = NULL,
+                     active_run_lease_expires_at_ms = NULL
+                 WHERE id = ?1 AND status = 'running'",
+                [&session_id],
+            )
+            .expect("canonical status CAS consumes pending request");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM exact_execution_interrupt_requests WHERE session_id = ?1",
+                    [&session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("terminal-consumed request count"),
+            0
+        );
+        insert_v58_raw_completed_terminal(&connection, &session_id, &turn_id)
+            .expect("terminal insert succeeds only after request consumption");
+
+        let (rollback_session_id, rollback_admission_id, rollback_turn_id, rollback_revision) =
+            insert_v58_running_root(&connection);
+        insert_v58_exact_execution_interrupt_request(
+            &connection,
+            &rollback_session_id,
+            &rollback_admission_id,
+            &rollback_turn_id,
+            rollback_revision,
+            "user_stop",
+        );
+        connection
+            .execute(
+                "DELETE FROM protocol_turn_sequence_allocators
+                 WHERE session_id = ?1 AND turn_id = ?2",
+                params![rollback_session_id, rollback_turn_id],
+            )
+            .expect("rollback-style exact turn cleanup");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM exact_execution_interrupt_requests WHERE session_id = ?1",
+                    [&rollback_session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("turn cleanup request count"),
+            0,
+            "the rollback-owned allocator delete must consume its exact request"
+        );
+        connection
+            .execute("DELETE FROM sessions WHERE id = ?1", [&rollback_session_id])
+            .expect("delete turn-cleanup fixture");
+
+        let (cascade_session_id, cascade_admission_id, cascade_turn_id, cascade_revision) =
+            insert_v58_running_root(&connection);
+        insert_v58_exact_execution_interrupt_request(
+            &connection,
+            &cascade_session_id,
+            &cascade_admission_id,
+            &cascade_turn_id,
+            cascade_revision,
+            "user_stop",
+        );
+        connection
+            .execute("DELETE FROM sessions WHERE id = ?1", [&cascade_session_id])
+            .expect("parent session cascade");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM exact_execution_interrupt_requests",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .expect("request cascade count"),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_admission_revisions WHERE session_id = ?1",
+                    [&cascade_session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("revision cascade count"),
+            0,
+            "V57 turn-delete revision trigger must not abort a parent session cascade"
+        );
+        connection
+            .execute(
+                "DELETE FROM protocol_turn_sequence_allocators WHERE session_id = ?1",
+                [&cascade_session_id],
+            )
+            .expect("clean allocator without a legacy parent foreign key");
+        assert!(foreign_key_violations(&connection).is_empty());
+        run(&connection).expect("V58 reopen after cascade");
+    }
+
+    #[test]
+    fn v58_fast_path_rejects_schema_and_exact_owner_corruption() {
+        let schema_connection = Connection::open_in_memory().expect("schema database");
+        run(&schema_connection).expect("fresh V58 schema");
+        schema_connection
+            .execute_batch("DROP TRIGGER exact_execution_interrupt_requests_prevent_update")
+            .expect("drop V58 trigger");
+        let schema_error = run(&schema_connection).expect_err("stale V58 schema must fail closed");
+        assert!(
+            schema_error.to_string().contains("V58 marker"),
+            "unexpected V58 schema error: {schema_error}"
+        );
+
+        let data_connection = Connection::open_in_memory().expect("data database");
+        data_connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run(&data_connection).expect("fresh V58 data schema");
+        let (session_id, admission_id, turn_id, revision) =
+            insert_v58_running_root(&data_connection);
+        insert_v58_exact_execution_interrupt_request(
+            &data_connection,
+            &session_id,
+            &admission_id,
+            &turn_id,
+            revision,
+            "user_stop",
+        );
+        let immutable_trigger = data_connection
+            .query_row(
+                "SELECT sql
+                 FROM sqlite_master
+                 WHERE type = 'trigger'
+                   AND name = 'exact_execution_interrupt_requests_prevent_update'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("immutable trigger SQL");
+        data_connection
+            .execute_batch("DROP TRIGGER exact_execution_interrupt_requests_prevent_update")
+            .expect("temporarily drop immutable trigger");
+        data_connection
+            .execute(
+                "UPDATE exact_execution_interrupt_requests
+                 SET admission_revision = admission_revision + 1
+                 WHERE session_id = ?1",
+                [&session_id],
+            )
+            .expect("inject stale request revision");
+        data_connection
+            .execute_batch(&immutable_trigger)
+            .expect("restore immutable trigger");
+        let data_error =
+            run(&data_connection).expect_err("stale V58 owner must fail closed on reopen");
+        assert!(
+            data_error
+                .to_string()
+                .contains("exact execution interrupt request row"),
+            "unexpected V58 data error: {data_error}"
+        );
+    }
+
+    #[test]
+    fn v58_fast_path_rejects_noncanonical_lowercase_interrupt_identity() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run(&connection).expect("fresh V58 schema");
+        let (session_id, admission_id, turn_id, revision) = insert_v58_running_root(&connection);
+        insert_v58_exact_execution_interrupt_request(
+            &connection,
+            &session_id,
+            &admission_id,
+            &turn_id,
+            revision,
+            "user_stop",
+        );
+        let immutable_trigger = connection
+            .query_row(
+                "SELECT sql
+                 FROM sqlite_master
+                 WHERE type = 'trigger'
+                   AND name = 'exact_execution_interrupt_requests_prevent_update'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("immutable trigger SQL");
+        connection
+            .execute_batch("DROP TRIGGER exact_execution_interrupt_requests_prevent_update")
+            .expect("temporarily drop immutable trigger");
+        let lowercase_admission_id = admission_id.to_ascii_lowercase();
+        connection
+            .execute(
+                "UPDATE sessions SET active_run_id = ?2 WHERE id = ?1",
+                params![session_id, lowercase_admission_id],
+            )
+            .expect("corrupt canonical active admission spelling");
+        connection
+            .execute(
+                "UPDATE exact_execution_interrupt_requests
+                 SET admission_id = ?2
+                 WHERE session_id = ?1",
+                params![session_id, lowercase_admission_id],
+            )
+            .expect("corrupt canonical request admission spelling");
+        connection
+            .execute_batch(&immutable_trigger)
+            .expect("restore immutable trigger");
+
+        let error = run(&connection)
+            .expect_err("noncanonical lowercase V58 identity must fail closed on reopen");
+        assert!(
+            error
+                .to_string()
+                .contains("exact execution interrupt request row"),
+            "unexpected V58 identity error: {error}"
+        );
+    }
+
+    #[test]
+    fn v58_insert_trigger_rejects_terminalized_or_wrong_topology_request() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run(&connection).expect("fresh V58 schema");
+
+        let (terminal_session, terminal_admission, terminal_turn, terminal_revision) =
+            insert_v58_running_root(&connection);
+        insert_v58_raw_completed_terminal(&connection, &terminal_session, &terminal_turn)
+            .expect("preexisting raw terminal fixture");
+        let terminal_error = connection
+            .execute(
+                "INSERT INTO exact_execution_interrupt_requests
+                 (session_id, admission_id, turn_id, admission_revision, cause, requested_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, 'user_stop', 5)",
+                params![
+                    terminal_session,
+                    terminal_admission,
+                    terminal_turn,
+                    terminal_revision,
+                ],
+            )
+            .expect_err("a preexisting exact terminal rejects the request");
+        assert!(terminal_error.to_string().contains("live exact admission"));
+
+        let (root_session, root_admission, root_turn, root_revision) =
+            insert_v58_running_root(&connection);
+        let topology_error = connection
+            .execute(
+                "INSERT INTO exact_execution_interrupt_requests
+                 (session_id, admission_id, turn_id, admission_revision, cause, requested_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, 'agent_interrupted', 5)",
+                params![root_session, root_admission, root_turn, root_revision],
+            )
+            .expect_err("AgentInterrupted requires a child topology");
+        assert!(topology_error.to_string().contains("matching topology"));
+    }
+
+    #[test]
+    fn v58_fast_path_rejects_pending_request_with_terminal_corruption() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run(&connection).expect("fresh V58 schema");
+        let (session_id, admission_id, turn_id, revision) = insert_v58_running_root(&connection);
+        insert_v58_exact_execution_interrupt_request(
+            &connection,
+            &session_id,
+            &admission_id,
+            &turn_id,
+            revision,
+            "user_stop",
+        );
+        let guard_sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'trigger'
+                   AND name = 'exact_execution_interrupt_requests_reject_raw_terminal'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("raw terminal guard SQL");
+        connection
+            .execute_batch("DROP TRIGGER exact_execution_interrupt_requests_reject_raw_terminal")
+            .expect("drop raw terminal guard for corruption fixture");
+        insert_v58_raw_completed_terminal(&connection, &session_id, &turn_id)
+            .expect("inject terminal behind pending request");
+        connection
+            .execute_batch(&guard_sql)
+            .expect("restore raw terminal guard");
+
+        let error = run(&connection).expect_err("request plus terminal must fail closed on reopen");
+        assert!(
+            error
+                .to_string()
+                .contains("exact execution interrupt request row"),
+            "unexpected V58 terminal-corruption error: {error}"
+        );
+    }
+
+    #[test]
+    fn v56_recovers_run28_terminalized_and_mapped_started_shapes_then_reopens() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v55_endpoint(&connection);
+        let session_id = "01M0A6DRJCQRVRFN97J7H39S6Y";
+        let turn_id = "01M0A6DRQJY1MP90K1RG0RXQ2T";
+        let run_ids = ["01M0A6DRQMARWG1Z30HDS2AKKC", "01M0A6DRQMARWG1Z30HDS2AKKD"];
+        let terminal_ids = ["01M0A6DRRP4PJNDF3G4WP8CV3K", "01M0A6DRRP4PJNDF3G4WP8CV3M"];
+        insert_v56_session_with_id(&connection, session_id);
+        for (index, run_id) in run_ids.iter().enumerate() {
+            insert_v56_exact_terminalized_orphan(
+                &connection,
+                run_id,
+                session_id,
+                turn_id,
+                terminal_ids[index],
+                index == 1,
+            );
+        }
+        let run30_event_id = "01M0A6DRRQJY5BJQ7TBKBHWJYQ";
+        let run30_payload = r#"{"type":"generic","data":{"kind":"turn_terminal","session_id":"01M0A6DRJCQRVRFN97J7H39S6Y","terminal":{"change_count":0,"failed_tool_count":0,"final_response_id":"01M0A6DRR4GKSMKMS8TZ21QHCE","metrics":{"config":{"access_mode":"full_access","base_url":"http://127.0.0.1:9815","model":"uat/run28-persistence"},"elapsed_ms":27,"model_request_count":1,"token_usage":{"completion_tokens":6,"prompt_tokens":12,"reasoning_tokens":0,"total_tokens":18}},"outcome":{"kind":"completed"},"tool_call_count":0}}}"#;
+        let run30_completed_at_ms = 1_787_048_682_262_i64;
+        let run30_envelope_sha256 = crate::harness::event_store::event_envelope_sha256(
+            run30_event_id,
+            run_ids[0],
+            12,
+            "\"run_terminalized\"",
+            run30_payload,
+            "[]",
+            "[]",
+            None,
+            run30_completed_at_ms,
+        )
+        .expect("Run30 terminalized event envelope hash");
+        assert_eq!(
+            run30_envelope_sha256,
+            "envelope-v1:6e4a3303a44b574f90bf5f922e5cf48b7ef15d659af64d11d241a38a199caba6",
+            "regression fixture must remain byte-exact with the frozen Run30 event"
+        );
+        connection
+            .execute(
+                "UPDATE harness_events
+                 SET id = ?2, sequence_no = 12, payload_json = ?3,
+                     payload_sha256 = ?4, created_at_ms = ?5
+                 WHERE run_id = ?1",
+                params![
+                    run_ids[0],
+                    run30_event_id,
+                    run30_payload,
+                    run30_envelope_sha256,
+                    run30_completed_at_ms,
+                ],
+            )
+            .expect("replace first fixture with exact Run30 terminalized event");
+        connection
+            .execute(
+                "UPDATE harness_runs SET completed_at_ms = ?2 WHERE id = ?1",
+                params![run_ids[0], run30_completed_at_ms],
+            )
+            .expect("match exact Run30 terminal completion time");
+
+        let legacy_payload = connection
+            .query_row(
+                "SELECT payload_json FROM harness_events WHERE run_id = ?1",
+                [run_ids[1]],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("legacy terminalized event payload");
+        connection
+            .execute(
+                "UPDATE harness_events SET payload_sha256 = ?2 WHERE run_id = ?1",
+                params![run_ids[1], sha256_text(&legacy_payload)],
+            )
+            .expect("retain V14 payload-only hash compatibility fixture");
+        let started_run_id = "01M0A6DRQMARWG1Z30HDS2AKKE";
+        connection
+            .execute(
+                "INSERT INTO harness_runs
+                 (id, session_id, workspace_root, artifact_root, mode,
+                  started_at_ms, completed_at_ms, status, protocol_turn_id,
+                  canonical_terminal_runtime_event_id)
+                 VALUES (?1, ?2, 'C:/v56', 'C:/v56/artifacts', 'native_runtime',
+                         10, NULL, '\"started\"', ?3, NULL)",
+                params![started_run_id, session_id, turn_id],
+            )
+            .expect("mapped started rollback orphan");
+
+        run(&connection).expect("recover exact Run28 orphan shape");
+        run(&connection).expect("reopen recovered V56 database");
+
+        for table_name in [
+            "harness_replay_reports",
+            "harness_gate_results",
+            "harness_contracts",
+            "harness_artifacts",
+            "harness_events",
+            "harness_runs",
+        ] {
+            let remaining = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table_name} WHERE run_id IN (?1, ?2)")
+                        .replace("harness_runs WHERE run_id", "harness_runs WHERE id"),
+                    params![run_ids[0], run_ids[1]],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or_else(|error| panic!("{table_name} recovery count: {error}"));
+            assert_eq!(remaining, 0, "{table_name} must be removed child-first");
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM harness_runs WHERE id = ?1",
+                    [started_run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("started orphan recovery count"),
+            0,
+            "mapped started rollback orphan must also be removed"
+        );
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                ROLLBACK_HARNESS_ORPHAN_RECOVERY_VERSION,
+                ROLLBACK_HARNESS_ORPHAN_RECOVERY_NAME,
+            )
+            .expect("V56 marker")
+        );
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v56_non_exact_orphans_fail_closed_and_keep_marker_atomic() {
+        fn assert_not_migrated(connection: &Connection, run_id: &str) {
+            assert!(
+                !schema_migration_applied(connection, ROLLBACK_HARNESS_ORPHAN_RECOVERY_VERSION)
+                    .expect("V56 marker query"),
+                "failed recovery must not commit its marker"
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM harness_runs WHERE id = ?1",
+                        [run_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("orphan run count"),
+                1,
+                "failed recovery must roll back candidate deletion"
+            );
+        }
+
+        let partial = Connection::open_in_memory().expect("partial database");
+        partial
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v55_endpoint(&partial);
+        let partial_session = insert_v56_session(&partial);
+        let partial_turn = crate::protocol::TurnId::new().to_string();
+        let partial_run = crate::harness::HarnessRunId::new().to_string();
+        insert_v56_exact_terminalized_orphan(
+            &partial,
+            &partial_run,
+            &partial_session,
+            &partial_turn,
+            &crate::protocol::RuntimeEventId::new().to_string(),
+            false,
+        );
+        partial
+            .execute(
+                "INSERT INTO protocol_turn_sequence_allocators
+                 (session_id, turn_id, next_sequence_no) VALUES (?1, ?2, 0)",
+                params![partial_session, partial_turn],
+            )
+            .expect("partial canonical residue");
+        let error = run(&partial).expect_err("partial canonical turn must fail closed");
+        assert!(error.to_string().contains("canonical terminal linkage"));
+        assert_not_migrated(&partial, &partial_run);
+
+        let cross_session = Connection::open_in_memory().expect("cross-session database");
+        cross_session
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v55_endpoint(&cross_session);
+        let owner_session = insert_v56_session(&cross_session);
+        let other_session = insert_v56_session(&cross_session);
+        let cross_turn = crate::protocol::TurnId::new().to_string();
+        let cross_run = crate::harness::HarnessRunId::new().to_string();
+        let cross_terminal = crate::protocol::RuntimeEventId::new().to_string();
+        insert_v56_exact_terminalized_orphan(
+            &cross_session,
+            &cross_run,
+            &owner_session,
+            &cross_turn,
+            &cross_terminal,
+            false,
+        );
+        cross_session
+            .execute(
+                "INSERT INTO protocol_runtime_events
+                 (id, session_id, turn_id, sequence_no, msg_json,
+                  payload_sha256, created_at_ms)
+                 VALUES (?1, ?2, ?3, 0, '{}', ?4, 20)",
+                params![
+                    cross_terminal,
+                    other_session,
+                    crate::protocol::TurnId::new().to_string(),
+                    sha256_text("{}"),
+                ],
+            )
+            .expect("cross-session terminal residue");
+        let error = run(&cross_session).expect_err("cross-session terminal must fail closed");
+        assert!(error.to_string().contains("canonical terminal linkage"));
+        assert_not_migrated(&cross_session, &cross_run);
+
+        let invalid = Connection::open_in_memory().expect("invalid database");
+        invalid
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v55_endpoint(&invalid);
+        let invalid_session = insert_v56_session(&invalid);
+        insert_v56_exact_terminalized_orphan(
+            &invalid,
+            "invalid-run-id",
+            &invalid_session,
+            &crate::protocol::TurnId::new().to_string(),
+            &crate::protocol::RuntimeEventId::new().to_string(),
+            false,
+        );
+        let error = run(&invalid).expect_err("invalid candidate id must fail closed");
+        assert!(error.to_string().contains("invalid harness run id"));
+        assert_not_migrated(&invalid, "invalid-run-id");
+
+        let stale_hash = Connection::open_in_memory().expect("stale-hash database");
+        stale_hash
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v55_endpoint(&stale_hash);
+        let stale_session = insert_v56_session(&stale_hash);
+        let stale_run = crate::harness::HarnessRunId::new().to_string();
+        insert_v56_exact_terminalized_orphan(
+            &stale_hash,
+            &stale_run,
+            &stale_session,
+            &crate::protocol::TurnId::new().to_string(),
+            &crate::protocol::RuntimeEventId::new().to_string(),
+            false,
+        );
+        stale_hash
+            .execute(
+                "UPDATE harness_events SET payload_sha256 = 'stale' WHERE run_id = ?1",
+                [&stale_run],
+            )
+            .expect("stale terminalized payload hash");
+        let error = run(&stale_hash).expect_err("stale harness hash must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("stale terminalized harness payload hash")
+        );
+        assert_not_migrated(&stale_hash, &stale_run);
+
+        let disguised_legacy = Connection::open_in_memory().expect("disguised-legacy database");
+        disguised_legacy
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v55_endpoint(&disguised_legacy);
+        let disguised_session = insert_v56_session(&disguised_legacy);
+        let disguised_run = crate::harness::HarnessRunId::new().to_string();
+        insert_v56_exact_terminalized_orphan(
+            &disguised_legacy,
+            &disguised_run,
+            &disguised_session,
+            &crate::protocol::TurnId::new().to_string(),
+            &crate::protocol::RuntimeEventId::new().to_string(),
+            false,
+        );
+        let disguised_payload = disguised_legacy
+            .query_row(
+                "SELECT payload_json FROM harness_events WHERE run_id = ?1",
+                [&disguised_run],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("disguised legacy payload");
+        disguised_legacy
+            .execute(
+                "UPDATE harness_events SET payload_sha256 = ?2 WHERE run_id = ?1",
+                params![
+                    disguised_run,
+                    format!("envelope-v1:{}", sha256_text(&disguised_payload))
+                ],
+            )
+            .expect("prefix legacy payload hash as current envelope");
+        let error = run(&disguised_legacy)
+            .expect_err("payload-only digest with a current prefix must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("stale terminalized harness payload hash")
+        );
+        assert_not_migrated(&disguised_legacy, &disguised_run);
+
+        let invalid_payload = Connection::open_in_memory().expect("invalid-payload database");
+        invalid_payload
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v55_endpoint(&invalid_payload);
+        let payload_session = insert_v56_session(&invalid_payload);
+        let payload_run = crate::harness::HarnessRunId::new().to_string();
+        insert_v56_exact_terminalized_orphan(
+            &invalid_payload,
+            &payload_run,
+            &payload_session,
+            &crate::protocol::TurnId::new().to_string(),
+            &crate::protocol::RuntimeEventId::new().to_string(),
+            false,
+        );
+        let malformed_payload = serde_json::json!({
+            "type": "generic",
+            "data": {
+                "kind": "turn_terminal",
+                "session_id": payload_session,
+                "terminal": {
+                    "outcome": { "kind": "completed" },
+                    "unexpected": true
+                }
+            }
+        })
+        .to_string();
+        invalid_payload
+            .execute(
+                "UPDATE harness_events
+                 SET payload_json = ?2, payload_sha256 = ?3
+                 WHERE run_id = ?1",
+                params![
+                    payload_run,
+                    malformed_payload,
+                    sha256_text(&malformed_payload)
+                ],
+            )
+            .expect("invalid typed terminalized payload");
+        let error = run(&invalid_payload).expect_err("invalid terminal payload must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid typed terminal run event")
+        );
+        assert_not_migrated(&invalid_payload, &payload_run);
+
+        let dependency = Connection::open_in_memory().expect("dependency database");
+        dependency
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v55_endpoint(&dependency);
+        let dependency_session = insert_v56_session(&dependency);
+        let dependency_turn = crate::protocol::TurnId::new().to_string();
+        let dependency_run = crate::harness::HarnessRunId::new().to_string();
+        insert_v56_exact_terminalized_orphan(
+            &dependency,
+            &dependency_run,
+            &dependency_session,
+            &dependency_turn,
+            &crate::protocol::RuntimeEventId::new().to_string(),
+            false,
+        );
+        dependency
+            .execute(
+                "UPDATE sessions
+                 SET status = 'running', active_run_id = ?2, active_turn_id = ?3,
+                     active_run_lease_expires_at_ms = 100
+                 WHERE id = ?1",
+                params![
+                    dependency_session,
+                    crate::session::AdmissionId::new().to_string(),
+                    dependency_turn,
+                ],
+            )
+            .expect("active turn dependency residue");
+        let error = run(&dependency).expect_err("active turn dependency must fail closed");
+        assert!(error.to_string().contains("canonical terminal linkage"));
+        assert_not_migrated(&dependency, &dependency_run);
+    }
+
+    #[test]
+    fn v55_upgrades_exact_v54_reopens_idempotently_and_owns_exact_schema() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v51_endpoint(&connection);
+        connection
+            .execute_batch(V52_HARNESS_TURN_IDENTITY)
+            .expect("exact V52 endpoint");
+        connection
+            .execute_batch(V53_AGENT_TRIGGER_TURN_CLAIMS)
+            .expect("exact V53 endpoint");
+        connection
+            .execute_batch(V54_PERMISSION_RETRY_FENCES)
+            .expect("exact V54 endpoint");
+        assert!(
+            !schema_migration_applied(&connection, DURABLE_SIDE_CHATS_VERSION)
+                .expect("V55 marker query")
+        );
+
+        run(&connection).expect("V54 to V55 upgrade");
+        run(&connection).expect("idempotent V55 reopen");
+
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                DURABLE_SIDE_CHATS_VERSION,
+                DURABLE_SIDE_CHATS_NAME,
+            )
+            .expect("V55 marker")
+        );
+        validate_durable_side_chats_schema(&connection).expect("exact V55 schema");
+        validate_durable_side_chats_data(&connection).expect("valid V55 data");
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v55_fast_path_rejects_schema_marker_and_identity_tampering() {
+        let schema_connection = Connection::open_in_memory().expect("database");
+        run(&schema_connection).expect("fresh current schema");
+        schema_connection
+            .execute_batch("DROP TRIGGER validate_side_chat_binding_before_update")
+            .expect("drop V55 transition trigger");
+        let schema_error = run(&schema_connection).expect_err("stale V55 schema must fail closed");
+        assert!(
+            schema_error.to_string().contains("V55 marker"),
+            "unexpected V55 schema audit error: {schema_error}"
+        );
+
+        let tombstone_schema_connection = Connection::open_in_memory().expect("database");
+        run(&tombstone_schema_connection).expect("fresh current schema");
+        tombstone_schema_connection
+            .execute_batch("DROP TRIGGER prevent_tombstoned_side_chat_binding_update")
+            .expect("drop V55 tombstone freeze trigger");
+        let tombstone_schema_error = run(&tombstone_schema_connection)
+            .expect_err("stale V55 tombstone schema must fail closed");
+        assert!(
+            tombstone_schema_error.to_string().contains("V55 marker"),
+            "unexpected V55 tombstone schema audit error: {tombstone_schema_error}"
+        );
+
+        let marker_connection = Connection::open_in_memory().expect("database");
+        run(&marker_connection).expect("fresh current schema");
+        marker_connection
+            .execute(
+                "UPDATE moyai_schema_migrations
+                 SET name = 'tampered_v55'
+                 WHERE version = ?1",
+                [DURABLE_SIDE_CHATS_VERSION],
+            )
+            .expect("tamper V55 marker");
+        let marker_error = run(&marker_connection).expect_err("wrong V55 marker must fail closed");
+        assert!(
+            marker_error.to_string().contains(DURABLE_SIDE_CHATS_NAME),
+            "unexpected V55 marker audit error: {marker_error}"
+        );
+
+        let data_connection = Connection::open_in_memory().expect("database");
+        data_connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run(&data_connection).expect("fresh current schema");
+        let project_id = crate::session::ProjectId::new().to_string();
+        let owner_id = crate::session::SessionId::new().to_string();
+        let conversation_id = crate::session::SessionId::new().to_string();
+        data_connection
+            .execute(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'C:/v55', 'v55', 'none', 1, 1)",
+                [&project_id],
+            )
+            .expect("V55 fixture project");
+        for session_id in [&owner_id, &conversation_id] {
+            data_connection
+                .execute(
+                    "INSERT INTO sessions
+                     (id, project_id, title, status, cwd_path, model_name, base_url,
+                      access_mode, model_parameters_json,
+                      created_at_ms, updated_at_ms, completed_at_ms)
+                     VALUES (?1, ?2, 'session', 'idle', 'C:/v55', 'gemma',
+                             'http://localhost:1234', 'default', '{}', 1, 1, NULL)",
+                    params![session_id, project_id],
+                )
+                .expect("V55 fixture session");
+        }
+        data_connection
+            .execute(
+                "INSERT INTO side_chat_bindings (
+                     id, owner_session_id, conversation_session_id,
+                     base_url, model, provider_metadata_mode, provider_api_mode,
+                     context_window, max_output_tokens,
+                     request_timeout_ms, connect_timeout_ms, max_retries,
+                     supports_images, supports_tools, supports_reasoning,
+                     persisted_draft, draft_revision, request_generation, context_scope,
+                     created_at_ms, updated_at_ms
+                 ) VALUES (
+                     '!!!!!!!!!!!!!!!!!!!!!!!!!!', ?1, ?2,
+                     'http://localhost:1234', 'gemma',
+                     'lm_studio_native_required', 'chat_completions',
+                     65536, 8192, 60000, 5000, 1,
+                     0, 0, 1, '', 0, 0, 'general', 2, 2
+                 )",
+                params![owner_id, conversation_id],
+            )
+            .expect("inject invalid V55 binding identity");
+        let data_error = run(&data_connection).expect_err("invalid V55 id must fail closed");
+        assert!(
+            data_error.to_string().contains("invalid id"),
+            "unexpected V55 data audit error: {data_error}"
+        );
+    }
+
+    #[test]
+    fn current_runner_upgrades_exact_v53_through_v55_in_one_startup() {
+        let connection = Connection::open_in_memory().expect("database");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("foreign keys");
+        run_through_exact_v51_endpoint(&connection);
+        connection
+            .execute_batch(V52_HARNESS_TURN_IDENTITY)
+            .expect("exact V52 endpoint");
+        connection
+            .execute_batch(V53_AGENT_TRIGGER_TURN_CLAIMS)
+            .expect("exact V53 endpoint");
+        assert!(
+            !schema_migration_applied(&connection, PERMISSION_RETRY_FENCES_VERSION)
+                .expect("V54 marker query")
+        );
+
+        run_to_current(&connection).expect("V53 through current upgrade");
+        run_to_current(&connection).expect("idempotent current reopen");
+
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                PERMISSION_RETRY_FENCES_VERSION,
+                PERMISSION_RETRY_FENCES_NAME,
+            )
+            .expect("V54 marker")
+        );
+        validate_permission_retry_fences_schema(&connection).expect("exact V54 schema");
+        validate_permission_retry_fences_data(&connection).expect("valid V54 data");
+        assert!(
+            schema_migration_has_exact_name(
+                &connection,
+                DURABLE_SIDE_CHATS_VERSION,
+                DURABLE_SIDE_CHATS_NAME,
+            )
+            .expect("V55 marker")
+        );
+        validate_durable_side_chats_schema(&connection).expect("exact V55 schema");
+        validate_durable_side_chats_data(&connection).expect("valid V55 data");
+        assert!(foreign_key_violations(&connection).is_empty());
+    }
+
+    #[test]
+    fn v54_fast_path_rejects_schema_marker_and_row_tampering() {
+        let schema_connection = Connection::open_in_memory().expect("database");
+        run(&schema_connection).expect("fresh current schema");
+        schema_connection
+            .execute_batch("DROP TRIGGER validate_permission_retry_fence_before_update")
+            .expect("drop V54 lifecycle trigger");
+        let schema_error = run(&schema_connection).expect_err("stale V54 schema must fail closed");
+        assert!(
+            schema_error.to_string().contains("V54 marker"),
+            "unexpected V54 schema audit error: {schema_error}"
+        );
+
+        let marker_connection = Connection::open_in_memory().expect("database");
+        run(&marker_connection).expect("fresh current schema");
+        marker_connection
+            .execute(
+                "UPDATE moyai_schema_migrations
+                 SET name = 'tampered_v54'
+                 WHERE version = ?1",
+                [PERMISSION_RETRY_FENCES_VERSION],
+            )
+            .expect("tamper V54 marker");
+        let marker_error = run(&marker_connection).expect_err("wrong V54 marker must fail closed");
+        assert!(
+            marker_error
+                .to_string()
+                .contains(PERMISSION_RETRY_FENCES_NAME),
+            "unexpected V54 marker audit error: {marker_error}"
+        );
+
+        let data_connection = Connection::open_in_memory().expect("database");
+        run(&data_connection).expect("fresh current schema");
+        let session_id = crate::session::SessionId::new().to_string();
+        let turn_id = crate::protocol::TurnId::new().to_string();
+        let authority_id = crate::protocol::HistoryItemId::new().to_string();
+        data_connection
+            .execute_batch(
+                "INSERT INTO projects
+                 (id, root_path, display_name, vcs_kind, created_at_ms, updated_at_ms)
+                 VALUES ('v54-project', 'C:/v54', 'v54', 'none', 1, 1);",
+            )
+            .expect("V54 fixture project");
+        data_connection
+            .execute(
+                "INSERT INTO sessions (
+                     id, project_id, title, status, cwd_path, model_name, base_url,
+                     created_at_ms, updated_at_ms, completed_at_ms,
+                     active_run_id, active_turn_id, active_run_lease_expires_at_ms
+                 )
+                 VALUES (
+                     ?1, 'v54-project', 'session', 'idle',
+                     'C:/v54', 'model', 'http://localhost',
+                     1, 1, NULL, NULL, NULL, NULL
+                 )",
+                [&session_id],
+            )
+            .expect("V54 fixture session");
+        let authority_payload =
+            serde_json::to_string(&crate::protocol::HistoryItemPayload::UserTurn {
+                content: vec![crate::protocol::ContentPart::Text {
+                    text: "authority".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+            })
+            .expect("V54 authority payload");
+        insert_v51_history_fixture(
+            &data_connection,
+            &authority_id,
+            &session_id,
+            &turn_id,
+            0,
+            2,
+            &authority_payload,
+        );
+        data_connection
+            .execute(
+                "INSERT INTO permission_retry_fences (
+                     root_session_id, family_version, family_sha256,
+                     authority_history_item_id, state, review_id, identity_sha256,
+                     outcome, created_at_ms, updated_at_ms
+                 ) VALUES (
+                     ?1, 1, ?2, ?3, 'reviewing', 'not-a-ulid', ?4, NULL, 3, 3
+                 )",
+                params![
+                    session_id,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    authority_id,
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ],
+            )
+            .expect("inject syntactically invalid V54 review id");
+        let data_error = validate_permission_retry_fences_data(&data_connection)
+            .expect_err("invalid V54 review identity must fail closed");
+        assert!(
+            data_error.to_string().contains("invalid review id"),
+            "unexpected V54 data audit error: {data_error}"
+        );
+        assert!(
+            run(&data_connection).is_err(),
+            "current-schema reopen must execute the V54 data audit"
+        );
+
+        data_connection
+            .execute("DELETE FROM permission_retry_fences", [])
+            .expect("remove invalid review-id fixture");
+        data_connection
+            .pragma_update(None, "ignore_check_constraints", "ON")
+            .expect("temporarily bypass V54 family-version constraint");
+        data_connection
+            .execute(
+                "INSERT INTO permission_retry_fences (
+                     root_session_id, family_version, family_sha256,
+                     authority_history_item_id, state, review_id, identity_sha256,
+                     outcome, created_at_ms, updated_at_ms
+                 ) VALUES (
+                     ?1, 4294967296, ?2, ?3, 'reviewing', ?4, ?5, NULL, 4, 4
+                 )",
+                params![
+                    session_id,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    authority_id,
+                    crate::storage::PermissionReviewId::new().to_string(),
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                ],
+            )
+            .expect("inject out-of-range V54 family version");
+        data_connection
+            .pragma_update(None, "ignore_check_constraints", "OFF")
+            .expect("restore V54 family-version constraint");
+        let version_error = validate_permission_retry_fences_data(&data_connection)
+            .expect_err("family versions outside u32 must fail closed");
+        assert!(
+            version_error
+                .to_string()
+                .contains("permission retry fence row"),
+            "unexpected V54 family-version audit error: {version_error}"
+        );
+        assert!(
+            run(&data_connection).is_err(),
+            "current-schema reopen must reject an out-of-range V54 family version"
         );
     }
 

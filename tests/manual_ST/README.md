@@ -6,10 +6,13 @@
 
 - 現在の作業ルール: user requestと、現在workspaceに適用される `AGENTS.md`。このorchestration checkoutでは親rootのものを使うが、standalone cloneやrelease packageに親fileを要求しない
 - 必要な smoke: user request、変更面、user-visible risk。`Kanban.md` は優先度・進捗の補助情報だけとする
+- 共通 actual E2E lifecycle / driver / evidence contract: `../desktop_e2e/README.md`
 - scenario の user-visible requirement: 各 `spec.md`
 - run固有の結果とfailure: 必須のtask-local `RESULTS.md`。親orchestration workspaceに `docs/logs/worklog.md` がある場合だけ判断概要も追記する
 
 現行 `src/harness/` が保存する runtime evidence は利用できるが、harness internal state や旧 classifier を final oracle にしない。合否は実 GUI 操作、workspace output、外部 verification、transcript / protocol evidence で判定する。
+
+各caseはscenario intentとproduct predicateを所有する。launch、port、process ledger、deadline、evidence writer、verdict、cleanupは `tests/desktop_e2e/` の共通ownerへ委ね、caseや実行ごとにRun番号付きscript一式を複製しない。未対応driverが必要な場合は、case内の一時helperではなく共通adapterとそのqualificationを先に追加する。
 
 ## Scenarios
 
@@ -32,13 +35,13 @@ core / agent-loop / release の広い regression では、必要に応じて `ca
 
 ## Common execution
 
-1. `project_sandbox/<task>/<case>/` に fresh workspace、fresh config/data、artifact directory を作る。
+1. `tests/desktop_e2e/` の共通runnerで `project_sandbox/<task>/<execution-id>/` に fresh workspace、fresh config/data/WebView profile、artifact directory を作る。
 2. 対象 build と provider/model/configを`RESULTS.md`に記録する。provider/modelはcurrent verified profileを起点とし、別用途fixtureの縮小したcontext/output budgetを流用しない。意図的なoverrideは既定/profileとの差分と理由を明記する。
 3. visible Tauri Desktop を起動し、scenario の canonical user request を GUI から送る。
 4. pointer、keyboard、attachment、confirmation など scenario に必要な操作を実際に行う。
 5. scenario 内の required verification を moyAI の tool evidence と外部 command の両方で確認する。
 6. workspace diff、transcript Markdown export、必要な protocol/provider diagnostics、screenshots を保存する。
-7. helper process と app を終了し、残留 process がないことを確認する。
+7. 共通cleanup ownerがtask-owned exact process / profileを終了し、必要なSQLite最終確認後にresultとevidenceをsealする。
 
 CLI から Desktop を起動する場合の current option は `moyai desktop --dir <workspace>`。実際の binary / option は current `--help` を優先する。
 
@@ -62,3 +65,4 @@ release package の gate artifact は `Manual ST Gate: PASS` を含め、`script
 - case-specific hack や hidden gate を product code に追加しない。
 - task-local `RESULTS.md` に直接原因、対応、次アクションを記録する。親orchestration workspaceに `docs/logs/worklog.md` がある場合だけ同じ判断概要を追記し、旧台帳や別形式の履歴は更新しない。
 - 修正後は fresh workspace / fresh data で対象 scenario を再実行する。
+- harness failureは共通ownerへ修正と回帰testを追加し、旧executionを上書きせずfresh execution IDで再qualificationする。

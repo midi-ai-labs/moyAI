@@ -9,9 +9,9 @@ use crate::protocol::{
 };
 use crate::runtime::RunCancellationCause;
 use crate::session::{
-    CanonicalSessionRead, DispatchTransformKind, DurableTurnTerminal, LoadedSessionStatus,
-    LoadedSessionSummary, PendingTurnInputProjection, PromptDispatchPart, RunEvent, RunSummary,
-    SessionId, SessionRecord, SessionStatus, ToolCallId, ToolCallStatus,
+    ActiveTurnExpectation, CanonicalSessionRead, DispatchTransformKind, DurableTurnTerminal,
+    LoadedSessionStatus, LoadedSessionSummary, PendingTurnInputProjection, PromptDispatchPart,
+    RunEvent, RunSummary, SessionId, SessionRecord, SessionStatus, ToolCallId, ToolCallStatus,
 };
 use crate::tool::{PermissionRequest, ToolName};
 
@@ -186,10 +186,32 @@ pub enum PromptReviewPhase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptReviewState {
     pub request_id: u64,
+    pub tui_owner: Option<PromptReviewOwner>,
     pub phase: PromptReviewPhase,
     pub raw_prompt_text: String,
     pub initial_draft_text: Option<String>,
     pub current_draft_text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptReviewOwner {
+    pub session_id: Option<SessionId>,
+    pub expected_active_turn: ActiveTurnExpectation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptReviewTarget {
+    pub request_id: u64,
+    pub owner: PromptReviewOwner,
+}
+
+impl PromptReviewState {
+    pub fn tui_target(&self) -> Option<PromptReviewTarget> {
+        Some(PromptReviewTarget {
+            request_id: self.request_id,
+            owner: self.tui_owner?,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +220,7 @@ pub struct AppState {
     pub modal: Modal,
     pub current_session_id: Option<SessionId>,
     pub current_session_title: String,
+    pub active_turn_expectation: ActiveTurnExpectation,
     pub sessions: Vec<SessionRecord>,
     pub loaded_sessions: Vec<LoadedSessionSummary>,
     pub selected_session_index: usize,
@@ -226,6 +249,7 @@ impl Default for AppState {
             modal: Modal::None,
             current_session_id: None,
             current_session_title: "New Session".to_string(),
+            active_turn_expectation: ActiveTurnExpectation::initial_idle(),
             sessions: Vec::new(),
             loaded_sessions: Vec::new(),
             selected_session_index: 0,
@@ -288,6 +312,19 @@ impl AppState {
         self.route = Route::Session;
         self.current_session_id = Some(session.id);
         self.current_session_title = session.title.clone();
+        let latest_turn_id = turn_items_in_projection_order(turn_items)
+            .last()
+            .map(|item| item.turn_id);
+        self.active_turn_expectation = active_turn_id.map_or(
+            ActiveTurnExpectation::Idle {
+                latest_turn_id,
+                revision: 0,
+            },
+            |turn_id| ActiveTurnExpectation::Turn {
+                turn_id,
+                revision: 0,
+            },
+        );
         let roots = self.file_change_display_roots();
         let transcript_entries = transcript_entries_from_turn_items_with_roots(turn_items, roots);
         self.transcript_entries = transcript_entries;
@@ -340,6 +377,16 @@ impl AppState {
             &read.turns.items,
             read.active_turn_id,
         );
+        self.active_turn_expectation = read.active_turn_id.map_or(
+            ActiveTurnExpectation::Idle {
+                latest_turn_id: read.latest_turn_id,
+                revision: read.admission_revision,
+            },
+            |turn_id| ActiveTurnExpectation::Turn {
+                turn_id,
+                revision: read.admission_revision,
+            },
+        );
         self.pending_turn_inputs = read.pending_turn_inputs.clone();
     }
 
@@ -352,6 +399,16 @@ impl AppState {
             transcript_entries_from_turn_items_with_roots(&read.turns.items, roots);
         self.transcript_entries = transcript_entries;
         self.pending_turn_inputs = read.pending_turn_inputs.clone();
+        self.active_turn_expectation = read.active_turn_id.map_or(
+            ActiveTurnExpectation::Idle {
+                latest_turn_id: read.latest_turn_id,
+                revision: read.admission_revision,
+            },
+            |turn_id| ActiveTurnExpectation::Turn {
+                turn_id,
+                revision: read.admission_revision,
+            },
+        );
         self.refresh_plan_from_turn_items(&read.turns.items);
         true
     }
@@ -419,8 +476,15 @@ impl AppState {
     }
 
     pub fn apply_run_event(&mut self, event: &RunEvent) {
+        super::reducer::reduce_run_event(self, event);
+    }
+
+    pub(super) fn reduce_run_event_inner(&mut self, event: &RunEvent) {
         match event {
             RunEvent::SessionStarted { session_id, title } => {
+                if self.current_session_id != Some(*session_id) {
+                    self.active_turn_expectation = ActiveTurnExpectation::initial_idle();
+                }
                 self.interruption_cause = None;
                 self.route = Route::Session;
                 self.current_session_id = Some(*session_id);
@@ -756,6 +820,11 @@ impl AppState {
     }
 
     pub fn apply_durable_user_turn(&mut self, turn: &crate::protocol::UserTurn) {
+        let revision = self.active_turn_expectation.revision() + 1;
+        self.active_turn_expectation = ActiveTurnExpectation::Turn {
+            turn_id: turn.turn_id,
+            revision,
+        };
         self.route = Route::Session;
         self.transcript_entries.push(TranscriptEntry {
             kind: TranscriptKind::User,
@@ -794,6 +863,7 @@ impl AppState {
     pub fn begin_prompt_enhance(&mut self, request_id: u64, raw_prompt: &str) {
         self.prompt_review = Some(PromptReviewState {
             request_id,
+            tui_owner: None,
             phase: PromptReviewPhase::Enhancing,
             raw_prompt_text: raw_prompt.to_string(),
             initial_draft_text: None,
@@ -801,6 +871,30 @@ impl AppState {
         });
         self.modal = Modal::EnhanceReview;
         self.status_message = Some("enhancing prompt draft".to_string());
+    }
+
+    pub fn begin_tui_prompt_enhance(
+        &mut self,
+        target: PromptReviewTarget,
+        raw_prompt: &str,
+    ) -> bool {
+        if !matches!(
+            target.owner.expected_active_turn,
+            ActiveTurnExpectation::Idle { .. }
+        ) {
+            return false;
+        }
+        self.prompt_review = Some(PromptReviewState {
+            request_id: target.request_id,
+            tui_owner: Some(target.owner),
+            phase: PromptReviewPhase::Enhancing,
+            raw_prompt_text: raw_prompt.to_string(),
+            initial_draft_text: None,
+            current_draft_text: String::new(),
+        });
+        self.modal = Modal::EnhanceReview;
+        self.status_message = Some("enhancing prompt draft".to_string());
+        true
     }
 
     pub fn finish_prompt_enhance(&mut self, request_id: u64, draft: String) -> bool {
@@ -831,6 +925,27 @@ impl AppState {
         }
     }
 
+    pub fn cancel_prompt_review_if_current(&mut self, target: PromptReviewTarget) -> bool {
+        if !self.prompt_review.as_ref().is_some_and(|review| {
+            review.request_id == target.request_id && review.tui_owner == Some(target.owner)
+        }) {
+            return false;
+        }
+        self.cancel_prompt_review();
+        true
+    }
+
+    pub fn prompt_review_matches_current_owner(&self, target: PromptReviewTarget) -> bool {
+        self.prompt_review.as_ref().is_some_and(|review| {
+            review.request_id == target.request_id && review.tui_owner == Some(target.owner)
+        }) && target.owner.session_id == self.current_session_id
+            && target.owner.expected_active_turn == self.active_turn_expectation
+            && matches!(
+                target.owner.expected_active_turn,
+                ActiveTurnExpectation::Idle { .. }
+            )
+    }
+
     pub fn build_prompt_dispatch(&self, send_enhanced: bool) -> Option<PromptDispatchPart> {
         let review = self.prompt_review.as_ref()?;
         let initial = review.initial_draft_text.as_ref()?;
@@ -842,7 +957,25 @@ impl AppState {
         ))
     }
 
+    pub fn build_prompt_dispatch_from_draft(
+        &mut self,
+        request_id: u64,
+        current_draft_text: String,
+        send_enhanced: bool,
+    ) -> Option<PromptDispatchPart> {
+        let review = self.prompt_review.as_mut()?;
+        if review.request_id != request_id {
+            return None;
+        }
+        review.current_draft_text = current_draft_text;
+        self.build_prompt_dispatch(send_enhanced)
+    }
+
     pub(crate) fn apply_terminal_outcome_projection(&mut self, outcome: &TurnTerminalOutcome) {
+        self.active_turn_expectation = ActiveTurnExpectation::Idle {
+            latest_turn_id: self.active_turn_expectation.latest_turn_id(),
+            revision: self.active_turn_expectation.revision(),
+        };
         self.interruption_cause = outcome.interruption_cause();
         self.permission = None;
         self.progress.current_phase = RunProgressPhase::Terminal;
@@ -922,6 +1055,7 @@ fn loaded_summary_from_session(session: SessionRecord) -> LoadedSessionSummary {
         archived: false,
         active_turn_id: None,
         active_turn_sequence_no: None,
+        admission_revision: 0,
         pending_permission_requests: 0,
         pending_user_input_requests: 0,
     }
@@ -1384,6 +1518,27 @@ fn terminal_transcript_kind(outcome: &TurnTerminalOutcome) -> TranscriptKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_review_submission_preserves_the_frontend_owned_edited_draft() {
+        let mut state = AppState::default();
+        state.begin_prompt_enhance(7, "raw request");
+        assert!(state.finish_prompt_enhance(7, "initial enhancement".to_string()));
+
+        let dispatch = state
+            .build_prompt_dispatch_from_draft(7, "edited enhancement".to_string(), false)
+            .expect("review dispatch");
+
+        assert_eq!(dispatch.dispatch_prompt_text, "raw request");
+        assert_eq!(
+            dispatch.enhanced_draft_text.as_deref(),
+            Some("edited enhancement")
+        );
+        assert_eq!(
+            dispatch.transforms[0].label.as_deref(),
+            Some("sent_raw_after_edit")
+        );
+    }
     use camino::Utf8PathBuf;
 
     fn test_session(id: SessionId) -> SessionRecord {
@@ -1432,6 +1587,7 @@ mod tests {
             latest_turn_id: active_turn_id,
             active_turn_id,
             active_turn_sequence_no: active_turn_id.map(|_| 1),
+            admission_revision: u64::from(active_turn_id.is_some()),
         }
     }
 
@@ -1547,6 +1703,65 @@ mod tests {
                 .filter(|entry| entry.body == "same text")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn canonical_active_turn_expectation_tracks_running_and_terminal_owners() {
+        let session_id = SessionId::new();
+        let turn_a = TurnId::new();
+        let mut running = test_session(session_id);
+        running.status = SessionStatus::Running;
+        running.completed_at_ms = None;
+        let running_read = canonical_read(&running, Vec::new(), Vec::new(), Some(turn_a));
+        let mut state = AppState::default();
+
+        state.load_canonical_session_read(&running_read);
+        assert_eq!(
+            state.active_turn_expectation,
+            ActiveTurnExpectation::Turn {
+                turn_id: turn_a,
+                revision: 1,
+            }
+        );
+
+        let mut completed = test_session(session_id);
+        completed.status = SessionStatus::Completed;
+        let mut terminal_read = canonical_read(&completed, Vec::new(), Vec::new(), None);
+        terminal_read.latest_turn_id = Some(turn_a);
+        terminal_read.admission_revision = 1;
+        assert!(state.refresh_canonical_conversation(&terminal_read));
+        assert_eq!(
+            state.active_turn_expectation,
+            ActiveTurnExpectation::Idle {
+                latest_turn_id: Some(turn_a),
+                revision: 1,
+            }
+        );
+
+        let turn_b = TurnId::new();
+        state.apply_durable_user_turn(&crate::protocol::UserTurn {
+            turn_id: turn_b,
+            items: vec![crate::protocol::UserInputItem::Text {
+                text: "B".to_string(),
+            }],
+            prompt_dispatch: None,
+            editor_context: None,
+        });
+        assert_eq!(
+            state.active_turn_expectation,
+            ActiveTurnExpectation::Turn {
+                turn_id: turn_b,
+                revision: 2,
+            }
+        );
+        state.apply_terminal_outcome_projection(&TurnTerminalOutcome::Completed);
+        assert_eq!(
+            state.active_turn_expectation,
+            ActiveTurnExpectation::Idle {
+                latest_turn_id: Some(turn_b),
+                revision: 2,
+            }
         );
     }
 
@@ -1891,5 +2106,38 @@ mod tests {
         state.load_turn_items(&test_session(next_session_id), &[]);
 
         assert_eq!(state.latest_context_window, None);
+    }
+
+    #[test]
+    fn prompt_review_draft_commit_rejects_a_stale_request_without_mutating_the_current_review() {
+        let mut state = AppState::default();
+        state.begin_prompt_enhance(8, "raw request");
+        assert!(state.finish_prompt_enhance(8, "initial draft".to_string()));
+
+        assert!(
+            state
+                .build_prompt_dispatch_from_draft(7, "stale edit".to_string(), true)
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .prompt_review
+                .as_ref()
+                .map(|review| review.current_draft_text.as_str()),
+            Some("initial draft")
+        );
+
+        let dispatch = state
+            .build_prompt_dispatch_from_draft(8, "current edit".to_string(), false)
+            .expect("current review dispatch");
+        assert_eq!(dispatch.dispatch_prompt_text, "raw request");
+        assert_eq!(
+            dispatch.enhanced_draft_text.as_deref(),
+            Some("current edit")
+        );
+        assert_eq!(
+            dispatch.transforms[0].label.as_deref(),
+            Some("sent_raw_after_edit")
+        );
     }
 }

@@ -1,5 +1,14 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { actionById, menuActions, paletteActions, shortcutActions, type ActionDefinition, type ActionMenu } from "./actions.ts";
+import {
+  actionById,
+  actionEnabledById,
+  menuActions,
+  paletteActions,
+  shortcutActions,
+  type ActionDefinition,
+  type ActionMenu,
+  type ActionPayload,
+} from "./actions.ts";
 import { icon } from "./icons.ts";
 import { turnPageLoadPending } from "./history_navigation.ts";
 import { renderMarkdown } from "./markdown.ts";
@@ -12,6 +21,18 @@ import {
 } from "./render_agent_activity.ts";
 import { agentDisplayName, stableAgentVisual } from "./agent_activity.ts";
 import { runCanBeCancelled, runSurfaceActive } from "./run_control.ts";
+import {
+  classifyTaskActivity,
+  renderTaskActivityIndicator,
+  taskActivityStateForSessionRow,
+} from "./task_activity_indicator.ts";
+import { titlebarMenuPopupRole } from "./titlebar_interaction.ts";
+import {
+  DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
+  createDesktopRenderModel,
+  type DesktopRenderLocalPresentation,
+  type DesktopRenderModel,
+} from "./render_projection.ts";
 import type {
   ConfigFieldProjection,
   DesktopViewState,
@@ -19,48 +40,43 @@ import type {
   PendingTurnInput,
   ProjectRow,
   SessionRow,
+  TaskActivityState,
 } from "./types.ts";
-import type { AgentExecutionCacheEntry, ArtifactPaneMode } from "./ui_state.ts";
-import { displayAccessLabel, escapeHtml, fileName, goalSlashCommandHint, shortenPath } from "./utils.ts";
-import { providerCapabilities } from "./view_state.ts";
+import {
+  sideChatConfigurationOpen,
+  sideChatModelOptionLabel,
+  sideChatModelOptions,
+  sideChatOwnerSessionId,
+  type SideChatCatalogView,
+} from "./ui_state.ts";
+import {
+  configCommitControlState,
+  displayAccessLabel,
+  escapeHtml,
+  fileName,
+  goalSlashCommandHint,
+  providerOverlayFeedback,
+  shortenPath,
+  validateConfigFieldValues,
+  validateConfigInput,
+  validateSideChatProviderSettings,
+} from "./utils.ts";
+import { normalizeProviderBaseUrl, providerCapabilities } from "./view_state.ts";
+
+import { renderConfirmation, renderLocalConfirmation } from "./render_overlays.ts";
 
 export type { LocalConfirmation } from "./render_overlays.ts";
-export { renderConfirmation, renderLocalConfirmation } from "./render_overlays.ts";
+export { renderConfirmation, renderLocalConfirmation };
 
 const splashLogoUrl = new URL("../../../logo/fabicon/android-chrome-512x512.png", import.meta.url).href;
 
-interface RenderContext {
-  artifactPaneCollapsed: boolean;
-  artifactPaneMode?: ArtifactPaneMode;
-  selectedAgentPath?: string | null;
-  selectedAgentExecution?: AgentExecutionCacheEntry | null;
-  attachmentTrayOpen: boolean;
-  configDirty: boolean;
-  configMutationPending: boolean;
-  configOwnerMutationOpen: boolean;
-  configDraftEditOpen: boolean;
-  configDraftDiscardOpen: boolean;
-  configDraftCommitOpen: boolean;
-}
-
-let artifactPaneCollapsed = false;
-let artifactPaneMode: ArtifactPaneMode = "output";
-let selectedAgentPath: string | null = null;
-let selectedAgentExecution: AgentExecutionCacheEntry | null = null;
-let attachmentTrayOpen = false;
-let configDirty = false;
-let configMutationInFlight = false;
-let configOwnerMutationIsOpen = true;
-let configDraftEditingIsOpen = true;
-let configDraftDiscardIsOpen = false;
-let configDraftCommitIsOpen = false;
-
-const TYPED_CONFIG_KEYS = new Set([
+const TYPED_CONFIG_KEYS: readonly string[] = Object.freeze([
   "model.base_url",
   "model.model",
   "model.provider_metadata_mode",
   "model.context_window",
   "model.max_output_tokens",
+  "model.request_timeout_ms",
   "model.temperature",
   "model.top_p",
   "model.supports_tools",
@@ -90,18 +106,94 @@ const TYPED_CONFIG_KEYS = new Set([
   "mcp.servers_json",
 ]);
 
-export function setRenderContext(context: RenderContext): void {
-  artifactPaneCollapsed = context.artifactPaneCollapsed;
-  artifactPaneMode = context.artifactPaneMode ?? "output";
-  selectedAgentPath = context.selectedAgentPath ?? null;
-  selectedAgentExecution = context.selectedAgentExecution ?? null;
-  attachmentTrayOpen = context.attachmentTrayOpen;
-  configDirty = context.configDirty;
-  configMutationInFlight = context.configMutationPending;
-  configOwnerMutationIsOpen = context.configOwnerMutationOpen;
-  configDraftEditingIsOpen = context.configDraftEditOpen;
-  configDraftDiscardIsOpen = context.configDraftDiscardOpen;
-  configDraftCommitIsOpen = context.configDraftCommitOpen;
+export interface DesktopMarkupOptions {
+  readonly backgroundInert: boolean;
+  readonly taskActivityDelay: string;
+}
+
+/** Pure Desktop markup composition from one explicit immutable render model. */
+export function renderDesktopMarkup(
+  model: DesktopRenderModel,
+  options: DesktopMarkupOptions,
+): string {
+  const state = model.view;
+  const local = model.local;
+  const localConfirmationPending = local.modal.localConfirmation !== null;
+  const sideChatDeletePending = local.sideChat.deleteConfirmation !== null;
+  const localModalPending = localConfirmationPending || sideChatDeletePending;
+  const markup = `
+    <div class="app-frame ${local.artifactPane.collapsed ? "artifact-collapsed" : ""} ${!local.artifactPane.collapsed && local.artifactPane.mode === "side_chat" ? "side-chat-open" : ""}" style="--window-opacity: ${state.window_opacity_percent / 100}; --task-activity-delay: ${options.taskActivityDelay}">
+      ${renderTitlebar(local.windowMaximized, options.backgroundInert, state.overlay)}
+      <div class="shell" ${options.backgroundInert ? 'inert aria-hidden="true"' : ""}>
+        ${renderSidebar(state)}
+        <main class="conversation">
+          ${renderTopbar(state, local)}
+          ${renderRunStatusStrip(state)}
+          <section class="thread" id="thread" tabindex="-1" aria-label="会話履歴">
+            ${renderThreadContent(state, local)}
+          </section>
+          ${renderComposer(state, local)}
+        </main>
+        ${renderArtifactPane(state, local)}
+      </div>
+    </div>
+    ${
+      !state.confirmation_visible && local.modal.localConfirmation
+        ? renderLocalConfirmation(
+            local.modal.localConfirmation,
+            local.modal.localDecisionPending,
+            local.modal.localDecisionError,
+          )
+        : ""
+    }
+    ${
+      !state.confirmation_visible && !localConfirmationPending && sideChatDeletePending
+        ? renderSideChatDeleteConfirmation(state, local)
+        : ""
+    }
+    ${state.confirmation_visible ? renderConfirmation(state, local.modal.permissionDecision) : ""}
+    ${!state.confirmation_visible && !localModalPending && state.overlay !== "none" ? renderOverlay(state, local, model) : ""}
+    ${options.backgroundInert ? "" : renderRecoverableError(local.recoverableError)}
+  `;
+  return applyActionAvailabilityToButtons(markup, model);
+}
+
+/**
+ * Normalizes button availability once at the final markup boundary. Surface owners still decide
+ * whether a control exists and what it says; the action registry alone decides whether it can run.
+ */
+function applyActionAvailabilityToButtons(html: string, model: DesktopRenderModel): string {
+  return html.replace(/<button\b[^>]*>/gi, (tag) => {
+    const action = htmlAttribute(tag, "data-action");
+    if (!action) return tag;
+    const payload: ActionPayload = {
+      index: Number(htmlAttribute(tag, "data-index") ?? "-1"),
+      value: htmlAttribute(tag, "data-agent-path")
+        ?? htmlAttribute(tag, "data-history-target")
+        ?? htmlAttribute(tag, "data-mode")
+        ?? "",
+    };
+    const enabled = actionEnabledById(action, model, payload);
+    const normalized = tag
+      .replace(/\sdisabled(?:=(?:"[^"]*"|'[^']*'|[^\s>]+))?/gi, "")
+      .replace(/\saria-disabled=(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+    return normalized.replace(/>$/, `${enabled ? "" : " disabled"} aria-disabled="${String(!enabled)}">`);
+  });
+}
+
+function htmlAttribute(tag: string, name: string): string | null {
+  const match = new RegExp(`\\b${name}=(?:"([^"]*)"|'([^']*)')`, "i").exec(tag);
+  const value = match?.[1] ?? match?.[2];
+  return value === undefined ? null : decodeHtmlAttribute(value);
+}
+
+function decodeHtmlAttribute(value: string): string {
+  return value
+    .replaceAll("&quot;", '"')
+    .replaceAll("&#39;", "'")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&");
 }
 
 export function renderStartupSplash(state: DesktopWebState, elapsedMs: number, minVisibleMs: number): string {
@@ -147,18 +239,23 @@ function startupCheckMark(status: string): string {
   return "…";
 }
 
-export function renderTitlebar(maximized = false, applicationCommandsInert = false): string {
+export function renderTitlebar(maximized = false, applicationCommandsInert = false, activeOverlay = ""): string {
   const maximizeLabel = maximized ? "元のサイズに戻す" : "最大化";
   const applicationCommandsState = applicationCommandsInert ? ' inert aria-hidden="true"' : "";
+  const menuTrigger = (menu: ActionMenu, label: string): string => {
+    const menuId = `titlebar-${menu}-menu`;
+    const popupRole = titlebarMenuPopupRole(menu);
+    return `<button id="${menuId}-trigger" data-action="show-${menu}-menu" aria-label="${label}メニュー" aria-haspopup="${popupRole}" aria-expanded="${activeOverlay === `${menu}_menu`}" aria-controls="${menuId}">${label}</button>`;
+  };
   return `
     <header class="app-titlebar">
       <div class="titlebar-left">
         <span class="app-brand" data-drag-region>moyAI</span>
-        <nav class="titlebar-menu"${applicationCommandsState}>
-          <button data-action="show-file-menu" aria-label="ファイルメニュー">ファイル</button>
-          <button data-action="show-edit-menu" aria-label="編集メニュー">編集</button>
-          <button data-action="show-view-menu" aria-label="表示メニュー">表示</button>
-          <button data-action="show-help-menu" aria-label="ヘルプメニュー">ヘルプ</button>
+        <nav class="titlebar-menu" aria-label="アプリケーションメニュー"${applicationCommandsState}>
+          ${menuTrigger("file", "ファイル")}
+          ${menuTrigger("edit", "編集")}
+          ${menuTrigger("view", "表示")}
+          ${menuTrigger("help", "ヘルプ")}
         </nav>
       </div>
       <div class="titlebar-drag" data-drag-region></div>
@@ -169,6 +266,25 @@ export function renderTitlebar(maximized = false, applicationCommandsInert = fal
       </div>
     </header>
   `;
+}
+
+export function synchronizeTitlebarMenuState(
+  titlebar: HTMLElement,
+  activeOverlay: string,
+  applicationCommandsInert: boolean,
+): void {
+  const applicationCommands = titlebar.querySelector<HTMLElement>(".titlebar-menu");
+  applicationCommands?.toggleAttribute("inert", applicationCommandsInert);
+  if (applicationCommandsInert) {
+    applicationCommands?.setAttribute("aria-hidden", "true");
+  } else {
+    applicationCommands?.removeAttribute("aria-hidden");
+  }
+  for (const menu of ["file", "edit", "view", "help"] as const) {
+    titlebar
+      .querySelector<HTMLElement>(`#titlebar-${menu}-menu-trigger`)
+      ?.setAttribute("aria-expanded", String(activeOverlay === `${menu}_menu`));
+  }
 }
 
 function renderProjectRowWithSessions(state: DesktopWebState, row: ProjectRow, index: number): string {
@@ -226,17 +342,21 @@ function renderProjectSessionRows(state: DesktopWebState): string {
         row.loaded_status,
         row.archived,
       );
+      const selected = index === state.selected_session_index;
+      const selectedActivityState = runSurfaceActive(state) && selected
+        ? state.task_activity_state
+        : "idle";
       return renderNavRow(
         row.label,
         sessionRowSubtitle(row, "開発チャット"),
-        index === state.selected_session_index,
+        selected,
         "session",
         index,
         capabilities.rejoinAction,
         capabilities.secondaryAction,
         capabilities.rollbackAction,
         capabilities.deleteAction,
-        runSurfaceActive(state) && index === state.selected_session_index,
+        taskActivityStateForSessionRow(row, selectedActivityState),
         !navigationIsIdle(state),
         `session:${row.session_id}`,
       );
@@ -259,7 +379,7 @@ function renderActiveProjectSessionPlaceholder(state: DesktopWebState): string {
   return `
     <div class="nav-row-wrap selected project-session-placeholder">
       <div class="nav-row">
-        <span class="nav-title"><span class="busy-spinner" title="実行中"></span><span>${escapeHtml(label)}</span></span>
+        <span class="nav-title">${renderTaskActivityIndicator(state.task_activity_state)}<span>${escapeHtml(label)}</span></span>
         <small>開発チャット</small>
       </div>
     </div>
@@ -283,25 +403,31 @@ function renderChatRows(state: DesktopWebState): string {
   }
   const selectedChatSessionId =
     state.selected_project_index < 0 && state.selected_session_index >= 0
-      ? state.session_rows[state.selected_session_index]?.session_id
+      ? state.chat_session_rows[state.selected_session_index]?.session_id
       : undefined;
   return state.chat_session_rows
-    .map((row, index) =>
-      renderNavRow(
+    .map((row, index) => {
+      const selected = row.session_id === selectedChatSessionId;
+      const selectedActivityState = state.selected_project_index < 0
+        && runSurfaceActive(state)
+        && selected
+        ? state.task_activity_state
+        : "idle";
+      return renderNavRow(
         row.label,
         sessionRowSubtitle(row, "通常チャット"),
-        row.session_id === selectedChatSessionId,
+        selected,
         "chat-session",
         index,
         "",
         "",
         "",
         quickChatDeleteAction(row.loaded_status),
-        state.selected_project_index < 0 && runSurfaceActive(state) && row.session_id === selectedChatSessionId,
+        taskActivityStateForSessionRow(row, selectedActivityState),
         !navigationIsIdle(state),
         `chat-session:${row.session_id}`,
-      )
-    )
+      );
+    })
     .join("");
 }
 
@@ -324,7 +450,6 @@ function sessionRowSubtitle(row: SessionRow, fallback: string): string {
 }
 
 export function renderSidebar(state: DesktopWebState): string {
-  const chatRunning = state.selected_project_index < 0 && runSurfaceActive(state);
   const navigationDisabled = !navigationIsIdle(state);
   return `
     <aside class="sidebar">
@@ -345,8 +470,8 @@ export function renderSidebar(state: DesktopWebState): string {
           .join("")}
       </div>
       <div class="rail-section row-heading">
-        <span class="section-label">チャット${chatRunning ? '<span class="busy-spinner small" title="実行中"></span>' : ""}</span>
-        <button class="tiny-button icon-only" data-action="new-chat" title="新しい通常チャット" aria-label="新しい通常チャット" ${navigationDisabled ? "disabled" : ""}>${icon("plus")}</button>
+        <span class="section-label">チャット</span>
+        <button class="tiny-button icon-only" data-action="new-chat" data-focus-key="quick-chat:new-session" title="新しい通常チャット" aria-label="新しい通常チャット" ${navigationDisabled ? "disabled" : ""}>${icon("plus")}</button>
       </div>
       <div class="row-list chat-list">${renderChatRows(state)}</div>
       <button class="settings" data-action="show-config" title="設定"><span class="rail-icon">${icon("settings")}</span><span>設定</span></button>
@@ -354,7 +479,10 @@ export function renderSidebar(state: DesktopWebState): string {
   `;
 }
 
-export function renderTopbar(state: DesktopViewState): string {
+export function renderTopbar(
+  state: DesktopViewState,
+  local: Readonly<DesktopRenderLocalPresentation> = DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
+): string {
   const workspaceLabel =
     state.selected_project_index >= 0 ? selectedProjectDisplayLabel(state) : "プロジェクトなし";
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
@@ -384,6 +512,7 @@ export function renderTopbar(state: DesktopViewState): string {
           </button>
            <button data-action="toggle-access" title="権限モードを切り替え（承認を求める → 代理で承認 → フルアクセス）" aria-disabled="${state.config_draft.access_mode_mutation_enabled ? "false" : "true"}" ${state.config_draft.access_mode_mutation_enabled ? "" : "disabled"}>${escapeHtml(displayAccessLabel(state.access_label))}</button>
           <button class="icon-button" data-action="export-transcript" title="${exportTitle}" aria-label="${exportTitle}" ${exportDisabled ? "disabled" : ""}>${icon("download")}</button>
+          <button class="icon-button responsive-output-toggle" data-action="toggle-artifact-pane" data-focus-key="artifact-pane-toggle" title="${local.artifactPane.collapsed ? "右ペインを表示" : "右ペインを閉じる"}" aria-label="${local.artifactPane.collapsed ? "右ペインを表示" : "右ペインを閉じる"}" aria-expanded="${local.artifactPane.collapsed ? "false" : "true"}">${icon("folder")}</button>
         </div>
       </div>
     </header>
@@ -391,27 +520,31 @@ export function renderTopbar(state: DesktopViewState): string {
 }
 
 export function renderRunStatusStrip(state: DesktopWebState): string {
-  if (!runCanBeCancelled(state)) {
-    return "";
-  }
+  const activity = classifyTaskActivity(state.task_activity_state);
+  if (!activity) return "";
+  const canCancel = runCanBeCancelled(state);
   const phase = state.run_phase.trim() || "running";
   const step = state.run_active_step.trim() || state.status_message;
   const toolLine = state.latest_tool_summary.trim() || "ツール待機中";
-  const statusLabel = state.confirmation_visible ? "確認待ち" : "実行中";
   return `
-    <section class="run-strip" aria-live="polite">
-      <span class="busy-spinner" title="${statusLabel}"></span>
-      <strong>${statusLabel}</strong>
+    <section class="run-strip${canCancel ? " has-stop" : ""}" aria-live="polite">
+      ${renderTaskActivityIndicator(activity.state, { decorative: true })}
+      <strong>${activity.label}</strong>
       <span>${escapeHtml(phase)}</span>
       <span>${escapeHtml(step)}</span>
       <small>${escapeHtml(toolLine)}</small>
-      <button class="icon-only danger" data-action="cancel-run" title="実行停止" aria-label="実行停止">${icon("square")}</button>
+      ${canCancel ? `<button class="icon-only danger" data-action="cancel-run" title="実行停止" aria-label="実行停止">${icon("square")}</button>` : ""}
     </section>
   `;
 }
 
-export function renderThreadContent(state: DesktopWebState): string {
-  const selectedTranscriptAgentPath = artifactPaneMode === "agents" ? selectedAgentPath : null;
+export function renderThreadContent(
+  state: DesktopWebState,
+  local: Readonly<DesktopRenderLocalPresentation> = DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
+): string {
+  const selectedTranscriptAgentPath = local.artifactPane.mode === "agents"
+    ? local.artifactPane.selectedAgentPath
+    : null;
   const representedAgentPaths = new Set(
     state.transcript_rows
       .filter((row) => row.row_kind.startsWith("sub_agent_"))
@@ -539,7 +672,10 @@ export function composerSendTitle(
           : "現在は送信できません";
 }
 
-export function renderComposer(state: DesktopWebState): string {
+export function renderComposer(
+  state: DesktopWebState,
+  local: Readonly<DesktopRenderLocalPresentation> = DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
+): string {
   const projectContextAction = state.selected_project_index >= 0 ? "open-workspace-folder" : "create-project-from-picker";
   const sendTitle = composerSendTitle(state, state.draft_prompt);
   const enhanceTitle = state.navigation_loading
@@ -549,12 +685,13 @@ export function renderComposer(state: DesktopWebState): string {
       : state.draft_prompt.trim().length === 0
         ? "依頼文を入力してください"
         : "Enhance";
-  const controlsVisible = attachmentTrayOpen || state.image_input.trim().length > 0;
+  const controlsVisible = local.attachmentTrayOpen || state.image_input.trim().length > 0;
   const trayVisible = controlsVisible || state.attached_images.length > 0;
   const goalHint = goalSlashCommandHint(state.draft_prompt);
   return `
     <section class="composer ${goalHint ? "goal-command" : ""}">
       ${trayVisible ? renderAttachmentTray(state, controlsVisible) : ""}
+      <label class="sr-only" for="prompt">moyAIへの依頼</label>
       <textarea id="prompt" placeholder="moyAI に依頼する" aria-describedby="goal-command-hint" ${state.navigation_loading ? "disabled" : ""}>${escapeHtml(state.draft_prompt)}</textarea>
       <div class="goal-command-hint" id="goal-command-hint" ${goalHint ? "" : "hidden"}>
         <span class="goal-command-badge">/goal</span>
@@ -646,16 +783,16 @@ export function renderPlanProjection(state: DesktopWebState): string {
   const plan = state.plan;
   if (!plan || (plan.steps.length === 0 && !(plan.explanation ?? "").trim())) return "";
   return `
-    <section class="output-file-section" aria-label="作業計画">
+    <section class="output-file-section output-plan-section" aria-labelledby="output-plan-heading">
       <div class="output-section-heading">
-        <strong>計画</strong>
-        <small>${plan.steps.length}件</small>
+        <h3 id="output-plan-heading">計画</h3>
+        <span class="output-section-count">${plan.steps.length}件</span>
       </div>
-      ${plan.explanation?.trim() ? `<p>${escapeHtml(plan.explanation.trim())}</p>` : ""}
+      ${plan.explanation?.trim() ? `<p class="plan-explanation">${escapeHtml(plan.explanation.trim())}</p>` : ""}
       <ol class="plan-list">
         ${plan.steps
           .map(
-            (step) => `<li data-plan-status="${step.status}"><span>${escapeHtml(planStepStatusLabel(step.status))}</span> ${escapeHtml(step.step)}</li>`,
+            (step) => `<li data-plan-status="${step.status}"><span class="plan-step-row"><span class="plan-step-status">${escapeHtml(planStepStatusLabel(step.status))}</span><span class="plan-step-copy">${escapeHtml(step.step)}</span></span></li>`,
           )
           .join("")}
       </ol>
@@ -663,16 +800,24 @@ export function renderPlanProjection(state: DesktopWebState): string {
   `;
 }
 
-export function renderArtifactPane(state: DesktopWebState): string {
-  if (artifactPaneCollapsed) {
+export function renderArtifactPane(
+  state: DesktopWebState,
+  local: Readonly<DesktopRenderLocalPresentation> = DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
+): string {
+  if (local.artifactPane.collapsed) {
     return `
       <aside class="artifact-pane collapsed">
         <button class="pin" data-action="toggle-artifact-pane" title="出力を表示" aria-label="出力を表示">${icon("folder")}</button>
       </aside>
     `;
   }
-  if (artifactPaneMode === "agents") {
-    const selectedAgent = state.agent_activity_rows.find((row) => row.agent_path === selectedAgentPath);
+  if (local.artifactPane.mode === "side_chat") {
+    return renderSideChatPane(state, local);
+  }
+  if (local.artifactPane.mode === "agents") {
+    const selectedAgent = state.agent_activity_rows.find(
+      (row) => row.agent_path === local.artifactPane.selectedAgentPath,
+    );
     const visual = selectedAgent ? stableAgentVisual(selectedAgent.agent_path) : null;
     return `
       <aside id="sub-agent-inspector" class="artifact-pane agent-inspector-pane" data-pane-mode="sub-agents" aria-label="Sub Agent履歴">
@@ -682,9 +827,16 @@ export function renderArtifactPane(state: DesktopWebState): string {
           ${selectedAgent && visual
             ? `<span class="agent-pane-identity agent-tone-${visual.tone}"><span class="agent-symbol" aria-hidden="true">${visual.glyph}</span><strong>${escapeHtml(agentDisplayName(selectedAgent))}</strong></span>`
             : "<strong>サブエージェント</strong>"}
-          <button class="pin" data-action="toggle-artifact-pane" title="Sub Agentペインを閉じる" aria-label="Sub Agentペインを閉じる">${icon("x")}</button>
+          <div class="pane-actions">
+            ${renderSideChatTrigger(state)}
+            <button class="pin" data-action="toggle-artifact-pane" title="Sub Agentペインを閉じる" aria-label="Sub Agentペインを閉じる">${icon("x")}</button>
+          </div>
         </div>
-        ${renderAgentInspector(state, selectedAgentPath, selectedAgentExecution)}
+        ${renderAgentInspector(
+          state,
+          local.artifactPane.selectedAgentPath,
+          local.artifactPane.selectedAgentExecution,
+        )}
       </aside>
     `;
   }
@@ -698,92 +850,291 @@ export function renderArtifactPane(state: DesktopWebState): string {
     : ' title="アーティファクトのフォルダーを開く"';
   const hasActivity = state.busy && (state.progress_text.trim().length > 0 || state.tool_status_text.trim().length > 0);
   return `
-    <aside class="artifact-pane" data-pane-mode="output">
+    <aside class="artifact-pane" data-pane-mode="output" aria-labelledby="output-pane-heading">
       <div class="pane-title">
-        <strong>出力</strong>
+        <h2 id="output-pane-heading">出力</h2>
         <div class="pane-actions">
+          ${renderSideChatTrigger(state)}
           <button class="pin" data-action="toggle-artifact-pane" title="出力ペインを閉じる" aria-label="出力ペインを閉じる">${icon("x")}</button>
           <button class="pin" data-action="open-artifact-folder"${artifactFolderDisabledAttrs} aria-label="アーティファクトのフォルダーを開く">${icon("folder")}</button>
         </div>
       </div>
-      ${renderSubAgentSummaryTrigger(state)}
-      ${renderPlanProjection(state)}
-      <section class="output-file-section" aria-label="ファイル出力">
-        <div class="output-section-heading">
-          <strong>ファイル</strong>
-          <small>${state.artifact_rows.length}件</small>
-        </div>
-        <div class="artifact-list">
-          ${
-            state.artifact_rows.length === 0
-              ? '<div class="empty artifact-empty">生成ファイル、開いたファイル、変更履歴がここに表示されます</div>'
-              : state.artifact_rows
-                  .map(
-                    (row, index) => `
-                      <button class="artifact-row ${index === state.selected_artifact_index ? "selected" : ""}"
-                        data-action="artifact" data-index="${index}" data-focus-key="artifact:${escapeHtml(row.path)}"${index === state.selected_artifact_index ? ' aria-current="true"' : ""} ${artifactNavigationBlocked ? 'disabled aria-disabled="true"' : ""}>
-                        <span class="file-icon">▣</span>
-                        <span><b>${escapeHtml(row.label)}</b><small>${escapeHtml(row.path)}</small></span>
-                      </button>`
-                  )
-                  .join("")
-          }
-        </div>
-      </section>
-      ${
-        hasPreview
-          ? `<div class="preview">
-              <div class="preview-tabs">
-                <span>プレビュー</span>
-                <button data-action="open-artifact-folder" ${artifactFolderDisabled ? "disabled aria-disabled=\"true\"" : ""}>開く</button>
-              </div>
-              <pre>${escapeHtml(state.artifact_preview_text)}</pre>
-            </div>`
-          : ""
-      }
-      ${
-        hasActivity
-          ? `<div class="activity">
-              <h3>進捗</h3>
-              <pre>${escapeHtml(state.progress_text)}</pre>
-              <h3>ツール</h3>
-              <pre>${escapeHtml(state.tool_status_text)}</pre>
-            </div>`
-          : ""
-      }
+      <div class="output-scroll" data-focus-key="artifact-pane-content" role="region" aria-label="出力内容" tabindex="0">
+        ${renderSubAgentSummaryTrigger(state)}
+        ${renderPlanProjection(state)}
+        <section class="output-file-section" aria-labelledby="output-files-heading">
+          <div class="output-section-heading">
+            <h3 id="output-files-heading">ファイル</h3>
+            <span class="output-section-count">${state.artifact_rows.length}件</span>
+          </div>
+          <ul class="artifact-list">
+            ${
+              state.artifact_rows.length === 0
+                ? '<li class="empty artifact-empty">生成ファイル、開いたファイル、変更履歴がここに表示されます</li>'
+                : state.artifact_rows
+                    .map(
+                      (row, index) => `
+                        <li>
+                          <button class="artifact-row ${index === state.selected_artifact_index ? "selected" : ""}"
+                            data-action="artifact" data-index="${index}" data-focus-key="artifact:${escapeHtml(row.path)}"${index === state.selected_artifact_index ? ' aria-current="true"' : ""} title="${escapeHtml(row.path)}" aria-label="${escapeHtml(`${row.label}: ${row.path}`)}" ${artifactNavigationBlocked ? 'disabled aria-disabled="true"' : ""}>
+                            <span class="file-icon" aria-hidden="true">▣</span>
+                            <span class="artifact-row-copy"><b>${escapeHtml(row.label)}</b><small>${escapeHtml(row.path)}</small></span>
+                          </button>
+                        </li>`
+                    )
+                    .join("")
+            }
+          </ul>
+        </section>
+        ${
+          hasPreview
+            ? `<section class="preview output-preview-section" aria-labelledby="output-preview-heading">
+                <div class="preview-tabs">
+                  <h3 id="output-preview-heading">プレビュー</h3>
+                  <button data-action="open-artifact-folder" ${artifactFolderDisabled ? "disabled aria-disabled=\"true\"" : ""}>開く</button>
+                </div>
+                <pre>${escapeHtml(state.artifact_preview_text)}</pre>
+              </section>`
+            : ""
+        }
+        ${
+          hasActivity
+            ? `<section class="activity output-activity-section" aria-labelledby="output-activity-heading">
+                <div class="output-section-heading">
+                  <h3 id="output-activity-heading">進捗／ツール</h3>
+                </div>
+                <div class="output-activity-group">
+                  <h4>進捗</h4>
+                  <pre>${escapeHtml(state.progress_text)}</pre>
+                </div>
+                <div class="output-activity-group">
+                  <h4>ツール</h4>
+                  <pre>${escapeHtml(state.tool_status_text)}</pre>
+                </div>
+              </section>`
+            : ""
+        }
+      </div>
     </aside>
   `;
 }
 
-export function renderOverlay(state: DesktopViewState): string {
-  if (state.overlay === "provider") return renderProviderOverlay(state);
-  if (state.overlay === "config") return renderConfigOverlay(state);
+function renderSideChatTrigger(state: DesktopWebState): string {
+  const hasOwner = state.draft_target.sessionId !== null;
+  const unavailable = hasOwner
+    ? ""
+    : ' disabled aria-disabled="true" title="チャットを選択してから開いてください"';
+  return `<button class="compact-button side-chat-trigger" data-action="show-side-chat-pane"${unavailable}>サイドチャット</button>`;
+}
+
+function renderSideChatPane(
+  state: DesktopWebState,
+  local: Readonly<DesktopRenderLocalPresentation>,
+): string {
+  const side = state.side_chat;
+  const ownerSessionId = side.owner_session_id ?? state.draft_target.sessionId;
+  const targetAvailable = ownerSessionId !== null && side.chat_id !== null;
+  const statusLabel = sideChatStatusLabel(side.status);
+  const phase = side.phase.trim();
+  const statusDetail = side.deleting
+    ? "削除処理中"
+    : phase && phase !== side.status ? `${statusLabel} · ${phase}` : statusLabel;
+  if (!side.configured) {
+    return `
+      <aside class="artifact-pane side-chat-pane" data-pane-mode="side-chat" aria-labelledby="side-chat-heading" aria-busy="${side.deleting}">
+        <div class="pane-title side-chat-pane-title">
+          <button class="agent-pane-back" data-action="show-output-pane" aria-label="出力ペインに戻る">‹ <span>出力</span></button>
+          <h2 id="side-chat-heading">サイドチャット</h2>
+          <button class="pin" data-action="toggle-artifact-pane" title="サイドチャットを隠す" aria-label="サイドチャットを隠す">${icon("x")}</button>
+        </div>
+        <div class="side-chat-setup" data-focus-key="artifact-pane-content" role="region" aria-label="サイドチャット設定案内" tabindex="0">
+          <p>サイドチャット専用のLLM URLとモデルは、左サイドバーの設定から選択中のチャットへ設定します。</p>
+          <p>サイドチャットはメインとは別のモデルを使用でき、ツールを使用しません。</p>
+          ${side.deleting ? renderSideChatDeletePending() : ""}
+          ${side.last_error.trim() ? `<p class="side-chat-error" role="alert">${escapeHtml(side.last_error)}</p>` : ""}
+          <button class="wide-send" data-action="show-config" ${!local.sideChat.operationsOpen || local.sideChat.mutationPending || side.deleting ? "disabled" : ""}>設定を開く</button>
+        </div>
+      </aside>
+    `;
+  }
+
+  const canSend = targetAvailable
+    && side.can_send
+    && local.sideChat.draft.trim().length > 0
+    && local.sideChat.operationsOpen
+    && !side.deleting
+    && !local.sideChat.mutationPending
+    && local.sideChat.deleteConfirmation === null;
+  const canCancel = targetAvailable
+    && side.can_cancel
+    && local.sideChat.operationsOpen
+    && !side.deleting
+    && !local.sideChat.mutationPending
+    && local.sideChat.deleteConfirmation === null;
+  const canDelete = targetAvailable
+    && local.sideChat.operationsOpen
+    && !side.deleting
+    && !local.sideChat.mutationPending;
+  return `
+    <aside class="artifact-pane side-chat-pane" data-pane-mode="side-chat" aria-labelledby="side-chat-heading" data-side-chat-owner="${escapeHtml(ownerSessionId ?? "")}" aria-busy="${side.deleting}">
+      <div class="pane-title side-chat-pane-title">
+        <button class="agent-pane-back" data-action="show-output-pane" aria-label="出力ペインに戻る">‹ <span>出力</span></button>
+        <h2 id="side-chat-heading">サイドチャット</h2>
+        <div class="pane-actions">
+          <button class="pin danger-pin" data-action="request-delete-side-chat" data-focus-key="side-chat-delete-trigger" title="サイドチャットを削除" aria-label="サイドチャットを削除" aria-haspopup="dialog" aria-controls="side-chat-delete-dialog" aria-expanded="${local.sideChat.deleteConfirmation !== null}" ${canDelete ? "" : "disabled"}>${icon("x")}</button>
+          <button class="pin" data-action="toggle-artifact-pane" title="サイドチャットを隠す" aria-label="サイドチャットを隠す">${icon("folder")}</button>
+        </div>
+      </div>
+      <div class="side-chat-meta">
+        <strong title="${escapeHtml(side.model)}">${escapeHtml(side.model || "モデル未設定")}</strong>
+        <span class="side-chat-status ${side.deleting ? "side-chat-status-deleting" : `side-chat-status-${escapeHtml(side.status)}`}" role="status">${escapeHtml(statusDetail)}</span>
+        <small title="${escapeHtml(side.base_url)}">${escapeHtml(side.base_url)}</small>
+      </div>
+      ${side.last_error.trim() ? `<p class="side-chat-error" role="alert">${escapeHtml(side.last_error)}</p>` : ""}
+      ${side.deleting ? renderSideChatDeletePending() : ""}
+      <div class="side-chat-scroll" data-focus-key="artifact-pane-content" role="log" aria-label="サイドチャット履歴" tabindex="0">
+        ${side.messages.length === 0
+          ? '<p class="side-chat-empty">質問を入力すると、ここに会話が表示されます。</p>'
+          : side.messages.map(renderSideChatMessage).join("")}
+      </div>
+      <div class="side-chat-composer">
+        <label class="sr-only" for="side-chat-prompt">サイドチャットへの質問</label>
+        <textarea id="side-chat-prompt" placeholder="サイドチャットに質問" ${targetAvailable && local.sideChat.operationsOpen && !side.deleting && local.sideChat.deleteConfirmation === null ? "" : "disabled"}>${escapeHtml(local.sideChat.draft)}</textarea>
+        <div class="side-chat-composer-actions">
+          <small>${side.deleting ? "削除の完了を待っています" : "Ctrl+Enterで送信"}</small>
+          <button data-action="cancel-side-chat" ${canCancel ? "" : "disabled"}>${side.deleting ? "停止処理中" : side.status === "running" ? "停止" : "停止不可"}</button>
+          <button class="send" data-action="send-side-chat" title="サイドチャットへ送信" aria-label="サイドチャットへ送信" ${canSend ? "" : "disabled"}>${icon("send")}</button>
+        </div>
+      </div>
+    </aside>
+  `;
+}
+
+export function renderSideChatDeleteConfirmation(
+  state: DesktopWebState,
+  local: Readonly<DesktopRenderLocalPresentation> = DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
+): string {
+  const side = state.side_chat;
+  const targetAvailable = sideChatOwnerSessionId(state) !== null && side.chat_id !== null;
+  if (local.sideChat.deleteConfirmation === null || !targetAvailable || side.deleting) return "";
+  const pending = local.sideChat.mutationPending;
+  const controlsDisabled = pending || !local.sideChat.operationsOpen;
+  return `
+    <div class="modal-backdrop" data-local-modal="side-chat-delete">
+      <section id="side-chat-delete-dialog" class="modal confirmation side-chat-delete-confirmation" data-modal role="alertdialog" aria-modal="true" aria-labelledby="side-chat-delete-title" aria-describedby="side-chat-delete-detail" tabindex="-1" ${pending ? 'aria-busy="true"' : ""}>
+        <div class="modal-header">
+          <h2 id="side-chat-delete-title">サイドチャットを削除しますか？</h2>
+        </div>
+        <p id="side-chat-delete-detail" class="confirm-summary">${side.status === "running"
+          ? "実行中のサイドチャットを停止して、保存された履歴を削除します。"
+          : "保存されたサイドチャット履歴を削除します。"} この操作は元に戻せません。メインチャットとワークスペースのファイルは変更しません。</p>
+        ${pending ? '<div id="side-chat-delete-status" class="permission-decision-status" role="status" aria-live="polite" tabindex="-1">削除を確定しています…</div>' : ""}
+        <div class="modal-actions side-chat-delete-actions">
+          <button data-action="cancel-delete-side-chat" autofocus ${controlsDisabled ? "disabled" : ""}>キャンセル</button>
+          <button class="danger-button" data-action="confirm-delete-side-chat" ${controlsDisabled ? "disabled" : ""}>${pending ? "削除しています…" : side.status === "running" ? "停止して削除" : "削除"}</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderSideChatDeletePending(): string {
+  return `
+    <section class="side-chat-delete-pending" role="status" aria-live="polite">
+      <strong>サイドチャットを削除しています</strong>
+      <p>実行の停止と保存データの削除を確定しています。完了するとこのサイドチャットは閉じます。</p>
+    </section>
+  `;
+}
+
+function renderSideChatMessage(message: DesktopWebState["side_chat"]["messages"][number]): string {
+  const label = message.role === "user" ? "あなた" : message.role === "assistant" ? "サイドチャット" : "エラー";
+  const body = message.role === "error"
+    ? `<div class="side-chat-message-error">${escapeHtml(message.content)}</div>`
+    : `<div class="markdown-body">${renderMarkdown(message.content)}</div>`;
+  return `
+    <article class="side-chat-message side-chat-message-${escapeHtml(message.role)}" data-side-chat-message-id="${escapeHtml(message.id)}">
+      <small>${label}</small>
+      ${body}
+    </article>
+  `;
+}
+
+function sideChatStatusLabel(status: DesktopWebState["side_chat"]["status"]): string {
+  if (status === "running") return "実行中";
+  if (status === "completed") return "完了";
+  if (status === "failed") return "失敗";
+  if (status === "cancelled") return "停止済み";
+  return "待機中";
+}
+
+export function renderOverlay(
+  state: DesktopViewState,
+  local: Readonly<DesktopRenderLocalPresentation> = DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
+  renderModel: DesktopRenderModel = createDesktopRenderModel(
+    state as DesktopViewState,
+    local as DesktopRenderLocalPresentation,
+  ),
+): string {
+  if (state.overlay === "provider") return renderProviderOverlay(state, local);
+  if (state.overlay === "config") return renderConfigOverlay(state, local);
   if (state.overlay === "workspace") return renderWorkspaceOverlay(state);
   if (state.overlay === "prompt_review") return renderPromptReviewOverlay(state);
-  if (state.overlay === "command_palette") return renderCommandPalette(state);
+  if (state.overlay === "command_palette") return renderCommandPalette(state, renderModel);
   if (state.overlay === "shortcuts") return renderShortcuts();
+  if (state.overlay === "about") return renderAboutOverlay(state);
   if (state.overlay === "project_menu") return "";
-  if (state.overlay === "file_menu") return renderMenuPopover("file", menuActions("file", state));
-  if (state.overlay === "edit_menu") return renderMenuPopover("edit", menuActions("edit", state));
+  if (state.overlay === "file_menu") return renderMenuPopover("file", menuActions("file", renderModel));
+  if (state.overlay === "edit_menu") return renderMenuPopover("edit", menuActions("edit", renderModel));
   if (state.overlay === "view_menu") {
     return renderMenuPopover(
       "view",
-      menuActions("view", state),
+      menuActions("view", renderModel),
       `
         <div class="menu-slider" data-modal>
-          <label class="field-label">ウィンドウ透過率</label>
-          <input id="opacity-input" type="range" min="50" max="100" value="${state.window_opacity_percent}" />
+          <label class="field-label" for="opacity-input">ウィンドウ透過率</label>
+          <input id="opacity-input" type="range" min="50" max="100" value="${state.window_opacity_percent}" aria-valuetext="${state.window_opacity_percent}%" />
         </div>
       `
     );
   }
-  if (state.overlay === "help_menu") return renderMenuPopover("help", menuActions("help", state));
+  if (state.overlay === "help_menu") return renderMenuPopover("help", menuActions("help", renderModel));
   return "";
 }
 
-function renderProviderOverlay(state: DesktopViewState): string {
+function renderAboutOverlay(state: DesktopViewState): string {
+  const about = state.about;
+  return `
+    <div class="modal-backdrop" data-action="close-overlay">
+      <section class="modal side about-modal" data-modal role="dialog" aria-modal="true" aria-labelledby="about-dialog-title" aria-describedby="about-dialog-description" tabindex="-1">
+        <div class="modal-header">
+          <h2 id="about-dialog-title">${escapeHtml(about.product_name)}について</h2>
+          <button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>
+        </div>
+        <div class="about-content" id="about-dialog-description">
+          <img class="about-logo" src="${splashLogoUrl}" alt="" aria-hidden="true" />
+          <strong class="about-product">${escapeHtml(about.product_name)}</strong>
+          <dl class="about-metadata">
+            <div><dt>バージョン</dt><dd>${escapeHtml(about.version)}</dd></div>
+            <div><dt>ライセンス</dt><dd>${escapeHtml(about.license_identifier)}</dd></div>
+          </dl>
+          <p class="about-copyright">${escapeHtml(about.copyright_notice)}</p>
+        </div>
+        <div class="modal-actions">
+          <button data-action="close-overlay" autofocus>OK</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderProviderOverlay(
+  state: DesktopViewState,
+  local: Readonly<DesktopRenderLocalPresentation>,
+): string {
   const selectedSummary = state.provider_selected_model_summary.length > 0 ? state.provider_selected_model_summary : ["モデル metadata は未取得です。"];
-  const providerStatus = providerStatusView(state);
+  const providerFeedback = providerOverlayFeedback(state.provider_base_url, state.provider_status);
+  const providerStatus = providerStatusView(providerFeedback.status);
   const setupRequired = startupSetupRequired(state);
   const providerModeOptions = [
     ["lm_studio_native_required", "LM Studio native"],
@@ -796,11 +1147,12 @@ function renderProviderOverlay(state: DesktopViewState): string {
           <h2 id="provider-dialog-title">${setupRequired ? "初期設定" : "LLM URL"}</h2>
           ${setupRequired ? "" : `<button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>`}
         </div>
-        ${setupRequired ? renderInitialSetupStatus(state) : ""}
+        ${setupRequired ? renderInitialSetupStatus(state, local) : ""}
         <label class="field-label" for="provider-url">ベースURL</label>
-        <input id="provider-url" value="${escapeHtml(state.provider_base_url)}" />
-        <label class="field-label">Provider mode</label>
-        <div class="segmented-control provider-mode-control">
+        <input id="provider-url" value="${escapeHtml(state.provider_base_url)}" aria-describedby="provider-url-help provider-status" aria-invalid="${!providerFeedback.baseUrl.ok}" />
+        <small id="provider-url-help" class="provider-url-help">http:// または https:// の接続先を入力してください。認証情報、query string、fragment は含められません。</small>
+        <span class="field-label" id="provider-mode-label">Provider mode</span>
+        <div class="segmented-control provider-mode-control" role="group" aria-labelledby="provider-mode-label">
           ${providerModeOptions
             .map(
               ([mode, label]) => `
@@ -822,9 +1174,14 @@ function renderProviderOverlay(state: DesktopViewState): string {
         </div>
         <div class="split-actions">
           <button data-action="load-provider-models" ${providerCapabilities(state).canLoadProviderModels ? "" : "disabled"}>${state.provider_loading ? "読込中" : "モデル読込"}</button>
-          <button data-action="apply-provider-session" ${state.provider_apply_enabled ? "" : "disabled"}>UIセッションに適用</button>
-          <button data-action="save-provider-global" ${state.provider_apply_enabled ? "" : "disabled"}>設定ファイルに保存</button>
-          ${setupRequired ? `<button data-action="import-config-toml" ${configOwnerMutationIsOpen ? "" : "disabled"}>TOML設定をImport</button>` : ""}
+          ${setupRequired
+            ? `<span class="setup-completion-actions" role="group" aria-label="初期設定の完了方法" aria-describedby="initial-setup-action-help">
+                <button class="setup-secondary-action" data-action="apply-provider-session" ${state.provider_apply_enabled ? "" : "disabled"}>この起動中だけ適用</button>
+                <button class="setup-primary-action" data-action="save-provider-global" ${state.provider_apply_enabled ? "" : "disabled"}>設定を保存して開始</button>
+                <button class="setup-secondary-action" data-action="import-config-toml" ${state.config_draft.external_owner_mutation_open ? "" : "disabled"}>TOML設定をImport</button>
+              </span>`
+            : `<button data-action="apply-provider-session" ${state.provider_apply_enabled ? "" : "disabled"}>UIセッションに適用</button>
+               <button data-action="save-provider-global" ${state.provider_apply_enabled ? "" : "disabled"}>設定ファイルに保存</button>`}
         </div>
         <div class="select-list">
           ${state.provider_models
@@ -847,22 +1204,20 @@ function renderProviderOverlay(state: DesktopViewState): string {
               .join("")}
           </div>
         </details>
-        <div class="provider-status ${providerStatus.kind}">
-          <strong>${escapeHtml(providerStatus.title)}</strong>
-          <p>${escapeHtml(providerStatus.hint)}</p>
-          ${
-            providerStatus.details.trim().length > 0
-              ? `<details data-details-key="provider-status-details"><summary>技術詳細</summary><pre>${escapeHtml(providerStatus.details)}</pre></details>`
-              : ""
-          }
+        <div id="provider-status" class="provider-status ${providerStatus.kind}" role="status" aria-live="polite">
+          <strong data-provider-status-title>${escapeHtml(providerStatus.title)}</strong>
+          <p data-provider-status-hint>${escapeHtml(providerStatus.hint)}</p>
+          <details data-details-key="provider-status-details" ${providerStatus.details.trim().length > 0 ? "" : "hidden"}>
+            <summary>技術詳細</summary>
+            <pre data-provider-status-details>${escapeHtml(providerStatus.details)}</pre>
+          </details>
         </div>
       </section>
     </div>
   `;
 }
 
-function providerStatusView(state: DesktopWebState): { kind: string; title: string; hint: string; details: string } {
-  const typed = state.provider_status;
+function providerStatusView(typed: DesktopWebState["provider_status"]): { kind: string; title: string; hint: string; details: string } {
   return {
     kind: typed.kind === "success" ? "ok" : typed.kind,
     title: typed.title,
@@ -871,9 +1226,13 @@ function providerStatusView(state: DesktopWebState): { kind: string; title: stri
   };
 }
 
-function renderInitialSetupStatus(state: DesktopWebState): string {
-  const guidance = `<p class="setup-message">${escapeHtml(state.startup.message)} ${escapeHtml(state.startup.detail)}</p>`;
-  if (configMutationInFlight) {
+function renderInitialSetupStatus(
+  state: DesktopWebState,
+  local: Readonly<DesktopRenderLocalPresentation>,
+): string {
+  const guidance = `<p class="setup-message">${escapeHtml(state.startup.message)} ${escapeHtml(state.startup.detail)}</p>
+    <p id="initial-setup-action-help" class="setup-action-help">「設定を保存して開始」が推奨です。「この起動中だけ適用」は再起動後には引き継がれません。TOMLのファイル選択をキャンセルしても設定は変わりません。この画面は、保存または一時適用が完了するまで閉じません。</p>`;
+  if (local.configMutationPending) {
     return `<div class="initial-setup-status">${guidance}<div class="validation" role="status" aria-live="polite">設定を確認しています…</div></div>`;
   }
   if (state.status_code !== "config_import_failed") {
@@ -888,34 +1247,153 @@ function renderInitialSetupStatus(state: DesktopWebState): string {
     </div></div>`;
 }
 
-function renderConfigOverlay(state: DesktopWebState): string {
+function renderSideChatSettings(
+  state: DesktopWebState,
+  local: Readonly<DesktopRenderLocalPresentation>,
+): string {
+  const side = state.side_chat;
+  const ownerSessionId = sideChatOwnerSessionId(state);
+  const configurationOpen = local.sideChat.operationsOpen
+    && sideChatConfigurationOpen(state)
+    && !local.sideChat.mutationPending;
+  const baseUrl = local.sideChat.setupBaseUrl.trim();
+  const model = local.sideChat.setupModel.trim();
+  const settingsValidation = validateSideChatProviderSettings(baseUrl, model);
+  const baseUrlInvalid = ownerSessionId !== null && !settingsValidation.baseUrl.ok;
+  const modelInvalid = ownerSessionId !== null && !settingsValidation.modelOk;
+  const modelOptions = sideChatModelOptions(local.sideChat.catalog, model);
+  const catalogLoading = local.sideChat.catalog.status === "loading";
+  const catalogStatus = baseUrlInvalid
+    ? settingsValidation.baseUrl.message
+    : sideChatCatalogStatusText(local.sideChat.catalog);
+  const changed = !side.configured
+    || baseUrl !== side.base_url.trim()
+    || model !== side.model.trim();
+  const canCommit = configurationOpen && settingsValidation.ok && changed;
+  const canLoadCatalog = local.sideChat.operationsOpen
+    && local.sideChat.catalogLoadEnabled
+    && settingsValidation.baseUrl.ok;
+  const controlsDisabled = configurationOpen ? "" : "disabled";
+  const invalidSettings = ownerSessionId !== null && !settingsValidation.ok;
+  const statusKind = side.last_error.trim() || invalidSettings
+    ? "error"
+    : "ok";
+  const statusText = ownerSessionId === null
+    ? "通常チャットを選択すると、そのチャット専用のside providerを設定できます。"
+    : side.deleting
+      ? "サイドチャットを削除しています。完了するまで設定は変更できません。"
+      : !local.sideChat.operationsOpen
+        ? "メインLLM設定の処理が完了するまで、サイドチャット設定は変更できません。"
+      : local.sideChat.mutationPending
+        ? "サイドチャット設定を更新しています…"
+        : invalidSettings
+          ? settingsValidation.message
+          : side.last_error.trim()
+          ? side.last_error
+          : side.configured && !side.can_send
+            ? "サイドチャットの実行中は設定を変更できません。停止または完了後に更新してください。"
+            : side.configured
+              ? `${side.model} を選択中のチャットで使用します。`
+              : "LLM URLとモデルを入力して、選択中のチャットへ設定してください。";
+  return `
+    <section id="settings-side-chat" class="settings-section" aria-labelledby="settings-side-chat-title" aria-describedby="side-chat-settings-help" data-side-chat-settings-owner="${escapeHtml(ownerSessionId ?? "")}" aria-busy="${!local.sideChat.operationsOpen || local.sideChat.mutationPending || catalogLoading ? "true" : "false"}">
+      <div class="settings-section-head">
+        <div>
+          <h3 id="settings-side-chat-title">サイドチャットLLM</h3>
+          <p id="side-chat-settings-help">選択中の通常チャットだけに適用する、text-only・tool-lessのLLM設定です。上部の「UIセッションに適用」「設定ファイルに保存」とは別に保存されます。</p>
+        </div>
+        <button data-action="load-side-chat-models" aria-controls="side-chat-model side-chat-model-catalog-status" aria-disabled="${canLoadCatalog ? "false" : "true"}" ${canLoadCatalog ? "" : "disabled"}>${catalogLoading ? "読込中…" : "モデル読込"}</button>
+      </div>
+      <div class="settings-grid-two">
+        <div class="settings-field">
+          <label for="side-chat-base-url">LLM URL</label>
+          <input id="side-chat-base-url" class="side-chat-settings-control" data-side-chat-setting="base-url" type="url" value="${escapeHtml(local.sideChat.setupBaseUrl)}" autocomplete="off" spellcheck="false" aria-describedby="side-chat-base-url-help side-chat-settings-help side-chat-settings-status"${baseUrlInvalid ? ' aria-invalid="true"' : ""} ${controlsDisabled} />
+          <small id="side-chat-base-url-help" class="settings-field-help">選択中の通常チャット専用の接続先URLです。</small>
+        </div>
+        <div class="settings-field side-chat-model-field">
+          <label for="side-chat-model">Model</label>
+          <select id="side-chat-model" class="side-chat-settings-control" data-side-chat-setting="model" aria-describedby="side-chat-model-help side-chat-settings-help side-chat-model-catalog-status side-chat-settings-status"${modelInvalid ? ' aria-invalid="true"' : ""} ${configurationOpen && modelOptions.length > 0 ? "" : "disabled"}>
+            ${model.length === 0 ? '<option value="" selected disabled>モデルを選択してください</option>' : ""}
+            ${modelOptions.map((option) => `<option value="${escapeHtml(option.id)}" ${option.id === model ? "selected" : ""}>${escapeHtml(sideChatModelOptionLabel(option))}</option>`).join("")}
+          </select>
+          <details class="side-chat-manual-model" data-details-key="side-chat-manual-model">
+            <summary>一覧にないモデルIDを入力</summary>
+            <label for="side-chat-model-manual">モデルID</label>
+            <input id="side-chat-model-manual" class="side-chat-settings-control" data-side-chat-setting="model" value="${escapeHtml(local.sideChat.setupModel)}" autocomplete="off" spellcheck="false" aria-describedby="side-chat-model-help side-chat-settings-help side-chat-model-catalog-status side-chat-settings-status"${modelInvalid ? ' aria-invalid="true"' : ""} ${controlsDisabled} />
+          </details>
+          <small id="side-chat-model-help" class="settings-field-help">選択中の通常チャットへ保存するモデルIDです。読込済み候補から選ぶか、一覧にないIDを入力できます。</small>
+        </div>
+      </div>
+      <p id="side-chat-model-catalog-status" class="side-chat-model-catalog-status ${local.sideChat.catalog.status === "error" || baseUrlInvalid ? "error" : ""}" role="status" aria-live="polite">${escapeHtml(catalogStatus)}</p>
+      <div class="side-chat-settings-actions">
+        <p id="side-chat-settings-status" class="side-chat-settings-status ${statusKind}" role="status" aria-live="polite">${escapeHtml(statusText)}</p>
+        <button data-action="configure-side-chat" aria-disabled="${canCommit ? "false" : "true"}" ${canCommit ? "" : "disabled"}>${local.sideChat.mutationPending ? "設定しています…" : side.configured ? "設定を更新" : "設定する"}</button>
+      </div>
+    </section>
+  `;
+}
+
+export function sideChatCatalogStatusText(catalog: SideChatCatalogView): string {
+  switch (catalog.status) {
+    case "loading":
+      return "モデル一覧を読み込んでいます…";
+    case "error":
+      return catalog.error || "モデル一覧を読み込めませんでした。";
+    case "ready":
+      return catalog.source === "main"
+        ? `メインLLMで読み込み済みの${catalog.models.length}件から選択できます。`
+        : `${catalog.models.length}件のモデルから選択できます。`;
+    case "idle":
+      return "「モデル読込」で候補を取得できます。一覧にないモデルIDは直接入力できます。";
+  }
+}
+
+function renderConfigOverlay(
+  state: DesktopViewState,
+  local: Readonly<DesktopRenderLocalPresentation>,
+): string {
   const setupRequired = startupSetupRequired(state);
   const title = setupRequired ? "初期設定" : "Preferences";
-  const configCommitDisabled = !configDraftCommitIsOpen;
+  const configValidation = validateConfigFieldValues(state.config_fields);
+  const configCommitState = configCommitControlState(state.config_draft.commit_enabled, configValidation.ok);
+  const configCommitAttributes = `${configCommitState.disabled ? "disabled " : ""}aria-disabled="${configCommitState.ariaDisabled}"`;
+  const validationKind = configValidation.ok ? "ok" : "error";
+  const validationText = configValidation.ok
+    ? state.config_draft.dirty
+      ? "未保存の設定があります。Apply、保存、または変更を破棄するまで別画面からの設定変更は停止します。"
+      : "入力形式は問題ありません。"
+    : `${configValidation.invalidKey}: ${configValidation.message}`;
   return `
     <div class="modal-backdrop">
       <section class="modal settings-modal ${setupRequired ? "setup-modal" : ""}" data-modal role="dialog" aria-modal="true" aria-labelledby="config-dialog-title" tabindex="-1">
         <div class="settings-header">
           <div>
             <h2 id="config-dialog-title">${escapeHtml(title)}</h2>
-            <p>${setupRequired ? "起動に必要な設定を確認します。" : "永続設定を編集します。セッションだけの変更は LLM URL または上部チップから行います。"}</p>
+            <p>${setupRequired ? "起動に必要な設定を確認します。" : "メインLLMとサイドチャットLLMをこの画面で管理します。保存先は各項目の説明を確認してください。"}</p>
           </div>
           <div class="settings-header-actions">
-            <span class="dirty-badge ${configDirty ? "visible" : ""}">変更あり</span>
-            <button data-action="discard-config-draft" ${configDirty ? "" : "hidden"} ${configDraftDiscardIsOpen ? "" : "disabled"}>変更を破棄</button>
-            <button data-action="apply-session-config" ${configCommitDisabled ? "disabled" : ""}>UIセッションに適用</button>
-            <button data-action="save-global-config" ${configCommitDisabled ? "disabled" : ""}>設定ファイルに保存</button>
-            ${setupRequired ? `<button data-action="import-config-toml" ${configOwnerMutationIsOpen ? "" : "disabled"}>TOML設定をImport</button>` : `<button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>`}
+            <span class="dirty-badge ${state.config_draft.dirty ? "visible" : ""}">変更あり</span>
+            <button data-action="discard-config-draft" ${state.config_draft.dirty ? "" : "hidden"} ${state.config_draft.discard_enabled ? "" : "disabled"}>変更を破棄</button>
+            ${setupRequired
+              ? `<span class="setup-completion-actions" role="group" aria-label="初期設定の完了方法" aria-describedby="initial-setup-action-help">
+                  <button class="setup-secondary-action" data-action="apply-session-config" ${configCommitAttributes}>この起動中だけ適用</button>
+                  <button class="setup-primary-action" data-action="save-global-config" ${configCommitAttributes}>設定を保存して開始</button>
+                  <button class="setup-secondary-action" data-action="import-config-toml" ${state.config_draft.external_owner_mutation_open ? "" : "disabled"}>TOML設定をImport</button>
+                </span>`
+              : `<button data-action="apply-session-config" ${configCommitAttributes}>UIセッションに適用</button>
+                 <button data-action="save-global-config" ${configCommitAttributes}>設定ファイルに保存</button>
+                 <button class="icon-button" data-action="close-overlay" title="閉じる" aria-label="閉じる">${icon("x")}</button>`}
           </div>
         </div>
         <div class="settings-status-stack">
-          ${setupRequired ? renderInitialSetupStatus(state) : ""}
-          <div id="settings-validation" class="validation ok">${configDirty ? "未保存の設定があります。Apply、保存、または変更を破棄するまで別画面からの設定変更は停止します。" : "入力形式は問題ありません。"}</div>
+          ${setupRequired ? renderInitialSetupStatus(state, local) : ""}
+          <div id="settings-validation" class="validation ${validationKind}" role="status" aria-live="polite">${escapeHtml(validationText)}</div>
         </div>
         <div class="settings-layout">
           <nav class="settings-nav" aria-label="設定カテゴリ">
-            <a href="#settings-provider">Provider</a>
+            <a href="#settings-provider">メインLLM</a>
             <a href="#settings-model">Model</a>
+            <a href="#settings-side-chat">サイドチャットLLM</a>
             <a href="#settings-permissions">Permissions</a>
             <a href="#settings-agents">Agents</a>
             <a href="#settings-tools">Tools</a>
@@ -925,25 +1403,39 @@ function renderConfigOverlay(state: DesktopWebState): string {
             <button data-action="open-user-data-folder">データフォルダーを開く</button>
           </nav>
           <div class="settings-content">
-            <section id="settings-provider" class="settings-section">
+            <section id="settings-provider" class="settings-section" aria-labelledby="settings-provider-title" aria-describedby="main-provider-settings-help" aria-busy="${state.provider_loading ? "true" : "false"}">
               <div class="settings-section-head">
-                <h3>Provider</h3>
-                <button data-action="show-provider">LLM URL 画面を開く</button>
+                <div>
+                  <h3 id="settings-provider-title">メインLLM</h3>
+                  <p id="main-provider-settings-help">メインチャットのUIセッション、または設定ファイルへ保存します。サイドチャットLLMは選択中のチャットへ別に保存されます。</p>
+                </div>
+                <button data-action="show-provider" aria-controls="main-provider-model main-provider-model-catalog-status" title="メインLLMのモデル一覧と接続詳細を開く" ${state.config_draft.external_owner_mutation_open ? "" : "disabled"}>モデル読込・詳細設定</button>
               </div>
               <div class="settings-grid-two">
-                ${renderConfigTextField(state, "model.base_url", "Base URL", "url")}
-                ${renderConfigTextField(state, "model.model", "Model")}
+                ${renderConfigTextField(state, "model.base_url", "LLM URL", "url", "モデル一覧はこのURLとProvider modeに紐付きます。")}
+                ${renderMainProviderModelField(state)}
               </div>
+              <p id="main-provider-model-catalog-status" class="side-chat-model-catalog-status" role="status" aria-live="polite">${escapeHtml(mainProviderCatalogStatusText(state))}</p>
               ${renderConfigEnumField(state, "model.provider_metadata_mode", "Provider mode", {
                 lm_studio_native_required: "LM Studio metadata API",
                 openai_compatible_only: "OpenAI compatible",
               })}
             </section>
-            <section id="settings-model" class="settings-section">
-              <h3>Model</h3>
+            <section id="settings-model" class="settings-section" aria-labelledby="settings-model-title" aria-describedby="settings-model-help">
+              <div>
+                <h3 id="settings-model-title">Model</h3>
+                <p id="settings-model-help">メインチャットLLMのcontext、出力量、sampling、対応capabilityを設定します。</p>
+              </div>
               <div class="settings-grid-two">
                 ${renderConfigTextField(state, "model.context_window", "Context window", "number")}
                 ${renderConfigTextField(state, "model.max_output_tokens", "Max output tokens", "number")}
+                ${renderConfigTextField(
+                  state,
+                  "model.request_timeout_ms",
+                  "LLM応答タイムアウト",
+                  "number",
+                  "最初の送信開始からstream完了までのLLM応答全体に適用する総上限です（ms）。",
+                )}
                 ${renderConfigTextField(state, "model.temperature", "Temperature", "number")}
                 ${renderConfigTextField(state, "model.top_p", "Top P", "number")}
               </div>
@@ -954,19 +1446,23 @@ function renderConfigOverlay(state: DesktopWebState): string {
                 ${renderConfigToggleField(state, "model.parallel_tool_calls", "Parallel tool calls")}
               </div>
             </section>
-            <section id="settings-permissions" class="settings-section">
-              <h3>Permissions</h3>
+            ${renderSideChatSettings(state, local)}
+            <section id="settings-permissions" class="settings-section" aria-labelledby="settings-permissions-title" aria-describedby="settings-permissions-help">
+              <div>
+                <h3 id="settings-permissions-title">Permissions</h3>
+                <p id="settings-permissions-help">ツール実行時の承認方法を設定します。</p>
+              </div>
               ${renderConfigEnumField(state, "permissions.access_mode", "Access mode", {
                 default: "承認を求める",
                 auto_review: "代理で承認",
                 full_access: "フルアクセス",
               })}
             </section>
-            <section id="settings-agents" class="settings-section">
+            <section id="settings-agents" class="settings-section" aria-labelledby="settings-agents-title" aria-describedby="settings-agents-help">
               <div class="settings-section-head">
                 <div>
-                  <h3>Agents</h3>
-                  <p>通常のmoyAIセッションをSub Agentとして共有workspace上で実行します。変更は次回runから有効です。</p>
+                  <h3 id="settings-agents-title">Agents</h3>
+                  <p id="settings-agents-help">通常のmoyAIセッションをSub Agentとして共有workspace上で実行します。変更は次回runから有効です。</p>
                 </div>
                 ${renderConfigToggleField(state, "multi_agent.enabled", "Multi-Agentを有効化")}
               </div>
@@ -980,8 +1476,11 @@ function renderConfigOverlay(state: DesktopWebState): string {
               </div>
               <p class="settings-hint">ローカルLLMではmodel requestを1本に保つ設定を推奨します。Agentごとのcontextと独立レビューは並列推論なしでも維持されます。</p>
             </section>
-            <section id="settings-tools" class="settings-section">
-              <h3>Tools</h3>
+            <section id="settings-tools" class="settings-section" aria-labelledby="settings-tools-title" aria-describedby="settings-tools-help">
+              <div>
+                <h3 id="settings-tools-title">Tools</h3>
+                <p id="settings-tools-help">Shell、Docling、MCPの利用可否と接続情報を設定します。</p>
+              </div>
               <div class="settings-subsection">
                 <div class="settings-section-head compact">
                   <div>
@@ -1017,8 +1516,11 @@ function renderConfigOverlay(state: DesktopWebState): string {
                 ${renderConfigJsonField(state, "mcp.servers_json", "MCP servers JSON")}
               </div>
             </section>
-            <section id="settings-files" class="settings-section">
-              <h3>Files</h3>
+            <section id="settings-files" class="settings-section" aria-labelledby="settings-files-title" aria-describedby="settings-files-help">
+              <div>
+                <h3 id="settings-files-title">Files</h3>
+                <p id="settings-files-help">workspace inspectionと大きなファイルの読取上限を設定します。</p>
+              </div>
               <div class="settings-grid-two">
                 ${renderConfigTextField(state, "inspection.default_max_depth", "Inspection depth", "number")}
                 ${renderConfigTextField(state, "inspection.default_max_entries_per_dir", "Entries per dir", "number")}
@@ -1030,14 +1532,18 @@ function renderConfigOverlay(state: DesktopWebState): string {
               </div>
               ${renderConfigToggleField(state, "inspection.include_hidden_by_default", "Hidden files を inspection に含める")}
             </section>
-            <section id="settings-advanced" class="settings-section">
+            <section id="settings-advanced" class="settings-section" aria-labelledby="settings-advanced-title" aria-describedby="settings-advanced-help">
+              <div>
+                <h3 id="settings-advanced-title">Advanced</h3>
+                <p id="settings-advanced-help">専用controlを持たない設定値を、projected typeと制約を確認しながら編集します。</p>
+              </div>
               <details data-details-key="settings-advanced-fields">
                 <summary>Advanced raw fields</summary>
                 <div class="settings-raw-grid">
                   ${state.config_fields
                     .map((field, index) => ({ field, index }))
-                    .filter(({ field }) => !TYPED_CONFIG_KEYS.has(field.key))
-                    .map(({ field, index }) => renderRawConfigField(field, index))
+                    .filter(({ field }) => !TYPED_CONFIG_KEYS.includes(field.key))
+                    .map(({ field, index }) => renderRawConfigField(field, index, state.config_draft.edit_enabled))
                     .join("")}
                 </div>
               </details>
@@ -1055,48 +1561,187 @@ function configField(state: DesktopWebState, key: string): { field: ConfigFieldP
   return { field: state.config_fields[index], index };
 }
 
+function configFieldDomToken(key: string): string {
+  return Array.from(key, (character) => character.codePointAt(0)!.toString(16)).join("-");
+}
+
+function configFieldControlId(key: string): string {
+  return `settings-config-control-${configFieldDomToken(key)}`;
+}
+
+function configFieldHelpId(key: string): string {
+  return `settings-config-help-${configFieldDomToken(key)}`;
+}
+
+function configFieldSectionHelpId(key: string): string {
+  if (["model.base_url", "model.model", "model.provider_metadata_mode"].includes(key)) {
+    return "main-provider-settings-help";
+  }
+  if (key.startsWith("model.")) return "settings-model-help";
+  if (key.startsWith("permissions.")) return "settings-permissions-help";
+  if (key.startsWith("multi_agent.")) return "settings-agents-help";
+  if (key.startsWith("shell.") || key.startsWith("docling.") || key.startsWith("mcp.")) {
+    return "settings-tools-help";
+  }
+  if (key.startsWith("inspection.") || key.startsWith("file_guard.")) {
+    return "settings-files-help";
+  }
+  return "settings-advanced-help";
+}
+
+function configFieldDescriptionIds(field: ConfigFieldProjection, extraIds: string[] = []): string {
+  return [...new Set([
+    configFieldHelpId(field.key),
+    configFieldSectionHelpId(field.key),
+    "settings-validation",
+    ...extraIds,
+  ])].join(" ");
+}
+
+function configFieldHelpText(field: ConfigFieldProjection, explicitHelp = ""): string {
+  const typeLabel = {
+    string: "文字列",
+    boolean: "オン / オフ",
+    integer: "整数",
+    number: "数値",
+    json: "JSON",
+    enum: "選択式",
+  }[field.value_type] ?? field.value_type;
+  const parts = [
+    explicitHelp.trim(),
+    `設定キー: ${field.key}。`,
+    `形式: ${typeLabel}。`,
+  ].filter((part) => part.length > 0);
+  if (field.min_value !== null && field.max_value !== null) {
+    parts.push(`範囲: ${field.min_value}以上${field.max_value}以下。`);
+  } else if (field.min_value !== null) {
+    parts.push(`範囲: ${field.min_value}以上。`);
+  } else if (field.max_value !== null) {
+    parts.push(`範囲: ${field.max_value}以下。`);
+  }
+  if (field.options.length > 0) parts.push(`選択肢: ${field.options.join(" / ")}。`);
+  if (field.required) parts.push("必須入力です。");
+  if (field.env_override) parts.push(`環境変数: ${field.env_override}。`);
+  return parts.join(" ");
+}
+
+function renderConfigFieldHelp(field: ConfigFieldProjection, explicitHelp = ""): string {
+  return `<small id="${configFieldHelpId(field.key)}" class="settings-field-help">${escapeHtml(configFieldHelpText(field, explicitHelp))}</small>`;
+}
+
+function configFieldValidationAttribute(field: ConfigFieldProjection): string {
+  return validateConfigInput(field, field.value).ok ? "" : ' aria-invalid="true"';
+}
+
 function renderMissingConfigField(key: string): string {
   return `<div class="settings-field missing"><label>${escapeHtml(key)}</label><small>未対応の設定項目です。</small></div>`;
 }
 
-function renderConfigTextField(state: DesktopWebState, key: string, label: string, type = "text"): string {
+function renderConfigTextField(
+  state: DesktopViewState,
+  key: string,
+  label: string,
+  type = "text",
+  help = "",
+): string {
   const found = configField(state, key);
   if (!found) return renderMissingConfigField(key);
   const inputMode = type === "number" ? ' inputmode="numeric"' : "";
+  const controlId = configFieldControlId(found.field.key);
   return `
-    <label class="settings-field">
-      <span>${escapeHtml(label)}${renderEnvBadge(found.field)}</span>
-      <input class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" type="${type === "number" ? "text" : type}"${inputMode} value="${escapeHtml(found.field.value)}" ${configDraftEditingIsOpen ? "" : "disabled"} />
-    </label>
+    <div class="settings-field">
+      <label for="${controlId}">${escapeHtml(label)}${renderEnvBadge(found.field)}</label>
+      <input id="${controlId}" class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" type="${type === "number" ? "text" : type}"${inputMode} value="${escapeHtml(found.field.value)}" aria-describedby="${configFieldDescriptionIds(found.field)}"${configFieldValidationAttribute(found.field)} ${state.config_draft.edit_enabled ? "" : "disabled"} />
+      ${renderConfigFieldHelp(found.field, help)}
+    </div>
   `;
 }
 
-function renderConfigJsonField(state: DesktopWebState, key: string, label: string): string {
+function renderMainProviderModelField(state: DesktopViewState): string {
+  const found = configField(state, "model.model");
+  if (!found) return renderMissingConfigField("model.model");
+  const currentModel = found.field.value.trim();
+  const catalogAvailable = mainProviderCatalogMatchesSettings(state)
+    && state.provider_model_ids.length > 0;
+  const options = catalogAvailable
+    ? state.provider_model_ids.map((id, index) => ({
+      id,
+      label: state.provider_models[index] ?? id,
+    }))
+    : [];
+  if (currentModel.length > 0 && !options.some((option) => option.id === currentModel)) {
+    options.unshift({ id: currentModel, label: `${currentModel}（現在の設定）` });
+  }
+  const controlsEnabled = state.config_draft.edit_enabled;
+  const describedBy = configFieldDescriptionIds(found.field, ["main-provider-model-catalog-status"]);
+  return `
+    <div class="settings-field main-provider-model-field">
+      <label for="main-provider-model">Model${renderEnvBadge(found.field)}</label>
+      <select id="main-provider-model" class="settings-control" data-main-provider-model-control data-config-index="${found.index}" data-config-key="model.model" aria-describedby="${describedBy}"${configFieldValidationAttribute(found.field)} ${controlsEnabled && options.length > 0 ? "" : "disabled"}>
+        ${currentModel.length === 0 ? '<option value="" selected disabled>モデルを選択してください</option>' : ""}
+        ${options.map((option) => `<option value="${escapeHtml(option.id)}" ${option.id === currentModel ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}
+      </select>
+      <details class="side-chat-manual-model main-provider-manual-model" data-details-key="main-provider-manual-model">
+        <summary>一覧にないモデルIDを入力</summary>
+        <label for="main-provider-model-manual">モデルID</label>
+        <input id="main-provider-model-manual" class="settings-control" data-main-provider-model-control data-config-index="${found.index}" data-config-key="model.model" value="${escapeHtml(found.field.value)}" autocomplete="off" spellcheck="false" aria-describedby="${describedBy}"${configFieldValidationAttribute(found.field)} ${controlsEnabled ? "" : "disabled"} />
+      </details>
+      ${renderConfigFieldHelp(found.field)}
+    </div>
+  `;
+}
+
+function mainProviderCatalogMatchesSettings(state: DesktopViewState): boolean {
+  const baseUrl = configField(state, "model.base_url")?.field.value ?? "";
+  const metadataMode = configField(state, "model.provider_metadata_mode")?.field.value ?? "";
+  return state.provider_catalog_base_url !== null
+    && normalizeProviderBaseUrl(baseUrl) === normalizeProviderBaseUrl(state.provider_catalog_base_url)
+    && metadataMode === state.provider_catalog_metadata_mode;
+}
+
+function mainProviderCatalogStatusText(state: DesktopViewState): string {
+  if (state.provider_loading) return "メインLLMのモデル一覧を読み込んでいます…";
+  if (!state.config_draft.external_owner_mutation_open) {
+    return "未保存の変更を適用、保存、または破棄してからモデル一覧を更新できます。一覧にないモデルIDは直接入力できます。";
+  }
+  if (mainProviderCatalogMatchesSettings(state) && state.provider_model_ids.length > 0) {
+    return `${state.provider_model_ids.length}件のメインLLMモデルから選択できます。`;
+  }
+  return "「モデル読込・詳細設定」で現在のLLM URLとProvider modeに対応する候補を取得できます。一覧にないモデルIDは直接入力できます。";
+}
+
+function renderConfigJsonField(state: DesktopViewState, key: string, label: string): string {
   const found = configField(state, key);
   if (!found) return renderMissingConfigField(key);
+  const controlId = configFieldControlId(found.field.key);
   return `
-    <label class="settings-field wide">
-      <span>${escapeHtml(label)}${renderEnvBadge(found.field)}</span>
-      <textarea class="settings-control settings-json" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" ${configDraftEditingIsOpen ? "" : "disabled"}>${escapeHtml(found.field.value)}</textarea>
-    </label>
+    <div class="settings-field wide">
+      <label for="${controlId}">${escapeHtml(label)}${renderEnvBadge(found.field)}</label>
+      <textarea id="${controlId}" class="settings-control settings-json" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" aria-describedby="${configFieldDescriptionIds(found.field)}"${configFieldValidationAttribute(found.field)} ${state.config_draft.edit_enabled ? "" : "disabled"}>${escapeHtml(found.field.value)}</textarea>
+      ${renderConfigFieldHelp(found.field)}
+    </div>
   `;
 }
 
-function renderConfigToggleField(state: DesktopWebState, key: string, label: string): string {
+function renderConfigToggleField(state: DesktopViewState, key: string, label: string): string {
   const found = configField(state, key);
   if (!found) return renderMissingConfigField(key);
   const checked = found.field.value.trim().toLowerCase() === "true" ? "checked" : "";
+  const controlId = configFieldControlId(found.field.key);
   return `
-    <label class="settings-toggle">
-      <input class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" type="checkbox" ${checked} ${configDraftEditingIsOpen ? "" : "disabled"} />
-      <span class="toggle-ui"></span>
-      <span>${escapeHtml(label)}${renderEnvBadge(found.field)}</span>
-    </label>
+    <div class="settings-toggle-field">
+      <label class="settings-toggle" for="${controlId}">
+        <input id="${controlId}" class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" type="checkbox" ${checked} aria-describedby="${configFieldDescriptionIds(found.field)}"${configFieldValidationAttribute(found.field)} ${state.config_draft.edit_enabled ? "" : "disabled"} />
+        <span class="toggle-ui"></span>
+        <span>${escapeHtml(label)}${renderEnvBadge(found.field)}</span>
+      </label>
+      ${renderConfigFieldHelp(found.field)}
+    </div>
   `;
 }
 
 function renderConfigEnumField(
-  state: DesktopWebState,
+  state: DesktopViewState,
   key: string,
   label: string,
   optionLabels: Record<string, string>,
@@ -1104,22 +1749,30 @@ function renderConfigEnumField(
   const found = configField(state, key);
   if (!found) return renderMissingConfigField(key);
   const options = found.field.options.length > 0 ? found.field.options : [found.field.value];
+  const controlId = configFieldControlId(found.field.key);
   return `
-    <label class="settings-field wide">
-      <span>${escapeHtml(label)}${renderEnvBadge(found.field)}</span>
-      <select class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" ${configDraftEditingIsOpen ? "" : "disabled"}>
+    <div class="settings-field wide">
+      <label for="${controlId}">${escapeHtml(label)}${renderEnvBadge(found.field)}</label>
+      <select id="${controlId}" class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" aria-describedby="${configFieldDescriptionIds(found.field)}"${configFieldValidationAttribute(found.field)} ${state.config_draft.edit_enabled ? "" : "disabled"}>
         ${options.map((value) => `<option value="${escapeHtml(value)}" ${found.field.value === value ? "selected" : ""}>${escapeHtml(optionLabels[value] ?? value)}</option>`).join("")}
       </select>
-    </label>
+      ${renderConfigFieldHelp(found.field)}
+    </div>
   `;
 }
 
-function renderRawConfigField(field: ConfigFieldProjection, index: number): string {
+function renderRawConfigField(
+  field: ConfigFieldProjection,
+  index: number,
+  editEnabled: boolean,
+): string {
+  const controlId = configFieldControlId(field.key);
   return `
-    <label class="settings-field raw">
-      <span>${escapeHtml(field.key)}${renderEnvBadge(field)}</span>
-      <textarea class="settings-control settings-raw-value" data-config-index="${index}" data-config-key="${escapeHtml(field.key)}" ${configDraftEditingIsOpen ? "" : "disabled"}>${escapeHtml(field.value)}</textarea>
-    </label>
+    <div class="settings-field raw">
+      <label for="${controlId}">${escapeHtml(field.key)}${renderEnvBadge(field)}</label>
+      <textarea id="${controlId}" class="settings-control settings-raw-value" data-config-index="${index}" data-config-key="${escapeHtml(field.key)}" aria-describedby="${configFieldDescriptionIds(field)}"${configFieldValidationAttribute(field)} ${editEnabled ? "" : "disabled"}>${escapeHtml(field.value)}</textarea>
+      ${renderConfigFieldHelp(field)}
+    </div>
   `;
 }
 
@@ -1137,7 +1790,7 @@ function renderWorkspaceOverlay(state: DesktopWebState): string {
     <div class="modal-backdrop" data-action="close-overlay">
       <section class="modal wide" data-modal role="dialog" aria-modal="true" aria-labelledby="workspace-dialog-title" tabindex="-1">
         <h2 id="workspace-dialog-title">ワークスペース</h2>
-        <label class="field-label">パス</label>
+        <label class="field-label" for="workspace-input">パス</label>
         <input id="workspace-input" value="${escapeHtml(state.workspace_input)}" />
         <div class="split-actions">
           <button data-action="switch-workspace">切り替え</button>
@@ -1157,6 +1810,7 @@ function renderPromptReviewOverlay(state: DesktopWebState): string {
         <h2 id="prompt-review-dialog-title">Enhance</h2>
         <div class="review-grid">
           <pre>${escapeHtml(state.review_raw_text)}</pre>
+          <label class="sr-only" for="review-draft">推敲文</label>
           <textarea id="review-draft">${escapeHtml(state.review_draft_text)}</textarea>
         </div>
         <pre class="feedback">${escapeHtml(state.review_status_text)}</pre>
@@ -1170,12 +1824,16 @@ function renderPromptReviewOverlay(state: DesktopWebState): string {
   `;
 }
 
-function renderCommandPalette(state: DesktopViewState): string {
-  const actions = paletteActions(state, configDirty && !configMutationInFlight);
+function renderCommandPalette(
+  state: DesktopViewState,
+  renderModel: DesktopRenderModel,
+): string {
+  const actions = paletteActions(renderModel);
   return `
     <div class="modal-backdrop" data-action="close-overlay">
       <section class="modal command" data-modal role="dialog" aria-modal="true" aria-labelledby="command-palette-dialog-title" tabindex="-1">
         <h2 id="command-palette-dialog-title">コマンドパレット</h2>
+        <label class="sr-only" for="local-search">アクション、セッション、コマンドを検索</label>
         <input id="local-search" value="${escapeHtml(state.local_search_text)}" placeholder="アクション、セッション、/コマンドを検索" />
         <pre class="feedback">${escapeHtml(state.local_search_results_text)}</pre>
         <div class="select-list compact">
@@ -1212,13 +1870,17 @@ function renderShortcuts(): string {
 }
 
 function renderMenuPopover(menu: ActionMenu, items: ActionDefinition[], extra = ""): string {
+  const label = { file: "ファイル", edit: "編集", view: "表示", help: "ヘルプ" }[menu];
+  const menuId = `titlebar-${menu}-menu`;
+  const popupRole = titlebarMenuPopupRole(menu);
+  const menuItemRole = popupRole === "menu" ? ' role="menuitem"' : "";
   return `
     <div class="menu-scrim" data-action="close-overlay">
-      <section class="titlebar-popover ${menu}" data-modal role="menu">
+      <section id="${menuId}" class="titlebar-popover ${menu}" data-modal data-titlebar-menu="${menu}" role="${popupRole}" aria-label="${label}メニュー" aria-labelledby="${menuId}-trigger">
         ${items
           .map(
-            (action) => `
-              <button data-action="${escapeHtml(action.id)}" role="menuitem">
+            (action, index) => `
+              <button data-action="${escapeHtml(action.id)}"${menu === "file" && action.id === "new-chat" ? ' data-focus-key="titlebar-menu:file:new-chat"' : ""} data-titlebar-menu-action${popupRole === "menu" ? ` tabindex="${index === 0 ? "0" : "-1"}"` : ""}${menuItemRole}>
                 <span>${escapeHtml(action.label)}</span>
                 ${action.shortcut ? `<small>${escapeHtml(action.shortcut)}</small>` : ""}
               </button>`
@@ -1236,11 +1898,26 @@ function renderMenuOverlay(title: string, items: Array<[string, string]>): strin
       <section class="modal side" data-modal role="dialog" aria-modal="true" aria-labelledby="shortcuts-dialog-title" tabindex="-1">
         <h2 id="shortcuts-dialog-title">${escapeHtml(title)}</h2>
         <div class="select-list">
-          ${items.map(([action, label]) => `<button data-action="${action}">${escapeHtml(label)}</button>`).join("")}
+        ${items.map(([action, label]) => `<button data-action="${action}"${action === "new-chat" ? ' data-focus-key="shortcut-action:new-chat"' : ""}>${escapeHtml(label)}</button>`).join("")}
         </div>
       </section>
     </div>
   `;
+}
+
+function renderRecoverableError(
+  error: DesktopRenderLocalPresentation["recoverableError"],
+): string {
+  if (!error) return "";
+  return `
+    <aside class="ui-error-notice" role="status" aria-live="polite">
+      <div>
+        <strong>${escapeHtml(error.title)}</strong>
+        <span>${escapeHtml(error.hint)}</span>
+        ${error.details.trim().length > 0 ? `<details data-details-key="recoverable-error-details"><summary data-focus-key="recoverable-error-summary">技術詳細</summary><pre>${escapeHtml(error.details)}</pre></details>` : ""}
+      </div>
+      <button class="icon-button" data-action="dismiss-ui-error" title="閉じる" aria-label="閉じる">×</button>
+    </aside>`;
 }
 
 function renderNavRow(
@@ -1253,7 +1930,7 @@ function renderNavRow(
   secondaryAction: string,
   rollbackAction: string,
   deleteAction: string,
-  running = false,
+  taskActivityState: TaskActivityState = "idle",
   mutationDisabled = false,
   focusKey = `${kind}:${index}`,
 ): string {
@@ -1274,7 +1951,7 @@ function renderNavRow(
   return `
     <div class="nav-row-wrap ${actionClass} ${selected ? "selected" : ""}">
       <button class="nav-row" data-action="${kind}" data-index="${index}" data-focus-key="${escapeHtml(focusKey)}:select"${selected ? ' aria-current="page"' : ""}${disabled}>
-        <span class="nav-title">${running ? '<span class="busy-spinner" title="実行中"></span>' : ""}<span>${escapeHtml(label)}</span></span>
+        <span class="nav-title">${renderTaskActivityIndicator(taskActivityState, { small: !selected })}<span>${escapeHtml(label)}</span></span>
         <small>${escapeHtml(detail)}</small>
       </button>
       ${

@@ -68,6 +68,27 @@ impl OpenSessionView {
         self.read.active_turn_id
     }
 
+    pub fn latest_turn_id(&self) -> Option<crate::protocol::TurnId> {
+        self.read.latest_turn_id
+    }
+
+    pub fn admission_revision(&self) -> u64 {
+        self.read.admission_revision
+    }
+
+    pub fn active_turn_expectation(&self) -> crate::session::ActiveTurnExpectation {
+        self.read.active_turn_id.map_or(
+            crate::session::ActiveTurnExpectation::Idle {
+                latest_turn_id: self.read.latest_turn_id,
+                revision: self.read.admission_revision,
+            },
+            |turn_id| crate::session::ActiveTurnExpectation::Turn {
+                turn_id,
+                revision: self.read.admission_revision,
+            },
+        )
+    }
+
     pub fn pending_turn_inputs(&self) -> &[crate::session::PendingTurnInputProjection] {
         &self.read.pending_turn_inputs
     }
@@ -126,6 +147,7 @@ impl OpenSessionView {
         self.read.latest_turn_id = incoming.latest_turn_id;
         self.read.active_turn_id = incoming.active_turn_id;
         self.read.active_turn_sequence_no = incoming.active_turn_sequence_no;
+        self.read.admission_revision = incoming.admission_revision;
         self.read.turn_elapsed_ms.extend(
             incoming
                 .turn_elapsed_ms
@@ -421,18 +443,47 @@ fn stored_transcript_covers_live_conversation(
         return false;
     }
 
-    let stored_suffix = &stored_rows[stored_rows.len() - live_rows.len()..];
-    let Some((stored_last, stored_prefix)) = stored_suffix.split_last() else {
-        return false;
-    };
-    let Some((live_last, live_prefix)) = live_rows.split_last() else {
-        return false;
-    };
-    stored_prefix == live_prefix
-        && stored_last.0 == super::models::DesktopTranscriptRowKind::Assistant
-        && live_last.0 == super::models::DesktopTranscriptRowKind::Assistant
-        && !live_last.1.is_empty()
-        && stored_last.1.starts_with(&live_last.1)
+    // A provider response is committed to canonical history before the Desktop
+    // renderer necessarily projects that AgentMessage. A later turn can append
+    // another User row while that earlier Assistant is absent or still partial
+    // in live state. Prefer the complete canonical suffix only when every live
+    // primary row remains exact, except for a non-empty Assistant prefix, and
+    // the only canonical gaps are Assistant rows.
+    canonical_suffix_covers_live_conversation(&stored_rows, &live_rows)
+}
+
+fn canonical_suffix_covers_live_conversation(
+    stored: &[(super::models::DesktopTranscriptRowKind, String)],
+    live: &[(super::models::DesktopTranscriptRowKind, String)],
+) -> bool {
+    use super::models::DesktopTranscriptRowKind::Assistant;
+
+    for suffix_start in 0..stored.len() {
+        let mut live_index = 0;
+        let mut valid = true;
+        for stored_row in &stored[suffix_start..] {
+            match live.get(live_index) {
+                Some(live_row) if live_row == stored_row => live_index += 1,
+                Some(live_row)
+                    if stored_row.0 == Assistant
+                        && live_row.0 == Assistant
+                        && !live_row.1.is_empty()
+                        && stored_row.1.starts_with(&live_row.1) =>
+                {
+                    live_index += 1;
+                }
+                _ if stored_row.0 == Assistant => {}
+                _ => {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if valid && live_index == live.len() {
+            return true;
+        }
+    }
+    false
 }
 
 fn stored_lifecycle_matches_live(stored: crate::session::SessionStatus, live: RunStatus) -> bool {
@@ -539,6 +590,9 @@ fn canonical_metadata_is_newer(
     existing: &CanonicalSessionRead,
     incoming: &CanonicalSessionRead,
 ) -> bool {
+    if incoming.admission_revision != existing.admission_revision {
+        return incoming.admission_revision > existing.admission_revision;
+    }
     if incoming.session.updated_at_ms != existing.session.updated_at_ms {
         return incoming.session.updated_at_ms > existing.session.updated_at_ms;
     }
@@ -617,6 +671,7 @@ mod tests {
             latest_turn_id: None,
             active_turn_id: None,
             active_turn_sequence_no: None,
+            admission_revision: 0,
         }
     }
 
@@ -1534,6 +1589,294 @@ mod tests {
                 .iter()
                 .any(|row| row.body == "ROOT_SMO")
         );
+    }
+
+    #[test]
+    fn terminal_refresh_projects_a_canonical_final_missing_from_the_live_renderer_exactly_once() {
+        let mut running_session = session();
+        running_session.status = SessionStatus::Running;
+        running_session.completed_at_ms = None;
+        let turn_id = TurnId::new();
+        let user = turn_item(
+            running_session.id,
+            turn_id,
+            1,
+            TurnItemPayload::UserMessage {
+                text: "return only MAIN_OK".to_string(),
+            },
+        );
+        let assistant = turn_item(
+            running_session.id,
+            turn_id,
+            2,
+            TurnItemPayload::AgentMessage {
+                text: "MAIN_OK".to_string(),
+            },
+        );
+        let terminal = turn_item(
+            running_session.id,
+            turn_id,
+            3,
+            TurnItemPayload::Terminal {
+                outcome: TurnTerminalOutcome::Completed,
+            },
+        );
+        let mut running_read = canonical_read(&running_session, 0, 1, 1, vec![user.clone()]);
+        running_read.active_turn_id = Some(turn_id);
+        let mut view = OpenSessionView::from_loaded(&running_read);
+
+        let mut completed_session = running_session.clone();
+        completed_session.status = SessionStatus::Completed;
+        completed_session.updated_at_ms = completed_session.updated_at_ms.saturating_add(1);
+        completed_session.completed_at_ms = Some(completed_session.updated_at_ms);
+        let completed_read =
+            canonical_read(&completed_session, 0, 3, 3, vec![user, assistant, terminal]);
+        assert!(view.merge_contiguous(&completed_read));
+
+        // This is the observed terminal race: durable history already owns the
+        // final answer, while process-local transcript delivery stopped at the
+        // user request and only the terminal summary reached live state.
+        let durable_terminal = crate::session::DurableTurnTerminal {
+            outcome: TurnTerminalOutcome::Completed,
+            final_response_id: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        };
+        let mut live = AppState::default();
+        live.current_session_id = Some(completed_session.id);
+        live.transcript_entries = vec![TranscriptEntry {
+            kind: TranscriptKind::User,
+            title: "User".to_string(),
+            body: "return only MAIN_OK".to_string(),
+            response_id: None,
+            tool_call_id: None,
+        }];
+        live.apply_run_summary(crate::session::RunSummary::from_terminal(
+            completed_session.id,
+            turn_id,
+            durable_terminal,
+        ));
+
+        let assert_terminal_projection = |view: &OpenSessionView| {
+            let rows = view.live_detail(&live, None).transcript_rows;
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.row_kind == DesktopTranscriptRowKind::User)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| {
+                        row.row_kind == DesktopTranscriptRowKind::Assistant && row.body == "MAIN_OK"
+                    })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCompleted)
+                    .count(),
+                1
+            );
+        };
+
+        assert_terminal_projection(&view);
+        assert!(view.merge_contiguous(&completed_read));
+        assert_terminal_projection(&view);
+
+        let reopened = OpenSessionView::from_loaded(&completed_read);
+        assert_terminal_projection(&reopened);
+    }
+
+    #[test]
+    fn terminal_refresh_completes_a_prior_partial_assistant_before_a_cancelled_later_turn() {
+        let mut cancelled_session = session();
+        cancelled_session.status = SessionStatus::Cancelled;
+        let first_turn = TurnId::new();
+        let second_turn = TurnId::new();
+        let items = vec![
+            turn_item(
+                cancelled_session.id,
+                first_turn,
+                1,
+                TurnItemPayload::UserMessage {
+                    text: "first request".to_string(),
+                },
+            ),
+            turn_item(
+                cancelled_session.id,
+                first_turn,
+                2,
+                TurnItemPayload::AgentMessage {
+                    text: "FIRST_OK".to_string(),
+                },
+            ),
+            turn_item(
+                cancelled_session.id,
+                first_turn,
+                3,
+                TurnItemPayload::Terminal {
+                    outcome: TurnTerminalOutcome::Completed,
+                },
+            ),
+            turn_item(
+                cancelled_session.id,
+                second_turn,
+                1,
+                TurnItemPayload::UserMessage {
+                    text: "second request".to_string(),
+                },
+            ),
+            turn_item(
+                cancelled_session.id,
+                second_turn,
+                2,
+                TurnItemPayload::Terminal {
+                    outcome: TurnTerminalOutcome::Interrupted {
+                        cause: crate::protocol::TurnInterruptionCause::UserStop,
+                    },
+                },
+            ),
+        ];
+        let view = OpenSessionView::from_loaded(&canonical_read(
+            &cancelled_session,
+            0,
+            items.len(),
+            items.len(),
+            items,
+        ));
+
+        // Observed terminal race: only a prefix of the first canonical response
+        // reached process-local transcript state before the next User row was
+        // appended.
+        let mut live = AppState::default();
+        live.current_session_id = Some(cancelled_session.id);
+        live.transcript_entries = vec![
+            TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User".to_string(),
+                body: "first request".to_string(),
+                response_id: None,
+                tool_call_id: None,
+            },
+            TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "FIRST_".to_string(),
+                response_id: None,
+                tool_call_id: None,
+            },
+            TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User".to_string(),
+                body: "second request".to_string(),
+                response_id: None,
+                tool_call_id: None,
+            },
+        ];
+        live.apply_run_summary(crate::session::RunSummary::from_terminal(
+            cancelled_session.id,
+            second_turn,
+            crate::session::DurableTurnTerminal {
+                outcome: TurnTerminalOutcome::Interrupted {
+                    cause: crate::protocol::TurnInterruptionCause::UserStop,
+                },
+                final_response_id: None,
+                tool_call_count: 0,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            },
+        ));
+
+        let detail = view.live_detail(&live, None);
+
+        assert_eq!(
+            primary_conversation_rows(&detail),
+            vec![
+                (DesktopTranscriptRowKind::User, "first request".to_string()),
+                (DesktopTranscriptRowKind::Assistant, "FIRST_OK".to_string()),
+                (DesktopTranscriptRowKind::User, "second request".to_string()),
+            ]
+        );
+        assert_eq!(
+            detail
+                .transcript_rows
+                .iter()
+                .filter(|row| row.row_kind == DesktopTranscriptRowKind::WorkSummaryCancelled)
+                .count(),
+            1
+        );
+        assert_eq!(detail.transcript_text.matches("FIRST_OK").count(), 1);
+        assert!(!detail.transcript_text.contains("FIRST_\n"));
+    }
+
+    #[test]
+    fn terminal_reconciliation_rejects_divergent_primary_content() {
+        let stored = vec![
+            (DesktopTranscriptRowKind::User, "first request".to_string()),
+            (DesktopTranscriptRowKind::Assistant, "FIRST_OK".to_string()),
+            (DesktopTranscriptRowKind::User, "second request".to_string()),
+            (
+                DesktopTranscriptRowKind::Error,
+                "canonical error".to_string(),
+            ),
+        ];
+
+        assert!(canonical_suffix_covers_live_conversation(
+            &stored,
+            &[
+                (DesktopTranscriptRowKind::User, "first request".to_string()),
+                (DesktopTranscriptRowKind::Assistant, "FIRST_".to_string()),
+                (DesktopTranscriptRowKind::User, "second request".to_string()),
+                (
+                    DesktopTranscriptRowKind::Error,
+                    "canonical error".to_string()
+                ),
+            ],
+        ));
+        assert!(!canonical_suffix_covers_live_conversation(
+            &stored,
+            &[
+                (
+                    DesktopTranscriptRowKind::User,
+                    "different request".to_string()
+                ),
+                (DesktopTranscriptRowKind::Assistant, "FIRST_".to_string()),
+                (DesktopTranscriptRowKind::User, "second request".to_string()),
+                (
+                    DesktopTranscriptRowKind::Error,
+                    "canonical error".to_string()
+                ),
+            ],
+        ));
+        assert!(!canonical_suffix_covers_live_conversation(
+            &stored,
+            &[
+                (DesktopTranscriptRowKind::User, "first request".to_string()),
+                (DesktopTranscriptRowKind::Assistant, "unrelated".to_string()),
+                (DesktopTranscriptRowKind::User, "second request".to_string()),
+                (
+                    DesktopTranscriptRowKind::Error,
+                    "canonical error".to_string()
+                ),
+            ],
+        ));
+        assert!(!canonical_suffix_covers_live_conversation(
+            &stored,
+            &[
+                (DesktopTranscriptRowKind::User, "first request".to_string()),
+                (DesktopTranscriptRowKind::Assistant, "FIRST_".to_string()),
+                (DesktopTranscriptRowKind::User, "second request".to_string()),
+                (
+                    DesktopTranscriptRowKind::Error,
+                    "different error".to_string()
+                ),
+            ],
+        ));
     }
 
     #[test]

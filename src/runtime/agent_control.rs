@@ -386,30 +386,12 @@ struct AgentControlInner {
     activity_tx: watch::Sender<u64>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct TreeClassificationResult {
-    root_outcome: RunCancelOutcome,
-    tree_applied: bool,
-}
-
-impl TreeClassificationResult {
-    fn rejected() -> Self {
-        Self {
-            root_outcome: RunCancelOutcome::Rejected,
-            tree_applied: false,
-        }
-    }
-
-    fn changed(self) -> bool {
-        matches!(self.root_outcome, RunCancelOutcome::Applied) || self.tree_applied
-    }
-}
-
 struct AgentTreeState {
     max_concurrent_agents: usize,
     next_spawn_order: u64,
     pending_capacity_reservations: usize,
     root_scope_control: RunControl,
+    pending_root_durable_turn: Option<(TurnId, u64)>,
     agents: HashMap<AgentPath, AgentEntry>,
 }
 
@@ -489,6 +471,29 @@ pub enum AgentRootContinuationOutcome {
     Blocked,
     NotReady,
     Invalid,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootExecutionStopDisposition {
+    Applied,
+    Deferred,
+    AlreadyUserStopped,
+    AlreadyClassified,
+    TerminalAlreadySettled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RootExecutionLocalStop {
+    pub(crate) disposition: RootExecutionStopDisposition,
+}
+
+impl RootExecutionLocalStop {
+    pub(crate) fn stop_accepted(self) -> bool {
+        !matches!(
+            self.disposition,
+            RootExecutionStopDisposition::AlreadyClassified
+        )
+    }
 }
 
 #[must_use]
@@ -578,6 +583,7 @@ impl AgentControl {
                     next_spawn_order: 1,
                     pending_capacity_reservations: 0,
                     root_scope_control: root_scope_control.clone(),
+                    pending_root_durable_turn: None,
                     agents,
                 }),
                 mail_delivery: Mutex::new(()),
@@ -773,7 +779,10 @@ impl AgentControl {
         if root.execution_marker.is_some() {
             return Err(AgentControlError::AgentAlreadyActive(root_path));
         }
-        if root_scope_control.is_cancelled() || root_scope_control.success_is_sealed() {
+        if root_scope_control.is_cancelled()
+            || root_scope_control.success_is_sealed()
+            || root_scope_control.root_admission_stop_is_sealed()
+        {
             return Err(AgentControlError::TreeCancelled);
         }
         let root_turn_control = RunControl::new();
@@ -784,6 +793,7 @@ impl AgentControl {
         }
         let marker = Arc::new(());
         state.root_scope_control = root_scope_control;
+        state.pending_root_durable_turn = None;
         let root = state
             .agents
             .get_mut(&root_path)
@@ -815,7 +825,9 @@ impl AgentControl {
         if !state.root_scope_control.same_owner(&root_scope_control) {
             return Ok(AgentRootContinuationOutcome::Invalid);
         }
-        if state.root_scope_control.is_cancelled() {
+        if state.root_scope_control.is_cancelled()
+            || state.root_scope_control.root_admission_stop_is_sealed()
+        {
             return Ok(AgentRootContinuationOutcome::Blocked);
         }
         let root = state
@@ -1143,6 +1155,158 @@ impl AgentControl {
         Ok(scheduled)
     }
 
+    /// Stages the durable root identity while the matching context owner is installed.
+    ///
+    /// The short-lived tuple only prevents a partial or mismatched local bind. Root admission and
+    /// Stop ownership remain canonical in the root [`RunControl`].
+    pub(crate) fn publish_root_execution_plan(
+        &self,
+        scope: &AgentExecutionScope,
+        turn_id: TurnId,
+        admission_revision: u64,
+    ) -> Result<(), AgentControlError> {
+        if !scope.path.is_root() {
+            return Err(AgentControlError::RootTurnRequiresScope);
+        }
+        let mut state = self.lock()?;
+        if state.root_scope_control.is_cancelled() {
+            return Err(AgentControlError::TreeCancelled);
+        }
+        validate_execution_scope_locked(self, &state, scope, &scope.path)?;
+        let pending_turn = (turn_id, admission_revision);
+        match state.pending_root_durable_turn {
+            None => state.pending_root_durable_turn = Some(pending_turn),
+            Some(pending) if pending == pending_turn => {}
+            Some(_) => return Err(AgentControlError::StaleExecution(scope.path.clone())),
+        }
+        Ok(())
+    }
+
+    /// Publishes the durable turn owned by one exact root execution.
+    ///
+    /// Root turns do not have a mailbox wake identity, so they use this boundary instead of
+    /// synthesizing an [`AgentExecutionWakeCause`].
+    pub(crate) fn mark_root_execution_admitted(
+        &self,
+        scope: &AgentExecutionScope,
+        turn_id: TurnId,
+        admission_revision: u64,
+    ) -> Result<Vec<AgentExecutionLease>, AgentControlError> {
+        if !scope.path.is_root() {
+            return Err(AgentControlError::RootTurnRequiresScope);
+        }
+        let marker = scope
+            .marker
+            .upgrade()
+            .ok_or_else(|| AgentControlError::StaleExecution(scope.path.clone()))?;
+        let mut state = self.lock()?;
+        if state.root_scope_control.is_cancelled() {
+            return Err(AgentControlError::TreeCancelled);
+        }
+        validate_execution_scope_locked(self, &state, scope, &scope.path)?;
+        if state.pending_root_durable_turn != Some((turn_id, admission_revision)) {
+            return Err(AgentControlError::StaleExecution(scope.path.clone()));
+        }
+        state.pending_root_durable_turn = None;
+        let root = state
+            .agents
+            .get_mut(&scope.path)
+            .expect("execution scope validation proved root existence");
+        if !root
+            .execution_marker
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, &marker))
+        {
+            return Err(AgentControlError::StaleExecution(scope.path.clone()));
+        }
+        root.status = AgentStatus::Running;
+        root.active_durable_turn_id = Some(turn_id);
+        root.awaiting_deferred_turn_id = None;
+        root.pending_deferred_release = None;
+        let scheduled = if state.root_scope_control.is_cancelled() {
+            Vec::new()
+        } else {
+            self.reserve_pending_triggered_executions_locked(&mut state)
+        };
+        drop(state);
+        self.notify_activity();
+        Ok(scheduled)
+    }
+
+    /// Returns the exact durable root turn that still owns this retained tree.
+    ///
+    /// A terminal root keeps its turn in the awaiting slot only while descendants remain live, so
+    /// a Stop captured for A can cross A's terminal projection but can never target replacement B.
+    pub(crate) fn active_or_awaiting_root_turn_id(
+        &self,
+    ) -> Result<Option<TurnId>, AgentControlError> {
+        let state = self.lock()?;
+        let root = state
+            .agents
+            .iter()
+            .find_map(|(path, agent)| path.is_root().then_some(agent))
+            .ok_or_else(|| AgentControlError::AgentNotFound(AgentPath::root()))?;
+        debug_assert!(
+            root.active_durable_turn_id.is_none() || root.awaiting_deferred_turn_id.is_none(),
+            "a root cannot be both active and awaiting the same tree turn"
+        );
+        Ok(root
+            .active_durable_turn_id
+            .or(root.awaiting_deferred_turn_id))
+    }
+
+    /// Returns the stable task-scope capability for this retained root.
+    pub(crate) fn root_scope_control(&self) -> Result<RunControl, AgentControlError> {
+        Ok(self.lock()?.root_scope_control.clone())
+    }
+
+    /// Cancels only the current root execution owned by one exact retained task scope.
+    ///
+    /// Ordinary surface Stop is not a tree Stop: descendants retain their independent controls.
+    /// The exact root turn is classified while the tree-state lock still proves the stable outer
+    /// owner. RunService separately commits that outer owner's root-admission Stop seal, which
+    /// blocks a retained continuation without propagating cancellation into descendants.
+    pub(crate) fn cancel_root_execution_at_scope_control(
+        &self,
+        expected_root_scope_control: &RunControl,
+        root_cause: TurnInterruptionCause,
+        terminal_already_settled: bool,
+    ) -> Result<Option<RootExecutionLocalStop>, AgentControlError> {
+        let state = self.lock()?;
+        if !state
+            .root_scope_control
+            .same_owner(expected_root_scope_control)
+        {
+            return Ok(None);
+        }
+        let root_control = state
+            .agents
+            .iter()
+            .find_map(|(path, agent)| path.is_root().then(|| agent.run_control.clone()))
+            .ok_or_else(|| AgentControlError::AgentNotFound(AgentPath::root()))?;
+        let cause = crate::runtime::RunCancellationCause::Interruption(root_cause);
+        let disposition = if terminal_already_settled {
+            RootExecutionStopDisposition::TerminalAlreadySettled
+        } else {
+            let root_outcome = root_control.request_cancel_local(cause.clone());
+            match root_outcome {
+                RunCancelOutcome::Applied => RootExecutionStopDisposition::Applied,
+                RunCancelOutcome::Deferred(_) => RootExecutionStopDisposition::Deferred,
+                RunCancelOutcome::Rejected if root_control.cause().as_ref() == Some(&cause) => {
+                    RootExecutionStopDisposition::AlreadyUserStopped
+                }
+                RunCancelOutcome::Rejected => RootExecutionStopDisposition::AlreadyClassified,
+            }
+        };
+        if matches!(disposition, RootExecutionStopDisposition::AlreadyClassified) {
+            return Ok(Some(RootExecutionLocalStop { disposition }));
+        }
+        drop(state);
+        self.notify_activity();
+        Ok(Some(RootExecutionLocalStop { disposition }))
+    }
+
+    #[cfg(test)]
     pub(crate) fn schedule_pending_triggered_executions(
         &self,
     ) -> Result<Vec<AgentExecutionLease>, AgentControlError> {
@@ -1761,6 +1925,9 @@ impl AgentControl {
         agent.status = status.into();
         agent.last_activity = activity;
         agent.execution_marker = None;
+        if lease.path.is_root() {
+            state.pending_root_durable_turn = None;
+        }
         let scheduled = if state.root_scope_control.is_cancelled() {
             Vec::new()
         } else {
@@ -2157,7 +2324,8 @@ impl AgentControl {
         Ok(())
     }
 
-    pub fn cancel_agent(&self, path: &AgentPath) -> Result<(), AgentControlError> {
+    #[cfg(test)]
+    pub(crate) fn cancel_agent(&self, path: &AgentPath) -> Result<(), AgentControlError> {
         let run_control = {
             let state = self.lock()?;
             let agent = state
@@ -2250,7 +2418,8 @@ impl AgentControl {
         Ok(())
     }
 
-    pub fn interrupt_tree(&self, root_cause: TurnInterruptionCause) -> bool {
+    #[cfg(test)]
+    pub(crate) fn interrupt_tree(&self, root_cause: TurnInterruptionCause) -> bool {
         self.cancel_tree_with_root_cause(root_cause)
     }
 
@@ -2297,6 +2466,7 @@ impl AgentControl {
         })
     }
 
+    #[cfg(test)]
     fn cancel_tree_with_root_cause(&self, root_cause: TurnInterruptionCause) -> bool {
         self.classify_tree(
             crate::runtime::RunCancellationCause::Interruption(root_cause),
@@ -2304,32 +2474,24 @@ impl AgentControl {
         )
     }
 
+    #[cfg(test)]
     fn classify_tree(
         &self,
         root_cause: crate::runtime::RunCancellationCause,
         descendant_cause: crate::runtime::RunCancellationCause,
     ) -> bool {
-        self.classify_tree_result(root_cause, descendant_cause)
-            .changed()
-    }
-
-    fn classify_tree_result(
-        &self,
-        root_cause: crate::runtime::RunCancellationCause,
-        descendant_cause: crate::runtime::RunCancellationCause,
-    ) -> TreeClassificationResult {
         let Ok(_spawn_tree_fence) = self.lock_spawn_tree_fence() else {
-            return TreeClassificationResult::rejected();
+            return false;
         };
         let Ok(mut state) = self.lock() else {
-            return TreeClassificationResult::rejected();
+            return false;
         };
         let Some(root) = state
             .agents
             .iter()
             .find_map(|(path, agent)| path.is_root().then_some(agent))
         else {
-            return TreeClassificationResult::rejected();
+            return false;
         };
         let root_success_is_durable = root.run_control.success_is_sealed();
         if root_success_is_durable {
@@ -2338,7 +2500,7 @@ impl AgentControl {
                 .cause()
                 .is_some_and(|existing| existing != root_cause)
             {
-                return TreeClassificationResult::rejected();
+                return false;
             }
             let scope_outcome = state
                 .root_scope_control
@@ -2347,7 +2509,7 @@ impl AgentControl {
             let scope_owns_requested_cause =
                 scope_applied || state.root_scope_control.cause().as_ref() == Some(&root_cause);
             if !scope_owns_requested_cause {
-                return TreeClassificationResult::rejected();
+                return false;
             }
             for (path, agent) in &mut state.agents {
                 if !path.is_root() {
@@ -2359,17 +2521,14 @@ impl AgentControl {
             }
             drop(state);
             self.notify_activity();
-            return TreeClassificationResult {
-                root_outcome: RunCancelOutcome::Rejected,
-                tree_applied: scope_applied,
-            };
+            return scope_applied;
         }
         if state
             .root_scope_control
             .cause()
             .is_some_and(|existing| existing != root_cause)
         {
-            return TreeClassificationResult::rejected();
+            return false;
         }
         let root_outcome = root.run_control.request_cancel_local(root_cause.clone());
         let root_owns_requested_cause =
@@ -2378,10 +2537,7 @@ impl AgentControl {
         let deferred_tree_action =
             matches!(root_outcome, crate::runtime::RunCancelOutcome::Deferred(_));
         if !root_owns_requested_cause && !deferred_tree_action {
-            return TreeClassificationResult {
-                root_outcome,
-                tree_applied: false,
-            };
+            return false;
         }
         let scope_outcome = state
             .root_scope_control
@@ -2390,10 +2546,7 @@ impl AgentControl {
         let scope_owns_requested_cause =
             scope_applied || state.root_scope_control.cause().as_ref() == Some(&root_cause);
         if !scope_owns_requested_cause {
-            return TreeClassificationResult {
-                root_outcome,
-                tree_applied: false,
-            };
+            return false;
         }
         for (path, agent) in &mut state.agents {
             if !path.is_root() {
@@ -2405,10 +2558,7 @@ impl AgentControl {
         }
         drop(state);
         self.notify_activity();
-        TreeClassificationResult {
-            root_outcome,
-            tree_applied: scope_applied,
-        }
+        matches!(root_outcome, RunCancelOutcome::Applied) || scope_applied
     }
 
     pub fn tree_is_cancelled(&self) -> bool {
@@ -2475,6 +2625,9 @@ impl AgentControl {
             agent.active_durable_turn_id = None;
             agent.awaiting_deferred_turn_id = None;
             agent.pending_deferred_release = None;
+            if path.is_root() {
+                state.pending_root_durable_turn = None;
+            }
             drop(state);
             self.notify_activity();
         }
@@ -2505,6 +2658,9 @@ impl AgentControl {
         &self,
         state: &mut AgentTreeState,
     ) -> Vec<AgentExecutionLease> {
+        if state.root_scope_control.is_cancelled() {
+            return Vec::new();
+        }
         let mut candidates = state
             .agents
             .iter()
@@ -3076,6 +3232,129 @@ mod tests {
         control
             .complete_execution(continuation, InactiveAgentStatus::Interrupted, None)
             .expect("settle stopped continuation");
+    }
+
+    #[test]
+    fn committed_admission_stop_blocks_root_continuation_but_not_a_dormant_child() {
+        let root_scope = RunControl::new();
+        let (control, root_execution) =
+            AgentControl::with_root_control(SessionId::new(), 2, root_scope.clone())
+                .expect("agent tree");
+        let (child, child_execution) = control
+            .register_child(&AgentPath::root(), "child", SessionId::new(), None)
+            .expect("child");
+        control
+            .complete_execution(child_execution, InactiveAgentStatus::Completed(None), None)
+            .expect("complete first child turn");
+        assert!(root_execution.run_control().seal_success());
+        control
+            .complete_execution(root_execution, InactiveAgentStatus::Completed(None), None)
+            .expect("complete root");
+        let stop_plan = match root_scope.seal_root_admission_for_stop() {
+            crate::runtime::RootAdmissionStopSealOutcome::Acquired(plan) => plan,
+            outcome => panic!("expected admission Stop seal, got {outcome:?}"),
+        };
+        assert!(matches!(
+            control
+                .try_acquire_root_continuation(root_scope.clone())
+                .expect("uncommitted Stop seal continuation outcome"),
+            AgentRootContinuationOutcome::Blocked
+        ));
+        assert!(root_scope.commit_root_admission_stop_seal(stop_plan.seal_id));
+
+        assert!(matches!(
+            control
+                .try_acquire_root_continuation(root_scope.clone())
+                .expect("continuation outcome"),
+            AgentRootContinuationOutcome::Blocked
+        ));
+        let resumed_child = control
+            .try_acquire_execution(&child.path)
+            .expect("ordinary root Stop must not block a descendant turn");
+        assert_eq!(resumed_child.run_control().cause(), None);
+        assert_eq!(root_scope.cause(), None);
+        drop(resumed_child);
+    }
+
+    #[test]
+    fn exact_root_stop_respects_effect_commit_settlement_and_success_reservations() {
+        let user_stop = RunCancellationCause::Interruption(TurnInterruptionCause::UserStop);
+
+        let effect_scope = RunControl::new();
+        let (effect_tree, effect_root) =
+            AgentControl::with_root_control(SessionId::new(), 1, effect_scope.clone())
+                .expect("effect tree");
+        let effect_control = effect_root.run_control();
+        let effect_commit = effect_control
+            .begin_tool_effect_commit()
+            .expect("effect commit reservation");
+        let effect_stop = effect_tree
+            .cancel_root_execution_at_scope_control(
+                &effect_scope,
+                TurnInterruptionCause::UserStop,
+                false,
+            )
+            .expect("effect Stop")
+            .expect("effect scope owner");
+        assert_eq!(
+            effect_stop.disposition,
+            RootExecutionStopDisposition::Deferred
+        );
+        assert_eq!(effect_control.cause(), None);
+        assert_eq!(effect_scope.cause(), None);
+        effect_commit.release();
+        assert_eq!(effect_control.cause(), Some(user_stop.clone()));
+
+        let settlement_scope = RunControl::new();
+        let (settlement_tree, settlement_root) =
+            AgentControl::with_root_control(SessionId::new(), 1, settlement_scope.clone())
+                .expect("settlement tree");
+        let settlement_control = settlement_root.run_control();
+        let settlement = settlement_control
+            .begin_tool_settlement()
+            .expect("tool settlement reservation");
+        let settlement_stop = settlement_tree
+            .cancel_root_execution_at_scope_control(
+                &settlement_scope,
+                TurnInterruptionCause::UserStop,
+                false,
+            )
+            .expect("settlement Stop")
+            .expect("settlement scope owner");
+        assert_eq!(
+            settlement_stop.disposition,
+            RootExecutionStopDisposition::Deferred
+        );
+        assert_eq!(settlement_control.cause(), None);
+        assert_eq!(settlement_scope.cause(), None);
+        settlement.release();
+        assert_eq!(settlement_control.cause(), Some(user_stop));
+
+        let success_scope = RunControl::new();
+        let (success_tree, success_root) =
+            AgentControl::with_root_control(SessionId::new(), 1, success_scope.clone())
+                .expect("success tree");
+        let success_control = success_root.run_control();
+        let success = success_control
+            .begin_success_commit()
+            .expect("success reservation");
+        let success_stop = success_tree
+            .cancel_root_execution_at_scope_control(
+                &success_scope,
+                TurnInterruptionCause::UserStop,
+                false,
+            )
+            .expect("success Stop")
+            .expect("success scope owner");
+        assert_eq!(
+            success_stop.disposition,
+            RootExecutionStopDisposition::Deferred
+        );
+        assert_eq!(success_control.cause(), None);
+        assert_eq!(success_scope.cause(), None);
+        assert!(success.seal());
+        assert!(success_control.success_is_sealed());
+        assert_eq!(success_control.cause(), None);
     }
 
     #[test]

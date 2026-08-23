@@ -78,6 +78,31 @@ pub struct DesktopProjectRow {
     pub path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum DesktopStopMutationTarget {
+    Root {
+        workspace_path: String,
+        session_id: Option<String>,
+        root_generation: String,
+        latest_turn_id: Option<String>,
+        admission_revision: String,
+        permission_confirmation_id: Option<String>,
+    },
+    Turn {
+        workspace_path: String,
+        session_id: String,
+        turn_id: String,
+        admission_revision: String,
+        root_epoch: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopSessionRow {
     pub session_id: SessionId,
@@ -90,6 +115,9 @@ pub struct DesktopSessionRow {
     pub active_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_sequence_no: Option<i64>,
+    pub admission_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupt_target: Option<DesktopStopMutationTarget>,
     #[serde(default)]
     pub pending_permission_requests: u32,
     #[serde(default)]
@@ -107,6 +135,7 @@ impl DesktopSessionRow {
             summary.loaded_status,
             summary.active_turn_id,
             summary.active_turn_sequence_no,
+            summary.admission_revision,
             summary.pending_permission_requests,
             summary.pending_user_input_requests,
         );
@@ -155,6 +184,7 @@ impl DesktopSessionRow {
             None,
             0,
             0,
+            0,
         )
     }
 
@@ -165,6 +195,7 @@ impl DesktopSessionRow {
         loaded_status: LoadedSessionStatus,
         active_turn_id: Option<TurnId>,
         active_turn_sequence_no: Option<i64>,
+        admission_revision: u64,
         pending_permission_requests: u32,
         pending_user_input_requests: u32,
     ) -> Self {
@@ -176,6 +207,8 @@ impl DesktopSessionRow {
             archived: false,
             active_turn_id,
             active_turn_sequence_no,
+            admission_revision: admission_revision.to_string(),
+            interrupt_target: None,
             pending_permission_requests,
             pending_user_input_requests,
             short_id: short_session_id(session_id),
@@ -322,6 +355,7 @@ mod tests {
             Some(turn_id),
             Some(3),
             1,
+            1,
             2,
         );
 
@@ -376,6 +410,7 @@ mod tests {
             LoadedSessionStatus::Active,
             Some(turn_id),
             Some(7),
+            1,
             1,
             2,
         );

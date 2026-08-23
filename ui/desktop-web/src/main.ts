@@ -1,14 +1,43 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { command } from "./api";
+import { cancelRunCommand, interruptSessionCommand } from "./stop_contract";
 import { agentActivityRowsChanged, selectedAgentActivityChanged } from "./agent_activity";
+import {
+  beginCommandPaletteInsertion,
+  CommandPaletteInsertionAsyncOwner,
+  commandPaletteInsertionFocusCandidates,
+  commandPaletteInsertionFocusStillCurrent,
+  dispatchCommandPaletteInsertion,
+  settleCommandPaletteInsertion,
+} from "./command_palette_insertion";
+import {
+  dispatchNewSessionMutation,
+  mutationStartsNewSession,
+} from "./new_session_mutation";
+import {
+  beginAttachmentFocusContinuation,
+  attachmentFocusCandidates,
+  reconcileAttachmentFocusContinuation,
+  type AttachmentFocusDecision,
+} from "./attachment_focus_continuation";
+import {
+  agentExecutionPrependOwnerMatches,
+  beginAgentExecutionPrependContinuation,
+  agentExecutionPrependFocusCandidates,
+  reconcileAgentExecutionPrependContinuation,
+  restoreAgentExecutionPrependViewport,
+} from "./agent_execution_prepend_continuation";
 import {
   acknowledgePendingHistoryPrepend,
   advancePendingHistoryPrepend,
   captureViewportAnchor,
   createPendingHistoryPrepend,
+  historyPrependFocusCandidates,
+  historyPrependFocusContinuationIsCurrent,
   pinResolvedThreadToEnd,
   rejectPendingHistoryPrepend,
   restoreViewportAnchor,
+  runCompletionEdge,
   shouldRevealThreadEnd,
   syncResolvedInactiveThreadViewport,
   ThreadTailFollowAffinity,
@@ -17,26 +46,30 @@ import {
 import { commandConflictState, commandInternalState } from "./command_error";
 import type { ActionContext } from "./actions";
 import {
+  focusOverlayPrimary,
   installGlobalKeyboardShortcuts,
   prepareConfigMutation,
   prepareConfigSnapshot,
   wireEvents,
 } from "./events";
 import {
-  renderArtifactPane,
-  renderComposer,
-  renderConfirmation,
-  renderLocalConfirmation,
-  renderOverlay,
-  renderRunStatusStrip,
-  renderSidebar,
+  PostRenderFocusArbiter,
+  animationFrameFocusScheduler,
+  type FocusArbiterResult,
+  type PostRenderFocusIntent,
+} from "./focus_arbiter";
+import {
+  renderDesktopMarkup,
   renderStartupSplash,
-  renderThreadContent,
-  renderTitlebar,
-  renderTopbar,
-  setRenderContext,
+  synchronizeTitlebarMenuState,
 } from "./render";
-import type { AgentExecutionProjection, DesktopViewState, DesktopWebState } from "./types";
+import type {
+  AgentExecutionProjection,
+  CommandPaletteInsertionResult,
+  DesktopViewState,
+  DesktopWebState,
+  SideChatCatalogResult,
+} from "./types";
 import {
   beginAgentExecutionLoad,
   beginPreviousAgentExecutionPageLoad,
@@ -47,7 +80,15 @@ import {
   finishAgentExecutionLoad,
   reconcileAgentPaneState,
   selectedAgentExecution,
+  sideChatCatalogLoadOpen,
+  sideChatCatalogViewForState,
+  sideChatDeleteConfirmationStillTargets,
+  sideChatDraftForState,
+  sideChatMutationPending,
+  sideChatOperationsOpen,
+  sideChatOwnerSessionId,
   shouldPreserveAgentExecutionSnapshots,
+  type SessionInteractionSnapshot,
 } from "./ui_state";
 import {
   InteractionLifecycle,
@@ -59,10 +100,67 @@ import {
   deferredProjectionCandidatePreferred,
   projectionUpdateAccepted,
 } from "./projection_state";
-import { modalIdentity, modalIsOpen } from "./modal_state";
+import {
+  createDesktopRenderModel,
+  desktopRenderRequired,
+  type DesktopRenderModel,
+} from "./render_projection";
+import { isRegularModalOverlay, localModalIdentity, modalIdentity, modalIsOpen } from "./modal_state";
 import { autoRefreshAllowed, runtimePollingRequired } from "./polling_state";
 import {
+  reconcileTaskActivityAnimationEpoch,
+  taskActivityAnimationDelay,
+} from "./task_activity_indicator";
+import {
+  quickChatDeleteFocusCandidates,
+  reconcileQuickChatDeleteFocusContinuation,
+} from "./quick_chat_delete_focus_continuation";
+import { restoreScrollPosition } from "./scroll_state";
+import {
+  beginNewChatFocusContinuation,
+  beginNewProjectSessionFocusContinuation,
+  captureSessionInteractionSnapshot,
+  newSessionRetryFocusTarget,
+  reconcileNewSessionFocusContinuation,
+  restoreSessionPromptInteraction,
+  restoreSessionThreadInteraction,
+  sameNewSessionFocusRequest,
+  settledNewSessionFocusContinuationIsCurrent,
+  sessionPromptInteractionForRender,
+  sessionSelectionRequestsComposerFocus,
+  type NewSessionFocusContinuation,
+  type SettledNewSessionFocusContinuation,
+} from "./session_interaction_state";
+import {
+  refreshPromptFocusContinuationAccepted,
+  retainConnectedMainPrompt,
+  takePendingRefreshPromptFocus,
+  type RefreshPromptFocusContinuation,
+} from "./main_prompt_continuity";
+import {
+  applyTitlebarMenuRovingTabIndex,
+  titlebarMenuFromOverlay,
+  titlebarMenuTriggerAction,
+  titlebarMenuUsesRovingFocus,
+} from "./titlebar_interaction";
+import {
+  settingsActionFocusCandidates,
+  settingsActionFocusStillTargets,
+  sameSettingsSurface,
+  settingsSurfaceIdentity,
+} from "./settings_surface";
+import {
+  mainRunFocusSurface,
+  reconcileMainRunFocusContinuation,
+} from "./run_focus_continuation";
+import {
+  reconcileSideChatFocusContinuation,
+  sideChatFocusSurface,
+  sideChatFocusTargetStillMatches,
+} from "./side_chat_focus_continuation";
+import {
   beginPermissionDecision,
+  beginPermissionStop,
   failPermissionDecision,
   finishLocalDecision,
   finishPermissionDecision,
@@ -74,7 +172,6 @@ import {
 } from "./decision_state";
 import { escapeHtml, humanizeError } from "./utils";
 import {
-  configDraftAppliesTo,
   configMutationPending,
 } from "./config_mutation";
 import { rowMutationTargetStillMatches } from "./row_target";
@@ -86,6 +183,8 @@ import {
   mutationChangesConfigOwner,
   mutationStartsRun,
   operationInvalidatesComposer,
+  composerOwner,
+  composerSessionOwner,
   projectViewState,
   reconcileUiDrafts,
   rejectDraftMutation,
@@ -96,9 +195,10 @@ const app = document.querySelector<HTMLDivElement>("#app");
 const desktopWindow = getCurrentWindow();
 let currentState: DesktopWebState | null = null;
 let lastRenderedState: DesktopViewState | null = null;
+let lastRenderedModel: DesktopRenderModel | null = null;
 let polling = false;
 let previousSessionKey = "";
-let lastRenderedLocalConfirmationPending = false;
+let lastRenderedLocalModalIdentity: string | null = null;
 let splashDismissed = false;
 let splashTimer: number | null = null;
 const splashStartedAt = performance.now();
@@ -110,14 +210,22 @@ let nextHistoryPrependGeneration = 1;
 let lastRenderedAgentExecutionOwner: string | null = null;
 const threadTailFollow = new ThreadTailFollowAffinity();
 let threadEndRevealGeneration = 0;
+const commandPaletteInsertionOwner = new CommandPaletteInsertionAsyncOwner();
+let commandPaletteInsertionInteractionGeneration = 0n;
+let nextCommandPaletteInsertionRequestId = 1;
+let composerFocusInteractionGeneration = 0n;
+let postRenderFocusInteractionEpoch = 0n;
+let pendingNewSessionInitiatingFocus: NewSessionFocusContinuation | null = null;
+let pendingNewSessionPromptFocus: SettledNewSessionFocusContinuation | null = null;
 
 interface StateUpdate {
   state: DesktopWebState;
-  render: boolean;
+  forceRender: boolean;
   mutationName: string | null;
   scheduleNavigation: boolean;
   sequence: number;
   draftSnapshot: DraftMutationSnapshot | null;
+  refreshPromptFocusContinuation: RefreshPromptFocusContinuation | null;
 }
 
 const interactionLifecycle = new InteractionLifecycle<StateUpdate>((current, candidate) =>
@@ -127,6 +235,19 @@ const interactionLifecycle = new InteractionLifecycle<StateUpdate>((current, can
     current.sequence,
     candidate.sequence,
   ),
+);
+const postRenderFocusArbiter = new PostRenderFocusArbiter(
+  animationFrameFocusScheduler(window),
+  {
+    currentRenderCommit: () => threadEndRevealGeneration,
+    currentInteractionEpoch: () => postRenderFocusInteractionEpoch,
+    interactionActive: () => interactionLifecycle.active,
+    activeElement: () => document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null,
+    bodyElement: () => document.body,
+    documentElement: () => document.documentElement,
+  },
 );
 let nextStateSequence = 1;
 let lastAppliedStateSequence = 0;
@@ -144,19 +265,26 @@ const eventContext: ActionContext = {
   uiState,
   getProjection: () => currentState,
   getViewState: () => currentState ? projectViewState(currentState, uiState) : null,
-  acceptProjection: (state: DesktopWebState, shouldRender = true) => acceptState(state, shouldRender),
+  getRenderModel: () => currentState
+    ? buildDesktopRenderModel(projectViewState(currentState, uiState))
+    : null,
+  acceptProjection: (state: DesktopWebState, forceRender = true) => acceptState(state, forceRender),
   rerender: () => {
     if (currentState) acceptState(currentState, true);
   },
   mutate,
+  insertCommandFromPalette,
+  invalidateCommandPaletteInsertion,
   recoverCommandConflict,
   reportError,
   prepareConfigMutation: (target) => prepareConfigMutation(eventContext, target),
   prepareConfigSnapshot: (target) => prepareConfigSnapshot(eventContext, target),
   submitPermissionDecision,
+  submitRunStop,
   setWindowMaximized,
   loadAgentExecution,
   loadPreviousAgentExecutionPage,
+  loadSideChatModels: (args) => command<SideChatCatalogResult>("load_side_chat_models", args),
   jumpToHistoryAnchor,
 };
 
@@ -167,6 +295,7 @@ installInteractionEventGate({
   lifecycle: interactionLifecycle,
   finish: finishInteraction,
 });
+installComposerFocusInteractionInvalidation();
 installWindowMaximizedSync();
 void refresh();
 window.setInterval(() => {
@@ -187,7 +316,7 @@ async function refresh(): Promise<void> {
   }
   polling = true;
   try {
-    render(await command<DesktopWebState>("desktop_state"));
+    acceptState(await command<DesktopWebState>("desktop_state"), false);
   } catch (error) {
     reportError(error);
   } finally {
@@ -195,10 +324,50 @@ async function refresh(): Promise<void> {
   }
 }
 
-async function mutate(name: string, args?: Record<string, unknown>): Promise<void> {
+async function mutate(
+  name: string,
+  args?: Record<string, unknown>,
+  activationSource?: "shortcut",
+): Promise<void> {
   const startsRun = mutationStartsRun(name);
   const changesConfigOwner = mutationChangesConfigOwner(name);
+  const refreshPromptFocusContinuation = takePendingRefreshPromptFocus(uiState, name);
   if (!mutationAdmissionOpen(uiState, name)) return;
+  if (
+    mutationStartsNewSession(name)
+    && (!currentState || !projectViewState(currentState, uiState).navigation_admission_open)
+  ) {
+    return;
+  }
+  const activeElement = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null;
+  const requestOwner = currentState ? composerOwner(currentState) : null;
+  const newSessionFocusContinuation = name === "new_chat"
+    ? beginNewChatFocusContinuation(
+      activationSource === "shortcut" ? "shortcut" : "element",
+      activeElement,
+      composerFocusInteractionGeneration,
+      activeElement?.dataset.action ?? null,
+      activeElement?.dataset.focusKey ?? null,
+      requestOwner,
+    )
+    : name === "new_project_session"
+      ? beginNewProjectSessionFocusContinuation(
+        activeElement,
+        composerFocusInteractionGeneration,
+        activeElement?.dataset.action ?? null,
+        activeElement?.dataset.focusKey ?? null,
+        requestOwner,
+        newProjectSessionTargetProjectId(currentState, args),
+      )
+      : null;
+  const attachmentFocusContinuation = currentState
+    ? beginAttachmentFocusContinuation(projectViewState(currentState, uiState), name, args)
+    : null;
+  if (attachmentFocusContinuation) {
+    uiState.attachmentFocusContinuation = attachmentFocusContinuation;
+  }
   let historyPrependRequest: PendingHistoryPrepend | null = null;
   if (name === "load_previous_turn_page") {
     historyPrependRequest = beginHistoryPrepend();
@@ -222,17 +391,55 @@ async function mutate(name: string, args?: Record<string, unknown>): Promise<voi
   }
   const draftSnapshot = captureDraftMutation(uiState, name);
   try {
-    const state = await command<DesktopWebState>(name, args);
-    if (
-      historyPrependRequest
-      && pendingHistoryPrepend?.generation === historyPrependRequest.generation
-    ) {
-      pendingHistoryPrepend = acknowledgePendingHistoryPrepend(pendingHistoryPrepend);
+    const acceptMutationResponse = (state: DesktopWebState): void => {
+      if (
+        historyPrependRequest
+        && pendingHistoryPrepend?.generation === historyPrependRequest.generation
+      ) {
+        pendingHistoryPrepend = acknowledgePendingHistoryPrepend(pendingHistoryPrepend);
+      }
+      acknowledgeDraftMutation(uiState, state, name, draftSnapshot);
+      acceptState(
+        state,
+        true,
+        name,
+        true,
+        draftSnapshot,
+        refreshPromptFocusContinuation,
+      );
+      if (currentState && currentState !== state) acceptState(currentState, true);
+    };
+    if (mutationStartsNewSession(name)) {
+      pendingNewSessionInitiatingFocus = newSessionFocusContinuation;
+      pendingNewSessionPromptFocus = null;
+      const dispatched = await dispatchNewSessionMutation(
+        uiState,
+        name,
+        interactionLifecycle,
+        () => {
+          if (currentState) acceptState(currentState, true);
+        },
+        () => command<DesktopWebState>(name, args),
+        acceptMutationResponse,
+        () => {
+          if (currentState) acceptState(currentState, true);
+        },
+      );
+      if (!dispatched) {
+        cancelNewSessionFocusRequest(newSessionFocusContinuation);
+      }
+    } else {
+      acceptMutationResponse(
+        name === "interrupt_session"
+          ? await interruptSessionCommand<DesktopWebState>(args ?? {})
+          : await command<DesktopWebState>(name, args),
+      );
     }
-    acknowledgeDraftMutation(uiState, state, name, draftSnapshot);
-    acceptState(state, true, name, true, draftSnapshot);
-    if (currentState && currentState !== state) acceptState(currentState, true);
   } catch (error) {
+    cancelNewSessionFocusRequest(newSessionFocusContinuation);
+    if (uiState.attachmentFocusContinuation === attachmentFocusContinuation) {
+      uiState.attachmentFocusContinuation = null;
+    }
     if (historyPrependRequest) {
       pendingHistoryPrepend = rejectPendingHistoryPrepend(
         pendingHistoryPrepend,
@@ -240,9 +447,11 @@ async function mutate(name: string, args?: Record<string, unknown>): Promise<voi
       );
       scheduleInactiveThreadViewportSync();
     }
-    rejectDraftMutation(uiState, name, draftSnapshot);
     if (startsRun) threadTailFollow.cancelRun();
-    if (!recoverCommandConflict(error)) reportError(error);
+    rejectDraftMutation(uiState, name, draftSnapshot);
+    const conflictRecovered = recoverCommandConflict(error, draftSnapshot);
+    if (!conflictRecovered) reportError(error);
+    scheduleNewSessionRetryFocus(newSessionFocusContinuation);
   } finally {
     if (startsRun) {
       uiState.runStartMutationPending = false;
@@ -253,6 +462,169 @@ async function mutate(name: string, args?: Record<string, unknown>): Promise<voi
       if (currentState) acceptState(currentState, true);
     }
   }
+}
+
+function invalidateCommandPaletteInsertion(): void {
+  commandPaletteInsertionInteractionGeneration += 1n;
+}
+
+async function insertCommandFromPalette(
+  state: DesktopViewState,
+  index: number,
+): Promise<void> {
+  const projection = currentState;
+  if (
+    !projection
+    || state.projection_revision !== projection.projection_revision
+    || state.command_rows[index]?.path !== projection.command_rows[index]?.path
+  ) {
+    return;
+  }
+  const active = document.activeElement;
+  const focusOwner = active instanceof Element
+    ? active.closest<HTMLElement>('[data-action="insert-command"]')
+    : null;
+  if (!focusOwner || focusOwner.dataset.index !== String(index)) return;
+  const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
+  if (!prompt) return;
+  const request = beginCommandPaletteInsertion(
+    projection,
+    uiState.drafts,
+    prompt,
+    focusOwner,
+    index,
+    nextCommandPaletteInsertionRequestId++,
+    commandPaletteInsertionInteractionGeneration,
+  );
+  if (!request) return;
+
+  try {
+    const dispatched = await dispatchCommandPaletteInsertion(
+      commandPaletteInsertionOwner,
+      request,
+      interactionLifecycle,
+      () => command<CommandPaletteInsertionResult>("insert_command", {
+        index,
+        expectedTarget: request.expectedTarget,
+        expectedDraftTarget: request.expectedDraftTarget,
+      }),
+      (response) => {
+        const current = currentState;
+        return current
+          ? settleCommandPaletteInsertion({
+              request,
+              activeRequest: commandPaletteInsertionOwner.activeRequest,
+              interactionGeneration: commandPaletteInsertionInteractionGeneration,
+              interactionIdle: !interactionLifecycle.active,
+              projectionAccepted: projectionUpdateAccepted(
+                lastAppliedProjectionRevision,
+                response.state.projection_revision,
+                response.state === currentState,
+              ),
+              currentState: current,
+              response,
+              drafts: uiState.drafts,
+              prompt: document.querySelector<HTMLTextAreaElement>("#prompt"),
+              focusOwned: document.activeElement === request.focusOwner,
+            })
+          : null;
+      },
+    );
+    if (!dispatched) return;
+    const { response, settlement } = dispatched;
+    if (settlement) {
+      uiState.drafts.prompt = settlement.value;
+      uiState.drafts.composerRevision = settlement.focusContinuation.composerRevision;
+    }
+    acceptState(response.state, true, "insert_command", true);
+    if (!settlement || currentState !== response.state) return;
+    const continuation = settlement.focusContinuation;
+    const paletteFocusOwners = Array.from(
+      document.querySelectorAll<HTMLElement>('[data-action="show-command-palette"]'),
+    );
+    schedulePostRenderFocus([{
+      source: "command-palette",
+      priority: "explicit-transfer",
+      claim: { kind: "yield-from", owners: paletteFocusOwners },
+      candidates: commandPaletteInsertionFocusCandidates(document, continuation),
+      isCurrent: () => Boolean(
+        currentState
+        && commandPaletteInsertionFocusStillCurrent(
+          continuation,
+          commandPaletteInsertionInteractionGeneration,
+          currentState,
+          uiState.drafts,
+        )
+      ),
+    }]);
+  } catch (error) {
+    if (!recoverCommandConflict(error)) reportError(error);
+  }
+}
+
+function cancelNewSessionFocusRequest(request: NewSessionFocusContinuation | null): void {
+  if (request === null) return;
+  request.requestToken.rejected = true;
+  if (sameNewSessionFocusRequest(pendingNewSessionInitiatingFocus, request)) {
+    pendingNewSessionInitiatingFocus = null;
+  }
+  if (sameNewSessionFocusRequest(pendingNewSessionPromptFocus, request)) {
+    pendingNewSessionPromptFocus = null;
+  }
+}
+
+function scheduleNewSessionRetryFocus(request: NewSessionFocusContinuation | null): void {
+  if (request === null) return;
+  schedulePostRenderFocus([{
+    source: "new-session",
+    priority: "explicit-transfer",
+    claim: { kind: "unowned" },
+    candidates: [{
+      resolve: () => {
+        if (!currentState) return null;
+        const initiatingElement = request.initiatingElement instanceof HTMLElement
+          && request.initiatingElement !== document.body
+          && request.initiatingElement !== document.documentElement
+          && request.initiatingElement.isConnected
+          && !request.initiatingElement.matches(":disabled")
+            ? request.initiatingElement
+            : null;
+        const exactRouteTarget = request.activeAction && request.activeFocusKey
+          ? document.querySelector<HTMLElement>(
+            `[data-action="${CSS.escape(request.activeAction)}"]`
+            + `[data-focus-key="${CSS.escape(request.activeFocusKey)}"]:not(:disabled)`,
+          )
+          : null;
+        const target = newSessionRetryFocusTarget(request, {
+          currentOwner: composerOwner(currentState),
+          currentInteractionGeneration: composerFocusInteractionGeneration,
+          focusUnclaimed: true,
+          initiatingElementConnected: initiatingElement !== null,
+          exactRouteTarget,
+          promptTarget: document.querySelector<HTMLTextAreaElement>("#prompt:not(:disabled)"),
+        });
+        return target instanceof HTMLElement ? target : null;
+      },
+    }],
+    isCurrent: () => Boolean(
+      currentState
+      && request.requestToken.rejected
+      && request.requestOwner === composerOwner(currentState)
+      && request.interactionGeneration === composerFocusInteractionGeneration
+    ),
+  }]);
+}
+
+function newProjectSessionTargetProjectId(
+  state: DesktopWebState | null,
+  args: Record<string, unknown> | undefined,
+): string | null {
+  if (!state || !args || typeof args.index !== "number" || !Number.isInteger(args.index)) return null;
+  const expectedTarget = args.expectedTarget;
+  if (!expectedTarget || typeof expectedTarget !== "object") return null;
+  const rowId = (expectedTarget as { rowId?: unknown }).rowId;
+  if (typeof rowId !== "string" || rowId.length === 0) return null;
+  return state.project_rows[args.index]?.project_id === rowId ? rowId : null;
 }
 
 async function loadAgentExecution(state: DesktopWebState, agentPath: string): Promise<void> {
@@ -284,6 +656,10 @@ async function loadPreviousAgentExecutionPage(
   if (!row || state.draft_target.sessionId === null) return;
   const request = beginPreviousAgentExecutionPageLoad(uiState, state, row);
   if (!request || request.expectedOffset === null || request.expectedEnd === null) return;
+  uiState.agentExecutionPrependContinuation = beginAgentExecutionPrependContinuation(
+    document,
+    request,
+  );
   if (currentState) acceptState(currentState, true);
   try {
     const projection = await command<AgentExecutionProjection>(
@@ -314,7 +690,7 @@ function renderAgentExecutionSettlement(request: ReturnType<typeof beginAgentExe
   if (
     refreshAfterSettlement
     && uiState.selectedAgentPath === request.expectedTarget.agentPath
-    && uiState.activeAgentExecutionRequest === null
+    && uiState.agentExecutionTransaction.active === null
   ) {
     void loadAgentExecution(settledState, request.expectedTarget.agentPath);
   }
@@ -325,6 +701,7 @@ function beginHistoryPrepend(): PendingHistoryPrepend | null {
   const request = createPendingHistoryPrepend(
     currentState,
     nextHistoryPrependGeneration,
+    document,
   );
   if (!request) return null;
   nextHistoryPrependGeneration += 1;
@@ -354,125 +731,39 @@ function jumpToHistoryAnchor(anchorId: string): void {
   if (alreadyAtTarget) scheduleInactiveThreadViewportSync();
 }
 
-function recoverCommandConflict(error: unknown): boolean {
+function recoverCommandConflict(
+  error: unknown,
+  draftSnapshot: DraftMutationSnapshot | null = null,
+): boolean {
   const state = commandConflictState(error);
   if (!state) return false;
-  acceptState(state, true, "command_conflict");
+  acceptState(state, true, "command_conflict", true, draftSnapshot);
   return true;
 }
 
-function render(state: DesktopWebState): void {
-  acceptState(state, true);
-}
-
+/**
+ * Accepts one ordered Rust projection. Visual changes are detected from the
+ * reconciled DesktopRenderModel; `forceRender` only requests imperative
+ * render-phase work for an otherwise identical model.
+ */
 function acceptState(
   state: DesktopWebState,
-  shouldRender: boolean,
+  forceRender: boolean,
   mutationName: string | null = null,
   scheduleNavigation = false,
   draftSnapshot: DraftMutationSnapshot | null = null,
+  refreshPromptFocusContinuation: RefreshPromptFocusContinuation | null = null,
 ): void {
-  const stateChangeRequiresRender = currentState !== null && requiresRenderForStateChange(currentState, state);
   const update: StateUpdate = {
     state,
-    render: shouldRender || stateChangeRequiresRender,
+    forceRender,
     mutationName,
     scheduleNavigation,
     sequence: nextStateSequence++,
     draftSnapshot,
+    refreshPromptFocusContinuation,
   };
   applyStateUpdate(update);
-}
-
-function requiresRenderForStateChange(previous: DesktopWebState, state: DesktopWebState): boolean {
-  if (
-    previous.provider_label !== state.provider_label ||
-    previous.model_label !== state.model_label ||
-    previous.access_label !== state.access_label ||
-    previous.current_session_label !== state.current_session_label ||
-    previous.selected_session_title !== state.selected_session_title ||
-    previous.status_message !== state.status_message ||
-    previous.status_detail !== state.status_detail ||
-    previous.run_status_text !== state.run_status_text ||
-    previous.run_phase !== state.run_phase ||
-    previous.run_active_step !== state.run_active_step ||
-    previous.latest_tool_summary !== state.latest_tool_summary ||
-    JSON.stringify(previous.plan) !== JSON.stringify(state.plan) ||
-    previous.progress_text !== state.progress_text ||
-    previous.tool_status_text !== state.tool_status_text ||
-    previous.token_meter_label !== state.token_meter_label ||
-    previous.confirmation_visible !== state.confirmation_visible ||
-    previous.confirmation_id !== state.confirmation_id ||
-    previous.confirmation?.agent_path !== state.confirmation?.agent_path ||
-    previous.confirmation?.agent_task_name !== state.confirmation?.agent_task_name ||
-    previous.composer_commit_generation !== state.composer_commit_generation ||
-    previous.agent_tree_active !== state.agent_tree_active ||
-    previous.async_polling_required !== state.async_polling_required ||
-    previous.provider_loading !== state.provider_loading ||
-    previous.navigation_loading !== state.navigation_loading ||
-    previous.busy !== state.busy ||
-    previous.post_run_refresh_pending !== state.post_run_refresh_pending ||
-    previous.background_mutation_pending !== state.background_mutation_pending ||
-    previous.overlay !== state.overlay ||
-    previous.startup.status !== state.startup.status ||
-    previous.run_status_key !== state.run_status_key ||
-    previous.can_submit !== state.can_submit ||
-    previous.selected_project_index !== state.selected_project_index ||
-    previous.selected_session_index !== state.selected_session_index ||
-    previous.selected_artifact_index !== state.selected_artifact_index ||
-    previous.thread_empty !== state.thread_empty ||
-    previous.turn_page_offset !== state.turn_page_offset ||
-    previous.turn_page_total !== state.turn_page_total ||
-    previous.turn_page_has_more !== state.turn_page_has_more ||
-    previous.transcript_rows.length !== state.transcript_rows.length ||
-    JSON.stringify(previous.pending_turn_inputs) !== JSON.stringify(state.pending_turn_inputs) ||
-    previous.artifact_preview_available !== state.artifact_preview_available ||
-    previous.artifact_preview_text !== state.artifact_preview_text ||
-    previous.provider_metadata_mode !== state.provider_metadata_mode ||
-    previous.provider_selected_index !== state.provider_selected_index ||
-    previous.provider_status?.kind !== state.provider_status?.kind ||
-    previous.provider_status?.title !== state.provider_status?.title ||
-    previous.provider_status?.hint !== state.provider_status?.hint ||
-    previous.provider_status?.details !== state.provider_status?.details ||
-    previous.provider_selected_model_summary.join("\u0000") !== state.provider_selected_model_summary.join("\u0000") ||
-    previous.provider_model_ids.join("\u0000") !== state.provider_model_ids.join("\u0000") ||
-    previous.provider_apply_enabled !== state.provider_apply_enabled ||
-    JSON.stringify(previous.config_draft_capabilities) !== JSON.stringify(state.config_draft_capabilities) ||
-    previous.config_target.workspacePath !== state.config_target.workspacePath ||
-    previous.config_target.sessionId !== state.config_target.sessionId ||
-    previous.config_target.configGeneration !== state.config_target.configGeneration ||
-    previous.review_status_text !== state.review_status_text ||
-    previous.send_enhanced_enabled !== state.send_enhanced_enabled ||
-    previous.send_raw_enabled !== state.send_raw_enabled ||
-    previous.history_export_enabled !== state.history_export_enabled ||
-    previous.enhance_enabled !== state.enhance_enabled ||
-    previous.image_input_enabled !== state.image_input_enabled
-  ) {
-    return true;
-  }
-  return (
-    keyedRowsChanged(previous.project_rows, state.project_rows, (row) => `${row.project_id}:${row.path}:${row.label}`) ||
-    keyedRowsChanged(
-      previous.session_rows,
-      state.session_rows,
-      (row) => `${row.session_id}:${row.label}:${row.status}:${row.loaded_status}:${row.archived}:${row.pending_permission_requests}:${row.pending_user_input_requests}`,
-    ) ||
-    keyedRowsChanged(
-      previous.chat_session_rows,
-      state.chat_session_rows,
-      (row) => `${row.session_id}:${row.label}:${row.status}:${row.loaded_status}:${row.archived}:${row.pending_permission_requests}:${row.pending_user_input_requests}`,
-    ) ||
-    keyedRowsChanged(previous.artifact_rows, state.artifact_rows, (row) => `${row.path}:${row.action}:${row.label}`) ||
-    keyedRowsChanged(previous.file_change_rows, state.file_change_rows, (row) => `${row.path}:${row.action}:${row.summary}`) ||
-    agentActivityRowsChanged(previous.agent_activity_rows ?? [], state.agent_activity_rows ?? []) ||
-    keyedRowsChanged(previous.provider_models, state.provider_models, (model) => model) ||
-    keyedRowsChanged(previous.config_fields, state.config_fields, (field) => `${field.key}:${field.value}:${field.env_override ?? ""}`) ||
-    keyedRowsChanged(previous.attached_images, state.attached_images, (imagePath) => imagePath)
-  );
-}
-
-function keyedRowsChanged<T>(previous: T[], state: T[], key: (value: T) => string): boolean {
-  return previous.length !== state.length || previous.some((value, index) => key(value) !== key(state[index]));
 }
 
 function deferredStateUpdateStillAccepted(update: StateUpdate): boolean {
@@ -494,31 +785,96 @@ function applyStateUpdate(update: StateUpdate): void {
   ) {
     return;
   }
-  if (interactionLifecycle.defer({ ...update, render: true }, update.state === currentState, update.render)) return;
+  if (
+    interactionLifecycle.defer(
+      { ...update, forceRender: true },
+      update.state === currentState,
+      update.forceRender,
+    )
+  ) return;
   const previousProjection = currentState;
   reconcileUiDrafts(uiState, previousProjection, update.state, update.draftSnapshot);
   reconcileAgentPaneState(uiState, update.state);
+  const viewState = projectViewState(update.state, uiState);
+  const attachmentFocusDecision = reconcileUiLocalState(
+    lastRenderedState,
+    viewState,
+    update.mutationName,
+  );
+  const renderModel = buildDesktopRenderModel(viewState);
   currentState = update.state;
   lastAppliedStateSequence = update.sequence;
   lastAppliedProjectionRevision = appliedProjectionRevision(
     lastAppliedProjectionRevision,
     update.state.projection_revision,
   );
-  if (update.render) {
-    renderCommitted(projectViewState(update.state, uiState), update.mutationName);
+  if (desktopRenderRequired(lastRenderedModel, renderModel, update.forceRender)) {
+    renderCommitted(
+      renderModel,
+      update.mutationName,
+      update.refreshPromptFocusContinuation,
+      attachmentFocusDecision,
+    );
   }
   if (update.scheduleNavigation) {
     scheduleNavigationRefresh(update.state);
   }
 }
 
-function renderCommitted(state: DesktopViewState, mutationName: string | null): void {
+function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
+  const sideChatDraft = sideChatDraftForState(uiState, state);
+  const sideChatOwner = sideChatOwnerSessionId(state);
+  const sideChatDeleteConfirmation = sideChatDeleteConfirmationStillTargets(
+    uiState.sideChatDeleteConfirmation,
+    state,
+  ) ? uiState.sideChatDeleteConfirmation : null;
+  return createDesktopRenderModel(state, {
+    artifactPane: {
+      collapsed: uiState.artifactPaneCollapsed,
+      mode: uiState.artifactPaneMode,
+      selectedAgentPath: uiState.selectedAgentPath,
+      selectedAgentExecution: selectedAgentExecution(uiState, state),
+    },
+    attachmentTrayOpen: uiState.attachmentTrayOpen,
+    configMutationPending: configMutationPending(uiState),
+    sideChat: {
+      draft: sideChatDraft?.text ?? "",
+      setupBaseUrl: sideChatDraft?.setupBaseUrl ?? "",
+      setupModel: sideChatDraft?.setupModel ?? "",
+      catalog: sideChatCatalogViewForState(uiState, state),
+      catalogLoadEnabled: sideChatCatalogLoadOpen(uiState, state),
+      mutationPending: sideChatMutationPending(uiState, sideChatOwner),
+      operationsOpen: sideChatOperationsOpen(uiState),
+      deleteConfirmation: sideChatDeleteConfirmation,
+    },
+    modal: {
+      localConfirmation: uiState.pendingLocalConfirmation,
+      localDecisionPending: uiState.localConfirmationDecisionPending,
+      localDecisionError: uiState.localConfirmationDecisionError,
+      permissionDecision: uiState.permissionDecision,
+    },
+    recoverableError: uiState.recoverableError,
+    windowMaximized: uiState.windowMaximized,
+  });
+}
+
+function renderCommitted(
+  model: DesktopRenderModel,
+  mutationName: string | null,
+  refreshPromptFocusContinuation: RefreshPromptFocusContinuation | null,
+  attachmentFocusDecision: AttachmentFocusDecision,
+): void {
+  const state = model.view;
   const revealGeneration = ++threadEndRevealGeneration;
-  const elapsedSplashMs = performance.now() - splashStartedAt;
+  const postRenderFocusIntents: PostRenderFocusIntent[] = [];
+  const postRenderFocusResultHandlers: Array<(result: FocusArbiterResult) => void> = [];
+  const renderNowMs = performance.now();
+  const elapsedSplashMs = renderNowMs - splashStartedAt;
   if (!splashDismissed && shouldShowSplash(elapsedSplashMs)) {
     appRoot.innerHTML = renderStartupSplash(state, elapsedSplashMs, SPLASH_MIN_VISIBLE_MS);
     scheduleSplashReveal(elapsedSplashMs);
     lastRenderedState = state;
+    lastRenderedModel = model;
     lastRenderedAgentExecutionOwner = null;
     return;
   }
@@ -529,35 +885,212 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
       splashTimer = null;
     }
   }
+  uiState.taskActivityAnimationEpoch = reconcileTaskActivityAnimationEpoch(
+    uiState.taskActivityAnimationEpoch,
+    {
+      activityState: state.task_activity_state,
+      workspacePath: state.run_target.workspacePath,
+      sessionId: state.run_target.sessionId,
+      runtimeOwnerToken: state.run_target.runtimeOwnerToken,
+      runStartMutationPending: uiState.runStartMutationPending,
+      nowMs: renderNowMs,
+    },
+  );
+  const taskActivityDelay = taskActivityAnimationDelay(
+    uiState.taskActivityAnimationEpoch,
+    renderNowMs,
+  );
   const previous = lastRenderedState;
-  reconcileUiLocalState(previous, state, mutationName);
+  const runFocusDecision = reconcileMainRunFocusContinuation(
+    uiState.mainRunFocusContinuation,
+    previous,
+    state,
+    mainRunFocusSurface(document),
+  );
+  uiState.mainRunFocusContinuation = runFocusDecision.continuation;
   const nextAgentExecutionOwner = agentExecutionSnapshotOwnerIdentity(
     state,
     uiState.selectedAgentPath,
   );
-  const localConfirmationPending = uiState.pendingLocalConfirmation !== null;
-  const backgroundInert = modalIsOpen(state, localConfirmationPending);
-  const localConfirmationOpening = !lastRenderedLocalConfirmationPending && localConfirmationPending;
-  const localConfirmationClosing = lastRenderedLocalConfirmationPending && !localConfirmationPending;
-  const modalOpening = (previous !== null && isModalOpening(previous, state)) || localConfirmationOpening;
-  const modalClosing = (previous !== null && isModalClosing(previous, state)) || localConfirmationClosing;
+  const selectedExecution = model.local.artifactPane.selectedAgentExecution;
+  const agentExecutionPrependDecision = reconcileAgentExecutionPrependContinuation(
+    uiState.agentExecutionPrependContinuation,
+    state,
+    uiState.selectedAgentPath,
+    selectedExecution,
+  );
+  uiState.agentExecutionPrependContinuation = agentExecutionPrependDecision.continuation;
+  const localConfirmationPending = model.local.modal.localConfirmation !== null;
+  const sideChatDeleteTarget = model.local.sideChat.deleteConfirmation;
+  const renderedLocalModalIdentity = localModalIdentity(localConfirmationPending, sideChatDeleteTarget);
+  const localModalPending = renderedLocalModalIdentity !== null;
+  const quickChatDeleteFocusDecision = reconcileQuickChatDeleteFocusContinuation(
+    uiState.quickChatDeleteFocusContinuation,
+    state,
+    localModalPending,
+  );
+  uiState.quickChatDeleteFocusContinuation = quickChatDeleteFocusDecision.continuation;
+  const sideChatOwner = sideChatOwnerSessionId(state);
+  const sideChatFocusDecision = reconcileSideChatFocusContinuation(
+    uiState.sideChatFocusContinuation,
+    previous,
+    state,
+    sideChatFocusSurface(document),
+    {
+      paneVisible: uiState.artifactPaneMode === "side_chat" && !uiState.artifactPaneCollapsed,
+      localModalOpen: localModalPending,
+      mutation: sideChatOwner === null
+        ? null
+        : (uiState.sideChatMutations.get(sideChatOwner) ?? null),
+    },
+  );
+  uiState.sideChatFocusContinuation = sideChatFocusDecision.continuation;
+  const backgroundInert = modalIsOpen(state, localModalPending);
+  const localModalOpening = lastRenderedLocalModalIdentity === null && renderedLocalModalIdentity !== null;
+  const localModalClosing = lastRenderedLocalModalIdentity !== null && renderedLocalModalIdentity === null;
+  const modalOpening = (previous !== null && isModalOpening(previous, state)) || localModalOpening;
+  const modalClosing = (previous !== null && isModalClosing(previous, state)) || localModalClosing;
+  const titlebarMenuClosing = Boolean(
+    previous
+    && titlebarMenuFromOverlay(previous.overlay)
+    && state.overlay === "none"
+    && !state.confirmation_visible
+    && !localModalPending,
+  );
+  const titlebarMenuFocusAction = titlebarMenuClosing
+    && previous
+    && uiState.titlebarMenuFocusContinuation?.overlay === previous.overlay
+      ? uiState.titlebarMenuFocusContinuation.action
+      : null;
+  const previousSettingsOwner = settingsSurfaceIdentity(previous);
+  const nextSettingsOwner = settingsSurfaceIdentity(state);
   if (modalOpening) {
-    modalScrollReturnStack.push(captureSelectorScrollSnapshots(MODAL_SCROLL_SELECTORS));
-    modalDetailsReturnStack.push(captureCurrentDetailSnapshots(lastRenderedAgentExecutionOwner));
-    modalFocusReturnStack.push(captureCurrentFocusSnapshot());
+    modalScrollReturnStack.push(captureSelectorScrollSnapshots(
+      MODAL_SCROLL_SELECTORS,
+      lastRenderedAgentExecutionOwner,
+      previousSettingsOwner,
+    ));
+    modalDetailsReturnStack.push(captureCurrentDetailSnapshots(
+      lastRenderedAgentExecutionOwner,
+      previousSettingsOwner,
+    ));
+    modalFocusReturnStack.push(captureModalReturnFocusSnapshot(previous, previousSettingsOwner));
   }
-  const focusSnapshot = modalClosing
+  const activeElement = document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null;
+  const selectedProjectId = state.project_rows[state.selected_project_index]?.project_id ?? null;
+  const newSessionFocusAtRenderStart = pendingNewSessionInitiatingFocus;
+  const newSessionPromptAtRenderStart = pendingNewSessionPromptFocus;
+  const newSessionFocusDecision = reconcileNewSessionFocusContinuation(
+    newSessionFocusAtRenderStart,
+    {
+      mutationName,
+      currentActiveElement: activeElement,
+      currentFocusUnclaimed: activeElement === null
+        || activeElement === document.body
+        || activeElement === document.documentElement,
+      currentInteractionGeneration: composerFocusInteractionGeneration,
+      selectedProjectId,
+      selectedSessionIndex: state.selected_session_index,
+      currentOwner: composerOwner(state),
+      currentSessionId: state.draft_target.sessionId,
+      navigationLoading: state.navigation_loading,
+    },
+  );
+  pendingNewSessionInitiatingFocus = newSessionFocusDecision.continuation;
+  if (newSessionFocusDecision.settled) {
+    pendingNewSessionPromptFocus = newSessionFocusDecision.settled;
+    uiState.focusPromptAfterRender = true;
+  } else if (mutationName !== null && !mutationStartsNewSession(mutationName)) {
+    pendingNewSessionPromptFocus = null;
+  }
+  const newSessionFocusRejected = newSessionFocusDecision.rejected
+    || (mutationName !== null
+      && mutationStartsNewSession(mutationName)
+      && newSessionFocusAtRenderStart === null
+      && newSessionPromptAtRenderStart === null);
+  const independentComposerFocusRequested = sessionSelectionRequestsComposerFocus(mutationName);
+  if (newSessionFocusRejected && !independentComposerFocusRequested) {
+    pendingNewSessionPromptFocus = null;
+    uiState.focusPromptAfterRender = false;
+  }
+  if (
+    pendingNewSessionPromptFocus
+    && !settledNewSessionFocusContinuationIsCurrent(
+      pendingNewSessionPromptFocus,
+      composerFocusInteractionGeneration,
+      selectedProjectId,
+      state.selected_session_index,
+      composerOwner(state),
+      state.draft_target.sessionId,
+    )
+  ) {
+    pendingNewSessionPromptFocus = null;
+    if (!independentComposerFocusRequested) {
+      uiState.focusPromptAfterRender = false;
+    }
+  }
+  const initiatingTriggerYieldsPromptFocus = newSessionFocusDecision.yieldsInitiatingFocus
+    || newSessionFocusDecision.settled !== null
+    || newSessionFocusDecision.continuation !== null
+    || pendingNewSessionPromptFocus !== null;
+  const modalReturnFocusSnapshot = modalClosing
     ? (modalFocusReturnStack.pop() ?? null)
-    : modalOpening
-      ? null
-      : captureFocusSnapshot(previous, state);
+    : null;
+  const focusSnapshot = initiatingTriggerYieldsPromptFocus
+    ? null
+    : modalClosing
+      ? modalReturnFocusSnapshot
+      : modalOpening
+        ? null
+        : captureFocusSnapshot(previous, state);
+  if (
+    previous
+    && titlebarMenuFromOverlay(previous.overlay)
+    && previous.overlay !== state.overlay
+  ) {
+    uiState.titlebarMenuFocusContinuation = null;
+  }
   const scrollSnapshots = captureScrollSnapshots(previous, state, lastRenderedAgentExecutionOwner);
   if (modalClosing) scrollSnapshots.push(...(modalScrollReturnStack.pop() ?? []));
   const detailSnapshots = captureDetailSnapshots(previous, state, lastRenderedAgentExecutionOwner);
   if (modalClosing) detailSnapshots.push(...(modalDetailsReturnStack.pop() ?? []));
   const previousThread = document.querySelector<HTMLElement>("#thread");
+  const previousPrompt = document.querySelector<HTMLTextAreaElement>("#prompt");
   const previousThreadScrollTop = previousThread?.scrollTop ?? 0;
   const previousThreadWasNearEnd = previousThread ? isThreadNearEnd(previousThread) : true;
+  const previousSessionInteractionOwner = previous ? composerSessionOwner(previous) : null;
+  const nextSessionInteractionOwner = composerSessionOwner(state);
+  const restorePromptFocusAfterRefresh = refreshPromptFocusContinuationAccepted(
+    refreshPromptFocusContinuation,
+    uiState.refreshPromptFocusInteractionGeneration,
+    mutationName,
+    composerOwner(state),
+    document.activeElement instanceof Element
+      && document.activeElement.closest('[data-action="refresh"]') !== null,
+  );
+  if (previousSessionInteractionOwner && previousThread && previousPrompt) {
+    uiState.sessionInteractionSnapshots.set(
+      previousSessionInteractionOwner,
+      captureSessionInteractionSnapshot(previousThread, previousPrompt),
+    );
+  }
+  const sessionInteractionOwnerChanged = previousSessionInteractionOwner !== null
+    && previousSessionInteractionOwner !== nextSessionInteractionOwner;
+  const rememberedSessionInteraction = sessionInteractionOwnerChanged
+    && state.draft_target.sessionId !== null
+    ? (uiState.sessionInteractionSnapshots.get(nextSessionInteractionOwner) ?? null)
+    : null;
+  const promptSessionInteraction = sessionPromptInteractionForRender(
+    uiState.sessionInteractionSnapshots,
+    {
+      owner: nextSessionInteractionOwner,
+      ownerChanged: sessionInteractionOwnerChanged,
+      durableSession: state.draft_target.sessionId !== null,
+      focusPending: uiState.focusPromptAfterRender,
+    },
+  );
   const nextSessionKey = state.session_rows[state.selected_session_index]?.session_id ?? state.selected_session_title;
   const previousTranscriptCount = previous?.transcript_rows.length ?? 0;
   const previousPendingInputCount = previous?.pending_turn_inputs.length ?? 0;
@@ -579,7 +1112,16 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
   const selectedAgentNeedsRefresh = previous !== null
     && uiState.artifactPaneMode === "agents"
     && selectedAgentActivityChanged(previousAgentRows, agentRows, uiState.selectedAgentPath);
-  const runCompleted = Boolean(previous?.busy && !state.busy) || isTerminalRunStatus(state.run_status_key);
+  const runCompleted = previous !== null && runCompletionEdge(
+    {
+      busy: previous.busy,
+      terminal: isTerminalRunStatus(previous.run_status_key),
+    },
+    {
+      busy: state.busy,
+      terminal: isTerminalRunStatus(state.run_status_key),
+    },
+  );
   const tailFollowDecision = threadTailFollow.reconcile({
     workspacePath: state.run_target.workspacePath,
     sessionId: state.run_target.sessionId,
@@ -588,7 +1130,7 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
     terminal: isTerminalRunStatus(state.run_status_key),
   });
   const shouldRevealEnd = shouldRevealThreadEnd({
-    sessionChanged,
+    sessionChanged: sessionChanged && rememberedSessionInteraction === null,
     runStartRequested: tailFollowDecision.follow,
     previouslyNearEnd: previousThreadWasNearEnd,
     updateWantsEnd: state.busy
@@ -597,72 +1139,80 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
       || agentActivityAdvanced
       || runCompleted,
   });
-  const previousOutputCount = (previous?.artifact_rows.length ?? 0) + (previous?.file_change_rows.length ?? 0) + previousAgentRows.length;
-  const outputCount = state.artifact_rows.length + state.file_change_rows.length + agentRows.length;
-  if (previous && outputCount > 0 && previousOutputCount === 0 && uiState.artifactPaneCollapsed) {
-    uiState.artifactPaneCollapsed = false;
-    window.localStorage.setItem("moyai.artifactPaneCollapsed", "false");
-  }
-  setRenderContext({
-    artifactPaneCollapsed: uiState.artifactPaneCollapsed,
-    artifactPaneMode: uiState.artifactPaneMode,
-    selectedAgentPath: uiState.selectedAgentPath,
-    selectedAgentExecution: selectedAgentExecution(uiState, state),
-    attachmentTrayOpen: uiState.attachmentTrayOpen,
-    configDirty: configDraftAppliesTo(uiState, state.config_target),
-    configMutationPending: configMutationPending(uiState),
-    configOwnerMutationOpen: state.config_draft.external_owner_mutation_open,
-    configDraftEditOpen: state.config_draft.edit_enabled,
-    configDraftDiscardOpen: state.config_draft.discard_enabled,
-    configDraftCommitOpen: state.config_draft.commit_enabled,
-  });
+  const preserveConnectedSettings = !localModalPending && sameSettingsSurface(previous, state);
+  const currentSettingsModal = preserveConnectedSettings
+    ? document.querySelector<HTMLElement>(".settings-modal")
+    : null;
+  const currentFrame = preserveConnectedSettings
+    ? appRoot.querySelector<HTMLElement>(".app-frame")
+    : null;
   const preservedTitlebar = document.querySelector<HTMLElement>(".app-titlebar");
-  preservedTitlebar?.remove();
-  appRoot.innerHTML = `
-    <div class="app-frame ${uiState.artifactPaneCollapsed ? "artifact-collapsed" : ""}" style="--window-opacity: ${state.window_opacity_percent / 100}">
-      ${renderTitlebar(uiState.windowMaximized, backgroundInert)}
-      <div class="shell" ${backgroundInert ? 'inert aria-hidden="true"' : ""}>
-        ${renderSidebar(state)}
-        <main class="conversation">
-          ${renderTopbar(state)}
-          ${renderRunStatusStrip(state)}
-          <section class="thread" id="thread">
-            ${renderThreadContent(state)}
-          </section>
-          ${renderComposer(state)}
-        </main>
-        ${renderArtifactPane(state)}
-      </div>
-    </div>
-    ${
-      !state.confirmation_visible && uiState.pendingLocalConfirmation
-        ? renderLocalConfirmation(
-            uiState.pendingLocalConfirmation,
-            uiState.localConfirmationDecisionPending,
-            uiState.localConfirmationDecisionError,
-          )
-        : ""
-    }
-    ${state.confirmation_visible ? renderConfirmation(state, uiState.permissionDecision) : ""}
-    ${!state.confirmation_visible && !localConfirmationPending && state.overlay !== "none" ? renderOverlay(state) : ""}
-    ${backgroundInert ? "" : renderRecoverableError()}
-  `;
-  const nextTitlebar = document.querySelector<HTMLElement>(".app-titlebar");
-  if (preservedTitlebar && nextTitlebar) {
-    nextTitlebar.replaceWith(preservedTitlebar);
-    const applicationCommands = preservedTitlebar.querySelector<HTMLElement>(".titlebar-menu");
-    applicationCommands?.toggleAttribute("inert", backgroundInert);
-    if (backgroundInert) {
-      applicationCommands?.setAttribute("aria-hidden", "true");
-    } else {
-      applicationCommands?.removeAttribute("aria-hidden");
+  const renderedMarkup = renderDesktopMarkup(model, {
+    backgroundInert,
+    taskActivityDelay,
+  });
+  let retainedConnectedSettings = false;
+  let retainedConnectedPrompt = false;
+  if (currentSettingsModal && currentFrame) {
+    const template = document.createElement("template");
+    template.innerHTML = renderedMarkup;
+    const nextFrame = template.content.querySelector<HTMLElement>(".app-frame");
+    const nextSettingsModal = template.content.querySelector<HTMLElement>(".settings-modal");
+    if (nextFrame && nextSettingsModal) {
+      retainedConnectedPrompt = retainConnectedMainPrompt(
+        previousPrompt,
+        nextFrame.querySelector<HTMLTextAreaElement>("#prompt"),
+        previousSessionInteractionOwner,
+        nextSessionInteractionOwner,
+      );
+      const nextTitlebar = nextFrame.querySelector<HTMLElement>(".app-titlebar");
+      if (preservedTitlebar && nextTitlebar) nextTitlebar.replaceWith(preservedTitlebar);
+      currentFrame.replaceWith(nextFrame);
+      const currentStatus = currentSettingsModal.querySelector<HTMLElement>(".settings-status-stack");
+      const nextStatus = nextSettingsModal.querySelector<HTMLElement>(".settings-status-stack");
+      if (currentStatus && nextStatus && !currentStatus.contains(document.activeElement)) {
+        currentStatus.replaceWith(nextStatus);
+      }
+      retainedConnectedSettings = true;
     }
   }
-  if (prependViewportAnchor) restoreDetailSnapshots(detailSnapshots, nextAgentExecutionOwner);
+  if (!retainedConnectedSettings) {
+    preservedTitlebar?.remove();
+    if (
+      previousPrompt?.isConnected
+      && previousSessionInteractionOwner === nextSessionInteractionOwner
+    ) {
+      const template = document.createElement("template");
+      template.innerHTML = renderedMarkup;
+      retainedConnectedPrompt = retainConnectedMainPrompt(
+        previousPrompt,
+        template.content.querySelector<HTMLTextAreaElement>("#prompt"),
+        previousSessionInteractionOwner,
+        nextSessionInteractionOwner,
+      );
+      appRoot.replaceChildren(template.content);
+    } else {
+      appRoot.innerHTML = renderedMarkup;
+    }
+    const nextTitlebar = document.querySelector<HTMLElement>(".app-titlebar");
+    if (preservedTitlebar && nextTitlebar) nextTitlebar.replaceWith(preservedTitlebar);
+  }
+  if (preservedTitlebar?.isConnected) {
+    synchronizeTitlebarMenuState(preservedTitlebar, state.overlay, backgroundInert);
+  }
+  if (prependViewportAnchor) {
+    restoreDetailSnapshots(detailSnapshots, nextAgentExecutionOwner, nextSettingsOwner);
+  }
   const thread = document.querySelector<HTMLElement>("#thread");
+  let sessionThreadInteractionAfterLayout: SessionInteractionSnapshot | null = null;
   let pinnedToEnd = false;
   if (thread && prependViewportAnchor && restoreViewportAnchor(thread, prependViewportAnchor)) {
     // Preserve the visible message while an older bounded history chunk is prepended.
+  } else if (thread && rememberedSessionInteraction) {
+    // wireEvents autosizes the composer and changes the thread's available scroll range. Defer
+    // this session-owned viewport until that final geometry exists, or a short Quick Chat thread
+    // can clamp the offset against the default composer reserve and persist it on the next poll.
+    sessionThreadInteractionAfterLayout = rememberedSessionInteraction;
   } else if (thread && shouldRevealEnd) {
     revealThreadEnd(revealGeneration);
     pinnedToEnd = true;
@@ -670,13 +1220,232 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
     restoreThreadPosition(thread, previousThreadScrollTop);
   }
   previousSessionKey = nextSessionKey;
-  lastRenderedLocalConfirmationPending = localConfirmationPending;
+  lastRenderedLocalModalIdentity = renderedLocalModalIdentity;
   lastRenderedState = state;
+  lastRenderedModel = model;
   lastRenderedAgentExecutionOwner = nextAgentExecutionOwner;
-  restoreScrollSnapshots(scrollSnapshots, nextAgentExecutionOwner);
-  if (!prependViewportAnchor) restoreDetailSnapshots(detailSnapshots, nextAgentExecutionOwner);
-  restoreFocusSnapshot(focusSnapshot);
+  if (!prependViewportAnchor) {
+    restoreDetailSnapshots(detailSnapshots, nextAgentExecutionOwner, nextSettingsOwner);
+  }
+  restoreScrollSnapshots(scrollSnapshots, nextAgentExecutionOwner, nextSettingsOwner);
+  if (
+    agentExecutionPrependDecision.restoreViewport
+    && agentExecutionPrependOwnerMatches(
+      agentExecutionPrependDecision.restoreViewport,
+      state,
+      uiState.selectedAgentPath,
+      selectedExecution,
+    )
+  ) {
+    restoreAgentExecutionPrependViewport(
+      document,
+      agentExecutionPrependDecision.restoreViewport,
+    );
+  }
+  const sessionInteractionOwnsPromptSelection = state.draft_target.sessionId !== null
+    || sessionInteractionOwnerChanged;
+  const focusSnapshotIntent = createFocusSnapshotIntent(
+    focusSnapshot,
+    nextSettingsOwner,
+    sessionInteractionOwnsPromptSelection,
+    modalClosing ? "modal-return" : "focus-snapshot",
+  );
+  const focusSnapshotReserved = focusSnapshotIntent !== null;
+  if (focusSnapshotIntent) postRenderFocusIntents.push(focusSnapshotIntent);
+  const settingsActionFocusContinuation = uiState.settingsActionFocusContinuation;
+  uiState.settingsActionFocusContinuation = null;
+  if (settingsActionFocusContinuation) {
+    postRenderFocusIntents.push({
+      source: "settings-action",
+      priority: "explicit-transfer",
+      claim: { kind: "unowned" },
+      candidates: settingsActionFocusCandidates(
+        settingsActionFocusContinuation,
+        (selector) => document.querySelector<HTMLElement>(selector),
+      ),
+      isCurrent: () => settingsActionFocusStillTargets(
+        settingsActionFocusContinuation,
+        state,
+      ),
+    });
+  }
+  const titlebarForContinuation = titlebarMenuFocusAction
+    ? document.querySelector<HTMLElement>(".app-titlebar")
+    : null;
+  const titlebarMenuFocusIntent: PostRenderFocusIntent | null =
+    !initiatingTriggerYieldsPromptFocus
+    && titlebarForContinuation
+    && titlebarMenuFocusAction
+      ? {
+          source: "titlebar-menu",
+          priority: "explicit-transfer",
+          claim: { kind: "unowned" },
+          candidates: [{
+            resolve: () => Array.from(
+              titlebarForContinuation.querySelectorAll<HTMLElement>(
+                "button[data-action]:not(:disabled):not([aria-disabled='true'])",
+              ),
+            ).find((candidate) => candidate.dataset.action === titlebarMenuFocusAction) ?? null,
+          }],
+          isCurrent: () => (
+            lastRenderedState === state
+            && state.overlay === "none"
+            && !state.confirmation_visible
+            && uiState.pendingLocalConfirmation === null
+            && uiState.sideChatDeleteConfirmation === null
+          ),
+        }
+      : null;
+  const titlebarMenuFocusReserved = titlebarMenuFocusIntent !== null;
+  if (titlebarMenuFocusIntent) postRenderFocusIntents.push(titlebarMenuFocusIntent);
   wireEvents(state, eventContext);
+  const overlayPrimaryFocusIntent = focusOverlayPrimary(state, uiState);
+  if (overlayPrimaryFocusIntent) postRenderFocusIntents.push(overlayPrimaryFocusIntent);
+  if (
+    historyPrependTransition.focusContinuation
+    && historyPrependTransition.focusPhase
+  ) {
+    const settledState = state;
+    const settledRenderGeneration = revealGeneration;
+    const continuation = historyPrependTransition.focusContinuation;
+    const phase = historyPrependTransition.focusPhase;
+    postRenderFocusIntents.push({
+      source: "history-prepend",
+      priority: "operation-return",
+      claim: { kind: "unowned" },
+      candidates: historyPrependFocusCandidates(document, continuation),
+      isCurrent: () => (
+        lastRenderedState === settledState
+        && threadEndRevealGeneration === settledRenderGeneration
+        && historyPrependFocusContinuationIsCurrent(
+          continuation,
+          settledState,
+          pendingHistoryPrepend,
+          nextHistoryPrependGeneration - 1,
+          phase,
+        )
+      ),
+    });
+  }
+  if (agentExecutionPrependDecision.restoreFocus) {
+    const settledState = state;
+    const settledRenderGeneration = revealGeneration;
+    const continuation = agentExecutionPrependDecision.restoreFocus;
+    postRenderFocusIntents.push({
+      source: "agent-execution-prepend",
+      priority: "operation-return",
+      claim: { kind: "unowned" },
+      candidates: agentExecutionPrependFocusCandidates(document, continuation),
+      isCurrent: () => {
+      const execution = selectedAgentExecution(uiState, settledState);
+      return (
+        lastRenderedState === settledState
+        && threadEndRevealGeneration === settledRenderGeneration
+        && agentExecutionPrependOwnerMatches(
+          continuation,
+          settledState,
+          uiState.selectedAgentPath,
+          execution,
+        )
+      );
+      },
+    });
+  }
+  if (thread && sessionThreadInteractionAfterLayout) {
+    restoreSessionThreadInteraction(sessionThreadInteractionAfterLayout, thread);
+  }
+  if (promptSessionInteraction) {
+    const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
+    if (prompt) restoreSessionPromptInteraction(promptSessionInteraction, prompt);
+  }
+  if (
+    restorePromptFocusAfterRefresh
+    && retainedConnectedPrompt
+    && previousPrompt
+    && refreshPromptFocusContinuation
+  ) {
+    const settledState = state;
+    const settledContinuation = refreshPromptFocusContinuation;
+    const refreshFocusOwners = Array.from(
+      document.querySelectorAll<HTMLElement>('[data-action="refresh"]'),
+    );
+    postRenderFocusIntents.push({
+      source: "refresh-prompt",
+      priority: "operation-return",
+      claim: { kind: "yield-from", owners: refreshFocusOwners },
+      candidates: [{
+        resolve: () => {
+          const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
+          return prompt === previousPrompt ? prompt : null;
+        },
+        settle: (target) => {
+          if (promptSessionInteraction && target instanceof HTMLTextAreaElement) {
+            restoreSessionPromptInteraction(promptSessionInteraction, target);
+          }
+        },
+      }],
+      isCurrent: () => (
+        lastRenderedState === settledState
+        && uiState.refreshPromptFocusInteractionGeneration === settledContinuation.interactionGeneration
+        && composerOwner(settledState) === settledContinuation.owner
+        && previousPrompt.isConnected
+        && !previousPrompt.disabled
+      ),
+    });
+  }
+  if (quickChatDeleteFocusDecision.focusTarget && !focusSnapshotReserved) {
+    const settledState = state;
+    const settledRenderGeneration = revealGeneration;
+    const continuation = quickChatDeleteFocusDecision.continuation;
+    const focusTarget = quickChatDeleteFocusDecision.focusTarget;
+    if (continuation) {
+      postRenderFocusIntents.push({
+        source: "quick-chat-delete",
+        priority: "operation-return",
+        claim: { kind: "unowned" },
+        candidates: quickChatDeleteFocusCandidates(document, focusTarget),
+        isCurrent: () => (
+        continuation
+        && uiState.quickChatDeleteFocusContinuation === continuation
+        && lastRenderedState === settledState
+        && threadEndRevealGeneration === settledRenderGeneration
+        && uiState.pendingLocalConfirmation === null
+        && uiState.sideChatDeleteConfirmation === null
+        ),
+      });
+      postRenderFocusResultHandlers.push((result) => {
+        if (
+          result.source === "quick-chat-delete"
+          && result.kind !== "unavailable"
+          && result.kind !== "stale-render"
+          && result.kind !== "stale-interaction"
+          && result.kind !== "interaction-active"
+          && result.kind !== "stale-intent"
+          && result.kind !== "superseded"
+          && uiState.quickChatDeleteFocusContinuation === continuation
+        ) {
+          uiState.quickChatDeleteFocusContinuation = null;
+        }
+      });
+    }
+  } else if (
+    quickChatDeleteFocusDecision.focusTarget
+    && focusSnapshotReserved
+    && uiState.quickChatDeleteFocusContinuation === quickChatDeleteFocusDecision.continuation
+  ) {
+    uiState.quickChatDeleteFocusContinuation = null;
+  }
+  if (attachmentFocusDecision.focusTarget) {
+    const settledState = state;
+    const focusTarget = attachmentFocusDecision.focusTarget;
+    postRenderFocusIntents.push({
+      source: "attachment",
+      priority: "operation-return",
+      claim: { kind: "unowned" },
+      candidates: attachmentFocusCandidates(document, focusTarget),
+      isCurrent: () => lastRenderedState === settledState,
+    });
+  }
   if (thread) wireThreadTailFollowEvents(thread);
   if (pinnedToEnd) {
     pinResolvedThreadToEnd(resolveCurrentThread);
@@ -688,47 +1457,163 @@ function renderCommitted(state: DesktopViewState, mutationName: string | null): 
     || historyPrependTransition.disposition === "discard") {
     scheduleInactiveThreadViewportSync();
   }
-  focusAgentPaneAfterRender();
+  const agentPaneFocusIntent = takeAgentPaneFocusIntent(state);
+  if (agentPaneFocusIntent) postRenderFocusIntents.push(agentPaneFocusIntent);
+  const artifactPaneFocusIntent = takeArtifactPaneFocusIntent(state);
+  if (artifactPaneFocusIntent) postRenderFocusIntents.push(artifactPaneFocusIntent);
+  if (runFocusDecision.focusPrompt && !focusSnapshotReserved) {
+    const settledState = state;
+    postRenderFocusIntents.push({
+      source: "main-run",
+      priority: "operation-return",
+      claim: { kind: "unowned" },
+      candidates: [{
+        resolve: () => document.querySelector<HTMLTextAreaElement>("#prompt"),
+      }],
+      isCurrent: () => lastRenderedState === settledState,
+    });
+  }
+  if (sideChatFocusDecision.focusTarget && !focusSnapshotReserved) {
+    const settledState = state;
+    const settledRenderGeneration = revealGeneration;
+    const settledInteractionGeneration = uiState.sideChatFocusInteractionGeneration;
+    const focusTarget = sideChatFocusDecision.focusTarget;
+    postRenderFocusIntents.push({
+      source: "side-chat",
+      priority: "operation-return",
+      claim: { kind: "unowned" },
+      candidates: [{
+        resolve: () => document.querySelector<HTMLTextAreaElement>("#side-chat-prompt"),
+      }],
+      isCurrent: () => (
+        lastRenderedState === settledState
+        && threadEndRevealGeneration === settledRenderGeneration
+        && uiState.sideChatFocusInteractionGeneration === settledInteractionGeneration
+        && uiState.artifactPaneMode === "side_chat"
+        && !uiState.artifactPaneCollapsed
+        && uiState.pendingLocalConfirmation === null
+        && uiState.sideChatDeleteConfirmation === null
+        && sideChatFocusTargetStillMatches(focusTarget, settledState)
+      ),
+    });
+  }
   if (
-    modalClosing &&
-    !focusSnapshot &&
+    (modalClosing || (titlebarMenuFocusAction !== null && !titlebarMenuFocusReserved)) &&
+    !initiatingTriggerYieldsPromptFocus &&
+    !newSessionFocusRejected &&
+    !focusSnapshotReserved &&
+    !quickChatDeleteFocusDecision.ownsModalCloseFallback &&
     !state.confirmation_visible &&
-    !localConfirmationPending &&
+    !localModalPending &&
     state.overlay === "none"
   ) {
-    requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>("#prompt")?.focus());
+    postRenderFocusIntents.push({
+      source: "composer-request",
+      priority: "fallback",
+      claim: { kind: "unowned" },
+      candidates: [{
+        resolve: () => document.querySelector<HTMLTextAreaElement>("#prompt"),
+      }],
+      isCurrent: () => (
+        lastRenderedState === state
+        && !state.confirmation_visible
+        && uiState.pendingLocalConfirmation === null
+        && uiState.sideChatDeleteConfirmation === null
+        && state.overlay === "none"
+      ),
+    });
   }
-  focusPromptIfRequested(state);
+  const requestedPromptFocus = focusPromptIfRequested(
+    state,
+    promptSessionInteraction,
+    pendingNewSessionPromptFocus,
+  );
+  if (requestedPromptFocus) postRenderFocusIntents.push(requestedPromptFocus);
   if (
     selectedAgentNeedsRefresh
     && uiState.selectedAgentPath
-    && uiState.activeAgentExecutionRequest === null
+    && uiState.agentExecutionTransaction.active === null
   ) {
     void loadAgentExecution(state, uiState.selectedAgentPath);
   }
+  schedulePostRenderFocus(
+    postRenderFocusIntents,
+    revealGeneration,
+    postRenderFocusResultHandlers.length > 0
+      ? (result) => postRenderFocusResultHandlers.forEach((handler) => handler(result))
+      : undefined,
+  );
 }
 
-function focusAgentPaneAfterRender(): void {
+function schedulePostRenderFocus(
+  intents: readonly PostRenderFocusIntent[],
+  renderCommit = threadEndRevealGeneration,
+  onResult?: (result: FocusArbiterResult) => void,
+): void {
+  postRenderFocusArbiter.schedule({
+    renderCommit,
+    interactionEpoch: postRenderFocusInteractionEpoch,
+    intents,
+    onResult,
+  });
+}
+
+function takeArtifactPaneFocusIntent(state: DesktopWebState): PostRenderFocusIntent | null {
+  const target = uiState.artifactPaneFocusAfterRender;
+  if (!target) return null;
+  uiState.artifactPaneFocusAfterRender = null;
+  const selector = target === "content"
+    ? '[data-focus-key="artifact-pane-content"]'
+    : '[data-focus-key="artifact-pane-toggle"]';
+  return {
+    source: "artifact-pane",
+    priority: "pane-navigation",
+    claim: { kind: "unowned" },
+    candidates: [{ resolve: () => document.querySelector<HTMLElement>(selector) }],
+    isCurrent: () => lastRenderedState === state,
+  };
+}
+
+function takeAgentPaneFocusIntent(state: DesktopWebState): PostRenderFocusIntent | null {
   if (uiState.focusSelectedAgentAfterRender && uiState.selectedAgentPath) {
     const agentPath = uiState.selectedAgentPath;
     uiState.focusSelectedAgentAfterRender = false;
-    requestAnimationFrame(() => {
-      const detail = document.querySelector<HTMLElement>(
-        `[data-focus-key="agent-execution:${CSS.escape(agentPath)}"]`,
-      );
-      detail?.focus({ preventScroll: true });
-      detail?.scrollIntoView({ block: "nearest", inline: "nearest" });
-    });
-    return;
+    return {
+      source: "agent-pane",
+      priority: "pane-navigation",
+      claim: { kind: "unowned" },
+      candidates: [{
+        resolve: () => document.querySelector<HTMLElement>(
+          `[data-focus-key="agent-execution:${CSS.escape(agentPath)}"]`,
+        ),
+        settle: (target) => {
+          if (target instanceof HTMLElement) {
+            target.scrollIntoView({ block: "nearest", inline: "nearest" });
+          }
+        },
+      }],
+      isCurrent: () => (
+        lastRenderedState === state
+        && uiState.selectedAgentPath === agentPath
+        && uiState.artifactPaneMode === "agents"
+        && !uiState.artifactPaneCollapsed
+      ),
+    };
   }
   const focusTarget = uiState.agentPaneFocusAfterRender;
-  if (!focusTarget) return;
+  if (!focusTarget) return null;
   uiState.agentPaneFocusAfterRender = null;
-  requestAnimationFrame(() => {
-    document.querySelector<HTMLElement>(
-      `[data-focus-key="${CSS.escape(focusTarget)}"]`,
-    )?.focus({ preventScroll: true });
-  });
+  return {
+    source: "agent-pane",
+    priority: "pane-navigation",
+    claim: { kind: "unowned" },
+    candidates: [{
+      resolve: () => document.querySelector<HTMLElement>(
+        `[data-focus-key="${CSS.escape(focusTarget)}"]`,
+      ),
+    }],
+    isCurrent: () => lastRenderedState === state,
+  };
 }
 
 function shouldShowSplash(elapsedMs: number): boolean {
@@ -742,12 +1627,16 @@ function scheduleSplashReveal(elapsedMs: number): void {
   splashTimer = window.setTimeout(() => {
     splashTimer = null;
     if (currentState) {
-      render(currentState);
+      acceptState(currentState, true);
     }
   }, Math.max(0, SPLASH_MIN_VISIBLE_MS - elapsedMs));
 }
 
-function reconcileUiLocalState(previous: DesktopWebState | null, state: DesktopWebState, mutationName: string | null): void {
+function reconcileUiLocalState(
+  previous: DesktopWebState | null,
+  state: DesktopWebState,
+  mutationName: string | null,
+): AttachmentFocusDecision {
   const nextSessionKey = state.session_rows[state.selected_session_index]?.session_id ?? state.selected_session_title;
   const previousSessionKey = previous?.session_rows[previous.selected_session_index]?.session_id ?? previous?.selected_session_title ?? "";
   const sessionChanged = previous !== null && nextSessionKey !== previousSessionKey;
@@ -756,7 +1645,11 @@ function reconcileUiLocalState(previous: DesktopWebState | null, state: DesktopW
   if (sessionChanged || operationInvalidatesComposer(mutationName)) {
     uiState.attachmentTrayOpen = false;
   }
-  if (mutationName === "new_chat" || mutationName === "new_project_session") {
+  if (
+    mutationName === "new_chat"
+    || mutationName === "new_project_session"
+    || sessionSelectionRequestsComposerFocus(mutationName)
+  ) {
     uiState.focusPromptAfterRender = true;
   }
   if ((mutationName === "attach_image" || mutationName === "browse_image") && state.image_input.trim().length === 0) {
@@ -765,17 +1658,47 @@ function reconcileUiLocalState(previous: DesktopWebState | null, state: DesktopW
   if ((mutationName === "clear_images" || mutationName === "remove_image") && imagesCleared) {
     uiState.attachmentTrayOpen = false;
   }
+  const attachmentFocusDecision = reconcileAttachmentFocusContinuation(
+    uiState.attachmentFocusContinuation,
+    state,
+    mutationName,
+  );
+  uiState.attachmentFocusContinuation = attachmentFocusDecision.continuation;
+  if (attachmentFocusDecision.trayOpen !== null) {
+    uiState.attachmentTrayOpen = attachmentFocusDecision.trayOpen;
+  }
   if (uiState.pendingLocalConfirmation && !localConfirmationStillTargetsRow(uiState.pendingLocalConfirmation, state)) {
     uiState.pendingLocalConfirmation = null;
     finishLocalDecision(uiState);
+  }
+  if (
+    uiState.sideChatDeleteConfirmation
+    && !sideChatDeleteConfirmationStillTargets(uiState.sideChatDeleteConfirmation, state)
+  ) {
+    uiState.sideChatDeleteConfirmation = null;
   }
   reconcilePermissionDecision(
     uiState,
     state.confirmation_visible ? state.confirmation_id : null,
   );
+  const previousOutputCount = (previous?.artifact_rows.length ?? 0)
+    + (previous?.file_change_rows.length ?? 0)
+    + (previous?.agent_activity_rows.length ?? 0);
+  const outputCount = state.artifact_rows.length
+    + state.file_change_rows.length
+    + state.agent_activity_rows.length;
+  if (previous && outputCount > 0 && previousOutputCount === 0 && uiState.artifactPaneCollapsed) {
+    uiState.artifactPaneCollapsed = false;
+    window.localStorage.setItem("moyai.artifactPaneCollapsed", "false");
+  }
+  return attachmentFocusDecision;
 }
 
-function focusPromptIfRequested(state: DesktopWebState): void {
+function focusPromptIfRequested(
+  state: DesktopWebState,
+  interactionSnapshot: SessionInteractionSnapshot | null,
+  newSessionFocusContinuation: SettledNewSessionFocusContinuation | null,
+): PostRenderFocusIntent | null {
   const shouldFocusInitialPrompt =
     !uiState.initialPromptFocusDone &&
     state.selected_session_index < 0 &&
@@ -783,16 +1706,54 @@ function focusPromptIfRequested(state: DesktopWebState): void {
     state.overlay === "none" &&
     !state.confirmation_visible;
   if (!uiState.focusPromptAfterRender && !shouldFocusInitialPrompt) {
-    return;
+    return null;
   }
-  if (state.busy || state.overlay !== "none" || state.confirmation_visible) {
-    return;
+  if (state.busy || state.navigation_loading || state.overlay !== "none" || state.confirmation_visible) {
+    return null;
   }
   uiState.initialPromptFocusDone = true;
   uiState.focusPromptAfterRender = false;
-  requestAnimationFrame(() => {
-    document.querySelector<HTMLTextAreaElement>("#prompt")?.focus();
-  });
+  pendingNewSessionPromptFocus = null;
+  const expectedOwner = composerOwner(state);
+  const expectedNewSessionInteractionGeneration = newSessionFocusContinuation?.interactionGeneration ?? null;
+  const expectedNewSessionRequestToken = newSessionFocusContinuation?.requestToken ?? null;
+  return {
+    source: newSessionFocusContinuation ? "new-session" : shouldFocusInitialPrompt
+      ? "initial-composer"
+      : "composer-request",
+    priority: newSessionFocusContinuation ? "explicit-transfer" : "fallback",
+    claim: { kind: "unowned" },
+    candidates: [{
+      resolve: () => document.querySelector<HTMLTextAreaElement>("#prompt"),
+      settle: (target) => {
+        if (!(target instanceof HTMLTextAreaElement)) return;
+        if (interactionSnapshot) {
+          restoreSessionPromptInteraction(interactionSnapshot, target);
+        }
+      },
+    }],
+    isCurrent: () => {
+    const settledState = lastRenderedState;
+    if (
+      !settledState
+      || composerOwner(settledState) !== expectedOwner
+      || settledState.busy
+      || settledState.navigation_loading
+      || settledState.overlay !== "none"
+      || settledState.confirmation_visible
+      || interactionLifecycle.active
+      || expectedNewSessionRequestToken?.rejected === true
+      || (
+        expectedNewSessionInteractionGeneration !== null
+        && composerFocusInteractionGeneration !== expectedNewSessionInteractionGeneration
+      )
+    ) {
+      return false;
+    }
+    const prompt = document.querySelector<HTMLTextAreaElement>("#prompt");
+    return Boolean(prompt && !prompt.disabled);
+    },
+  };
 }
 
 interface FocusSnapshot {
@@ -800,6 +1761,7 @@ interface FocusSnapshot {
   occurrence: number;
   selectionStart: number | null;
   selectionEnd: number | null;
+  settingsSurfaceOwner: string | null;
 }
 
 interface ScrollSnapshot {
@@ -808,32 +1770,51 @@ interface ScrollSnapshot {
   scrollLeft: number;
   scrollTop: number;
   agentExecutionOwner: string | null;
+  settingsSurfaceOwner: string | null;
 }
 
 interface DetailSnapshot {
   key: string;
   open: boolean;
-  scope: "global" | "agent-execution";
+  scope: "global" | "agent-execution" | "settings";
   agentExecutionOwner: string | null;
+  settingsSurfaceOwner: string | null;
 }
 
 const STABLE_LIST_SCROLL_SELECTORS = [
   ".project-list",
   ".chat-list",
-  ".artifact-list",
   ".sub-agent-list",
   ".agent-execution-scroll",
 ];
-const MODAL_SCROLL_SELECTORS = [".modal", ".settings-content", ".settings-nav", ".select-list"];
+const MODAL_SCROLL_SELECTORS = [
+  ".modal",
+  ".settings-content",
+  ".settings-nav",
+  ".settings-json",
+  ".settings-raw-value",
+  ".select-list",
+];
 
-function captureFocusSnapshot(previous: DesktopWebState | null, state: DesktopWebState): FocusSnapshot | null {
-  if (!previous || modalIdentity(previous) !== modalIdentity(state)) {
+function captureFocusSnapshot(previous: DesktopViewState | null, state: DesktopViewState): FocusSnapshot | null {
+  if (
+    !previous
+    || modalIdentity(previous) !== modalIdentity(state)
+    || (previous.overlay === "config" && !sameSettingsSurface(previous, state))
+  ) {
     return null;
   }
-  return captureCurrentFocusSnapshot();
+  if (
+    document.activeElement instanceof Element
+    && document.activeElement.closest(".side-chat-pane")
+    && sideChatIdentity(previous) !== sideChatIdentity(state)
+  ) {
+    return null;
+  }
+  return captureCurrentFocusSnapshot(settingsSurfaceIdentity(previous));
 }
 
-function captureCurrentFocusSnapshot(): FocusSnapshot | null {
+function captureCurrentFocusSnapshot(settingsSurfaceOwner: string | null = null): FocusSnapshot | null {
   const active = document.activeElement;
   if (!(active instanceof HTMLElement)) {
     return null;
@@ -865,40 +1846,105 @@ function captureCurrentFocusSnapshot(): FocusSnapshot | null {
     occurrence,
     selectionStart: active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement ? active.selectionStart : null,
     selectionEnd: active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement ? active.selectionEnd : null,
+    settingsSurfaceOwner: active.closest(".settings-modal") ? settingsSurfaceOwner : null,
   };
 }
 
-function restoreFocusSnapshot(snapshot: FocusSnapshot | null): void {
-  if (!snapshot) return;
-  const target = document.querySelectorAll<HTMLElement>(snapshot.selector)[snapshot.occurrence];
-  if (!target || (target instanceof HTMLButtonElement && target.disabled)) return;
-  target.focus({ preventScroll: true });
-  if (
-    (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) &&
-    snapshot.selectionStart !== null &&
-    snapshot.selectionEnd !== null
-  ) {
-    target.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd);
+function captureModalReturnFocusSnapshot(
+  previous: DesktopViewState | null,
+  settingsSurfaceOwner: string | null,
+): FocusSnapshot | null {
+  const menuTriggerAction = previous ? titlebarMenuTriggerAction(previous.overlay) : null;
+  if (menuTriggerAction) {
+    const selector = `[data-action="${menuTriggerAction}"]`;
+    const target = document.querySelector<HTMLElement>(selector);
+    if (target) {
+      return {
+        selector,
+        occurrence: Array.from(document.querySelectorAll(selector)).indexOf(target),
+        selectionStart: null,
+        selectionEnd: null,
+        settingsSurfaceOwner: null,
+      };
+    }
   }
+  return captureCurrentFocusSnapshot(settingsSurfaceOwner);
+}
+
+function createFocusSnapshotIntent(
+  snapshot: FocusSnapshot | null,
+  settingsSurfaceOwner: string | null,
+  sessionInteractionOwnsPromptSelection = false,
+  source: "modal-return" | "focus-snapshot" = "focus-snapshot",
+): PostRenderFocusIntent | null {
+  if (!snapshot) return null;
+  if (
+    snapshot.settingsSurfaceOwner !== null
+    && snapshot.settingsSurfaceOwner !== settingsSurfaceOwner
+  ) return null;
+  const resolve = (): HTMLElement | null => (
+    document.querySelectorAll<HTMLElement>(snapshot.selector)[snapshot.occurrence] ?? null
+  );
+  if (!resolve()) return null;
+  return {
+    source,
+    priority: "exact-restore",
+    claim: { kind: "unowned" },
+    candidates: [{
+      resolve,
+      settle: (candidate) => {
+        if (!(candidate instanceof HTMLElement)) return;
+        const titlebarMenu = candidate.closest<HTMLElement>(
+          ".titlebar-popover[data-titlebar-menu]",
+        );
+        if (
+          titlebarMenu
+          && titlebarMenuUsesRovingFocus(titlebarMenu.getAttribute("role"))
+          && candidate.matches("button[data-titlebar-menu-action]")
+        ) {
+          const actions = Array.from(
+            titlebarMenu.querySelectorAll<HTMLElement>(
+              "button[data-titlebar-menu-action]:not(:disabled):not([aria-disabled='true'])",
+            ),
+          );
+          const actionIndex = actions.indexOf(candidate);
+          if (actionIndex >= 0) applyTitlebarMenuRovingTabIndex(actions, actionIndex);
+        }
+        if (
+          (candidate instanceof HTMLInputElement || candidate instanceof HTMLTextAreaElement)
+          && snapshot.selectionStart !== null
+          && snapshot.selectionEnd !== null
+          && !(sessionInteractionOwnsPromptSelection && candidate.id === "prompt")
+        ) {
+          candidate.setSelectionRange(snapshot.selectionStart, snapshot.selectionEnd);
+        }
+      },
+    }],
+    isCurrent: () => (
+      snapshot.settingsSurfaceOwner === null
+      || snapshot.settingsSurfaceOwner === settingsSurfaceIdentity(lastRenderedState)
+    ),
+  };
 }
 
 function captureScrollSnapshots(
-  previous: DesktopWebState | null,
-  state: DesktopWebState,
+  previous: DesktopViewState | null,
+  state: DesktopViewState,
   agentExecutionOwner: string | null,
 ): ScrollSnapshot[] {
   const selectors = [...STABLE_LIST_SCROLL_SELECTORS];
-  if (previous && selectedSessionIdentity(previous) === selectedSessionIdentity(state)) selectors.push(".activity");
-  if (previous && selectedArtifactIdentity(previous) === selectedArtifactIdentity(state)) selectors.push(".preview");
+  if (previous && selectedSessionIdentity(previous) === selectedSessionIdentity(state)) selectors.push(".output-scroll");
+  if (previous && sideChatIdentity(previous) === sideChatIdentity(state)) selectors.push(".side-chat-scroll");
   if (previous && modalIdentity(previous) === modalIdentity(state) && modalIdentity(state) !== "none") {
     selectors.push(...MODAL_SCROLL_SELECTORS);
   }
-  return captureSelectorScrollSnapshots(selectors, agentExecutionOwner);
+  return captureSelectorScrollSnapshots(selectors, agentExecutionOwner, settingsSurfaceIdentity(previous));
 }
 
 function captureSelectorScrollSnapshots(
   selectors: string[],
   agentExecutionOwner: string | null = null,
+  settingsSurfaceOwner: string | null = null,
 ): ScrollSnapshot[] {
   const snapshots: ScrollSnapshot[] = [];
   for (const selector of selectors) {
@@ -909,6 +1955,7 @@ function captureSelectorScrollSnapshots(
         scrollLeft: node.scrollLeft,
         scrollTop: node.scrollTop,
         agentExecutionOwner: selector === ".agent-execution-scroll" ? agentExecutionOwner : null,
+        settingsSurfaceOwner: node.closest(".settings-modal") ? settingsSurfaceOwner : null,
       });
     });
   }
@@ -918,6 +1965,7 @@ function captureSelectorScrollSnapshots(
 function restoreScrollSnapshots(
   snapshots: ScrollSnapshot[],
   agentExecutionOwner: string | null,
+  settingsSurfaceOwner: string | null,
 ): void {
   for (const snapshot of snapshots) {
     if (
@@ -926,36 +1974,47 @@ function restoreScrollSnapshots(
     ) {
       continue;
     }
+    if (
+      snapshot.settingsSurfaceOwner !== null
+      && snapshot.settingsSurfaceOwner !== settingsSurfaceOwner
+    ) {
+      continue;
+    }
     const target = document.querySelectorAll<HTMLElement>(snapshot.selector)[snapshot.occurrence];
     if (!target) continue;
-    target.scrollLeft = snapshot.scrollLeft;
-    target.scrollTop = snapshot.scrollTop;
+    restoreScrollPosition(target, snapshot.scrollLeft, snapshot.scrollTop);
   }
 }
 
 function captureDetailSnapshots(
-  previous: DesktopWebState | null,
-  state: DesktopWebState,
+  previous: DesktopViewState | null,
+  state: DesktopViewState,
   agentExecutionOwner: string | null,
 ): DetailSnapshot[] {
   if (
     !previous ||
     selectedSessionIdentity(previous) !== selectedSessionIdentity(state) ||
-    modalIdentity(previous) !== modalIdentity(state)
+    modalIdentity(previous) !== modalIdentity(state) ||
+    (previous.overlay === "config" && !sameSettingsSurface(previous, state))
   ) {
     return [];
   }
-  return captureCurrentDetailSnapshots(agentExecutionOwner);
+  return captureCurrentDetailSnapshots(agentExecutionOwner, settingsSurfaceIdentity(previous));
 }
 
-function captureCurrentDetailSnapshots(agentExecutionOwner: string | null): DetailSnapshot[] {
+function captureCurrentDetailSnapshots(
+  agentExecutionOwner: string | null,
+  settingsSurfaceOwner: string | null = null,
+): DetailSnapshot[] {
   return Array.from(document.querySelectorAll<HTMLDetailsElement>("details[data-details-key]"), (detail) => {
     const inAgentExecution = detail.closest(".agent-execution") !== null;
+    const inSettings = detail.closest(".settings-modal") !== null;
     return {
       key: detail.dataset.detailsKey ?? "",
       open: detail.open,
-      scope: inAgentExecution ? "agent-execution" as const : "global" as const,
+      scope: inAgentExecution ? "agent-execution" as const : inSettings ? "settings" as const : "global" as const,
       agentExecutionOwner: inAgentExecution ? agentExecutionOwner : null,
+      settingsSurfaceOwner: inSettings ? settingsSurfaceOwner : null,
     };
   }).filter((snapshot) => snapshot.key.length > 0);
 }
@@ -963,12 +2022,19 @@ function captureCurrentDetailSnapshots(agentExecutionOwner: string | null): Deta
 function restoreDetailSnapshots(
   snapshots: DetailSnapshot[],
   agentExecutionOwner: string | null,
+  settingsSurfaceOwner: string | null,
 ): void {
   const details = Array.from(document.querySelectorAll<HTMLDetailsElement>("details[data-details-key]"));
   for (const snapshot of snapshots) {
     if (
       snapshot.scope === "agent-execution"
       && !shouldPreserveAgentExecutionSnapshots(snapshot.agentExecutionOwner, agentExecutionOwner)
+    ) {
+      continue;
+    }
+    if (
+      snapshot.scope === "settings"
+      && snapshot.settingsSurfaceOwner !== settingsSurfaceOwner
     ) {
       continue;
     }
@@ -981,31 +2047,58 @@ function selectedSessionIdentity(state: DesktopWebState): string {
   return state.session_rows[state.selected_session_index]?.session_id ?? state.selected_session_title;
 }
 
-function selectedArtifactIdentity(state: DesktopWebState): string {
-  return state.artifact_rows[state.selected_artifact_index]?.path ?? "none";
+function sideChatIdentity(state: DesktopWebState): string {
+  return `${sideChatOwnerSessionId(state) ?? ""}\u0000${state.side_chat.chat_id ?? ""}`;
 }
 
 function isModalOpening(previous: DesktopWebState, state: DesktopWebState): boolean {
   return (
     (!previous.confirmation_visible && state.confirmation_visible) ||
-    (!state.confirmation_visible && previous.overlay === "none" && state.overlay !== "none")
+    (!state.confirmation_visible
+      && !isRegularModalOverlay(previous.overlay)
+      && isRegularModalOverlay(state.overlay))
   );
 }
 
 function isModalClosing(previous: DesktopWebState, state: DesktopWebState): boolean {
   return (
     (previous.confirmation_visible && !state.confirmation_visible) ||
-    (!previous.confirmation_visible && previous.overlay !== "none" && state.overlay === "none")
+    (!previous.confirmation_visible
+      && isRegularModalOverlay(previous.overlay)
+      && !isRegularModalOverlay(state.overlay))
   );
 }
 
 function finishInteraction(release: InteractionRelease<StateUpdate> | null): void {
   if (!release) return;
   if (release.deferred && deferredStateUpdateStillAccepted(release.deferred)) {
-    applyStateUpdate({ ...release.deferred, render: release.deferred.render || release.renderCurrent });
+    applyStateUpdate({
+      ...release.deferred,
+      forceRender: release.deferred.forceRender || release.renderCurrent,
+    });
   } else if (release.renderCurrent && currentState) {
     acceptState(currentState, true);
   }
+}
+
+function installComposerFocusInteractionInvalidation(): void {
+  const invalidate = (): void => {
+    composerFocusInteractionGeneration += 1n;
+    postRenderFocusInteractionEpoch += 1n;
+    postRenderFocusArbiter.cancel();
+  };
+  document.addEventListener("pointerdown", invalidate, true);
+  document.addEventListener("keydown", (event) => {
+    if (!event.repeat) invalidate();
+  }, true);
+  document.addEventListener("compositionstart", invalidate, true);
+  document.addEventListener("input", invalidate, true);
+  document.addEventListener("wheel", invalidate, { capture: true, passive: true });
+  window.addEventListener("blur", invalidate);
+  window.addEventListener("pagehide", invalidate);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) invalidate();
+  });
 }
 
 async function submitPermissionDecision(decision: PermissionReviewDecision): Promise<void> {
@@ -1014,7 +2107,7 @@ async function submitPermissionDecision(decision: PermissionReviewDecision): Pro
     : null;
   const submission = beginPermissionDecision(uiState, confirmationId, decision);
   if (submission === null) return;
-  if (currentState) render(currentState);
+  if (currentState) acceptState(currentState, true);
   try {
     const state = await command<DesktopWebState>("answer_permission", {
       decision,
@@ -1067,7 +2160,68 @@ async function submitPermissionDecision(decision: PermissionReviewDecision): Pro
       submission,
       "決定を反映できませんでした。もう一度お試しください。",
     )) {
-      if (currentState) render(currentState);
+      if (currentState) acceptState(currentState, true);
+    }
+  }
+}
+
+async function submitRunStop(state: DesktopViewState): Promise<void> {
+  const stopTarget = state.stop_target;
+  if (stopTarget === null) return;
+  const confirmationId = state.confirmation_visible ? state.confirmation_id : null;
+  if (confirmationId === null) {
+    try {
+      acceptState(await cancelRunCommand<DesktopWebState>(stopTarget), true, "cancel_run", true);
+    } catch (error) {
+      if (!recoverCommandConflict(error)) reportError(error);
+    }
+    return;
+  }
+  const submission = beginPermissionStop(uiState, confirmationId);
+  if (submission === null) return;
+  if (currentState) acceptState(currentState, true);
+  try {
+    const nextState = await cancelRunCommand<DesktopWebState>(stopTarget);
+    acceptState(nextState, true, "cancel_run", true);
+  } catch (error) {
+    const conflictState = commandConflictState(error);
+    if (conflictState) {
+      const recovered = recoverPermissionDecisionFromConflict(
+        uiState,
+        submission,
+        conflictState.confirmation_visible ? conflictState.confirmation_id : null,
+      );
+      if (recovered && conflictState.confirmation_visible) {
+        const active = document.activeElement;
+        if (active instanceof HTMLElement) active.blur();
+        uiState.lastFocusedOverlay = "none";
+      }
+      acceptState(conflictState, true, "command_conflict");
+      return;
+    }
+    const failureState = commandInternalState(error);
+    if (failureState) {
+      if (
+        failureState.confirmation_visible
+        && failureState.confirmation_id === submission.requestId
+      ) {
+        failPermissionDecision(
+          uiState,
+          submission,
+          "実行停止を要求できませんでした。もう一度お試しください。",
+        );
+      } else {
+        finishPermissionDecision(uiState, submission);
+      }
+      acceptState(failureState, true, "cancel_run_failure", true);
+      return;
+    }
+    if (failPermissionDecision(
+      uiState,
+      submission,
+      "実行停止を要求できませんでした。もう一度お試しください。",
+    )) {
+      if (currentState) acceptState(currentState, true);
     }
   }
 }
@@ -1246,18 +2400,4 @@ function reportError(value: unknown): void {
         <pre>${escapeHtml(error.details)}</pre>
       </details>
     </div>`;
-}
-
-function renderRecoverableError(): string {
-  const error = uiState.recoverableError;
-  if (!error) return "";
-  return `
-    <aside class="ui-error-notice" role="status" aria-live="polite">
-      <div>
-        <strong>${escapeHtml(error.title)}</strong>
-        <span>${escapeHtml(error.hint)}</span>
-        ${error.details.trim().length > 0 ? `<details data-details-key="recoverable-error-details"><summary data-focus-key="recoverable-error-summary">技術詳細</summary><pre>${escapeHtml(error.details)}</pre></details>` : ""}
-      </div>
-      <button class="icon-button" data-action="dismiss-ui-error" title="閉じる" aria-label="閉じる">×</button>
-    </aside>`;
 }

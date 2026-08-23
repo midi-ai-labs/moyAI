@@ -10,13 +10,27 @@ use crate::runtime::{ActiveRunRegistry, RunProcessLease};
 
 pub mod change_repo;
 pub mod migration;
+pub mod permission_retry_fence;
 pub mod project_repo;
 pub mod session_repo;
+pub mod side_chat;
 pub mod sqlite;
 
 pub use change_repo::SqliteChangeRepository;
+pub use permission_retry_fence::{
+    BeginPermissionReview, PermissionEffectAdmission, PermissionRetryFenceKey,
+    PermissionRetryFenceOutcome, PermissionRetryFenceRecord, PermissionRetryFenceState,
+    PermissionReviewClaim, PermissionReviewId, PermissionReviewLease, PermissionReviewTransition,
+    SqlitePermissionRetryFenceStore,
+};
 pub use project_repo::SqliteProjectRepository;
 pub use session_repo::SqliteSessionRepository;
+pub use side_chat::{
+    MAX_SIDE_CHAT_DRAFT_BYTES, MAX_SIDE_CHAT_PROJECTION_MESSAGES, SideChatAdmittedRequest,
+    SideChatBinding, SideChatContextScope, SideChatConversationMessage,
+    SideChatConversationProjection, SideChatConversationRole, SideChatDraftUpdate, SideChatId,
+    SideChatProviderTarget, SqliteSideChatRepository,
+};
 pub use sqlite::{SqliteStore, StorageMaintenanceReport};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -154,6 +168,14 @@ impl StoreBundle {
 
     pub fn project_repo(&self) -> SqliteProjectRepository {
         self.store.project_repo()
+    }
+
+    pub fn permission_retry_fence_store(&self) -> SqlitePermissionRetryFenceStore {
+        self.store.permission_retry_fence_store()
+    }
+
+    pub fn side_chat_repo(&self) -> SqliteSideChatRepository {
+        self.store.side_chat_repo()
     }
 
     pub fn change_repo(&self) -> SqliteChangeRepository {

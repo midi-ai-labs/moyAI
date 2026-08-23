@@ -1685,6 +1685,7 @@ mod tests {
             latest_turn_id,
             active_turn_id: None,
             active_turn_sequence_no: None,
+            admission_revision: u64::from(latest_turn_id.is_some()),
         }
     }
 

@@ -1,4 +1,5 @@
 export type PermissionReviewDecision = "approved" | "abort";
+export type PermissionModalAction = PermissionReviewDecision | "stop";
 
 export type PermissionDecisionState =
   | { phase: "ready"; requestId: string }
@@ -6,14 +7,14 @@ export type PermissionDecisionState =
     phase: "submitting";
     requestId: string;
     submissionId: number;
-    decision: PermissionReviewDecision;
+    decision: PermissionModalAction;
   }
   | { phase: "failed"; requestId: string; error: string };
 
 export interface PermissionDecisionSubmission {
   requestId: string;
   submissionId: number;
-  decision: PermissionReviewDecision;
+  decision: PermissionModalAction;
 }
 
 export function permissionDecisionForEscape(
@@ -37,6 +38,21 @@ export function beginPermissionDecision(
   owner: PermissionDecisionOwner,
   confirmationId: string | null,
   decision: PermissionReviewDecision,
+): PermissionDecisionSubmission | null {
+  return beginPermissionSubmission(owner, confirmationId, decision);
+}
+
+export function beginPermissionStop(
+  owner: PermissionDecisionOwner,
+  confirmationId: string | null,
+): PermissionDecisionSubmission | null {
+  return beginPermissionSubmission(owner, confirmationId, "stop");
+}
+
+function beginPermissionSubmission(
+  owner: PermissionDecisionOwner,
+  confirmationId: string | null,
+  decision: PermissionModalAction,
 ): PermissionDecisionSubmission | null {
   if (confirmationId === null) return null;
   reconcilePermissionDecision(owner, confirmationId);

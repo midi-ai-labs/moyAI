@@ -7,7 +7,7 @@ use crate::protocol::{
     ToolLifecycleStatus, TurnId, TurnItem, TurnItemId, TurnItemPayload,
 };
 use crate::runtime::SystemClock;
-use crate::session::{RunEvent, SessionId};
+use crate::session::{RunEvent, RunEventDurability, SessionId};
 use crate::tool::ToolName;
 
 #[derive(Debug, Clone)]
@@ -23,12 +23,7 @@ pub fn project_protocol_run_event(
     turn_id: TurnId,
     sequence_no: i64,
 ) -> Option<ProtocolRunEventProjection> {
-    if matches!(
-        event,
-        RunEvent::ProviderPhase { .. }
-            | RunEvent::TextDelta { .. }
-            | RunEvent::ReasoningSummaryDelta { .. }
-    ) {
+    if event.durability() == RunEventDurability::RuntimeOnly {
         return None;
     }
     let session_id = event.session_id().or(fallback_session_id)?;
@@ -786,16 +781,28 @@ mod tests {
 
     #[test]
     fn stream_deltas_are_runtime_only() {
-        let projection = project_protocol_run_event(
-            &RunEvent::TextDelta {
-                response_id: crate::protocol::ModelResponseId::new(),
-                delta: "partial".to_string(),
-            },
-            Some(SessionId::new()),
-            TurnId::new(),
-            3,
-        );
+        let event = RunEvent::TextDelta {
+            response_id: crate::protocol::ModelResponseId::new(),
+            delta: "partial".to_string(),
+        };
+        assert_eq!(event.durability(), RunEventDurability::RuntimeOnly);
+        let projection =
+            project_protocol_run_event(&event, Some(SessionId::new()), TurnId::new(), 3);
         assert!(projection.is_none());
+    }
+
+    #[test]
+    fn committed_assistant_is_protocol_projected() {
+        let event = RunEvent::AssistantMessageCommitted {
+            response_id: crate::protocol::ModelResponseId::new(),
+            text: "complete".to_string(),
+        };
+        assert_eq!(event.durability(), RunEventDurability::Committed);
+
+        let projection =
+            project_protocol_run_event(&event, Some(SessionId::new()), TurnId::new(), 4);
+
+        assert!(projection.is_some());
     }
 
     #[test]

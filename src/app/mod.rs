@@ -10,12 +10,14 @@ pub use agent_runtime::{
 pub use bootstrap::AppBootstrap;
 pub(crate) use command::AppProcessRuntime;
 pub use command::{
-    App, AppCommand, ReviewRequest, RunConfigInput, RunRequest, RunSessionAccessModeAdoption,
-    SessionArchiveRequest, SessionEventsRequest, SessionForkRequest, SessionGoalClearRequest,
-    SessionGoalGetRequest, SessionGoalSetRequest, SessionHistoryRequest,
+    App, AppCommand, ReviewRequest, RunAdmissionKind, RunConfigInput, RunRequest,
+    RunSessionAccessModeAdoption, SessionArchiveRequest, SessionEventsRequest, SessionForkRequest,
+    SessionGoalClearRequest, SessionGoalGetRequest, SessionGoalSetRequest, SessionHistoryRequest,
     SessionIdleAdmissionRequest, SessionInterruptRequest, SessionListRequest, SessionLoadedRequest,
     SessionReadRequest, SessionRejoinRequest, SessionRollbackRequest, SessionSearchRequest,
     SessionSettingsUpdateRequest, SessionShowRequest, SessionSteerRequest,
     SessionTitleUpdateRequest, SessionTurnsRequest,
 };
-pub use run_service::{AppCommandOutcome, RunService};
+pub use run_service::{
+    AppCommandOutcome, ExactRootExecutionStopOutcome, RootExecutionStopRequestOutcome, RunService,
+};

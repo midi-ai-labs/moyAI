@@ -29,10 +29,13 @@ use crate::cli::{
 };
 use crate::config::{AccessMode, ConfigLoader, ResolvedConfig, ShellFamily};
 use crate::error::{AppRunError, CliPromptError, CliRenderError};
-use crate::protocol::{PlanStepStatus, ToolApprovalDecision, TurnInterruptionCause};
+#[cfg(test)]
+use crate::protocol::TurnInterruptionCause;
+use crate::protocol::{PlanStepStatus, ToolApprovalDecision};
+#[cfg(test)]
+use crate::runtime::RunCancelOutcome;
 use crate::runtime::{
-    LocalTaskExecutor, OwnedTaskHandle, RunCancelOutcome, RunCancellationCause, RunControl,
-    SystemClock,
+    LocalTaskExecutor, OwnedTaskHandle, RunCancellationCause, RunControl, SystemClock,
 };
 #[cfg(test)]
 use crate::session::SessionStatus;
@@ -40,8 +43,8 @@ use crate::session::markdown::{
     canonical_markdown_export_read, canonical_session_read_to_markdown, history_markdown_file_name,
 };
 use crate::session::{
-    EditorContext, LoadedSessionStatus, LoadedSessionSummary, PromptDispatchPart, RunEvent,
-    RunSummary, SessionId, SessionRecord,
+    ActiveTurnExpectation, EditorContext, LoadedSessionStatus, LoadedSessionSummary,
+    PromptDispatchPart, RunEvent, RunSummary, SessionId, SessionRecord,
 };
 use crate::tool::PermissionRequest;
 use crate::workspace::project::normalize_path;
@@ -51,10 +54,10 @@ use super::prompt_enhance::enhance_prompt;
 use super::query::{latest_session, recent_sessions, search_sessions, session_view};
 use super::reducer::reduce_run_event;
 use super::state::{
-    AppState, Modal, PlanView, PromptReviewPhase, Route, RunStatus, TranscriptEntry,
-    TranscriptKind, interruption_status_message, latest_plan_from_turn_items,
-    permission_decision_pending_status_message, run_cancellation_status_message,
-    transcript_entries_from_turn_items_relative_to,
+    AppState, Modal, PlanView, PromptReviewOwner, PromptReviewPhase, PromptReviewTarget, Route,
+    RunStatus, TranscriptEntry, TranscriptKind, interruption_status_message,
+    latest_plan_from_turn_items, permission_decision_pending_status_message,
+    run_cancellation_status_message, transcript_entries_from_turn_items_relative_to,
 };
 
 type TerminalHandle = Terminal<CrosstermBackend<Stdout>>;
@@ -128,18 +131,10 @@ impl TuiRootRunLifecycle {
         self.active.is_some()
     }
 
-    fn request_cancel(&self) -> bool {
-        let Some(active) = self.active.as_ref() else {
-            return false;
-        };
-        match active
-            .run_control
-            .request_cancel(RunCancellationCause::Interruption(
-                TurnInterruptionCause::UserStop,
-            )) {
-            RunCancelOutcome::Applied | RunCancelOutcome::Deferred(_) => true,
-            RunCancelOutcome::Rejected => false,
-        }
+    fn run_control(&self) -> Option<RunControl> {
+        self.active
+            .as_ref()
+            .map(|active| active.run_control.clone())
     }
 
     fn finish(&mut self, generation: u64) -> Option<Option<RunCancellationCause>> {
@@ -217,6 +212,7 @@ enum PendingComposerSubmissionId {
 struct PendingComposerSubmission {
     id: PendingComposerSubmissionId,
     session_id: Option<SessionId>,
+    prompt_review_target: Option<PromptReviewTarget>,
     draft_revision: u64,
     draft_text: String,
 }
@@ -225,6 +221,27 @@ fn has_pending_steer_submission(submissions: &[PendingComposerSubmission]) -> bo
     submissions
         .iter()
         .any(|pending| matches!(pending.id, PendingComposerSubmissionId::Steer(_)))
+}
+
+fn has_pending_prompt_review_submission(
+    submissions: &[PendingComposerSubmission],
+    target: PromptReviewTarget,
+) -> bool {
+    submissions
+        .iter()
+        .any(|pending| pending.prompt_review_target == Some(target))
+}
+
+fn captured_composer_submission_is_steer(
+    has_session: bool,
+    prompt: &str,
+    has_review_request: bool,
+    expected_active_turn: ActiveTurnExpectation,
+) -> bool {
+    has_session
+        && !prompt.trim().is_empty()
+        && !has_review_request
+        && matches!(expected_active_turn, ActiveTurnExpectation::Turn { .. })
 }
 
 struct PreAdmissionAccessModeState {
@@ -675,16 +692,12 @@ impl TuiController {
             self.state.status_message = Some("select a Sub Agent first".to_string());
             return Ok(());
         };
-        let Some(expected_turn_id) = row.active_turn_id else {
+        let Some(expected_interrupt_target) = row.interrupt_target else {
             self.state.status_message =
                 Some("the selected Sub Agent has no interruptible running turn".to_string());
             return Ok(());
         };
-        if !row.can_interrupt || !matches!(row.status, crate::runtime::AgentStatus::Running) {
-            self.state.status_message =
-                Some("the selected Sub Agent is not currently interruptible".to_string());
-            return Ok(());
-        }
+        let expected_turn_id = expected_interrupt_target.turn_id;
         let accepted = self
             .app
             .run_service
@@ -693,6 +706,7 @@ impl TuiController {
                 &row.agent_path,
                 row.session_id,
                 expected_turn_id,
+                expected_interrupt_target.admission_revision,
             )
             .await?;
         if accepted {
@@ -722,6 +736,19 @@ impl TuiController {
             self.state.modal = Modal::None;
             return Ok(());
         };
+        let Some(prompt_review_target) = prompt_review.tui_target() else {
+            return Err(AppRunError::Message(
+                "TUI prompt review is missing its captured session owner".to_string(),
+            ));
+        };
+        if has_pending_prompt_review_submission(
+            &self.pending_composer_submissions,
+            prompt_review_target,
+        ) {
+            self.state.status_message =
+                Some("wait for the reviewed prompt submission to settle".to_string());
+            return Ok(());
+        }
         if prompt_review.phase == PromptReviewPhase::Enhancing {
             if key.code == KeyCode::Esc {
                 self.cancel_pending_prompt_enhance();
@@ -736,30 +763,42 @@ impl TuiController {
                 self.state.status_message = Some("kept raw prompt in composer".to_string());
             }
             KeyCode::F(6) => {
+                if !self
+                    .state
+                    .prompt_review_matches_current_owner(prompt_review_target)
+                {
+                    self.state.status_message = Some(
+                        "the prompt review session owner changed; cancel the review and retry"
+                            .to_string(),
+                    );
+                    return Ok(());
+                }
                 let Some(prompt_dispatch) = self.state.build_prompt_dispatch(true) else {
                     return Err(AppRunError::Message(
                         "enhanced draft is not ready yet".to_string(),
                     ));
                 };
-                self.cancel_pending_prompt_enhance();
-                self.launch_run(
-                    prompt_dispatch.dispatch_prompt_text.clone(),
-                    prompt_dispatch,
-                )
-                .await?;
+                self.launch_prompt_review_run(prompt_dispatch, prompt_review_target)
+                    .await?;
             }
             KeyCode::F(7) => {
+                if !self
+                    .state
+                    .prompt_review_matches_current_owner(prompt_review_target)
+                {
+                    self.state.status_message = Some(
+                        "the prompt review session owner changed; cancel the review and retry"
+                            .to_string(),
+                    );
+                    return Ok(());
+                }
                 let Some(prompt_dispatch) = self.state.build_prompt_dispatch(false) else {
                     return Err(AppRunError::Message(
                         "enhanced draft is not ready yet".to_string(),
                     ));
                 };
-                self.cancel_pending_prompt_enhance();
-                self.launch_run(
-                    prompt_dispatch.dispatch_prompt_text.clone(),
-                    prompt_dispatch,
-                )
-                .await?;
+                self.launch_prompt_review_run(prompt_dispatch, prompt_review_target)
+                    .await?;
             }
             KeyCode::Enter => {}
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -857,34 +896,62 @@ impl TuiController {
     }
 
     async fn stop_current_run(&mut self) -> Result<(), AppRunError> {
-        let exact_root_target = self.root_run_lifecycle.is_active()
-            || matches!(self.state.run_status, RunStatus::Running);
-        let stop_accepted = self.root_run_lifecycle.request_cancel();
-        if !exact_root_target && self.pending_permission.is_some() {
+        let expected_active_turn = self.state.active_turn_expectation;
+        if let Some(root_scope_control) = self.root_run_lifecycle.run_control() {
+            match self
+                .app
+                .run_service
+                .request_root_execution_stop(&root_scope_control)
+                .await?
+            {
+                crate::app::RootExecutionStopRequestOutcome::Accepted => {
+                    self.state.status_message =
+                        Some("stop requested for the current task".to_string());
+                    self.refresh_sessions().await?;
+                }
+                crate::app::RootExecutionStopRequestOutcome::AlreadyPending => {
+                    self.state.status_message =
+                        Some("the exact root task Stop is already being validated".to_string());
+                }
+                crate::app::RootExecutionStopRequestOutcome::Rejected => {
+                    self.state.status_message =
+                        Some("the current root task no longer accepts Stop".to_string());
+                }
+                crate::app::RootExecutionStopRequestOutcome::TargetChanged => {
+                    self.state.status_message = Some(
+                        "the task changed before Stop was applied; the replacement was not stopped"
+                            .to_string(),
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        if !matches!(expected_active_turn, ActiveTurnExpectation::Turn { .. })
+            && self.pending_permission.is_some()
+        {
             self.answer_permission(ReviewDecision::Abort)?;
             return Ok(());
         }
         let Some(session_id) = self.state.current_session_id else {
-            if stop_accepted {
-                self.state.status_message =
-                    Some("stop requested before run admission completed".to_string());
-                return Ok(());
-            }
             self.state.status_message = Some("no active session to stop".to_string());
             return Ok(());
         };
-        let durable_stop_accepted = self
-            .app
-            .session_service
-            .cancel_running_session(session_id)
-            .await?;
-        if stop_accepted || durable_stop_accepted {
+        let durable_stop_accepted = match expected_active_turn {
+            ActiveTurnExpectation::Turn { turn_id, revision } => matches!(
+                self.app
+                    .run_service
+                    .cancel_exact_root_execution(session_id, turn_id, revision)
+                    .await?,
+                crate::app::ExactRootExecutionStopOutcome::Applied { .. }
+            ),
+            ActiveTurnExpectation::Idle { .. } => false,
+        };
+        if durable_stop_accepted {
             // Stop dispatch is not a terminal transition. The exact task worker remains the owner
             // until its matching TurnTerminal/worker settlement is projected back to the TUI.
             self.state.status_message = Some("stop requested for the current task".to_string());
-            if durable_stop_accepted && !self.root_run_lifecycle.is_active() {
-                self.refresh_sessions().await?;
-            }
+            self.refresh_sessions().await?;
         } else {
             self.state.status_message =
                 Some("no current task accepted the Stop request".to_string());
@@ -1137,10 +1204,31 @@ impl TuiController {
             );
             return Ok(());
         }
+        let expected_active_turn = self.state.active_turn_expectation;
+        if !matches!(expected_active_turn, ActiveTurnExpectation::Idle { .. }) {
+            self.state.status_message =
+                Some("prompt enhancement requires the captured session to be idle".to_string());
+            return Ok(());
+        }
         if self.pending_prompt_enhance.is_some() || self.state.prompt_review.is_some() {
             self.state.status_message =
                 Some("prompt enhancement is already in progress or under review".to_string());
             return Ok(());
+        }
+        let target_session_id = self.state.current_session_id;
+        if let Some(session_id) = target_session_id {
+            let actual = self
+                .app
+                .session_service
+                .active_turn_expectation_for_session(session_id)
+                .await?;
+            if actual != Some(expected_active_turn) {
+                self.state.status_message = Some(
+                    "the durable session owner changed before prompt enhancement started"
+                        .to_string(),
+                );
+                return Ok(());
+            }
         }
         let request_id = self.next_enhance_request_id;
         let Some(next_request_id) = request_id.checked_add(1) else {
@@ -1151,19 +1239,40 @@ impl TuiController {
         self.next_enhance_request_id = next_request_id;
         let cancellation = CancellationToken::new();
         self.pending_prompt_enhance = Some((request_id, cancellation.clone()));
-        self.state.begin_prompt_enhance(request_id, &raw_prompt);
+        let target = PromptReviewTarget {
+            request_id,
+            owner: PromptReviewOwner {
+                session_id: self.state.current_session_id,
+                expected_active_turn,
+            },
+        };
+        if !self.state.begin_tui_prompt_enhance(target, &raw_prompt) {
+            self.pending_prompt_enhance = None;
+            self.state.status_message =
+                Some("prompt enhancement owner is no longer idle".to_string());
+            return Ok(());
+        }
         self.review_editor = build_composer();
         let runtime_tx = self.runtime_tx.clone();
         let config = self.effective_config.clone();
+        let session_service = self.app.session_service.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build prompt enhance runtime");
             let result = runtime.block_on(async move {
-                enhance_prompt(&config, &raw_prompt, cancellation)
-                    .await
-                    .map_err(|error| error.to_string())
+                crate::tui::prompt_enhance::enhance_prompt_for_captured_idle(
+                    &session_service,
+                    target_session_id,
+                    expected_active_turn,
+                    || async move {
+                        enhance_prompt(&config, &raw_prompt, cancellation)
+                            .await
+                            .map_err(|error| error.to_string())
+                    },
+                )
+                .await
             });
             let _ = runtime_tx.send(RuntimeMessage::EnhanceFinished { request_id, result });
         });
@@ -1172,10 +1281,32 @@ impl TuiController {
 
     async fn start_uncommitted_review(&mut self) -> Result<(), AppRunError> {
         let prompt = textarea_value(&self.composer).trim().to_string();
-        self.launch_run_with_options(
+        let expected_active_turn = self.state.active_turn_expectation;
+        if !matches!(expected_active_turn, ActiveTurnExpectation::Idle { .. }) {
+            self.state.status_message =
+                Some("uncommitted review requires the captured idle session owner".to_string());
+            return Ok(());
+        }
+        if let Some(session_id) = self.state.current_session_id {
+            let actual = self
+                .app
+                .session_service
+                .active_turn_expectation_for_session(session_id)
+                .await?;
+            if actual != Some(expected_active_turn) {
+                self.state.status_message = Some(
+                    "the durable session owner changed before uncommitted review started"
+                        .to_string(),
+                );
+                return Ok(());
+            }
+        }
+        self.launch_run_with_captured_owner(
             prompt.clone(),
             PromptDispatchPart::raw(&prompt),
             Some(ReviewRequest::Uncommitted),
+            expected_active_turn,
+            None,
         )
         .await
     }
@@ -1195,12 +1326,61 @@ impl TuiController {
         prompt_dispatch: PromptDispatchPart,
         review_request: Option<ReviewRequest>,
     ) -> Result<(), AppRunError> {
-        if review_request.is_none()
-            && !prompt.trim().is_empty()
-            && self.state.current_session_id.is_some()
-            && matches!(self.state.run_status, RunStatus::Running)
-        {
-            self.launch_active_turn_steer(prompt).await?;
+        let expected_active_turn = self.state.active_turn_expectation;
+        self.launch_run_with_captured_owner(
+            prompt,
+            prompt_dispatch,
+            review_request,
+            expected_active_turn,
+            None,
+        )
+        .await
+    }
+
+    async fn launch_prompt_review_run(
+        &mut self,
+        prompt_dispatch: PromptDispatchPart,
+        target: PromptReviewTarget,
+    ) -> Result<(), AppRunError> {
+        if !self.state.prompt_review_matches_current_owner(target) {
+            self.state.status_message = Some(
+                "the prompt review session owner changed; cancel the review and retry".to_string(),
+            );
+            return Ok(());
+        }
+        self.launch_run_with_captured_owner(
+            prompt_dispatch.dispatch_prompt_text.clone(),
+            prompt_dispatch,
+            None,
+            target.owner.expected_active_turn,
+            Some(target),
+        )
+        .await
+    }
+
+    async fn launch_run_with_captured_owner(
+        &mut self,
+        prompt: String,
+        prompt_dispatch: PromptDispatchPart,
+        review_request: Option<ReviewRequest>,
+        expected_active_turn: ActiveTurnExpectation,
+        prompt_review_target: Option<PromptReviewTarget>,
+    ) -> Result<(), AppRunError> {
+        if captured_composer_submission_is_steer(
+            self.state.current_session_id.is_some(),
+            &prompt,
+            review_request.is_some() || prompt_review_target.is_some(),
+            expected_active_turn,
+        ) {
+            self.launch_active_turn_steer(prompt, expected_active_turn)
+                .await?;
+            return Ok(());
+        }
+        if matches!(expected_active_turn, ActiveTurnExpectation::Turn { .. }) {
+            self.state.status_message = Some(
+                "the captured active turn only accepts a steer; refresh the session before retrying"
+                    .to_string(),
+            );
             return Ok(());
         }
         if self.root_run_lifecycle.is_active() {
@@ -1254,10 +1434,13 @@ impl TuiController {
             session_access_mode_adoption,
             agent_confirmation: None,
             agent_context: None,
+            admission_kind: crate::app::RunAdmissionKind::NewUserRun,
+            expected_active_turn,
         };
-        self.track_pending_composer_submission(
+        self.track_pending_composer_submission_with_review(
             PendingComposerSubmissionId::RootRun(run_generation),
             request.session_id,
+            prompt_review_target,
         );
         self.state.status_message = Some("submitting user input...".to_string());
         let run_service = self.app.run_service.clone();
@@ -1323,12 +1506,21 @@ impl TuiController {
         Ok(())
     }
 
-    async fn launch_active_turn_steer(&mut self, prompt: String) -> Result<(), AppRunError> {
+    async fn launch_active_turn_steer(
+        &mut self,
+        prompt: String,
+        expected_active_turn: ActiveTurnExpectation,
+    ) -> Result<(), AppRunError> {
         let Some(session_id) = self.state.current_session_id else {
             self.state.status_message =
                 Some("running session is not available for steer".to_string());
             return Ok(());
         };
+        if !matches!(expected_active_turn, ActiveTurnExpectation::Turn { .. }) {
+            self.state.status_message =
+                Some("the captured session owner is not an active turn".to_string());
+            return Ok(());
+        }
         if has_pending_steer_submission(&self.pending_composer_submissions) {
             self.state.status_message =
                 Some("wait for the previous steer input to finish storing".to_string());
@@ -1373,6 +1565,7 @@ impl TuiController {
                                 cwd,
                                 image_paths: Vec::new(),
                                 client_user_message_id: Some(format!("tui-steer-{submission_id}")),
+                                expected_active_turn,
                             }),
                             &mut renderer,
                             &mut prompt_ui,
@@ -1439,6 +1632,15 @@ impl TuiController {
         id: PendingComposerSubmissionId,
         session_id: Option<SessionId>,
     ) {
+        self.track_pending_composer_submission_with_review(id, session_id, None);
+    }
+
+    fn track_pending_composer_submission_with_review(
+        &mut self,
+        id: PendingComposerSubmissionId,
+        session_id: Option<SessionId>,
+        prompt_review_target: Option<PromptReviewTarget>,
+    ) {
         debug_assert!(
             self.pending_composer_submissions
                 .iter()
@@ -1449,6 +1651,7 @@ impl TuiController {
             .push(PendingComposerSubmission {
                 id,
                 session_id,
+                prompt_review_target,
                 draft_revision: self.composer_draft_revision,
                 draft_text: textarea_value(&self.composer),
             });
@@ -1494,6 +1697,9 @@ impl TuiController {
         if should_clear {
             self.composer = build_composer();
             self.advance_composer_draft_revision();
+        }
+        if accepted && let Some(target) = pending.prompt_review_target {
+            self.state.cancel_prompt_review_if_current(target);
         }
         true
     }
@@ -1661,6 +1867,22 @@ impl TuiController {
                 },
                 RuntimeMessage::EnhanceFinished { request_id, result } => {
                     if !self.finish_pending_prompt_enhance(request_id) {
+                        continue;
+                    }
+                    let Some(target) = self
+                        .state
+                        .prompt_review
+                        .as_ref()
+                        .and_then(|review| review.tui_target())
+                        .filter(|target| target.request_id == request_id)
+                    else {
+                        continue;
+                    };
+                    if !self.state.prompt_review_matches_current_owner(target) {
+                        self.state.status_message = Some(
+                            "prompt enhancement finished after the session owner changed; cancel the review and retry"
+                                .to_string(),
+                        );
                         continue;
                     }
                     match result {
@@ -2470,7 +2692,7 @@ impl TuiController {
                 };
                 ListItem::new(format!(
                     "{} = {}{}",
-                    field.key.label(),
+                    field.key.display_label(),
                     truncate_middle(&field.value, 28),
                     env_badge
                 ))
@@ -2488,9 +2710,11 @@ impl TuiController {
         let selected = self.config_editor.selected_field();
         frame.render_widget(
             Paragraph::new(Text::from(vec![
-                Line::from(format!("Field: {}", selected.key.label())),
+                Line::from(format!("Field: {}", selected.key.display_label())),
+                Line::from(format!("Key: {}", selected.key.label())),
                 Line::from(""),
                 Line::from(selected.value.clone()),
+                Line::from(selected.key.help()),
                 Line::from(""),
                 Line::from("Up/Down select field"),
                 Line::from("Type edits current value, Backspace/Delete clear"),
@@ -3579,7 +3803,7 @@ mod key_tests {
             .config_editor
             .fields
             .iter_mut()
-            .find(|field| field.key == crate::tui::config_editor::ConfigField::AccessMode)
+            .find(|field| field.key == crate::config::ConfigField::AccessMode)
             .expect("access mode field");
         field.value = value.to_string();
     }
@@ -3589,7 +3813,7 @@ mod key_tests {
             .config_editor
             .fields
             .iter()
-            .find(|field| field.key == crate::tui::config_editor::ConfigField::AccessMode)
+            .find(|field| field.key == crate::config::ConfigField::AccessMode)
             .expect("access mode field")
             .value
             .as_str()
@@ -3774,9 +3998,16 @@ mod key_tests {
         let request_id = 41;
         let cancellation = CancellationToken::new();
         controller.pending_prompt_enhance = Some((request_id, cancellation.clone()));
-        controller
-            .state
-            .begin_prompt_enhance(request_id, "keep this raw prompt");
+        assert!(controller.state.begin_tui_prompt_enhance(
+            PromptReviewTarget {
+                request_id,
+                owner: PromptReviewOwner {
+                    session_id: controller.state.current_session_id,
+                    expected_active_turn: controller.state.active_turn_expectation,
+                },
+            },
+            "keep this raw prompt",
+        ));
 
         controller
             .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
@@ -3812,9 +4043,16 @@ mod key_tests {
         let request_id = 42;
         let cancellation = CancellationToken::new();
         controller.pending_prompt_enhance = Some((request_id, cancellation.clone()));
-        controller
-            .state
-            .begin_prompt_enhance(request_id, "keep this raw prompt");
+        assert!(controller.state.begin_tui_prompt_enhance(
+            PromptReviewTarget {
+                request_id,
+                owner: PromptReviewOwner {
+                    session_id: controller.state.current_session_id,
+                    expected_active_turn: controller.state.active_turn_expectation,
+                },
+            },
+            "keep this raw prompt",
+        ));
 
         controller
             .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -3963,7 +4201,12 @@ mod key_tests {
         assert!(lifecycle.begin(7, control.clone()));
         assert!(lifecycle.is_active());
 
-        assert!(lifecycle.request_cancel());
+        assert_eq!(
+            control.request_cancel(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop,
+            )),
+            RunCancelOutcome::Applied
+        );
         assert_eq!(
             control.cause(),
             Some(RunCancellationCause::Interruption(
@@ -3985,7 +4228,7 @@ mod key_tests {
             RunCancellationCause::Interruption(TurnInterruptionCause::UserStop)
         );
         assert!(!lifecycle.is_active());
-        assert!(!lifecycle.request_cancel());
+        assert!(lifecycle.run_control().is_none());
         assert_eq!(
             tui_terminal_error_status(Some(&cause)),
             RunStatus::Cancelled
@@ -4018,10 +4261,12 @@ mod key_tests {
         let mut lifecycle = TuiRootRunLifecycle::default();
         assert!(lifecycle.begin(8, control.clone()));
 
-        assert!(
-            lifecycle.request_cancel(),
-            "a deferred Stop is accepted as cancel-pending"
-        );
+        assert!(matches!(
+            control.request_cancel(RunCancellationCause::Interruption(
+                TurnInterruptionCause::UserStop,
+            )),
+            RunCancelOutcome::Deferred(_)
+        ));
         assert!(lifecycle.is_active());
         assert_eq!(control.cause(), None);
 
@@ -4034,8 +4279,14 @@ mod key_tests {
         let sealed = RunControl::new();
         assert!(sealed.seal_success());
         assert!(lifecycle.begin(9, sealed));
-        assert!(
-            !lifecycle.request_cancel(),
+        assert_eq!(
+            lifecycle
+                .run_control()
+                .expect("sealed lifecycle owner")
+                .request_cancel(RunCancellationCause::Interruption(
+                    TurnInterruptionCause::UserStop,
+                )),
+            RunCancelOutcome::Rejected,
             "a rejected Stop is not reported as cancel-pending"
         );
         assert_eq!(lifecycle.finish(9), Some(None));
@@ -4371,7 +4622,7 @@ mod key_tests {
             .await
             .expect("spawn edge");
         let child_turn_id = crate::protocol::TurnId::new();
-        repository
+        let child_admission = repository
             .admit_session_turn(child.id, child_turn_id)
             .await
             .expect("child admission")
@@ -4384,9 +4635,9 @@ mod key_tests {
         assert!(!controller.root_run_lifecycle.is_active());
 
         controller
-            .stop_current_run()
+            .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
             .await
-            .expect("exact root stop");
+            .expect("ordinary root Ctrl+X");
 
         assert_eq!(controller.state.run_status, RunStatus::Completed);
         assert_eq!(
@@ -4425,7 +4676,55 @@ mod key_tests {
             repository
                 .get_session(child.id)
                 .await
-                .expect("interrupted child")
+                .expect("requested child")
+                .status,
+            SessionStatus::Running,
+            "the picker records exact interruption intent without stealing terminal ownership"
+        );
+        assert!(
+            repository
+                .durable_terminal_for_turn(child.id, child_turn_id)
+                .await
+                .expect("requested child terminal")
+                .is_none(),
+            "the exact interrupt request must not terminalize ahead of the admitted owner"
+        );
+        assert!(matches!(
+            repository
+                .renew_admitted_run_lease(child.id, child_admission.admission_id, child_turn_id,)
+                .await
+                .expect("child owner observes exact interrupt request"),
+            crate::storage::session_repo::RunAdmissionLeaseRenewalOutcome::InterruptRequested(
+                TurnInterruptionCause::AgentInterrupted
+            )
+        ));
+
+        let settlement = repository
+            .settle_admitted_turn_with_protocol_event(
+                child.id,
+                child_admission.admission_id,
+                &completed_turn_event(child.id),
+                child_turn_id,
+                None,
+                None,
+            )
+            .await
+            .expect("child owner settles the requested interrupt");
+        assert_eq!(
+            settlement.commit(),
+            crate::storage::session_repo::AdmittedTerminalCommit::Applied
+        );
+        assert!(matches!(
+            settlement.into_terminal().map(|terminal| terminal.outcome),
+            Some(crate::protocol::TurnTerminalOutcome::Interrupted {
+                cause: TurnInterruptionCause::AgentInterrupted,
+            })
+        ));
+        assert_eq!(
+            repository
+                .get_session(child.id)
+                .await
+                .expect("owner-settled child")
                 .status,
             SessionStatus::Cancelled
         );
@@ -4509,7 +4808,7 @@ mod key_tests {
                 .await
                 .expect("durable activity")
                 .iter()
-                .any(|record| record.can_interrupt)
+                .any(|record| record.interrupt_target.is_some())
         );
         assert!(!controller.root_run_lifecycle.is_active());
 
@@ -5664,6 +5963,7 @@ mod key_tests {
         let submissions = vec![PendingComposerSubmission {
             id: PendingComposerSubmissionId::Steer(7),
             session_id: Some(SessionId::new()),
+            prompt_review_target: None,
             draft_revision: 3,
             draft_text: "steer".to_string(),
         }];
@@ -5673,10 +5973,198 @@ mod key_tests {
             PendingComposerSubmission {
                 id: PendingComposerSubmissionId::RootRun(7),
                 session_id: None,
+                prompt_review_target: None,
                 draft_revision: 3,
                 draft_text: "root".to_string(),
             }
         ]));
+    }
+
+    #[tokio::test]
+    async fn stale_prompt_review_owner_cannot_be_sent_as_a_replacement_run_or_steer() {
+        let (_temp, mut controller, _session_id) =
+            tui_controller_with_session("exact-prompt-review-owner").await;
+        let captured = controller.state.active_turn_expectation;
+        let target = PromptReviewTarget {
+            request_id: 51,
+            owner: PromptReviewOwner {
+                session_id: controller.state.current_session_id,
+                expected_active_turn: captured,
+            },
+        };
+
+        for replacement in [
+            ActiveTurnExpectation::Turn {
+                turn_id: crate::protocol::TurnId::new(),
+                revision: captured.revision() + 1,
+            },
+            ActiveTurnExpectation::Idle {
+                latest_turn_id: Some(crate::protocol::TurnId::new()),
+                revision: captured.revision() + 2,
+            },
+        ] {
+            assert!(
+                controller
+                    .state
+                    .begin_tui_prompt_enhance(target, "captured raw prompt")
+            );
+            assert!(
+                controller.state.finish_prompt_enhance(
+                    target.request_id,
+                    "captured enhanced prompt".to_string()
+                )
+            );
+            controller.state.active_turn_expectation = replacement;
+
+            controller
+                .handle_enhance_review_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE))
+                .await
+                .expect("stale review send rejection");
+
+            assert!(!controller.root_run_lifecycle.is_active());
+            assert!(controller.pending_composer_submissions.is_empty());
+            assert_eq!(
+                controller
+                    .state
+                    .prompt_review
+                    .as_ref()
+                    .and_then(|review| review.tui_target()),
+                Some(target),
+                "a rejected review send must preserve its exact owner and draft"
+            );
+            assert_eq!(
+                controller
+                    .state
+                    .prompt_review
+                    .as_ref()
+                    .map(|review| review.current_draft_text.as_str()),
+                Some("captured enhanced prompt")
+            );
+            controller.state.cancel_prompt_review_if_current(target);
+            controller.state.active_turn_expectation = captured;
+        }
+    }
+
+    #[tokio::test]
+    async fn known_stale_idle_owner_cannot_start_tui_review_or_enhancement() {
+        let (_temp, mut controller, session_id) =
+            tui_controller_with_session("stale-review-start-owner").await;
+        let captured = controller.state.active_turn_expectation;
+        assert!(matches!(captured, ActiveTurnExpectation::Idle { .. }));
+        controller
+            .app
+            .store
+            .session_repo()
+            .admit_session_turn(session_id, crate::protocol::TurnId::new())
+            .await
+            .expect("replacement admission")
+            .expect("replacement admitted");
+        controller.composer.insert_str("keep local review draft");
+
+        controller
+            .start_uncommitted_review()
+            .await
+            .expect("stale uncommitted review rejection");
+        assert!(!controller.root_run_lifecycle.is_active());
+        assert!(controller.pending_composer_submissions.is_empty());
+
+        controller
+            .start_prompt_enhance()
+            .await
+            .expect("stale enhancement rejection");
+        assert!(controller.pending_prompt_enhance.is_none());
+        assert!(controller.state.prompt_review.is_none());
+        assert_eq!(
+            textarea_value(&controller.composer),
+            "keep local review draft"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_review_is_consumed_only_by_its_exact_durable_acceptance() {
+        let (_temp, mut controller, session_id) =
+            tui_controller_with_session("prompt-review-durable-settlement").await;
+        let target = PromptReviewTarget {
+            request_id: 52,
+            owner: PromptReviewOwner {
+                session_id: Some(session_id),
+                expected_active_turn: controller.state.active_turn_expectation,
+            },
+        };
+        assert!(
+            controller
+                .state
+                .begin_tui_prompt_enhance(target, "raw reviewed prompt")
+        );
+        assert!(
+            controller
+                .state
+                .finish_prompt_enhance(target.request_id, "enhanced prompt".to_string())
+        );
+
+        controller.track_pending_composer_submission_with_review(
+            PendingComposerSubmissionId::RootRun(70),
+            Some(session_id),
+            Some(target),
+        );
+        assert!(controller.settle_pending_composer_submission(
+            PendingComposerSubmissionId::RootRun(70),
+            session_id,
+            false,
+        ));
+        assert_eq!(
+            controller
+                .state
+                .prompt_review
+                .as_ref()
+                .and_then(|review| review.tui_target()),
+            Some(target),
+            "a rejected/pre-admission settlement must preserve review and draft"
+        );
+
+        controller.track_pending_composer_submission_with_review(
+            PendingComposerSubmissionId::RootRun(71),
+            Some(session_id),
+            Some(target),
+        );
+        assert!(controller.settle_pending_composer_submission(
+            PendingComposerSubmissionId::RootRun(71),
+            session_id,
+            true,
+        ));
+        assert!(controller.state.prompt_review.is_none());
+    }
+
+    #[test]
+    fn composer_command_kind_comes_only_from_the_captured_active_turn_owner() {
+        let turn_a = crate::protocol::TurnId::new();
+        assert!(captured_composer_submission_is_steer(
+            true,
+            "steer A",
+            false,
+            ActiveTurnExpectation::Turn {
+                turn_id: turn_a,
+                revision: 1,
+            },
+        ));
+        assert!(!captured_composer_submission_is_steer(
+            true,
+            "new turn",
+            false,
+            ActiveTurnExpectation::Idle {
+                latest_turn_id: Some(turn_a),
+                revision: 1,
+            },
+        ));
+        assert!(!captured_composer_submission_is_steer(
+            true,
+            "review",
+            true,
+            ActiveTurnExpectation::Turn {
+                turn_id: turn_a,
+                revision: 1,
+            },
+        ));
     }
 
     #[test]

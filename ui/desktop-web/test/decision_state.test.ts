@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   beginLocalDecision,
   beginPermissionDecision,
+  beginPermissionStop,
   failLocalDecision,
   failPermissionDecision,
   finishLocalDecision,
@@ -54,6 +55,38 @@ test("permission decision dispatches once while pending and recovers after failu
     phase: "ready",
     requestId: "9007199254740993",
   });
+});
+
+test("canonical Stop shares the permission modal single-flight owner without becoming Abort", () => {
+  const owner = {
+    permissionDecision: null as PermissionDecisionState | null,
+    nextPermissionSubmissionId: 1,
+  };
+  const stop = beginPermissionStop(owner, "A");
+  assert.ok(stop);
+  assert.equal(stop.decision, "stop");
+  assert.deepEqual(owner.permissionDecision, {
+    phase: "submitting",
+    requestId: "A",
+    submissionId: 1,
+    decision: "stop",
+  });
+  assert.equal(beginPermissionStop(owner, "A"), null);
+  assert.equal(
+    beginPermissionDecision(owner, "A", "abort"),
+    null,
+    "Stop-first must prevent an ApprovalAborted answer from becoming a second writer",
+  );
+  assert.equal(
+    beginPermissionDecision(owner, "A", "approved"),
+    null,
+    "Stop-first must also prevent approval from becoming a second writer",
+  );
+  reconcilePermissionDecision(owner, "A");
+  assert.equal(owner.permissionDecision?.phase, "submitting");
+  reconcilePermissionDecision(owner, "B");
+  assert.deepEqual(owner.permissionDecision, { phase: "ready", requestId: "B" });
+  assert.equal(finishPermissionDecision(owner, stop), false);
 });
 
 test("a new permission id owns fresh state and ignores every late settlement from the old id", () => {

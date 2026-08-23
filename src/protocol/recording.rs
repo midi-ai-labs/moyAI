@@ -4,8 +4,9 @@ use crate::protocol::{
     MAX_PROTOCOL_PAGE_LIMIT, ProtocolEventStore, RuntimeEvent, RuntimeEventMsg,
     SqliteProtocolEventStore, TurnId, project_protocol_run_event,
 };
+use crate::runtime::event_bus::validate_run_event_durability;
 use crate::runtime::{RunEventSink, SessionRuntimeEventPublisher};
-use crate::session::{AdmissionId, RunEvent, SessionId};
+use crate::session::{AdmissionId, RunEvent, RunEventDurability, SessionId};
 
 /// Replays committed protocol events into process-local observers.
 ///
@@ -252,6 +253,11 @@ impl<S: RunEventSink + ?Sized> RunEventSink for ProtocolRecordingSink<'_, S> {
     }
 
     fn emit_committed(&mut self, event: RunEvent) -> Result<(), RuntimeError> {
+        validate_run_event_durability(
+            &event,
+            RunEventDurability::Committed,
+            "ProtocolRecordingSink::emit_committed",
+        )?;
         if matches!(event, RunEvent::TurnTerminal { .. }) {
             // Let the native recorder flush its buffered deltas and atomically project the exact
             // canonical terminal before a fallible renderer runs. The shared projector then
@@ -270,6 +276,11 @@ impl<S: RunEventSink + ?Sized> RunEventSink for ProtocolRecordingSink<'_, S> {
     }
 
     fn emit_runtime_only(&mut self, event: RunEvent) -> Result<(), RuntimeError> {
+        validate_run_event_durability(
+            &event,
+            RunEventDurability::RuntimeOnly,
+            "ProtocolRecordingSink::emit_runtime_only",
+        )?;
         self.inner.emit_runtime_only(event)
     }
 
@@ -363,6 +374,54 @@ mod tests {
             ProtocolRecordingSink::new(event_store, Some(session_id), turn_id, &mut inner);
 
         assert_eq!(sink.reserve_sequence_no(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_sink_paths_reject_run_event_durability_mismatches() -> Result<(), StorageError> {
+        let temp = tempfile::tempdir()?;
+        let data_dir = camino::Utf8PathBuf::from_path_buf(temp.path().join("data"))
+            .expect("temp path should be utf8");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir,
+        };
+        let store = SqliteStore::open(&paths)?;
+        store.migrate()?;
+        let mut inner = NullSink;
+        let mut sink = ProtocolRecordingSink::new(
+            store.protocol_event_store(),
+            Some(SessionId::new()),
+            TurnId::new(),
+            &mut inner,
+        );
+
+        let committed_on_runtime_path = sink
+            .emit_runtime_only(RunEvent::RecoverableRuntimeFeedback {
+                session_id: SessionId::new(),
+                message: "canonical warning".to_string(),
+            })
+            .expect_err("committed facts cannot enter the lossy runtime-only path");
+        assert!(
+            committed_on_runtime_path
+                .to_string()
+                .contains("RuntimeOnly")
+        );
+        assert!(committed_on_runtime_path.to_string().contains("Committed"));
+
+        let runtime_on_committed_path = sink
+            .emit_committed(RunEvent::TextDelta {
+                response_id: crate::protocol::ModelResponseId::new(),
+                delta: "ephemeral".to_string(),
+            })
+            .expect_err("runtime telemetry cannot claim an existing durable commit");
+        assert!(runtime_on_committed_path.to_string().contains("Committed"));
+        assert!(
+            runtime_on_committed_path
+                .to_string()
+                .contains("RuntimeOnly")
+        );
         Ok(())
     }
 

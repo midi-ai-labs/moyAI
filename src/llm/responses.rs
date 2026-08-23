@@ -1901,8 +1901,7 @@ mod tests {
             model.provider_metadata_mode,
             ProviderApiMode::Responses,
             ProviderDeadlines {
-                response_start_timeout_ms: 10_000,
-                stream_idle_timeout_ms: 10_000,
+                request_timeout_ms: 10_000,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 0,
             },
@@ -2143,6 +2142,22 @@ mod tests {
         assert_eq!(wire["stop"], json!(["DONE", "STOP"]));
         assert_eq!(wire["num_ctx"], json!(131_072));
         assert_eq!(wire["min_p"], json!(0.05));
+
+        let no_thinking = ReasoningRequest {
+            effort: Some(ReasoningEffort::None),
+            summary: ReasoningSummary::None,
+        };
+        let no_thinking_wire = to_responses_request(
+            &request,
+            ResponsesRequestOptions {
+                reasoning_request: Some(&no_thinking),
+                reasoning_capability: ProviderReasoningCapability::Responses {
+                    supports_summary: false,
+                },
+            },
+        )
+        .expect("typed none reasoning effort should serialize on Responses");
+        assert_eq!(no_thinking_wire["reasoning"], json!({ "effort": "none" }));
     }
 
     #[test]

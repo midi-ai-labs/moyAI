@@ -219,6 +219,10 @@ impl AppBootstrap {
                     "warning: startup could not reconcile every committed terminal into the native harness: {error}"
                 );
             }
+            store
+                .side_chat_repo()
+                .finalize_pending_deletions()
+                .map_err(|error| AppBootstrapError::Message(error.to_string()))?;
             let agent_runtime = Arc::new(crate::app::AgentRuntime::new(
                 store.clone(),
                 session_service.clone(),

@@ -58,16 +58,15 @@ model transportの既定値は次の通り。
 [model]
 provider_api_mode = "responses"
 reasoning_summary = "none"
-request_timeout_ms = 1800000
-stream_idle_timeout_ms = 1800000
+request_timeout_ms = 3600000
 ```
 
-`request_timeout_ms`はconnect attempt、connect retry待機、request body送信、response header待ちを共有する一つの
-response-start operation budget、`stream_idle_timeout_ms`はstream開始後のSSE event未着に対する
-rolling timeoutで、どちらも既定値は1,800,000ms（30分）。この2設定はconfigまたは対応するenvironment variableで
-明示overrideできるno-progress deadlineであり、aggregate stream capではない。別にresponse header受信後は、
-製品固定で変更できない1,800,000ms（30分）のaggregate stream-duration limitが適用され、どちらの設定を
-増やしてもこの上限は延長されない。
+`request_timeout_ms`は1回のprovider generation request全体を所有する単一deadlineで、最初のPOST attemptから
+connect retry待機、request body送信、response header待ち、stream terminalまでを含み、header受信時に時計を
+リセットしない。既定値は3,600,000ms（60分）で、設定可能な上限も同じ値。Desktop Settings、TUI、
+ImportしたTOML、`MOYAI_REQUEST_TIMEOUT_MS`は同じ値を使う。旧`stream_idle_timeout_ms` TOML keyと
+`MOYAI_STREAM_IDLE_TIMEOUT_MS` environment variableは移行入力としてだけ受理し、旧keyだけならcanonical値へ昇格、
+新旧が同値なら受理、異なる値ならconfig errorとする。
 `max_output_tokens`は通常文だけでなくreasoningとtool-call引数のserialized output全体を制限する。
 文書全体を`write`するようなtool-heavy runではproviderごとに検証済みのbudgetを使い、製品既定値は
 `32768`とする。LM Studioが
@@ -82,8 +81,9 @@ providerへの到達、catalogへのmodel登録、model instanceのload状態は
 `loaded_instances`が非空なら`loaded`、明示的な空配列なら`not loaded`、fieldがなければ`unknown`である。
 OpenAI-compatible catalogだけの場合もload状態は`unknown`とし、catalog登録からon-demand loadの実行有無を推測しない。
 configはnested sectionを含めてstrictにparseし、未知keyや廃止済み`stream_max_retries`を黙って無視しない。
-errorにはparseに失敗したconfig fileの正確なpathを表示する。個人configは黙って移行しないため、報告されたfileから
-retiredな`stream_max_retries`、`[model_providers.*]`、`session.auto_compact_*`を削除またはcurrent keyへ修正してから再読込する。
+errorにはparseに失敗したconfig fileの正確なpathを表示する。`stream_idle_timeout_ms`からcanonical
+`request_timeout_ms`への明示した互換変換を除き、個人configは黙って移行しない。報告されたfileからretiredな
+`stream_max_retries`、`[model_providers.*]`、`session.auto_compact_*`を削除またはcurrent keyへ修正してから再読込する。
 
 ここでいうconfigのstrict parseとproviderのstrict tool schemaは別の契約である。current provider contractは
 server-side strict tool validationを宣言しないため、core / MCP tool schemaのRust型にもChat Completions / Responsesの
@@ -135,8 +135,9 @@ Desktop:
 - command palette: `Ctrl+K` または composer の検索/コマンドボタン。
 - Markdown export: transcript 表示中に export ボタンまたは `F9`。
 - 停止: 実行中に stop button を押すと、表示時のworkspace / root session / run generation / Agent Tree epochが一致するexact current root executionだけを停止する。実行中またはdetachedなchildへcascadeしない。画面更新後の古いStopは新しいrunへ適用されず、tree全体の停止は別名の明示的なtree-stop操作として扱う。
-- Settings: 「設定フォルダーを開く」はglobal `config.toml`の場所を開き、「データフォルダーを開く」はSQLite、履歴、harness等を保存するRoaming data directory（`MOYAI_DATA_DIR`指定時はそのdirectory）を開く。初回起動のInitial SetupにあるTOML設定Importでは、`config(1).toml`や`config_202608.toml`など`.toml` extensionを持つ任意名のfileを選択でき、TOML schemaと設定値を検証してからglobal `config.toml`へ取り込む。
+- Settings: 「設定フォルダーを開く」はglobal `config.toml`の場所を開き、「データフォルダーを開く」はSQLite、履歴、harness等を保存するRoaming data directory（`MOYAI_DATA_DIR`指定時はそのdirectory）を開く。初回起動のInitial Setupでは「設定を保存して開始」を推奨の完了方法として表示し、「この起動中だけ適用」は再起動後へ引き継がない。Initial Setupは保存または一時適用が完了するまで閉じず、TOML設定Importのfile pickerをcancelした場合は設定を変更しない。Importでは、`config(1).toml`や`config_202608.toml`など`.toml` extensionを持つ任意名のfileを選択でき、TOML schemaと設定値を検証してからglobal `config.toml`へ取り込む。
 - LLM URL: 現在のURL・Provider mode・modelを変えずにContext windowまたはMax output tokensだけを編集した場合、モデル一覧を再取得せずにUIセッションへ適用または設定ファイルへ保存できる。URL・mode・modelを変更した場合は、先に「モデル読込」を行う。
+- サイドチャット: sessionを開き、左サイドバーの`設定`にある`Side Chat` sectionで専用のLLM URLを入力して`モデル読込`を押し、取得した一覧からmodelを選択する。一覧に現れない互換modelは`一覧にないモデルIDを入力`からIDを直接指定できる。選択後に設定を適用する。右ペインの`サイドチャット`は設定済みmodelと会話を表示し、未設定時はSettingsへの導線だけを表示する。停止中は同じsectionからmodelを更新できるが、実行中・削除中は変更できない。設定・履歴・未送信draft・実行・Stopはowning session単位で保存され、メインtaskのmodel設定・composer・実行・Stopとは分離される。取得したmodel一覧も選択中sessionとURLに紐づけて表示し、別sessionや別URLの結果を混ぜないが、app再起動後は必要に応じて`モデル読込`を再実行する。サイドチャットはtext-onlyかつtool-lessで、workspaceの読取・変更やpermission dialogを行わない。現行のside provider設定は認証不要のendpointを対象とし、main providerのAPI keyやcustom headerを継承・転送しない。ペインを隠す、sessionを移動する、windowを閉じる操作では履歴を削除しない。`サイドチャットを削除`を確認した場合だけ、sideのcanonical conversationと未送信draftを破棄し、メインsessionとworkspaceは残す。
 
 Git repository内のsubdirectoryをworkspaceとして選んだ場合、選択したdirectoryがtoolとsandboxの境界になる。ancestorのGit rootはproject一覧、履歴、Git機能、ancestor instruction探索に使うが、選択directoryのsiblingをworkspace内にはしない。同じsessionを開き直した場合も、保存済みdirectoryからこの境界を復元する。built-in reviewがshell用に提示するGit commandも、末尾の`-- .`で選択directoryへscopeされる。
 
@@ -188,10 +189,11 @@ Windows sandboxはcurrent userから作る`WRITE_RESTRICTED` token、decision時
 
 - `実行する`: tool call を承認して続行する。
 - `実行せず、指示を変更する`: tool call を実行せず、要求元のtaskを停止して次の指示を待つ。拒否結果をmodelへ返して自動retryさせる動作ではない。
+- `実行停止`: Desktopのpermission dialogから行う通常のStop。permissionへAbort回答を送らず、表示時のworkspace / session / runtime owner / confirmation IDを検証して、exact current root execution（rootが既にterminalで要求元だけが残る場合はそのexact permission owner）へcanonical `UserStop`を要求する。`ApprovalAborted`や明示的なtree stopとは別のterminal causeである。
 
 Desktopでは`Esc`も「実行せず、指示を変更する」と同じ動作になる。CLIの`N`または空入力、TUIの`d`または`Esc`も同様に、そのconfirmationを要求したexact executionだけを停止する。TUIの`Ctrl+X`はexact current root executionへの通常Stopであり、個別のpermission応答とも、別名の明示的なtree-stop操作とも異なる。
 
-このとき、そのconfirmationを要求したtoolは`Failed`ではなく`Declined`（未実行）となり、要求元executionは`Interrupted`かつ`ApprovalAborted`として保存される。root、sibling、descendantへ自動伝播せず、それらのadmit済みtoolも同じ理由で`Cancelled`にしない。内部/API上の「実行せず続行する」`Denied`、通常のStop (`UserStop`)、明示的なtree stop (`TreeStopped`)、runtime・storage・providerの失敗 (`Failed`) は別の状態であり、互いにpermission拒否へ変換しない。sessionを開き直した後も、このtyped状態から同じ表示を復元する。
+「実行せず、指示を変更する」のとき、そのconfirmationを要求したtoolは`Failed`ではなく`Declined`（未実行）となり、要求元executionは`Interrupted`かつ`ApprovalAborted`として保存される。root、sibling、descendantへ自動伝播せず、それらのadmit済みtoolも同じ理由で`Cancelled`にしない。内部/API上の「実行せず続行する」`Denied`、通常のStop (`UserStop`)、明示的なtree stop (`TreeStopped`)、runtime・storage・providerの失敗 (`Failed`) は別の状態であり、互いにpermission拒否へ変換しない。sessionを開き直した後も、このtyped状態から同じ表示を復元する。
 
 例: `curl http://...`、`git pull`、delete/move 系 shell command、workspace 外書き込み。
 

@@ -6,7 +6,6 @@ model = "qwen/qwen3.6-35b-a3b"
 provider_metadata_mode = "lm_studio_native_required"
 api_key_env = "OPENAI_API_KEY"
 request_timeout_ms = 300000
-stream_idle_timeout_ms = 300000
 connect_timeout_ms = 10000
 max_retries = 2
 context_window = 131072

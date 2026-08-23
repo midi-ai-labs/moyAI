@@ -771,8 +771,7 @@ mod tests {
             ProviderMetadataMode::OpenAiCompatibleOnly,
             ProviderApiMode::Responses,
             ProviderDeadlines {
-                response_start_timeout_ms: 10_000,
-                stream_idle_timeout_ms: 10_000,
+                request_timeout_ms: 10_000,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 0,
             },
@@ -829,8 +828,7 @@ mod tests {
             ProviderMetadataMode::OpenAiCompatibleOnly,
             ProviderApiMode::ChatCompletions,
             ProviderDeadlines {
-                response_start_timeout_ms: 10_000,
-                stream_idle_timeout_ms: 10_000,
+                request_timeout_ms: 10_000,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 0,
             },
@@ -894,8 +892,7 @@ mod tests {
             ProviderMetadataMode::OpenAiCompatibleOnly,
             ProviderApiMode::ChatCompletions,
             ProviderDeadlines {
-                response_start_timeout_ms: 10_000,
-                stream_idle_timeout_ms: 10_000,
+                request_timeout_ms: 10_000,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 0,
             },
@@ -957,8 +954,7 @@ mod tests {
             ProviderMetadataMode::OpenAiCompatibleOnly,
             ProviderApiMode::Responses,
             ProviderDeadlines {
-                response_start_timeout_ms: 10_000,
-                stream_idle_timeout_ms: 10_000,
+                request_timeout_ms: 10_000,
                 connect_timeout_ms: 1_000,
                 max_connect_retries: 0,
             },

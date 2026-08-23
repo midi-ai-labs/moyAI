@@ -5,7 +5,6 @@ pub struct DesktopComposerState {
     pub draft_prompt: String,
     pub image_attachment_input: String,
     pub image_attachment_paths: Vec<camino::Utf8PathBuf>,
-    pub review_draft_text: String,
     owner_workspace_path: String,
     owner_session_id: Option<SessionId>,
     owner_generation: u64,
@@ -56,7 +55,6 @@ impl DesktopComposerState {
         self.draft_prompt.clear();
         self.image_attachment_input.clear();
         self.image_attachment_paths.clear();
-        self.review_draft_text.clear();
     }
 
     fn advance_owner_generation(&mut self) {

@@ -960,6 +960,9 @@ fn model_visible_non_success_kind(
     tool_metadata: &serde_json::Value,
     sandbox_failure_hint: Option<crate::tool::shell::ShellSandboxFailureHint>,
 ) -> Option<&'static str> {
+    if status == ToolLifecycleStatus::Declined {
+        return Some("permission_declined");
+    }
     if tool_name == "shell" {
         if sandbox_failure_hint
             == Some(
@@ -1234,8 +1237,7 @@ mod tests {
             model.provider_metadata_mode,
             ProviderApiMode::ChatCompletions,
             ProviderDeadlines {
-                response_start_timeout_ms: 1,
-                stream_idle_timeout_ms: 1,
+                request_timeout_ms: 1,
                 connect_timeout_ms: 1,
                 max_connect_retries: 0,
             },
@@ -1687,6 +1689,23 @@ mod tests {
 
         assert!(projected.len() <= MODEL_VISIBLE_NON_SUCCESS_MAX_BYTES);
         assert!(projected.contains("kind: tool_execution_failed"));
+        assert!(projected.ends_with(output));
+    }
+
+    #[test]
+    fn permission_decline_is_typed_and_disables_automatic_retry() {
+        let output = "automatic permission guardian could not authorize the action";
+        let projected = model_visible_tool_output(
+            "shell",
+            ToolLifecycleStatus::Declined,
+            output,
+            &serde_json::json!({}),
+        );
+
+        assert!(projected.len() <= MODEL_VISIBLE_NON_SUCCESS_MAX_BYTES);
+        assert!(projected.contains("lifecycle_status: declined"));
+        assert!(projected.contains("kind: permission_declined"));
+        assert!(projected.contains("automatic_retry: false"));
         assert!(projected.ends_with(output));
     }
 

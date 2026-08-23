@@ -5,6 +5,28 @@ use super::model::{
     PartialShellConfig, PartialToolOutputConfig, PartialWorkspaceConfig, ResolvedConfig,
 };
 
+pub(crate) fn normalize_request_timeout_alias(
+    patch: &mut PartialResolvedConfig,
+    canonical_name: &str,
+    legacy_name: &str,
+) -> Result<(), String> {
+    let Some(model) = patch.model.as_mut() else {
+        return Ok(());
+    };
+    let canonical = model.request_timeout_ms;
+    let legacy = model.legacy_stream_idle_timeout_ms;
+    if let (Some(canonical), Some(legacy)) = (canonical, legacy)
+        && canonical != legacy
+    {
+        return Err(format!(
+            "`{canonical_name}` and legacy `{legacy_name}` must match when both are set (got {canonical} and {legacy}); remove `{legacy_name}` or set both to one value"
+        ));
+    }
+    model.request_timeout_ms = canonical.or(legacy);
+    model.legacy_stream_idle_timeout_ms = None;
+    Ok(())
+}
+
 fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfig) {
     if let Some(value) = patch.base_url {
         target.base_url = value;
@@ -35,9 +57,6 @@ fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfi
     }
     if let Some(value) = patch.request_timeout_ms {
         target.request_timeout_ms = value;
-    }
-    if let Some(value) = patch.stream_idle_timeout_ms {
-        target.stream_idle_timeout_ms = value;
     }
     if let Some(value) = patch.connect_timeout_ms {
         target.connect_timeout_ms = value;
@@ -311,7 +330,7 @@ pub fn apply_patch(mut target: ResolvedConfig, patch: PartialResolvedConfig) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::apply_patch;
+    use super::{apply_patch, normalize_request_timeout_alias};
     use crate::config::model::{
         ChatCompletionsReasoningParameters, PartialModelConfig, PartialResolvedConfig,
         ProviderApiMode, ReasoningEffort, ReasoningSummary, ResolvedConfig,
@@ -352,10 +371,9 @@ mod tests {
     }
 
     #[test]
-    fn provider_no_progress_timeouts_share_a_default_and_remain_overridable() {
+    fn provider_request_timeout_has_one_default_and_remains_overridable() {
         let defaults = ResolvedConfig::default();
-        assert_eq!(defaults.model.request_timeout_ms, 1_800_000);
-        assert_eq!(defaults.model.stream_idle_timeout_ms, 1_800_000);
+        assert_eq!(defaults.model.request_timeout_ms, 3_600_000);
         assert_eq!(defaults.model.max_output_tokens, 32_768);
 
         let resolved = apply_patch(
@@ -363,7 +381,6 @@ mod tests {
             PartialResolvedConfig {
                 model: Some(PartialModelConfig {
                     request_timeout_ms: Some(45_000),
-                    stream_idle_timeout_ms: Some(20_000),
                     ..PartialModelConfig::default()
                 }),
                 ..PartialResolvedConfig::default()
@@ -371,6 +388,57 @@ mod tests {
         );
 
         assert_eq!(resolved.model.request_timeout_ms, 45_000);
-        assert_eq!(resolved.model.stream_idle_timeout_ms, 20_000);
+    }
+
+    #[test]
+    fn legacy_stream_timeout_promotes_only_when_unambiguous() {
+        for (canonical, legacy, expected) in [
+            (None, Some(45_000), Some(45_000)),
+            (Some(45_000), Some(45_000), Some(45_000)),
+            (Some(45_000), None, Some(45_000)),
+        ] {
+            let mut patch = PartialResolvedConfig {
+                model: Some(PartialModelConfig {
+                    request_timeout_ms: canonical,
+                    legacy_stream_idle_timeout_ms: legacy,
+                    ..PartialModelConfig::default()
+                }),
+                ..PartialResolvedConfig::default()
+            };
+
+            normalize_request_timeout_alias(
+                &mut patch,
+                "model.request_timeout_ms",
+                "model.stream_idle_timeout_ms",
+            )
+            .expect("compatible timeout fields");
+            let model = patch.model.expect("model patch");
+            assert_eq!(model.request_timeout_ms, expected);
+            assert_eq!(model.legacy_stream_idle_timeout_ms, None);
+        }
+    }
+
+    #[test]
+    fn mismatched_legacy_stream_timeout_is_rejected_explicitly() {
+        let mut patch = PartialResolvedConfig {
+            model: Some(PartialModelConfig {
+                request_timeout_ms: Some(45_000),
+                legacy_stream_idle_timeout_ms: Some(20_000),
+                ..PartialModelConfig::default()
+            }),
+            ..PartialResolvedConfig::default()
+        };
+
+        let error = normalize_request_timeout_alias(
+            &mut patch,
+            "model.request_timeout_ms",
+            "model.stream_idle_timeout_ms",
+        )
+        .expect_err("different canonical and legacy values must fail");
+
+        assert!(error.contains("model.request_timeout_ms"));
+        assert!(error.contains("model.stream_idle_timeout_ms"));
+        assert!(error.contains("45000"));
+        assert!(error.contains("20000"));
     }
 }
