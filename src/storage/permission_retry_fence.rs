@@ -1,6 +1,7 @@
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -252,7 +253,13 @@ impl SqlitePermissionRetryFenceStore {
         Self { connection }
     }
 
-    fn try_connection(&self) -> Result<MutexGuard<'_, Connection>, StorageError> {
+    fn connection(&self) -> Result<MutexGuard<'_, Connection>, StorageError> {
+        self.connection.lock().map_err(|_| {
+            StorageError::Message("permission retry fence storage mutex is poisoned".to_string())
+        })
+    }
+
+    fn try_cleanup_connection(&self) -> Result<MutexGuard<'_, Connection>, StorageError> {
         match self.connection.try_lock() {
             Ok(connection) => Ok(connection),
             Err(TryLockError::WouldBlock) => Err(StorageError::Message(
@@ -288,7 +295,7 @@ impl SqlitePermissionRetryFenceStore {
         validate_timestamp(now_ms)?;
         let identity_sha256 = identity_sha256.into();
         validate_sha256(&identity_sha256, "permission retry fence identity")?;
-        let mut connection = self.try_connection()?;
+        let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current_authority_history_item_id =
             latest_authority_history_item_id(&transaction, key.root_session_id)?;
@@ -368,7 +375,7 @@ impl SqlitePermissionRetryFenceStore {
         now_ms: i64,
     ) -> Result<PermissionEffectAdmission, StorageError> {
         validate_timestamp(now_ms)?;
-        let mut connection = self.try_connection()?;
+        let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current_authority_history_item_id =
             latest_authority_history_item_id(&transaction, claim.key.root_session_id)?;
@@ -437,7 +444,7 @@ impl SqlitePermissionRetryFenceStore {
         &self,
         claim: &PermissionReviewClaim,
     ) -> Result<PermissionReviewTransition, StorageError> {
-        let connection = self.try_connection()?;
+        let connection = self.connection()?;
         let deleted = delete_owned_non_denied(&connection, claim)?;
         Ok(if deleted == 1 {
             PermissionReviewTransition::Applied
@@ -450,8 +457,17 @@ impl SqlitePermissionRetryFenceStore {
         &self,
         claim: &PermissionReviewClaim,
     ) -> Result<PermissionReviewTransition, StorageError> {
-        let connection = self.try_connection()?;
-        let deleted = delete_owned_approved_effect(&connection, claim)?;
+        let connection = self.try_cleanup_connection()?;
+        let busy_timeout_ms =
+            connection.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, u64>(0))?;
+        connection.busy_timeout(Duration::ZERO)?;
+        let delete_result = delete_owned_approved_effect(&connection, claim);
+        let restore_result = connection.busy_timeout(Duration::from_millis(busy_timeout_ms));
+        let deleted = match (delete_result, restore_result) {
+            (Ok(deleted), Ok(())) => deleted,
+            (Err(error), _) => return Err(error),
+            (Ok(_), Err(error)) => return Err(error.into()),
+        };
         Ok(if deleted == 1 {
             PermissionReviewTransition::Applied
         } else {
@@ -463,7 +479,7 @@ impl SqlitePermissionRetryFenceStore {
         &self,
         key: &PermissionRetryFenceKey,
     ) -> Result<Option<PermissionRetryFenceRecord>, StorageError> {
-        let connection = self.try_connection()?;
+        let connection = self.connection()?;
         record_for_key(&connection, key)
     }
 
@@ -475,7 +491,7 @@ impl SqlitePermissionRetryFenceStore {
         now_ms: i64,
     ) -> Result<PermissionReviewTransition, StorageError> {
         validate_timestamp(now_ms)?;
-        let connection = self.try_connection()?;
+        let connection = self.connection()?;
         let updated = connection.execute(
             "UPDATE permission_retry_fences
              SET state = ?7, outcome = ?8, updated_at_ms = ?9
@@ -732,9 +748,9 @@ fn validate_timestamp(value: i64) -> Result<(), StorageError> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use rusqlite::{Connection, params};
 
@@ -946,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn busy_mutex_returns_an_error_and_lease_drop_remains_fail_closed() {
+    fn ordinary_claim_waits_for_transient_mutex_contention_and_lease_drop_remains_fail_closed() {
         let connection = open_test_connection(None);
         let session_id = SessionId::new();
         let authority_id = HistoryItemId::new();
@@ -965,12 +981,40 @@ mod tests {
         );
 
         let connection = shared.lock().expect("hold sqlite mutex");
-        let error = store
-            .record(&key)
-            .expect_err("busy storage must return without blocking");
+        let waiting_store = store.clone();
+        let waiting_key = PermissionRetryFenceKey::new(
+            session_id,
+            2,
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        )
+        .expect("valid waiting key");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let waiting = thread::spawn(move || {
+            started_tx.send(()).expect("signal waiting claim");
+            let claimed = match waiting_store.begin_review_at(
+                waiting_key,
+                authority_id,
+                IDENTITY_SHA256,
+                101,
+            ) {
+                Ok(BeginPermissionReview::Claimed(lease)) => {
+                    lease.release().expect("release waiting claim")
+                        == PermissionReviewTransition::Applied
+                }
+                _ => false,
+            };
+            result_tx
+                .send(claimed)
+                .expect("return waiting claim result");
+        });
+        started_rx.recv().expect("waiting claim started");
         assert!(
-            error.to_string().contains("storage is busy"),
-            "unexpected busy storage error: {error}"
+            matches!(
+                result_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "an ordinary fence claim must serialize behind transient shared-storage ownership"
         );
         drop(lease);
         assert_eq!(
@@ -983,6 +1027,13 @@ mod tests {
         );
         drop(connection);
 
+        assert!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("waiting claim completed after mutex release")
+        );
+        waiting.join().expect("join waiting claim");
+
         assert_eq!(
             store
                 .record(&key)
@@ -990,6 +1041,112 @@ mod tests {
                 .expect("busy Drop must retain the fence")
                 .state,
             PermissionRetryFenceState::AllowedPending
+        );
+    }
+
+    #[test]
+    fn approved_lease_drop_does_not_wait_for_an_external_sqlite_writer() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database_path = directory.path().join("permission-fence.sqlite3");
+        let session_id = SessionId::new();
+        let authority_id = HistoryItemId::new();
+        let key = PermissionRetryFenceKey::new(session_id, 1, FAMILY_SHA256).expect("valid key");
+
+        let connection = open_test_connection(Some(&database_path));
+        seed_session_and_authority(&connection, session_id, authority_id, 0, "user_turn");
+        let store = test_store(connection);
+        let lease = claimed(
+            store
+                .begin_review_at(key.clone(), authority_id, IDENTITY_SHA256, 100)
+                .expect("begin review"),
+        );
+        assert_eq!(
+            lease.mark_allowed_pending().expect("record Guardian allow"),
+            PermissionReviewTransition::Applied
+        );
+
+        let external_writer = open_test_connection(Some(&database_path));
+        external_writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold an external SQLite write transaction");
+        let started_at = Instant::now();
+        drop(lease);
+        let elapsed = started_at.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "lease Drop must not inherit the connection busy timeout: {elapsed:?}"
+        );
+        external_writer
+            .execute_batch("ROLLBACK")
+            .expect("release external SQLite writer");
+
+        assert_eq!(
+            store
+                .record(&key)
+                .expect("read retained fence")
+                .expect("busy Drop must retain the fence")
+                .state,
+            PermissionRetryFenceState::AllowedPending
+        );
+    }
+
+    #[test]
+    fn admission_waiting_for_mutex_rechecks_authority_before_effect() {
+        let connection = open_test_connection(None);
+        let session_id = SessionId::new();
+        let first_authority = HistoryItemId::new();
+        let second_authority = HistoryItemId::new();
+        seed_session_and_authority(&connection, session_id, first_authority, 0, "user_turn");
+        let shared = Arc::new(Mutex::new(connection));
+        let store = SqlitePermissionRetryFenceStore::new(shared.clone());
+        let key = PermissionRetryFenceKey::new(session_id, 1, FAMILY_SHA256).expect("valid key");
+        let lease = claimed(
+            store
+                .begin_review_at(key.clone(), first_authority, IDENTITY_SHA256, 100)
+                .expect("begin review"),
+        );
+        assert_eq!(
+            lease.mark_allowed_pending().expect("record Guardian allow"),
+            PermissionReviewTransition::Applied
+        );
+
+        let connection = shared.lock().expect("hold sqlite mutex");
+        let waiting_lease = lease.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let waiting = thread::spawn(move || {
+            started_tx.send(()).expect("signal waiting admission");
+            result_tx
+                .send(waiting_lease.admit_if_authority_current())
+                .expect("return waiting admission result");
+        });
+        started_rx.recv().expect("waiting admission started");
+        assert!(
+            matches!(
+                result_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "effect admission must serialize behind shared-storage ownership"
+        );
+        seed_session_and_authority(&connection, session_id, second_authority, 1, "steer_turn");
+        drop(connection);
+
+        assert_eq!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("waiting admission completed after mutex release")
+                .expect("waiting admission storage result"),
+            PermissionEffectAdmission::AuthorityChanged {
+                current_authority_history_item_id: Some(second_authority),
+            }
+        );
+        waiting.join().expect("join waiting admission");
+        assert!(
+            store
+                .record(&key)
+                .expect("read authority-changed fence")
+                .is_none(),
+            "a stale allowed lease must be removed instead of admitting its effect"
         );
     }
 

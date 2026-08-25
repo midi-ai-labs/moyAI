@@ -6,6 +6,7 @@ export const SCRIPTED_PROVIDER_PROMPT = "return only MAIN_OK";
 export const SCRIPTED_PROVIDER_RESPONSE = "MAIN_OK";
 export const SCRIPTED_PROVIDER_MAX_BODY_BYTES = 1_048_576;
 export const SCRIPTED_PROVIDER_MAX_OUTPUT_TOKENS = 1_024;
+export const SCRIPTED_PROVIDER_MAX_TURNS = 64;
 export const SCRIPTED_PROVIDER_AGENT_INTERRUPT_KIND = "agent_interrupt";
 export const SCRIPTED_PROVIDER_AGENT_INTERRUPT_MAX_RESPONSES = 3;
 export const SCRIPTED_PROVIDER_AGENT_INTERRUPT_TASK_NAME = "interrupt_target";
@@ -60,8 +61,8 @@ function scriptedTurns(value, fallbackPrompt, fallbackResponseText) {
   if (value === null || value === undefined) {
     return Object.freeze([Object.freeze({ prompt: fallbackPrompt, responseText: fallbackResponseText })]);
   }
-  if (!Array.isArray(value) || value.length < 1 || value.length > 8) {
-    throw new TypeError("scripted provider turns must contain 1 through 8 entries");
+  if (!Array.isArray(value) || value.length < 1 || value.length > SCRIPTED_PROVIDER_MAX_TURNS) {
+    throw new TypeError(`scripted provider turns must contain 1 through ${SCRIPTED_PROVIDER_MAX_TURNS} entries`);
   }
   return Object.freeze(value.map((turn, index) => {
     if (!exactKeys(turn, ["prompt", "responseText"])) {
@@ -279,6 +280,82 @@ function requestContract(body, modelId, expectedPrompt, expectedMaxOutputTokens)
     ...contract,
     pass: contract.model_matches
       && contract.input_matches
+      && contract.instructions_non_empty
+      && contract.top_level_keys_match
+      && contract.max_output_tokens_matches
+      && contract.stream_true
+      && contract.store_false,
+  };
+}
+
+function exactOutputText(item) {
+  if (!exactKeys(item, ["content", "role", "type"])
+    || item.type !== "message"
+    || item.role !== "assistant"
+    || !Array.isArray(item.content)
+    || item.content.length !== 1) return null;
+  const [content] = item.content;
+  if (!exactKeys(content, ["text", "type"])
+    || content.type !== "output_text"
+    || typeof content.text !== "string") return null;
+  return content.text;
+}
+
+function orderedConversationInputContract(input, turns, currentTurnIndex) {
+  const expectedCount = currentTurnIndex * 2 + 1;
+  const items = Array.isArray(input) ? input : [];
+  const roles = items.map((item) => typeof item?.role === "string" ? item.role : null);
+  const textHashes = items.map((item) => {
+    const text = item?.role === "assistant" ? exactOutputText(item) : exactInputText(item);
+    return text === null ? null : sha256(Buffer.from(text, "utf8"));
+  });
+  let matches = items.length === expectedCount;
+  for (let index = 0; matches && index < currentTurnIndex; index += 1) {
+    matches = exactInputText(items[index * 2]) === turns[index].prompt
+      && exactOutputText(items[index * 2 + 1]) === turns[index].responseText;
+  }
+  matches = matches
+    && exactInputText(items[expectedCount - 1]) === turns[currentTurnIndex].prompt;
+  return {
+    input_count: items.length,
+    expected_input_count: expectedCount,
+    roles,
+    text_sha256: textHashes,
+    matches,
+  };
+}
+
+function orderedConversationRequestContract(
+  body,
+  modelId,
+  turns,
+  currentTurnIndex,
+  expectedMaxOutputTokens,
+) {
+  const model = typeof body?.model === "string" ? body.model : null;
+  const instructions = typeof body?.instructions === "string" ? body.instructions : null;
+  const topLevelKeys = body !== null && typeof body === "object" && !Array.isArray(body)
+    ? Object.keys(body).sort()
+    : [];
+  const forbiddenFieldsPresent = FORBIDDEN_RESPONSES_KEYS.filter((key) => Object.hasOwn(body ?? {}, key));
+  const conversation = orderedConversationInputContract(body?.input, turns, currentTurnIndex);
+  const contract = {
+    ordered_conversation: conversation,
+    model_sha256: model === null ? null : sha256(Buffer.from(model, "utf8")),
+    instructions_sha256: instructions === null ? null : sha256(Buffer.from(instructions, "utf8")),
+    top_level_keys: topLevelKeys,
+    forbidden_fields_present: forbiddenFieldsPresent,
+    model_matches: model === modelId,
+    instructions_non_empty: instructions !== null && instructions.trim().length > 0,
+    top_level_keys_match: JSON.stringify(topLevelKeys) === JSON.stringify(EXPECTED_RESPONSES_KEYS),
+    max_output_tokens_matches: body?.max_output_tokens === expectedMaxOutputTokens,
+    stream_true: body?.stream === true,
+    store_false: body?.store === false,
+  };
+  return {
+    ...contract,
+    pass: conversation.matches
+      && contract.model_matches
       && contract.instructions_non_empty
       && contract.top_level_keys_match
       && contract.max_output_tokens_matches
@@ -651,12 +728,20 @@ export class ScriptedProvider {
     responseBehavior: configuredResponseBehavior = "complete",
     doclingReadinessStatus = null,
     turns = null,
+    orderedConversation = false,
     script = null,
   } = {}) {
     this.modelId = nonEmptyString(modelId, "modelId");
     this.expectedPrompt = nonEmptyString(expectedPrompt, "expectedPrompt");
     this.responseText = nonEmptyString(responseText, "responseText");
     this.turns = scriptedTurns(turns, this.expectedPrompt, this.responseText);
+    if (typeof orderedConversation !== "boolean") {
+      throw new TypeError("orderedConversation must be boolean");
+    }
+    if (orderedConversation && (turns === null || this.turns.length < 2)) {
+      throw new TypeError("orderedConversation requires at least two explicit turns");
+    }
+    this.orderedConversation = orderedConversation;
     this.maxBodyBytes = positiveInteger(maxBodyBytes, "maxBodyBytes");
     this.expectedMaxOutputTokens = positiveInteger(expectedMaxOutputTokens, "expectedMaxOutputTokens");
     this.responseBehavior = responseBehavior(configuredResponseBehavior);
@@ -735,7 +820,9 @@ export class ScriptedProvider {
       request_count: this.#ledger.length,
       accepted_response_count: this.#acceptedResponseCount,
       successful_response_count: this.#successfulResponseCount,
-      script_kind: this.script?.kind ?? (this.turns.length === 1 ? "single_turn" : "ordered_turns"),
+      script_kind: this.script?.kind ?? (this.orderedConversation
+        ? "ordered_conversation_turns"
+        : this.turns.length === 1 ? "single_turn" : "ordered_turns"),
       scripted_responses_request_count: this.#scriptedResponsesRequestCount,
       scripted_responses_maximum: this.script === null
         ? this.turns.length
@@ -927,21 +1014,28 @@ export class ScriptedProvider {
       return;
     }
 
-    const turn = this.turns[this.#acceptedResponseCount] ?? this.turns.at(-1);
-    row.contract = requestContract(decoded.value, this.modelId, turn.prompt, this.expectedMaxOutputTokens);
-    if (!row.contract.pass) {
-      row.response_phase = "rejected";
-      row.response_status = 422;
-      fixedError(response, 422, "request_contract_mismatch");
-      return;
-    }
     if (this.#acceptedResponseCount >= this.turns.length) {
       row.response_phase = "rejected";
       row.response_status = 409;
       fixedError(response, 409, "successful_response_already_consumed");
       return;
     }
-
+    const turn = this.turns[this.#acceptedResponseCount];
+    row.contract = this.orderedConversation
+      ? orderedConversationRequestContract(
+        decoded.value,
+        this.modelId,
+        this.turns,
+        this.#acceptedResponseCount,
+        this.expectedMaxOutputTokens,
+      )
+      : requestContract(decoded.value, this.modelId, turn.prompt, this.expectedMaxOutputTokens);
+    if (!row.contract.pass) {
+      row.response_phase = "rejected";
+      row.response_status = 422;
+      fixedError(response, 422, "request_contract_mismatch");
+      return;
+    }
     const turnIndex = this.#acceptedResponseCount;
     this.#acceptedResponseCount += 1;
     if (this.responseBehavior === "hold_until_peer_close") {

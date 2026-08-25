@@ -1537,7 +1537,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_live_detail_reconciles_a_partial_streamed_final_from_canonical_history() {
+    fn terminal_live_detail_reconciles_a_partial_final_past_a_runtime_only_notice() {
         let session = session();
         let turn_id = TurnId::new();
         let items = vec![
@@ -1585,6 +1585,13 @@ mod tests {
                 tool_call_id: None,
             },
             TranscriptEntry {
+                kind: TranscriptKind::System,
+                title: "Runtime notice".to_string(),
+                body: "display-only advisory".to_string(),
+                response_id: None,
+                tool_call_id: None,
+            },
+            TranscriptEntry {
                 kind: TranscriptKind::Assistant,
                 title: "Assistant".to_string(),
                 body: "ROOT_SMO".to_string(),
@@ -1606,6 +1613,12 @@ mod tests {
                 .transcript_rows
                 .iter()
                 .any(|row| row.body == "ROOT_SMO")
+        );
+        assert!(
+            !detail
+                .transcript_rows
+                .iter()
+                .any(|row| row.body == "display-only advisory")
         );
     }
 

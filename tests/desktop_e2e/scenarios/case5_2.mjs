@@ -14,15 +14,22 @@ import {
 
 import {
   case52EvaluatorFailures,
+  case52RestartPreviousPageTransitionFailures,
   case52Stage1ManifestFailures,
   case52Stage2ManifestFailures,
   classifyCase52NonConvergence,
   classifyCase52NormalTerminal,
   classifyCase52RestartContinuity,
+  classifyCase52RestartTurnPage,
 } from "../case5_2_predicates.mjs";
 import { inventoryCase52CleanSeed, copyCase52CleanSeed } from "../core/clean_seed.mjs";
 import { waitForObservation } from "../core/deadline.mjs";
 import { DesktopE2eError } from "../core/execution.mjs";
+import { waitForSemanticTargetSettlement } from "../core/semantic_target_settlement.mjs";
+import {
+  DesktopCommandProbe,
+  assertExactDesktopCommandSequence,
+} from "../drivers/desktop_command_probe.mjs";
 import {
   WebviewInput,
   assertTrustedProbeSequence,
@@ -56,13 +63,18 @@ const MAX_CAPTURE_SAMPLE_BYTES = 128 * 1024;
 const PROVIDER_CLEANUP_TIMEOUT_MS = 120_000;
 const PROVIDER_CLEANUP_POLL_MS = 1_000;
 const PROVIDER_CLEANUP_STABLE_SAMPLES = 2;
+const LM_STUDIO_PROFILE = "lm_studio";
+const OPENAI_COMPATIBLE_PROFILE = "openai_compatible";
+const GUI_CONNECTION_BASELINE_BASE_URL = "http://127.0.0.1:9";
+const GUI_CONNECTION_BASELINE_MODEL = "moyai-case5-2-before-gui-save";
+const MAIN_API_KEY_ENV = "";
 
 const PROMPT = Object.freeze({
   selector: "section.composer textarea#prompt",
   identity: { tag: "TEXTAREA", id: "prompt" },
 });
-const SEND = Object.freeze({
-  selector: 'section.composer button[data-action="send"]',
+const SEND_NEW_REQUEST = Object.freeze({
+  selector: 'section.composer button[data-action="send"][title="送信"][aria-label="送信"]',
   identity: { tag: "BUTTON", action: "send" },
 });
 const EXPORT_TRANSCRIPT = Object.freeze({
@@ -77,6 +89,42 @@ const SHOW_SETTINGS = Object.freeze({
   selector: 'aside.sidebar button.settings[data-action="show-config"][title="設定"]',
   identity: { tag: "BUTTON", action: "show-config" },
 });
+const SHOW_COMMAND_PALETTE = Object.freeze({
+  selector: 'section.composer button[data-action="show-command-palette"]',
+  identity: { tag: "BUTTON", action: "show-command-palette" },
+});
+const COMMAND_PALETTE_SEARCH = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="command-palette-dialog-title"] input#local-search',
+  identity: { tag: "INPUT", id: "local-search" },
+});
+const PREVIOUS_TURN_PAGE = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="command-palette-dialog-title"] button[data-action="load-previous-turn-page"]',
+  identity: { tag: "BUTTON", action: "load-previous-turn-page" },
+});
+const MAIN_BASE_URL = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[data-config-key="model.base_url"]',
+  identity: { tag: "INPUT", configKey: "model.base_url" },
+});
+const MAIN_PROVIDER_PROFILE = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] select.settings-control[data-config-key="model.provider_profile"]',
+  identity: { tag: "SELECT", configKey: "model.provider_profile" },
+});
+const MAIN_MANUAL_DETAILS = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] details[data-details-key="main-provider-manual-model"] > summary',
+  identity: { tag: "DETAILS", detailsKey: "main-provider-manual-model" },
+});
+const MAIN_MANUAL_MODEL = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input#main-provider-model-manual[data-config-key="model.model"]',
+  identity: { tag: "INPUT", id: "main-provider-model-manual", configKey: "model.model" },
+});
+const MAIN_API_KEY = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[data-config-key="model.api_key_env"]',
+  identity: { tag: "INPUT", configKey: "model.api_key_env" },
+});
+const SAVE_GLOBAL_CONFIG = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="save-global-config"]',
+  identity: { tag: "BUTTON", action: "save-global-config" },
+});
 const SIDE_SETTINGS_NAV = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-side-chat"]',
   identity: { tag: "A", href: "#settings-side-chat" },
@@ -84,6 +132,10 @@ const SIDE_SETTINGS_NAV = Object.freeze({
 const SIDE_BASE_URL = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input#side-chat-base-url[data-side-chat-setting="base-url"]',
   identity: { tag: "INPUT", id: "side-chat-base-url", sideSetting: "base-url" },
+});
+const SIDE_PROVIDER_PROFILE = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] select#side-chat-provider-profile[data-side-chat-setting="provider-profile"]',
+  identity: { tag: "SELECT", id: "side-chat-provider-profile", sideSetting: "provider-profile" },
 });
 const SIDE_MANUAL_DETAILS = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] details[data-details-key="side-chat-manual-model"] > summary',
@@ -151,18 +203,148 @@ function productFailure(code, message, evidence) {
   return new DesktopE2eError("product", code, message, evidence);
 }
 
-function canonicalProviderBaseUrl(value) {
+export function classifyCase52MainPreferencesObservationError(error, action) {
+  if (typeof action !== "string" || action.length === 0) {
+    throw new TypeError("case5_2 Main Preferences observation action is required");
+  }
+  if (error?.code !== "observation-timeout"
+    || error?.evidence?.last_error !== null
+    || !Object.hasOwn(error?.evidence ?? {}, "last_value")) return error;
+  const evidence = error?.evidence !== null && typeof error?.evidence === "object"
+    ? error.evidence
+    : {};
+  return productFailure(
+    "case5_2-main-preferences-observation-timeout",
+    `Main Preferences did not settle after trusted ${action}`,
+    {
+      action,
+      label: evidence.label ?? null,
+      attempts: evidence.attempts ?? null,
+      elapsed_ms: evidence.elapsed_ms ?? null,
+      last_value: evidence.last_value ?? null,
+      last_error: evidence.last_error ?? null,
+    },
+  );
+}
+
+export function classifyCase52MainSaveCommandError(error) {
+  if (!new Set([
+    "desktop-command-probe-cardinality",
+    "desktop-command-probe-call-mismatch",
+  ]).has(error?.code)) return error;
+  return productFailure(
+    "case5_2-main-provider-save-command",
+    "trusted Main Preferences Save invoked an unexpected product command",
+    errorObservation(error),
+  );
+}
+
+export function classifyCase52SideScreenshotObservationError(error, action) {
+  if (typeof action !== "string" || action.length === 0) {
+    throw new TypeError("case5_2 Side screenshot observation action is required");
+  }
+  if (error?.code !== "observation-timeout"
+    || error?.evidence?.last_error !== null
+    || !Object.hasOwn(error?.evidence ?? {}, "last_value")) return error;
+  return productFailure(
+    "case5_2-side-screenshot-observation-timeout",
+    `Side Chat Settings did not become screenshot-ready after trusted ${action}`,
+    {
+      action,
+      label: error.evidence.label ?? null,
+      attempts: error.evidence.attempts ?? null,
+      elapsed_ms: error.evidence.elapsed_ms ?? null,
+      last_value: error.evidence.last_value,
+      last_error: null,
+    },
+  );
+}
+
+export function case52ProviderControlTokenLeakFailure(stage, evidence) {
+  if (typeof stage !== "string" || stage.length === 0) {
+    throw new TypeError("case5_2 provider control-token leak stage is required");
+  }
+  if (evidence === null || typeof evidence !== "object" || Array.isArray(evidence)) {
+    throw new TypeError("case5_2 provider control-token leak evidence is required");
+  }
+  const message = `${stage} exposed an OpenAI chat-template control token in an assistant transcript body`;
+  const observedProductFailure = {
+    owner: "product",
+    code: "case5_2-provider-control-token-leak",
+    message,
+    evidence: structuredClone(evidence),
+  };
+  const acquisitionErrors = [
+    evidence.projection_error ?? null,
+    evidence.screenshot_error ?? null,
+    evidence.stop_error ?? null,
+    evidence.record_error ?? null,
+  ];
+  const failStopSettledExactly = acquisitionErrors.every((error) => error === null)
+    && evidence.projection !== null
+    && evidence.projection !== undefined
+    && evidence.screenshot !== null
+    && evidence.screenshot !== undefined
+    && evidence.visible_stop_count === 1
+    && evidence.terminal !== null
+    && typeof evidence.terminal === "object";
+  if (!failStopSettledExactly) {
+    return new DesktopE2eError(
+      "harness",
+      "case5_2-provider-control-token-leak-stop",
+      `${message}, but the required evidence and visible Stop did not settle exactly`,
+      {
+        observed_product_failure: observedProductFailure,
+        projection_error: evidence.projection_error ?? null,
+        screenshot_error: evidence.screenshot_error ?? null,
+        visible_stop_count: evidence.visible_stop_count ?? null,
+        stop_error: evidence.stop_error ?? null,
+        record_error: evidence.record_error ?? null,
+        terminal: evidence.terminal ?? null,
+      },
+    );
+  }
+  return productFailure(
+    observedProductFailure.code,
+    observedProductFailure.message,
+    observedProductFailure.evidence,
+  );
+}
+
+async function waitForSideScreenshotObservation({ action, ...options }) {
+  try {
+    return await waitForObservation({ ...options, retrySampleErrors: false });
+  } catch (error) {
+    throw classifyCase52SideScreenshotObservationError(error, action);
+  }
+}
+
+async function waitForMainPreferencesObservation({ action, ...options }) {
+  try {
+    return await waitForObservation({ ...options, retrySampleErrors: false });
+  } catch (error) {
+    throw classifyCase52MainPreferencesObservationError(error, action);
+  }
+}
+
+function canonicalProviderBaseUrl(value, providerProfile) {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new TypeError("case5_2 provider_base_url must be a non-empty string");
   }
   const url = new URL(value.trim());
+  const allowedPaths = providerProfile === OPENAI_COMPATIBLE_PROFILE
+    ? new Set(["/v1", "/v1/"])
+    : new Set(["", "/"]);
   if (!new Set(["http:", "https:"]).has(url.protocol)
     || url.username.length > 0
     || url.password.length > 0
     || url.search.length > 0
     || url.hash.length > 0
-    || !["", "/"].includes(url.pathname)) {
-    throw new TypeError("case5_2 provider_base_url must be one credential-free HTTP(S) origin");
+    || !allowedPaths.has(url.pathname)) {
+    const expected = providerProfile === OPENAI_COMPATIBLE_PROFILE
+      ? "one credential-free HTTP(S) /v1 base URL"
+      : "one credential-free HTTP(S) origin";
+    throw new TypeError(`case5_2 provider_base_url must be ${expected}`);
   }
   return url.toString().replace(/\/$/, "");
 }
@@ -177,6 +359,116 @@ function modelIdentity(value, name) {
   return value;
 }
 
+function normalizeJsonSafeValue(value, pathLabel, active) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new TypeError(`manual.case5_2 ${pathLabel} contains a non-finite number`);
+    return value;
+  }
+  if (typeof value !== "object") {
+    throw new TypeError(`manual.case5_2 ${pathLabel} contains a non-JSON-safe value`);
+  }
+  if (active.has(value)) throw new TypeError(`manual.case5_2 ${pathLabel} contains a cycle`);
+  active.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const keys = Reflect.ownKeys(value);
+      const expectedKeys = Array.from({ length: value.length }, (_, index) => String(index));
+      const actualKeys = keys.filter((key) => key !== "length");
+      if (actualKeys.some((key) => typeof key !== "string")
+        || !sameValue(actualKeys, expectedKeys)) {
+        throw new TypeError(`manual.case5_2 ${pathLabel} contains a sparse or extended array`);
+      }
+      return value.map((entry, index) => normalizeJsonSafeValue(entry, `${pathLabel}[${index}]`, active));
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new TypeError(`manual.case5_2 ${pathLabel} contains a non-plain object`);
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const output = {};
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (typeof key !== "string") {
+        throw new TypeError(`manual.case5_2 ${pathLabel} contains a symbol key`);
+      }
+      const descriptor = descriptors[key];
+      if (descriptor.enumerable !== true || !Object.hasOwn(descriptor, "value")) {
+        throw new TypeError(`manual.case5_2 ${pathLabel}.${key} is not a JSON data property`);
+      }
+      Object.defineProperty(output, key, {
+        value: normalizeJsonSafeValue(descriptor.value, `${pathLabel}.${key}`, active),
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+    return output;
+  } finally {
+    active.delete(value);
+  }
+}
+
+function normalizeExtraBodyJson(value) {
+  if (value === undefined) return { value: null, compact: null };
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("manual.case5_2 extra_body_json must be a JSON object");
+  }
+  const normalized = normalizeJsonSafeValue(value, "extra_body_json", new WeakSet());
+  const topLevelKeys = Object.keys(normalized);
+  const unknownTopLevel = topLevelKeys.filter((key) => key !== "chat_template_kwargs");
+  if (unknownTopLevel.length > 0) {
+    throw new TypeError(`manual.case5_2 extra_body_json contains a non-generation field: ${unknownTopLevel.join(",")}`);
+  }
+  if (Object.hasOwn(normalized, "chat_template_kwargs")) {
+    const kwargs = normalized.chat_template_kwargs;
+    if (kwargs === null || typeof kwargs !== "object" || Array.isArray(kwargs)) {
+      throw new TypeError("manual.case5_2 extra_body_json.chat_template_kwargs must be an object");
+    }
+    const allowed = new Set(["enable_thinking", "preserve_thinking"]);
+    const unknown = Object.keys(kwargs).filter((key) => !allowed.has(key));
+    if (unknown.length > 0) {
+      throw new TypeError(`manual.case5_2 extra_body_json.chat_template_kwargs contains a non-generation field: ${unknown.join(",")}`);
+    }
+    for (const key of Object.keys(kwargs)) {
+      if (typeof kwargs[key] !== "boolean") {
+        throw new TypeError(`manual.case5_2 extra_body_json.chat_template_kwargs.${key} must be boolean`);
+      }
+    }
+  }
+  return { value: normalized, compact: JSON.stringify(normalized) };
+}
+
+export function case52ExtraBodyEvidence(options) {
+  if (options.extraBodyJsonCompact === null) {
+    return {
+      configured: false,
+      environment_key: null,
+      compact_json_sha256: null,
+      compact_json_size_bytes: 0,
+      generation_fields: [],
+      allowlist_profile: "qwen-chat-template-thinking-v1",
+    };
+  }
+  const kwargs = options.extraBodyJson?.chat_template_kwargs;
+  const generationFields = kwargs === null || typeof kwargs !== "object"
+    ? []
+    : Object.keys(kwargs).sort().map((key) => `chat_template_kwargs.${key}`);
+  const bytes = Buffer.from(options.extraBodyJsonCompact, "utf8");
+  return {
+    configured: true,
+    environment_key: "MOYAI_EXTRA_BODY_JSON",
+    compact_json_sha256: sha256(bytes),
+    compact_json_size_bytes: bytes.byteLength,
+    generation_fields: generationFields,
+    allowlist_profile: "qwen-chat-template-thinking-v1",
+  };
+}
+
+export function case52EvidenceOptions(options) {
+  const { extraBodyJson: _value, extraBodyJsonCompact: _compact, ...safe } = options;
+  return { ...safe, extra_body_json: case52ExtraBodyEvidence(options) };
+}
+
 export function normalizeCase52Options(options) {
   if (options === null || typeof options !== "object" || Array.isArray(options)) {
     throw new TypeError("manual.case5_2 requires one scenario config object");
@@ -184,6 +476,9 @@ export function normalizeCase52Options(options) {
   const allowed = new Set([
     "fixture_source",
     "provider_base_url",
+    "provider_profile",
+    "configure_main_via_gui",
+    "extra_body_json",
     "main_model",
     "side_model",
     "expected_main_variant",
@@ -194,22 +489,82 @@ export function normalizeCase52Options(options) {
   if (typeof options.fixture_source !== "string" || !path.isAbsolute(options.fixture_source)) {
     throw new TypeError("manual.case5_2 fixture_source must be an absolute path");
   }
-  return Object.freeze({
+  const providerProfile = options.provider_profile === undefined
+    ? LM_STUDIO_PROFILE
+    : options.provider_profile;
+  if (!new Set([LM_STUDIO_PROFILE, OPENAI_COMPATIBLE_PROFILE]).has(providerProfile)) {
+    throw new TypeError("manual.case5_2 provider_profile must be lm_studio or openai_compatible");
+  }
+  if (options.configure_main_via_gui !== undefined
+    && typeof options.configure_main_via_gui !== "boolean") {
+    throw new TypeError("manual.case5_2 configure_main_via_gui must be boolean");
+  }
+  if (Object.hasOwn(options, "configure_main_via_gui") && providerProfile !== LM_STUDIO_PROFILE) {
+    throw new TypeError("manual.case5_2 configure_main_via_gui is supported only by lm_studio");
+  }
+  const common = {
     fixtureSource: path.resolve(options.fixture_source),
-    providerBaseUrl: canonicalProviderBaseUrl(options.provider_base_url),
+    providerBaseUrl: canonicalProviderBaseUrl(options.provider_base_url, providerProfile),
+    providerProfile,
     mainModel: modelIdentity(options.main_model, "main_model"),
+    configureMainViaGui: options.configure_main_via_gui ?? false,
+  };
+  if (providerProfile === OPENAI_COMPATIBLE_PROFILE) {
+    const legacyFields = ["side_model", "expected_main_variant", "expected_side_variant"]
+      .filter((key) => Object.hasOwn(options, key));
+    if (legacyFields.length > 0) {
+      throw new TypeError(`manual.case5_2 openai_compatible does not accept LM Studio fields: ${legacyFields.join(",")}`);
+    }
+    const extraBody = normalizeExtraBodyJson(options.extra_body_json);
+    return Object.freeze({
+      ...common,
+      sideModel: common.mainModel,
+      expectedMainVariant: null,
+      expectedSideVariant: null,
+      providerLifecycle: "external-unmanaged",
+      scenarioConfigProfile: "openai-compatible-v1",
+      extraBodyJson: extraBody.value,
+      extraBodyJsonCompact: extraBody.compact,
+    });
+  }
+  if (Object.hasOwn(options, "extra_body_json")) {
+    throw new TypeError("manual.case5_2 extra_body_json is supported only by openai_compatible");
+  }
+  return Object.freeze({
+    ...common,
     sideModel: modelIdentity(options.side_model, "side_model"),
     expectedMainVariant: modelIdentity(options.expected_main_variant, "expected_main_variant"),
     expectedSideVariant: modelIdentity(options.expected_side_variant, "expected_side_variant"),
+    providerLifecycle: "execution-owned",
+    scenarioConfigProfile: options.provider_profile === undefined
+      ? "legacy-lm-studio-six-field"
+      : "lm-studio-native",
+    extraBodyJson: null,
+    extraBodyJsonCompact: null,
   });
 }
 
 export function case52FixtureConfig(options) {
+  const initialBaseUrl = options.configureMainViaGui
+    ? GUI_CONNECTION_BASELINE_BASE_URL
+    : options.providerBaseUrl;
+  const initialModel = options.configureMainViaGui
+    ? GUI_CONNECTION_BASELINE_MODEL
+    : options.mainModel;
+  const providerConnection = options.providerProfile === OPENAI_COMPATIBLE_PROFILE
+    ? `provider_profile = "openai_compatible"`
+    : `provider_metadata_mode = "lm_studio_native_required"
+provider_api_mode = "responses"`;
+  const providerExtraBody = options.providerProfile === OPENAI_COMPATIBLE_PROFILE
+    ? ""
+    : `
+[model.extra_body_json]
+num_ctx = ${QUALITY_CONTEXT_WINDOW}
+`;
   return `[model]
-base_url = ${JSON.stringify(options.providerBaseUrl)}
-model = ${JSON.stringify(options.mainModel)}
-provider_metadata_mode = "lm_studio_native_required"
-provider_api_mode = "responses"
+base_url = ${JSON.stringify(initialBaseUrl)}
+model = ${JSON.stringify(initialModel)}
+${providerConnection}
 reasoning_summary = "none"
 connect_timeout_ms = 10000
 request_timeout_ms = ${QUALITY_REQUEST_TIMEOUT_MS}
@@ -222,9 +577,7 @@ supports_reasoning = false
 supports_images = true
 parallel_tool_calls = false
 max_parallel_predictions = 1
-
-[model.extra_body_json]
-num_ctx = ${QUALITY_CONTEXT_WINDOW}
+${providerExtraBody}
 
 [permissions]
 access_mode = "auto_review"
@@ -344,7 +697,7 @@ function baselineManifest(seed, taskIdentity) {
 }
 
 function providerEndpoint(baseUrl, pathname) {
-  return new URL(pathname, `${baseUrl}/`).toString();
+  return new URL(pathname.replace(/^\/+/, ""), `${baseUrl}/`).toString();
 }
 
 async function providerJson(baseUrl, pathname, { method = "GET", body = undefined, timeoutMs = 300_000 } = {}) {
@@ -380,6 +733,14 @@ function exactCatalogRow(snapshot, key) {
 }
 
 async function providerSnapshot(options) {
+  if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
+    const models = await providerJson(options.providerBaseUrl, "/models");
+    return {
+      captured_at: new Date().toISOString(),
+      provider_profile: options.providerProfile,
+      models,
+    };
+  }
   const [v1, v0] = await Promise.all([
     providerJson(options.providerBaseUrl, "/api/v1/models"),
     providerJson(options.providerBaseUrl, "/api/v0/models"),
@@ -387,7 +748,36 @@ async function providerSnapshot(options) {
   return { captured_at: new Date().toISOString(), v1, v0 };
 }
 
-function providerModelState(snapshot, options) {
+function openAiContextCapacity(model) {
+  const candidates = [
+    ["max_model_len", model?.max_model_len],
+    ["max_context_length", model?.max_context_length],
+    ["context_length", model?.context_length],
+    ["context_window", model?.context_window],
+  ].filter(([, value]) => Number.isInteger(value) && value > 0)
+    .map(([field, value]) => ({ field, value }));
+  const distinct = [...new Set(candidates.map((entry) => entry.value))];
+  return {
+    reported: candidates.length > 0,
+    candidates,
+    effective: distinct.length === 1 ? distinct[0] : null,
+    conflict: distinct.length > 1,
+  };
+}
+
+export function case52ProviderModelState(snapshot, options) {
+  if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
+    const rows = snapshot?.models?.value?.data;
+    if (!Array.isArray(rows)) throw new Error("OpenAI-compatible /v1/models catalog is invalid");
+    const matches = rows.filter((row) => row?.id === options.mainModel);
+    const main = matches.length === 1 ? matches[0] : null;
+    return {
+      main,
+      side: main,
+      main_match_count: matches.length,
+      context_capacity: openAiContextCapacity(main),
+    };
+  }
   const main = exactCatalogRow(snapshot, options.mainModel);
   const side = exactCatalogRow(snapshot, options.sideModel);
   const v0Rows = snapshot?.v0?.value?.data;
@@ -398,6 +788,17 @@ function providerModelState(snapshot, options) {
 
 function providerCatalogFailures(state, options, { mainLoaded, expectedLoadedContext = null }) {
   const failures = [];
+  if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
+    if (state.main_match_count !== 1 || state.main?.id !== options.mainModel) {
+      failures.push("main-model-exact-catalog-mismatch");
+    }
+    if (state.context_capacity?.conflict === true) failures.push("main-context-capacity-conflict");
+    if (Number.isInteger(state.context_capacity?.effective)
+      && state.context_capacity.effective < QUALITY_CONTEXT_WINDOW) {
+      failures.push("main-context-capacity-below-requested");
+    }
+    return failures;
+  }
   if (state.main?.selected_variant !== options.expectedMainVariant) failures.push("main-variant-mismatch");
   if (state.side?.selected_variant !== options.expectedSideVariant) failures.push("side-variant-mismatch");
   const mainInstances = state.main?.loaded_instances;
@@ -447,8 +848,52 @@ export function case52ProviderCleanupPlan(providerState) {
 }
 
 async function loadMainProvider({ options, sink, state, phase }) {
+  if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
+    const snapshot = await providerSnapshot(options);
+    const models = case52ProviderModelState(snapshot, options);
+    const failures = providerCatalogFailures(models, options, { mainLoaded: true });
+    const effectiveContext = models.context_capacity.effective;
+    const deviations = [
+      "provider-lifecycle-external-unmanaged",
+      "provider-wire-openai-compatible-chat-completions",
+      ...(models.context_capacity.reported ? [] : ["provider-context-capacity-unreported"]),
+      ...(Number.isInteger(effectiveContext) && effectiveContext !== QUALITY_CONTEXT_WINDOW
+        ? ["provider-context-capacity-not-exact"]
+        : []),
+    ];
+    const evidence = {
+      snapshot,
+      models,
+      context: {
+        requested: QUALITY_CONTEXT_WINDOW,
+        reported: effectiveContext,
+        exact: effectiveContext === QUALITY_CONTEXT_WINDOW,
+        metadata: models.context_capacity,
+      },
+      failures,
+      ownership_contract: "external-unmanaged-observation-only",
+      lifecycle_actions: { load_attempted: false, unload_authorized: false },
+      comparability_deviations: deviations,
+    };
+    await sink.writeJson("case5_2/provider/external-preflight.json", evidence);
+    await sink.record("case5_2-provider-external-preflight", evidence, { phase, owner: OWNER });
+    if (failures.length > 0) {
+      throw new DesktopE2eError(
+        "environment",
+        "case5_2-provider-preflight",
+        "OpenAI-compatible provider did not expose the exact main model with sufficient reported context capacity",
+        evidence,
+      );
+    }
+    state.providerEffectiveContext = effectiveContext;
+    state.providerProfileExact = deviations.length === 0;
+    state.providerComparabilityDeviations = deviations;
+    state.acceptedProviderLoad = structuredClone(evidence);
+    state.providerExternalPreflightObserved = true;
+    return;
+  }
   const before = await providerSnapshot(options);
-  const beforeState = providerModelState(before, options);
+  const beforeState = case52ProviderModelState(before, options);
   const beforeFailures = providerCatalogFailures(beforeState, options, { mainLoaded: false });
   await sink.writeJson("case5_2/provider/before-load.json", { snapshot: before, models: beforeState, failures: beforeFailures });
   if (beforeFailures.length > 0) {
@@ -470,7 +915,7 @@ async function loadMainProvider({ options, sink, state, phase }) {
   state.providerOwned = state.mainProviderInstanceId === options.mainModel && response.value?.status === "loaded";
   const responseContext = response.value?.load_config?.context_length;
   const after = await providerSnapshot(options);
-  const afterState = providerModelState(after, options);
+  const afterState = case52ProviderModelState(after, options);
   const afterFailures = providerCatalogFailures(afterState, options, {
     mainLoaded: true,
     expectedLoadedContext: Number.isInteger(responseContext) ? responseContext : null,
@@ -500,10 +945,54 @@ async function loadMainProvider({ options, sink, state, phase }) {
   }
   state.providerEffectiveContext = responseContext;
   state.providerProfileExact = context.exact;
+  state.providerComparabilityDeviations = context.exact
+    ? []
+    : ["provider-context-capacity-not-exact"];
   state.acceptedProviderLoad = structuredClone(evidence);
 }
 
 export async function unloadMainProvider({ options, state, providerIo = {} }) {
+  if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
+    const capture = providerIo.capture ?? (async () => {
+      const snapshot = await providerSnapshot(options);
+      return { snapshot, models: case52ProviderModelState(snapshot, options) };
+    });
+    let captured = null;
+    let error = null;
+    let failures = [];
+    try {
+      captured = await capture();
+      failures = providerCatalogFailures(captured.models, options, { mainLoaded: true });
+    } catch (caught) {
+      error = errorObservation(caught);
+      failures = ["provider-final-snapshot-failed"];
+    }
+    const pass = state.providerExternalPreflightObserved === true
+      && error === null
+      && failures.length === 0;
+    if (state.providerExternalPreflightObserved !== true) {
+      failures.push("provider-external-preflight-unobserved");
+    }
+    return {
+      input: pass ? "pass" : "fail",
+      resources: [{
+        kind: "openai-compatible-external-model",
+        provider_profile: options.providerProfile,
+        lifecycle: "external-unmanaged",
+        main_model: options.mainModel,
+        side_model: options.sideModel,
+        load_attempted: false,
+        unload_attempted: false,
+        unload_authorized: false,
+        final_snapshot: captured?.snapshot ?? null,
+        models: captured?.models ?? null,
+        comparability_deviations: state.providerComparabilityDeviations ?? [],
+        failures: [...new Set(failures)],
+        error,
+      }],
+      productFailure: null,
+    };
+  }
   if (!state.providerLoadAttempted) {
     return {
       input: "pass",
@@ -521,7 +1010,7 @@ export async function unloadMainProvider({ options, state, providerIo = {} }) {
   }
   const capture = providerIo.capture ?? (async () => {
     const snapshot = await providerSnapshot(options);
-    return { snapshot, models: providerModelState(snapshot, options) };
+    return { snapshot, models: case52ProviderModelState(snapshot, options) };
   });
   const unloadInstance = providerIo.unload ?? ((instanceId) => providerJson(options.providerBaseUrl, "/api/v1/models/unload", {
     method: "POST",
@@ -1164,9 +1653,9 @@ async function desktopProjection(cdp) {
   return invokeDesktopCommand(cdp, "desktop_state");
 }
 
-async function trustedClick(input, locator) {
+async function trustedClick(input, locator, { stableHitSamples = 1 } = {}) {
   const start = (await input.snapshotProbe()).sequence;
-  const target = await input.click(locator);
+  const target = await input.click(locator, { stableHitSamples });
   const snapshot = await input.snapshotProbe(start);
   const probe = assertTrustedProbeSequence(snapshot, {
     afterSequence: start,
@@ -1179,8 +1668,8 @@ async function trustedClick(input, locator) {
   return { target, probe };
 }
 
-async function recordTrustedClick({ input, locator, action, sink }) {
-  const acquisition = await trustedClick(input, locator);
+async function recordTrustedClick({ input, locator, action, sink, stableHitSamples = 1 }) {
+  const acquisition = await trustedClick(input, locator, { stableHitSamples });
   await sink.record("case5_2-trusted-action", { action, input_kind: "browser_trusted", ...acquisition }, {
     phase: "executing",
     owner: OWNER,
@@ -1194,10 +1683,51 @@ async function exactDomValue(cdp, selector) {
     const node = nodes.length === 1 ? nodes[0] : null;
     return {
       count: nodes.length,
-      value: node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement ? node.value : null,
+      value: node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement || node instanceof HTMLSelectElement
+        ? node.value
+        : null,
       active: node !== null && document.activeElement === node,
     };
   })()`);
+}
+
+async function newRequestComposerSurface(cdp) {
+  return cdp.evaluate(`(() => {
+    const prompts = document.querySelectorAll("section.composer textarea#prompt");
+    const sends = document.querySelectorAll('section.composer button[data-action="send"]');
+    const prompt = prompts.length === 1 && prompts[0] instanceof HTMLTextAreaElement
+      ? prompts[0]
+      : null;
+    const send = sends.length === 1 && sends[0] instanceof HTMLButtonElement
+      ? sends[0]
+      : null;
+    return {
+      prompt_count: prompts.length,
+      prompt_value: prompt?.value ?? null,
+      prompt_disabled: prompt?.disabled ?? null,
+      send_count: sends.length,
+      send_disabled: send?.disabled ?? null,
+      send_title: send?.title ?? null,
+      send_aria_label: send?.getAttribute("aria-label") ?? null,
+      run_strip_count: document.querySelectorAll("section.run-strip").length,
+      visible_stop_count: document.querySelectorAll('section.run-strip button[data-action="cancel-run"]').length,
+    };
+  })()`);
+}
+
+export function case52NewRequestComposerSurfaceReady(surface, expectedPrompt) {
+  if (typeof expectedPrompt !== "string") {
+    throw new TypeError("case5_2 expected composer prompt must be a string");
+  }
+  return surface?.prompt_count === 1
+    && surface.prompt_value === expectedPrompt
+    && surface.prompt_disabled === false
+    && surface.send_count === 1
+    && surface.send_disabled === false
+    && surface.send_title === "送信"
+    && surface.send_aria_label === "送信"
+    && surface.run_strip_count === 0
+    && surface.visible_stop_count === 0;
 }
 
 async function transcriptExports(workspace) {
@@ -1320,7 +1850,44 @@ async function replaceExactText({ cdp, input, locator, text, action, sink }) {
   return { changed: true, initial, final, inserted, probe };
 }
 
-async function observeSideSettings(cdp) {
+function mainConnectionDesired(options) {
+  return {
+    baseUrl: options.providerBaseUrl,
+    model: options.mainModel,
+    providerProfile: options.providerProfile,
+    apiKeyEnv: MAIN_API_KEY_ENV,
+  };
+}
+
+function configValues(projection, overrides = {}) {
+  const fields = Array.isArray(projection?.config_fields) ? projection.config_fields : [];
+  return fields.map((field) => ({
+    key: field.key,
+    text: Object.hasOwn(overrides, field.key) ? overrides[field.key] : field.value,
+  }));
+}
+
+export function case52ExpectedMainGlobalSave(surface, options) {
+  const target = surface?.projection?.config_target;
+  if (target === null || typeof target !== "object") {
+    throw new TypeError("case5_2 Main Preferences save requires one config target");
+  }
+  const desired = mainConnectionDesired(options);
+  return {
+    command: "save_global_config",
+    args: {
+      values: configValues(surface.projection, {
+        "model.base_url": desired.baseUrl,
+        "model.model": desired.model,
+        "model.provider_profile": desired.providerProfile,
+        "model.api_key_env": desired.apiKeyEnv,
+      }),
+      expectedTarget: structuredClone(target),
+    },
+  };
+}
+
+async function observeMainSettings(cdp) {
   return cdp.evaluate(`(async () => {
     const invoke = window.__TAURI_INTERNALS__?.invoke;
     if (typeof invoke !== 'function') throw new Error('tauri-invoke-unavailable');
@@ -1337,19 +1904,413 @@ async function observeSideSettings(cdp) {
       const nodes = document.querySelectorAll(selector);
       return { count: nodes.length, node: nodes.length === 1 ? nodes[0] : null };
     };
+    const control = (selector) => {
+      const found = one(selector);
+      const node = found.node;
+      return {
+        count: found.count,
+        visible: visible(node),
+        enabled: (node instanceof HTMLInputElement || node instanceof HTMLSelectElement)
+          && !node.disabled && (!(node instanceof HTMLInputElement) || !node.readOnly),
+        value: node instanceof HTMLInputElement || node instanceof HTMLSelectElement ? node.value : null,
+        options: node instanceof HTMLSelectElement ? Array.from(node.options).map((option) => option.value) : [],
+      };
+    };
+    const button = (selector) => {
+      const found = one(selector);
+      return {
+        count: found.count,
+        visible: visible(found.node),
+        enabled: found.node instanceof HTMLButtonElement
+          && !found.node.disabled
+          && found.node.getAttribute('aria-disabled') !== 'true',
+      };
+    };
+    const settings = one('[role="dialog"][aria-labelledby="config-dialog-title"]');
+    const details = one('[role="dialog"][aria-labelledby="config-dialog-title"] details[data-details-key="main-provider-manual-model"]');
+    return {
+      projection,
+      settings: { count: settings.count, visible: visible(settings.node) },
+      base: control(${JSON.stringify(MAIN_BASE_URL.selector)}),
+      profile: control(${JSON.stringify(MAIN_PROVIDER_PROFILE.selector)}),
+      manual: control(${JSON.stringify(MAIN_MANUAL_MODEL.selector)}),
+      api_key_env: control(${JSON.stringify(MAIN_API_KEY.selector)}),
+      details: {
+        count: details.count,
+        visible: visible(details.node),
+        open: details.node instanceof HTMLDetailsElement ? details.node.open : null,
+      },
+      dirty: Array.from(document.querySelectorAll('[role="dialog"][aria-labelledby="config-dialog-title"] .dirty-badge.visible')).filter(visible).length === 1,
+      save: button(${JSON.stringify(SAVE_GLOBAL_CONFIG.selector)}),
+      close: button(${JSON.stringify(CLOSE_SETTINGS.selector)}),
+      fatal_count: Array.from(document.querySelectorAll('.fatal')).filter(visible).length,
+      recoverable_error_count: Array.from(document.querySelectorAll('.ui-error-notice')).filter(visible).length,
+      validation_error_count: Array.from(document.querySelectorAll('.validation.error')).filter(visible).length,
+    };
+  })()`);
+}
+
+function mainSettingsErrorFree(surface) {
+  return surface?.fatal_count === 0
+    && surface?.recoverable_error_count === 0
+    && surface?.validation_error_count === 0;
+}
+
+function exactMainSettingsControls(surface, desired, { dirty }) {
+  return surface?.projection?.overlay === "config"
+    && surface?.settings?.count === 1
+    && surface.settings.visible === true
+    && surface?.base?.count === 1
+    && surface.base.visible === true
+    && surface.base.enabled === true
+    && surface.base.value === desired.baseUrl
+    && surface?.profile?.count === 1
+    && surface.profile.visible === true
+    && surface.profile.enabled === true
+    && surface.profile.value === desired.providerProfile
+    && surface.profile.options.includes(desired.providerProfile)
+    && surface?.manual?.count === 1
+    && surface.manual.enabled === true
+    && surface.manual.value === desired.model
+    && surface?.api_key_env?.count === 1
+    && surface.api_key_env.visible === true
+    && surface.api_key_env.enabled === true
+    && surface.api_key_env.value === desired.apiKeyEnv
+    && surface?.dirty === dirty
+    && surface?.save?.count === 1
+    && surface.save.visible === true
+    && surface.save.enabled === dirty
+    && surface?.close?.count === 1
+    && surface.close.visible === true
+    && mainSettingsErrorFree(surface);
+}
+
+function sameConfigTargetOwner(current, baseline) {
+  return current?.workspacePath === baseline?.workspacePath
+    && current?.sessionId === baseline?.sessionId;
+}
+
+function advancedConfigTarget(current, baseline) {
+  return sameConfigTargetOwner(current, baseline)
+    && typeof current?.configGeneration === "string"
+    && current.configGeneration.length > 0
+    && current.configGeneration !== baseline?.configGeneration;
+}
+
+export function case52MainProviderSelectionKeys(value) {
+  if (value === LM_STUDIO_PROFILE) return ["Home"];
+  if (value === OPENAI_COMPATIBLE_PROFILE) return ["Home", "ArrowDown"];
+  throw new TypeError(`unsupported case5_2 Main provider profile selection: ${value}`);
+}
+
+async function selectMainProviderProfile({ cdp, input, sink, expected }) {
+  const initial = await exactDomValue(cdp, MAIN_PROVIDER_PROFILE.selector);
+  if (initial.count !== 1) throw new Error("Main provider profile target cardinality drifted");
+  const alternate = expected === LM_STUDIO_PROFILE ? OPENAI_COMPATIBLE_PROFILE : LM_STUDIO_PROFILE;
+  if (initial.value !== expected) {
+    throw productFailure("case5_2-main-provider-profile-baseline", "Main provider profile did not begin at the expected neutral-fixture value", {
+      expected,
+      initial,
+    });
+  }
+  const select = async ({ keys, value, action }) => {
+    const focused = await recordTrustedClick({ input, locator: MAIN_PROVIDER_PROFILE, action: `${action}-focus`, sink });
+    const start = (await input.snapshotProbe()).sequence;
+    for (const key of keys) await input.pressKey(key);
+    await input.pressKey("Enter");
+    const snapshot = await input.snapshotProbe(start);
+    const probe = assertTrustedProbeSequence(snapshot, {
+      afterSequence: start,
+      expected: [{ type: "change", identity: MAIN_PROVIDER_PROFILE.identity }],
+    });
+    const settled = await waitForMainPreferencesObservation({
+      action,
+      label: `${action} exact value`,
+      timeoutMs: 10_000,
+      pollMs: 100,
+      sample: () => exactDomValue(cdp, MAIN_PROVIDER_PROFILE.selector),
+      accept: (observation) => observation.count === 1 && observation.value === value,
+    });
+    const evidence = { action, keys, value, focused, probe, final: settled.value };
+    await sink.record("case5_2-trusted-main-provider-profile", evidence, { phase: "executing", owner: OWNER });
+    return evidence;
+  };
+  const selections = [await select({
+    keys: case52MainProviderSelectionKeys(alternate),
+    value: alternate,
+    action: "main-provider-profile-alternate",
+  })];
+  selections.push(await select({
+    keys: case52MainProviderSelectionKeys(expected),
+    value: expected,
+    action: "main-provider-profile-final",
+  }));
+  return { initial, alternate, selections, final: await exactDomValue(cdp, MAIN_PROVIDER_PROFILE.selector) };
+}
+
+export async function settleCase52MainCommandProbe({
+  commandProbe,
+  sink,
+  cleanupFailures,
+  primaryError = null,
+}) {
+  if (commandProbe === null || typeof commandProbe?.remove !== "function") {
+    throw new TypeError("case5_2 Main command probe is required");
+  }
+  if (sink === null || typeof sink?.record !== "function") {
+    throw new TypeError("case5_2 Main command probe evidence sink is required");
+  }
+  if (!Array.isArray(cleanupFailures)) {
+    throw new TypeError("case5_2 scenario cleanup failures must be an array");
+  }
+  let removal;
+  try {
+    removal = await commandProbe.remove();
+    if (removal?.removed !== true
+      || removal.probe_id !== commandProbe.probeId
+      || !Number.isInteger(removal.sequence)
+      || removal.sequence < 0) {
+      throw Object.assign(
+        new Error("Main Preferences command probe removal result was not exact"),
+        {
+          code: "desktop-command-probe-remove",
+          evidence: removal ?? null,
+        },
+      );
+    }
+  } catch (error) {
+    const failure = {
+      owner: "desktop-command-probe",
+      label: "main-provider-command-probe",
+      ...errorObservation(error),
+    };
+    cleanupFailures.push(failure);
+    if (primaryError !== null) {
+      return {
+        removal: null,
+        cleanup_failure: structuredClone(failure),
+        primary_error: errorObservation(primaryError),
+      };
+    }
+    throw new DesktopE2eError(
+      "harness",
+      "case5_2-main-provider-command-probe-cleanup",
+      "Main Preferences command probe removal did not settle exactly",
+      failure,
+    );
+  }
+  try {
+    await sink.record("case5_2-main-provider-command-probe-settled", removal, { phase: "executing", owner: OWNER });
+  } catch (error) {
+    const failure = {
+      owner: "evidence-sink",
+      label: "main-provider-command-probe-settlement-evidence",
+      ...errorObservation(error),
+    };
+    cleanupFailures.push(failure);
+    if (primaryError !== null) {
+      return {
+        removal,
+        cleanup_failure: structuredClone(failure),
+        primary_error: errorObservation(primaryError),
+      };
+    }
+    throw new DesktopE2eError(
+      "harness",
+      "case5_2-main-provider-command-probe-cleanup",
+      "Main Preferences command probe settlement evidence was not recorded",
+      failure,
+    );
+  }
+  return {
+    removal,
+    cleanup_failure: null,
+    primary_error: primaryError === null ? null : errorObservation(primaryError),
+  };
+}
+
+async function configureMainConnectionViaGui({ cdp, input, sink, options, state }) {
+  const desired = mainConnectionDesired(options);
+  const commandProbe = new DesktopCommandProbe(cdp, {
+    probeId: "case5-2-main-preferences",
+    commands: ["save_global_config"],
+  });
+  let primaryError = null;
+  try {
+    await commandProbe.install();
+    await recordTrustedClick({ input, locator: SHOW_SETTINGS, action: "open-main-settings", sink });
+    const baseline = await waitForMainPreferencesObservation({
+      action: "opening Main Preferences",
+      label: "case5_2 Main Preferences baseline",
+      timeoutMs: 30_000,
+      pollMs: 100,
+      sample: () => observeMainSettings(cdp),
+      accept: (surface) => surface?.projection?.overlay === "config"
+        && surface?.base?.value === GUI_CONNECTION_BASELINE_BASE_URL
+        && surface?.profile?.value === options.providerProfile
+        && surface?.api_key_env?.value === MAIN_API_KEY_ENV
+        && surface?.dirty === false
+        && mainSettingsErrorFree(surface),
+    });
+    const baselineTarget = structuredClone(baseline.value.projection.config_target);
+    const profile = await selectMainProviderProfile({
+      cdp,
+      input,
+      sink,
+      expected: options.providerProfile,
+    });
+    await replaceExactText({
+      cdp,
+      input,
+      locator: MAIN_BASE_URL,
+      text: options.providerBaseUrl,
+      action: "main-provider-base-url",
+      sink,
+    });
+    let surface = await observeMainSettings(cdp);
+    if (surface?.details?.open !== true) {
+      await recordTrustedClick({ input, locator: MAIN_MANUAL_DETAILS, action: "open-main-provider-manual-model", sink });
+      surface = (await waitForMainPreferencesObservation({
+        action: "opening the Main manual-model controls",
+        label: "case5_2 Main manual model input",
+        timeoutMs: 10_000,
+        pollMs: 100,
+        sample: () => observeMainSettings(cdp),
+        accept: (value) => value?.details?.open === true
+          && value?.manual?.visible === true
+          && value?.manual?.enabled === true,
+      })).value;
+    }
+    await replaceExactText({
+      cdp,
+      input,
+      locator: MAIN_MANUAL_MODEL,
+      text: options.mainModel,
+      action: "main-provider-model",
+      sink,
+    });
+    const dirty = await waitForMainPreferencesObservation({
+      action: "editing the Main connection draft",
+      label: "case5_2 exact dirty Main Preferences",
+      timeoutMs: 10_000,
+      pollMs: 100,
+      sample: () => observeMainSettings(cdp),
+      accept: (value) => exactMainSettingsControls(value, desired, { dirty: true }),
+    });
+    const dirtyScreenshot = await captureScenarioScreenshot({
+      cdp,
+      sink,
+      name: "case5_2-main-provider-preferences-dirty",
+      owner: OWNER,
+    });
+    const expectedSave = case52ExpectedMainGlobalSave(dirty.value, options);
+    const commandStart = (await commandProbe.snapshot()).sequence;
+    await recordTrustedClick({ input, locator: SAVE_GLOBAL_CONFIG, action: "save-main-provider-global-config", sink });
+    const saved = await waitForMainPreferencesObservation({
+      action: "saving the Main connection",
+      label: "case5_2 saved Main Preferences",
+      timeoutMs: 60_000,
+      pollMs: 100,
+      sample: () => observeMainSettings(cdp),
+      accept: (value) => exactMainSettingsControls(value, desired, { dirty: false })
+        && advancedConfigTarget(value?.projection?.config_target, baselineTarget)
+        && mainConfigurationFailures(value.projection, options).length === 0
+        && configField(value.projection, "model.api_key_env") === MAIN_API_KEY_ENV,
+    });
+    const commandSnapshot = await waitForMainPreferencesObservation({
+      action: "saving the Main connection command",
+      label: "case5_2 exact Main Preferences save command",
+      timeoutMs: 10_000,
+      pollMs: 50,
+      sample: () => commandProbe.snapshot(commandStart),
+      accept: (snapshot) => snapshot.calls.length >= 1,
+    });
+    let saveCommand;
+    try {
+      saveCommand = assertExactDesktopCommandSequence(commandSnapshot.value, {
+        afterSequence: commandStart,
+        expected: [expectedSave],
+      });
+    } catch (error) {
+      throw classifyCase52MainSaveCommandError(error);
+    }
+    const savedScreenshot = await captureScenarioScreenshot({
+      cdp,
+      sink,
+      name: "case5_2-main-provider-preferences-saved",
+      owner: OWNER,
+    });
+    await sink.record("case5_2-main-provider-preferences-saved", {
+      input_kind: "browser_trusted",
+      desired,
+      baseline: baseline.value,
+      profile_selection: profile,
+      dirty: dirty.value,
+      saved: saved.value,
+      save_command: saveCommand,
+      screenshots: { dirty: dirtyScreenshot, saved: savedScreenshot },
+    }, { phase: "executing", owner: OWNER });
+    await recordTrustedClick({ input, locator: CLOSE_SETTINGS, action: "close-main-settings", sink });
+    await waitForMainPreferencesObservation({
+      action: "closing Main Preferences",
+      label: "case5_2 Main Preferences closed",
+      timeoutMs: 30_000,
+      pollMs: 100,
+      sample: () => desktopProjection(cdp),
+      accept: (projection) => projection?.overlay === "none"
+        && projection?.confirmation_visible === false
+        && projection?.confirmation == null,
+    });
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    await settleCase52MainCommandProbe({
+      commandProbe,
+      sink,
+      cleanupFailures: state.scenarioCleanupFailures,
+      primaryError,
+    });
+  }
+}
+
+async function observeSideSettings(cdp) {
+  return cdp.evaluate(`(async () => {
+    const invoke = window.__TAURI_INTERNALS__?.invoke;
+    if (typeof invoke !== 'function') throw new Error('tauri-invoke-unavailable');
+    const projection = await invoke('desktop_state');
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const visible = (node) => {
+      if (!(node instanceof HTMLElement) || !node.isConnected) return false;
+      const style = getComputedStyle(node);
+      const rect = node.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0
+        && rect.width > 0 && rect.height > 0 && node.closest('[hidden], [inert], [aria-hidden="true"]') === null;
+    };
+    const viewportVisible = (node) => {
+      if (!visible(node)) return false;
+      const rect = node.getBoundingClientRect();
+      return rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth;
+    };
+    const one = (selector) => {
+      const nodes = document.querySelectorAll(selector);
+      return { count: nodes.length, node: nodes.length === 1 ? nodes[0] : null };
+    };
     const settings = one('[role="dialog"][aria-labelledby="config-dialog-title"]');
     const section = one('[role="dialog"][aria-labelledby="config-dialog-title"] section#settings-side-chat');
+    const profile = one('select#side-chat-provider-profile[data-side-chat-setting="provider-profile"]');
     const base = one('input#side-chat-base-url[data-side-chat-setting="base-url"]');
     const manual = one('input#side-chat-model-manual[data-side-chat-setting="model"]');
     const details = one('details[data-details-key="side-chat-manual-model"]');
     const configure = one('button[data-action="configure-side-chat"]');
     return {
       projection,
-      settings: { count: settings.count, visible: visible(settings.node) },
-      section: { count: section.count, visible: visible(section.node), owner: section.node instanceof HTMLElement ? section.node.dataset.sideChatSettingsOwner ?? null : null },
-      base: { count: base.count, visible: visible(base.node), value: base.node instanceof HTMLInputElement ? base.node.value : null, enabled: base.node instanceof HTMLInputElement && !base.node.disabled && !base.node.readOnly },
-      manual: { count: manual.count, visible: visible(manual.node), value: manual.node instanceof HTMLInputElement ? manual.node.value : null, enabled: manual.node instanceof HTMLInputElement && !manual.node.disabled && !manual.node.readOnly },
-      details: { count: details.count, visible: visible(details.node), open: details.node instanceof HTMLDetailsElement ? details.node.open : null },
+      settings: { count: settings.count, visible: visible(settings.node), viewport_visible: viewportVisible(settings.node) },
+      section: { count: section.count, visible: visible(section.node), viewport_visible: viewportVisible(section.node), owner: section.node instanceof HTMLElement ? section.node.dataset.sideChatSettingsOwner ?? null : null },
+      profile: { count: profile.count, visible: visible(profile.node), viewport_visible: viewportVisible(profile.node), value: profile.node instanceof HTMLSelectElement ? profile.node.value : null, enabled: profile.node instanceof HTMLSelectElement && !profile.node.disabled, options: profile.node instanceof HTMLSelectElement ? Array.from(profile.node.options).map((option) => option.value) : [] },
+      base: { count: base.count, visible: visible(base.node), viewport_visible: viewportVisible(base.node), value: base.node instanceof HTMLInputElement ? base.node.value : null, enabled: base.node instanceof HTMLInputElement && !base.node.disabled && !base.node.readOnly },
+      manual: { count: manual.count, visible: visible(manual.node), viewport_visible: viewportVisible(manual.node), value: manual.node instanceof HTMLInputElement ? manual.node.value : null, enabled: manual.node instanceof HTMLInputElement && !manual.node.disabled && !manual.node.readOnly },
+      details: { count: details.count, visible: visible(details.node), viewport_visible: viewportVisible(details.node), open: details.node instanceof HTMLDetailsElement ? details.node.open : null },
       configure: { count: configure.count, visible: visible(configure.node), enabled: configure.node instanceof HTMLButtonElement && !configure.node.disabled && configure.node.getAttribute('aria-disabled') !== 'true' },
       fatal_count: Array.from(document.querySelectorAll('.fatal')).filter(visible).length,
       recoverable_error_count: Array.from(document.querySelectorAll('.ui-error-notice')).filter(visible).length,
@@ -1367,6 +2328,7 @@ function exactSideChatProjection(projection, options, sessionId) {
     && side.chat_id.length > 0
     && side.base_url === options.providerBaseUrl
     && side.model === options.sideModel
+    && side.provider_profile === options.providerProfile
     && side.status === "idle"
     && side.phase === ""
     && side.last_error === ""
@@ -1375,6 +2337,25 @@ function exactSideChatProjection(projection, options, sessionId) {
     && side.messages.length === 0
     && side.can_send === true
     && side.can_cancel === false;
+}
+
+export function case52SideScreenshotSurfaceReady(surface, options, sessionId) {
+  return exactSideChatProjection(surface?.projection, options, sessionId)
+    && surface?.settings?.visible === true
+    && surface.settings.viewport_visible === true
+    && surface?.section?.visible === true
+    && surface.section.viewport_visible === true
+    && surface.section.owner === sessionId
+    && surface?.details?.open === true
+    && surface?.profile?.visible === true
+    && surface.profile.viewport_visible === true
+    && surface.profile.value === options.providerProfile
+    && surface?.base?.visible === true
+    && surface.base.viewport_visible === true
+    && surface.base.value === options.providerBaseUrl
+    && surface?.manual?.visible === true
+    && surface.manual.viewport_visible === true
+    && surface.manual.value === options.sideModel;
 }
 
 async function waitSettingsOverlay(cdp, expected) {
@@ -1393,7 +2374,8 @@ async function openSideSettings({ cdp, input, sink }) {
   await recordTrustedClick({ input, locator: SHOW_SETTINGS, action: "open-settings", sink });
   await waitSettingsOverlay(cdp, "config");
   await recordTrustedClick({ input, locator: SIDE_SETTINGS_NAV, action: "navigate-side-chat-settings", sink });
-  return waitForObservation({
+  return waitForSideScreenshotObservation({
+    action: "navigating to Side Chat Settings",
     label: "visible Side Chat Settings section",
     timeoutMs: 30_000,
     pollMs: 100,
@@ -1412,12 +2394,71 @@ async function closeSettings({ cdp, input, sink }) {
   await waitSettingsOverlay(cdp, "none");
 }
 
+async function trustedSelectSideProviderProfile({ cdp, input, sink, options }) {
+  const initial = await exactDomValue(cdp, SIDE_PROVIDER_PROFILE.selector);
+  if (initial.count !== 1) throw new Error("Side Chat provider profile target cardinality drifted");
+  if (initial.value === options.providerProfile) {
+    const evidence = {
+      changed: false,
+      expected: options.providerProfile,
+      initial,
+      final: initial,
+    };
+    await sink.record("case5_2-side-provider-profile-observed", evidence, { phase: "executing", owner: OWNER });
+    return evidence;
+  }
+  const selections = [];
+  const select = async (key, expected, action) => {
+    await recordTrustedClick({ input, locator: SIDE_PROVIDER_PROFILE, action: `${action}-focus`, sink });
+    const start = (await input.snapshotProbe()).sequence;
+    await input.pressKey(key);
+    await input.pressKey("Enter");
+    const snapshot = await input.snapshotProbe(start);
+    const probe = assertTrustedProbeSequence(snapshot, {
+      afterSequence: start,
+      expected: [{ type: "change", identity: SIDE_PROVIDER_PROFILE.identity }],
+    });
+    const settled = await waitForObservation({
+      label: `${action} exact value`,
+      timeoutMs: 10_000,
+      pollMs: 100,
+      sample: () => exactDomValue(cdp, SIDE_PROVIDER_PROFILE.selector),
+      accept: (value) => value.count === 1 && value.value === expected,
+    });
+    const evidence = { action, expected, probe, final: settled.value };
+    selections.push(evidence);
+    await sink.record("case5_2-trusted-side-provider-profile", evidence, { phase: "executing", owner: OWNER });
+  };
+  if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
+    await select("o", OPENAI_COMPATIBLE_PROFILE, "side-chat-provider-profile-openai-compatible");
+  } else {
+    await select("l", LM_STUDIO_PROFILE, "side-chat-provider-profile-lm-studio");
+  }
+  const final = await exactDomValue(cdp, SIDE_PROVIDER_PROFILE.selector);
+  if (final.count !== 1 || final.value !== options.providerProfile) {
+    throw productFailure("case5_2-side-chat-provider-profile", "trusted Side Chat provider profile selection did not settle exactly", {
+      expected: options.providerProfile,
+      initial,
+      selections,
+      final,
+    });
+  }
+  return { initial, selections, final };
+}
+
 async function configureSideChat({ cdp, input, sink, options, sessionId }) {
   await openSideSettings({ cdp, input, sink });
+  const providerProfile = await trustedSelectSideProviderProfile({ cdp, input, sink, options });
   await replaceExactText({ cdp, input, locator: SIDE_BASE_URL, text: options.providerBaseUrl, action: "side-chat-base-url", sink });
   let surface = await observeSideSettings(cdp);
   if (surface.details.open !== true) {
-    await recordTrustedClick({ input, locator: SIDE_MANUAL_DETAILS, action: "open-side-chat-manual-model", sink });
+    await recordTrustedClick({
+      input,
+      locator: SIDE_MANUAL_DETAILS,
+      action: "open-side-chat-manual-model",
+      sink,
+      stableHitSamples: 3,
+    });
     surface = (await waitForObservation({
       label: "Side Chat manual model input",
       timeoutMs: 10_000,
@@ -1432,7 +2473,8 @@ async function configureSideChat({ cdp, input, sink, options, sessionId }) {
     timeoutMs: 10_000,
     pollMs: 100,
     sample: () => observeSideSettings(cdp),
-    accept: (value) => value.configure.count === 1 && value.configure.visible === true && value.configure.enabled === true,
+    accept: (value) => value.profile.value === options.providerProfile
+      && value.configure.count === 1 && value.configure.visible === true && value.configure.enabled === true,
   });
   await recordTrustedClick({ input, locator: CONFIGURE_SIDE_CHAT, action: "configure-side-chat", sink });
   const configured = await waitForObservation({
@@ -1442,19 +2484,65 @@ async function configureSideChat({ cdp, input, sink, options, sessionId }) {
     sample: () => observeSideSettings(cdp),
     accept: (value) => exactSideChatProjection(value.projection, options, sessionId)
       && value.section.owner === sessionId
+      && value.profile.value === options.providerProfile
       && value.base.value === options.providerBaseUrl
       && value.manual.value === options.sideModel
       && value.fatal_count === 0
       && value.recoverable_error_count === 0
       && value.validation_error_count === 0,
   });
+  let screenshotSurface = configured;
+  if (!case52SideScreenshotSurfaceReady(configured.value, options, sessionId)) {
+    await recordTrustedClick({
+      input,
+      locator: SIDE_SETTINGS_NAV,
+      action: "show-configured-side-chat-settings",
+      sink,
+    });
+    const visibleSection = await waitForSideScreenshotObservation({
+      action: "showing the configured Side Chat Settings section",
+      label: "visible configured Side Chat Settings controls",
+      timeoutMs: 10_000,
+      pollMs: 100,
+      sample: () => observeSideSettings(cdp),
+      accept: (value) => value?.settings?.visible === true
+        && value?.settings?.viewport_visible === true
+        && value?.section?.visible === true
+        && value?.section?.viewport_visible === true
+        && value?.profile?.visible === true
+        && value?.profile?.viewport_visible === true
+        && value?.base?.visible === true
+        && value?.base?.viewport_visible === true
+        && exactSideChatProjection(value?.projection, options, sessionId),
+    });
+    if (visibleSection.value?.details?.open !== true) {
+      await recordTrustedClick({
+        input,
+        locator: SIDE_MANUAL_DETAILS,
+        action: "show-configured-side-chat-manual-model",
+        sink,
+        stableHitSamples: 3,
+      });
+    }
+    screenshotSurface = await waitForSideScreenshotObservation({
+      action: "showing the configured Side Chat model",
+      label: "visible configured Side Chat Settings section",
+      timeoutMs: 10_000,
+      pollMs: 100,
+      sample: () => observeSideSettings(cdp),
+      accept: (value) => case52SideScreenshotSurfaceReady(value, options, sessionId),
+    });
+  }
   const screenshot = await captureScenarioScreenshot({ cdp, sink, name: "case5_2-side-chat-configured", owner: OWNER });
   await sink.record("case5_2-side-chat-configured", {
     owner_session_id: sessionId,
     base_url: options.providerBaseUrl,
     model: options.sideModel,
+    provider_profile: options.providerProfile,
+    provider_profile_selection: providerProfile,
     initial_surface: committable.value,
     configured_surface: configured.value,
+    screenshot_surface: screenshotSurface.value,
     screenshot,
   }, { phase: "executing", owner: OWNER });
   await closeSettings({ cdp, input, sink });
@@ -1471,20 +2559,26 @@ async function verifyRestoredSideChat({ cdp, input, sink, options, sessionId }) 
   }
   const visible = await openSideSettings({ cdp, input, sink });
   if (!exactSideChatProjection(visible.value.projection, options, sessionId)
-    || visible.value.base.value !== options.providerBaseUrl) {
+    || visible.value.base.value !== options.providerBaseUrl
+    || visible.value.profile.value !== options.providerProfile) {
     throw productFailure("case5_2-side-chat-restart-settings", "reopened Settings did not display the persisted Side Chat owner and provider", { surface: visible.value });
   }
   if (visible.value.details.open !== true) {
-    await recordTrustedClick({ input, locator: SIDE_MANUAL_DETAILS, action: "reopen-side-chat-manual-model", sink });
+    await recordTrustedClick({
+      input,
+      locator: SIDE_MANUAL_DETAILS,
+      action: "reopen-side-chat-manual-model",
+      sink,
+      stableHitSamples: 3,
+    });
   }
-  const exact = await waitForObservation({
+  const exact = await waitForSideScreenshotObservation({
+    action: "showing the restored Side Chat model",
     label: "restarted Side Chat Settings exact values",
     timeoutMs: 10_000,
     pollMs: 100,
     sample: () => observeSideSettings(cdp),
-    accept: (value) => value.manual.visible === true
-      && value.manual.value === options.sideModel
-      && exactSideChatProjection(value.projection, options, sessionId),
+    accept: (value) => case52SideScreenshotSurfaceReady(value, options, sessionId),
   });
   const screenshot = await captureScenarioScreenshot({ cdp, sink, name: "case5_2-side-chat-restored", owner: OWNER });
   await sink.record("case5_2-side-chat-restored", { surface: exact.value, screenshot }, { phase: "executing", owner: OWNER });
@@ -1496,12 +2590,75 @@ function configField(projection, key) {
   return rows.length === 1 ? rows[0].value : null;
 }
 
+function canonicalJsonText(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJsonText).join(",")}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJsonText(value[key])}`).join(",")}}`;
+}
+
+function effectiveExtraBodyEvidence(value) {
+  if (value === "") {
+    return {
+      configured: false,
+      valid_allowed_generation_body: true,
+      canonical_json_sha256: null,
+      canonical_json_size_bytes: 0,
+      generation_fields: [],
+    };
+  }
+  if (typeof value !== "string") {
+    return {
+      configured: value !== null,
+      valid_allowed_generation_body: false,
+      canonical_json_sha256: null,
+      canonical_json_size_bytes: 0,
+      generation_fields: [],
+    };
+  }
+  try {
+    const normalized = normalizeExtraBodyJson(JSON.parse(value));
+    const canonical = canonicalJsonText(normalized.value);
+    const kwargs = normalized.value?.chat_template_kwargs;
+    return {
+      configured: true,
+      valid_allowed_generation_body: true,
+      canonical_json_sha256: sha256(Buffer.from(canonical, "utf8")),
+      canonical_json_size_bytes: Buffer.byteLength(canonical, "utf8"),
+      generation_fields: kwargs === null || typeof kwargs !== "object"
+        ? []
+        : Object.keys(kwargs).sort().map((key) => `chat_template_kwargs.${key}`),
+    };
+  } catch {
+    return {
+      configured: value.length > 0,
+      valid_allowed_generation_body: false,
+      canonical_json_sha256: null,
+      canonical_json_size_bytes: 0,
+      generation_fields: [],
+      rejected_value_sha256: sha256(Buffer.from(value, "utf8")),
+      rejected_value_size_bytes: Buffer.byteLength(value, "utf8"),
+    };
+  }
+}
+
+export function case52EffectiveExtraBodyFailures(projection, options) {
+  if (options.providerProfile !== OPENAI_COMPATIBLE_PROFILE) return [];
+  const expectedValue = options.extraBodyJson === null
+    ? ""
+    : canonicalJsonText(options.extraBodyJson);
+  const expected = effectiveExtraBodyEvidence(expectedValue);
+  const actual = effectiveExtraBodyEvidence(configField(projection, "model.extra_body_json"));
+  return sameValue(actual, expected)
+    ? []
+    : [{ key: "model.extra_body_json", expected, actual }];
+}
+
 function mainConfigurationFailures(projection, options, { sessionRequired = false } = {}) {
-  const failures = [];
+  const failures = case52EffectiveExtraBodyFailures(projection, options);
   const expectedFields = new Map([
     ["model.base_url", options.providerBaseUrl],
     ["model.model", options.mainModel],
-    ["model.provider_metadata_mode", "lm_studio_native_required"],
+    ["model.provider_profile", options.providerProfile],
     ["model.request_timeout_ms", String(QUALITY_REQUEST_TIMEOUT_MS)],
     ["model.max_retries", "0"],
     ["model.context_window", String(QUALITY_CONTEXT_WINDOW)],
@@ -1525,7 +2682,7 @@ function mainConfigurationFailures(projection, options, { sessionRequired = fals
     ["provider_effective_model_id", options.mainModel, projection?.provider_effective_model_id],
     ["provider_effective_context_window", String(QUALITY_CONTEXT_WINDOW), projection?.provider_effective_context_window],
     ["provider_effective_max_output_tokens", String(QUALITY_MAX_OUTPUT_TOKENS), projection?.provider_effective_max_output_tokens],
-    ["provider_effective_metadata_mode", "lm_studio_native_required", projection?.provider_effective_metadata_mode],
+    ["provider_effective_profile", options.providerProfile, projection?.provider_effective_profile],
   ]) {
     if (actual !== expected) failures.push({ key, expected, actual });
   }
@@ -1535,6 +2692,7 @@ function mainConfigurationFailures(projection, options, { sessionRequired = fals
       ["session_settings.available", true, settings?.available],
       ["session_settings.base_url", options.providerBaseUrl, settings?.base_url],
       ["session_settings.model", options.mainModel, settings?.model],
+      ["session_settings.provider_profile", options.providerProfile, settings?.provider_profile],
       ["session_settings.access_mode", "auto_review", settings?.access_mode],
       ["session_settings.context_window", "", settings?.context_window],
       ["session_settings.max_output_tokens", "", settings?.max_output_tokens],
@@ -1586,6 +2744,46 @@ function repetitionObservation(projection, expectedPrompt) {
   };
 }
 
+export function case52ProviderControlTokenLeaks(projection) {
+  const markers = ["<|im_start|>", "<|im_end|>"];
+  const rows = Array.isArray(projection?.transcript_rows) ? projection.transcript_rows : [];
+  return rows.flatMap((row, rowIndex) => {
+    if (row?.row_kind !== "assistant" || typeof row.body !== "string") return [];
+    const detected = markers.filter((marker) => row.body.includes(marker));
+    if (detected.length === 0) return [];
+    const firstOffset = Math.min(...detected.map((marker) => row.body.indexOf(marker)));
+    return [{
+      row_index: rowIndex,
+      stable_history_identity: row.stable_history_identity ?? null,
+      markers: detected,
+      body_sha256: sha256(Buffer.from(row.body, "utf8")),
+      body_size_bytes: Buffer.byteLength(row.body, "utf8"),
+      bounded_excerpt: row.body.slice(Math.max(0, firstOffset - 120), firstOffset + 240),
+    }];
+  });
+}
+
+export function case52ProviderControlTokenLeakEvidence(projection, leaks) {
+  const session = selectedSessionRow(projection);
+  return {
+    schema_version: "desktop-e2e.case5_2-provider-control-token-leak.v1",
+    run_status_key: projection?.run_status_key ?? null,
+    run_phase: projection?.run_phase ?? null,
+    task_activity_state: projection?.task_activity_state ?? null,
+    busy: projection?.busy ?? null,
+    agent_tree_active: projection?.agent_tree_active ?? null,
+    selected_navigation: selectedNavigationIdentity(projection),
+    selected_session: session === null ? null : {
+      session_id: session.session_id ?? null,
+      status: session.status ?? null,
+      loaded_status: session.loaded_status ?? null,
+      active_turn_id: session.active_turn_id ?? null,
+      admission_revision: session.admission_revision ?? null,
+    },
+    leaks: structuredClone(leaks),
+  };
+}
+
 function requiredArtifactCount(stageId, manifest, reference) {
   const current = fileMap(manifest.files);
   if (stageId === "stage1") {
@@ -1621,6 +2819,69 @@ async function stopNonConvergentRun({ cdp, input, sink, stage, evidence }) {
   throw productFailure("case5_2-nonconvergent", `${stage} met the specified non-convergence cutoff and was visibly stopped without steering`, record);
 }
 
+async function stopProviderControlTokenLeak({ cdp, input, sink, stage, projection, leaks }) {
+  const minimizedProjection = case52ProviderControlTokenLeakEvidence(projection, leaks);
+  let projectionIdentity = null;
+  let projectionError = null;
+  try {
+    projectionIdentity = await sink.writeJson(
+      `case5_2/projections/${stage}-provider-control-token-leak.json`,
+      minimizedProjection,
+    );
+  } catch (error) {
+    projectionError = errorObservation(error);
+  }
+  let before = null;
+  let screenshotError = null;
+  try {
+    before = await captureScenarioScreenshot({
+      cdp,
+      sink,
+      name: `case5_2-${stage}-provider-control-token-leak`,
+      owner: OWNER,
+    });
+  } catch (error) {
+    screenshotError = errorObservation(error);
+  }
+  let stop = null;
+  let stopError = null;
+  let terminal = null;
+  try {
+    stop = await recordTrustedClick({ input, locator: STOP, action: `${stage}-provider-control-token-leak-visible-stop`, sink });
+    terminal = (await waitForObservation({
+      label: `${stage} interrupted terminal after provider control-token leak`,
+      timeoutMs: 120_000,
+      pollMs: 250,
+      sample: () => desktopProjection(cdp),
+      accept: (value) => value?.run_status_key === "cancelled"
+        && value?.task_activity_state === "idle"
+        && value?.busy === false
+        && value?.agent_tree_active === false,
+    })).value;
+  } catch (error) {
+    stopError = errorObservation(error);
+  }
+  const evidence = {
+    stage,
+    leaks,
+    projection: projectionIdentity,
+    projection_error: projectionError,
+    screenshot: before,
+    screenshot_error: screenshotError,
+    visible_stop_count: stop === null ? 0 : 1,
+    stop,
+    stop_error: stopError,
+    terminal,
+    record_error: null,
+  };
+  try {
+    await sink.record("case5_2-provider-control-token-leak", evidence, { phase: "executing", owner: OWNER });
+  } catch (error) {
+    evidence.record_error = errorObservation(error);
+  }
+  throw case52ProviderControlTokenLeakFailure(stage, evidence);
+}
+
 async function waitForStageTerminal({ context, cdp, input, sink, baseline, referenceManifest, stage, expectedSessionId, expectedTurnId, expectedPrompt }) {
   const started = Date.now();
   let nextManifestAt = started;
@@ -1636,6 +2897,17 @@ async function waitForStageTerminal({ context, cdp, input, sink, baseline, refer
   while (Date.now() - started < STAGE_TIMEOUT_MS) {
     const projection = await desktopProjection(cdp);
     lastProjection = projection;
+    const providerControlTokenLeaks = case52ProviderControlTokenLeaks(projection);
+    if (providerControlTokenLeaks.length > 0) {
+      await stopProviderControlTokenLeak({
+        cdp,
+        input,
+        sink,
+        stage: stage.id,
+        projection,
+        leaks: providerControlTokenLeaks,
+      });
+    }
     const classified = classifyCase52NormalTerminal(projection, {
       expectedSessionId,
       expectedTurnId,
@@ -1693,26 +2965,59 @@ async function waitForStageTerminal({ context, cdp, input, sink, baseline, refer
   });
 }
 
-async function waitForTurnAcquisition(cdp, expectedSessionId) {
+function case52AdmissionRevision(value) {
+  if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value)) return null;
+  try {
+    const revision = BigInt(value);
+    return revision <= 18_446_744_073_709_551_615n ? revision : null;
+  } catch {
+    return null;
+  }
+}
+
+export function case52NewTurnAcquisitionAccepted(projection, {
+  expectedSessionId = null,
+  previousExpectedState = null,
+} = {}) {
+  const row = selectedSessionRow(projection);
+  const expectedState = projection?.run_target?.expectedState;
+  const sessionAccepted = typeof row?.session_id === "string"
+    && row.session_id.length > 0
+    && (expectedSessionId === null || row.session_id === expectedSessionId);
+  const rowRevision = case52AdmissionRevision(row?.admission_revision);
+  const turnRevision = case52AdmissionRevision(expectedState?.admissionRevision);
+  const turnAccepted = row?.status === "running"
+    && row.loaded_status === "active"
+    && typeof row.active_turn_id === "string"
+    && row.active_turn_id.length > 0
+    && expectedState?.kind === "turn"
+    && expectedState.turnId === row.active_turn_id
+    && rowRevision !== null
+    && turnRevision === rowRevision;
+  if (!sessionAccepted || !turnAccepted || previousExpectedState === null) {
+    return sessionAccepted && turnAccepted;
+  }
+
+  const previousRevision = case52AdmissionRevision(previousExpectedState?.admissionRevision);
+  return previousExpectedState?.kind === "idle"
+    && (previousExpectedState.latestTurnId === null
+      || (typeof previousExpectedState.latestTurnId === "string"
+        && previousExpectedState.latestTurnId.length > 0
+        && previousExpectedState.latestTurnId !== row.active_turn_id))
+    && previousRevision !== null
+    && rowRevision === previousRevision + 1n;
+}
+
+async function waitForTurnAcquisition(cdp, { expectedSessionId, previousExpectedState }) {
   return waitForObservation({
     label: "case5_2 trusted Send turn acquisition",
     timeoutMs: 30_000,
     pollMs: 100,
     sample: () => desktopProjection(cdp),
-    accept: (projection) => {
-      const row = selectedSessionRow(projection);
-      const expectedState = projection?.run_target?.expectedState;
-      const sessionAccepted = typeof row?.session_id === "string"
-        && row.session_id.length > 0
-        && (expectedSessionId === null || row.session_id === expectedSessionId);
-      const turnAccepted = row?.status === "running"
-        && row.loaded_status === "active"
-        && typeof row.active_turn_id === "string"
-        && row.active_turn_id.length > 0
-        && expectedState?.kind === "turn"
-        && expectedState.turnId === row.active_turn_id;
-      return sessionAccepted && turnAccepted;
-    },
+    accept: (projection) => case52NewTurnAcquisitionAccepted(projection, {
+      expectedSessionId,
+      previousExpectedState,
+    }),
   });
 }
 
@@ -1735,9 +3040,35 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
       identity: beforeIdentity,
     });
   }
+  const previousExpectedState = expectedSessionId === null
+    ? null
+    : before?.run_target?.expectedState ?? null;
   await insertExactText({ cdp, input, locator: PROMPT, text: prompt, action: `${stage.id}-prompt`, sink });
-  const send = await recordTrustedClick({ input, locator: SEND, action: `${stage.id}-send`, sink });
-  const acquired = await waitForTurnAcquisition(cdp, expectedSessionId);
+  const composerSettlement = await waitForObservation({
+    label: `case5_2 ${stage.id} GUI new-request composer settlement`,
+    timeoutMs: 30_000,
+    pollMs: 100,
+    sample: () => newRequestComposerSurface(cdp),
+    accept: (surface) => case52NewRequestComposerSurfaceReady(surface, prompt),
+  });
+  await sink.record("case5_2-composer-settled", {
+    stage: stage.id,
+    elapsed_ms: composerSettlement.elapsed_ms,
+    prompt_value_sha256: sourceIdentity.gui_text_sha256,
+    prompt_value_bytes: sourceIdentity.gui_text_size_bytes,
+    surface: {
+      ...composerSettlement.value,
+      prompt_value: null,
+    },
+  }, { phase: "executing", owner: OWNER });
+  const send = await recordTrustedClick({
+    input,
+    locator: SEND_NEW_REQUEST,
+    action: `${stage.id}-send`,
+    sink,
+    stableHitSamples: 3,
+  });
+  const acquired = await waitForTurnAcquisition(cdp, { expectedSessionId, previousExpectedState });
   const acquiredProjection = acquired.value;
   const row = selectedSessionRow(acquiredProjection);
   const sessionId = row.session_id;
@@ -1754,6 +3085,7 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
     wire_prompt_sha256: sha256(Buffer.from(wirePrompt, "utf8")),
     session_id: sessionId,
     turn_id: turnId,
+    previous_expected_state: previousExpectedState,
     identity,
     send,
     acquisition_elapsed_ms: acquired.elapsed_ms,
@@ -2124,9 +3456,255 @@ async function stableRestartProjection({ cdp, sessionId, turnId, prompt, beforeH
   };
 }
 
+async function waitForRestartTurnPage({
+  cdp,
+  sessionId,
+  turnId,
+  admissionRevision,
+  total,
+  limit,
+  requireLatestSuffix,
+  previousOffset = null,
+  allowCommandPalette = false,
+}) {
+  let observed;
+  try {
+    observed = await waitForObservation({
+      label: requireLatestSuffix
+        ? "case5_2 restarted latest bounded turn page"
+        : "case5_2 previous turn page settlement",
+      timeoutMs: 60_000,
+      pollMs: 100,
+      sample: async () => {
+        const projection = await desktopProjection(cdp);
+        const terminal = classifyCase52NormalTerminal(projection, {
+          expectedSessionId: sessionId,
+          expectedTurnId: turnId,
+          expectedPrompt: null,
+          minimumCompletedSummaryCount: 1,
+          allowedOverlay: allowCommandPalette ? "command_palette" : "none",
+        });
+        const page = classifyCase52RestartTurnPage(projection, {
+          expectedSessionId: sessionId,
+          expectedTurnId: turnId,
+          expectedAdmissionRevision: admissionRevision,
+          expectedTotal: total,
+          expectedLimit: limit,
+          requireLatestSuffix,
+        });
+        return { projection, terminal, page };
+      },
+      accept: ({ terminal, page }) => {
+        if (terminal.decision === "fail" || page.decision === "fail") return true;
+        if (terminal.decision !== "pass" || page.decision === "pending") return false;
+        return previousOffset === null || page.metadata.offset !== previousOffset;
+      },
+      retrySampleErrors: false,
+    });
+  } catch (error) {
+    if (error?.code !== "observation-timeout" || error?.evidence?.last_error) throw error;
+    throw productFailure(
+      "case5_2-restart-turn-page-timeout",
+      "restarted Project Chat turn-page owner did not settle before the product deadline",
+      error.evidence,
+    );
+  }
+  if (observed.value.terminal.decision === "fail" || observed.value.page.decision === "fail") {
+    throw productFailure(
+      "case5_2-restart-turn-page-owner",
+      "restarted Project Chat bounded turn-page owner drifted",
+      {
+        terminal: observed.value.terminal,
+        page: observed.value.page,
+        projection: observed.value.projection,
+      },
+    );
+  }
+  return observed;
+}
+
+async function closeCommandPaletteWithTrustedEscape({ cdp, input, sink }) {
+  const start = (await input.snapshotProbe()).sequence;
+  await input.pressKey("Escape");
+  const snapshot = await input.snapshotProbe(start);
+  const probe = assertTrustedProbeSequence(snapshot, {
+    afterSequence: start,
+    expected: [
+      { type: "keydown", key: "Escape", code: "Escape" },
+      { type: "keyup", key: "Escape", code: "Escape" },
+    ],
+  });
+  const closed = await waitForObservation({
+    label: "case5_2 restart history command palette closed",
+    timeoutMs: 10_000,
+    pollMs: 100,
+    sample: () => desktopProjection(cdp),
+    accept: (projection) => projection?.overlay === "none",
+    retrySampleErrors: false,
+  });
+  await sink.record("case5_2-trusted-action", {
+    action: "close-restart-history-command-palette",
+    input_kind: "browser_trusted",
+    probe,
+    projection_revision: closed.value.projection_revision,
+  }, { phase: "executing", owner: OWNER });
+}
+
+export async function waitForCase52RestartHistoryTarget({ input }) {
+  let observed;
+  try {
+    observed = await waitForSemanticTargetSettlement({
+      input,
+      locator: PREVIOUS_TURN_PAGE,
+      label: "case5_2 restart history semantic target",
+      timeoutMs: 10_000,
+      pollMs: 16,
+    });
+  } catch (error) {
+    if (error?.code !== "observation-timeout" || error?.evidence?.last_error) throw error;
+    throw productFailure(
+      "case5_2-restart-history-target-timeout",
+      "restarted Project Chat semantic previous-page action did not reappear after page settlement",
+      error.evidence,
+    );
+  }
+  if (observed.value.classified.decision === "fail") {
+    throw productFailure(
+      "case5_2-restart-history-target",
+      "restarted Project Chat semantic previous-page action was ambiguous after page settlement",
+      observed.value,
+    );
+  }
+  return observed;
+}
+
+async function expandRestartHistory({
+  cdp,
+  input,
+  sink,
+  sessionId,
+  turnId,
+  admissionRevision,
+  total,
+  limit,
+}) {
+  const initial = await waitForRestartTurnPage({
+    cdp,
+    sessionId,
+    turnId,
+    admissionRevision,
+    total,
+    limit,
+    requireLatestSuffix: true,
+  });
+  if (initial.value.page.decision === "ready") {
+    return { projection: initial.value.projection, pages: [], initial: initial.value.page.metadata };
+  }
+
+  await recordTrustedClick({
+    input,
+    locator: SHOW_COMMAND_PALETTE,
+    action: "open-restart-history-command-palette",
+    sink,
+  });
+  await waitForObservation({
+    label: "case5_2 restart history command palette",
+    timeoutMs: 10_000,
+    pollMs: 100,
+    sample: () => desktopProjection(cdp),
+    accept: (projection) => projection?.overlay === "command_palette",
+    retrySampleErrors: false,
+  });
+  await replaceExactText({
+    cdp,
+    input,
+    locator: COMMAND_PALETTE_SEARCH,
+    text: "load-previous-turn-page",
+    action: "filter-restart-history-command",
+    sink,
+  });
+
+  const pages = [];
+  let current = initial.value;
+  const maximumPages = Math.ceil(current.page.metadata.offset / current.page.metadata.limit);
+  while (current.page.decision === "page_needed") {
+    if (pages.length >= maximumPages) {
+      throw productFailure(
+        "case5_2-restart-turn-page-bound",
+        "restarted Project Chat required more previous-page transitions than its canonical metadata permits",
+        { maximum_pages: maximumPages, pages, current },
+      );
+    }
+    const before = current.page.metadata;
+    await waitForCase52RestartHistoryTarget({ input });
+    const action = await recordTrustedClick({
+      input,
+      locator: PREVIOUS_TURN_PAGE,
+      action: `restart-history-previous-page-${pages.length + 1}`,
+      sink,
+    });
+    const settled = await waitForRestartTurnPage({
+      cdp,
+      sessionId,
+      turnId,
+      admissionRevision,
+      total,
+      limit,
+      requireLatestSuffix: false,
+      previousOffset: before.offset,
+      allowCommandPalette: true,
+    });
+    const after = settled.value.page.metadata;
+    const failures = case52RestartPreviousPageTransitionFailures({ before, after });
+    const evidence = {
+      page: pages.length + 1,
+      before,
+      after,
+      failures,
+      action,
+    };
+    await sink.record("case5_2-restart-history-prepend", evidence, {
+      phase: "executing",
+      owner: OWNER,
+    });
+    if (failures.length > 0) {
+      throw productFailure(
+        "case5_2-restart-turn-page-transition",
+        "restarted Project Chat previous-page transition drifted from the exact bounded range",
+        evidence,
+      );
+    }
+    pages.push({ before, after });
+    current = settled.value;
+  }
+  await closeCommandPaletteWithTrustedEscape({ cdp, input, sink });
+  return { projection: current.projection, pages, initial: initial.value.page.metadata };
+}
+
 async function providerMustKeepSideUnloaded({ options, sink, state, name }) {
   const snapshot = await providerSnapshot(options);
-  const models = providerModelState(snapshot, options);
+  const models = case52ProviderModelState(snapshot, options);
+  if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
+    state.sideProviderSamples.push({
+      name,
+      captured_at: snapshot.captured_at,
+      selected_side_model: options.sideModel,
+      same_as_main_model: options.sideModel === options.mainModel,
+      exact_model_present: models.main_match_count === 1,
+      context_capacity: models.context_capacity,
+      provider_load_state: "not-observable-external-unmanaged",
+    });
+    const failures = providerCatalogFailures(models, options, { mainLoaded: true });
+    const identity = await sink.writeJson(`case5_2/provider/${name}.json`, { snapshot, models, failures });
+    if (failures.length > 0) {
+      throw productFailure(
+        "case5_2-provider-runtime-drift",
+        "OpenAI-compatible external provider model availability drifted during the scored run",
+        { name, failures, models, identity },
+      );
+    }
+    return { snapshot, models, failures, identity };
+  }
   state.sideProviderSamples.push({
     name,
     captured_at: snapshot.captured_at,
@@ -2144,6 +3722,16 @@ async function providerMustKeepSideUnloaded({ options, sink, state, name }) {
     throw productFailure("case5_2-provider-runtime-drift", "provider model ownership drifted during the scored run", { name, failures, models, identity });
   }
   return { snapshot, models, failures, identity };
+}
+
+export function case52SideProviderSummary(options, samples) {
+  const providerSamples = structuredClone(samples);
+  return {
+    selected_model_unloaded_samples: options.providerProfile === LM_STUDIO_PROFILE
+      ? structuredClone(samples)
+      : [],
+    selected_model_provider_samples: providerSamples,
+  };
 }
 
 async function cleanupWebviewInput(input, state, label) {
@@ -2172,10 +3760,12 @@ export function createCase52Scenario(rawOptions = {}) {
     providerLoadAttempted: false,
     providerLoadResponseObserved: false,
     providerOwned: false,
+    providerExternalPreflightObserved: false,
     mainProviderInstanceId: null,
     acceptedProviderLoad: null,
     providerEffectiveContext: null,
     providerProfileExact: false,
+    providerComparabilityDeviations: [],
     sideProviderSamples: [],
     externalProcessOwner: {
       started: 0,
@@ -2185,6 +3775,7 @@ export function createCase52Scenario(rawOptions = {}) {
     },
     inputCleanupAttempts: new WeakSet(),
     inputCleanupFailures: [],
+    scenarioCleanupFailures: [],
     quiesceOutcome: null,
     acceptedEnd: false,
     performance: {
@@ -2198,6 +3789,11 @@ export function createCase52Scenario(rawOptions = {}) {
     manualGate: "pending",
     databaseRequired: true,
     requestGracefulExit,
+    get environment() {
+      return options.extraBodyJsonCompact === null
+        ? {}
+        : { MOYAI_EXTRA_BODY_JSON: options.extraBodyJsonCompact };
+    },
     async prepare({ context, sink, phase }) {
       const task = await fileIdentity(path.join(caseDirectory, "task.md"), { includeBytes: true });
       const oracleSource = await fileIdentity(path.join(caseDirectory, "oracle", "test_cancel_contract.py"), { includeBytes: true });
@@ -2254,11 +3850,23 @@ export function createCase52Scenario(rawOptions = {}) {
 
       await loadMainProvider({ options, sink, state, phase });
       await sink.record("case5_2-prepared", {
-        options,
+        options: case52EvidenceOptions(options),
+        provider_contract: {
+          profile: options.providerProfile,
+          lifecycle: options.providerLifecycle,
+          scenario_config_profile: options.scenarioConfigProfile,
+          extra_body: case52ExtraBodyEvidence(options),
+          comparability_deviations: state.providerComparabilityDeviations,
+        },
         quality_profile: {
           context_window: QUALITY_CONTEXT_WINDOW,
-          provider_num_ctx: QUALITY_CONTEXT_WINDOW,
-          provider_applied_context: state.providerEffectiveContext,
+          provider_num_ctx: options.providerProfile === LM_STUDIO_PROFILE ? QUALITY_CONTEXT_WINDOW : null,
+          provider_applied_context: options.providerProfile === LM_STUDIO_PROFILE
+            ? state.providerEffectiveContext
+            : null,
+          provider_reported_context_capacity: options.providerProfile === OPENAI_COMPATIBLE_PROFILE
+            ? state.providerEffectiveContext
+            : null,
           provider_profile_exact: state.providerProfileExact,
           max_output_tokens: QUALITY_MAX_OUTPUT_TOKENS,
           request_timeout_ms: QUALITY_REQUEST_TIMEOUT_MS,
@@ -2298,6 +3906,17 @@ export function createCase52Scenario(rawOptions = {}) {
           screenshotStem: "case5_2-main-shell-ready",
         });
         state.performance.launch_to_ready_ms = elapsedSince(firstRuntime.launch_started_at);
+        activeInput = new WebviewInput(activeCdp, { probeId: "case5-2-generation-1", maxProbeEvents: 65_536 });
+        await activeInput.installProbe();
+        if (options.configureMainViaGui) {
+          await configureMainConnectionViaGui({
+            cdp: activeCdp,
+            input: activeInput,
+            sink,
+            options,
+            state,
+          });
+        }
         const initialProjection = await desktopProjection(activeCdp);
         const initialConfigFailures = mainConfigurationFailures(initialProjection, options);
         if (initialConfigFailures.length > 0) {
@@ -2310,9 +3929,6 @@ export function createCase52Scenario(rawOptions = {}) {
           throw productFailure("case5_2-side-chat-not-fresh", "fresh case5_2 data unexpectedly contained a Side Chat binding", { side_chat: initialProjection.side_chat });
         }
         await providerMustKeepSideUnloaded({ options, sink, state, name: "desktop-ready" });
-
-        activeInput = new WebviewInput(activeCdp, { probeId: "case5-2-generation-1", maxProbeEvents: 65_536 });
-        await activeInput.installProbe();
 
         const stage1 = await executeStage({
           context,
@@ -2395,6 +4011,35 @@ export function createCase52Scenario(rawOptions = {}) {
           screenshotStem: "case5_2-restart-shell-ready",
         });
         state.performance.reopen_to_ready_ms = elapsedSince(restarted.runtime.launch_started_at);
+        activeInput = new WebviewInput(activeCdp, { probeId: "case5-2-generation-2", maxProbeEvents: 65_536 });
+        await activeInput.installProbe();
+        const stage3Owner = stage3.terminal?.run_target?.expectedState;
+        if (stage3Owner?.kind !== "idle"
+          || typeof stage3Owner.admissionRevision !== "string"
+          || !Number.isSafeInteger(stage3.terminal?.turn_page_total)
+          || stage3.terminal.turn_page_total < 1
+          || !Number.isSafeInteger(stage3.terminal?.turn_page_limit)
+          || stage3.terminal.turn_page_limit < 1) {
+          throw productFailure(
+            "case5_2-stage3-restart-owner",
+            "Stage 3 terminal projection did not expose a reusable durable restart owner",
+            {
+              expected_state: stage3Owner ?? null,
+              turn_page_total: stage3.terminal?.turn_page_total ?? null,
+              turn_page_limit: stage3.terminal?.turn_page_limit ?? null,
+            },
+          );
+        }
+        const expandedRestartHistory = await expandRestartHistory({
+          cdp: activeCdp,
+          input: activeInput,
+          sink,
+          sessionId: stage1.sessionId,
+          turnId: stage3.turnId,
+          admissionRevision: stage3Owner.admissionRevision,
+          total: stage3.terminal.turn_page_total,
+          limit: stage3.terminal.turn_page_limit,
+        });
         const restored = await stableRestartProjection({
           cdp: activeCdp,
           sessionId: stage1.sessionId,
@@ -2416,13 +4061,16 @@ export function createCase52Scenario(rawOptions = {}) {
           identity: selectedNavigationIdentity(restoredProjection),
           history_prefix_rows: stage3.history.length,
           restored_history_rows: historyRows(restoredProjection).length,
+          bounded_history: {
+            initial: expandedRestartHistory.initial,
+            previous_pages_loaded: expandedRestartHistory.pages.length,
+            transitions: expandedRestartHistory.pages,
+          },
           stability_ms: RESTORE_STABILITY_MS,
           projection: restartProjectionIdentity,
           screenshot: restartScreenshot,
         }, { phase: "executing", owner: OWNER });
 
-        activeInput = new WebviewInput(activeCdp, { probeId: "case5-2-generation-2", maxProbeEvents: 65_536 });
-        await activeInput.installProbe();
         await verifyRestoredSideChat({ cdp: activeCdp, input: activeInput, sink, options, sessionId: stage1.sessionId });
         await providerMustKeepSideUnloaded({ options, sink, state, name: "restart-side-restored-no-request" });
 
@@ -2500,7 +4148,7 @@ export function createCase52Scenario(rawOptions = {}) {
 
         const summary = {
           schema_version: "desktop-e2e.case5_2-summary.v1",
-          options,
+          options: case52EvidenceOptions(options),
           session_id: stage1.sessionId,
           stages: [stage1, stage2, stage3, stage4].map((item) => ({
             stage: item.stage,
@@ -2513,15 +4161,24 @@ export function createCase52Scenario(rawOptions = {}) {
             trusted_side_send_action_count: "not-derived-from-event-ledger",
             persisted_message_count_at_restart_restore: restoredProjection.side_chat?.messages?.length ?? null,
             persisted_message_count_at_stage4_terminal: stage4.terminal.side_chat?.messages?.length ?? null,
-            selected_model_unloaded_samples: state.sideProviderSamples,
+            ...case52SideProviderSummary(options, state.sideProviderSamples),
             provider_generation_request_zero: "unverified-no-traffic-ledger",
           },
           transcript,
           evaluation,
           safety,
           provider_requested_context: QUALITY_CONTEXT_WINDOW,
-          provider_applied_context: state.providerEffectiveContext,
+          provider_applied_context: options.providerProfile === LM_STUDIO_PROFILE
+            ? state.providerEffectiveContext
+            : null,
+          provider_reported_context_capacity: options.providerProfile === OPENAI_COMPATIBLE_PROFILE
+            ? state.providerEffectiveContext
+            : null,
           provider_profile_exact: state.providerProfileExact,
+          provider_profile: options.providerProfile,
+          provider_lifecycle: options.providerLifecycle,
+          provider_extra_body: case52ExtraBodyEvidence(options),
+          provider_comparability_deviations: state.providerComparabilityDeviations,
           provider_effective_load_config: state.acceptedProviderLoad?.response?.value?.load_config ?? null,
           provider_final: finalProvider.models,
           quality_adjudication: "manual_rubric_pending",
@@ -2570,7 +4227,8 @@ export function createCase52Scenario(rawOptions = {}) {
       const quiesced = state.quiesceOutcome !== null;
       const pass = quiesced
         && state.quiesceOutcome.input === "pass"
-        && state.inputCleanupFailures.length === 0;
+        && state.inputCleanupFailures.length === 0
+        && state.scenarioCleanupFailures.length === 0;
       return {
         input: pass ? "pass" : "fail",
         resources: [{
@@ -2579,6 +4237,7 @@ export function createCase52Scenario(rawOptions = {}) {
           quiesced,
           quiesce_input: state.quiesceOutcome?.input ?? null,
           input_cleanup_failures: state.inputCleanupFailures,
+          scenario_cleanup_failures: state.scenarioCleanupFailures,
         }],
       };
     },

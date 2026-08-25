@@ -10,30 +10,118 @@ import {
   case52EvaluatorAccepted,
   case52EvaluatorFailures,
   case52NormalTerminalFailures,
+  case52RestartPreviousPageTransitionFailures,
   case52RestartContinuityAccepted,
   case52RestartContinuityFailures,
   case52Stage1ManifestFailures,
   case52Stage2ManifestFailures,
+  classifyCase52RestartHistoryTarget,
   classifyCase52NonConvergence,
   classifyCase52NormalTerminal,
   classifyCase52RestartContinuity,
+  classifyCase52RestartTurnPage,
 } from "../case5_2_predicates.mjs";
 import {
   assertCase52PhysicalFileIdentity,
   case52EvaluatorWorkspaceDiff,
+  case52EffectiveExtraBodyFailures,
+  case52EvidenceOptions,
+  case52ExpectedMainGlobalSave,
+  case52ExtraBodyEvidence,
   case52ForbiddenWorkspacePaths,
   case52FixtureConfig,
+  case52MainProviderSelectionKeys,
+  case52NewRequestComposerSurfaceReady,
+  case52NewTurnAcquisitionAccepted,
   case52PhysicalFileIdentity,
+  case52ProviderControlTokenLeaks,
+  case52ProviderControlTokenLeakEvidence,
+  case52ProviderModelState,
   case52ProviderCleanupPlan,
+  case52SideProviderSummary,
+  case52SideScreenshotSurfaceReady,
+  case52ProviderControlTokenLeakFailure,
+  classifyCase52MainSaveCommandError,
+  classifyCase52MainPreferencesObservationError,
+  classifyCase52SideScreenshotObservationError,
   normalizeCase52PromptText,
   normalizeCase52Options,
   readCase52ExternalOutput,
+  settleCase52MainCommandProbe,
   settleCase52WorkspaceEvaluator,
   unloadMainProvider,
+  waitForCase52RestartHistoryTarget,
+  createCase52Scenario,
 } from "../scenarios/case5_2.mjs";
 
 const SESSION_ID = "01K3CASE52SESSION0000000000";
 const TURN_ID = "01K3CASE52TURN000000000000";
+
+test("manual.case5_2 waits for the visible GUI composer to leave steer mode before Send", () => {
+  const prompt = "implement stage 3";
+  const ready = {
+    prompt_count: 1,
+    prompt_value: prompt,
+    prompt_disabled: false,
+    send_count: 1,
+    send_disabled: false,
+    send_title: "送信",
+    send_aria_label: "送信",
+    run_strip_count: 0,
+    visible_stop_count: 0,
+  };
+  assert.equal(case52NewRequestComposerSurfaceReady(ready, prompt), true);
+  for (const drift of [
+    { prompt_value: "stale draft" },
+    { send_disabled: true },
+    { send_title: "実行中のタスクへ追加指示を送信" },
+    { send_aria_label: "実行中のタスクへ追加指示を送信" },
+    { run_strip_count: 1 },
+    { visible_stop_count: 1 },
+  ]) {
+    assert.equal(case52NewRequestComposerSurfaceReady({ ...ready, ...drift }, prompt), false);
+  }
+  assert.throws(() => case52NewRequestComposerSurfaceReady(ready, null), /expected composer prompt/);
+});
+
+test("manual.case5_2 accepts only a newly admitted Turn after an Idle owner", () => {
+  const previousExpectedState = {
+    kind: "idle",
+    latestTurnId: TURN_ID,
+    admissionRevision: "7",
+  };
+  const nextTurnId = "01K3CASE52TURNNEXT000000000";
+  const running = {
+    selected_project_index: 0,
+    selected_session_index: 0,
+    session_rows: [{
+      session_id: SESSION_ID,
+      status: "running",
+      loaded_status: "active",
+      active_turn_id: nextTurnId,
+      admission_revision: "8",
+    }],
+    run_target: {
+      expectedState: { kind: "turn", turnId: nextTurnId, admissionRevision: "8" },
+    },
+  };
+  const expected = { expectedSessionId: SESSION_ID, previousExpectedState };
+  assert.equal(case52NewTurnAcquisitionAccepted(running, expected), true);
+  assert.equal(case52NewTurnAcquisitionAccepted({
+    ...running,
+    session_rows: [{ ...running.session_rows[0], active_turn_id: TURN_ID }],
+    run_target: { expectedState: { kind: "turn", turnId: TURN_ID, admissionRevision: "8" } },
+  }, expected), false);
+  assert.equal(case52NewTurnAcquisitionAccepted({
+    ...running,
+    session_rows: [{ ...running.session_rows[0], admission_revision: "7" }],
+    run_target: { expectedState: { ...running.run_target.expectedState, admissionRevision: "7" } },
+  }, expected), false);
+  assert.equal(case52NewTurnAcquisitionAccepted({
+    ...running,
+    run_target: { expectedState: { ...running.run_target.expectedState, admissionRevision: "9" } },
+  }, expected), false);
+});
 
 test("manual.case5_2 options and Quality config are explicit, portable, and reject legacy timeout drift", () => {
   const normalized = normalizeCase52Options({
@@ -46,6 +134,9 @@ test("manual.case5_2 options and Quality config are explicit, portable, and reje
   });
   assert.equal(normalized.fixtureSource, "C:\\fixture");
   assert.equal(normalized.providerBaseUrl, "http://192.0.2.1:1234");
+  assert.equal(normalized.providerProfile, "lm_studio");
+  assert.equal(normalized.scenarioConfigProfile, "legacy-lm-studio-six-field");
+  assert.equal(normalized.configureMainViaGui, false);
   const config = case52FixtureConfig(normalized);
   assert.match(config, /model = "qwen\/qwen3\.6-27b"/);
   assert.match(config, /request_timeout_ms = 3600000/);
@@ -59,6 +150,604 @@ test("manual.case5_2 options and Quality config are explicit, portable, and reje
   assert.doesNotMatch(config, /stream_idle_timeout_ms/);
   assert.throws(() => normalizeCase52Options({}), /fixture_source/);
   assert.throws(() => normalizeCase52Options({ ...case52OptionsForFailure(), run_number: 95 }), /unknown/);
+});
+
+test("manual.case5_2 accepts an external-unmanaged OpenAI-compatible /v1 provider without LM Studio fields", () => {
+  const normalized = normalizeCase52Options({
+    fixture_source: "C:\\fixture",
+    provider_profile: "openai_compatible",
+    provider_base_url: "http://192.0.2.10:8119/v1/",
+    main_model: "Qwen3.8-27B-4bit",
+  });
+  assert.deepEqual(normalized, {
+    fixtureSource: "C:\\fixture",
+    providerBaseUrl: "http://192.0.2.10:8119/v1",
+    providerProfile: "openai_compatible",
+    mainModel: "Qwen3.8-27B-4bit",
+    sideModel: "Qwen3.8-27B-4bit",
+    expectedMainVariant: null,
+    expectedSideVariant: null,
+    providerLifecycle: "external-unmanaged",
+    scenarioConfigProfile: "openai-compatible-v1",
+    configureMainViaGui: false,
+    extraBodyJson: null,
+    extraBodyJsonCompact: null,
+  });
+  const config = case52FixtureConfig(normalized);
+  assert.match(config, /provider_profile = "openai_compatible"/);
+  assert.doesNotMatch(config, /provider_metadata_mode|provider_api_mode|num_ctx/);
+  assert.match(config, /context_window = 131072/);
+  assert.throws(
+    () => normalizeCase52Options({
+      ...case52OptionsForFailure(),
+      provider_profile: "openai_compatible",
+      provider_base_url: "http://192.0.2.10:8119/v1",
+    }),
+    /does not accept LM Studio fields/,
+  );
+  assert.throws(
+    () => normalizeCase52Options({
+      fixture_source: "C:\\fixture",
+      provider_profile: "openai_compatible",
+      provider_base_url: "http://192.0.2.10:8119",
+      main_model: "Qwen3.8-27B-4bit",
+    }),
+    /\/v1 base URL/,
+  );
+  assert.throws(
+    () => normalizeCase52Options({
+      fixture_source: "C:\\fixture",
+      provider_profile: "openai_compatible",
+      configure_main_via_gui: true,
+      provider_base_url: "http://192.0.2.10:8119/v1",
+      main_model: "Qwen3.8-27B-4bit",
+    }),
+    /configure_main_via_gui is supported only by lm_studio/,
+  );
+  assert.throws(
+    () => normalizeCase52Options({
+      fixture_source: "C:\\fixture",
+      provider_profile: "openai_compatible",
+      configure_main_via_gui: false,
+      provider_base_url: "http://192.0.2.10:8119/v1",
+      main_model: "Qwen3.8-27B-4bit",
+    }),
+    /configure_main_via_gui is supported only by lm_studio/,
+  );
+});
+
+test("manual.case5_2 can seed a neutral connection for same-execution trusted Main Preferences input", () => {
+  const normalized = normalizeCase52Options({
+    ...case52OptionsForFailure(),
+    provider_profile: "lm_studio",
+    configure_main_via_gui: true,
+  });
+  assert.equal(normalized.configureMainViaGui, true);
+  const config = case52FixtureConfig(normalized);
+  assert.match(config, /base_url = "http:\/\/127\.0\.0\.1:9"/);
+  assert.match(config, /model = "moyai-case5-2-before-gui-save"/);
+  assert.doesNotMatch(config, /base_url = "http:\/\/192\.0\.2\.1:1234"/);
+  assert.doesNotMatch(config, /model = "main"/);
+  assert.match(config, /context_window = 131072/);
+  assert.match(config, /max_output_tokens = 32768/);
+  assert.match(config, /num_ctx = 131072/);
+  const explicitFalse = normalizeCase52Options({
+    ...case52OptionsForFailure(),
+    provider_profile: "lm_studio",
+    configure_main_via_gui: false,
+  });
+  assert.equal(explicitFalse.configureMainViaGui, false);
+  assert.match(case52FixtureConfig(explicitFalse), /base_url = "http:\/\/192\.0\.2\.1:1234"/);
+  assert.throws(
+    () => normalizeCase52Options({ ...case52OptionsForFailure(), configure_main_via_gui: "true" }),
+    /must be boolean/,
+  );
+  assert.deepEqual(case52MainProviderSelectionKeys("lm_studio"), ["Home"]);
+  assert.deepEqual(case52MainProviderSelectionKeys("openai_compatible"), ["Home", "ArrowDown"]);
+  assert.throws(() => case52MainProviderSelectionKeys("lm_studio_chat_completions"), /unsupported/);
+
+  const surface = {
+    projection: {
+      config_target: { workspacePath: "C:\\workspace", sessionId: null, configGeneration: "7" },
+      config_fields: [
+        { key: "model.base_url", value: "http://127.0.0.1:9" },
+        { key: "model.model", value: "moyai-case5-2-before-gui-save" },
+        { key: "model.provider_profile", value: "lm_studio" },
+        { key: "model.api_key_env", value: "" },
+        { key: "model.context_window", value: "131072" },
+      ],
+    },
+  };
+  assert.deepEqual(case52ExpectedMainGlobalSave(surface, normalized), {
+    command: "save_global_config",
+    args: {
+      values: [
+        { key: "model.base_url", text: "http://192.0.2.1:1234" },
+        { key: "model.model", text: "main" },
+        { key: "model.provider_profile", text: "lm_studio" },
+        { key: "model.api_key_env", text: "" },
+        { key: "model.context_window", text: "131072" },
+      ],
+      expectedTarget: { workspacePath: "C:\\workspace", sessionId: null, configGeneration: "7" },
+    },
+  });
+});
+
+test("manual.case5_2 classifies only Main Preferences observation timeouts as product failures", () => {
+  const timeout = Object.assign(new Error("timed out"), {
+    code: "observation-timeout",
+    evidence: {
+      label: "Main draft",
+      attempts: 4,
+      elapsed_ms: 10_000,
+      last_value: { dirty: false, base: { value: "http://127.0.0.1:9" } },
+      last_error: null,
+    },
+  });
+  const classified = classifyCase52MainPreferencesObservationError(timeout, "editing the Main connection draft");
+  assert.equal(classified.owner, "product");
+  assert.equal(classified.code, "case5_2-main-preferences-observation-timeout");
+  assert.equal(classified.evidence.action, "editing the Main connection draft");
+  assert.deepEqual(classified.evidence.last_value, timeout.evidence.last_value);
+
+  const transport = Object.assign(new Error("CDP transport closed"), { code: "cdp-transport-closed" });
+  assert.equal(
+    classifyCase52MainPreferencesObservationError(transport, "saving the Main connection"),
+    transport,
+  );
+  const sample = new Error("desktop_state sample failed");
+  assert.equal(
+    classifyCase52MainPreferencesObservationError(sample, "opening Main Preferences"),
+    sample,
+  );
+  const retriedSampleFailure = Object.assign(new Error("sample never recovered"), {
+    code: "observation-timeout",
+    evidence: {
+      last_value: null,
+      last_error: "desktop_state sample failed",
+    },
+  });
+  assert.equal(
+    classifyCase52MainPreferencesObservationError(retriedSampleFailure, "opening Main Preferences"),
+    retriedSampleFailure,
+  );
+  const missingObservation = Object.assign(new Error("no observation"), {
+    code: "observation-timeout",
+    evidence: { last_error: null },
+  });
+  assert.equal(
+    classifyCase52MainPreferencesObservationError(missingObservation, "opening Main Preferences"),
+    missingObservation,
+  );
+});
+
+test("manual.case5_2 product-owns only cardinality and call mismatch after trusted Main Save", () => {
+  for (const code of ["desktop-command-probe-cardinality", "desktop-command-probe-call-mismatch"]) {
+    const mismatch = Object.assign(new Error("unexpected Save command"), {
+      code,
+      evidence: { expected: "save_global_config", actual: "other" },
+    });
+    const classified = classifyCase52MainSaveCommandError(mismatch);
+    assert.equal(classified.owner, "product");
+    assert.equal(classified.code, "case5_2-main-provider-save-command");
+    assert.equal(classified.evidence.code, code);
+  }
+  for (const code of [
+    "desktop-command-probe-snapshot-invalid",
+    "desktop-command-probe-overflow",
+    "desktop-command-probe-order",
+  ]) {
+    const harnessError = Object.assign(new Error("probe integrity failed"), { code });
+    assert.equal(classifyCase52MainSaveCommandError(harnessError), harnessError);
+  }
+});
+
+test("manual.case5_2 settles a successful Main Preferences command probe removal", async () => {
+  const cleanupFailures = [];
+  const recorded = [];
+  const result = await settleCase52MainCommandProbe({
+    commandProbe: { probeId: "main", remove: async () => ({ removed: true, probe_id: "main", sequence: 1 }) },
+    sink: { record: async (...args) => { recorded.push(args); } },
+    cleanupFailures,
+  });
+  assert.equal(result.removal.removed, true);
+  assert.equal(result.cleanup_failure, null);
+  assert.deepEqual(cleanupFailures, []);
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0][0], "case5_2-main-provider-command-probe-settled");
+});
+
+test("manual.case5_2 records command probe removal failure while preserving a primary GUI error", async () => {
+  const cleanupFailures = [];
+  const primary = new Error("Main Preferences did not settle");
+  const removal = Object.assign(new Error("probe owner drifted"), {
+    code: "desktop-command-probe-remove",
+    evidence: { reason: "owner-drift" },
+  });
+  const result = await settleCase52MainCommandProbe({
+    commandProbe: { probeId: "main", remove: async () => { throw removal; } },
+    sink: { record: async () => { throw new Error("failure must not be recorded as success"); } },
+    cleanupFailures,
+    primaryError: primary,
+  });
+  assert.equal(result.primary_error.message, primary.message);
+  assert.equal(result.cleanup_failure.code, removal.code);
+  assert.equal(cleanupFailures.length, 1);
+  assert.equal(cleanupFailures[0].message, removal.message);
+});
+
+test("manual.case5_2 records and surfaces command probe removal failure without a primary GUI error", async () => {
+  const cleanupFailures = [];
+  await assert.rejects(
+    () => settleCase52MainCommandProbe({
+      commandProbe: { probeId: "main", remove: async () => { throw new Error("probe removal failed"); } },
+      sink: { record: async () => { throw new Error("failure must not be recorded as success"); } },
+      cleanupFailures,
+    }),
+    (error) => error.owner === "harness"
+      && error.code === "case5_2-main-provider-command-probe-cleanup",
+  );
+  assert.equal(cleanupFailures.length, 1);
+  assert.equal(cleanupFailures[0].message, "probe removal failed");
+});
+
+test("manual.case5_2 records settlement evidence failure while preserving a primary GUI error", async () => {
+  const cleanupFailures = [];
+  const primary = new Error("Main Preferences did not settle");
+  const result = await settleCase52MainCommandProbe({
+    commandProbe: { probeId: "main", remove: async () => ({ removed: true, probe_id: "main", sequence: 2 }) },
+    sink: { record: async () => { throw new Error("evidence write failed"); } },
+    cleanupFailures,
+    primaryError: primary,
+  });
+  assert.equal(result.removal.removed, true);
+  assert.equal(result.primary_error.message, primary.message);
+  assert.equal(result.cleanup_failure.owner, "evidence-sink");
+  assert.equal(cleanupFailures.length, 1);
+  assert.equal(cleanupFailures[0].message, "evidence write failed");
+});
+
+test("manual.case5_2 records and surfaces settlement evidence failure without a primary GUI error", async () => {
+  const cleanupFailures = [];
+  await assert.rejects(
+    () => settleCase52MainCommandProbe({
+      commandProbe: { probeId: "main", remove: async () => ({ removed: true, probe_id: "main", sequence: 2 }) },
+      sink: { record: async () => { throw new Error("evidence write failed"); } },
+      cleanupFailures,
+    }),
+    (error) => error.owner === "harness"
+      && error.code === "case5_2-main-provider-command-probe-cleanup",
+  );
+  assert.equal(cleanupFailures.length, 1);
+  assert.equal(cleanupFailures[0].owner, "evidence-sink");
+});
+
+test("manual.case5_2 rejects unresolved or mismatched Main Preferences command probe removal", async () => {
+  for (const removal of [
+    { removed: false, probe_id: "main", sequence: null },
+    { removed: true, probe_id: "other", sequence: 1 },
+    { removed: true, probe_id: "main", sequence: null },
+  ]) {
+    const cleanupFailures = [];
+    const primary = new Error("probe installation or GUI acquisition was ambiguous");
+    const result = await settleCase52MainCommandProbe({
+      commandProbe: { probeId: "main", remove: async () => removal },
+      sink: { record: async () => { throw new Error("invalid removal must not be recorded as settled"); } },
+      cleanupFailures,
+      primaryError: primary,
+    });
+    assert.equal(result.removal, null);
+    assert.equal(result.primary_error.message, primary.message);
+    assert.equal(result.cleanup_failure.code, "desktop-command-probe-remove");
+    assert.deepEqual(result.cleanup_failure.evidence, removal);
+    assert.equal(cleanupFailures.length, 1);
+  }
+});
+
+test("manual.case5_2 Side screenshot readiness requires every configured value in the viewport", () => {
+  const options = {
+    providerBaseUrl: "http://192.0.2.10:1234",
+    providerProfile: "lm_studio",
+    sideModel: "google/gemma-4-12b-qat",
+  };
+  const visible = { visible: true, viewport_visible: true };
+  const surface = {
+    projection: {
+      side_chat: {
+        configured: true,
+        deleting: false,
+        owner_session_id: SESSION_ID,
+        chat_id: "01K3CASE52SIDECHAT000000000",
+        base_url: options.providerBaseUrl,
+        model: options.sideModel,
+        provider_profile: options.providerProfile,
+        status: "idle",
+        phase: "",
+        last_error: "",
+        draft_text: "",
+        messages: [],
+        can_send: true,
+        can_cancel: false,
+      },
+    },
+    settings: { ...visible },
+    section: { ...visible, owner: SESSION_ID },
+    details: { ...visible, open: true },
+    profile: { ...visible, value: options.providerProfile },
+    base: { ...visible, value: options.providerBaseUrl },
+    manual: { ...visible, value: options.sideModel },
+  };
+  assert.equal(case52SideScreenshotSurfaceReady(surface, options, SESSION_ID), true);
+  for (const changed of [
+    { settings: { ...surface.settings, viewport_visible: false } },
+    { section: { ...surface.section, viewport_visible: false } },
+    { details: { ...surface.details, open: false } },
+    { profile: { ...surface.profile, value: "openai_compatible" } },
+    { base: { ...surface.base, viewport_visible: false } },
+    { manual: { ...surface.manual, viewport_visible: false } },
+  ]) {
+    assert.equal(case52SideScreenshotSurfaceReady({ ...surface, ...changed }, options, SESSION_ID), false);
+  }
+});
+
+test("manual.case5_2 product-owns only reachable Side screenshot observation mismatches", () => {
+  const timeout = Object.assign(new Error("Side controls stayed outside the viewport"), {
+    code: "observation-timeout",
+    evidence: {
+      label: "visible configured Side Chat Settings section",
+      attempts: 10,
+      elapsed_ms: 10_000,
+      last_value: { section: { visible: true }, manual: { viewport_visible: false } },
+      last_error: null,
+    },
+  });
+  const classified = classifyCase52SideScreenshotObservationError(timeout, "showing the configured Side Chat model");
+  assert.equal(classified.owner, "product");
+  assert.equal(classified.code, "case5_2-side-screenshot-observation-timeout");
+  assert.deepEqual(classified.evidence.last_value, timeout.evidence.last_value);
+  const restored = classifyCase52SideScreenshotObservationError(timeout, "showing the restored Side Chat model");
+  assert.equal(restored.owner, "product");
+  assert.equal(restored.evidence.action, "showing the restored Side Chat model");
+
+  const sampleFailure = Object.assign(new Error("desktop_state sample failed"), {
+    code: "observation-timeout",
+    evidence: { last_value: null, last_error: "cdp disconnected" },
+  });
+  assert.equal(
+    classifyCase52SideScreenshotObservationError(sampleFailure, "showing the configured Side Chat model"),
+    sampleFailure,
+  );
+  const screenshotFailure = Object.assign(new Error("Page.captureScreenshot failed"), {
+    code: "cdp-screenshot-failed",
+  });
+  assert.equal(
+    classifyCase52SideScreenshotObservationError(screenshotFailure, "showing the configured Side Chat model"),
+    screenshotFailure,
+  );
+});
+
+test("manual.case5_2 isolates an optional JSON-safe OpenAI-compatible generation body in the Desktop environment", () => {
+  const extraBody = {
+    chat_template_kwargs: {
+      enable_thinking: false,
+      preserve_thinking: false,
+    },
+  };
+  const raw = {
+    fixture_source: "C:\\fixture",
+    provider_profile: "openai_compatible",
+    provider_base_url: "http://192.0.2.10:8119/v1",
+    main_model: "Qwen3.8-27B-4bit",
+    extra_body_json: extraBody,
+  };
+  const normalized = normalizeCase52Options(raw);
+  assert.deepEqual(normalized.extraBodyJson, extraBody);
+  assert.equal(
+    normalized.extraBodyJsonCompact,
+    '{"chat_template_kwargs":{"enable_thinking":false,"preserve_thinking":false}}',
+  );
+  assert.deepEqual(createCase52Scenario(raw).environment, {
+    MOYAI_EXTRA_BODY_JSON: '{"chat_template_kwargs":{"enable_thinking":false,"preserve_thinking":false}}',
+  });
+  const config = case52FixtureConfig(normalized);
+  assert.doesNotMatch(config, /chat_template_kwargs|enable_thinking|preserve_thinking/);
+  const metadata = case52ExtraBodyEvidence(normalized);
+  assert.equal(metadata.configured, true);
+  assert.equal(metadata.environment_key, "MOYAI_EXTRA_BODY_JSON");
+  assert.match(metadata.compact_json_sha256, /^[a-f0-9]{64}$/);
+  assert.equal(metadata.compact_json_size_bytes, Buffer.byteLength(normalized.extraBodyJsonCompact));
+  assert.deepEqual(metadata.generation_fields, [
+    "chat_template_kwargs.enable_thinking",
+    "chat_template_kwargs.preserve_thinking",
+  ]);
+  const evidenceOptions = case52EvidenceOptions(normalized);
+  assert.equal(Object.hasOwn(evidenceOptions, "extraBodyJson"), false);
+  assert.equal(Object.hasOwn(evidenceOptions, "extraBodyJsonCompact"), false);
+  assert.deepEqual(evidenceOptions.extra_body_json, metadata);
+  assert.doesNotMatch(JSON.stringify(evidenceOptions), /"enable_thinking":false|"preserve_thinking":false/);
+
+  for (const invalid of [null, [], "{}", 1]) {
+    assert.throws(() => normalizeCase52Options({ ...raw, extra_body_json: invalid }), /must be a JSON object/);
+  }
+  for (const invalid of [
+    { value: undefined },
+    { value: Number.NaN },
+    { value: Number.POSITIVE_INFINITY },
+    { value: 1n },
+    { value: new Date(0) },
+  ]) {
+    assert.throws(() => normalizeCase52Options({ ...raw, extra_body_json: invalid }), /JSON|finite|plain/);
+  }
+  const cyclic = {};
+  cyclic.self = cyclic;
+  assert.throws(() => normalizeCase52Options({ ...raw, extra_body_json: cyclic }), /cycle/);
+  assert.throws(
+    () => normalizeCase52Options({ ...case52OptionsForFailure(), extra_body_json: extraBody }),
+    /only by openai_compatible/,
+  );
+  for (const secretBearing of [
+    { api_key: "secret" },
+    { authorization: "Bearer secret" },
+    { chat_template_kwargs: { secret: "value" } },
+    { chat_template_kwargs: { enable_thinking: false, token: "secret" } },
+  ]) {
+    assert.throws(
+      () => normalizeCase52Options({ ...raw, extra_body_json: secretBearing }),
+      /non-generation field/,
+    );
+  }
+  assert.throws(
+    () => normalizeCase52Options({
+      ...raw,
+      extra_body_json: { chat_template_kwargs: { enable_thinking: "false" } },
+    }),
+    /must be boolean/,
+  );
+
+  const matchingProjection = {
+    config_fields: [{
+      key: "model.extra_body_json",
+      value: '{"chat_template_kwargs":{"preserve_thinking":false,"enable_thinking":false}}',
+    }],
+  };
+  assert.deepEqual(case52EffectiveExtraBodyFailures(matchingProjection, normalized), []);
+
+  for (const actual of [
+    "",
+    '{"chat_template_kwargs":{"enable_thinking":true,"preserve_thinking":false}}',
+    '{"api_key":"must-not-leak"}',
+    "not-json-must-not-leak",
+  ]) {
+    const failures = case52EffectiveExtraBodyFailures({
+      config_fields: [{ key: "model.extra_body_json", value: actual }],
+    }, normalized);
+    assert.equal(failures.length, 1);
+    const evidence = JSON.stringify(failures);
+    assert.doesNotMatch(evidence, /api_key|must-not-leak|not-json/);
+    assert.match(evidence, /model\.extra_body_json/);
+  }
+
+  const lmStudio = normalizeCase52Options(case52OptionsForFailure());
+  assert.deepEqual(case52EffectiveExtraBodyFailures({
+    config_fields: [{ key: "model.extra_body_json", value: '{"num_ctx":131072}' }],
+  }, lmStudio), []);
+});
+
+test("manual.case5_2 detects only exact chat-template control tokens in assistant bodies", () => {
+  assert.deepEqual(case52ProviderControlTokenLeaks({
+    transcript_rows: [
+      { row_kind: "assistant", stable_history_identity: "assistant-safe", body: "一般的な <|token|> は対象外です。" },
+      { row_kind: "tool", stable_history_identity: "tool-leak", body: "<|im_start|>tool" },
+    ],
+  }), []);
+  const leaks = case52ProviderControlTokenLeaks({
+    transcript_rows: [{
+      row_kind: "assistant",
+      stable_history_identity: "assistant-leak",
+      body: "prefix <|im_start|>assistant payload<|im_end|> suffix",
+    }],
+  });
+  assert.equal(leaks.length, 1);
+  assert.deepEqual(leaks[0].markers, ["<|im_start|>", "<|im_end|>"]);
+  assert.equal(leaks[0].stable_history_identity, "assistant-leak");
+  assert.match(leaks[0].body_sha256, /^[a-f0-9]{64}$/);
+  assert.match(leaks[0].bounded_excerpt, /<\|im_start\|>/);
+
+  const minimized = case52ProviderControlTokenLeakEvidence({
+    run_status_key: "running",
+    run_phase: "streaming",
+    task_activity_state: "running",
+    busy: true,
+    agent_tree_active: true,
+    selected_project_index: -1,
+    selected_session_index: -1,
+    chat_session_rows: [],
+    config_fields: [{ key: "model.extra_body_json", value: '{"api_key":"must-not-leak"}' }],
+    transcript_rows: [{ row_kind: "assistant", body: "<|im_start|>" }],
+  }, leaks);
+  const minimizedJson = JSON.stringify(minimized);
+  assert.doesNotMatch(minimizedJson, /config_fields|extra_body_json|api_key|must-not-leak/);
+  assert.match(minimizedJson, /assistant-leak/);
+});
+
+test("manual.case5_2 keeps a detected control-token leak while Stop acquisition remains harness-owned", () => {
+  const settled = {
+    stage: "stage1",
+    leaks: [{ stable_history_identity: "assistant-leak", markers: ["<|im_start|>"] }],
+    projection: { path: "stage1-provider-control-token-leak.json" },
+    projection_error: null,
+    screenshot: { path: "stage1-provider-control-token-leak.png" },
+    screenshot_error: null,
+    visible_stop_count: 1,
+    stop: { action: "stage1-provider-control-token-leak-visible-stop" },
+    stop_error: null,
+    terminal: { run_status_key: "cancelled", task_activity_state: "idle" },
+    record_error: null,
+  };
+  const product = case52ProviderControlTokenLeakFailure("stage1", settled);
+  assert.equal(product.owner, "product");
+  assert.equal(product.code, "case5_2-provider-control-token-leak");
+
+  const unsettled = {
+    ...settled,
+    visible_stop_count: 0,
+    stop: null,
+    stop_error: { code: "cdp-transport", message: "connection closed" },
+    terminal: null,
+  };
+  const harness = case52ProviderControlTokenLeakFailure("stage1", unsettled);
+  assert.equal(harness.owner, "harness");
+  assert.equal(harness.code, "case5_2-provider-control-token-leak-stop");
+  assert.equal(harness.evidence.observed_product_failure.owner, "product");
+  assert.equal(harness.evidence.observed_product_failure.code, "case5_2-provider-control-token-leak");
+  assert.deepEqual(harness.evidence.observed_product_failure.evidence, unsettled);
+
+  for (const field of ["projection_error", "screenshot_error", "record_error"]) {
+    const failedEvidence = {
+      ...settled,
+      [field]: { code: `injected-${field}`, message: `${field} failed` },
+    };
+    const failure = case52ProviderControlTokenLeakFailure("stage1", failedEvidence);
+    assert.equal(failure.owner, "harness");
+    assert.equal(failure.evidence.observed_product_failure.owner, "product");
+    assert.deepEqual(failure.evidence.observed_product_failure.evidence, failedEvidence);
+  }
+});
+
+test("manual.case5_2 summary v1 preserves unloaded samples and adds provider samples", () => {
+  const samples = [{ name: "desktop-ready", provider_load_state: "not-observable-external-unmanaged" }];
+  assert.deepEqual(case52SideProviderSummary({ providerProfile: "openai_compatible" }, samples), {
+    selected_model_unloaded_samples: [],
+    selected_model_provider_samples: samples,
+  });
+  assert.deepEqual(case52SideProviderSummary({ providerProfile: "lm_studio" }, samples), {
+    selected_model_unloaded_samples: samples,
+    selected_model_provider_samples: samples,
+  });
+});
+
+test("manual.case5_2 reads exact OpenAI-compatible model identity and optional context capacity", () => {
+  const options = {
+    providerProfile: "openai_compatible",
+    mainModel: "Qwen3.8-27B-4bit",
+  };
+  assert.deepEqual(case52ProviderModelState({
+    models: {
+      value: {
+        data: [{ id: "Qwen3.8-27B-4bit", owned_by: "omlx", max_model_len: 131_072 }],
+      },
+    },
+  }, options), {
+    main: { id: "Qwen3.8-27B-4bit", owned_by: "omlx", max_model_len: 131_072 },
+    side: { id: "Qwen3.8-27B-4bit", owned_by: "omlx", max_model_len: 131_072 },
+    main_match_count: 1,
+    context_capacity: {
+      reported: true,
+      candidates: [{ field: "max_model_len", value: 131_072 }],
+      effective: 131_072,
+      conflict: false,
+    },
+  });
 });
 
 test("manual.case5_2 normalizes checkout line endings before exact trusted GUI insertion", () => {
@@ -302,6 +991,44 @@ test("manual.case5_2 provider cleanup preserves Side activity seen only by the v
   assert.match(result.productFailure.evidence.observations[0].catalog_failures.join(","), /side-v0-state-mismatch/);
 });
 
+test("manual.case5_2 external provider cleanup verifies availability without load or unload", async () => {
+  let unloadCalls = 0;
+  const result = await unloadMainProvider({
+    options: {
+      providerProfile: "openai_compatible",
+      providerBaseUrl: "http://192.0.2.10:8119/v1",
+      mainModel: "Qwen3.8-27B-4bit",
+      sideModel: "Qwen3.8-27B-4bit",
+    },
+    state: {
+      providerExternalPreflightObserved: true,
+      providerComparabilityDeviations: ["provider-lifecycle-external-unmanaged"],
+    },
+    providerIo: {
+      capture: async () => ({
+        snapshot: { captured_at: "2026-08-24T00:00:00.000Z" },
+        models: {
+          main: { id: "Qwen3.8-27B-4bit" },
+          side: { id: "Qwen3.8-27B-4bit" },
+          main_match_count: 1,
+          context_capacity: {
+            reported: true,
+            candidates: [{ field: "max_model_len", value: 131_072 }],
+            effective: 131_072,
+            conflict: false,
+          },
+        },
+      }),
+      unload: async () => { unloadCalls += 1; },
+    },
+  });
+  assert.equal(result.input, "pass");
+  assert.equal(unloadCalls, 0);
+  assert.equal(result.resources[0].lifecycle, "external-unmanaged");
+  assert.equal(result.resources[0].load_attempted, false);
+  assert.equal(result.resources[0].unload_attempted, false);
+});
+
 async function streamSha256(candidate) {
   const digest = crypto.createHash("sha256");
   for await (const chunk of createReadStream(candidate)) digest.update(chunk);
@@ -407,6 +1134,10 @@ function terminalProjection(overrides = {}) {
       expectedState: { kind: "idle", latestTurnId: TURN_ID, admissionRevision: "7" },
     },
     transcript_rows: transcript(),
+    turn_page_offset: 0,
+    turn_page_limit: 80,
+    turn_page_total: 4,
+    turn_page_has_more: false,
     ...overrides,
   };
 }
@@ -486,6 +1217,33 @@ test("case5_2 normal terminal requires one settled completed session owner", () 
   const wrongRevision = terminalProjection();
   wrongRevision.session_rows[0].admission_revision = "8";
   assert.match(case52NormalTerminalFailures(wrongRevision, options).join(","), /terminal-admission-revision-mismatch/);
+});
+
+test("case5_2 terminal permits only an explicitly owned restart command palette", () => {
+  const palette = terminalProjection({ overlay: "command_palette" });
+  const options = { allowedOverlay: "command_palette" };
+  assert.equal(classifyCase52NormalTerminal(palette).decision, "fail");
+  assert.deepEqual(classifyCase52NormalTerminal(palette, options), { decision: "pass", failures: [] });
+  assert.equal(classifyCase52NormalTerminal({ ...palette, overlay: "none" }, options).decision, "fail");
+  assert.equal(classifyCase52NormalTerminal({ ...palette, overlay: "config" }, options).decision, "fail");
+  assert.equal(classifyCase52NormalTerminal({
+    ...palette,
+    navigation_loading: true,
+    turn_page_admission_open: false,
+    pending_async_operations: ["turn_page_load"],
+  }, options).decision, "pending");
+  for (const drift of [
+    { confirmation_visible: true },
+    { confirmation_id: "restart-confirmation" },
+    { confirmation: { id: "restart-confirmation" } },
+  ]) {
+    assert.equal(classifyCase52NormalTerminal({ ...palette, ...drift }, options).decision, "fail");
+  }
+  assert.equal(classifyCase52NormalTerminal({ ...palette, run_status_key: "failed" }, options).decision, "fail");
+  assert.throws(
+    () => classifyCase52NormalTerminal(palette, { allowedOverlay: "any" }),
+    /allowedOverlay/,
+  );
 });
 
 test("case5_2 terminal classifier fail-stops durable failure and immutable session drift", () => {
@@ -604,7 +1362,7 @@ test("case5_2 Stage 2-4 terminals reject summaries that belong only to past turn
   }
 });
 
-test("restart continuity preserves the exact session and allows only a history suffix", () => {
+test("restart continuity compares durable conversation turns and ignores runtime-only rows", () => {
   const before = transcript();
   const value = {
     beforeSessionId: SESSION_ID,
@@ -619,7 +1377,7 @@ test("restart continuity preserves the exact session and allows only a history s
     /restart-session-id-mismatch/,
   );
   assert.match(
-    case52RestartContinuityFailures({ ...value, afterHistory: before.slice(1) }).join(","),
+    case52RestartContinuityFailures({ ...value, afterHistory: [] }).join(","),
     /restart-history-truncated/,
   );
   const rewritten = structuredClone(before);
@@ -627,6 +1385,206 @@ test("restart continuity preserves the exact session and allows only a history s
   assert.match(
     case52RestartContinuityFailures({ ...value, afterHistory: rewritten }).join(","),
     /restart-history-prefix-mismatch/,
+  );
+
+  const live = [
+    { row_kind: "user", stable_history_identity: "user-1", body: "stage 1" },
+    { row_kind: "assistant", body: "first complete" },
+    { row_kind: "user", stable_history_identity: "user-2", body: "stage 2" },
+    { row_kind: "error", stable_history_identity: "error-1", body: "first durable tool failure" },
+    { row_kind: "error", stable_history_identity: "error-2", body: "second durable tool failure" },
+    { row_kind: "assistant", body: "second complete" },
+    { row_kind: "user", stable_history_identity: "user-3", body: "stage 3" },
+    { row_kind: "system", body: "display-only runtime notice" },
+    { row_kind: "work_summary_completed", body: "live summary" },
+    { row_kind: "assistant", body: "canonical final pre" },
+  ];
+  const reopened = [
+    { row_kind: "user", stable_history_identity: "user-1", body: "stage 1" },
+    { row_kind: "assistant", body: "first complete" },
+    { row_kind: "user", stable_history_identity: "user-2", body: "stage 2" },
+    { row_kind: "error", stable_history_identity: "error-1", body: "first durable tool failure" },
+    { row_kind: "error", stable_history_identity: "error-2", body: "second durable tool failure" },
+    { row_kind: "assistant", body: "second complete" },
+    { row_kind: "user", stable_history_identity: "user-3", body: "stage 3" },
+    { row_kind: "work_summary_completed", body: "canonical summary" },
+    { row_kind: "assistant", body: "canonical final prefix completed" },
+    { row_kind: "file_changes", body: "two files" },
+  ];
+  assert.deepEqual(case52RestartContinuityFailures({
+    beforeSessionId: SESSION_ID,
+    afterSessionId: SESSION_ID,
+    beforeHistory: live,
+    afterHistory: reopened,
+  }), []);
+  const olderAssistantRewrite = structuredClone(reopened);
+  olderAssistantRewrite[1].body = "first rewritten";
+  assert.match(case52RestartContinuityFailures({
+    beforeSessionId: SESSION_ID,
+    afterSessionId: SESSION_ID,
+    beforeHistory: live,
+    afterHistory: olderAssistantRewrite,
+  }).join(","), /restart-history-prefix-mismatch/);
+  const missingError = reopened.filter((row) => row.stable_history_identity !== "error-1");
+  assert.match(case52RestartContinuityFailures({
+    beforeSessionId: SESSION_ID,
+    afterSessionId: SESSION_ID,
+    beforeHistory: live,
+    afterHistory: missingError,
+  }).join(","), /restart-history-prefix-mismatch/);
+  const rewrittenError = structuredClone(reopened);
+  rewrittenError.find((row) => row.stable_history_identity === "error-1").body = "rewritten";
+  assert.match(case52RestartContinuityFailures({
+    beforeSessionId: SESSION_ID,
+    afterSessionId: SESSION_ID,
+    beforeHistory: live,
+    afterHistory: rewrittenError,
+  }).join(","), /restart-history-prefix-mismatch/);
+  const reorderedErrors = structuredClone(reopened);
+  [reorderedErrors[3], reorderedErrors[4]] = [reorderedErrors[4], reorderedErrors[3]];
+  assert.match(case52RestartContinuityFailures({
+    beforeSessionId: SESSION_ID,
+    afterSessionId: SESSION_ID,
+    beforeHistory: live,
+    afterHistory: reorderedErrors,
+  }).join(","), /restart-history-prefix-mismatch/);
+  const changedUserIdentity = structuredClone(reopened);
+  changedUserIdentity[0].stable_history_identity = "different-user";
+  assert.match(case52RestartContinuityFailures({
+    beforeSessionId: SESSION_ID,
+    afterSessionId: SESSION_ID,
+    beforeHistory: live,
+    afterHistory: changedUserIdentity,
+  }).join(","), /restart-history-prefix-mismatch/);
+});
+
+test("restart bounded page classifier accepts the exact latest suffix and every previous transition", () => {
+  const expected = {
+    expectedSessionId: SESSION_ID,
+    expectedTurnId: TURN_ID,
+    expectedAdmissionRevision: "7",
+    expectedTotal: 529,
+    expectedLimit: 80,
+  };
+  const latest = terminalProjection({
+    turn_page_offset: 449,
+    turn_page_limit: 80,
+    turn_page_total: 529,
+    turn_page_has_more: false,
+  });
+  assert.deepEqual(classifyCase52RestartTurnPage(latest, {
+    ...expected,
+    requireLatestSuffix: true,
+  }), {
+    decision: "page_needed",
+    failures: [],
+    metadata: { offset: 449, limit: 80, total: 529, has_more: false },
+  });
+
+  const offsets = [449, 369, 289, 209, 129, 49, 0];
+  for (let index = 0; index < offsets.length - 1; index += 1) {
+    assert.deepEqual(case52RestartPreviousPageTransitionFailures({
+      before: { offset: offsets[index], limit: 80, total: 529, has_more: false },
+      after: { offset: offsets[index + 1], limit: 80, total: 529, has_more: false },
+    }), []);
+  }
+  assert.equal(classifyCase52RestartTurnPage(terminalProjection({
+    turn_page_offset: 0,
+    turn_page_limit: 80,
+    turn_page_total: 529,
+    turn_page_has_more: false,
+  }), expected).decision, "ready");
+  assert.match(case52RestartPreviousPageTransitionFailures({
+    before: { offset: 449, limit: 80, total: 529, has_more: false },
+    after: { offset: 449, limit: 80, total: 529, has_more: false },
+  }).join(","), /restart-turn-page-offset-drift/);
+  assert.equal(classifyCase52RestartTurnPage({ ...latest, turn_page_total: 530 }, {
+    ...expected,
+    requireLatestSuffix: true,
+  }).decision, "fail");
+  assert.equal(classifyCase52RestartTurnPage(terminalProjection({
+    turn_page_offset: 0,
+    turn_page_limit: 529,
+    turn_page_total: 529,
+    turn_page_has_more: false,
+  }), {
+    ...expected,
+    requireLatestSuffix: true,
+  }).decision, "fail");
+});
+
+test("restart history target classifier waits for WebView rerender after every page settlement", () => {
+  assert.deepEqual(classifyCase52RestartHistoryTarget({ observation: { count: 0 } }), {
+    decision: "pending",
+    failures: [],
+  });
+  assert.deepEqual(classifyCase52RestartHistoryTarget({
+    observation: {
+      count: 1,
+      connected: true,
+      visible: true,
+      enabled: false,
+      identity: { tag: "BUTTON", action: "load-previous-turn-page" },
+    },
+  }), {
+    decision: "pending",
+    failures: [],
+  });
+  assert.deepEqual(classifyCase52RestartHistoryTarget({
+    observation: {
+      count: 1,
+      connected: true,
+      visible: true,
+      enabled: true,
+      identity: { tag: "BUTTON", action: "load-previous-turn-page" },
+    },
+  }), {
+    decision: "pass",
+    failures: [],
+  });
+  assert.match(classifyCase52RestartHistoryTarget({ observation: { count: 2 } }).failures.join(","), /cardinality/);
+});
+
+test("restart history target settlement delays the next trusted action until the exact row rerenders", async () => {
+  const observations = [
+    { count: 0 },
+    {
+      count: 1,
+      connected: true,
+      visible: true,
+      enabled: false,
+      identity: { tag: "BUTTON", action: "load-previous-turn-page" },
+    },
+    {
+      count: 1,
+      connected: true,
+      visible: true,
+      enabled: true,
+      identity: { tag: "BUTTON", action: "load-previous-turn-page" },
+    },
+  ];
+  let calls = 0;
+  const settled = await waitForCase52RestartHistoryTarget({
+    input: {
+      async observeExactTarget() {
+        const observation = observations[Math.min(calls, observations.length - 1)];
+        calls += 1;
+        return { locator: { selector: "previous" }, observation };
+      },
+    },
+  });
+  assert.equal(calls, 3);
+  assert.equal(settled.value.classified.decision, "pass");
+
+  await assert.rejects(
+    () => waitForCase52RestartHistoryTarget({
+      input: {
+        async observeExactTarget() {
+          return { locator: { selector: "previous" }, observation: { count: 2 } };
+        },
+      },
+    }),
+    (error) => error?.owner === "product" && error?.code === "case5_2-restart-history-target",
   );
 });
 
@@ -651,8 +1609,8 @@ test("restart decision exposes complete terminal and continuity reasons", () => 
   const pending = classifyCase52RestartContinuity(loading, options);
   assert.equal(pending.decision, "pending");
   assert.equal(pending.terminal_failures.includes("projection-not-settled"), true);
-  assert.equal(pending.continuity_failures.includes("restart-history-truncated"), true);
-  assert.equal(pending.failures.includes("restart-history-truncated"), true);
+  assert.equal(pending.continuity_failures.includes("restart-history-invalid"), true);
+  assert.equal(pending.failures.includes("restart-history-invalid"), true);
 
   const rewritten = terminalProjection();
   rewritten.transcript_rows[0] = { ...rewritten.transcript_rows[0], body: "rewritten" };

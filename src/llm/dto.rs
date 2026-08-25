@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct OpenAiChatRequest {
     pub model: String,
     pub stream: bool,
+    pub stream_options: OpenAiStreamOptions,
     pub n: u32,
     pub messages: Vec<OpenAiMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -26,6 +27,11 @@ pub struct OpenAiChatRequest {
     pub tools: Vec<OpenAiToolSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OpenAiStreamOptions {
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]

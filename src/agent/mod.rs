@@ -300,13 +300,7 @@ impl AgentLoop {
         let mut pre_turn_compaction_item_id = request.initial_user_history_item_id;
         let mut can_drain_pending_input = pre_turn_compaction_item_id.is_none();
         let mut must_sample_without_compaction = false;
-        let previous_terminal = repo
-            .latest_durable_terminal_before_turn(request.session.session.id, request.turn_id())
-            .await?;
-        let mut active_context_tokens = context_manager::ActiveContextTokenState::rehydrate(
-            &request.context,
-            previous_terminal.as_ref(),
-        );
+        let mut active_context_tokens = context_manager::ActiveContextTokenState::default();
 
         let outcome: Result<RunSummary, AgentError> = async {
             'model_round: loop {
@@ -652,7 +646,13 @@ impl AgentLoop {
                     .into_iter()
                     .map(|call| (ToolCallId::new(), call))
                     .collect::<Vec<_>>();
-                let assistant_text = (!collector.text.is_empty()).then(|| collector.text.clone());
+                let assistant_text_present = match sent_request.provider_target().api_mode() {
+                    crate::config::ProviderApiMode::ChatCompletions => {
+                        !collector.text.trim().is_empty()
+                    }
+                    crate::config::ProviderApiMode::Responses => !collector.text.is_empty(),
+                };
+                let assistant_text = assistant_text_present.then(|| collector.text.clone());
                 let assistant_protocol_sequence_no = assistant_text
                     .as_ref()
                     .and_then(|_| sink.reserve_protocol_sequence_no());
@@ -693,6 +693,8 @@ impl AgentLoop {
                 active_context_tokens.record_provider_response(
                     model_response_id,
                     response.usage.as_ref(),
+                    &sent_request,
+                    &messages,
                     sent_context_item_ids,
                 );
                 let pending_turn_steer_after_response = repo
@@ -1329,9 +1331,9 @@ impl AgentLoop {
         // publisher/UI projection cannot revoke it; the next loop iteration reloads the durable
         // append through ContextManager.
         let _ = sink.emit_committed(event);
-        // This accuracy warning is a canonical history fact. Route it through the recording
-        // owner so it cannot be mistaken for lossy display telemetry and silently disappear.
-        sink.emit(RunEvent::RecoverableRuntimeFeedback {
+        // Keep this user-facing advisory out of canonical conversation history. Replaying it as
+        // an Assistant message would make a resumed provider request look already answered.
+        sink.emit_runtime_only(RunEvent::RuntimeNotice {
             session_id: request.session.session.id,
             message: COMPACTION_ACCURACY_WARNING.to_string(),
         })?;
@@ -3916,6 +3918,10 @@ Apply the selected write change, then run its focused verification.
 ## Evidence coverage
 Repository inspection was observed; mutation and verification results remain unobserved."#;
 
+    // With the full prepared-request estimate as a safety lower bound, this keeps the
+    // rejection fixtures above the working compaction target but below the hard limit.
+    const REJECTED_COMPACTION_CONTINUATION_OUTPUT_CHARS: usize = 235_000;
+
     const EXPECTED_CODEX_MULTI_AGENT_ROOT_ROLE_PREFIX: &str = r#"You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
 At the start of your turn, you are the active agent.
@@ -4994,13 +5000,14 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
-    async fn automatic_compaction_checkpoints_the_real_user_anchor_in_the_next_request() {
+    async fn automatic_compaction_warning_stays_display_only_and_next_request_ends_with_user_checkpoint()
+     {
         const CHECKPOINT: &str = VALID_C8_COMPACTION_CHECKPOINT;
         let mut config = ResolvedConfig::default();
         config.model.context_window = 68_000;
         config.model.max_output_tokens = 512;
         config.session.overflow_margin_tokens = 128;
-        let run = run_scripted_with_control_and_tool(
+        let run = run_scripted_with_control_tool_and_protocol_recording(
             config,
             vec![
                 ScriptedResponse {
@@ -5034,11 +5041,18 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         .expect("scripted compaction run");
         run.summary.expect("run completes after compaction");
 
-        assert!(run.events.iter().any(|event| matches!(
-            event,
-            RunEvent::RecoverableRuntimeFeedback { message, .. }
-                if message == COMPACTION_ACCURACY_WARNING
-        )));
+        assert_eq!(
+            run.events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    RunEvent::RuntimeNotice { message, .. }
+                        if message == COMPACTION_ACCURACY_WARNING
+                ))
+                .count(),
+            1,
+            "the display sink receives the compaction advisory exactly once"
+        );
 
         assert_eq!(run.requests.len(), 3);
         let first = &run.requests[0];
@@ -5087,6 +5101,12 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                     && summary.contains("Apply the selected write change")
                     && !summary.contains("write hello.txt")
         ));
+        assert!(!resumed.messages.iter().any(|message| matches!(
+            message,
+            ModelMessage::Assistant { content }
+                if content.contains(COMPACTION_ACCURACY_WARNING)
+                    || content.contains("Previous run ended with an error:")
+        )));
 
         let history = run
             .store
@@ -5116,6 +5136,84 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             .expect("compaction checkpoint");
         assert!(replacement_ids.contains(&user_id));
         assert_eq!(preserved_user_messages, &["write hello.txt"]);
+    }
+
+    #[tokio::test]
+    async fn provider_usage_baseline_triggers_compaction_before_an_underestimated_full_request() {
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 68_000;
+        config.model.max_output_tokens = 512;
+        config.session.overflow_margin_tokens = 128;
+        let working_limit =
+            crate::llm::model_policy::ModelPolicy::from_config(&config).working_context_token_limit;
+        let run = run_scripted_with_control_and_tool(
+            config,
+            vec![
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::ToolCallStart {
+                            call_id: "usage-read".to_string(),
+                            tool_name: "read".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "usage-read".to_string(),
+                            delta: "{}".to_string(),
+                        },
+                        LlmEvent::Finished {
+                            finish_reason: FinishReason::ToolCall,
+                            usage: Some(TokenUsage {
+                                prompt_tokens: 59_900,
+                                completion_tokens: 100,
+                                total_tokens: 60_000,
+                                reasoning_tokens: None,
+                            }),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        VALID_C8_COMPACTION_CHECKPOINT.to_string(),
+                    )],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            RunControl::new(),
+            Arc::new(LargeReadOutputTool {
+                output_chars: 8_000,
+            }),
+        )
+        .await
+        .expect("provider-usage compaction run");
+        run.summary
+            .expect("run completes after provider-usage compaction");
+
+        assert_eq!(run.requests.len(), 3);
+        assert!(
+            run.requests[1].tools.is_empty(),
+            "second request is compaction"
+        );
+        let mut underestimated_normal_request = run.requests[1].clone();
+        underestimated_normal_request.messages.pop();
+        underestimated_normal_request.tools = run.requests[0].tools.clone();
+        underestimated_normal_request.tool_choice = run.requests[0].tool_choice.clone();
+        underestimated_normal_request.parallel_tool_calls = run.requests[0].parallel_tool_calls;
+        let fallback_estimate =
+            ContextWindowTokenStatus::for_request(&underestimated_normal_request, 128)
+                .active_context_tokens;
+        assert!(
+            fallback_estimate < working_limit,
+            "the coarse full-request estimate must stay below the compaction threshold"
+        );
+        assert!(
+            run.events
+                .iter()
+                .any(|event| matches!(event, RunEvent::CompactionCompleted { .. }))
+        );
     }
 
     #[tokio::test]
@@ -5264,7 +5362,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             ],
             RunControl::new(),
             Arc::new(LargeReadOutputTool {
-                output_chars: 250_000,
+                output_chars: REJECTED_COMPACTION_CONTINUATION_OUTPUT_CHARS,
             }),
         )
         .await
@@ -5335,7 +5433,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             ],
             RunControl::new(),
             Arc::new(LargeReadOutputTool {
-                output_chars: 250_000,
+                output_chars: REJECTED_COMPACTION_CONTINUATION_OUTPUT_CHARS,
             }),
         )
         .await
@@ -5464,7 +5562,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         ));
         assert!(run.events.iter().any(|event| matches!(
             event,
-            RunEvent::RecoverableRuntimeFeedback { message, .. }
+            RunEvent::RuntimeNotice { message, .. }
                 if message == COMPACTION_ACCURACY_WARNING
         )));
     }
@@ -5648,7 +5746,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert!(replacement_item_ids.contains(&user_id));
         assert!(run.events.iter().any(|event| matches!(
             event,
-            RunEvent::RecoverableRuntimeFeedback { message, .. }
+            RunEvent::RuntimeNotice { message, .. }
                 if message == COMPACTION_ACCURACY_WARNING
         )));
     }
@@ -5688,7 +5786,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             ],
             RunControl::new(),
             Arc::new(LargeReadOutputTool {
-                output_chars: 250_000,
+                output_chars: REJECTED_COMPACTION_CONTINUATION_OUTPUT_CHARS,
             }),
         )
         .await
@@ -6439,7 +6537,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             context_sources,
             vec![
                 crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
-                crate::context::ActiveContextTokenSource::ProviderUsageWithLocalEstimate,
+                crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
             ]
         );
         assert_eq!(
@@ -9376,6 +9474,115 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert_eq!(persisted_assistant_text, vec!["hello world"]);
     }
 
+    #[tokio::test]
+    async fn whitespace_only_tool_call_content_is_not_committed_or_replayed() {
+        let mut config = ResolvedConfig::default();
+        config.model.provider_profile = crate::config::ProviderProfile::OpenAiCompatible;
+        let run = run_scripted(
+            config,
+            vec![
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::TextDelta("\n \t\n".to_string()),
+                        LlmEvent::ToolCallStart {
+                            call_id: "call_list".to_string(),
+                            tool_name: "list".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "call_list".to_string(),
+                            delta: r#"{"path":"."}"#.to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("run");
+        run.summary.expect("summary");
+
+        assert_eq!(run.requests.len(), 2);
+        assert!(run.requests[1].messages.iter().any(|message| matches!(
+            message,
+            ModelMessage::AssistantToolCalls {
+                content: None,
+                tool_calls,
+            } if matches!(tool_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "list")
+        )));
+
+        let persisted_assistant_text = run
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(run.session_id)
+            .expect("history")
+            .into_iter()
+            .filter_map(|item| match item.payload {
+                HistoryItemPayload::AssistantMessage { content, .. } => {
+                    Some(content_text(&content))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(persisted_assistant_text, vec!["done"]);
+    }
+
+    #[tokio::test]
+    async fn responses_preserves_whitespace_only_tool_call_content() {
+        let run = run_scripted(
+            ResolvedConfig::default(),
+            vec![
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::TextDelta("\n \t\n".to_string()),
+                        LlmEvent::ToolCallStart {
+                            call_id: "call_list".to_string(),
+                            tool_name: "list".to_string(),
+                        },
+                        LlmEvent::ToolCallArgsDelta {
+                            call_id: "call_list".to_string(),
+                            delta: r#"{"path":"."}"#.to_string(),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCall,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        )
+        .await
+        .expect("Responses run");
+        run.summary.expect("summary");
+
+        assert!(run.requests[1].messages.iter().any(|message| matches!(
+            message,
+            ModelMessage::AssistantToolCalls {
+                content: Some(content),
+                tool_calls,
+            } if content == "\n \t\n"
+                && matches!(tool_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "list")
+        )));
+        let persisted_assistant_text = run
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(run.session_id)
+            .expect("history")
+            .into_iter()
+            .filter_map(|item| match item.payload {
+                HistoryItemPayload::AssistantMessage { content, .. } => {
+                    Some(content_text(&content))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(persisted_assistant_text, vec!["\n \t\n", "done"]);
+    }
+
     #[test]
     fn prompt_asset_stays_small() {
         assert!(include_str!("../../assets/prompts/system.md").len() < 8 * 1024);
@@ -9774,6 +9981,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             None,
             None,
             Some(resolver),
+            false,
         )
         .await
     }
@@ -9837,6 +10045,32 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             run_control,
             Some(replacement_tool),
             false,
+        )
+        .await
+    }
+
+    async fn run_scripted_with_control_tool_and_protocol_recording(
+        config: ResolvedConfig,
+        responses: Vec<ScriptedResponse>,
+        run_control: RunControl,
+        replacement_tool: Arc<dyn crate::tool::registry::Tool>,
+    ) -> Result<ScriptedRun, AgentError> {
+        run_scripted_internal_with_prior_user_and_api_key_resolver(
+            config,
+            responses
+                .into_iter()
+                .map(ScriptedOutcome::Response)
+                .collect(),
+            None,
+            Vec::new(),
+            crate::cli::ReviewDecision::Approved,
+            run_control,
+            Some(replacement_tool),
+            false,
+            None,
+            None,
+            None,
+            true,
         )
         .await
     }
@@ -9919,6 +10153,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             prior_user_text,
             success_commit_interrupt,
             None,
+            false,
         )
         .await
     }
@@ -9936,6 +10171,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         prior_user_text: Option<String>,
         success_commit_interrupt: Option<TurnInterruptionCause>,
         provider_api_key_resolver: Option<Arc<ProviderApiKeyResolver>>,
+        record_protocol_events: bool,
     ) -> Result<ScriptedRun, AgentError> {
         let run_control_observer = run_control.clone();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -10167,41 +10403,48 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             decision: review_decision,
             ..DecisionPrompt::default()
         };
-        let summary = agent
-            .run(
-                AgentRunRequest {
-                    session,
-                    turn: Arc::new(turn_context::TurnContext {
-                        turn_id,
-                        admission_id,
-                        mode: mode::CollaborationMode::resolve(mode::ModeKind::Default),
-                        policy: Arc::new(
-                            crate::llm::model_policy::ResolvedTurnPolicy::resolve(
-                                &mode::CollaborationMode::resolve(mode::ModeKind::Default),
-                                crate::llm::model_policy::ModelPolicy::from_config(&config),
-                                crate::llm::model_policy::ProviderCapabilities::from_config(
-                                    &config,
-                                ),
-                                config.model.reasoning_summary,
-                            )
-                            .expect("turn policy"),
-                        ),
-                        config: Arc::new(
-                            crate::config::ResolvedTurnConfig::capture(config.clone())
-                                .expect("valid provider endpoint"),
-                        ),
-                        goal: goal_snapshot,
-                        current_time: crate::context::current_time::CurrentTimeSnapshot::now(),
-                    }),
-                    context,
-                    run_control,
-                    agent_context: None,
-                    initial_user_history_item_id: Some(initial_user_history_item_id),
-                },
-                &mut prompt,
+        let recording_admission_id = admission_id;
+        let run_request = AgentRunRequest {
+            session,
+            turn: Arc::new(turn_context::TurnContext {
+                turn_id,
+                admission_id,
+                mode: mode::CollaborationMode::resolve(mode::ModeKind::Default),
+                policy: Arc::new(
+                    crate::llm::model_policy::ResolvedTurnPolicy::resolve(
+                        &mode::CollaborationMode::resolve(mode::ModeKind::Default),
+                        crate::llm::model_policy::ModelPolicy::from_config(&config),
+                        crate::llm::model_policy::ProviderCapabilities::from_config(&config),
+                        config.model.reasoning_summary,
+                    )
+                    .expect("turn policy"),
+                ),
+                config: Arc::new(
+                    crate::config::ResolvedTurnConfig::capture(config.clone())
+                        .expect("valid provider endpoint"),
+                ),
+                goal: goal_snapshot,
+                current_time: crate::context::current_time::CurrentTimeSnapshot::now(),
+            }),
+            context,
+            run_control,
+            agent_context: None,
+            initial_user_history_item_id: Some(initial_user_history_item_id),
+        };
+        let summary = if record_protocol_events {
+            let mut recording_sink = crate::protocol::ProtocolRecordingSink::new(
+                store.protocol_event_store(),
+                Some(session_id),
+                turn_id,
                 &mut sink,
             )
-            .await;
+            .with_admission_id(recording_admission_id);
+            agent
+                .run(run_request, &mut prompt, &mut recording_sink)
+                .await
+        } else {
+            agent.run(run_request, &mut prompt, &mut sink).await
+        };
 
         Ok(ScriptedRun {
             summary,

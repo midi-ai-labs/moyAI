@@ -27,6 +27,8 @@
 
 core / agent-loop / release の広い regression では、必要に応じて `case1 -> case3` を同一 route として実行する。vision / image transport 変更では `case2`、staged task / long context / system diagnostics / Docling 変更では該当 case を選ぶ。すべてを毎回直列実行しない。最終的な組み合わせは依頼、変更面、user-visible riskで決め、Phase・milestone・Kanban checkboxを入場条件にしない。
 
+通常のfailure regressionは focused deterministic / fault-injection / scripted-provider testを起点とし、実interactionが必要な場合だけbounded actual-Tauri scenario、provider固有wireまたはGUI接続設定からの実到達性にだけshort live-provider smokeを追加する。`manual.case5_2` は実long-context、model品質・収束性、provider soak、比較benchmark用であり、その中で見つかった非品質failureの通常な再試験先にしない。
+
 ## Portability
 
 - 各specの `project_sandbox/<task>/<case>/` はoperatorが選ぶartifact rootのplaceholderである。このcheckoutでは通常repositoryの親にある `../project_sandbox/` を使うが、cloneにその親構成を要求しない。
@@ -45,11 +47,15 @@ core / agent-loop / release の広い regression では、必要に応じて `ca
 
 外部verification commandはexecution-owned `TEMP` / `TMP` / `TMPDIR`で起動し、Windows Jobがrootと全descendantを所有する。command終了後のroot / descendant zeroまでをmachine gateに含め、scenario固有のprocess listやglobal killへ分岐しない。
 
-`case5_2` のcurrent execution ownerは `tests/desktop_e2e/` の `manual.case5_2` scenarioである。operator指定fixtureとprovider/modelはhash付きscenario configで渡し、旧 `prepare-fixture.ps1` / `launch-desktop.ps1` / `cdp-action.mjs` をrun controllerとして組み合わせない。旧helperはhistorical/manual diagnosis用であり、fresh context、dynamic CDP、restart generation、SQLite audit、provider cleanup、sealを共通ownerから分離しない。providerへrequested contextを渡した値とLM Studioのload response / catalogから取得したapplied/effective contextは別々にsealし、appliedがrequested以上でも一致しなければprofile deviationとして`RESULTS.md`へ明記する。
+`case5_2` のcurrent execution ownerは `tests/desktop_e2e/` の `manual.case5_2` scenarioである。operator指定fixtureとprovider/modelはhash付きscenario configで渡し、旧 `prepare-fixture.ps1` / `launch-desktop.ps1` / `cdp-action.mjs` をrun controllerとして組み合わせない。旧helperはhistorical/manual diagnosis用であり、fresh context、dynamic CDP、restart generation、SQLite audit、provider cleanup、sealを共通ownerから分離しない。LM Studio routeではrequested contextとload response / catalogのapplied contextを分けてsealする。`openai_compatible` routeではcredential-freeな`/v1` base URLを使い、external-unmanaged modelをload / unloadせず、`/v1/models`のexact IDとmetadataがあればreported context capacityをpreflight、時点sample、cleanupで確認する。reported capacityがrequested 131072未満またはmetadata内で競合する場合はenvironment block、未報告またはrequested以上だが非exactの場合とexternal lifecycle / wire差分はcomparability deviationとして`RESULTS.md`へ明記する。
 
 `manual.case5_2` はStage 1〜4のmachine predicateとcleanupが成立した時点でも`manual_pending`を返す。transcript、成果物、公開・hidden evaluator evidenceをtask-local rubricで人手採点し、その結果を`RESULTS.md`へ確定するまではfull PASSではない。
 
-Side Chat Sendはscenarioの操作経路に含めず、restart復元時とStage 4 terminalのpersisted message count、provider catalogの時点付き各sampleでselected Side model unloadedを記録する。trusted Side Sendを独立event ledgerから集計しているわけではなく、remote providerにもtraffic ledgerがないためgeneration request 0そのものはmachine証明せず、`RESULTS.md`で観測済み事実と未検証境界を分ける。
+各stageのassistant transcript bodyにexact `<|im_start|>` / `<|im_end|>` が現れた場合はprovider control-token leakとする。scenarioはconfig fieldを含まない最小evidence取得後にvisible Stopをtrusted inputでexact 1回送り、`case5_2-provider-control-token-leak`で即時fail-stopする。一般の`<|...|>`やtool rowは対象外である。
+
+Side Chat Sendはscenarioの操作経路に含めず、restart復元時とStage 4 terminalのpersisted message countがexact 0であることを要求して記録する。LM Studioではselected Side modelのunloaded sampleを要求し、OpenAI-compatibleでは同じMain modelのcatalog availability sampleへ置き換える。trusted Side Sendを独立event ledgerから集計しているわけではなく、remote providerにもtraffic ledgerがないためgeneration request 0そのものはmachine証明せず、`RESULTS.md`で観測済み事実と未検証境界を分ける。
+
+scenario configのcurrent discriminatorは`provider_profile`である。`lm_studio`は従来のSide model / variant 3fieldを追加で要求し、既存のdiscriminatorなし6fieldも後方互換に受理する。Main接続を同一executionのPreferencesで直接設定する場合はoptional `configure_main_via_gui: true`を使い、Stage 1前にtrusted GUI input、exact global Save、persisted/effective projectionをsealする。`openai_compatible`は`fixture_source`、`provider_profile`、`provider_base_url`、`main_model`を必須とし、generation-only allowlistのboolean thinking制御だけを`extra_body_json`としてoptionalに受理する。credential / secret / unknown keyは拒否する。optional bodyはcompact JSONとして隔離Desktopの`MOYAI_EXTRA_BODY_JSON`へ渡し、fixture configへ固定せず、sealed prepared / summaryにはhash、byte size、許可field名だけを残す。summary v1の`selected_model_unloaded_samples`は維持し、profile横断sampleはadditive fieldへ記録する。exact JSON例は`../desktop_e2e/README.md`を正とする。
 
 Windows Jobが証明するのはexternal evaluatorのroot / descendant lifecycleであり、filesystem / network sandboxではない。比較条件を変えない通常のexternal CPython / pytestでは、workspace、fixture seed、Python site roots、known dependency/runtime pathをmachine比較し、任意のworkspace外namespace全体についてはcanonical transcriptと人手rubricで裁定する。targeted evidenceだけからworkspace外mutation全般のPASSを宣言しない。
 
@@ -74,5 +80,5 @@ release package の gate artifact は `Manual ST Gate: PASS` を含め、`script
 - provider/image transport、Desktop interaction、model capability、generated artifact、verification、environment failure を観測 evidence から分ける。
 - case-specific hack や hidden gate を product code に追加しない。
 - task-local `RESULTS.md` に直接原因、対応、次アクションを記録する。親orchestration workspaceに `docs/logs/worklog.md` がある場合だけ同じ判断概要を追記し、旧台帳や別形式の履歴は更新しない。
-- 修正後は fresh workspace / fresh data で対象 scenario を再実行する。
-- harness failureは共通ownerへ修正と回帰testを追加し、旧executionを上書きせずfresh execution IDで再qualificationする。
+- 修正後はsmallest owner regressionをfresh fixtureで実行し、user-visible interactionを変更した場合だけ対応するbounded actual-Tauri scenarioを追加する。大きいcaseで見つかったmodel品質・収束性・soak以外のfailureはこの最小再現へ切り出し、元case全体の再実行を自動的に要求しない。
+- harness failureは共通ownerへ修正と回帰testを追加し、最小のactual-Tauri qualificationを旧executionを上書きせずfresh execution IDで行う。元のmanual scenarioはlong-context / quality / soak / comparison claimがなお必要な場合だけ、別のfresh executionで再実行する。

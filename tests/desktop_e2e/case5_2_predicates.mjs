@@ -1,3 +1,9 @@
+import {
+  classifyRestartHistoryTarget,
+  classifyRestartTurnPage,
+  restartPreviousPageTransitionFailures,
+} from "./core/history_restart_contract.mjs";
+
 const REQUIRED_DOCUMENTS = Object.freeze([
   "README.md",
   "basic_design.md",
@@ -44,6 +50,7 @@ export function case52NormalTerminalFailures(
     expectedTurnId = null,
     expectedPrompt = null,
     minimumCompletedSummaryCount = 1,
+    allowedOverlay = "none",
   } = {},
 ) {
   if (!Number.isInteger(minimumCompletedSummaryCount) || minimumCompletedSummaryCount < 1) {
@@ -53,6 +60,9 @@ export function case52NormalTerminalFailures(
     if (value !== null && (typeof value !== "string" || value.length === 0)) {
       throw new TypeError(`${name} must be a non-empty string or null`);
     }
+  }
+  if (allowedOverlay !== "none" && allowedOverlay !== "command_palette") {
+    throw new TypeError("allowedOverlay must be none or command_palette");
   }
 
   const failures = [];
@@ -74,7 +84,7 @@ export function case52NormalTerminalFailures(
     || projection.provider_loading !== false) {
     failures.push("projection-not-settled");
   }
-  if (projection.overlay !== "none"
+  if (projection.overlay !== allowedOverlay
     || projection.confirmation_visible !== false
     || projection.confirmation_id !== null
     || projection.confirmation != null) {
@@ -186,15 +196,87 @@ export function case52RestartContinuityFailures({
   } else if (beforeSessionId !== afterSessionId) {
     failures.push("restart-session-id-mismatch");
   }
-  if (!Array.isArray(beforeHistory) || beforeHistory.length === 0 || !Array.isArray(afterHistory)) {
+  const conversationTurns = (rows) => {
+    if (!Array.isArray(rows)) return null;
+    const durableAnchor = (row) => ({
+      body: row.body,
+      identity: typeof row.stable_history_identity === "string"
+        && row.stable_history_identity.length > 0
+        ? row.stable_history_identity
+        : null,
+    });
+    const turns = [];
+    let current = null;
+    for (const row of rows) {
+      if (row?.row_kind === "user") {
+        if (typeof row.body !== "string" || row.body.length === 0) return null;
+        if (current !== null) turns.push(current);
+        current = { user: durableAnchor(row), errors: [], assistant: null };
+      } else if (row?.row_kind === "error") {
+        if (current === null || typeof row.body !== "string" || row.body.length === 0) return null;
+        current.errors.push(durableAnchor(row));
+      } else if (row?.row_kind === "assistant" && typeof row.body === "string" && row.body.length > 0) {
+        if (current === null) return null;
+        current.assistant = row.body;
+      }
+    }
+    if (current !== null) turns.push(current);
+    return turns;
+  };
+  const beforeTurns = conversationTurns(beforeHistory);
+  const afterTurns = conversationTurns(afterHistory);
+  if (beforeTurns === null || beforeTurns.length === 0 || afterTurns === null) {
     failures.push("restart-history-invalid");
-  } else if (afterHistory.length < beforeHistory.length) {
+  } else if (afterTurns.length < beforeTurns.length) {
     failures.push("restart-history-truncated");
   } else {
-    const mismatchIndex = beforeHistory.findIndex((row, index) => !sameValue(row, afterHistory[index]));
+    const durableAnchorMatches = (before, after) => before.body === after?.body
+      && (before.identity === null || before.identity === after.identity);
+    const mismatchIndex = beforeTurns.findIndex((before, index) => {
+      const after = afterTurns[index];
+      if (!durableAnchorMatches(before.user, after?.user)) return true;
+      if (before.errors.length !== after.errors.length
+        || before.errors.some((error, errorIndex) => (
+          !durableAnchorMatches(error, after.errors[errorIndex])
+        ))) return true;
+      if (before.assistant === null) return after.assistant !== null;
+      if (after.assistant === before.assistant) return false;
+      return index !== beforeTurns.length - 1
+        || after.assistant === null
+        || !after.assistant.startsWith(before.assistant);
+    });
     if (mismatchIndex >= 0) failures.push("restart-history-prefix-mismatch");
   }
   return failures;
+}
+
+export function classifyCase52RestartTurnPage(
+  projection,
+  {
+    expectedSessionId,
+    expectedTurnId,
+    expectedAdmissionRevision,
+    expectedTotal,
+    expectedLimit,
+    requireLatestSuffix = false,
+  } = {},
+) {
+  return classifyRestartTurnPage(projection, {
+    expectedSessionId,
+    expectedTurnId,
+    expectedAdmissionRevision,
+    expectedTotal,
+    expectedLimit,
+    requireLatestSuffix,
+  });
+}
+
+export function case52RestartPreviousPageTransitionFailures({ before, after }) {
+  return restartPreviousPageTransitionFailures({ before, after });
+}
+
+export function classifyCase52RestartHistoryTarget(target) {
+  return classifyRestartHistoryTarget(target);
 }
 
 export function case52RestartContinuityAccepted(value) {

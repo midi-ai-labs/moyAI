@@ -6,6 +6,7 @@ import {
   assertExactSemanticTarget,
   assertTrustedProbeSequence,
   assertTrustedTextInsertion,
+  normalizeSemanticIdentity,
   normalizeSemanticLocator,
   normalizeWebviewKey,
 } from "../drivers/webview_input.mjs";
@@ -77,6 +78,15 @@ function event(sequence, type, identity, detail = {}) {
 }
 
 test("semantic locators require stable identity and exact hit-tested ownership", () => {
+  assert.equal(
+    normalizeSemanticIdentity({ tag: "SECTION", modal: "" }).modal,
+    null,
+    "boolean data attributes are presence markers, not empty semantic identities",
+  );
+  assert.throws(
+    () => normalizeSemanticIdentity({ tag: "" }),
+    /semantic identity tag must not be empty/,
+  );
   assert.deepEqual(normalizeSemanticLocator(showShortcuts), {
     ...showShortcuts,
     requireVisible: true,
@@ -248,6 +258,34 @@ test("semantic target acquisition waits without input for the product scroll to 
   await input.pointerUp();
 });
 
+test("explicit stable-hit acquisition waits through an already hittable smooth scroll", async () => {
+  const first = targetObservation({
+    center: { x: 1233.0625, y: 513.5 },
+    rect: { left: 1179.125, top: 495, right: 1287, bottom: 532, width: 107.875, height: 37 },
+  });
+  const moving = targetObservation({
+    center: { x: 1233.0625, y: 463.5 },
+    rect: { left: 1179.125, top: 445, right: 1287, bottom: 482, width: 107.875, height: 37 },
+  });
+  const settled = targetObservation({
+    center: { x: 1233.0625, y: 413.5 },
+    rect: { left: 1179.125, top: 395, right: 1287, bottom: 432, width: 107.875, height: 37 },
+  });
+  const cdp = new FakeCdp([first, moving, settled, settled, settled]);
+  const input = new WebviewInput(cdp, {
+    targetAcquisitionTimeoutMs: 100,
+    targetAcquisitionPollMs: 0,
+  });
+
+  const target = await input.pointerDown(showShortcuts, { stableHitSamples: 3 });
+  assert.equal(target.acquisition.kind, "stable-hit-settled");
+  assert.equal(target.acquisition.attempts, 5);
+  assert.equal(target.acquisition.stable_hit_samples, 3);
+  assert.equal(target.center.y, 413.5);
+  assert.deepEqual(cdp.calls.map((call) => call.params.type), ["mouseMoved", "mousePressed"]);
+  await input.pointerUp();
+});
+
 test("semantic target acquisition never waits through viewport occlusion or identity drift", async () => {
   const occluded = targetObservation({
     hit_identity: { ...targetObservation().hit_identity, action: "covering-control" },
@@ -328,7 +366,7 @@ test("an ambiguous mousePressed remains cleanup-owned until mouseReleased is con
   assert.deepEqual(cdp.calls.map((call) => call.params.type), ["mouseMoved", "mousePressed", "mouseReleased"]);
 });
 
-test("Escape, Tab, and printable keys expose distinct browser keyDown and keyUp calls", async () => {
+test("navigation, Escape, Tab, and printable keys expose distinct browser keyDown and keyUp calls", async () => {
   const cdp = new FakeCdp();
   const input = new WebviewInput(cdp);
 
@@ -336,20 +374,28 @@ test("Escape, Tab, and printable keys expose distinct browser keyDown and keyUp 
   assert.deepEqual(input.pressedKeys, [{ key: "Escape", code: "Escape", delivery: "confirmed" }]);
   assert.equal(cdp.calls.length, 1, "keyDown does not imply release");
   await input.keyUp("Escape");
+  await input.pressKey("Home");
+  await input.pressKey("ArrowDown");
   await input.pressKey("Tab");
   await input.pressKey("a");
 
   assert.deepEqual(cdp.calls.map((call) => [call.params.type, call.params.code]), [
     ["keyDown", "Escape"],
     ["keyUp", "Escape"],
+    ["keyDown", "Home"],
+    ["keyUp", "Home"],
+    ["keyDown", "ArrowDown"],
+    ["keyUp", "ArrowDown"],
     ["keyDown", "Tab"],
     ["keyUp", "Tab"],
     ["keyDown", "KeyA"],
     ["keyUp", "KeyA"],
   ]);
-  assert.equal(Object.hasOwn(cdp.calls[2].params, "text"), false, "Tab does not inject text");
-  assert.equal(cdp.calls[4].params.text, "a");
-  assert.equal(cdp.calls[4].params.unmodifiedText, "a");
+  for (const call of cdp.calls.slice(2, 8)) {
+    assert.equal(Object.hasOwn(call.params, "text"), false, "navigation keys do not inject text");
+  }
+  assert.equal(cdp.calls[8].params.text, "a");
+  assert.equal(cdp.calls[8].params.unmodifiedText, "a");
   assert.deepEqual(input.pressedKeys, []);
   assert.throws(() => normalizeWebviewKey("A"), /unsupported WebView key/);
 });

@@ -16,11 +16,18 @@ const liveProviderOptions = Object.freeze({
   provider_base_url: "http://192.0.2.10:8119/v1",
   model: "example/Qwen-27B",
 });
+const case52OpenAiOptions = Object.freeze({
+  fixture_source: "C:\\fixture",
+  provider_profile: "openai_compatible",
+  provider_base_url: "http://192.0.2.10:8119/v1",
+  main_model: "Qwen3.8-27B-4bit",
+});
 
 test("one registry binds every reusable scenario to the common runner contract", () => {
   assert.deepEqual(scenarioIds, [
     "shell.baseline",
     "agent.interrupt",
+    "history.restart-prepend",
     "input.pointer-keyboard",
     "manual.case5_2",
     "manual.provider-openai-compatible",
@@ -46,6 +53,7 @@ test("one registry binds every reusable scenario to the common runner contract",
     }
   }
   assert.notEqual(createScenario("provider.restart"), createScenario("provider.restart"));
+  assert.notEqual(createScenario("history.restart-prepend"), createScenario("history.restart-prepend"));
   assert.notEqual(createScenario("settings.docling-readiness"), createScenario("settings.docling-readiness"));
   assert.notEqual(createScenario("settings.initial-setup"), createScenario("settings.initial-setup"));
   assert.notEqual(createScenario("settings.preferences"), createScenario("settings.preferences"));
@@ -54,6 +62,10 @@ test("one registry binds every reusable scenario to the common runner contract",
   assert.notEqual(createScenario("run.stop"), createScenario("run.stop"));
   assert.notEqual(createScenario("agent.interrupt"), createScenario("agent.interrupt"));
   assert.notEqual(createScenario("manual.case5_2", case52Options), createScenario("manual.case5_2", case52Options));
+  assert.notEqual(
+    createScenario("manual.case5_2", case52OpenAiOptions),
+    createScenario("manual.case5_2", case52OpenAiOptions),
+  );
   assert.notEqual(
     createScenario("manual.provider-openai-compatible", liveProviderOptions),
     createScenario("manual.provider-openai-compatible", liveProviderOptions),

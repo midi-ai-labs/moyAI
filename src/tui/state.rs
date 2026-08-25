@@ -728,6 +728,19 @@ impl AppState {
                     tool_call_id: None,
                 });
             }
+            RunEvent::RuntimeNotice { message, .. } => {
+                self.run_status = RunStatus::Running;
+                self.status_message = Some(message.clone());
+                self.progress.current_phase = RunProgressPhase::RuntimeFeedback;
+                self.progress.active_step = message.clone();
+                self.transcript_entries.push(TranscriptEntry {
+                    kind: TranscriptKind::System,
+                    title: "Runtime notice".to_string(),
+                    body: message.clone(),
+                    response_id: None,
+                    tool_call_id: None,
+                });
+            }
             RunEvent::RecoverableRuntimeFeedback { message, .. } => {
                 self.run_status = RunStatus::Running;
                 self.status_message = Some(message.clone());
@@ -1877,6 +1890,30 @@ mod tests {
             .expect("pending tool transcript entry");
         assert_eq!(transcript.body, "vendor.custom_tool");
         assert_eq!(transcript.tool_call_id, Some(tool_call_id));
+    }
+
+    #[test]
+    fn runtime_notice_is_visible_without_becoming_a_primary_error_row() {
+        let session_id = SessionId::new();
+        let mut state = AppState::default();
+
+        state.apply_run_event(&RunEvent::RuntimeNotice {
+            session_id,
+            message: "display-only advisory".to_string(),
+        });
+
+        assert_eq!(state.run_status, RunStatus::Running);
+        assert_eq!(
+            state.status_message.as_deref(),
+            Some("display-only advisory")
+        );
+        let notice = state
+            .transcript_entries
+            .last()
+            .expect("runtime notice transcript entry");
+        assert_eq!(notice.kind, TranscriptKind::System);
+        assert_eq!(notice.title, "Runtime notice");
+        assert_eq!(notice.body, "display-only advisory");
     }
 
     #[test]

@@ -199,7 +199,8 @@ impl EventRenderer for HumanRenderer {
                     }
                 )?;
             }
-            RunEvent::RecoverableRuntimeFeedback { message, .. } => {
+            RunEvent::RuntimeNotice { message, .. }
+            | RunEvent::RecoverableRuntimeFeedback { message, .. } => {
                 writeln!(stdout, "[feedback] {}", terminal_safe_inline(message))?;
             }
             RunEvent::TurnTerminal {

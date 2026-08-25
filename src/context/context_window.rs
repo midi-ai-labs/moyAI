@@ -54,13 +54,30 @@ impl ContextWindowTokenStatus {
         overflow_margin_tokens: usize,
         provider_total_tokens: u32,
         local_messages: &[ModelMessage],
+        positive_noncanonical_prepared_tokens: u32,
     ) -> Self {
         let local_tokens = estimate_model_messages_tokens(local_messages);
+        let provider_usage_estimate = provider_total_tokens
+            .saturating_add(local_tokens)
+            .saturating_add(positive_noncanonical_prepared_tokens);
+        let full_prepared_request_estimate = estimate_request_tokens(request);
+        let (active_context_tokens, source) =
+            if provider_usage_estimate > full_prepared_request_estimate {
+                (
+                    provider_usage_estimate,
+                    ActiveContextTokenSource::ProviderUsageWithLocalEstimate,
+                )
+            } else {
+                (
+                    full_prepared_request_estimate,
+                    ActiveContextTokenSource::FullPreparedRequestEstimate,
+                )
+            };
         Self::from_active_context_tokens(
             request,
             overflow_margin_tokens,
-            provider_total_tokens.saturating_add(local_tokens),
-            ActiveContextTokenSource::ProviderUsageWithLocalEstimate,
+            active_context_tokens,
+            source,
         )
     }
 

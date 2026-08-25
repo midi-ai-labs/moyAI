@@ -11,10 +11,12 @@ import { createSettingsPreferencesScenario } from "./scenarios/settings_preferen
 import { createSettingsSessionScenario } from "./scenarios/settings_session.mjs";
 import { createAgentInterruptScenario } from "./scenarios/agent_interrupt.mjs";
 import { createCase52Scenario } from "./scenarios/case5_2.mjs";
+import { createHistoryRestartPrependScenario } from "./scenarios/history_restart_prepend.mjs";
 
 const factories = new Map([
   [shellBaseline.id, () => shellBaseline],
   ["agent.interrupt", createAgentInterruptScenario],
+  ["history.restart-prepend", createHistoryRestartPrependScenario],
   ["input.pointer-keyboard", createPointerKeyboardScenario],
   ["manual.case5_2", createCase52Scenario],
   ["manual.provider-openai-compatible", createProviderConnectionLiveScenario],

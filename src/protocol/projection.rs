@@ -176,6 +176,7 @@ fn project_history_item(
         | RunEvent::ReasoningSummaryDelta { .. }
         | RunEvent::SessionStarted { .. }
         | RunEvent::SessionTitleUpdated { .. }
+        | RunEvent::RuntimeNotice { .. }
         | RunEvent::PermissionRequested { .. }
         | RunEvent::TurnTerminal { .. } => return None,
         RunEvent::AssistantMessageCommitted { response_id, text } => {
@@ -344,6 +345,7 @@ pub fn project_turn_item_for_run_event(
         | RunEvent::ReasoningSummaryDelta { .. }
         | RunEvent::SessionStarted { .. }
         | RunEvent::SessionTitleUpdated { .. }
+        | RunEvent::RuntimeNotice { .. }
         | RunEvent::ModelRequestPrepared { .. } => return None,
         RunEvent::AssistantMessageCommitted { text, .. } => {
             TurnItemPayload::AgentMessage { text: text.clone() }
@@ -602,7 +604,8 @@ fn project_runtime_message(
             tool: *tool,
             decision: permission_decision(*approved),
         },
-        RunEvent::RecoverableRuntimeFeedback { message, .. } => RuntimeEventMsg::Warning {
+        RunEvent::RuntimeNotice { message, .. }
+        | RunEvent::RecoverableRuntimeFeedback { message, .. } => RuntimeEventMsg::Warning {
             message: message.clone(),
         },
         RunEvent::TurnTerminal { terminal, .. } => RuntimeEventMsg::TurnTerminal {

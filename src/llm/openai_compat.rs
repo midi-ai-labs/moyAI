@@ -16,7 +16,7 @@ use crate::llm::contract::{ReasoningRequest, validate_chat_completions_reasoning
 use crate::llm::dto::{
     OpenAiChatChunk, OpenAiChatRequest, OpenAiContent, OpenAiContentPart, OpenAiErrorPayload,
     OpenAiFunctionSchema, OpenAiImageUrl, OpenAiMessage, OpenAiMessageToolCall,
-    OpenAiMessageToolCallFunction, OpenAiToolSchema, OpenAiUsage,
+    OpenAiMessageToolCallFunction, OpenAiStreamOptions, OpenAiToolSchema, OpenAiUsage,
 };
 use crate::llm::responses::{
     ResponsesRequestOptions, ResponsesStreamAccumulator, ResponsesTerminal, to_responses_request,
@@ -34,6 +34,15 @@ const RETRY_MAX_DELAY_MS: u64 = 30_000;
 const PROVIDER_FAILURE_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES: usize = 243;
 const PROVIDER_STREAM_SUMMARY_SCAN_LIMIT_BYTES: usize = PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES * 4;
+const CHATML_ARTIFACT_HOLDBACK_MAX_BYTES: usize = 256;
+const CHATML_ROLE_BOUNDARY_ARTIFACTS: [&str; 6] = [
+    "<|im_start|>system",
+    "<|im_start|>developer",
+    "<|im_start|>user",
+    "<|im_start|>assistant",
+    "<|im_start|>tool",
+    "<|im_end|>",
+];
 const PROVIDER_STREAM_ERROR_MESSAGE_LIMIT_BYTES: usize = 160;
 const PROVIDER_STREAM_ERROR_FIELD_LIMIT_BYTES: usize = 48;
 
@@ -123,108 +132,129 @@ impl OpenAiCompatClient {
         let mut ended_by_eof = false;
         let mut accumulator = ChatStreamAccumulator::default();
 
-        loop {
-            let next_event = if let Some(timeout) = stream_budget.wait_timeout() {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        return Ok(LlmResponseSummary {
-                            finish_reason: FinishReason::Cancelled,
-                            usage,
-                            response_id: None,
-                        });
-                    }
-                    result = tokio::time::timeout(timeout, stream.next()) => {
-                        match result {
-                            Ok(event) => event,
-                            Err(_) => {
-                                return Err(stream_budget.timeout_error());
+        let result: Result<LlmResponseSummary, LlmError> = async {
+            loop {
+                let next_event = if let Some(timeout) = stream_budget.wait_timeout() {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            return Ok(LlmResponseSummary {
+                                finish_reason: FinishReason::Cancelled,
+                                usage,
+                                response_id: None,
+                            });
+                        }
+                        result = tokio::time::timeout(timeout, stream.next()) => {
+                            match result {
+                                Ok(event) => event,
+                                Err(_) => {
+                                    return Err(stream_budget.timeout_error());
+                                }
                             }
                         }
                     }
-                }
-            } else {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        return Ok(LlmResponseSummary {
-                            finish_reason: FinishReason::Cancelled,
-                            usage,
-                            response_id: None,
-                        });
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            return Ok(LlmResponseSummary {
+                                finish_reason: FinishReason::Cancelled,
+                                usage,
+                                response_id: None,
+                            });
+                        }
+                        result = stream.next() => result,
                     }
-                    result = stream.next() => result,
-                }
-            };
+                };
 
-            let Some(event) = next_event else {
-                ended_by_eof = true;
-                break;
-            };
+                let Some(event) = next_event else {
+                    ended_by_eof = true;
+                    break;
+                };
 
-            let event = match event {
-                Ok(event) => event,
-                Err(EventStreamError::Transport(error)) => return Err(error),
-                Err(error) => {
-                    return Err(LlmError::Message(format!("SSE stream error: {error}")));
+                let event = match event {
+                    Ok(event) => event,
+                    Err(EventStreamError::Transport(error)) => return Err(error),
+                    Err(error) => {
+                        return Err(LlmError::Message(format!("SSE stream error: {error}")));
+                    }
+                };
+                stream_budget.record_event()?;
+                sink.record_progress()?;
+                if event.data == "[DONE]" {
+                    saw_terminal_signal = true;
+                    break;
                 }
-            };
-            stream_budget.record_event()?;
-            sink.record_progress()?;
-            if event.data == "[DONE]" {
-                saw_terminal_signal = true;
-                break;
+
+                let chunk =
+                    serde_json::from_str::<OpenAiChatChunk>(&event.data).map_err(|error| {
+                        LlmError::Message(format!(
+                            "failed to parse openai-compatible stream chunk: {}. Raw chunk: {}",
+                            error,
+                            summarize_stream_chunk(&event.data)
+                        ))
+                    })?;
+                if let Some(error) = chunk.error.as_ref() {
+                    return Err(LlmError::Message(format!(
+                        "openai-compatible stream error: {}",
+                        summarize_stream_error(error)
+                    )));
+                }
+                let chunk_usage = chunk.usage.as_ref().map(to_usage).transpose()?;
+                if let (Some(existing), Some(candidate)) = (usage.as_ref(), chunk_usage.as_ref())
+                    && !same_token_usage(existing, candidate)
+                {
+                    return Err(LlmError::Message(
+                        "openai-compatible stream returned conflicting usage payloads across chunks"
+                            .to_string(),
+                    ));
+                }
+                let update = accumulator.apply_chunk(chunk, &mut stream_budget)?;
+                if usage.is_none() {
+                    usage = chunk_usage;
+                }
+                saw_terminal_signal |= update.saw_terminal_signal;
+                for event in update.events {
+                    sink.push(event)?;
+                }
             }
 
-            let chunk = serde_json::from_str::<OpenAiChatChunk>(&event.data).map_err(|error| {
-                LlmError::Message(format!(
-                    "failed to parse openai-compatible stream chunk: {}. Raw chunk: {}",
-                    error,
-                    summarize_stream_chunk(&event.data)
-                ))
+            if ended_by_eof && !saw_terminal_signal {
+                return Err(stream_missing_terminal_signal_error());
+            }
+
+            let has_complete_tool_calls = validate_streamed_tool_calls(&accumulator.tool_calls)?;
+            let finish_reason =
+                resolve_finish_reason(accumulator.finish_reason, has_complete_tool_calls)?;
+
+            sink.push(LlmEvent::Finished {
+                finish_reason,
+                usage: usage.clone(),
             })?;
-            if let Some(error) = chunk.error.as_ref() {
-                return Err(LlmError::Message(format!(
-                    "openai-compatible stream error: {}",
-                    summarize_stream_error(error)
-                )));
+            Ok(LlmResponseSummary {
+                finish_reason,
+                usage,
+                response_id: None,
+            })
+        }
+        .await;
+
+        match result {
+            Ok(summary) if summary.finish_reason == FinishReason::Cancelled => {
+                accumulator.flush_assistant_text_before_early_exit(sink)?;
+                Ok(summary)
             }
-            let chunk_usage = chunk.usage.as_ref().map(to_usage).transpose()?;
-            if let (Some(existing), Some(candidate)) = (usage.as_ref(), chunk_usage.as_ref())
-                && !same_token_usage(existing, candidate)
+            Ok(summary) => Ok(summary),
+            Err(error)
+                if sink.failure_origin == Some(ProviderTraceFailureOrigin::EventProjection) =>
             {
-                return Err(LlmError::Message(
-                    "openai-compatible stream returned conflicting usage payloads across chunks"
-                        .to_string(),
-                ));
+                Err(error)
             }
-            let update = accumulator.apply_chunk(chunk, &mut stream_budget)?;
-            if usage.is_none() {
-                usage = chunk_usage;
-            }
-            saw_terminal_signal |= update.saw_terminal_signal;
-            for event in update.events {
-                sink.push(event)?;
+            Err(error) => {
+                accumulator.flush_assistant_text_before_early_exit(sink)?;
+                Err(error)
             }
         }
-
-        if ended_by_eof && !saw_terminal_signal {
-            return Err(stream_missing_terminal_signal_error());
-        }
-
-        let has_complete_tool_calls = validate_streamed_tool_calls(&accumulator.tool_calls)?;
-        let finish_reason =
-            resolve_finish_reason(accumulator.finish_reason, has_complete_tool_calls)?;
-
-        sink.push(LlmEvent::Finished {
-            finish_reason,
-            usage: usage.clone(),
-        })?;
-        Ok(LlmResponseSummary {
-            finish_reason,
-            usage,
-            response_id: None,
-        })
     }
 }
 
@@ -1184,6 +1214,7 @@ struct ChatStreamAccumulator {
     finish_reason: Option<FinishReason>,
     tool_calls: HashMap<usize, PartialToolCall>,
     call_id_to_delta_index: HashMap<String, usize>,
+    assistant_text: ChatAssistantTextHoldback,
 }
 
 struct ChatChunkUpdate {
@@ -1192,6 +1223,18 @@ struct ChatChunkUpdate {
 }
 
 impl ChatStreamAccumulator {
+    fn flush_assistant_text_before_early_exit(
+        &mut self,
+        sink: &mut dyn LlmEventSink,
+    ) -> Result<(), LlmError> {
+        let mut events = Vec::with_capacity(1);
+        self.assistant_text.flush_before_early_exit(&mut events);
+        for event in events {
+            sink.push(event)?;
+        }
+        Ok(())
+    }
+
     fn apply_chunk(
         &mut self,
         chunk: OpenAiChatChunk,
@@ -1242,7 +1285,7 @@ impl ChatStreamAccumulator {
                 )));
             }
             if let Some(value) = choice.delta.content {
-                events.push(LlmEvent::TextDelta(value));
+                self.assistant_text.push_delta(value, &mut events);
             }
             if let Some(deltas) = choice.delta.tool_calls {
                 for delta in deltas {
@@ -1264,7 +1307,9 @@ impl ChatStreamAccumulator {
         }
         if saw_terminal_signal {
             let has_complete_tool_calls = validate_streamed_tool_calls(&self.tool_calls)?;
-            resolve_finish_reason(self.finish_reason, has_complete_tool_calls)?;
+            let finish_reason = resolve_finish_reason(self.finish_reason, has_complete_tool_calls)?;
+            self.assistant_text
+                .finish(finish_reason, has_complete_tool_calls, &mut events);
         }
         Ok(ChatChunkUpdate {
             events,
@@ -1358,10 +1403,110 @@ impl ChatStreamAccumulator {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ChatAssistantTextHoldback {
+    pending: String,
+    passthrough: bool,
+}
+
+impl ChatAssistantTextHoldback {
+    fn push_delta(&mut self, delta: String, events: &mut Vec<LlmEvent>) {
+        if self.passthrough {
+            events.push(LlmEvent::TextDelta(delta));
+            return;
+        }
+
+        if self.pending.len().saturating_add(delta.len()) > CHATML_ARTIFACT_HOLDBACK_MAX_BYTES {
+            self.flush_pending(events);
+            if !delta.is_empty() {
+                events.push(LlmEvent::TextDelta(delta));
+            }
+            self.passthrough = true;
+            return;
+        }
+
+        self.pending.push_str(&delta);
+        if classify_chatml_artifact_candidate(&self.pending) == ChatmlArtifactCandidate::No {
+            self.flush_pending(events);
+            self.passthrough = true;
+        }
+    }
+
+    fn finish(
+        &mut self,
+        finish_reason: FinishReason,
+        has_complete_tool_calls: bool,
+        events: &mut Vec<LlmEvent>,
+    ) {
+        if self.passthrough {
+            return;
+        }
+
+        let suppress = finish_reason == FinishReason::ToolCall
+            && has_complete_tool_calls
+            && classify_chatml_artifact_candidate(&self.pending)
+                == ChatmlArtifactCandidate::Complete;
+        if suppress {
+            self.pending.clear();
+        } else {
+            self.flush_pending(events);
+        }
+        self.passthrough = true;
+    }
+
+    fn flush_before_early_exit(&mut self, events: &mut Vec<LlmEvent>) {
+        if self.passthrough {
+            return;
+        }
+        self.flush_pending(events);
+        self.passthrough = true;
+    }
+
+    fn flush_pending(&mut self, events: &mut Vec<LlmEvent>) {
+        if !self.pending.is_empty() {
+            events.push(LlmEvent::TextDelta(std::mem::take(&mut self.pending)));
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChatmlArtifactCandidate {
+    Complete,
+    Prefix,
+    No,
+}
+
+fn classify_chatml_artifact_candidate(mut value: &str) -> ChatmlArtifactCandidate {
+    loop {
+        value = value.trim_start_matches(char::is_whitespace);
+        if value.is_empty() {
+            return ChatmlArtifactCandidate::Complete;
+        }
+
+        if let Some(artifact) = CHATML_ROLE_BOUNDARY_ARTIFACTS
+            .iter()
+            .find(|artifact| value.starts_with(**artifact))
+        {
+            value = &value[artifact.len()..];
+            continue;
+        }
+
+        return if CHATML_ROLE_BOUNDARY_ARTIFACTS
+            .iter()
+            .any(|artifact| artifact.starts_with(value))
+        {
+            ChatmlArtifactCandidate::Prefix
+        } else {
+            ChatmlArtifactCandidate::No
+        };
+    }
+}
+
 struct ChatChunkJournal {
     original_finish_reason: Option<FinishReason>,
     tool_call_checkpoints: Vec<PartialToolCallCheckpoint>,
     inserted_call_id_aliases: Vec<String>,
+    original_assistant_text: ChatAssistantTextHoldback,
 }
 
 impl ChatChunkJournal {
@@ -1370,6 +1515,7 @@ impl ChatChunkJournal {
             original_finish_reason: accumulator.finish_reason,
             tool_call_checkpoints: Vec::new(),
             inserted_call_id_aliases: Vec::new(),
+            original_assistant_text: accumulator.assistant_text.clone(),
         }
     }
 
@@ -1386,6 +1532,7 @@ impl ChatChunkJournal {
             checkpoint.rollback(accumulator);
         }
         accumulator.finish_reason = self.original_finish_reason;
+        accumulator.assistant_text = self.original_assistant_text;
     }
 }
 
@@ -1616,7 +1763,11 @@ pub(crate) fn to_openai_request_with_reasoning(
                 tool_calls,
             } => OpenAiMessage {
                 role: "assistant".to_string(),
-                content: Some(OpenAiContent::Text(content.clone().unwrap_or_default())),
+                content: content
+                    .as_ref()
+                    .filter(|text| !text.trim().is_empty())
+                    .cloned()
+                    .map(OpenAiContent::Text),
                 tool_calls: Some(
                     tool_calls
                         .iter()
@@ -1648,6 +1799,9 @@ pub(crate) fn to_openai_request_with_reasoning(
     let base = OpenAiChatRequest {
         model: request.provider_target().model().to_string(),
         stream: true,
+        stream_options: OpenAiStreamOptions {
+            include_usage: true,
+        },
         n: 1,
         messages,
         max_tokens: Some(request.effective_max_output_tokens()),
@@ -1756,6 +1910,7 @@ fn is_runtime_owned_openai_request_key(key: &str) -> bool {
         key,
         "model"
             | "stream"
+            | "stream_options"
             | "n"
             | "messages"
             | "max_tokens"
@@ -1979,6 +2134,16 @@ mod tests {
         ProviderStreamBudget::new(limits, OperationDeadline::new(limits.max_duration_ms))
     }
 
+    fn concatenated_text(events: &[LlmEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                LlmEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn replace_provider_endpoint(request: &mut ChatRequest, endpoint: &str) {
         let model = request.provider_target().model().to_string();
         let profile = request.provider_target().profile();
@@ -2132,6 +2297,56 @@ mod tests {
             !messages
                 .iter()
                 .any(|message| message["role"] == json!("developer"))
+        );
+    }
+
+    #[test]
+    fn chat_wire_omits_absent_or_whitespace_tool_call_content_and_preserves_prose_exactly() {
+        let mut request = reasoning_fixture_request();
+        request.messages = vec![
+            ModelMessage::AssistantToolCalls {
+                content: None,
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call_without_content".to_string(),
+                    tool_name: "read".to_string(),
+                    arguments_json: r#"{"path":"README.md"}"#.to_string(),
+                }],
+            },
+            ModelMessage::Tool {
+                call_id: "call_without_content".to_string(),
+                tool_name: "read".to_string(),
+                result: "README contents".to_string(),
+                metadata: Value::Null,
+            },
+            ModelMessage::AssistantToolCalls {
+                content: Some("\n \t\n".to_string()),
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call_with_whitespace".to_string(),
+                    tool_name: "list".to_string(),
+                    arguments_json: r#"{"path":"."}"#.to_string(),
+                }],
+            },
+            ModelMessage::AssistantToolCalls {
+                content: Some("  I will inspect another file.  ".to_string()),
+                tool_calls: vec![ModelToolCall {
+                    call_id: "call_with_prose".to_string(),
+                    tool_name: "read".to_string(),
+                    arguments_json: r#"{"path":"Cargo.toml"}"#.to_string(),
+                }],
+            },
+        ];
+
+        let body = to_openai_request(&request).expect("Chat request serialization");
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages[1]["role"], json!("assistant"));
+        assert!(messages[1].get("content").is_none());
+        assert_eq!(messages[3]["role"], json!("assistant"));
+        assert!(messages[3].get("content").is_none());
+        assert_eq!(messages[4]["role"], json!("assistant"));
+        assert_eq!(
+            messages[4]["content"],
+            json!("  I will inspect another file.  ")
         );
     }
 
@@ -2347,12 +2562,14 @@ mod tests {
         let mut request = reasoning_fixture_request();
         request.extra_body = Some(json!({
             "n": 2,
+            "stream_options": { "include_usage": false },
             "num_ctx": 8192
         }));
 
         let body = to_openai_request(&request).expect("one-choice Chat request");
 
         assert_eq!(body["n"], 1);
+        assert_eq!(body["stream_options"], json!({ "include_usage": true }));
         assert_eq!(body["num_ctx"], 8192);
     }
 
@@ -2385,6 +2602,235 @@ mod tests {
         assert!(resolve_finish_reason(Some(FinishReason::ToolCall), false).is_err());
         assert!(resolve_finish_reason(Some(FinishReason::Stop), true).is_err());
         assert!(resolve_finish_reason(Some(FinishReason::Length), true).is_err());
+    }
+
+    #[test]
+    fn tool_call_terminal_suppresses_chunked_chatml_role_boundary_artifact() {
+        let mut accumulator = ChatStreamAccumulator::default();
+        let mut budget = fresh_stream_budget(ProviderStreamLimits::product_default());
+
+        for content in ["\n\n<|im_", "start|>us"] {
+            let chunk = serde_json::from_value(json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": content },
+                    "finish_reason": null
+                }]
+            }))
+            .expect("split ChatML artifact chunk");
+            let update = accumulator
+                .apply_chunk(chunk, &mut budget)
+                .expect("candidate prefix remains held back");
+            assert!(update.events.is_empty());
+            assert!(!update.saw_terminal_signal);
+        }
+
+        let terminal = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": "er",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_list",
+                        "function": { "name": "list", "arguments": "{\"path\":\".\"}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("terminal ChatML artifact tool chunk");
+        let update = accumulator
+            .apply_chunk(terminal, &mut budget)
+            .expect("complete tool-call terminal");
+
+        assert!(update.saw_terminal_signal);
+        assert_eq!(concatenated_text(&update.events), "");
+        assert!(matches!(
+            update.events.as_slice(),
+            [
+                LlmEvent::ToolCallStart { call_id, tool_name },
+                LlmEvent::ToolCallArgsDelta { call_id: args_id, delta },
+            ] if call_id == "call_list"
+                && tool_name == "list"
+                && args_id == "call_list"
+                && delta == r#"{"path":"."}"#
+        ));
+        assert_eq!(
+            accumulator
+                .tool_calls
+                .get(&0)
+                .map(|call| call.arguments.as_str()),
+            Some(r#"{"path":"."}"#)
+        );
+    }
+
+    #[test]
+    fn normal_stop_flushes_chatml_literal_and_candidate_bytes_exactly() {
+        let explanation = "The literal <|im_start|>user names a ChatML boundary.";
+        let mut explanation_accumulator = ChatStreamAccumulator::default();
+        let mut explanation_budget = fresh_stream_budget(ProviderStreamLimits::product_default());
+        let explanation_chunk = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "content": explanation },
+                "finish_reason": "stop"
+            }]
+        }))
+        .expect("ordinary explanation chunk");
+        let explanation_update = explanation_accumulator
+            .apply_chunk(explanation_chunk, &mut explanation_budget)
+            .expect("ordinary stop response");
+        assert_eq!(concatenated_text(&explanation_update.events), explanation);
+
+        let mut literal_accumulator = ChatStreamAccumulator::default();
+        let mut literal_budget = fresh_stream_budget(ProviderStreamLimits::product_default());
+        let prefix = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "content": "\n<|im_start|>" },
+                "finish_reason": null
+            }]
+        }))
+        .expect("literal prefix chunk");
+        assert!(
+            literal_accumulator
+                .apply_chunk(prefix, &mut literal_budget)
+                .expect("literal candidate prefix")
+                .events
+                .is_empty()
+        );
+        let literal_terminal = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "content": "user" },
+                "finish_reason": "stop"
+            }]
+        }))
+        .expect("literal stop terminal");
+        let literal_update = literal_accumulator
+            .apply_chunk(literal_terminal, &mut literal_budget)
+            .expect("literal stop must remain visible");
+        assert_eq!(
+            concatenated_text(&literal_update.events),
+            "\n<|im_start|>user"
+        );
+    }
+
+    #[test]
+    fn semantic_tool_call_text_containing_chatml_literal_is_preserved_exactly() {
+        let content = "\nI observed <|im_start|>user and will inspect the file.";
+        let mut accumulator = ChatStreamAccumulator::default();
+        let mut budget = fresh_stream_budget(ProviderStreamLimits::product_default());
+        let chunk = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": content,
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_read",
+                        "function": { "name": "read", "arguments": "{}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("semantic tool-call chunk");
+
+        let update = accumulator
+            .apply_chunk(chunk, &mut budget)
+            .expect("semantic tool-call response");
+
+        assert_eq!(concatenated_text(&update.events), content);
+        assert!(matches!(
+            update.events.as_slice(),
+            [
+                LlmEvent::TextDelta(text),
+                LlmEvent::ToolCallStart { call_id, tool_name },
+                LlmEvent::ToolCallArgsDelta { call_id: args_id, delta },
+            ] if text == content
+                && call_id == "call_read"
+                && tool_name == "read"
+                && args_id == "call_read"
+                && delta == "{}"
+        ));
+    }
+
+    #[test]
+    fn unknown_control_token_is_flushed_byte_exact_with_tool_call() {
+        let mut accumulator = ChatStreamAccumulator::default();
+        let mut budget = fresh_stream_budget(ProviderStreamLimits::product_default());
+        let prefix = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "content": "\n<|im_" },
+                "finish_reason": null
+            }]
+        }))
+        .expect("unknown token prefix");
+        assert!(
+            accumulator
+                .apply_chunk(prefix, &mut budget)
+                .expect("shared prefix stays bounded")
+                .events
+                .is_empty()
+        );
+        let terminal = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": "mystery|>",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_read",
+                        "function": { "name": "read", "arguments": "{}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("unknown token terminal");
+        let update = accumulator
+            .apply_chunk(terminal, &mut budget)
+            .expect("unknown token is ordinary content");
+
+        assert_eq!(concatenated_text(&update.events), "\n<|im_mystery|>");
+        assert!(matches!(
+            &update.events[1..],
+            [
+                LlmEvent::ToolCallStart { call_id, tool_name },
+                LlmEvent::ToolCallArgsDelta { call_id: args_id, delta },
+            ] if call_id == "call_read"
+                && tool_name == "read"
+                && args_id == "call_read"
+                && delta == "{}"
+        ));
+    }
+
+    #[test]
+    fn artifact_holdback_is_bounded_and_overflow_flushes_without_rechunking_delta() {
+        let mut accumulator = ChatStreamAccumulator::default();
+        let mut budget = fresh_stream_budget(ProviderStreamLimits::product_default());
+        let oversized_whitespace = " ".repeat(super::CHATML_ARTIFACT_HOLDBACK_MAX_BYTES + 1);
+        let chunk = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "content": oversized_whitespace },
+                "finish_reason": null
+            }]
+        }))
+        .expect("oversized whitespace chunk");
+
+        let update = accumulator
+            .apply_chunk(chunk, &mut budget)
+            .expect("holdback overflow becomes passthrough");
+
+        assert_eq!(concatenated_text(&update.events), oversized_whitespace);
+        assert!(matches!(
+            update.events.as_slice(),
+            [LlmEvent::TextDelta(delta)] if delta == &oversized_whitespace
+        ));
     }
 
     #[test]
@@ -2436,6 +2882,7 @@ mod tests {
         assert!(entry.saw_arguments_field);
         assert_eq!(entry.emitted_len, 2);
         assert!(entry.started);
+        assert_eq!(accumulator.assistant_text, Default::default());
         assert_eq!(budget.tool_calls.len(), 1);
         assert_eq!(budget.tool_argument_bytes.get("chat:0"), Some(&2));
 
@@ -2465,6 +2912,7 @@ mod tests {
         assert_eq!(incomplete_accumulator.finish_reason, None);
         assert!(incomplete_accumulator.tool_calls.is_empty());
         assert!(incomplete_accumulator.call_id_to_delta_index.is_empty());
+        assert_eq!(incomplete_accumulator.assistant_text, Default::default());
         assert!(incomplete_budget.tool_calls.is_empty());
         assert!(incomplete_budget.tool_argument_bytes.is_empty());
     }
@@ -3072,6 +3520,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_split_candidate_sink_failure_does_not_retry_held_text_projection() {
+        let response = [
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": "\n<|im_" },
+                        "finish_reason": null
+                    }]
+                })
+            ),
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "content": "start|>user",
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_projection_failure",
+                                "function": { "name": "read", "arguments": "{}" }
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                })
+            ),
+        ]
+        .concat();
+        let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = FailingLlmEventSink::fail_push_on(1);
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("the first tool-event projection must fail the request");
+        server.abort();
+
+        let failure = error.provider_failure().expect("typed projection failure");
+        assert_eq!(failure.kind, ProviderFailureKind::EventProjection);
+        assert_eq!(failure.phase, ProviderPhase::FirstProgress);
+        assert!(matches!(
+            sink.attempted_events.as_slice(),
+            [LlmEvent::ToolCallStart { call_id, tool_name }]
+                if call_id == "call_projection_failure" && tool_name == "read"
+        ));
+        assert!(
+            !sink.phases.iter().any(|event| matches!(
+                event.phase,
+                ProviderPhase::LastProgress | ProviderPhase::ProviderTerminal
+            )),
+            "a failed tool-event sink must not receive held text or lifecycle projection"
+        );
+    }
+
+    #[tokio::test]
     async fn chat_phase_sink_failure_is_typed_before_model_projection() {
         let response = format!(
             "data: {}\n\ndata: [DONE]\n\n",
@@ -3402,7 +3911,7 @@ mod tests {
             "data: [DONE]\n\n".to_string(),
         ]
         .concat();
-        let (base_url, _requests, server) = start_responses_fixture(vec![response]).await;
+        let (base_url, requests, server) = start_responses_fixture(vec![response]).await;
         let mut request = reasoning_fixture_request();
         replace_provider_endpoint(&mut request, &base_url);
         let client = OpenAiCompatClient::new(None);
@@ -3433,6 +3942,12 @@ mod tests {
                 }
             ] if text == "complete"
         ));
+        let captured = requests.lock().expect("Chat request capture");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0]["stream_options"],
+            json!({ "include_usage": true })
+        );
     }
 
     #[tokio::test]
@@ -4363,6 +4878,234 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn chat_local_cancellation_flushes_split_chatml_candidate_before_return() {
+        let response = [
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": "\n<|im_" },
+                        "finish_reason": null
+                    }]
+                })
+            ),
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "content": "start|>user",
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_cancel",
+                                "function": { "name": "read", "arguments": "{}" }
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                })
+            ),
+        ]
+        .concat();
+        let (base_url, requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let cancel = CancellationToken::new();
+        let mut sink = CancelOnToolCallLlmEventSink {
+            events: Vec::new(),
+            phases: Vec::new(),
+            cancel: cancel.clone(),
+        };
+        let client = OpenAiCompatClient::new(None);
+
+        let summary = client
+            .stream_chat(request, cancel, &mut sink)
+            .await
+            .expect("local cancellation must preserve held assistant bytes");
+        server.abort();
+
+        assert_eq!(summary.finish_reason, FinishReason::Cancelled);
+        assert_eq!(requests.lock().expect("request capture").len(), 1);
+        assert_eq!(concatenated_text(&sink.events), "\n<|im_start|>user");
+        assert!(matches!(
+            sink.events.as_slice(),
+            [
+                LlmEvent::ToolCallStart { call_id, tool_name },
+                LlmEvent::ToolCallArgsDelta { call_id: args_id, delta },
+                LlmEvent::TextDelta(text),
+            ] if call_id == "call_cancel"
+                && tool_name == "read"
+                && args_id == "call_cancel"
+                && delta == "{}"
+                && text == "\n<|im_start|>user"
+        ));
+        assert!(matches!(
+            sink.phases.last(),
+            Some(ProviderPhaseEvent {
+                phase: ProviderPhase::ProviderTerminal,
+                terminal_status: Some(ProviderTerminalStatus::Cancelled),
+                failure: None,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn chat_protocol_error_flushes_split_chatml_candidate_before_error() {
+        let response = [
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": "\n<|im_" },
+                        "finish_reason": null
+                    }]
+                })
+            ),
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": "start|>user" },
+                        "finish_reason": null
+                    }]
+                })
+            ),
+            "data: {not-valid-json}\n\n".to_string(),
+        ]
+        .concat();
+        let (base_url, requests, server) = start_responses_fixture(vec![response]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("malformed Chat SSE must remain a protocol failure");
+        server.abort();
+
+        assert_eq!(
+            error.provider_failure().map(|failure| failure.kind),
+            Some(ProviderFailureKind::Protocol)
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse openai-compatible stream chunk")
+        );
+        assert_eq!(requests.lock().expect("request capture").len(), 1);
+        assert_eq!(concatenated_text(&sink.events), "\n<|im_start|>user");
+        assert!(matches!(
+            sink.events.as_slice(),
+            [LlmEvent::TextDelta(text)] if text == "\n<|im_start|>user"
+        ));
+        assert!(matches!(
+            sink.phases.last(),
+            Some(ProviderPhaseEvent {
+                phase: ProviderPhase::ProviderTerminal,
+                terminal_status: Some(ProviderTerminalStatus::Failed),
+                failure: Some(failure),
+                ..
+            }) if failure.kind == ProviderFailureKind::Protocol
+        ));
+    }
+
+    #[tokio::test]
+    async fn chat_timeout_flushes_split_chatml_candidate_before_typed_error() {
+        const REQUEST_TIMEOUT_MS: u64 = 100;
+        let candidate = [
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": "\n<|im_" },
+                        "finish_reason": null
+                    }]
+                })
+            ),
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": { "content": "start|>user" },
+                        "finish_reason": null
+                    }]
+                })
+            ),
+        ]
+        .concat();
+        let terminal = [
+            format!(
+                "data: {}\n\n",
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop"
+                    }]
+                })
+            ),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let (base_url, request_count, server) = start_staged_delayed_fixture(
+            vec![
+                (Duration::ZERO, candidate),
+                (Duration::from_millis(500), terminal),
+            ],
+            Duration::ZERO,
+        )
+        .await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        replace_provider_deadlines(
+            &mut request,
+            ProviderDeadlines {
+                request_timeout_ms: REQUEST_TIMEOUT_MS,
+                connect_timeout_ms: 1_000,
+                max_connect_retries: 0,
+            },
+        );
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("the original request timeout must remain typed");
+        server.abort();
+
+        assert_eq!(
+            error.provider_failure().map(|failure| failure.kind),
+            Some(ProviderFailureKind::RequestTimeout)
+        );
+        assert!(matches!(
+            error,
+            LlmError::ProviderFailure { source, .. }
+                if matches!(
+                    *source,
+                    LlmError::ProviderRequestTimeout {
+                        timeout_ms: REQUEST_TIMEOUT_MS,
+                    }
+                )
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
+        assert_eq!(concatenated_text(&sink.events), "\n<|im_start|>user");
+        assert!(matches!(
+            sink.events.as_slice(),
+            [LlmEvent::TextDelta(text)] if text == "\n<|im_start|>user"
+        ));
+    }
+
     async fn assert_response_start_time_is_charged_to_stream_deadline(api_mode: ProviderApiMode) {
         const REQUEST_TIMEOUT_MS: u64 = 400;
         let (first_progress, terminal) = match api_mode {
@@ -4850,6 +5593,12 @@ mod tests {
         phases: Vec<ProviderPhaseEvent>,
     }
 
+    struct CancelOnToolCallLlmEventSink {
+        events: Vec<LlmEvent>,
+        phases: Vec<ProviderPhaseEvent>,
+        cancel: CancellationToken,
+    }
+
     #[derive(Default)]
     struct FailingLlmEventSink {
         attempted_events: Vec<LlmEvent>,
@@ -4877,6 +5626,25 @@ mod tests {
     impl LlmEventSink for RecordingLlmEventSink {
         fn push(&mut self, event: LlmEvent) -> Result<(), crate::error::LlmError> {
             self.events.push(event);
+            Ok(())
+        }
+
+        fn provider_phase(
+            &mut self,
+            event: ProviderPhaseEvent,
+        ) -> Result<(), crate::error::LlmError> {
+            self.phases.push(event);
+            Ok(())
+        }
+    }
+
+    impl LlmEventSink for CancelOnToolCallLlmEventSink {
+        fn push(&mut self, event: LlmEvent) -> Result<(), crate::error::LlmError> {
+            let cancel = matches!(event, LlmEvent::ToolCallStart { .. });
+            self.events.push(event);
+            if cancel {
+                self.cancel.cancel();
+            }
             Ok(())
         }
 

@@ -4,12 +4,13 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
 use crate::context::ContextWindowTokenStatus;
+use crate::context::context_window::estimate_model_messages_tokens;
 use crate::llm::{ChatRequest, ModelContentPart, ModelMessage, ModelToolCall};
 use crate::protocol::{
     CompactionLayout, CompactionMode, ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload,
     HistoryScope, ModelResponseId, ToolLifecycleStatus,
 };
-use crate::session::{DurableTurnTerminal, TokenUsage};
+use crate::session::TokenUsage;
 use crate::tool::truncate::{clip_text_head_tail_with_marker, clip_text_with_ellipsis};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +39,7 @@ pub(crate) struct ActiveContextTokenState {
 struct ProviderTokenBaseline {
     response_id: ModelResponseId,
     total_tokens: u32,
+    noncanonical_prepared_tokens: u32,
     known_item_ids: HashSet<HistoryItemId>,
 }
 
@@ -234,34 +236,6 @@ impl ContextManager {
             .collect()
     }
 
-    fn active_item_ids_through_model_response(
-        &self,
-        response_id: ModelResponseId,
-    ) -> Option<HashSet<HistoryItemId>> {
-        let active = self.active_history_items();
-        if latest_model_response_id(&active) != Some(response_id) {
-            return None;
-        }
-        let last_response_index = active.iter().rposition(|item| {
-            matches!(
-                item.payload,
-                HistoryItemPayload::AssistantMessage {
-                    response_id: item_response_id,
-                    ..
-                } | HistoryItemPayload::ToolCall {
-                    response_id: item_response_id,
-                    ..
-                } if item_response_id == response_id
-            )
-        })?;
-        Some(
-            active[..=last_response_index]
-                .iter()
-                .map(|item| item.id)
-                .collect(),
-        )
-    }
-
     fn active_history_items(&self) -> Vec<&HistoryItem> {
         let replaced = crate::protocol::compacted_history_item_ids(&self.history_items);
         self.history_items
@@ -277,6 +251,10 @@ impl ContextManager {
     ) -> Option<Vec<ModelMessage>> {
         let active = self.active_history_items();
         if latest_model_response_id(&active) != Some(baseline.response_id) {
+            return None;
+        }
+        let active_item_ids = active.iter().map(|item| item.id).collect::<HashSet<_>>();
+        if !baseline.known_item_ids.is_subset(&active_item_ids) {
             return None;
         }
 
@@ -542,29 +520,6 @@ impl ContextManager {
 }
 
 impl ActiveContextTokenState {
-    pub(crate) fn rehydrate(
-        context: &ContextManager,
-        terminal: Option<&DurableTurnTerminal>,
-    ) -> Self {
-        let provider_baseline = terminal.and_then(|terminal| {
-            if !matches!(
-                terminal.outcome,
-                crate::protocol::TurnTerminalOutcome::Completed
-            ) {
-                return None;
-            }
-            let response_id = terminal.final_response_id?;
-            let usage = terminal.metrics.token_usage.as_ref()?;
-            let known_item_ids = context.active_item_ids_through_model_response(response_id)?;
-            Some(ProviderTokenBaseline {
-                response_id,
-                total_tokens: usage.total_tokens,
-                known_item_ids,
-            })
-        });
-        Self { provider_baseline }
-    }
-
     pub(crate) fn status_for_request(
         &self,
         context: &ContextManager,
@@ -576,11 +531,17 @@ impl ActiveContextTokenState {
             && let Some(local_messages) =
                 context.local_messages_after_provider_baseline(baseline, supports_images)
         {
+            let current_canonical_messages = context.model_messages(supports_images);
+            let current_noncanonical_prepared_tokens =
+                noncanonical_prepared_request_tokens(request, &current_canonical_messages);
+            let positive_noncanonical_prepared_tokens = current_noncanonical_prepared_tokens
+                .saturating_sub(baseline.noncanonical_prepared_tokens);
             return ContextWindowTokenStatus::from_provider_usage(
                 request,
                 overflow_margin_tokens,
                 baseline.total_tokens,
                 &local_messages,
+                positive_noncanonical_prepared_tokens,
             );
         }
         ContextWindowTokenStatus::for_request(request, overflow_margin_tokens)
@@ -590,11 +551,17 @@ impl ActiveContextTokenState {
         &mut self,
         response_id: ModelResponseId,
         usage: Option<&TokenUsage>,
+        sent_request: &ChatRequest,
+        sent_canonical_messages: &[ModelMessage],
         known_item_ids: Vec<HistoryItemId>,
     ) {
         self.provider_baseline = usage.map(|usage| ProviderTokenBaseline {
             response_id,
             total_tokens: usage.total_tokens,
+            noncanonical_prepared_tokens: noncanonical_prepared_request_tokens(
+                sent_request,
+                sent_canonical_messages,
+            ),
             known_item_ids: known_item_ids.into_iter().collect(),
         });
     }
@@ -602,6 +569,15 @@ impl ActiveContextTokenState {
     pub(crate) fn reset_after_compaction(&mut self) {
         self.provider_baseline = None;
     }
+}
+
+fn noncanonical_prepared_request_tokens(
+    request: &ChatRequest,
+    canonical_messages: &[ModelMessage],
+) -> u32 {
+    ContextWindowTokenStatus::for_request(request, 0)
+        .active_context_tokens
+        .saturating_sub(estimate_model_messages_tokens(canonical_messages))
 }
 
 fn latest_model_response_id(active_items: &[&HistoryItem]) -> Option<ModelResponseId> {
@@ -1195,9 +1171,9 @@ mod tests {
     use crate::config::model::ProviderReasoningCapability;
     use crate::config::{ProviderDeadlines, ProviderProfile, ProviderTarget};
     use crate::context::ActiveContextTokenSource;
-    use crate::llm::{ModelCapabilities, ModelProfile};
+    use crate::llm::{ModelCapabilities, ModelProfile, ToolSchema};
     use crate::protocol::{HistoryScope, ModelResponseId, ToolLifecycleStatus, TurnId};
-    use crate::session::{ImagePart, RunMetrics, SessionId, ToolCallId};
+    use crate::session::{ImagePart, SessionId, ToolCallId};
 
     fn user_item(text: &str) -> HistoryItem {
         let session_id = SessionId::new();
@@ -1295,6 +1271,14 @@ mod tests {
         )
     }
 
+    fn provider_sent_request() -> (Vec<ModelMessage>, ChatRequest) {
+        let canonical_messages = vec![ModelMessage::User {
+            content: "inspect the file".to_string(),
+        }];
+        let request = token_status_request(canonical_messages.clone());
+        (canonical_messages, request)
+    }
+
     fn usage(total_tokens: u32) -> TokenUsage {
         TokenUsage {
             prompt_tokens: total_tokens,
@@ -1308,20 +1292,112 @@ mod tests {
     fn provider_usage_drives_the_next_step_with_only_local_suffix_estimated() {
         let (context, user_id, response_id) = provider_tool_round();
         let request = token_status_request(context.model_messages(false));
+        let (sent_canonical_messages, sent_request) = provider_sent_request();
         let mut state = ActiveContextTokenState::default();
-        state.record_provider_response(response_id, Some(&usage(1_000)), vec![user_id]);
+        state.record_provider_response(
+            response_id,
+            Some(&usage(1_000)),
+            &sent_request,
+            &sent_canonical_messages,
+            vec![user_id],
+        );
 
         let status = state.status_for_request(&context, &request, false, 128);
+        let full_estimate =
+            ContextWindowTokenStatus::for_request(&request, 128).active_context_tokens;
 
         assert_eq!(
             status.source,
             ActiveContextTokenSource::ProviderUsageWithLocalEstimate
         );
         assert!(status.active_context_tokens > 1_000);
-        assert!(
-            status.active_context_tokens
-                < ContextWindowTokenStatus::for_request(&request, 128).active_context_tokens
-                    + 1_000
+        assert!(status.active_context_tokens >= full_estimate);
+    }
+
+    #[test]
+    fn full_prepared_request_estimate_is_the_provider_usage_safety_lower_bound() {
+        let (context, user_id, response_id) = provider_tool_round();
+        let request = token_status_request(context.model_messages(false));
+        let (sent_canonical_messages, sent_request) = provider_sent_request();
+        let mut state = ActiveContextTokenState::default();
+        state.record_provider_response(
+            response_id,
+            Some(&usage(0)),
+            &sent_request,
+            &sent_canonical_messages,
+            vec![user_id],
+        );
+
+        let status = state.status_for_request(&context, &request, false, 128);
+        let expected = ContextWindowTokenStatus::for_request(&request, 128);
+
+        assert_eq!(status, expected);
+        assert_eq!(
+            status.source,
+            ActiveContextTokenSource::FullPreparedRequestEstimate
+        );
+    }
+
+    #[test]
+    fn provider_usage_adds_positive_noncanonical_prepared_request_growth() {
+        let (context, user_id, response_id) = provider_tool_round();
+        let current_canonical_messages = context.model_messages(false);
+        let mut request = token_status_request(current_canonical_messages.clone());
+        request
+            .system_prompt
+            .push_str(&" expanded system".repeat(64));
+        request.messages.insert(
+            0,
+            ModelMessage::Developer {
+                content: "expanded developer context ".repeat(64),
+            },
+        );
+        request.tools.push(ToolSchema {
+            name: "expanded_tool".to_string(),
+            description: "expanded tool description ".repeat(64),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "payload": {"type": "string", "description": "expanded schema".repeat(64)}
+                }
+            }),
+        });
+        let (sent_canonical_messages, sent_request) = provider_sent_request();
+        let baseline_noncanonical =
+            noncanonical_prepared_request_tokens(&sent_request, &sent_canonical_messages);
+        let current_noncanonical =
+            noncanonical_prepared_request_tokens(&request, &current_canonical_messages);
+        let positive_noncanonical_growth =
+            current_noncanonical.saturating_sub(baseline_noncanonical);
+        assert!(positive_noncanonical_growth > 0);
+
+        let mut state = ActiveContextTokenState::default();
+        state.record_provider_response(
+            response_id,
+            Some(&usage(10_000)),
+            &sent_request,
+            &sent_canonical_messages,
+            vec![user_id],
+        );
+        let local_messages = context
+            .local_messages_after_provider_baseline(
+                state.provider_baseline.as_ref().expect("provider baseline"),
+                false,
+            )
+            .expect("matching canonical suffix");
+        let expected_provider_estimate = 10_000u32
+            .saturating_add(estimate_model_messages_tokens(&local_messages))
+            .saturating_add(positive_noncanonical_growth);
+        let full_estimate =
+            ContextWindowTokenStatus::for_request(&request, 128).active_context_tokens;
+        assert!(expected_provider_estimate > full_estimate);
+
+        let status = state.status_for_request(&context, &request, false, 128);
+
+        assert_eq!(status.active_context_tokens, expected_provider_estimate);
+        assert_eq!(
+            status.source,
+            ActiveContextTokenSource::ProviderUsageWithLocalEstimate
         );
     }
 
@@ -1329,8 +1405,15 @@ mod tests {
     fn missing_provider_usage_falls_back_to_the_full_prepared_request_estimate() {
         let (context, user_id, response_id) = provider_tool_round();
         let request = token_status_request(context.model_messages(false));
+        let (sent_canonical_messages, sent_request) = provider_sent_request();
         let mut state = ActiveContextTokenState::default();
-        state.record_provider_response(response_id, None, vec![user_id]);
+        state.record_provider_response(
+            response_id,
+            None,
+            &sent_request,
+            &sent_canonical_messages,
+            vec![user_id],
+        );
 
         let status = state.status_for_request(&context, &request, false, 128);
         let expected = ContextWindowTokenStatus::for_request(&request, 128);
@@ -1346,8 +1429,15 @@ mod tests {
     fn compaction_reset_forces_a_full_local_recompute() {
         let (context, user_id, response_id) = provider_tool_round();
         let request = token_status_request(context.model_messages(false));
+        let (sent_canonical_messages, sent_request) = provider_sent_request();
         let mut state = ActiveContextTokenState::default();
-        state.record_provider_response(response_id, Some(&usage(1_000)), vec![user_id]);
+        state.record_provider_response(
+            response_id,
+            Some(&usage(1_000)),
+            &sent_request,
+            &sent_canonical_messages,
+            vec![user_id],
+        );
         assert_eq!(
             state
                 .status_for_request(&context, &request, false, 128)
@@ -1366,7 +1456,32 @@ mod tests {
     }
 
     #[test]
-    fn durable_terminal_rehydrates_only_a_matching_latest_model_response() {
+    fn changed_known_canonical_selection_falls_back_to_the_full_estimate() {
+        let (mut context, user_id, response_id) = provider_tool_round();
+        let (sent_canonical_messages, sent_request) = provider_sent_request();
+        let mut state = ActiveContextTokenState::default();
+        state.record_provider_response(
+            response_id,
+            Some(&usage(10_000)),
+            &sent_request,
+            &sent_canonical_messages,
+            vec![user_id],
+        );
+        context.history_items.retain(|item| item.id != user_id);
+        let request = token_status_request(context.model_messages(false));
+
+        let status = state.status_for_request(&context, &request, false, 128);
+        let expected = ContextWindowTokenStatus::for_request(&request, 128);
+
+        assert_eq!(status, expected);
+        assert_eq!(
+            status.source,
+            ActiveContextTokenSource::FullPreparedRequestEstimate
+        );
+    }
+
+    #[test]
+    fn new_turn_starts_from_the_full_estimate_with_prior_response_history() {
         let first_user = user_item("first turn");
         let response_id = ModelResponseId::new();
         let response = HistoryItem {
@@ -1388,44 +1503,13 @@ mod tests {
         next_user.created_at_ms = 3;
         let context = ContextManager::rehydrate(vec![first_user, response, next_user]);
         let request = token_status_request(context.model_messages(false));
-        let terminal = DurableTurnTerminal {
-            outcome: crate::protocol::TurnTerminalOutcome::Completed,
-            final_response_id: Some(response_id),
-            tool_call_count: 0,
-            failed_tool_count: 0,
-            change_count: 0,
-            metrics: RunMetrics {
-                token_usage: Some(usage(700)),
-                ..RunMetrics::default()
-            },
-        };
-
-        let state = ActiveContextTokenState::rehydrate(&context, Some(&terminal));
+        let state = ActiveContextTokenState::default();
         let status = state.status_for_request(&context, &request, false, 128);
+        let expected = ContextWindowTokenStatus::for_request(&request, 128);
 
+        assert_eq!(status, expected);
         assert_eq!(
             status.source,
-            ActiveContextTokenSource::ProviderUsageWithLocalEstimate
-        );
-        assert!(status.active_context_tokens > 700);
-
-        let mut failed = terminal.clone();
-        failed.outcome = crate::protocol::TurnTerminalOutcome::Failed {
-            error: "provider request failed after reporting usage".to_string(),
-        };
-        let failed_fallback = ActiveContextTokenState::rehydrate(&context, Some(&failed))
-            .status_for_request(&context, &request, false, 128);
-        assert_eq!(
-            failed_fallback.source,
-            ActiveContextTokenSource::FullPreparedRequestEstimate
-        );
-
-        let mut mismatched = terminal;
-        mismatched.final_response_id = Some(ModelResponseId::new());
-        let fallback = ActiveContextTokenState::rehydrate(&context, Some(&mismatched))
-            .status_for_request(&context, &request, false, 128);
-        assert_eq!(
-            fallback.source,
             ActiveContextTokenSource::FullPreparedRequestEstimate
         );
     }
@@ -2577,6 +2661,72 @@ mod tests {
         assert_eq!(tool_calls.len(), 2);
         assert!(matches!(projected[1], ModelMessage::Tool { .. }));
         assert!(matches!(projected[2], ModelMessage::Tool { .. }));
+    }
+
+    #[test]
+    fn whitespace_only_legacy_assistant_content_stays_in_transport_neutral_replay() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let response_id = ModelResponseId::new();
+        let call_id = ToolCallId::new();
+        let items = vec![
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: 0,
+                created_at_ms: 1,
+                payload: HistoryItemPayload::AssistantMessage {
+                    response_id,
+                    content: vec![ContentPart::Text {
+                        text: "\n \t\n".to_string(),
+                    }],
+                },
+            },
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: 1,
+                created_at_ms: 2,
+                payload: HistoryItemPayload::ToolCall {
+                    call_id,
+                    response_id,
+                    model_call_id: "provider-call".to_string(),
+                    tool_name: "read".to_string(),
+                    arguments_json: r#"{"path":"README.md"}"#.to_string(),
+                },
+            },
+            HistoryItem {
+                id: HistoryItemId::new(),
+                session_id,
+                scope: HistoryScope::Turn { turn_id },
+                sequence_no: 2,
+                created_at_ms: 3,
+                payload: HistoryItemPayload::ToolOutput {
+                    call_id,
+                    status: ToolLifecycleStatus::Completed,
+                    title: "read".to_string(),
+                    output_text: "README contents".to_string(),
+                    metadata: serde_json::Value::Null,
+                    success: Some(true),
+                },
+            },
+        ];
+
+        let projected = ContextManager::rehydrate(items).model_messages(true);
+
+        assert!(matches!(
+            projected.as_slice(),
+            [
+                ModelMessage::AssistantToolCalls {
+                    content: Some(content),
+                    tool_calls,
+                },
+                ModelMessage::Tool { .. },
+            ] if content == "\n \t\n"
+                && matches!(tool_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "read")
+        ));
     }
 
     #[test]

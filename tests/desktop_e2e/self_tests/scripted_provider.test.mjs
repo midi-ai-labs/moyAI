@@ -5,11 +5,99 @@ import test from "node:test";
 import {
   SCRIPTED_PROVIDER_MODEL_ID,
   SCRIPTED_PROVIDER_MAX_OUTPUT_TOKENS,
+  SCRIPTED_PROVIDER_MAX_TURNS,
   SCRIPTED_PROVIDER_PROMPT,
   SCRIPTED_PROVIDER_RESPONSE,
   scriptedProviderPortIsFetchSafe,
   startScriptedProvider,
 } from "../drivers/scripted_provider.mjs";
+
+test("scripted provider keeps long deterministic history fixtures explicitly bounded", async () => {
+  const turn = (index) => ({ prompt: `prompt-${index}`, responseText: `response-${index}` });
+  const maximum = Array.from({ length: SCRIPTED_PROVIDER_MAX_TURNS }, (_, index) => turn(index + 1));
+  const provider = await startScriptedProvider({ turns: maximum });
+  assert.equal(provider.resourceObservation().scripted_responses_maximum, SCRIPTED_PROVIDER_MAX_TURNS);
+  assert.equal((await provider.close()).pass, true);
+  await assert.rejects(
+    startScriptedProvider({ turns: [...maximum, turn(SCRIPTED_PROVIDER_MAX_TURNS + 1)] }),
+    new RegExp(`1 through ${SCRIPTED_PROVIDER_MAX_TURNS}`),
+  );
+});
+
+test("scripted provider validates one exact ordered same-session conversation", async (context) => {
+  const turns = [
+    { prompt: "first prompt", responseText: "FIRST_RESPONSE" },
+    { prompt: "second prompt", responseText: "SECOND_RESPONSE" },
+  ];
+  const provider = await startScriptedProvider({ turns, orderedConversation: true });
+  context.after(() => provider.close());
+
+  const first = await fetch(`${provider.baseUrl}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(responsesRequest(turns[0].prompt)),
+  });
+  assert.equal(first.status, 200);
+  await first.text();
+
+  const secondBody = responsesRequest(turns[1].prompt);
+  secondBody.input = [
+    { type: "message", role: "user", content: [{ type: "input_text", text: turns[0].prompt }] },
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: turns[0].responseText }] },
+    { type: "message", role: "user", content: [{ type: "input_text", text: turns[1].prompt }] },
+  ];
+  const second = await fetch(`${provider.baseUrl}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(secondBody),
+  });
+  assert.equal(second.status, 200);
+  const events = parseSse(await second.text());
+  assert.equal(events[0].delta, turns[1].responseText);
+  assert.deepEqual(provider.requestLedger.map((row) => ({
+    status: row.response_status,
+    pass: row.contract?.pass,
+    conversation: row.contract?.ordered_conversation,
+  })), [
+    {
+      status: 200,
+      pass: true,
+      conversation: {
+        input_count: 1,
+        expected_input_count: 1,
+        roles: ["user"],
+        text_sha256: [sha256(turns[0].prompt)],
+        matches: true,
+      },
+    },
+    {
+      status: 200,
+      pass: true,
+      conversation: {
+        input_count: 3,
+        expected_input_count: 3,
+        roles: ["user", "assistant", "user"],
+        text_sha256: [
+          sha256(turns[0].prompt),
+          sha256(turns[0].responseText),
+          sha256(turns[1].prompt),
+        ],
+        matches: true,
+      },
+    },
+  ]);
+
+  const exhausted = await fetch(`${provider.baseUrl}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(secondBody),
+  });
+  assert.equal(exhausted.status, 409);
+  assert.deepEqual(await exhausted.json(), { error: "successful_response_already_consumed" });
+  assert.equal(provider.requestLedger.at(-1)?.response_phase, "rejected");
+  assert.equal(provider.requestLedger.at(-1)?.response_status, 409);
+  assert.equal(provider.requestLedger.at(-1)?.contract, null);
+});
 
 function sha256(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
@@ -364,10 +452,21 @@ test("scripted provider rejects unknown response behavior before binding a liste
   );
   await assert.rejects(
     startScriptedProvider({ turns: [] }),
-    /must contain 1 through 8 entries/,
+    new RegExp(`must contain 1 through ${SCRIPTED_PROVIDER_MAX_TURNS} entries`),
   );
   await assert.rejects(
     startScriptedProvider({ turns: [{ prompt: "one", responseText: "ONE", extra: true }] }),
     /must use its exact schema/,
+  );
+  await assert.rejects(
+    startScriptedProvider({ orderedConversation: true }),
+    /requires at least two explicit turns/,
+  );
+  await assert.rejects(
+    startScriptedProvider({
+      turns: [{ prompt: "one", responseText: "ONE" }, { prompt: "two", responseText: "TWO" }],
+      orderedConversation: "yes",
+    }),
+    /must be boolean/,
   );
 });

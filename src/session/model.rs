@@ -1262,6 +1262,12 @@ pub enum RunEvent {
         tool: ToolName,
         approved: bool,
     },
+    /// A low-volume user-facing advisory that must never become canonical
+    /// conversation history or model input.
+    RuntimeNotice {
+        session_id: SessionId,
+        message: String,
+    },
     RecoverableRuntimeFeedback {
         session_id: SessionId,
         message: String,
@@ -1279,7 +1285,8 @@ impl RunEvent {
         match self {
             Self::ProviderPhase { .. }
             | Self::TextDelta { .. }
-            | Self::ReasoningSummaryDelta { .. } => RunEventDurability::RuntimeOnly,
+            | Self::ReasoningSummaryDelta { .. }
+            | Self::RuntimeNotice { .. } => RunEventDurability::RuntimeOnly,
             Self::SessionStarted { .. }
             | Self::SessionTitleUpdated { .. }
             | Self::UserTurnStored { .. }
@@ -1307,6 +1314,7 @@ impl RunEvent {
             | Self::UserTurnStored { session_id, .. }
             | Self::ModelRequestPrepared { session_id, .. }
             | Self::WorldStateUpdated { session_id, .. }
+            | Self::RuntimeNotice { session_id, .. }
             | Self::RecoverableRuntimeFeedback { session_id, .. }
             | Self::TurnTerminal { session_id, .. } => Some(*session_id),
             Self::TextDelta { .. }
@@ -1353,6 +1361,10 @@ mod tests {
             RunEvent::ReasoningSummaryDelta {
                 response_id: crate::protocol::ModelResponseId::new(),
                 delta: "summary".to_string(),
+            },
+            RunEvent::RuntimeNotice {
+                session_id: SessionId::new(),
+                message: "display only".to_string(),
             },
         ];
         assert!(

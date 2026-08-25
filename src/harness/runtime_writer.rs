@@ -532,7 +532,9 @@ fn harness_kind_for_run_event(event: &RunEvent) -> HarnessEventKind {
         RunEvent::CompactionCompleted { .. } => HarnessEventKind::StateSnapshotRecorded,
         RunEvent::PermissionRequested { .. } => HarnessEventKind::PermissionRequested,
         RunEvent::PermissionResolved { .. } => HarnessEventKind::PermissionResolved,
-        RunEvent::RecoverableRuntimeFeedback { .. } => HarnessEventKind::CorrectiveResultEmitted,
+        RunEvent::RuntimeNotice { .. } | RunEvent::RecoverableRuntimeFeedback { .. } => {
+            HarnessEventKind::CorrectiveResultEmitted
+        }
         RunEvent::TurnTerminal { .. } => HarnessEventKind::RunTerminalized,
     }
 }

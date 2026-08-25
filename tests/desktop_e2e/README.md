@@ -44,6 +44,8 @@ active phaseのfailureは必ず`cleaning`へ入り、`sealed`まで進む。muta
 
 scenario IDは永続contract、execution IDは毎回freshな証跡identityである。新しいexecutionのために新しいscriptを作らず、同じscenarioを新しいartifact rootで実行する。
 
+回帰はGUIを起動しないfocused deterministic / fault-injection / scripted-provider testから始め、変更interactionに必要な最小actual-Tauri scenarioだけを追加する。short live-provider scenarioはprovider固有wireまたはGUIで保存した接続値からの実到達性、`manual.case5_2` は実long-context、model品質・収束性、provider soak、比較benchmarkに限定する。大きいscenarioで見つかった非品質failureは最小の共通owner regressionとactual-Tauri scenarioへ切り出し、修正確認だけを理由に元scenarioを自動再実行しない。
+
 ## Verdict
 
 最終分類は次の5種類だけを使う。
@@ -83,7 +85,7 @@ Windowsの初期adapterは、製品binaryをtest pluginで変更しない外部b
 
 - pure self-test: `npm run test:desktop-e2e-harness`
 - actual shell baseline: `npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe --artifact-parent <absolute-task-root>`
-- representative scenario: 上記commandへ `--scenario input.pointer-keyboard`、`--scenario native-dialog.cancel`、`--scenario provider.restart`、`--scenario settings.initial-setup`、`--scenario settings.session`、`--scenario settings.preferences`、`--scenario settings.docling-readiness`、`--scenario run.stop`、`--scenario agent.interrupt` のいずれかを追加する。credential-freeなOpenAI-compatible live接続smokeは `manual.provider-openai-compatible`、live LLM benchmarkは下記の `manual.case5_2` routeを使う。
+- representative scenario: 上記commandへ `--scenario input.pointer-keyboard`、`--scenario native-dialog.cancel`、`--scenario provider.restart`、`--scenario history.restart-prepend`、`--scenario settings.initial-setup`、`--scenario settings.session`、`--scenario settings.preferences`、`--scenario settings.docling-readiness`、`--scenario run.stop`、`--scenario agent.interrupt` のいずれかを追加する。credential-freeなOpenAI-compatible live接続smokeは `manual.provider-openai-compatible`、long-context / model-quality / convergence / soak / comparison benchmarkは下記の `manual.case5_2` routeを使う。
 - Prompt Review exact-target changed-path scenario: 上記commandへ `--scenario prompt-review.cancel` を追加する。trusted typing後、`run_target.expectedState.admissionRevision`を意図的にずらしたdirect IPC Enhanceがtyped conflictとなりprovider接続、review作成、draft/run owner変更を一切起こさないことを先に確認する。その後trusted Enhance / Escapeを実Tauriで操作し、`run_target.expectedState`と`review_target.expectedState`のrequired decimal-string revisionを含むexact tagged union、Rustが生成するcanonical `requestId`を持つreview targetの連続観測同一性、推敲文DOM、元composer owner/draft、共通provider contractのcatalog GET 1件→enhancement POST 1件を同じsealed executionで検証する。新規sessionの初期revisionは`"0"`として検証する。
 - gate 1はprimitiveとshell readinessのself-test、gate 2は同じ共通orchestratorへのexecution-level fault injectionで検証する。
 - gate 3はfinal sourceごとにfresh executionで行う。sealed `execution.json` がbinary identityと本directory全fileのinventory / tree SHAを所有し、task-local `RESULTS.md` がexecution IDを所有する。
@@ -92,14 +94,17 @@ Windowsの初期adapterは、製品binaryをtest pluginで変更しない外部b
 - `prompt-review.cancel` はreusable scenarioとして登録済みであり、final source/binaryごとの合否はREADMEではなくfresh executionの`result.json` / `seal.json`を正とする。
 - `run.stop` はscripted providerの1件のResponses requestをpeer closeまでin-flightに保ち、required admission revision付きTurn targetを持つ実行停止をtrusted pointerで1回だけactivationする。in-flight oracleは中央badgeが`role=status` / polite live / atomicかつ「実行中」を可視表示すること、選択sidebar rowが`data-task-activity-row=running`と同じ状態subtitleを持ち、そのmarkerだけは`aria-hidden`な装飾であることをexact cardinalityで観測する。さらに選択rowのsemantic focus identityがexact Stop sessionと一致すること、中央20px・選択row 18pxのcomputed CSS box、中央・sidebar双方の可視ringと中央glyphが実paintを持つことをmachine判定する。実行時の`prefers-reduced-motion`に従い、通常motionならboundedな継続animation、reduced-motionなら同じ静的形状を要求するが、一つのexecution内でmedia preferenceを注入・切替して両分岐を証明しない。停止後はbadge、row activity contract、両indicatorの消失も要求するため`manualGate`は`not_required`のままとし、screenshotは補助的なvisible evidenceとして保存する。最終判定はcommand responseだけでなくfresh `desktop_state` polling後のdurable `UserStop` / Idle、provider replay 0、error overlay 0、共通cleanup / SQLite auditを束ねる。reduced-motion分岐、Finalizing / Attentionの形状、selected / backgroundの階層はfrontendのdeterministic unit / CSS contractでも検証し、このRunning / Stop scenarioへ未取得phaseやproduct stateを注入しない。child/descendant cascadeはRustのdeterministic owner testへ委ねる。
 - `agent.interrupt` はtool-enabled scripted providerのbounded 3-request flowでrootの`spawn_agent`、root final、exact child request holdを再現する。右output paneのexact child list→execution inspectorをcanonical操作経路とし、trusted pointerが実際に発行した唯一の`interrupt_agent.expectedTarget`を`DesktopCommandProbe`で取得して直前control ownerと照合する。response後のpollではdurable `AgentInterrupted` row、child cancelled history、agent tree Idle、root turn不変、newer root turn 0、provider replay 0、error overlay 0、共通cleanup / SQLite auditを束ねる。collapsed work summaryの可視性やprivate表示文言は合否ownerにしない。sibling/descendant non-cascadeはこの代表scenarioへ追加stateを注入せず、Rustのdeterministic owner testへ委ねる。
+- `history.restart-prepend` はbounded scripted providerでprevious-page transitionが2回以上必要な履歴を作り、live modelを使わずexact Desktop restart後の履歴復元を検証する。trusted command-palette inputからsemantic previous-page targetの再出現・exact cardinality・enabled settlementを待ち、`load_previous_turn_page` のexact mutation target、canonical offset / range transition、offset 0までの2回以上のprepend、provider replay 0、共通cleanup / closed SQLite auditを一つのbounded executionで判定する。`manual.case5_2` 内で発見されたrestart後のsemantic target / DOM settlement regressionはこのscenarioを通常のactual-Tauri再試験先とする。
 - `settings.preferences` は一つのloopback ledgerをmain providerとDoclingへ共有し、implicit HTTP 0を全stageとrestart後の安定観測で要求する。exact HWND native titlebar drag、provider overlayのcontext limit編集と`save_provider_global` 1回、PreferencesのDocling toggle、dirty explicit close / Escape guardでSettings dialogがinertかつ可視dialogがexact 2となること、Cancelとbaseline reset→close、`save_global_config` 1回、clean explicit close、exact process/profile zeroを挟むrestart persistenceを一つのbounded executionで検証する。native adapterはPID/start/executableとcurrent Tauri native classからmain HWND/thread/class fingerprintを取得し、同一processの補助rootをmain候補にしない。dragではforeground、physical LEFTのinitial-up、driver-owned DOWNだけに対応するUP、driverがcursorを移動した場合だけのrestore、移動前後rectを所有し、scenarioはwindow移動・size不変と`start_window_drag` command 1回をproduct oracleにする。scenario固有のprocess/profile/SQLite cleanup ownerは作らない。
 - `manual.provider-openai-compatible` はoperator指定のlive endpointをharnessが起動・停止しないcredential-free resourceとして扱う。actual Preferencesのtyped controlsへtrusted GUI入力し、`provider_profile=openai_compatible`、指定URL、指定model、空の`api_key_env`を一回のglobal Saveで保存する。完全なordered valuesとexact config targetをcommand probeで照合し、exact process/profile zeroを挟むrestart後も保存値とeffective値が安定することを要求する。その後、固定promptから`current_time`をexact 1件completedにし、local / utc / timezoneを含む非空の日本語assistant応答、可視error 0、workspace sentinel不変を判定する。Preferences dirty/saved/restoredとterminalのscreenshotを共通evidenceへ保存し、process/profile/SQLite/result/sealは共通orchestrator、input/probeとsentinelはscenario cleanupが所有する。外部providerはcleanup対象にせず、availabilityとmodel loadは実行者が事前に保証する。
 - `settings.docling-readiness` はDoclingを有効化したclean fixtureでもcold-start HTTP 0を要求し、trusted Settings→Tools→`Test Docling`だけが一回のexact `check_docling_readiness.expectedTarget`とGET `/ready`を発行することを検証する。共通scripted loopbackは応答をholdし、Rust projectionとlive regionの`checking`、button disabled、pending async operationを観測してからHTTP 204をreleaseする。その後typed `ready` / HTTP 204、error overlay 0、clean closeとfocus return、late request 0を共通quiesceまで要求する。これはimplicit-network-zeroを所有する`settings.preferences`とは別executionとし、どちらのoracleも緩めない。
 - `settings.initial-setup` はconfig pathを実在させないfixtureで専用fullscreen shellを起動し、`start → provider → model → permissions → tools → finish` の6stepをstable `data-surface` / `data-step` / `data-action` locatorで操作する。Provider stepのEscapeがownerを変えないこと、StartにImport入口があること、`finish_initial_setup` が全config values・config target・setup targetを一回だけ送ること、Finish後に通常shellへ切り替わること、exact restart後もwizardが再表示されないことを検証する。main providerとenabled Doclingは一つのloopback ledgerへenvironment overrideし、起動、step移動、Finish、restart、安定観測、quiesceまでHTTP 0を要求する。
 - `settings.session` はboundedな2-turn scripted providerでroot A / root Bを実GUIから作り、topbar model chipからroot-only panelを開く。badge、Provider / Model / Access / Context / Max outputの全field、global save不存在、explicit closeとEscapeのdirty guard、local discard、exact `apply_session_settings` target、Apply後のcanonical rebaseを検証する。root Bでglobal defaultが見えること、root Aへ戻すとoverrideが戻ること、exact restart後にも同じroot A値が安定復元されることを一つのSQLite / process lifecycleで判定し、別root非漏洩をDOM表示だけでなくRust typed targetと保存revisionで束ねる。
-- `manual.case5_2` はoperator指定のRippleFish physical sourceを共通clean-seed adapterでfresh workspaceへcopyし、Quality profileを固定したlive Main LLMでStage 1〜4を同じProject Chatへtrusted GUI入力する。Stage 1 terminalでsession ownerが成立した直後、Settingsのmanual model ID経路からtool-less Side Chatを保存するが、Side Chat sendはscenarioの操作経路に含めず、restart復元時とStage 4 terminalのpersisted message 0、時点付き各sampleでselected Side model unloadedを要求する。trusted Side Sendの独立event ledgerとremote providerのtraffic ledgerは持たないためgeneration request 0そのものはmachine証明せず、`manual_pending` evidenceへ明記する。Stage 1/2 scope、各normal terminal、visible Stopによるnon-convergence cutoff、Stage 3 public suite、exact process/profile zeroを挟むrestart、同一session/history prefix、Stage 4 public/hidden evaluator、frontend/dependency/fixture/Python environment safety、providerのactual instance ID再取得・unload・連続stable-zero確認を一つのsealed executionで判定する。case固有のsource/provider/modelはhash付き `--scenario-config` JSONで渡し、runnerへRun番号や固定portを追加しない。
+- `manual.case5_2` はoperator指定のRippleFish physical sourceを共通clean-seed adapterでfresh workspaceへcopyし、Quality profileを固定したlive Main LLMでStage 1〜4を同じProject Chatへtrusted GUI入力する。各terminalのRust projectionを確認した後も、実画面のcomposerがsteer表示を離れ、入力済みpromptを保持した`送信`状態へsettleするまで次turnを送らない。送信後は直前Idle ownerと同じsessionに、異なるTurn ID、row / run targetで一致するadmission revision、直前値からexact +1のrevisionを持つ新Turnだけを取得し、旧Turnやsteerを新requestとして受理しない。Stage 1 terminalでsession ownerが成立した直後、Settingsのmanual model ID経路からtool-less Side Chatを保存し、configured時とrestart restored時のprovider / URL / modelがviewport内に揃ったvisible screenshotを取得するが、Side Chat sendはscenarioの操作経路に含めず、restart復元時とStage 4 terminalのpersisted message 0を要求する。LM Studio routeはselected Side modelの時点付きunloaded sample、execution-owned Main instanceの再取得・unload・連続stable-zeroを判定する。`openai_compatible` routeはSide Chatにも同じMain modelを保存し、external-unmanagedな`/v1/models`のexact IDと任意のcontext capacity metadataをpreflight、実行中sample、cleanupで再確認するが、load / unloadは発行しない。trusted Side Sendの独立event ledgerとremote providerのtraffic ledgerは持たないためgeneration request 0そのものはmachine証明せず、`manual_pending` evidenceへ明記する。Stage 1/2 scope、各normal terminal、visible Stopによるnon-convergence cutoff、Stage 3 public suite、exact process/profile zeroを挟むrestart、同一session / latest turn / admission revision / canonical total、bounded latest pageからGUIでoffset 0まで行うtrusted history prepend、durable User、canonical Errorの順序・本文・利用可能なidentity、terminal Assistantの連続性、Stage 4 public/hidden evaluator、frontend/dependency/fixture/Python environment safetyを一つのsealed executionで判定する。runtime-only System noticeやlive work summary、tool detail、file-change rowをraw `transcript_rows` prefixへ含めないが、durable Error rowは除外しない。case固有のsource/provider/modelはhash付き `--scenario-config` JSONで渡し、runnerへRun番号や固定portを追加しない。
 
-`manual.case5_2` はproviderへrequested contextを渡した値と、LM Studioのload response / catalogで確認したapplied/effective contextを別fieldでsealする。appliedがrequested以上でも一致しない場合はcapacity machine predicateを満たし得るが、exact profileではなくcomparability deviationとしてtask-local `RESULTS.md`へ残す。Stage 1〜4のmachine predicateとcleanupがすべて成立してもscenario resultは`manual_pending`であり、人手rubric、transcript、成果物の採点が完了するまでfull PASSではない。
+`manual.case5_2` はrequested contextとprovider evidenceを分離する。LM Studioではload response / catalogのapplied context、OpenAI-compatibleでは`/v1/models`がmetadataを返す場合だけreported capacityをsealする。reported capacityがrequested 131072未満またはmetadata内で競合する場合はenvironment block、未報告またはrequested以上だが非exactの場合とexternal-unmanaged lifecycle / Chat Completions wire差分はcomparability deviationとしてtask-local `RESULTS.md`へ残す。Stage 1〜4のmachine predicateとcleanupがすべて成立してもscenario resultは`manual_pending`であり、人手rubric、transcript、成果物の採点が完了するまでfull PASSではない。
+
+各stage monitorはassistant transcript bodyだけを対象にexact `<|im_start|>` / `<|im_end|>` を監視する。検出時はconfig fieldを含まない最小projection evidenceとscreenshotを保存し、visible Stopをtrusted inputでexact 1回送って`case5_2-provider-control-token-leak`のproduct failureとして即時fail-stopする。検出後のevidence、Stop、terminal acquisitionのいずれかがsettleしない場合は`harness_ng`とし、観測済みleakを`observed_product_failure` evidenceへ保持する。一般の`<|...|>`文字列やtool rowはこのguardの対象外である。
 
 Windows Jobはexternal evaluatorのprocess lifecycle ownerであり、filesystem / network sandboxではない。current comparison Runは通常のexternal CPython / pytest条件を維持し、workspace全file、fixture seed、Python user/system site roots、known dependency/runtime path、canonical transcriptをmachine evidenceとして比較する。任意のworkspace外namespace全体を不変と証明したとは扱わず、残るoutside-mutation評価は`manual_pending`のrubricで明示的に裁定する。
 
@@ -112,11 +117,13 @@ Windows Jobはexternal evaluatorのprocess lifecycle ownerであり、filesystem
 }
 ```
 
-`manual.case5_2` のscenario configは次の6fieldを必須とする。pathとmodelをrepositoryへ固定せず、実行ごとの外部input identityとしてsealする。
+`manual.case5_2` の新しいscenario configは`provider_profile`をdiscriminatorとする。LM Studioでは次の7fieldを使い、Main接続を同一executionのPreferencesから直接入力する場合だけoptionalの`configure_main_via_gui: true`を追加する。このrouteはneutralな接続値で起動し、trusted GUI inputによるprofile / URL / manual model IDの設定、exact `save_global_config`、persisted/effective projectionをStage 1前にsealする。従来の`provider_profile`なし6fieldも`lm_studio`として後方互換に受理する。pathとmodelはrepositoryへ固定せず、実行ごとの外部input identityとしてsealする。
 
 ```json
 {
   "fixture_source": "C:\\absolute\\RippleFish",
+  "provider_profile": "lm_studio",
+  "configure_main_via_gui": true,
   "provider_base_url": "http://127.0.0.1:1234",
   "main_model": "provider/main-model",
   "side_model": "provider/side-model",
@@ -125,10 +132,30 @@ Windows Jobはexternal evaluatorのprocess lifecycle ownerであり、filesystem
 }
 ```
 
+OpenAI-compatibleのexternal-unmanaged routeは次の4fieldを必須とし、`extra_body_json`だけをoptional fieldとして受理する。base URLはcredential-freeな`/v1`でなければならず、LM Studio専用のSide model / variant fieldは渡さない。Side ChatにはMainと同じmodel IDを保存する。`extra_body_json`はgeneration-only allowlist `chat_template_kwargs.enable_thinking` / `chat_template_kwargs.preserve_thinking` のbooleanだけを許可し、credential、secret、その他の任意keyを再帰的に受理しない。compact JSONはexecution-owned Desktopの`MOYAI_EXTRA_BODY_JSON`だけへ渡し、fixture config本文へvendor fieldを固定しない。sealed prepared / summary evidenceにはraw JSONを複製せず、environment key、allowlist field名、SHA-256、byte sizeだけを残す。LM Studio routeではこのfieldを拒否する。
+
+summary schemaは`desktop-e2e.case5_2-summary.v1`を維持する。従来consumer向け`selected_model_unloaded_samples`はLM Studio sampleを従来どおり保持し、適用不能なOpenAI-compatible routeでは空配列とする。profile横断の観測はadditiveな`selected_model_provider_samples`へ保存する。
+
+```json
+{
+  "fixture_source": "C:\\absolute\\RippleFish",
+  "provider_profile": "openai_compatible",
+  "provider_base_url": "http://omlx-host:8119/v1",
+  "main_model": "Qwen3.8-27B-4bit",
+  "extra_body_json": {
+    "chat_template_kwargs": {
+      "enable_thinking": false,
+      "preserve_thinking": false
+    }
+  }
+}
+```
+
 ```powershell
 npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe --artifact-parent <absolute-task-root> --scenario prompt-review.cancel
 npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe --artifact-parent <absolute-task-root> --scenario run.stop
 npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe --artifact-parent <absolute-task-root> --scenario agent.interrupt
+npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe --artifact-parent <absolute-task-root> --scenario history.restart-prepend
 npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe --artifact-parent <absolute-task-root> --scenario settings.preferences
 npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe --artifact-parent <absolute-task-root> --scenario settings.docling-readiness
 npm run qualify:desktop-e2e-harness -- --binary target/debug/moyai-desktop.exe --artifact-parent <absolute-task-root> --scenario settings.initial-setup

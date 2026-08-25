@@ -29,10 +29,12 @@ const MODIFIER_BITS = Object.freeze({
 
 const NAMED_KEYS = Object.freeze({
   Alt: { key: "Alt", code: "AltLeft", virtualKey: 18, modifierBit: MODIFIER_BITS.Alt },
+  ArrowDown: { key: "ArrowDown", code: "ArrowDown", virtualKey: 40 },
   Backspace: { key: "Backspace", code: "Backspace", virtualKey: 8 },
   Control: { key: "Control", code: "ControlLeft", virtualKey: 17, modifierBit: MODIFIER_BITS.Control },
   Enter: { key: "Enter", code: "Enter", virtualKey: 13 },
   Escape: { key: "Escape", code: "Escape", virtualKey: 27 },
+  Home: { key: "Home", code: "Home", virtualKey: 36 },
   Meta: { key: "Meta", code: "MetaLeft", virtualKey: 91, modifierBit: MODIFIER_BITS.Meta },
   Shift: { key: "Shift", code: "ShiftLeft", virtualKey: 16, modifierBit: MODIFIER_BITS.Shift },
   Tab: { key: "Tab", code: "Tab", virtualKey: 9 },
@@ -90,6 +92,7 @@ function nullableIdentityValue(value, field) {
   if (value === null) return null;
   invariant(typeof value === "string", `semantic identity ${field} must be a string or null`);
   const normalized = field === "tag" ? value.trim().toUpperCase() : value;
+  if (field !== "tag" && normalized.length === 0) return null;
   invariant(normalized.length > 0, `semantic identity ${field} must not be empty`);
   return normalized;
 }
@@ -572,8 +575,14 @@ export class WebviewInput {
     return modifiers;
   }
 
-  async resolveExactTarget(locatorValue) {
+  async resolveExactTarget(locatorValue, { stableHitSamples: requiredStableHitSamples = 1 } = {}) {
     const locator = normalizeSemanticLocator(locatorValue);
+    invariant(
+      Number.isInteger(requiredStableHitSamples)
+        && requiredStableHitSamples >= 1
+        && requiredStableHitSamples <= 10,
+      "stableHitSamples must be an integer between 1 and 10",
+    );
     const started = this.now();
     invariant(Number.isFinite(started), "WebView input clock returned an invalid value");
     const deadline = started + this.targetAcquisitionTimeoutMs;
@@ -590,7 +599,7 @@ export class WebviewInput {
       lastObservation = clone(observation);
       try {
         const acquired = assertExactSemanticTarget(observation, locator);
-        if (!existingScrollObserved) {
+        if (!existingScrollObserved && requiredStableHitSamples === 1) {
           return {
             ...acquired,
             acquisition: {
@@ -608,11 +617,14 @@ export class WebviewInput {
           stableTarget = clone(acquired);
           stableHitSamples = 1;
         }
-        if (stableHitSamples >= EXISTING_SCROLL_STABLE_HIT_SAMPLES) {
+        const settledSamples = existingScrollObserved
+          ? Math.max(EXISTING_SCROLL_STABLE_HIT_SAMPLES, requiredStableHitSamples)
+          : requiredStableHitSamples;
+        if (stableHitSamples >= settledSamples) {
           return {
             ...acquired,
             acquisition: {
-              kind: "existing-scroll-settled",
+              kind: existingScrollObserved ? "existing-scroll-settled" : "stable-hit-settled",
               attempts,
               elapsed_ms: this.now() - started,
               stable_hit_samples: stableHitSamples,
@@ -632,8 +644,12 @@ export class WebviewInput {
         invariant(Number.isFinite(now), "WebView input clock returned an invalid value");
         if (now >= deadline) {
           throw new WebviewInputError(
-            "semantic-target-viewport-timeout",
-            "semantic target did not enter the viewport through the existing product scroll",
+            existingScrollObserved
+              ? "semantic-target-viewport-timeout"
+              : "semantic-target-stability-timeout",
+            existingScrollObserved
+              ? "semantic target did not enter the viewport through the existing product scroll"
+              : "semantic target did not remain stable for the required hit-test samples",
             {
               locator,
               attempts,
@@ -649,11 +665,11 @@ export class WebviewInput {
     }
   }
 
-  async pointerDown(locatorValue) {
+  async pointerDown(locatorValue, acquisitionOptions) {
     if (this.#pressedPointer !== null) {
       throw new WebviewInputError("pointer-already-pressed", "a WebView pointer press is already active", this.#pressedPointer);
     }
-    const target = await this.resolveExactTarget(locatorValue);
+    const target = await this.resolveExactTarget(locatorValue, acquisitionOptions);
     const modifiers = this.#currentModifiers();
     await this.#cdp.call("Input.dispatchMouseEvent", {
       type: "mouseMoved",
@@ -716,8 +732,8 @@ export class WebviewInput {
     return clone(pressed);
   }
 
-  async click(locatorValue) {
-    const target = await this.pointerDown(locatorValue);
+  async click(locatorValue, acquisitionOptions) {
+    const target = await this.pointerDown(locatorValue, acquisitionOptions);
     await this.pointerUp();
     return target;
   }

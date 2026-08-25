@@ -15,15 +15,21 @@
 - versionごとにfresh workspace、config/data、preferences、logs、screenshots directoryを作り、同じseedをcopyする。workspaceをresetして再利用しない。
 - このdirectoryの `task.md` をworkspace rootへ配置する。stage prompt fileのraw path / hash / byte countをsealしたうえで、GUIへ投入するtextはWindows checkoutのCRLFまたはCRをLFへcanonicalizeする。raw identityとGUI投入textのhash / byte countは分離し、canonicalize後のtextをtrusted input event、DOM value、wire promptでexactに照合する。
 - 同一provider/model、temperature、output budget、tool設定を全versionで使い、versionが所有するwire behaviorはbackportしない。
-- Quality profileはcurrent製品既定値 `context_window = 131072`、provider側 `num_ctx = 131072`、`max_output_tokens = 32768`、`request_timeout_ms = 3600000` とする。このtimeoutは最初のPOST attemptからstream terminalまでの単一deadlineである。historical版とのpaired比較では各runの実値と当時のtimeout contractを記録し、output budgetの意図的な縮小は行わない。artifact完成度とhidden contractを主に採点し、compactionは観測項目であって発生しなくてもfailまたはinconclusiveにしない。
-- provider loadのrequested contextと、load response / catalogで観測したapplied/effective contextは別fieldでsealする。appliedがrequested以上でもexactに一致しない場合はcapacity predicateとprofile comparabilityを分け、task-local `RESULTS.md`へdeviationを記録する。
-- Stress profileは `context_window = 32768`、provider側 `num_ctx = 32768`、`max_output_tokens = 8192` とする。これはcompaction/recoveryを確実に観測する意図的overrideであり、Quality profileやrelease smokeの代用にしない。
+- Quality profileはcurrent製品既定値 `context_window = 131072`、`max_output_tokens = 32768`、`request_timeout_ms = 3600000` とする。LM Studioではprovider側にも `num_ctx = 131072` をrequested load configとして渡すが、OpenAI-compatibleではLM Studio固有bodyを送らず、catalog metadataのreported capacityを別に記録する。このtimeoutは最初のPOST attemptからstream terminalまでの単一deadlineである。historical版とのpaired比較では各runの実値と当時のtimeout contractを記録し、output budgetの意図的な縮小は行わない。artifact完成度とhidden contractを主に採点し、compactionは観測項目であって発生しなくてもfailまたはinconclusiveにしない。
+- scenario configは`provider_profile`でprovider lifecycleを分岐する。LM Studioはexecution-owned load / unloadとnative catalogを使い、既存のdiscriminatorなし6fieldも後方互換に受理する。optional `configure_main_via_gui = true`ではneutral接続値をseedし、同一のsealed execution内でStage 1前にPreferencesのprofile / URL / manual model IDをtrusted GUI inputで設定し、exact global Saveとpersisted/effective projectionを確認する。OpenAI-compatibleはcredential-freeな`/v1` base URLとMain modelを必須とし、optional `extra_body_json`は`chat_template_kwargs.enable_thinking` / `preserve_thinking`のbooleanだけを許可する。credential / secret / unknown keyは拒否する。compact JSONは隔離Desktopの`MOYAI_EXTRA_BODY_JSON`だけへ渡し、fixture configへvendor fieldを固定せず、sealed prepared / summaryにはhash、byte size、許可field名だけを残す。external-unmanaged resourceへload / unloadを発行しない。
+- requested contextとprovider evidenceは別fieldでsealする。LM Studioではload response / catalogのapplied/effective context、OpenAI-compatibleでは`/v1/models`にmetadataがある場合だけreported capacityを使う。reported capacityがrequested 131072未満またはmetadata内で競合する場合はenvironment blockとする。未報告またはrequested以上だが非exactの場合とexternal lifecycle / wire差分はprofile comparability deviationとしてtask-local `RESULTS.md`へ記録する。
+- Stress profileは `context_window = 32768`、`max_output_tokens = 8192` とし、LM Studio routeだけprovider側 `num_ctx = 32768` を指定する。これはcompaction/recoveryを確実に観測する意図的overrideであり、Quality profileやrelease smokeの代用にしない。
 - access modeは `auto_review`（現UI: 代理で承認、旧UI: 自動レビュー）を要求する。versionがそのmodeを実装しない場合は暗黙に同等扱いせず、requested/effective modeとhuman approval回数を記録する。
 - multi-agent、MCP、Doclingは無効にする。dependency installとexternal fixture mutationは禁止する。
 - visible Tauri Desktopを実際に操作し、各stageを同じProject Chat sessionへ送る。
-- Stage 1 terminal後に同じProject ChatのSide Chatへ指定provider/modelをSettingsのmanual model ID経路から保存する。Side Chat Sendはscenario操作に含めず、restart復元時とStage 4 terminalのpersisted message count、provider catalogの時点付きunloaded sampleを記録する。remote traffic ledgerを持たない場合はgeneration request 0をmachine PASSとせず、未検証境界として残す。
+- Stage 1 terminal後に同じProject ChatのSide Chatへ指定provider/modelをSettingsのmanual model ID経路から保存する。OpenAI-compatibleではMainと同じmodel IDを保存する。Side Chat Sendはscenario操作に含めず、restart復元時とStage 4 terminalのpersisted message countがexact 0であることを要求して記録する。LM Studioは時点付きunloaded sample、OpenAI-compatibleは時点付きexact catalog availability / context metadata sampleを残す。remote traffic ledgerを持たない場合はgeneration request 0をmachine PASSとせず、未検証境界として残す。
+- summary v1の`selected_model_unloaded_samples`はLM Studioの既存意味を維持し、OpenAI-compatibleでは空配列とする。profile横断の時点sampleはadditiveな`selected_model_provider_samples`へ記録する。
 
 ## Execution
+
+各stage monitorはassistant transcript bodyのexact `<|im_start|>` / `<|im_end|>` をprovider control-token leakとして扱う。検出時はconfig fieldを含まない最小projection evidenceとscreenshotを保存し、visible Stopをtrusted inputでexact 1回送ったうえで`case5_2-provider-control-token-leak`として即時fail-stopする。検出後のevidence、Stop、terminal acquisitionのいずれかがsettleしない場合は`harness_ng`とし、観測済みleakを`observed_product_failure` evidenceへ保持する。一般の`<|...|>`文字列やtool rowまでは検出しない。
+
+各stage間ではRustのterminal projectionだけで次turnへ進まず、実画面からrun stripとvisible Stopが消え、入力した次stage promptが保持され、送信buttonのtitle / accessible labelがnew-requestの`送信`へsettleしたことを確認してからtrusted clickする。送信後は直前Idle ownerと同じsessionに、異なるTurn ID、row / run targetで一致するadmission revision、直前値からexact +1のrevisionを持つ新Turnだけを取得する。running中の同じ`data-action="send"`はsteerを意味するため、これや旧Turnを次turnのSendとして扱わない。
 
 ### Non-convergence safety cutoff
 
@@ -48,7 +54,7 @@ current directory の `task.md` に従って作業してください。
 
 ### Reopen boundary
 
-Stage 3 terminal completion後に共通actual E2E hostのgraceful exit contractでDesktop appを通常終了し、exact PID / start time / executableとprofile WebViewのzeroを確認する。タイトルバーの「閉じる」はtrayへ隠す操作なので再起動gateには使わない。同じworkspace、config/data、preferencesを使って共通hostがfresh process generationとして再起動し、同じProject Chat sessionとtranscriptを再開する。新しいsessionを作らず、履歴を手動要約または再投入しない。
+Stage 3 terminal completion後に共通actual E2E hostのgraceful exit contractでDesktop appを通常終了し、exact PID / start time / executableとprofile WebViewのzeroを確認する。タイトルバーの「閉じる」はtrayへ隠す操作なので再起動gateには使わない。同じworkspace、config/data、preferencesを使って共通hostがfresh process generationとして再起動し、同じProject Chat session、latest turn、admission revision、canonical turn totalを再開する。再起動直後の表示はStage 3と同じ上限のbounded latest turn pageでよく、offsetが正ならGUIの「以前の履歴」をtrusted操作でoffset 0までprependし、User本文、canonical Errorの順序・本文・利用可能なidentityのexact一致とterminal Assistantのcanonical completionを確認する。runtime-only System notice、work summaryのlive表現、tool detail、file-change rowをraw配列の同一性判定へ混ぜないが、durable Error rowは除外しない。新しいsessionを作らず、履歴を手動要約または再投入しない。
 
 ### Stage 4: regression repair
 
