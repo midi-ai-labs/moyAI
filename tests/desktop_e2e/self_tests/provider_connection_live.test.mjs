@@ -5,11 +5,11 @@ import {
   PROVIDER_OPENAI_COMPATIBLE_PROMPT,
   assertTrustedProviderProfileSelection,
   createProviderConnectionLiveScenario,
+  currentTimeFromCompletedProjection,
   expectedProviderConnectionGlobalSave,
   liveCurrentTimeTerminalAccepted,
   liveCurrentTimeTerminalDecision,
   normalizeProviderConnectionLiveOptions,
-  parseCurrentTimeToolStatus,
   parseCurrentTimeWorkSummary,
   providerConnectionLiveFixtureConfig,
   restoredProviderConnectionReady,
@@ -43,9 +43,8 @@ const CONFIG_FIELDS = Object.freeze([
   { key: "docling.enabled", value: "false" },
 ]);
 
-const TOOL_STATUS = "ツール:\n- Current time [completed] local: 2026-08-24T12:34:56+09:00\nutc: 2026-08-24T03:34:56Z\ntimezone: +09:00\nunix_ms: 1787542496000";
 const WORK_SUMMARY = "### 作業サマリ\n- 結果: セッションは完了しました。\n- コマンド/ツール: 2件\n\n### 作業履歴\n- [待機] current_time\n- [完了] Current time\n  出力: local: 2026-08-24T12:34:56+09:00 utc: 2026-08-24T03:34:56Z timezone: +09:00 unix_ms: 1787542496000";
-const ASSISTANT = "現在時刻は local=2026-08-24T12:34:56+09:00 / utc=2026-08-24T03:34:56Z / timezone=+09:00 です。";
+const ASSISTANT = "接続確認完了：local=2026-08-24T12:34:56+09:00 / utc=2026-08-24T03:34:56Z / timezone=+09:00 です。";
 
 function restoredSurface(overrides = {}) {
   const projection = {
@@ -90,6 +89,8 @@ function terminalSurface({ projection = {}, surface = {} } = {}) {
   return {
     projection: {
       run_status_key: "completed",
+      selected_session_title: "接続確認 [完了] 01M0TEST",
+      status_message: "実行完了",
       task_activity_state: "idle",
       busy: false,
       agent_tree_active: false,
@@ -103,15 +104,30 @@ function terminalSurface({ projection = {}, surface = {} } = {}) {
       confirmation: null,
       draft_prompt: "",
       can_submit: true,
-      tool_status_text: "ツール: 実行履歴はまだありません。",
+      tool_status_text: "ツール:\n- Current time [completed] local: 2026-08-24T12:34:56+09:00\nutc: 2026-08-24T03:34:56Z\ntimezone: +09:00\nunix_ms: 1787542496000",
+      latest_tool_summary: "ツール:",
+      progress_text: "Completed\nフェーズ: 終了処理\n手順: completed\nモデル要求: 2\nツール: 1件開始 / 1件完了 / 0件拒否 / 0件キャンセル / 0件失敗\n圧縮: 0",
       transcript_rows: [
         { row_kind: "user", body: PROVIDER_OPENAI_COMPATIBLE_PROMPT },
-        { row_kind: "work_summary_completed", body: WORK_SUMMARY },
+        { row_kind: "work_summary_completed", title: "1s作業しました", body: WORK_SUMMARY },
         { row_kind: "assistant", body: ASSISTANT },
       ],
       ...projection,
     },
     assistants: [{ text: ASSISTANT, visible: true }],
+    completed_summaries: [{
+      title: "1s作業しました",
+      body: "Current time local: 2026-08-24T12:34:56+09:00 utc: 2026-08-24T03:34:56Z timezone: +09:00 unix_ms: 1787542496000 完了",
+      visible: true,
+      summary_visible: true,
+    }],
+    terminal_dom: {
+      topbar_title: { count: 1, visible: true, text: "接続確認 [完了] 01M0TEST" },
+      topbar_status: { count: 1, visible: true, text: "実行完了" },
+      visible_run_strip_count: 0,
+      visible_task_activity_indicator_count: 0,
+      visible_selected_activity_row_count: 0,
+    },
     visible_fatal_count: 0,
     visible_recoverable_error_count: 0,
     visible_validation_error_count: 0,
@@ -235,17 +251,7 @@ test("global save accepts the product's collapsed model details after the exact 
   assert.equal(savedProviderConnectionReady(restoredSurface(), OPTIONS, CONFIG_TARGET), false);
 });
 
-test("current_time parser accepts exactly one completed four-field result", () => {
-  assert.deepEqual(parseCurrentTimeToolStatus(TOOL_STATUS), {
-    local: "2026-08-24T12:34:56+09:00",
-    utc: "2026-08-24T03:34:56Z",
-    timezone: "+09:00",
-    unixMs: "1787542496000",
-  });
-  assert.equal(parseCurrentTimeToolStatus(`${TOOL_STATUS}\n- Current time [completed] local: duplicate`), null);
-  assert.equal(parseCurrentTimeToolStatus(TOOL_STATUS.replace("[completed]", "[failed]")), null);
-  assert.equal(parseCurrentTimeToolStatus(TOOL_STATUS.replace("timezone: +09:00\n", "")), null);
-  assert.equal(parseCurrentTimeToolStatus(null), null);
+test("completed work summary is the single current_time evidence owner", () => {
   assert.deepEqual(parseCurrentTimeWorkSummary(WORK_SUMMARY), {
     local: "2026-08-24T12:34:56+09:00",
     utc: "2026-08-24T03:34:56Z",
@@ -254,6 +260,21 @@ test("current_time parser accepts exactly one completed four-field result", () =
   });
   assert.equal(parseCurrentTimeWorkSummary(`${WORK_SUMMARY}\n- [完了] Other`), null);
   assert.equal(parseCurrentTimeWorkSummary(WORK_SUMMARY.replace("[完了]", "[失敗]")), null);
+  assert.deepEqual(currentTimeFromCompletedProjection(terminalSurface().projection), {
+    local: "2026-08-24T12:34:56+09:00",
+    utc: "2026-08-24T03:34:56Z",
+    timezone: "+09:00",
+    unixMs: "1787542496000",
+  });
+  assert.equal(currentTimeFromCompletedProjection(terminalSurface({
+    projection: {
+      transcript_rows: [
+        { row_kind: "work_summary_completed", body: WORK_SUMMARY },
+        { row_kind: "work_summary_completed", body: WORK_SUMMARY },
+        { row_kind: "assistant", body: ASSISTANT },
+      ],
+    },
+  }).projection), null);
 });
 
 test("live terminal helper classifies deterministic pass, pending, and product failure without network", () => {
@@ -261,8 +282,46 @@ test("live terminal helper classifies deterministic pass, pending, and product f
   assert.equal(liveCurrentTimeTerminalAccepted(accepted), true);
   assert.equal(liveCurrentTimeTerminalDecision(accepted), "pass");
   assert.equal(liveCurrentTimeTerminalAccepted(terminalSurface({
-    surface: { assistants: [{ text: ASSISTANT.replace("現在時刻は", "確認結果は"), visible: true }] },
-  })), true);
+    surface: { assistants: [{ text: ASSISTANT.replace("接続確認完了：", ""), visible: true }] },
+  })), false);
+  for (const unexpectedAssistant of [
+    ASSISTANT.replace("接続確認完了：", "接続確認完了：余計な文 "),
+    ASSISTANT.replace(" です。", " 余計 です。"),
+    ASSISTANT.replace(" / utc=", "/utc="),
+  ]) {
+    const unexpected = terminalSurface({
+      projection: {
+        transcript_rows: [
+          { row_kind: "work_summary_completed", title: "1s作業しました", body: WORK_SUMMARY },
+          { row_kind: "assistant", body: unexpectedAssistant },
+        ],
+      },
+      surface: { assistants: [{ text: unexpectedAssistant, visible: true }] },
+    });
+    assert.equal(liveCurrentTimeTerminalAccepted(unexpected), false);
+    assert.equal(liveCurrentTimeTerminalDecision(unexpected), "fail");
+  }
+  const corruptLocal = ASSISTANT.replace(" / utc=", "-CORRUPT / utc=");
+  assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({
+    projection: {
+      transcript_rows: [
+        { row_kind: "work_summary_completed", title: "1s作業しました", body: WORK_SUMMARY },
+        { row_kind: "assistant", body: corruptLocal },
+      ],
+    },
+    surface: { assistants: [{ text: corruptLocal, visible: true }] },
+  })), "fail");
+  assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({
+    surface: { assistants: [{ text: corruptLocal, visible: true }] },
+  })), "pending");
+  assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({
+    surface: {
+      assistants: [{
+        text: "接続確認完了：local=2026-08-24T12:34:56+09:00 / utc=2026-08-24T03:34:56Z /",
+        visible: true,
+      }],
+    },
+  })), "pending");
 
   assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({
     projection: { run_status_key: "running", task_activity_state: "running", busy: true },
@@ -278,6 +337,55 @@ test("live terminal helper classifies deterministic pass, pending, and product f
   assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({
     surface: { visible_recoverable_error_count: 1 },
   })), "fail");
+  assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({
+    projection: {
+      tool_status_text: "ツール: 実行履歴はまだありません。",
+      latest_tool_summary: "ツール: 実行履歴はまだありません。",
+      progress_text: "Completed\nツール: 1件開始 / 0件完了 / 0件拒否 / 0件キャンセル / 0件失敗",
+    },
+  })), "fail");
+  assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({
+    surface: {
+      terminal_dom: {
+        visible_run_strip_count: 1,
+        visible_task_activity_indicator_count: 2,
+        visible_selected_activity_row_count: 1,
+      },
+    },
+  })), "pending");
+  assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({
+    projection: {
+      selected_session_title: "接続確認 [実行中] 01M0TEST",
+      status_message: "Provider応答受信中",
+    },
+    surface: {
+      terminal_dom: {
+        topbar_title: { count: 1, visible: true, text: "接続確認 [実行中] 01M0TEST" },
+        topbar_status: { count: 1, visible: true, text: "Provider応答受信中" },
+      },
+    },
+  })), "fail");
+  assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({
+    surface: {
+      completed_summaries: [{
+        title: "1s作業しました",
+        body: "Current time local: 2026-08-24T12:34:56+09:00-CORRUPT utc: 2026-08-24T03:34:56Z timezone: +09:00 unix_ms: 1787542496000 完了",
+        visible: true,
+        summary_visible: true,
+      }],
+    },
+  })), "pending");
+  assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({
+    surface: {
+      terminal_dom: {
+        topbar_title: { count: 1, visible: true, text: "接続確認 [実行中] 01M0TEST" },
+        topbar_status: { count: 1, visible: true, text: "Provider応答受信中" },
+        visible_run_strip_count: 1,
+        visible_task_activity_indicator_count: 2,
+        visible_selected_activity_row_count: 1,
+      },
+    },
+  })), "pending");
   assert.equal(liveCurrentTimeTerminalDecision(terminalSurface({
     projection: {
       transcript_rows: [

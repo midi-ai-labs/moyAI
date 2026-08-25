@@ -28,7 +28,7 @@ const SENTINEL_NAME = "E2E_PROVIDER_OPENAI_COMPATIBLE.txt";
 const SETTINGS_STABILITY_MS = 500;
 const LIVE_TURN_TIMEOUT_MS = 420_000;
 
-export const PROVIDER_OPENAI_COMPATIBLE_PROMPT = "接続確認です。必ず built-in の current_time ツールを引数 {} でちょうど1回だけ呼び出してください。その結果に含まれる local、utc、timezone の値をそのまま使い、「local=... / utc=... / timezone=...」を含む日本語の1文だけで答えてください。ファイル操作、shell、他のツールは使わないでください。";
+export const PROVIDER_OPENAI_COMPATIBLE_PROMPT = "接続確認です。必ず built-in の current_time ツールを引数 {} でちょうど1回だけ呼び出してください。その結果に含まれる local、utc、timezone の値をそのまま使い、回答を必ず「接続確認完了：local=... / utc=... / timezone=... です。」という日本語の1文にしてください（... はそれぞれの実値に置き換えてください）。ファイル操作、shell、他のツールは使わないでください。";
 
 const SHOW_SETTINGS = Object.freeze({
   selector: 'aside.sidebar button.settings[data-action="show-config"][title="設定"]',
@@ -253,11 +253,30 @@ export async function observeProviderConnectionLiveSurface(cdp) {
           && found.node.getAttribute('aria-disabled') !== 'true',
       };
     };
-    const details = one('[role="dialog"][aria-labelledby="config-dialog-title"] details[data-details-key="main-provider-manual-model"]');
-    const assistants = matches('main.conversation #thread article.message.assistant').map((row) => ({
+    const text = (selector) => {
+      const found = one(selector);
+      return {
+        count: found.count,
+        visible: found.visible,
+        text: found.node instanceof HTMLElement ? found.node.innerText.trim() : null,
+      };
+    };
+    const transcriptRows = (selector) => matches(selector).map((row) => ({
       text: (row.querySelector('.markdown-body')?.innerText ?? '').trim(),
       visible: visible(row),
     }));
+    const completedSummaries = matches('main.conversation #thread article.message.work-summary.work_summary_completed').map((row) => {
+      const summary = row.querySelector('details > summary');
+      const body = row.querySelector('.work-summary-body');
+      return {
+        title: summary instanceof HTMLElement ? summary.innerText.trim() : null,
+        body: body instanceof HTMLElement ? (body.textContent ?? '').trim() : null,
+        visible: visible(row),
+        summary_visible: visible(summary),
+      };
+    });
+    const details = one('[role="dialog"][aria-labelledby="config-dialog-title"] details[data-details-key="main-provider-manual-model"]');
+    const assistants = transcriptRows('main.conversation #thread article.message.assistant');
     return {
       projection,
       settings: {
@@ -277,6 +296,14 @@ export async function observeProviderConnectionLiveSurface(cdp) {
       prompt: control(${JSON.stringify(PROMPT.selector)}),
       send: button(${JSON.stringify(SEND.selector)}),
       assistants,
+      completed_summaries: completedSummaries,
+      terminal_dom: {
+        topbar_title: text('header.topbar h1'),
+        topbar_status: text('header.topbar .status-line > span'),
+        visible_run_strip_count: matches('section.run-strip').filter(visible).length,
+        visible_task_activity_indicator_count: matches('.task-activity-indicator').filter(visible).length,
+        visible_selected_activity_row_count: matches('aside.sidebar .nav-row-wrap.selected[data-task-activity-row]').filter(visible).length,
+      },
       visible_fatal_count: matches('.fatal').filter(visible).length,
       visible_recoverable_error_count: matches('.ui-error-notice').filter(visible).length,
       visible_validation_error_count: matches('.validation.error').filter(visible).length,
@@ -349,18 +376,6 @@ export function savedProviderConnectionReady(surface, options, baselineTarget) {
     && advancedConfigTarget(surface?.projection?.config_target, baselineTarget);
 }
 
-export function parseCurrentTimeToolStatus(value) {
-  if (typeof value !== "string") return null;
-  const match = /^ツール:\n- Current time \[completed\] local: ([^\n]+)\nutc: ([^\n]+)\ntimezone: ([^\n]+)\nunix_ms: ([0-9]+)$/u.exec(value);
-  if (match === null) return null;
-  return {
-    local: match[1],
-    utc: match[2],
-    timezone: match[3],
-    unixMs: match[4],
-  };
-}
-
 export function parseCurrentTimeWorkSummary(value) {
   if (typeof value !== "string") return null;
   const terminalRows = Array.from(value.matchAll(/^- \[(完了|失敗|拒否|キャンセル)\] ([^\r\n]+)$/gmu));
@@ -389,28 +404,47 @@ function completedWorkSummaries(projection) {
   return rows.filter((row) => row?.row_kind === "work_summary_completed");
 }
 
-function assistantUsesTime(assistant, time) {
-  return typeof assistant === "string"
-    && assistant.length > 0
-    && /[\u3040-\u30ff\u3400-\u9fff]/u.test(assistant)
-    && assistant.includes(time.local)
-    && assistant.includes(time.utc)
-    && assistant.includes(time.timezone);
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }
 
-export function liveCurrentTimeTerminalAccepted(surface) {
-  const projection = surface?.projection;
+export function currentTimeFromCompletedProjection(projection) {
   const summaries = completedWorkSummaries(projection);
-  const time = summaries.length === 1
+  return summaries.length === 1
     ? parseCurrentTimeWorkSummary(summaries[0].body)
     : null;
+}
+
+function assistantUsesTime(assistant, time) {
+  const expected = `接続確認完了：local=${time.local} / utc=${time.utc} / timezone=${time.timezone} です。`;
+  return assistant === expected;
+}
+
+function completedSummaryDomUsesTime(summary, time) {
+  if (typeof summary?.body !== "string") return false;
+  const renderedTime = new RegExp(
+    `local:\\s*${escapeRegExp(time.local)}\\s+utc:\\s*${escapeRegExp(time.utc)}\\s+timezone:\\s*${escapeRegExp(time.timezone)}\\s+unix_ms:\\s*${escapeRegExp(time.unixMs)}(?:$|\\s)`,
+    "u",
+  );
+  return renderedTime.test(summary.body);
+}
+
+function terminalToolProjectionUsesTime(projection, time) {
+  const expectedToolStatus = `ツール:\n- Current time [completed] local: ${time.local}\nutc: ${time.utc}\ntimezone: ${time.timezone}\nunix_ms: ${time.unixMs}`;
+  return projection?.tool_status_text === expectedToolStatus
+    && projection?.latest_tool_summary === "ツール:"
+    && typeof projection?.progress_text === "string"
+    && projection.progress_text.includes(
+      "ツール: 1件開始 / 1件完了 / 0件拒否 / 0件キャンセル / 0件失敗",
+    );
+}
+
+function liveCurrentTimeProjectionAccepted(surface) {
+  const projection = surface?.projection;
+  const summaries = completedWorkSummaries(projection);
+  const time = currentTimeFromCompletedProjection(projection);
   if (time === null || !surfaceErrorFree(surface)) return false;
   const assistant = finalAssistant(projection);
-  const visibleAssistants = Array.isArray(surface?.assistants)
-    ? surface.assistants.filter((row) => row?.visible === true)
-    : [];
-  const visibleAssistant = visibleAssistants.length === 1
-    && assistantUsesTime(visibleAssistants[0].text, time);
   return projection?.run_status_key === "completed"
     && projection?.task_activity_state === "idle"
     && projection?.busy === false
@@ -426,9 +460,46 @@ export function liveCurrentTimeTerminalAccepted(surface) {
     && projection?.confirmation == null
     && projection?.draft_prompt === ""
     && projection?.can_submit === true
+    && /\[完了\]/u.test(projection?.selected_session_title ?? "")
+    && projection?.status_message === "実行完了"
     && summaries.length === 1
-    && assistantUsesTime(assistant, time)
-    && visibleAssistant;
+    && terminalToolProjectionUsesTime(projection, time)
+    && assistantUsesTime(assistant, time);
+}
+
+function liveCurrentTimeDomAccepted(surface, time) {
+  const projection = surface?.projection;
+  const visibleAssistants = Array.isArray(surface?.assistants)
+    ? surface.assistants.filter((row) => row?.visible === true)
+    : [];
+  const visibleAssistant = visibleAssistants.length === 1
+    && assistantUsesTime(visibleAssistants[0].text, time);
+  const completedSummary = surface?.completed_summaries?.length === 1
+    ? surface.completed_summaries[0]
+    : null;
+  const canonicalSummary = completedWorkSummaries(projection)[0];
+  return visibleAssistant
+    && completedSummary?.visible === true
+    && completedSummary.summary_visible === true
+    && completedSummary.title === canonicalSummary?.title
+    && completedSummaryDomUsesTime(completedSummary, time)
+    && surface?.terminal_dom?.topbar_title?.count === 1
+    && surface.terminal_dom.topbar_title.visible === true
+    && surface.terminal_dom.topbar_title.text === projection?.selected_session_title
+    && /\[完了\]/u.test(surface.terminal_dom.topbar_title.text)
+    && surface.terminal_dom.topbar_status?.count === 1
+    && surface.terminal_dom.topbar_status.visible === true
+    && surface.terminal_dom.topbar_status.text === projection?.status_message
+    && surface.terminal_dom.topbar_status.text === "実行完了"
+    && surface.terminal_dom.visible_run_strip_count === 0
+    && surface.terminal_dom.visible_task_activity_indicator_count === 0
+    && surface.terminal_dom.visible_selected_activity_row_count === 0;
+}
+
+export function liveCurrentTimeTerminalAccepted(surface) {
+  if (!liveCurrentTimeProjectionAccepted(surface)) return false;
+  const time = currentTimeFromCompletedProjection(surface.projection);
+  return liveCurrentTimeDomAccepted(surface, time);
 }
 
 export function liveCurrentTimeTerminalDecision(surface) {
@@ -443,7 +514,8 @@ export function liveCurrentTimeTerminalDecision(surface) {
       || (Array.isArray(projection?.pending_async_operations)
         && projection.pending_async_operations.length > 0);
     if (refreshPending) return "pending";
-    return liveCurrentTimeTerminalAccepted(surface) ? "pass" : "fail";
+    if (!liveCurrentTimeProjectionAccepted(surface)) return "fail";
+    return liveCurrentTimeTerminalAccepted(surface) ? "pass" : "pending";
   }
   return "pending";
 }
@@ -918,14 +990,14 @@ export function createProviderConnectionLiveScenario(rawOptions = {}) {
         });
         const send = await trustedClick(secondInput, SEND);
         const terminal = await waitForProductStage({
-          label: "oMLX OpenAI-compatible current_time terminal",
+          label: "OpenAI-compatible current_time terminal",
           timeoutMs: LIVE_TURN_TIMEOUT_MS,
           sample: () => observeProviderConnectionLiveSurface(restarted.driver),
           decide: liveCurrentTimeTerminalDecision,
           code: "provider-live-current-time-mismatch",
           message: "the OpenAI-compatible provider did not complete exactly one current_time tool round with a visible Japanese answer",
         });
-        const time = parseCurrentTimeToolStatus(terminal.value.projection.tool_status_text);
+        const time = currentTimeFromCompletedProjection(terminal.value.projection);
         const assistant = finalAssistant(terminal.value.projection);
         const terminalScreenshot = await captureScenarioScreenshot({
           cdp: restarted.driver,

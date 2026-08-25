@@ -1072,6 +1072,7 @@ impl DesktopState {
     pub fn load_open_session_preserving_history(&mut self, read: &CanonicalSessionRead) -> bool {
         if self.merge_open_session_history(read) {
             self.apply_canonical_terminal_to_running_session(read);
+            self.reconcile_current_terminal_tool_projection();
             return true;
         }
         let preserved = self
@@ -1100,7 +1101,33 @@ impl DesktopState {
         self.update_session_row_title(session.id, &session.title);
         self.update_session_row_status(session.id, session.status);
         self.apply_canonical_terminal_to_running_session(read);
+        self.reconcile_current_terminal_tool_projection();
         false
+    }
+
+    fn reconcile_current_terminal_tool_projection(&mut self) -> bool {
+        let Some((session_id, latest_turn_id, turn_items)) = self
+            .open_session
+            .as_ref()
+            .filter(|open_session| {
+                open_session.active_turn_id().is_none()
+                    && matches!(
+                        open_session.session().status,
+                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                    )
+            })
+            .map(|open_session| {
+                (
+                    open_session.session_id(),
+                    open_session.latest_turn_id(),
+                    open_session.turn_items().to_vec(),
+                )
+            })
+        else {
+            return false;
+        };
+        self.app_state
+            .reconcile_terminal_tool_projection(session_id, latest_turn_id, &turn_items)
     }
 
     fn apply_canonical_terminal_to_running_session(&mut self, read: &CanonicalSessionRead) -> bool {
@@ -2911,6 +2938,159 @@ mod tests {
             SessionStatus::Cancelled
         );
         assert!(!state.snapshot.session_rows[0].label.contains("[実行中]"));
+    }
+
+    #[test]
+    fn canonical_terminal_refresh_reconciles_the_latest_turn_tool_projection() {
+        let session_id = SessionId::new();
+        let turn_id = crate::protocol::TurnId::new();
+        let call_id = crate::session::ToolCallId::new();
+        let mut running_session = session_record(session_id);
+        running_session.status = SessionStatus::Running;
+        running_session.completed_at_ms = None;
+        let user_item = turn_item(
+            session_id,
+            turn_id,
+            1,
+            TurnItemPayload::UserMessage {
+                text: "read the current time".to_string(),
+            },
+        );
+        let mut running = canonical_read(&running_session, Vec::new(), vec![user_item.clone()]);
+        running.active_turn_id = Some(turn_id);
+        running.active_turn_sequence_no = Some(1);
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session_id,
+                    &running_session.title,
+                    SessionStatus::Running,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&running);
+        state.app_state.progress.compactions = 3;
+        state.apply_run_summary(crate::session::RunSummary::from_terminal(
+            session_id,
+            turn_id,
+            crate::session::DurableTurnTerminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                final_response_id: None,
+                tool_call_count: 1,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: crate::session::RunMetrics {
+                    model_request_count: 2,
+                    ..Default::default()
+                },
+            },
+        ));
+        assert_eq!(state.app_state.progress.tool_calls_completed, 0);
+
+        let mut completed_session = running_session.clone();
+        completed_session.status = SessionStatus::Completed;
+        completed_session.updated_at_ms += 1;
+        completed_session.completed_at_ms = Some(completed_session.updated_at_ms);
+        let completed = canonical_read(
+            &completed_session,
+            Vec::new(),
+            vec![
+                user_item,
+                turn_item(
+                    session_id,
+                    turn_id,
+                    2,
+                    TurnItemPayload::ToolStatus {
+                        call_id,
+                        tool: crate::tool::ToolName::CurrentTime,
+                        status: crate::protocol::ToolLifecycleStatus::Completed,
+                        title: "Current time".to_string(),
+                        summary: "local: 2026-08-25T10:11:57+09:00".to_string(),
+                    },
+                ),
+                turn_item(
+                    session_id,
+                    turn_id,
+                    3,
+                    TurnItemPayload::AgentMessage {
+                        text: "local=2026-08-25T10:11:57+09:00".to_string(),
+                    },
+                ),
+                turn_item(
+                    session_id,
+                    turn_id,
+                    4,
+                    TurnItemPayload::Terminal {
+                        outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                    },
+                ),
+            ],
+        );
+
+        assert!(state.load_open_session_preserving_history(&completed));
+
+        let detail = state.selected_detail();
+        assert!(detail.progress_text.contains("モデル要求: 2"));
+        assert!(detail.progress_text.contains("ツール: 1件開始 / 1件完了"));
+        assert!(detail.tool_status_text.contains("Current time [completed]"));
+        assert!(!detail.tool_status_text.contains("実行履歴はまだありません"));
+        assert_eq!(state.app_state.progress.compactions, 3);
+        assert_eq!(
+            state.app_state.progress.current_phase,
+            RunProgressPhase::Terminal
+        );
+    }
+
+    #[test]
+    fn stale_terminal_page_cannot_reconcile_a_newer_terminal_summary() {
+        let session_id = SessionId::new();
+        let stale_turn_id = crate::protocol::TurnId::new();
+        let current_turn_id = crate::protocol::TurnId::new();
+        let session = session_record(session_id);
+        let mut stale = canonical_read(
+            &session,
+            Vec::new(),
+            vec![turn_item(
+                session_id,
+                stale_turn_id,
+                1,
+                TurnItemPayload::Terminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                },
+            )],
+        );
+        stale.latest_turn_id = Some(current_turn_id);
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session_id,
+                    &session.title,
+                    SessionStatus::Completed,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&stale);
+        state.apply_run_summary(crate::session::RunSummary::from_terminal(
+            session_id,
+            current_turn_id,
+            crate::session::DurableTurnTerminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                final_response_id: None,
+                tool_call_count: 1,
+                failed_tool_count: 0,
+                change_count: 0,
+                metrics: Default::default(),
+            },
+        ));
+        state.app_state.progress.tool_calls_completed = 41;
+
+        assert!(!state.reconcile_current_terminal_tool_projection());
+        assert_eq!(state.app_state.progress.tool_calls_completed, 41);
+        assert!(state.app_state.tool_statuses.is_empty());
     }
 
     #[test]

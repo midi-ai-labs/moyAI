@@ -1023,6 +1023,86 @@ impl AppState {
         self.apply_durable_terminal(summary.terminal());
         self.last_summary = Some(summary);
     }
+
+    pub(crate) fn reconcile_terminal_tool_projection(
+        &mut self,
+        session_id: SessionId,
+        latest_turn_id: Option<TurnId>,
+        turn_items: &[TurnItem],
+    ) -> bool {
+        if self.current_session_id != Some(session_id) || !self.run_status.is_terminal() {
+            return false;
+        }
+        let Some(summary) = self.last_summary.as_ref().filter(|summary| {
+            summary.session_id() == session_id && Some(summary.turn_id()) == latest_turn_id
+        }) else {
+            return false;
+        };
+        let summary_matches_run_status = matches!(
+            (self.run_status, summary.status()),
+            (RunStatus::Completed, SessionStatus::Completed)
+                | (RunStatus::Cancelled, SessionStatus::Cancelled)
+                | (RunStatus::Failed, SessionStatus::Failed)
+        );
+        if !summary_matches_run_status {
+            return false;
+        }
+        let Some(turn_id) = latest_turn_id else {
+            return false;
+        };
+        let Some((terminal_turn_id, terminal_outcome)) = turn_items_in_projection_order(turn_items)
+            .into_iter()
+            .rev()
+            .find_map(|item| match &item.payload {
+                TurnItemPayload::Terminal { outcome } => Some((item.turn_id, outcome)),
+                _ => None,
+            })
+        else {
+            return false;
+        };
+        if terminal_turn_id != turn_id || terminal_outcome != &summary.terminal().outcome {
+            return false;
+        }
+
+        let tool_statuses = tool_statuses_from_turn_items_for_turn(turn_items, Some(turn_id));
+        if tool_statuses.len() != summary.tool_call_count()
+            || tool_statuses.iter().any(|tool| {
+                matches!(
+                    tool.status,
+                    ToolCallStatus::Pending | ToolCallStatus::Running
+                )
+            })
+        {
+            return false;
+        }
+        let completed = tool_statuses
+            .iter()
+            .filter(|tool| tool.status == ToolCallStatus::Completed)
+            .count();
+        let declined = tool_statuses
+            .iter()
+            .filter(|tool| tool.status == ToolCallStatus::Declined)
+            .count();
+        let cancelled = tool_statuses
+            .iter()
+            .filter(|tool| tool.status == ToolCallStatus::Cancelled)
+            .count();
+        let failed = tool_statuses
+            .iter()
+            .filter(|tool| tool.status == ToolCallStatus::Failed)
+            .count();
+        if failed != summary.failed_tool_count() {
+            return false;
+        }
+
+        self.tool_statuses = tool_statuses;
+        self.progress.tool_calls_started = self.tool_statuses.len();
+        self.progress.tool_calls_completed = completed;
+        self.progress.tool_calls_declined = declined;
+        self.progress.tool_calls_cancelled = cancelled;
+        self.progress.tool_calls_failed = failed;
+        true
+    }
 }
 
 fn latest_interruption_cause(turn_items: &[TurnItem]) -> Option<TurnInterruptionCause> {
@@ -1866,6 +1946,204 @@ mod tests {
         assert_eq!(state.progress.tool_calls_failed, 2);
         assert_eq!(state.transcript_entries.len(), terminal_rows);
         assert!(state.last_summary.is_some());
+    }
+
+    #[test]
+    fn terminal_tool_reconciliation_uses_the_exact_latest_turn_and_preserves_other_state() {
+        let session_id = SessionId::new();
+        let previous_turn_id = TurnId::new();
+        let turn_id = TurnId::new();
+        let previous_call_id = ToolCallId::new();
+        let call_id = ToolCallId::new();
+        let terminal = DurableTurnTerminal {
+            outcome: TurnTerminalOutcome::Completed,
+            final_response_id: None,
+            tool_call_count: 1,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: crate::session::RunMetrics {
+                model_request_count: 2,
+                ..Default::default()
+            },
+        };
+        let transcript = TranscriptEntry {
+            kind: TranscriptKind::Assistant,
+            title: "Assistant".to_string(),
+            body: "keep the live transcript".to_string(),
+            response_id: None,
+            tool_call_id: None,
+        };
+        let mut state = AppState {
+            current_session_id: Some(session_id),
+            transcript_entries: vec![transcript.clone()],
+            ..AppState::default()
+        };
+        state.progress.compactions = 3;
+        state.apply_run_summary(RunSummary::from_terminal(session_id, turn_id, terminal));
+        let items = vec![
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id: previous_turn_id,
+                source_item_id: None,
+                sequence_no: 1,
+                payload: TurnItemPayload::ToolStatus {
+                    call_id: previous_call_id,
+                    tool: ToolName::Shell,
+                    status: ToolLifecycleStatus::Completed,
+                    title: "previous turn tool".to_string(),
+                    summary: "old".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 2,
+                payload: TurnItemPayload::ToolStatus {
+                    call_id,
+                    tool: ToolName::CurrentTime,
+                    status: ToolLifecycleStatus::Pending,
+                    title: "current_time".to_string(),
+                    summary: String::new(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 3,
+                payload: TurnItemPayload::ToolStatus {
+                    call_id,
+                    tool: ToolName::CurrentTime,
+                    status: ToolLifecycleStatus::Completed,
+                    title: "Current time".to_string(),
+                    summary: "local: 2026-08-25T10:11:57+09:00".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 4,
+                payload: TurnItemPayload::Terminal {
+                    outcome: TurnTerminalOutcome::Completed,
+                },
+            },
+        ];
+
+        assert!(state.reconcile_terminal_tool_projection(session_id, Some(turn_id), &items));
+
+        assert_eq!(state.tool_statuses.len(), 1);
+        assert_eq!(state.tool_statuses[0].tool_call_id, call_id);
+        assert_eq!(state.tool_statuses[0].status, ToolCallStatus::Completed);
+        assert_eq!(state.progress.tool_calls_started, 1);
+        assert_eq!(state.progress.tool_calls_completed, 1);
+        assert_eq!(state.progress.tool_calls_declined, 0);
+        assert_eq!(state.progress.tool_calls_cancelled, 0);
+        assert_eq!(state.progress.tool_calls_failed, 0);
+        assert_eq!(state.progress.model_requests, 2);
+        assert_eq!(state.progress.compactions, 3);
+        assert_eq!(state.progress.current_phase, RunProgressPhase::Terminal);
+        assert_eq!(state.progress.status, "Completed");
+        assert_eq!(state.transcript_entries, vec![transcript]);
+        assert_eq!(
+            state.last_summary.as_ref().map(RunSummary::turn_id),
+            Some(turn_id)
+        );
+    }
+
+    #[test]
+    fn terminal_tool_reconciliation_rejects_partial_stale_pending_and_unowned_items() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let stale_turn_id = TurnId::new();
+        let call_id = ToolCallId::new();
+        let terminal = DurableTurnTerminal {
+            outcome: TurnTerminalOutcome::Completed,
+            final_response_id: None,
+            tool_call_count: 1,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        };
+        let terminal_item = TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 2,
+            payload: TurnItemPayload::Terminal {
+                outcome: TurnTerminalOutcome::Completed,
+            },
+        };
+        let pending_item = TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 1,
+            payload: TurnItemPayload::ToolStatus {
+                call_id,
+                tool: ToolName::CurrentTime,
+                status: ToolLifecycleStatus::Pending,
+                title: "current_time".to_string(),
+                summary: String::new(),
+            },
+        };
+        let state_with_summary = || {
+            let mut state = AppState {
+                current_session_id: Some(session_id),
+                ..AppState::default()
+            };
+            state.apply_run_summary(RunSummary::from_terminal(
+                session_id,
+                turn_id,
+                terminal.clone(),
+            ));
+            state.progress.tool_calls_completed = 41;
+            state
+        };
+
+        let mut partial = state_with_summary();
+        assert!(!partial.reconcile_terminal_tool_projection(
+            session_id,
+            Some(turn_id),
+            std::slice::from_ref(&terminal_item),
+        ));
+        assert_eq!(partial.progress.tool_calls_completed, 41);
+
+        let mut pending = state_with_summary();
+        assert!(!pending.reconcile_terminal_tool_projection(
+            session_id,
+            Some(turn_id),
+            &[pending_item.clone(), terminal_item.clone()],
+        ));
+        assert_eq!(pending.progress.tool_calls_completed, 41);
+
+        let mut stale = state_with_summary();
+        assert!(!stale.reconcile_terminal_tool_projection(
+            session_id,
+            Some(stale_turn_id),
+            &[pending_item, terminal_item.clone()],
+        ));
+        assert_eq!(stale.progress.tool_calls_completed, 41);
+
+        let mut unowned = AppState {
+            current_session_id: Some(session_id),
+            run_status: RunStatus::Completed,
+            ..AppState::default()
+        };
+        unowned.progress.tool_calls_completed = 41;
+        assert!(!unowned.reconcile_terminal_tool_projection(
+            session_id,
+            Some(turn_id),
+            &[terminal_item],
+        ));
+        assert_eq!(unowned.progress.tool_calls_completed, 41);
     }
 
     #[test]
