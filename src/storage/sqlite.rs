@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use crate::error::StorageError;
 use crate::storage::{
@@ -21,6 +21,9 @@ const INTERNAL_FILE_QUARANTINE_TICK_BUDGET: usize = 64;
 #[derive(Clone)]
 pub struct SqliteStore {
     connection: Arc<Mutex<Connection>>,
+    // A fixed reader keeps ordinary Desktop/session projection traffic from becoming a
+    // Guardian authority failure. Contention on this reader still fails closed without waiting.
+    permission_guardian_authority_connection: Arc<Mutex<Connection>>,
     paths: StoragePaths,
     internal_file_cleanup_cursor: Arc<Mutex<InternalFileCleanupCursor>>,
     #[cfg(test)]
@@ -168,8 +171,19 @@ impl SqliteStore {
         connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        let permission_guardian_authority_connection = Connection::open_with_flags(
+            &paths.database_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        permission_guardian_authority_connection.busy_timeout(Duration::ZERO)?;
+        permission_guardian_authority_connection.pragma_update(None, "query_only", "ON")?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            permission_guardian_authority_connection: Arc::new(Mutex::new(
+                permission_guardian_authority_connection,
+            )),
             paths: paths.clone(),
             internal_file_cleanup_cursor: Arc::new(
                 Mutex::new(InternalFileCleanupCursor::default()),
@@ -231,6 +245,14 @@ impl SqliteStore {
 
     pub fn protocol_event_store(&self) -> crate::protocol::SqliteProtocolEventStore {
         crate::protocol::SqliteProtocolEventStore::new(self.connection.clone())
+    }
+
+    pub(crate) fn permission_guardian_authority_store(
+        &self,
+    ) -> crate::protocol::SqliteProtocolEventStore {
+        crate::protocol::SqliteProtocolEventStore::new(
+            self.permission_guardian_authority_connection.clone(),
+        )
     }
 
     pub fn cleanup_orphan_internal_files(&self) -> Result<StorageMaintenanceReport, StorageError> {
@@ -1776,7 +1798,13 @@ fn process_quarantine_entry(
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::params;
+    use rusqlite::{DatabaseName, params};
+
+    use crate::protocol::{
+        ContentPart, HistoryItem, HistoryItemId, HistoryItemPayload, HistoryScope,
+        ProtocolEventStore, TurnId,
+    };
+    use crate::session::SessionId;
 
     use super::*;
 
@@ -1809,6 +1837,105 @@ mod tests {
             .expect("busy timeout");
 
         assert_eq!(timeout_ms, SQLITE_BUSY_TIMEOUT.as_millis() as i64);
+    }
+
+    #[test]
+    fn permission_guardian_authority_reader_is_read_only_and_query_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = camino::Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8");
+        let paths = StoragePaths {
+            data_dir: data_dir.clone(),
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+        };
+        let store = SqliteStore::open(&paths).expect("store");
+        store.migrate().expect("migrate");
+
+        let reader = store
+            .permission_guardian_authority_connection
+            .lock()
+            .expect("Guardian authority sqlite mutex poisoned");
+        assert!(
+            reader
+                .is_readonly(DatabaseName::Main)
+                .expect("read-only database flag")
+        );
+        assert_eq!(
+            reader
+                .query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+                .expect("query-only pragma"),
+            1
+        );
+        assert_eq!(
+            reader
+                .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
+                .expect("non-waiting busy timeout"),
+            0
+        );
+        reader
+            .execute(
+                "CREATE TABLE guardian_reader_must_not_write (id INTEGER)",
+                [],
+            )
+            .expect_err("Guardian authority reader must reject writes");
+    }
+
+    #[test]
+    fn permission_guardian_authority_reader_reads_committed_user_turn_while_primary_is_held() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = camino::Utf8PathBuf::from_path_buf(temp.path().join("data")).expect("utf8");
+        let paths = StoragePaths {
+            data_dir: data_dir.clone(),
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+        };
+        let store = SqliteStore::open(&paths).expect("store");
+        store.migrate().expect("migrate");
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let item = HistoryItem {
+            id: HistoryItemId::new(),
+            session_id,
+            scope: HistoryScope::Turn { turn_id },
+            sequence_no: 0,
+            created_at_ms: 42,
+            payload: HistoryItemPayload::UserTurn {
+                content: vec![ContentPart::Text {
+                    text: "committed root authority".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+            },
+        };
+        store
+            .protocol_event_store()
+            .seed_history_item_for_test(&item)
+            .expect("commit canonical UserTurn");
+
+        let _primary_owner = store.connection.lock().expect("hold primary sqlite mutex");
+        let authority = store
+            .permission_guardian_authority_store()
+            .canonical_user_authority_items_for_session(session_id)
+            .expect("dedicated Guardian reader must not contend with the primary owner");
+
+        assert_eq!(authority.len(), 1);
+        let stored = &authority[0];
+        assert_eq!(stored.id, item.id);
+        assert_eq!(stored.session_id, session_id);
+        assert_eq!(stored.scope, HistoryScope::Turn { turn_id });
+        assert_eq!(stored.sequence_no, 0);
+        assert_eq!(stored.created_at_ms, 42);
+        assert!(matches!(
+            &stored.payload,
+            HistoryItemPayload::UserTurn {
+                content,
+                prompt_dispatch: None,
+                editor_context: None,
+            } if matches!(
+                content.as_slice(),
+                [ContentPart::Text { text }] if text == "committed root authority"
+            )
+        ));
     }
 
     #[test]

@@ -29,7 +29,7 @@
 
 各stage monitorはassistant transcript bodyのexact `<|im_start|>` / `<|im_end|>` をprovider control-token leakとして扱う。検出時はconfig fieldを含まない最小projection evidenceとscreenshotを保存し、visible Stopをtrusted inputでexact 1回送ったうえで`case5_2-provider-control-token-leak`として即時fail-stopする。検出後のevidence、Stop、terminal acquisitionのいずれかがsettleしない場合は`harness_ng`とし、観測済みleakを`observed_product_failure` evidenceへ保持する。一般の`<|...|>`文字列やtool rowまでは検出しない。
 
-各stage間ではRustのterminal projectionだけで次turnへ進まず、実画面からrun stripとvisible Stopが消え、入力した次stage promptが保持され、送信buttonのtitle / accessible labelがnew-requestの`送信`へsettleしたことを確認してからtrusted clickする。送信後は直前Idle ownerと同じsessionに、異なるTurn ID、row / run targetで一致するadmission revision、直前値からexact +1のrevisionを持つ新Turnだけを取得する。running中の同じ`data-action="send"`はsteerを意味するため、これや旧Turnを次turnのSendとして扱わない。
+各stage間ではRustのterminal projectionだけで次turnへ進まず、実画面からrun stripとvisible Stopが消え、入力した次stage promptが保持され、送信buttonのtitle / accessible labelがnew-requestの`送信`へsettleしたことを確認する。さらにfrontendがrenderしたrun targetと同時点のfresh Rust run targetが2 sample連続で完全一致した後だけtrusted clickし、command probeでexact `submit_prompt` 1件、そのprompt / draft target / run target、`cancel_run` 0件を固定する。送信後は直前Idle ownerと同じsessionに、異なるTurn ID、row / run targetで一致するadmission revision、直前値からexact +1のrevisionを持つ新Turnだけを取得する。running中の同じ`data-action="send"`はsteerを意味するため、これや旧Turnを次turnのSendとして扱わない。
 
 ### Non-convergence safety cutoff
 

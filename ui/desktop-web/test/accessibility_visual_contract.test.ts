@@ -162,6 +162,13 @@ test("composer and overlay text entry controls have stable explicit labels", () 
     enhance_enabled: false,
     can_submit: false,
     workspace_path: "C:/workspace",
+    run_target: {
+      workspacePath: "C:/workspace",
+      sessionId: null,
+      runtimeOwnerToken: "idle:0",
+      permissionConfirmationId: null,
+      expectedState: { kind: "idle", latestTurnId: null, admissionRevision: "0" },
+    },
     token_meter_label: "",
   }));
   const workspace = renderOverlay(viewState({

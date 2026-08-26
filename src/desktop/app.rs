@@ -4746,6 +4746,59 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
+    async fn post_run_refresh_blocks_every_new_root_entrypoint_at_central_admission() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let expected_active_turn = controller.current_active_turn_expectation();
+        let next_root_run_generation = controller.next_root_run_generation;
+        controller.state.mark_post_run_refresh_pending();
+
+        assert!(!controller.start_run_at("new root prompt".to_string(), expected_active_turn,));
+        assert!(!controller.start_review_uncommitted_at(
+            "review current changes".to_string(),
+            expected_active_turn,
+        ));
+
+        controller.state.begin_prompt_enhance_at(
+            78,
+            "review source",
+            CancellationToken::new(),
+            expected_active_turn,
+        );
+        assert!(
+            controller
+                .state
+                .finish_prompt_enhance(78, "reviewed prompt".to_string())
+        );
+        assert!(!controller.send_prompt_review_at(
+            78,
+            true,
+            "reviewed prompt".to_string(),
+            expected_active_turn,
+        ));
+
+        assert_eq!(
+            controller.state.app_state.status_message.as_deref(),
+            Some("wait for the completed task to finish refreshing before sending")
+        );
+        assert!(controller.state.post_run_refresh_pending());
+        assert!(!controller.run_lifecycle.root_is_active());
+        assert_eq!(
+            controller.next_root_run_generation,
+            next_root_run_generation
+        );
+        assert_eq!(
+            controller
+                .state
+                .app_state
+                .prompt_review
+                .as_ref()
+                .map(|review| review.request_id),
+            Some(78),
+            "rejected review send keeps the exact review recoverable"
+        );
+    }
+
+    #[tokio::test]
     async fn prompt_review_central_admission_preserves_owner_and_draft_for_every_mutation_class() {
         let (_temp, _root, mut controller) = empty_access_test_controller().await;
         controller
@@ -12828,6 +12881,12 @@ impl DesktopController {
                 .set_status_message("wait for navigation to finish before starting a run");
             return false;
         }
+        if self.state.post_run_refresh_pending() {
+            self.state.set_status_message(
+                "wait for the completed task to finish refreshing before sending",
+            );
+            return false;
+        }
         if matches!(expected_active_turn, ActiveTurnExpectation::Turn { .. }) {
             if review_request.is_none()
                 && prompt_review_to_cancel.is_none()
@@ -12863,7 +12922,6 @@ impl DesktopController {
         self.next_root_run_generation = next_generation;
         let image_paths = self.state.composer.image_attachment_paths.clone();
         let run_control = RunControl::new();
-        self.state.clear_post_run_refresh_pending();
         self.state.begin_agent_run();
         let request = RunRequest {
             prompt: prompt.clone(),

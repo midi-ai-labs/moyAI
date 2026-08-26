@@ -926,7 +926,7 @@ fn validate_run_mutation_target(
         || parsed_expected_state != active_turn_expectation
     {
         return Err(DesktopCommandConflict::new(
-            "the active run owner changed before Stop was applied; review the current task and try again",
+            "the active run owner changed before the action was applied; review the current task and try again",
         ));
     }
     Ok(parsed_expected_state)
@@ -5480,7 +5480,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_target_rejects_workspace_session_and_runtime_owner_drift() {
+    fn run_mutation_target_rejects_owner_drift_with_operation_neutral_guidance() {
         let expected = DesktopRunMutationTarget {
             workspace_path: "C:/workspace".to_string(),
             session_id: Some("session-a".to_string()),
@@ -5528,16 +5528,18 @@ mod tests {
                 Some("42".to_string()),
             ),
         ] {
-            assert!(
-                validate_run_mutation_target(
-                    &expected,
-                    workspace,
-                    session_id,
-                    runtime_owner_token,
-                    permission_confirmation_id,
-                    ActiveTurnExpectation::initial_idle(),
-                )
-                .is_err()
+            let conflict = validate_run_mutation_target(
+                &expected,
+                workspace,
+                session_id,
+                runtime_owner_token,
+                permission_confirmation_id,
+                ActiveTurnExpectation::initial_idle(),
+            )
+            .expect_err("a stale run mutation owner must be rejected");
+            assert_eq!(
+                conflict.message,
+                "the active run owner changed before the action was applied; review the current task and try again"
             );
         }
     }

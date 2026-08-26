@@ -441,6 +441,58 @@ test("scripted provider can hold one valid Responses request in flight until the
   assert.equal(close.after.successful_response_count, 0);
 });
 
+test("scripted provider releases ordered Responses turns only through their exact index", async (context) => {
+  const turns = [
+    { prompt: "first prompt", responseText: "FIRST_RESPONSE" },
+    { prompt: "second prompt", responseText: "SECOND_RESPONSE" },
+  ];
+  const provider = await startScriptedProvider({
+    turns,
+    orderedConversation: true,
+    responseBehavior: "hold_until_release",
+  });
+  context.after(() => provider.close());
+
+  const firstRequest = fetch(`${provider.baseUrl}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(responsesRequest(turns[0].prompt)),
+  });
+  await waitFor(() => provider.requestLedger[0]?.response_phase === "held");
+  assert.equal(provider.resourceObservation().successful_response_count, 0);
+  assert.deepEqual(provider.releaseResponse(0), {
+    released: true,
+    turn_index: 0,
+    request: provider.requestLedger[0],
+  });
+  assert.equal((await firstRequest).status, 200);
+  await waitFor(() => provider.requestLedger[0]?.response_phase === "completed");
+  assert.throws(() => provider.releaseResponse(0), /already released/);
+
+  const secondBody = responsesRequest(turns[1].prompt);
+  secondBody.input = [
+    { type: "message", role: "user", content: [{ type: "input_text", text: turns[0].prompt }] },
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: turns[0].responseText }] },
+    { type: "message", role: "user", content: [{ type: "input_text", text: turns[1].prompt }] },
+  ];
+  const secondRequest = fetch(`${provider.baseUrl}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(secondBody),
+  });
+  await waitFor(() => provider.requestLedger[1]?.response_phase === "held");
+  assert.equal(provider.resourceObservation().response_release_count, 1);
+  provider.releaseResponse(1);
+  assert.equal((await secondRequest).status, 200);
+  await waitFor(() => provider.requestLedger[1]?.response_phase === "completed");
+  assert.deepEqual(provider.requestLedger.map((row) => [row.response_phase, row.response_status]), [
+    ["completed", 200],
+    ["completed", 200],
+  ]);
+  assert.equal(provider.resourceObservation().response_release_count, 2);
+  assert.equal(provider.resourceObservation().successful_response_count, 2);
+});
+
 test("scripted provider rejects unknown response behavior before binding a listener", async () => {
   await assert.rejects(
     startScriptedProvider({ responseBehavior: "run-number-95" }),

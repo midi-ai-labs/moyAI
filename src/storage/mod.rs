@@ -210,6 +210,12 @@ impl StoreBundle {
         self.store.protocol_event_store()
     }
 
+    pub(crate) fn permission_guardian_authority_store(
+        &self,
+    ) -> crate::protocol::SqliteProtocolEventStore {
+        self.store.permission_guardian_authority_store()
+    }
+
     pub fn cleanup_orphan_internal_files(&self) -> Result<StorageMaintenanceReport, StorageError> {
         self.store.cleanup_orphan_internal_files()
     }

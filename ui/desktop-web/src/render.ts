@@ -1206,7 +1206,7 @@ export function renderComposer(
   const trayVisible = controlsVisible || state.attached_images.length > 0;
   const goalHint = goalSlashCommandHint(state.draft_prompt);
   return `
-    <section class="composer ${goalHint ? "goal-command" : ""}">
+    <section class="composer ${goalHint ? "goal-command" : ""}" data-run-target="${escapeHtml(JSON.stringify(state.run_target))}">
       ${trayVisible ? renderAttachmentTray(state, controlsVisible) : ""}
       <label class="sr-only" for="prompt">moyAIへの依頼</label>
       <textarea id="prompt" placeholder="moyAI に依頼する" aria-describedby="goal-command-hint" ${state.navigation_loading ? "disabled" : ""}>${escapeHtml(state.draft_prompt)}</textarea>

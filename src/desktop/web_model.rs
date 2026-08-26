@@ -312,6 +312,7 @@ fn composer_new_request_admission_is_open(
     busy: bool,
     navigation_loading: bool,
     background_mutation_pending: bool,
+    post_run_refresh_pending: bool,
 ) -> bool {
     matches!(
         runtime.active_turn_expectation,
@@ -319,6 +320,7 @@ fn composer_new_request_admission_is_open(
     ) && !busy
         && !navigation_loading
         && !background_mutation_pending
+        && !post_run_refresh_pending
         && !runtime.blocks_new_request()
 }
 
@@ -767,6 +769,7 @@ pub(crate) fn desktop_web_state_with_permission(
         busy,
         state.navigation_loading(),
         state.background_mutation_pending(),
+        state.post_run_refresh_pending(),
     );
     let prompt_review_owner_is_current =
         state.app_state.prompt_review.as_ref().is_none_or(|review| {
@@ -2164,6 +2167,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         ));
         assert!(composer_steer_admission_is_open(
             &DesktopRuntimeProjection {
@@ -2210,12 +2214,21 @@ mod tests {
             false,
             false,
             false,
+            false,
+        ));
+        assert!(!composer_new_request_admission_is_open(
+            &DesktopRuntimeProjection::default(),
+            false,
+            false,
+            false,
+            true,
         ));
         assert!(composer_new_request_admission_is_open(
             &DesktopRuntimeProjection {
                 agent_tree_active: true,
                 ..DesktopRuntimeProjection::default()
             },
+            false,
             false,
             false,
             false,
@@ -2863,6 +2876,53 @@ mod tests {
                 admission_revision,
             } if projected_turn_id == turn_id.to_string() && admission_revision == "1"
         ));
+    }
+
+    #[test]
+    fn post_run_refresh_closes_new_request_until_the_durable_owner_settles() {
+        let session_id = crate::session::SessionId::new();
+        let turn_id = crate::protocol::TurnId::new();
+        let mut state = DesktopState::new(
+            super::super::models::DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            crate::config::ResolvedConfig::default(),
+        );
+        state.app_state.current_session_id = Some(session_id);
+        let runtime = DesktopRuntimeProjection {
+            active_turn_expectation: ActiveTurnExpectation::Idle {
+                latest_turn_id: Some(turn_id),
+                revision: 2,
+            },
+            ..DesktopRuntimeProjection::default()
+        };
+
+        state.mark_post_run_refresh_pending();
+        let pending = desktop_web_state(&state, &runtime);
+        assert!(pending.post_run_refresh_pending);
+        assert_eq!(
+            pending.composer_submit_mode,
+            DesktopComposerSubmitMode::Blocked
+        );
+        assert!(!pending.can_submit);
+
+        state.clear_post_run_refresh_pending();
+        let settled = desktop_web_state(&state, &runtime);
+        assert!(!settled.post_run_refresh_pending);
+        assert_eq!(
+            settled.composer_submit_mode,
+            DesktopComposerSubmitMode::NewRequest
+        );
+        assert!(settled.can_submit);
     }
 
     #[test]

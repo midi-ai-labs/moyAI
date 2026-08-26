@@ -3177,7 +3177,7 @@ async fn permission_guardian_authority_snapshot(
         }
         let progress_state = Arc::clone(&worker_state);
         store
-            .protocol_event_store()
+            .permission_guardian_authority_store()
             .canonical_user_authority_items_for_session_with_interrupt(
                 authority_session_id,
                 |interrupt| worker_state.register_interrupt(interrupt),

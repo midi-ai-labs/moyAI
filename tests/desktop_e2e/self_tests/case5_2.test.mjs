@@ -59,7 +59,15 @@ const TURN_ID = "01K3CASE52TURN000000000000";
 
 test("manual.case5_2 waits for the visible GUI composer to leave steer mode before Send", () => {
   const prompt = "implement stage 3";
+  const runTarget = {
+    workspacePath: "C:/workspace",
+    sessionId: SESSION_ID,
+    runtimeOwnerToken: "idle:2",
+    permissionConfirmationId: null,
+    expectedState: { kind: "idle", latestTurnId: TURN_ID, admissionRevision: "2" },
+  };
   const ready = {
+    composer_count: 1,
     prompt_count: 1,
     prompt_value: prompt,
     prompt_disabled: false,
@@ -69,19 +77,27 @@ test("manual.case5_2 waits for the visible GUI composer to leave steer mode befo
     send_aria_label: "送信",
     run_strip_count: 0,
     visible_stop_count: 0,
+    rendered_run_target: runTarget,
+    run_target_parse_error: null,
   };
-  assert.equal(case52NewRequestComposerSurfaceReady(ready, prompt), true);
+  assert.equal(case52NewRequestComposerSurfaceReady(ready, prompt, runTarget), true);
   for (const drift of [
+    { composer_count: 0 },
     { prompt_value: "stale draft" },
     { send_disabled: true },
     { send_title: "実行中のタスクへ追加指示を送信" },
     { send_aria_label: "実行中のタスクへ追加指示を送信" },
     { run_strip_count: 1 },
     { visible_stop_count: 1 },
+    { rendered_run_target: { ...runTarget, runtimeOwnerToken: "idle:1" } },
+    { rendered_run_target: { ...runTarget, expectedState: { ...runTarget.expectedState, admissionRevision: "1" } } },
+    { rendered_run_target: null },
+    { run_target_parse_error: "SyntaxError: malformed JSON" },
   ]) {
-    assert.equal(case52NewRequestComposerSurfaceReady({ ...ready, ...drift }, prompt), false);
+    assert.equal(case52NewRequestComposerSurfaceReady({ ...ready, ...drift }, prompt, runTarget), false);
   }
-  assert.throws(() => case52NewRequestComposerSurfaceReady(ready, null), /expected composer prompt/);
+  assert.throws(() => case52NewRequestComposerSurfaceReady(ready, null, runTarget), /expected composer prompt/);
+  assert.throws(() => case52NewRequestComposerSurfaceReady(ready, prompt, null), /expected run target/);
 });
 
 test("manual.case5_2 accepts only a newly admitted Turn after an Idle owner", () => {

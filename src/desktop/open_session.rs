@@ -464,7 +464,9 @@ fn stored_transcript_covers_live_conversation(
     // another User row while that earlier Assistant is absent or still partial
     // in live state. Prefer the complete canonical suffix only when every live
     // primary row remains exact, except for a non-empty Assistant prefix, and
-    // the only canonical gaps are Assistant rows.
+    // the only canonical gaps are Assistant or durable Error rows. A failed
+    // ToolStatus can be committed as an Error without reaching the live
+    // renderer before terminal projection settles.
     canonical_suffix_covers_live_conversation(&stored_rows, &live_rows)
 }
 
@@ -472,7 +474,7 @@ fn canonical_suffix_covers_live_conversation(
     stored: &[(super::models::DesktopTranscriptRowKind, String)],
     live: &[(super::models::DesktopTranscriptRowKind, String)],
 ) -> bool {
-    use super::models::DesktopTranscriptRowKind::Assistant;
+    use super::models::DesktopTranscriptRowKind::{Assistant, Error};
 
     for suffix_start in 0..stored.len() {
         let mut live_index = 0;
@@ -488,7 +490,7 @@ fn canonical_suffix_covers_live_conversation(
                 {
                     live_index += 1;
                 }
-                _ if stored_row.0 == Assistant => {}
+                _ if matches!(stored_row.0, Assistant | Error) => {}
                 _ => {
                     valid = false;
                     break;
@@ -1620,6 +1622,137 @@ mod tests {
                 .iter()
                 .any(|row| row.body == "display-only advisory")
         );
+    }
+
+    #[test]
+    fn terminal_live_detail_reconciles_a_canonical_error_gap_and_partial_assistant() {
+        let session = session();
+        let turn_id = TurnId::new();
+        let mut items = Vec::with_capacity(641);
+        items.push(turn_item(
+            session.id,
+            turn_id,
+            1,
+            TurnItemPayload::UserMessage {
+                text: "complete the long-running task".to_string(),
+            },
+        ));
+        for sequence_no in 2..=638 {
+            items.push(turn_item(
+                session.id,
+                turn_id,
+                sequence_no,
+                TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Shell,
+                    status: crate::protocol::ToolLifecycleStatus::Completed,
+                    title: format!("completed step {sequence_no}"),
+                    summary: "completed".to_string(),
+                },
+            ));
+        }
+        items.extend([
+            turn_item(
+                session.id,
+                turn_id,
+                639,
+                TurnItemPayload::ToolStatus {
+                    call_id: crate::session::ToolCallId::new(),
+                    tool: crate::tool::ToolName::Write,
+                    status: crate::protocol::ToolLifecycleStatus::Failed,
+                    title: "Tool failed".to_string(),
+                    summary: "tool edit error: no edit baseline exists".to_string(),
+                },
+            ),
+            turn_item(
+                session.id,
+                turn_id,
+                640,
+                TurnItemPayload::AgentMessage {
+                    text: "CANONICAL_COMPLETED_RESPONSE".to_string(),
+                },
+            ),
+            turn_item(
+                session.id,
+                turn_id,
+                641,
+                TurnItemPayload::Terminal {
+                    outcome: TurnTerminalOutcome::Completed,
+                },
+            ),
+        ]);
+        assert_eq!(items.len(), 641);
+        let view = OpenSessionView::from_loaded(&canonical_read(&session, 0, 80, 641, items));
+
+        let mut live = AppState::default();
+        live.current_session_id = Some(session.id);
+        live.transcript_entries = vec![
+            TranscriptEntry {
+                kind: TranscriptKind::User,
+                title: "User".to_string(),
+                body: "complete the long-running task".to_string(),
+                response_id: None,
+                tool_call_id: None,
+            },
+            TranscriptEntry {
+                kind: TranscriptKind::Assistant,
+                title: "Assistant".to_string(),
+                body: "CANONICAL_COMPLETED_".to_string(),
+                response_id: None,
+                tool_call_id: None,
+            },
+        ];
+        live.apply_run_summary(crate::session::RunSummary::from_terminal(
+            session.id,
+            turn_id,
+            crate::session::DurableTurnTerminal {
+                outcome: TurnTerminalOutcome::Completed,
+                final_response_id: None,
+                tool_call_count: 638,
+                failed_tool_count: 1,
+                change_count: 0,
+                metrics: Default::default(),
+            },
+        ));
+        let uncorrected = build_session_detail_from_app_state_with_session(&live, Some(&session));
+        assert_eq!(
+            primary_conversation_rows(&uncorrected),
+            vec![
+                (
+                    DesktopTranscriptRowKind::User,
+                    "complete the long-running task".to_string(),
+                ),
+                (
+                    DesktopTranscriptRowKind::Assistant,
+                    "CANONICAL_COMPLETED_".to_string(),
+                ),
+            ]
+        );
+
+        let detail = view.live_detail(&live, None);
+
+        assert_eq!(
+            primary_conversation_rows(&detail),
+            vec![
+                (
+                    DesktopTranscriptRowKind::User,
+                    "complete the long-running task".to_string(),
+                ),
+                (
+                    DesktopTranscriptRowKind::Error,
+                    "tool edit error: no edit baseline exists".to_string(),
+                ),
+                (
+                    DesktopTranscriptRowKind::Assistant,
+                    "CANONICAL_COMPLETED_RESPONSE".to_string(),
+                ),
+            ]
+        );
+        assert!(!detail.transcript_text.contains("CANONICAL_COMPLETED_\n"));
+        assert_eq!(detail.turn_page_offset, 0);
+        assert_eq!(detail.turn_page_limit, 80);
+        assert_eq!(detail.turn_page_total, 641);
+        assert!(!detail.turn_page_has_more);
     }
 
     #[test]

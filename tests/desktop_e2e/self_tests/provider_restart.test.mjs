@@ -81,7 +81,15 @@ test("provider restart fixture intentionally covers legacy split-mode normalizat
   assert.match(config, /provider_metadata_mode = "openai_compatible_only"/);
   assert.match(config, /provider_api_mode = "responses"/);
   assert.doesNotMatch(config, /provider_profile\s*=/);
+  assert.match(config, /supports_tools = false/);
   assert.match(config, /\[model\.extra_body_json\]\r?\n\r?\n\[permissions\]/);
+
+  const toolEnabled = providerRestartFixtureConfig("http://127.0.0.1:19454", { supportsTools: true });
+  assert.match(toolEnabled, /supports_tools = true/);
+  assert.throws(
+    () => providerRestartFixtureConfig("http://127.0.0.1:19454", { supportsTools: "true" }),
+    /supportsTools must be boolean/,
+  );
 });
 
 test("fresh provider terminal requires exact transcript, idle projection, and rendered DOM", () => {

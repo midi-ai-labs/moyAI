@@ -747,6 +747,15 @@ function attribute(tag: string, name: string): string | null {
   return match?.[1] ?? match?.[2] ?? null;
 }
 
+function decodeHtmlAttribute(value: string): string {
+  return value
+    .replaceAll("&quot;", '"')
+    .replaceAll("&#39;", "'")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&");
+}
+
 function actionButtons(html: string): Array<{
   action: string;
   index: number;
@@ -779,6 +788,21 @@ test("every rendered button has one non-empty GUI action owner", () => {
   // Native window controls also use data-action so keyboard/pointer dispatch shares the same
   // exact-once owner. There are currently no intentional action-less button exceptions.
   assert.deepEqual(unwired, []);
+});
+
+test("composer exposes the exact frontend-owned run target for settlement checks", () => {
+  const state = representativeState({
+    workspace_path: 'C:/workspace/&"owner"',
+    run_target: {
+      ...representativeState().run_target,
+      workspacePath: 'C:/workspace/&"owner"',
+    },
+  });
+  const section = /<section\b[^>]*class="composer[^"]*"[^>]*>/i.exec(renderComposer(state))?.[0];
+  assert.ok(section, "composer section must be rendered");
+  const encoded = attribute(section, "data-run-target");
+  assert.notEqual(encoded, null, "composer must expose its rendered run owner");
+  assert.deepEqual(JSON.parse(decodeHtmlAttribute(encoded ?? "")), state.run_target);
 });
 
 test("initial setup is a six-step blocking shell and session settings exposes stable root-only locators", () => {

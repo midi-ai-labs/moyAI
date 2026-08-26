@@ -37,7 +37,10 @@ const SEND = Object.freeze({
   identity: { tag: "BUTTON", action: "send" },
 });
 
-export function providerRestartFixtureConfig(baseUrl) {
+export function providerRestartFixtureConfig(baseUrl, { supportsTools = false } = {}) {
+  if (typeof supportsTools !== "boolean") {
+    throw new TypeError("supportsTools must be boolean");
+  }
   return `[model]
 base_url = ${JSON.stringify(baseUrl)}
 model = ${JSON.stringify(SCRIPTED_PROVIDER_MODEL_ID)}
@@ -49,7 +52,7 @@ request_timeout_ms = 30000
 max_retries = 0
 context_window = 65536
 max_output_tokens = 1024
-supports_tools = false
+supports_tools = ${supportsTools}
 supports_reasoning = false
 supports_images = false
 parallel_tool_calls = false
@@ -246,6 +249,7 @@ export async function observeProviderTurnSurface(cdp) {
       visible: visible(row),
     }));
     const prompt = document.querySelector('textarea#prompt');
+    const send = document.querySelector('button[data-action="send"]');
     return {
       projection,
       thread_count: document.querySelectorAll('main.conversation #thread').length,
@@ -258,6 +262,11 @@ export async function observeProviderTurnSurface(cdp) {
         value: prompt instanceof HTMLTextAreaElement ? prompt.value : null,
         visible: visible(prompt),
         enabled: prompt instanceof HTMLTextAreaElement && !prompt.disabled && !prompt.readOnly,
+      },
+      send: {
+        count: document.querySelectorAll('button[data-action="send"]').length,
+        visible: visible(send),
+        enabled: send instanceof HTMLButtonElement && !send.disabled,
       },
       visible_fatal_count: Array.from(document.querySelectorAll('.fatal')).filter(visible).length,
       visible_recoverable_error_count: Array.from(document.querySelectorAll('.ui-error-notice')).filter(visible).length,

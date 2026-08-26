@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import {
   lstat,
   mkdir,
@@ -1693,15 +1694,27 @@ async function exactDomValue(cdp, selector) {
 
 async function newRequestComposerSurface(cdp) {
   return cdp.evaluate(`(() => {
+    const composers = document.querySelectorAll("section.composer");
     const prompts = document.querySelectorAll("section.composer textarea#prompt");
     const sends = document.querySelectorAll('section.composer button[data-action="send"]');
+    const composer = composers.length === 1 && composers[0] instanceof HTMLElement
+      ? composers[0]
+      : null;
     const prompt = prompts.length === 1 && prompts[0] instanceof HTMLTextAreaElement
       ? prompts[0]
       : null;
     const send = sends.length === 1 && sends[0] instanceof HTMLButtonElement
       ? sends[0]
       : null;
+    const runTargetText = composer?.getAttribute("data-run-target") ?? null;
+    let renderedRunTarget = null;
+    let runTargetParseError = null;
+    if (runTargetText !== null) {
+      try { renderedRunTarget = JSON.parse(runTargetText); }
+      catch (error) { runTargetParseError = String(error); }
+    }
     return {
+      composer_count: composers.length,
       prompt_count: prompts.length,
       prompt_value: prompt?.value ?? null,
       prompt_disabled: prompt?.disabled ?? null,
@@ -1711,15 +1724,21 @@ async function newRequestComposerSurface(cdp) {
       send_aria_label: send?.getAttribute("aria-label") ?? null,
       run_strip_count: document.querySelectorAll("section.run-strip").length,
       visible_stop_count: document.querySelectorAll('section.run-strip button[data-action="cancel-run"]').length,
+      rendered_run_target: renderedRunTarget,
+      run_target_parse_error: runTargetParseError,
     };
   })()`);
 }
 
-export function case52NewRequestComposerSurfaceReady(surface, expectedPrompt) {
+export function case52NewRequestComposerSurfaceReady(surface, expectedPrompt, expectedRunTarget) {
   if (typeof expectedPrompt !== "string") {
     throw new TypeError("case5_2 expected composer prompt must be a string");
   }
-  return surface?.prompt_count === 1
+  if (expectedRunTarget === null || typeof expectedRunTarget !== "object" || Array.isArray(expectedRunTarget)) {
+    throw new TypeError("case5_2 expected run target must be an object");
+  }
+  return surface?.composer_count === 1
+    && surface.prompt_count === 1
     && surface.prompt_value === expectedPrompt
     && surface.prompt_disabled === false
     && surface.send_count === 1
@@ -1727,7 +1746,9 @@ export function case52NewRequestComposerSurfaceReady(surface, expectedPrompt) {
     && surface.send_title === "送信"
     && surface.send_aria_label === "送信"
     && surface.run_strip_count === 0
-    && surface.visible_stop_count === 0;
+    && surface.visible_stop_count === 0
+    && surface.run_target_parse_error === null
+    && isDeepStrictEqual(surface.rendered_run_target, expectedRunTarget);
 }
 
 async function transcriptExports(workspace) {
@@ -3040,34 +3061,115 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
       identity: beforeIdentity,
     });
   }
-  const previousExpectedState = expectedSessionId === null
-    ? null
-    : before?.run_target?.expectedState ?? null;
   await insertExactText({ cdp, input, locator: PROMPT, text: prompt, action: `${stage.id}-prompt`, sink });
+  let consecutiveOwnerMatches = 0;
+  let lastMatchingRunTarget = null;
   const composerSettlement = await waitForObservation({
     label: `case5_2 ${stage.id} GUI new-request composer settlement`,
     timeoutMs: 30_000,
     pollMs: 100,
-    sample: () => newRequestComposerSurface(cdp),
-    accept: (surface) => case52NewRequestComposerSurfaceReady(surface, prompt),
+    sample: async () => {
+      const projection = await desktopProjection(cdp);
+      const surface = await newRequestComposerSurface(cdp);
+      return {
+        projection,
+        backend_run_target: projection?.run_target ?? null,
+        backend_draft_target: projection?.draft_target ?? null,
+        surface,
+      };
+    },
+    accept: (sample) => {
+      const expectedRunTarget = sample?.backend_run_target;
+      const ready = expectedRunTarget !== null
+        && typeof expectedRunTarget === "object"
+        && !Array.isArray(expectedRunTarget)
+        && case52NewRequestComposerSurfaceReady(sample?.surface, prompt, expectedRunTarget);
+      if (!ready) {
+        consecutiveOwnerMatches = 0;
+        lastMatchingRunTarget = null;
+        return false;
+      }
+      consecutiveOwnerMatches = lastMatchingRunTarget !== null
+        && isDeepStrictEqual(lastMatchingRunTarget, expectedRunTarget)
+        ? consecutiveOwnerMatches + 1
+        : 1;
+      lastMatchingRunTarget = structuredClone(expectedRunTarget);
+      return consecutiveOwnerMatches >= 2;
+    },
   });
+  const settledProjection = composerSettlement.value.projection;
+  const settledRunTarget = composerSettlement.value.backend_run_target;
+  const settledDraftTarget = composerSettlement.value.backend_draft_target;
+  const settledIdentity = selectedNavigationIdentity(settledProjection);
+  if (expectedSessionId !== null && settledIdentity.session_id !== expectedSessionId) {
+    throw productFailure("case5_2-session-before-send", `${stage.id} changed Project Chat while settling the composer owner`, {
+      expected_session_id: expectedSessionId,
+      identity: settledIdentity,
+    });
+  }
+  const previousExpectedState = expectedSessionId === null
+    ? null
+    : settledRunTarget?.expectedState ?? null;
   await sink.record("case5_2-composer-settled", {
     stage: stage.id,
     elapsed_ms: composerSettlement.elapsed_ms,
+    consecutive_owner_matches: consecutiveOwnerMatches,
     prompt_value_sha256: sourceIdentity.gui_text_sha256,
     prompt_value_bytes: sourceIdentity.gui_text_size_bytes,
+    backend_run_target: settledRunTarget,
+    backend_draft_target: settledDraftTarget,
     surface: {
-      ...composerSettlement.value,
+      ...composerSettlement.value.surface,
       prompt_value: null,
     },
   }, { phase: "executing", owner: OWNER });
-  const send = await recordTrustedClick({
-    input,
-    locator: SEND_NEW_REQUEST,
-    action: `${stage.id}-send`,
-    sink,
-    stableHitSamples: 3,
+  const sendCommandProbe = new DesktopCommandProbe(cdp, {
+    probeId: `case5-2-${stage.id}-send`,
+    commands: ["submit_prompt", "cancel_run"],
   });
+  await sendCommandProbe.install();
+  let send;
+  let sendCommand;
+  try {
+    const commandStart = (await sendCommandProbe.snapshot()).sequence;
+    send = await recordTrustedClick({
+      input,
+      locator: SEND_NEW_REQUEST,
+      action: `${stage.id}-send`,
+      sink,
+      stableHitSamples: 3,
+    });
+    const commandObservation = await waitForObservation({
+      label: `case5_2 ${stage.id} exact trusted Send command`,
+      timeoutMs: 10_000,
+      pollMs: 50,
+      sample: () => sendCommandProbe.snapshot(commandStart),
+      accept: (snapshot) => snapshot.calls.length >= 1,
+    });
+    sendCommand = assertExactDesktopCommandSequence(commandObservation.value, {
+      afterSequence: commandStart,
+      expected: [{
+        command: "submit_prompt",
+        args: {
+          text: prompt,
+          expectedTarget: settledDraftTarget,
+          expectedRunTarget: settledRunTarget,
+        },
+      }],
+    });
+    await sink.record("case5_2-send-command", {
+      stage: stage.id,
+      command: "submit_prompt",
+      sequence: sendCommand.last_sequence,
+      text_sha256: sourceIdentity.gui_text_sha256,
+      text_size_bytes: sourceIdentity.gui_text_size_bytes,
+      expected_target: settledDraftTarget,
+      expected_run_target: settledRunTarget,
+      cancel_run_count: 0,
+    }, { phase: "executing", owner: OWNER });
+  } finally {
+    await sendCommandProbe.remove();
+  }
   const acquired = await waitForTurnAcquisition(cdp, { expectedSessionId, previousExpectedState });
   const acquiredProjection = acquired.value;
   const row = selectedSessionRow(acquiredProjection);
@@ -3088,6 +3190,7 @@ async function executeStage({ context, cdp, input, sink, baseline, referenceMani
     previous_expected_state: previousExpectedState,
     identity,
     send,
+    send_command_sequence: sendCommand?.last_sequence ?? null,
     acquisition_elapsed_ms: acquired.elapsed_ms,
   }, { phase: "executing", owner: OWNER });
   const terminal = await waitForStageTerminal({
