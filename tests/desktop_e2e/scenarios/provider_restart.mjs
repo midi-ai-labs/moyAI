@@ -242,6 +242,14 @@ export async function observeProviderTurnSurface(cdp) {
       text: (row.querySelector('.markdown-body')?.innerText ?? '').trim(),
       visible: visible(row),
     }));
+    const allTranscriptRows = Array.from(document.querySelectorAll(
+      'main.conversation #thread article.message'
+    )).map((row) => ({
+      history_identity: row.getAttribute('data-history-identity'),
+      classes: Array.from(row.classList).sort(),
+      text: (row instanceof HTMLElement ? row.innerText : '').trim(),
+      visible: visible(row),
+    }));
     const selected = Array.from(document.querySelectorAll(
       'button.nav-row[aria-current="page"][data-action="session"], button.nav-row[aria-current="page"][data-action="chat-session"]'
     )).map((row) => ({
@@ -257,6 +265,7 @@ export async function observeProviderTurnSurface(cdp) {
       users: rows('main.conversation #thread article.message.user'),
       assistants: rows('main.conversation #thread article.message.assistant'),
       completed_summaries: rows('main.conversation #thread article.message.work-summary.work_summary_completed'),
+      all_transcript_rows: allTranscriptRows,
       selected_navigation: selected,
       prompt: {
         count: document.querySelectorAll('textarea#prompt').length,

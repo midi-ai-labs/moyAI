@@ -22,6 +22,47 @@ export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT =
   "Use current_time exactly once with {}. After the tool result, reply only CHAT_TOOL_CONTINUATION_OK.";
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_RESPONSE = "CHAT_TOOL_CONTINUATION_OK";
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_CALL_ID = "call_chat_current_time";
+export const SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND = "responses_compaction_retry";
+export const SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT = 8;
+export const SCRIPTED_PROVIDER_RESPONSES_COMPACTION_MAX_RESPONSES =
+  SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT + 3;
+export const SCRIPTED_PROVIDER_RESPONSES_COMPACTION_SATURATION_PROMPT_TOKENS = 13_000;
+export const SCRIPTED_PROVIDER_RESPONSES_COMPACTION_SATURATION_TOTAL_TOKENS = 31_129;
+export const SCRIPTED_PROVIDER_RESPONSES_COMPACTION_SENTINEL =
+  "E2E_RESPONSES_COMPACTION_RETRY.txt";
+export const SCRIPTED_PROVIDER_RESPONSES_COMPACTION_PROMPT =
+  `Read ${SCRIPTED_PROVIDER_RESPONSES_COMPACTION_SENTINEL} one line at a time with read offsets 1 through ${SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT} and limit 1. After every line is observed, reply only RESPONSES_COMPACTION_RETRY_OK.`;
+export const SCRIPTED_PROVIDER_RESPONSES_COMPACTION_RESPONSE =
+  "RESPONSES_COMPACTION_RETRY_OK";
+export const SCRIPTED_PROVIDER_RESPONSES_COMPACTION_RAW_REASONING_SENTINEL =
+  "E2E_PRIVATE_REASONING_MUST_NOT_REACH_TRANSCRIPT_7F3A9C";
+export const SCRIPTED_PROVIDER_RESPONSES_COMPACTION_CHECKPOINT = `## Objective and exact contract
+Complete the deterministic bounded compaction GUI regression and return its exact final response.
+
+## Observed changes and remaining state
+The bounded read units selected by this checkpoint were observed; later read units and the final response remain pending.
+
+## Exact failures and retry guards
+The larger compaction request exhausted host-owned reasoning without answer text and must not be repeated unchanged.
+
+## Open interactions and ownership boundaries
+The provider owns generation behavior while moyAI owns semantic-unit selection, canonical compaction, and tool replay.
+
+## Next falsifying actions
+Resume from this checkpoint, retain complete read call/output units, and return the exact requested final response.
+
+## Evidence coverage
+The selected read units and smaller retry were observed; canonical commit, remaining context, and final GUI completion still require verification.`;
+export const SCRIPTED_PROVIDER_COMPACTION_HEADINGS = Object.freeze([
+  "## Objective and exact contract",
+  "## Observed changes and remaining state",
+  "## Exact failures and retry guards",
+  "## Open interactions and ownership boundaries",
+  "## Next falsifying actions",
+  "## Evidence coverage",
+]);
+export const SCRIPTED_PROVIDER_COMPACTION_SUMMARY_PREFIX =
+  "Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:";
 export const SCRIPTED_PROVIDER_RESPONSE_BEHAVIORS = Object.freeze([
   "complete",
   "hold_until_release",
@@ -154,7 +195,7 @@ function agentInterruptScript(value) {
   });
 }
 
-function knownMissingRelativePath(value, name) {
+function normalizedRelativePath(value, name) {
   const path = nonEmptyString(value, name);
   const segments = path.split("/");
   if (path.includes("\\")
@@ -164,6 +205,10 @@ function knownMissingRelativePath(value, name) {
     throw new TypeError(`${name} must be a normalized relative path without traversal`);
   }
   return path;
+}
+
+function knownMissingRelativePath(value, name) {
+  return normalizedRelativePath(value, name);
 }
 
 function toolErrorRecoveryScript(value) {
@@ -218,6 +263,40 @@ function chatToolContinuationScript(value) {
   return Object.freeze({ kind: value.kind });
 }
 
+function responsesCompactionScript(value) {
+  const expectedKeys = [
+    "checkpointText",
+    "inputByteThreshold",
+    "kind",
+    "responseText",
+    "sentinelPath",
+    "toolCallCount",
+  ];
+  if (!exactKeys(value, expectedKeys)
+    || value.kind !== SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND) {
+    throw new TypeError("Responses compaction retry scripted provider mode must use its exact schema");
+  }
+  const toolCallCount = positiveInteger(value.toolCallCount, "script.toolCallCount");
+  if (toolCallCount < 3 || toolCallCount > 16) {
+    throw new TypeError("script.toolCallCount must be between 3 and 16");
+  }
+  const inputByteThreshold = positiveInteger(
+    value.inputByteThreshold,
+    "script.inputByteThreshold",
+  );
+  if (inputByteThreshold >= SCRIPTED_PROVIDER_MAX_BODY_BYTES) {
+    throw new TypeError("script.inputByteThreshold must be below the provider body limit");
+  }
+  return Object.freeze({
+    kind: value.kind,
+    sentinelPath: normalizedRelativePath(value.sentinelPath, "script.sentinelPath"),
+    toolCallCount,
+    inputByteThreshold,
+    checkpointText: nonEmptyString(value.checkpointText, "script.checkpointText"),
+    responseText: nonEmptyString(value.responseText, "script.responseText"),
+  });
+}
+
 function providerScript(value) {
   if (value === null || value === undefined) return null;
   if (value?.kind === SCRIPTED_PROVIDER_AGENT_INTERRUPT_KIND) return agentInterruptScript(value);
@@ -227,6 +306,9 @@ function providerScript(value) {
   }
   if (value?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
     return chatToolContinuationScript(value);
+  }
+  if (value?.kind === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND) {
+    return responsesCompactionScript(value);
   }
   throw new TypeError("scripted provider mode must use a known kind and its exact schema");
 }
@@ -240,6 +322,9 @@ function scriptedResponseMaximum(script) {
   }
   if (script?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
     return SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_MAX_RESPONSES;
+  }
+  if (script?.kind === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND) {
+    return script.toolCallCount + 3;
   }
   return SCRIPTED_PROVIDER_AGENT_INTERRUPT_MAX_RESPONSES;
 }
@@ -292,6 +377,23 @@ export function createPermissionRestartGuardianProviderScript({
 export function createChatToolContinuationProviderScript() {
   return chatToolContinuationScript({
     kind: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND,
+  });
+}
+
+export function createResponsesCompactionProviderScript({
+  sentinelPath = SCRIPTED_PROVIDER_RESPONSES_COMPACTION_SENTINEL,
+  toolCallCount = SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT,
+  inputByteThreshold,
+  checkpointText = SCRIPTED_PROVIDER_RESPONSES_COMPACTION_CHECKPOINT,
+  responseText = SCRIPTED_PROVIDER_RESPONSES_COMPACTION_RESPONSE,
+} = {}) {
+  return responsesCompactionScript({
+    kind: SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND,
+    sentinelPath,
+    toolCallCount,
+    inputByteThreshold,
+    checkpointText,
+    responseText,
   });
 }
 
@@ -1111,6 +1213,257 @@ function toolErrorRecoveryRequestContract(body, modelId, expectedPrompt, script)
   };
 }
 
+function responsesCompactionReadExpected(script, callIndex) {
+  return {
+    callId: `call_responses_compaction_read_${callIndex}`,
+    itemId: `fc_responses_compaction_read_${callIndex}`,
+    arguments: JSON.stringify({
+      path: script.sentinelPath,
+      offset: callIndex,
+      limit: 1,
+    }),
+  };
+}
+
+function responsesCompactionReadPair(input, itemIndex, script, callIndex) {
+  const call = input[itemIndex];
+  const output = input[itemIndex + 1];
+  const expected = responsesCompactionReadExpected(script, callIndex);
+  const callMatches = exactKeys(call, ["arguments", "call_id", "name", "type"])
+    && call.type === "function_call"
+    && call.call_id === expected.callId
+    && call.name === "read"
+    && call.arguments === expected.arguments;
+  const outputText = exactKeys(output, ["call_id", "output", "type"])
+    && output.type === "function_call_output"
+    && output.call_id === expected.callId
+    && typeof output.output === "string"
+    && output.output.trim().length > 0
+    ? output.output
+    : null;
+  return {
+    pass: callMatches && outputText !== null,
+    signature: callMatches && outputText !== null
+      ? sha256(Buffer.from(JSON.stringify([call, output]), "utf8"))
+      : null,
+    output_size_bytes: outputText === null ? null : Buffer.byteLength(outputText, "utf8"),
+    output_sha256: outputText === null ? null : sha256(Buffer.from(outputText, "utf8")),
+  };
+}
+
+function compactionPromptText(item) {
+  const text = exactInputText(item);
+  if (text === null || !text.startsWith("# Context checkpoint compaction\n")) return null;
+  const headings = Array.from(text.matchAll(/^## .+$/gmu), (match) => match[0]);
+  return JSON.stringify(headings) === JSON.stringify(SCRIPTED_PROVIDER_COMPACTION_HEADINGS)
+    ? text
+    : null;
+}
+
+function responsesCompactionReadPrefix(
+  input,
+  expectedPrompt,
+  script,
+  { requireCompactionPrompt = false } = {},
+) {
+  const items = Array.isArray(input) ? input : [];
+  const sourceEnd = requireCompactionPrompt ? items.length - 1 : items.length;
+  const terminalText = requireCompactionPrompt ? compactionPromptText(items.at(-1)) : null;
+  const terminalMatches = !requireCompactionPrompt
+    ? true
+    : sourceEnd >= 1 && terminalText !== null;
+  const source = sourceEnd >= 0 ? items.slice(0, sourceEnd) : [];
+  const firstPromptMatches = exactInputText(source[0]) === expectedPrompt;
+  const pairItemCount = source.length - 1;
+  const pairCount = pairItemCount >= 0 && pairItemCount % 2 === 0
+    ? pairItemCount / 2
+    : null;
+  const pairs = pairCount === null
+    ? []
+    : Array.from({ length: pairCount }, (_, index) => (
+      responsesCompactionReadPair(source, 1 + index * 2, script, index + 1)
+    ));
+  const matches = terminalMatches
+    && firstPromptMatches
+    && pairCount !== null
+    && pairCount <= script.toolCallCount
+    && pairs.every((pair) => pair.pass);
+  return {
+    matches,
+    input_count: items.length,
+    input_item_types: items.map((item) => typeof item?.type === "string" ? item.type : null),
+    source_read_count: pairCount,
+    source_unit_count: pairCount === null ? null : pairCount + 1,
+    source_unit_signatures: matches
+      ? [
+        sha256(Buffer.from(JSON.stringify(source[0]), "utf8")),
+        ...pairs.map((pair) => pair.signature),
+      ]
+      : [],
+    read_output_size_bytes: pairs.map((pair) => pair.output_size_bytes),
+    read_output_sha256: pairs.map((pair) => pair.output_sha256),
+    first_prompt_matches: firstPromptMatches,
+    terminal_prompt_matches: terminalMatches,
+    terminal_prompt_sha256: terminalText === null
+      ? null
+      : sha256(Buffer.from(terminalText, "utf8")),
+  };
+}
+
+function responsesCompactionCheckpointMessage(script) {
+  return `${SCRIPTED_PROVIDER_COMPACTION_SUMMARY_PREFIX}\n${script.checkpointText}`;
+}
+
+function responsesCompactionResumedInput(input, expectedPrompt, script) {
+  const items = Array.isArray(input) ? input : [];
+  const promptMatches = exactInputText(items[0]) === expectedPrompt;
+  const checkpointMatches = exactInputText(items[1]) === responsesCompactionCheckpointMessage(script);
+  const pairItemCount = items.length - 2;
+  const pairCount = pairItemCount >= 0 && pairItemCount % 2 === 0
+    ? pairItemCount / 2
+    : null;
+  let firstReadIndex = null;
+  const pairs = [];
+  if (pairCount !== null && pairCount > 0) {
+    const firstCallId = items[2]?.call_id;
+    const match = typeof firstCallId === "string"
+      ? firstCallId.match(/^call_responses_compaction_read_([0-9]+)$/u)
+      : null;
+    firstReadIndex = match === null ? null : Number(match[1]);
+    if (Number.isSafeInteger(firstReadIndex)) {
+      for (let index = 0; index < pairCount; index += 1) {
+        pairs.push(responsesCompactionReadPair(
+          items,
+          2 + index * 2,
+          script,
+          firstReadIndex + index,
+        ));
+      }
+    }
+  }
+  const matches = promptMatches
+    && checkpointMatches
+    && pairCount !== null
+    && pairCount > 0
+    && Number.isSafeInteger(firstReadIndex)
+    && firstReadIndex >= 2
+    && firstReadIndex + pairCount - 1 === script.toolCallCount
+    && pairs.every((pair) => pair.pass);
+  return {
+    matches,
+    input_count: items.length,
+    input_item_types: items.map((item) => typeof item?.type === "string" ? item.type : null),
+    first_prompt_matches: promptMatches,
+    checkpoint_matches: checkpointMatches,
+    checkpoint_sha256: checkpointMatches
+      ? sha256(Buffer.from(responsesCompactionCheckpointMessage(script), "utf8"))
+      : null,
+    remaining_read_count: pairCount,
+    first_remaining_read_index: firstReadIndex,
+    read_output_size_bytes: pairs.map((pair) => pair.output_size_bytes),
+    read_output_sha256: pairs.map((pair) => pair.output_sha256),
+  };
+}
+
+function responsesCompactionRole(body, expectedPrompt, script) {
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const inputSizeBytes = Buffer.byteLength(JSON.stringify(input), "utf8");
+  const hasTools = Array.isArray(body?.tools) && body.tools.length > 0;
+  if (hasTools && exactInputText(input[1]) === responsesCompactionCheckpointMessage(script)) {
+    const resumed = responsesCompactionResumedInput(input, expectedPrompt, script);
+    return {
+      role: resumed.matches ? "resumed_final" : null,
+      evidence: {
+        input_size_bytes: inputSizeBytes,
+        input_byte_threshold: script.inputByteThreshold,
+        ...resumed,
+      },
+    };
+  }
+  if (hasTools) {
+    const prefix = responsesCompactionReadPrefix(input, expectedPrompt, script);
+    const nextIndex = prefix.source_read_count === null ? null : prefix.source_read_count + 1;
+    return {
+      role: prefix.matches && nextIndex <= script.toolCallCount
+        ? `read_${nextIndex}`
+        : null,
+      evidence: {
+        input_size_bytes: inputSizeBytes,
+        input_byte_threshold: script.inputByteThreshold,
+        ...prefix,
+      },
+    };
+  }
+  const source = responsesCompactionReadPrefix(input, expectedPrompt, script, {
+    requireCompactionPrompt: true,
+  });
+  const oversized = inputSizeBytes > script.inputByteThreshold;
+  return {
+    role: source.matches
+      ? oversized ? "compaction_empty" : "compaction_valid"
+      : null,
+    evidence: {
+      input_size_bytes: inputSizeBytes,
+      input_byte_threshold: script.inputByteThreshold,
+      input_exceeds_threshold: oversized,
+      bounded_prefix_candidate: source.source_read_count !== null
+        && source.source_read_count < script.toolCallCount,
+      ...source,
+    },
+  };
+}
+
+function responsesCompactionRequestContract(body, modelId, expectedPrompt, script) {
+  const model = typeof body?.model === "string" ? body.model : null;
+  const instructions = typeof body?.instructions === "string" ? body.instructions : null;
+  const topLevelKeys = body !== null && typeof body === "object" && !Array.isArray(body)
+    ? Object.keys(body).sort()
+    : [];
+  const classified = responsesCompactionRole(body, expectedPrompt, script);
+  const generation = clientGenerationContract(body);
+  const toolBearing = classified.role?.startsWith("read_") === true
+    || classified.role === "resumed_final";
+  const expectedKeys = toolBearing ? TOOL_RESPONSES_KEYS : EXPECTED_RESPONSES_KEYS;
+  const tools = toolBearing ? readToolsContract(body?.tools) : null;
+  const contract = {
+    ...generation,
+    script_kind: script.kind,
+    role: classified.role,
+    role_evidence: classified.evidence,
+    model_sha256: model === null ? null : sha256(Buffer.from(model, "utf8")),
+    instructions_sha256: instructions === null ? null : sha256(Buffer.from(instructions, "utf8")),
+    top_level_keys: topLevelKeys,
+    model_matches: model === modelId,
+    instructions_non_empty: instructions !== null && instructions.trim().length > 0,
+    top_level_keys_match: JSON.stringify(topLevelKeys) === JSON.stringify(expectedKeys),
+    max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
+    stream_true: body?.stream === true,
+    store_false: body?.store === false,
+    compaction_tools_absent: toolBearing
+      ? null
+      : !Object.hasOwn(body ?? {}, "tools")
+        && !Object.hasOwn(body ?? {}, "tool_choice")
+        && !Object.hasOwn(body ?? {}, "parallel_tool_calls"),
+    tool_choice_auto: toolBearing ? body?.tool_choice === "auto" : null,
+    parallel_tool_calls_false: toolBearing ? body?.parallel_tool_calls === false : null,
+    tools,
+  };
+  return {
+    ...contract,
+    pass: contract.client_generation_fields_absent
+      && contract.role !== null
+      && contract.model_matches
+      && contract.instructions_non_empty
+      && contract.top_level_keys_match
+      && contract.max_output_tokens_absent
+      && contract.stream_true
+      && contract.store_false
+      && (toolBearing
+        ? contract.tool_choice_auto && contract.parallel_tool_calls_false && contract.tools.pass
+        : contract.compaction_tools_absent),
+  };
+}
+
 function permissionRestartGuardianExpected(script) {
   return {
     shellArguments: JSON.stringify({
@@ -1711,6 +2064,160 @@ function toolErrorRecoveryReadSse(script) {
   return events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
 }
 
+function responsesCompactionReadSse(script, callIndex) {
+  const expected = responsesCompactionReadExpected(script, callIndex);
+  const item = {
+    type: "function_call",
+    id: expected.itemId,
+    call_id: expected.callId,
+    name: "read",
+    arguments: expected.arguments,
+  };
+  const events = [
+    { type: "response.output_item.done", output_index: 0, item },
+    {
+      type: "response.completed",
+      response: {
+        id: `resp_responses_compaction_read_${callIndex}`,
+        output: [item],
+        usage: {
+          input_tokens: 8,
+          output_tokens: 6,
+          total_tokens: 14,
+          output_tokens_details: { reasoning_tokens: 0 },
+        },
+      },
+    },
+  ];
+  return events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+}
+
+function responsesCompactionReasoningOnlyEvents() {
+  const completionTokens = SCRIPTED_PROVIDER_RESPONSES_COMPACTION_SATURATION_TOTAL_TOKENS
+    - SCRIPTED_PROVIDER_RESPONSES_COMPACTION_SATURATION_PROMPT_TOKENS;
+  const item = {
+    type: "reasoning",
+    id: "rs_responses_compaction_saturated",
+    summary: [],
+  };
+  return [
+    { type: "response.output_item.added", output_index: 0, item },
+    {
+      type: "response.reasoning_text.delta",
+      item_id: item.id,
+      output_index: 0,
+      delta: SCRIPTED_PROVIDER_RESPONSES_COMPACTION_RAW_REASONING_SENTINEL,
+    },
+    {
+      type: "response.reasoning_text.done",
+      item_id: item.id,
+      output_index: 0,
+      text: SCRIPTED_PROVIDER_RESPONSES_COMPACTION_RAW_REASONING_SENTINEL,
+    },
+    { type: "response.output_item.done", output_index: 0, item },
+    {
+      type: "response.completed",
+      response: {
+        id: "resp_responses_compaction_saturated",
+        output: [item],
+        usage: {
+          input_tokens: SCRIPTED_PROVIDER_RESPONSES_COMPACTION_SATURATION_PROMPT_TOKENS,
+          output_tokens: completionTokens,
+          total_tokens: SCRIPTED_PROVIDER_RESPONSES_COMPACTION_SATURATION_TOTAL_TOKENS,
+          output_tokens_details: { reasoning_tokens: completionTokens },
+        },
+      },
+    },
+  ];
+}
+
+function responsesCompactionReasoningOnlySse() {
+  return responsesCompactionReasoningOnlyEvents()
+    .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+    .join("");
+}
+
+async function writeHeldResponsesCompactionReasoning(response, row, releasePromise) {
+  const startedAt = process.hrtime.bigint();
+  const events = responsesCompactionReasoningOnlyEvents();
+  const heldEventCount = 2;
+  const observation = {
+    schema_version: "desktop-e2e.scripted-provider-held-stream.v1",
+    hold_after_event_type: events[heldEventCount - 1].type,
+    events: [],
+    release_observed: false,
+    release_elapsed_ms: null,
+    terminal_sent: false,
+    response_finished: false,
+    peer_close_observed: false,
+  };
+  row.response_stream = observation;
+
+  let resolveClose;
+  let resolveFinish;
+  const closePromise = new Promise((resolve) => { resolveClose = resolve; });
+  const finishPromise = new Promise((resolve) => { resolveFinish = resolve; });
+  const markPeerClose = () => {
+    if (observation.response_finished || observation.peer_close_observed) return;
+    observation.peer_close_observed = true;
+    resolveClose();
+  };
+  response.once("close", markPeerClose);
+  response.once("error", markPeerClose);
+  response.once("finish", () => {
+    observation.response_finished = true;
+    resolveFinish();
+  });
+
+  response.sendDate = false;
+  response.writeHead(200, {
+    "cache-control": "no-store",
+    connection: "close",
+    "content-type": "text/event-stream",
+  });
+  response.flushHeaders();
+  row.response_phase = "held";
+  row.response_status = 200;
+
+  const writeEvent = (event, index) => {
+    const bytes = Buffer.from(`data: ${JSON.stringify(event)}\n\n`, "utf8");
+    response.write(bytes);
+    observation.events.push({
+      sequence: index + 1,
+      event_type: event.type,
+      elapsed_ms: elapsedMonotonicMs(startedAt),
+      size_bytes: bytes.byteLength,
+    });
+  };
+  events.slice(0, heldEventCount).forEach(writeEvent);
+
+  const releaseOutcome = await Promise.race([
+    releasePromise.then(() => "released"),
+    closePromise.then(() => "closed"),
+  ]);
+  if (releaseOutcome !== "released") {
+    row.response_phase = "peer_closed";
+    return false;
+  }
+  observation.release_observed = true;
+  observation.release_elapsed_ms = elapsedMonotonicMs(startedAt);
+  events.slice(heldEventCount).forEach((event, index) => {
+    writeEvent(event, heldEventCount + index);
+    if (event.type === "response.completed") observation.terminal_sent = true;
+  });
+  response.end();
+  const finishOutcome = await Promise.race([
+    finishPromise.then(() => "finished"),
+    closePromise.then(() => "closed"),
+  ]);
+  if (finishOutcome !== "finished") {
+    row.response_phase = "peer_closed";
+    return false;
+  }
+  row.response_phase = "completed";
+  return true;
+}
+
 function permissionRestartGuardianShellSse(script) {
   const item = {
     type: "function_call",
@@ -1906,6 +2413,9 @@ export class ScriptedProvider {
     const releaseHeldChatContinuation = this.script?.kind
       === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND
       && this.responseBehavior === "hold_until_release";
+    const releaseHeldResponsesCompaction = this.script?.kind
+      === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND
+      && this.responseBehavior === "hold_until_release";
     if (this.script?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND
       && !releaseHeldChatContinuation) {
       throw new TypeError("Chat tool continuation script requires hold_until_release behavior");
@@ -1914,18 +2424,23 @@ export class ScriptedProvider {
       && this.responseBehavior !== "complete"
       && !releaseHeldToolErrorInitial
       && !releaseHeldGuardianToolInitial
-      && !releaseHeldChatContinuation) {
+      && !releaseHeldChatContinuation
+      && !releaseHeldResponsesCompaction) {
       throw new TypeError("scripted provider mode owns its response lifecycle");
     }
     if (this.script !== null && turns !== null) {
       throw new TypeError("scripted provider mode cannot use ordinary turns");
     }
     if (this.responseBehavior === "hold_until_release") {
-      if (releaseHeldGuardianToolInitial || releaseHeldChatContinuation) {
+      if (releaseHeldGuardianToolInitial
+        || releaseHeldChatContinuation
+        || releaseHeldResponsesCompaction) {
         let release;
         const promise = new Promise((resolve) => { release = resolve; });
         this.#scriptRoleRelease = {
-          role: releaseHeldGuardianToolInitial ? "guardian_tool_initial" : "chat_continuation",
+          role: releaseHeldGuardianToolInitial
+            ? "guardian_tool_initial"
+            : releaseHeldChatContinuation ? "chat_continuation" : "compaction_empty",
           promise,
           release,
           released: false,
@@ -2073,7 +2588,10 @@ export class ScriptedProvider {
     const rows = this.#ledger.filter((row) => row.route === expectedRoute
       && row.contract?.pass === true
       && row.contract?.role === role);
-    if (rows.length !== 1 || rows[0].response_phase !== "held" || rows[0].response_status !== null) {
+    const expectedHeldStatus = role === "compaction_empty" ? 200 : null;
+    if (rows.length !== 1
+      || rows[0].response_phase !== "held"
+      || rows[0].response_status !== expectedHeldStatus) {
       throw new Error("scripted role response release requires one exact held request");
     }
     release.released = true;
@@ -2287,6 +2805,13 @@ export class ScriptedProvider {
           this.modelId,
           this.script,
         );
+      } else if (this.script.kind === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND) {
+        row.contract = responsesCompactionRequestContract(
+          decoded.value,
+          this.modelId,
+          this.expectedPrompt,
+          this.script,
+        );
       } else {
         row.contract = permissionRestartGuardianRequestContract(
           decoded.value,
@@ -2306,6 +2831,8 @@ export class ScriptedProvider {
         await this.#handleToolErrorRecoveryResponse(response, row);
       } else if (this.script.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
         await this.#handleChatToolContinuationResponse(response, row);
+      } else if (this.script.kind === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND) {
+        await this.#handleResponsesCompactionResponse(response, row);
       } else {
         await this.#handlePermissionRestartGuardianResponse(response, row);
       }
@@ -2489,6 +3016,120 @@ export class ScriptedProvider {
     const payload = role === "chat_tool_initial"
       ? chatToolContinuationCallSse(this.modelId)
       : chatToolContinuationFinalSse(this.modelId);
+    writeResponse(response, 200, "text/event-stream", payload);
+  }
+
+  async #handleResponsesCompactionResponse(response, row) {
+    if (!row.contract.pass) {
+      row.response_phase = "rejected";
+      row.response_status = 422;
+      fixedError(response, 422, "request_contract_mismatch");
+      return;
+    }
+    const role = row.contract.role;
+    if (this.#acceptedRoles.has(role)) {
+      row.response_phase = "rejected";
+      row.response_status = 409;
+      fixedError(response, 409, "script_role_already_consumed");
+      return;
+    }
+    const readMatch = role.match(/^read_([0-9]+)$/u);
+    let prerequisites = [];
+    if (readMatch !== null) {
+      const callIndex = Number(readMatch[1]);
+      prerequisites = callIndex === 1 ? [] : [`read_${callIndex - 1}`];
+    } else if (role === "compaction_empty") {
+      prerequisites = [`read_${this.script.toolCallCount}`];
+    } else if (role === "compaction_valid") {
+      prerequisites = ["compaction_empty"];
+      const oversized = this.#ledger.find((candidate) => (
+        candidate.contract?.role === "compaction_empty" && candidate.contract?.pass === true
+      ));
+      const first = oversized?.contract?.role_evidence;
+      const retry = row.contract.role_evidence;
+      const prefixLength = retry?.source_unit_signatures?.length;
+      const alignedStrictPrefix = Number.isSafeInteger(prefixLength)
+        && prefixLength > 0
+        && prefixLength < (first?.source_unit_signatures?.length ?? 0)
+        && JSON.stringify(retry.source_unit_signatures)
+          === JSON.stringify(first.source_unit_signatures.slice(0, prefixLength));
+      row.contract.retry_alignment = {
+        pass: alignedStrictPrefix,
+        strict_prefix: alignedStrictPrefix,
+        first_source_unit_count: first?.source_unit_count ?? null,
+        retry_source_unit_count: retry?.source_unit_count ?? null,
+        first_input_size_bytes: first?.input_size_bytes ?? null,
+        retry_input_size_bytes: retry?.input_size_bytes ?? null,
+      };
+      if (!alignedStrictPrefix) {
+        row.response_phase = "rejected";
+        row.response_status = 422;
+        fixedError(response, 422, "compaction_retry_not_aligned_prefix");
+        return;
+      }
+    } else if (role === "resumed_final") {
+      prerequisites = ["compaction_valid"];
+      const accepted = this.#ledger.find((candidate) => (
+        candidate.contract?.role === "compaction_valid" && candidate.contract?.pass === true
+      ));
+      const summarizedReadCount = accepted?.contract?.role_evidence?.source_read_count;
+      const resumed = row.contract.role_evidence;
+      const replayMatches = Number.isSafeInteger(summarizedReadCount)
+        && resumed?.first_remaining_read_index === summarizedReadCount + 1
+        && resumed?.remaining_read_count === this.script.toolCallCount - summarizedReadCount;
+      row.contract.compaction_replay = {
+        pass: replayMatches,
+        summarized_read_count: summarizedReadCount ?? null,
+        first_remaining_read_index: resumed?.first_remaining_read_index ?? null,
+        remaining_read_count: resumed?.remaining_read_count ?? null,
+      };
+      if (!replayMatches) {
+        row.response_phase = "rejected";
+        row.response_status = 422;
+        fixedError(response, 422, "compaction_replay_mismatch");
+        return;
+      }
+    }
+    if (prerequisites.some((required) => !this.#acceptedRoles.has(required))) {
+      row.response_phase = "rejected";
+      row.response_status = 409;
+      fixedError(response, 409, "script_role_prerequisite_missing");
+      return;
+    }
+
+    this.#acceptedRoles.add(role);
+    this.#acceptedResponseCount += 1;
+    if (role === "compaction_empty" && this.responseBehavior === "hold_until_release") {
+      if (this.#scriptRoleRelease?.role !== role) {
+        throw new Error("Responses compaction reasoning release owner is missing");
+      }
+      const completed = await writeHeldResponsesCompactionReasoning(
+        response,
+        row,
+        this.#scriptRoleRelease.promise,
+      );
+      if (completed) this.#successfulResponseCount += 1;
+      return;
+    }
+    this.#successfulResponseCount += 1;
+    row.response_phase = "completed";
+    row.response_status = 200;
+    let payload;
+    if (readMatch !== null) {
+      payload = responsesCompactionReadSse(this.script, Number(readMatch[1]));
+    } else if (role === "compaction_empty") {
+      payload = responsesCompactionReasoningOnlySse();
+    } else if (role === "compaction_valid") {
+      payload = responsesSse(this.script.checkpointText, {
+        itemId: "msg_responses_compaction_checkpoint",
+        responseId: "resp_responses_compaction_checkpoint",
+      });
+    } else {
+      payload = responsesSse(this.script.responseText, {
+        itemId: "msg_responses_compaction_done",
+        responseId: "resp_responses_compaction_done",
+      });
+    }
     writeResponse(response, 200, "text/event-stream", payload);
   }
 

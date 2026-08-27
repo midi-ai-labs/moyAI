@@ -66,7 +66,7 @@ moyAI is designed around those constraints:
 - Evidence-first task planning with canonical `update_plan` as a client-visible progress projection rather than an execution or tool-access gate. In proactive mode, static model instructions require minimum grounding followed by an early plan before broad investigation.
 - One immutable `ResolvedTurnConfig`/turn/step context captured at admission, canonical protocol history, and atomic response-scoped assistant/raw-tool-call commits keyed by `ModelResponseId`.
 - LM Studio Responses API support with full canonical HTTP input replay and typed reasoning summaries.
-- Automatic LLM semantic compaction near the context threshold, using provider-reported total usage plus a Codex-style UTF-8-bytes/4 local suffix estimate, a full-request local fallback, full native summary requests with typed overflow reduction, and durable replacement lineage.
+- Automatic LLM semantic compaction near the context threshold, using provider-reported total usage plus a Codex-style UTF-8-bytes/4 local suffix estimate, a full-request local fallback, oldest semantic-unit prefix summary requests with one aligned saturation/overflow retry, and durable replacement lineage for only the summarized units.
 - LM Studio metadata discovery through `/v1/models` and `/api/v1/models`.
 - Bounded workspace traversal/search/directory inspection with model-visible continuation cursors, guarded line-aware file-read pages with exact next offsets and no read spool path, diff-based edits, and shell execution.
 - A selected nested directory remains the tool and sandbox authority boundary even when an ancestor is the Git project root; reopening its session restores that exact directory.
@@ -591,9 +591,14 @@ identify which source was used. One provider response's assistant text,
 calls, and settled outputs stay together; no compaction is attempted while a tool response is
 unsettled. Summary generation keeps the base instructions and native User / Assistant / tool
 structure, appends the C8 evidence-grounded checkpoint prompt as the final User input, and sends no tools or provider
-cursor. It first sends that full native request. Only a typed `context_length_exceeded` response removes
-the oldest provider-native item (and its exact call/output counterpart when required) before retrying;
-there is no semantic map/reduce path.
+cursor. When possible, its source is the largest oldest semantic-unit prefix whose complete tool-less
+request fits within half of the working target while still projecting a useful checkpoint. If no such
+prefix exists, moyAI keeps semantic units indivisible and chooses the smallest prefix projected to make
+progress; one oversized unit remains whole and fails closed if it cannot be summarized safely. A typed
+`context_length_exceeded`, or a context-saturated completion containing reasoning tokens but no answer
+text, may retry once with a strictly smaller oldest semantic-unit prefix. The provider/local prompt gap
+observed on that attempt remains part of the retry and resumed-request safety check. Only the units in
+the successful request enter replacement lineage; there is no semantic map/reduce path.
 The exact checkpoint text in `assets/prompts/compaction.md` is the current source-level contract.
 Runtime validation proves only that its six required headings occur once, in order, with non-empty
 bodies. Evidence grounding and semantic completeness remain model-quality concerns over the native

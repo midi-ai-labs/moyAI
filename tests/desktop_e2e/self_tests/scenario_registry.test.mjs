@@ -41,6 +41,7 @@ test("one registry binds every reusable scenario to the common runner contract",
     "prompt-review.cancel",
     "permission.restart-guardian",
     "provider.chat-tool-continuation",
+    "provider.responses-compaction-retry",
     "provider.responses-progress",
     "provider.restart",
     "settings.docling-readiness",
@@ -79,6 +80,10 @@ test("one registry binds every reusable scenario to the common runner contract",
   assert.notEqual(
     createScenario("provider.chat-tool-continuation"),
     createScenario("provider.chat-tool-continuation"),
+  );
+  assert.notEqual(
+    createScenario("provider.responses-compaction-retry"),
+    createScenario("provider.responses-compaction-retry"),
   );
   assert.notEqual(
     createScenario("provider.responses-progress"),

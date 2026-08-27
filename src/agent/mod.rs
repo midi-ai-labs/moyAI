@@ -61,6 +61,40 @@ const TOOL_CANCELLATION_CLEANUP_TIMEOUT: Duration =
     crate::tool::process::MANAGED_PROCESS_CLEANUP_GRACE;
 const PERMISSION_GUARDIAN_TOTAL_DEADLINE: Duration = Duration::from_secs(90);
 const COMPACTION_ACCURACY_WARNING: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
+// Generation policy is owned by the provider host, so a reasoning model may need materially more
+// decode headroom than a non-reasoning model before it emits the checkpoint text. Keep the first
+// semantic compaction source comfortably below the ordinary working boundary without splitting a
+// response/tool-output unit or changing any provider generation setting.
+const COMPACTION_SOURCE_TARGET_DIVISOR: u32 = 2;
+const COMPACTION_CHECKPOINT_RESERVE_TOKENS: usize = 1_800;
+const COMPACTION_PREFIX_SEARCH_MAX_EVALUATIONS: usize = usize::BITS as usize + 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompactionUnitSelection {
+    initial_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompactionPrefixProjection {
+    after_context_tokens: u32,
+    projected_request_tokens: u32,
+    source_request_tokens: u32,
+}
+
+enum CompactionSummaryOutcome {
+    Summary {
+        text: String,
+        prompt_gap: u32,
+    },
+    ReasoningOnlySaturation {
+        usage: TokenUsage,
+        local_request_tokens: u32,
+    },
+    SourceContextOverflow {
+        error: crate::error::LlmError,
+        local_request_tokens: u32,
+    },
+}
 
 #[cfg(test)]
 type ProviderApiKeyResolver =
@@ -430,6 +464,7 @@ impl AgentLoop {
                             goal_snapshot.as_ref(),
                             pre_turn_item_id,
                             &mut model_request_count,
+                            &mut latest_usage,
                             sink,
                         )
                         .await
@@ -452,10 +487,15 @@ impl AgentLoop {
                             compaction_unavailable_at_revision =
                                 Some(request.context.revision().as_str().to_string());
                         }
-                        Err(error) if compaction_context_status.token_limit_reached => {
-                            return Err(error);
-                        }
                         Err(error) => {
+                            if let AgentError::Llm(llm_error) = &error
+                                && let Some(usage) = llm_error.token_usage()
+                            {
+                                latest_usage = Some(usage.clone());
+                            }
+                            if compaction_context_status.token_limit_reached {
+                                return Err(error);
+                            }
                             compaction_unavailable_at_revision =
                                 Some(request.context.revision().as_str().to_string());
                             sink.emit(RunEvent::RecoverableRuntimeFeedback {
@@ -1226,6 +1266,7 @@ impl AgentLoop {
         goal: Option<&goal_steering::GoalSnapshot>,
         excluded_item_id: Option<HistoryItemId>,
         model_request_count: &mut usize,
+        latest_usage: &mut Option<TokenUsage>,
         sink: &mut dyn RunEventSink,
     ) -> Result<bool, AgentError> {
         let excluded_item_ids = excluded_item_id.into_iter().collect::<HashSet<_>>();
@@ -1235,41 +1276,125 @@ impl AgentLoop {
         if units.is_empty() {
             return Ok(false);
         }
-        let mut seen_item_ids = HashSet::new();
-        let selected_item_ids = units
-            .iter()
-            .flatten()
-            .copied()
-            .filter(|item_id| seen_item_ids.insert(*item_id))
-            .collect::<Vec<_>>();
-        if selected_item_ids.is_empty() {
-            return Ok(false);
-        }
-        let preserved_user_messages = bounded_compaction_user_messages(
-            &request
-                .context
-                .compaction_user_messages_for_items(&selected_item_ids),
-        );
         let supports_images = request
             .turn
             .policy
             .model
             .input_modalities
             .contains(&crate::llm::model_policy::InputModality::Image);
-        let compaction_source_messages = request
-            .context
-            .model_messages_for_items(&selected_item_ids, supports_images);
-        let compaction_source_template = self
-            .chat_request(request, step, &compaction_source_messages, tool_plan, goal)?
-            .chat_request;
-        let summary = self
-            .summarize_compaction_history(
-                request,
-                &compaction_source_template,
-                model_request_count,
-                sink,
-            )
-            .await?;
+        let selection = self.compaction_unit_selection(
+            request,
+            request_template,
+            step,
+            tool_plan,
+            goal,
+            &units,
+            &excluded_item_ids,
+            supports_images,
+        )?;
+        let mut selected_unit_count = selection.initial_count;
+        let mut retry_available = true;
+        let mut required_prompt_gap = 0;
+        let (selected_item_ids, preserved_user_messages, summary, required_prompt_gap) = loop {
+            let selected_item_ids = flatten_compaction_unit_prefix(&units, selected_unit_count);
+            if selected_item_ids.is_empty() {
+                return Ok(false);
+            }
+            let preserved_user_messages = bounded_compaction_user_messages(
+                &request
+                    .context
+                    .compaction_user_messages_for_items(&selected_item_ids),
+            );
+            let compaction_source_messages = request
+                .context
+                .model_messages_for_items(&selected_item_ids, supports_images);
+            let compaction_source_template = self
+                .chat_request(request, step, &compaction_source_messages, tool_plan, goal)?
+                .chat_request;
+            match self
+                .summarize_compaction_history(
+                    request,
+                    &compaction_source_template,
+                    model_request_count,
+                    latest_usage,
+                    sink,
+                )
+                .await?
+            {
+                CompactionSummaryOutcome::Summary { text, prompt_gap } => {
+                    required_prompt_gap = required_prompt_gap.max(prompt_gap);
+                    break (
+                        selected_item_ids,
+                        preserved_user_messages,
+                        text,
+                        required_prompt_gap,
+                    );
+                }
+                CompactionSummaryOutcome::ReasoningOnlySaturation {
+                    usage,
+                    local_request_tokens,
+                } => {
+                    let observed_prompt_gap =
+                        provider_prompt_gap(Some(&usage), local_request_tokens);
+                    if !retry_available {
+                        return Err(reasoning_only_compaction_error(
+                            &usage,
+                            request.turn.policy.model.effective_context_token_limit,
+                            observed_prompt_gap,
+                        ));
+                    }
+                    retry_available = false;
+                    let Some(retry_count) = self.compaction_retry_unit_count(
+                        request,
+                        request_template,
+                        step,
+                        tool_plan,
+                        goal,
+                        &units,
+                        &excluded_item_ids,
+                        supports_images,
+                        selected_unit_count,
+                        local_request_tokens,
+                        observed_prompt_gap,
+                    )?
+                    else {
+                        return Err(reasoning_only_compaction_error(
+                            &usage,
+                            request.turn.policy.model.effective_context_token_limit,
+                            observed_prompt_gap,
+                        ));
+                    };
+                    required_prompt_gap = observed_prompt_gap;
+                    selected_unit_count = retry_count;
+                }
+                CompactionSummaryOutcome::SourceContextOverflow {
+                    error,
+                    local_request_tokens,
+                } => {
+                    if !retry_available {
+                        return Err(AgentError::Llm(error));
+                    }
+                    retry_available = false;
+                    let Some(retry_count) = self.compaction_retry_unit_count(
+                        request,
+                        request_template,
+                        step,
+                        tool_plan,
+                        goal,
+                        &units,
+                        &excluded_item_ids,
+                        supports_images,
+                        selected_unit_count,
+                        local_request_tokens,
+                        0,
+                    )?
+                    else {
+                        return Err(AgentError::Llm(error));
+                    };
+                    selected_unit_count = retry_count;
+                }
+            }
+        };
         let before_context_tokens = estimate_model_messages_tokens(
             &request
                 .context
@@ -1290,13 +1415,18 @@ impl AgentLoop {
         let projected_request_tokens = before_request_tokens
             .saturating_sub(before_context_tokens)
             .saturating_add(after_context_tokens);
+        let provider_adjusted_projected_request_tokens =
+            projected_request_tokens.saturating_add(required_prompt_gap);
         if after_context_tokens >= before_context_tokens
-            || projected_request_tokens >= request.turn.policy.model.working_context_token_limit
+            || provider_adjusted_projected_request_tokens
+                >= request.turn.policy.model.working_context_token_limit
         {
             return Err(AgentError::Message(format!(
                 "semantic compaction summary was rejected because it did not create a usable checkpoint \
                  (context {before_context_tokens}->{after_context_tokens} estimated tokens, full request \
-                 {before_request_tokens}->{projected_request_tokens}, working limit {}); canonical history was left unchanged",
+                 {before_request_tokens}->{projected_request_tokens}, provider-adjusted projected request \
+                 {provider_adjusted_projected_request_tokens} with observed prompt gap {required_prompt_gap}, \
+                 working limit {}); canonical history was left unchanged",
                 request.turn.policy.model.working_context_token_limit
             )));
         }
@@ -1329,33 +1459,266 @@ impl AgentLoop {
         Ok(true)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn compaction_unit_selection(
+        &self,
+        request: &AgentRunRequest,
+        request_template: &ChatRequest,
+        step: &step_context::StepContext,
+        tool_plan: &crate::tool::spec_plan::ToolSpecPlan,
+        goal: Option<&goal_steering::GoalSnapshot>,
+        units: &[Vec<HistoryItemId>],
+        excluded_item_ids: &HashSet<HistoryItemId>,
+        supports_images: bool,
+    ) -> Result<CompactionUnitSelection, AgentError> {
+        debug_assert!(!units.is_empty());
+        let working_limit = request.turn.policy.model.working_context_token_limit;
+        let source_target = working_limit
+            .checked_div(COMPACTION_SOURCE_TARGET_DIVISOR)
+            .unwrap_or_default()
+            .max(1);
+        let before_context_tokens = estimate_model_messages_tokens(
+            &request
+                .context
+                .model_messages_excluding(excluded_item_ids, supports_images),
+        );
+        let before_request_tokens =
+            ContextWindowTokenStatus::for_request(request_template, 0).active_context_tokens;
+        // This is only a local projection reserve matching the checkpoint prompt's upper target.
+        // It is never serialized as an output cap or any other provider generation control.
+        let checkpoint_reserve = "x".repeat(COMPACTION_CHECKPOINT_RESERVE_TOKENS * 4);
+        let mut projections = HashMap::<usize, CompactionPrefixProjection>::new();
+        let mut projection_for = |unit_count| -> Result<CompactionPrefixProjection, AgentError> {
+            if let Some(projection) = projections.get(&unit_count) {
+                return Ok(*projection);
+            }
+            let projection = self.compaction_prefix_projection(
+                request,
+                step,
+                tool_plan,
+                goal,
+                units,
+                excluded_item_ids,
+                supports_images,
+                unit_count,
+                before_context_tokens,
+                before_request_tokens,
+                &checkpoint_reserve,
+            )?;
+            projections.insert(unit_count, projection);
+            Ok(projection)
+        };
+        let minimum_projected_safe_count = first_monotonic_prefix_count(
+            1,
+            units.len(),
+            &mut |unit_count| -> Result<bool, AgentError> {
+                let projection = projection_for(unit_count)?;
+                Ok(projection.after_context_tokens < before_context_tokens
+                    && projection.projected_request_tokens < working_limit)
+            },
+        )?;
+        let Some(minimum_projected_safe_count) = minimum_projected_safe_count else {
+            return Ok(CompactionUnitSelection {
+                initial_count: units.len(),
+            });
+        };
+        let largest_bounded_safe_count = last_monotonic_prefix_count(
+            minimum_projected_safe_count,
+            units.len(),
+            &mut |unit_count| -> Result<bool, AgentError> {
+                let projection = projection_for(unit_count)?;
+                Ok(projection.source_request_tokens <= source_target)
+            },
+        )?;
+        let mut initial_count = largest_bounded_safe_count.unwrap_or(minimum_projected_safe_count);
+        let final_projection = projection_for(initial_count)?;
+        if final_projection.after_context_tokens >= before_context_tokens
+            || final_projection.projected_request_tokens >= working_limit
+        {
+            initial_count = minimum_projected_safe_count;
+        }
+        Ok(CompactionUnitSelection { initial_count })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compaction_retry_unit_count(
+        &self,
+        request: &AgentRunRequest,
+        request_template: &ChatRequest,
+        step: &step_context::StepContext,
+        tool_plan: &crate::tool::spec_plan::ToolSpecPlan,
+        goal: Option<&goal_steering::GoalSnapshot>,
+        units: &[Vec<HistoryItemId>],
+        excluded_item_ids: &HashSet<HistoryItemId>,
+        supports_images: bool,
+        failed_unit_count: usize,
+        failed_source_request_tokens: u32,
+        observed_prompt_gap: u32,
+    ) -> Result<Option<usize>, AgentError> {
+        let Some(max_retry_count) = failed_unit_count.checked_sub(1) else {
+            return Ok(None);
+        };
+        if max_retry_count == 0 {
+            return Ok(None);
+        }
+        let working_limit = request.turn.policy.model.working_context_token_limit;
+        let before_context_tokens = estimate_model_messages_tokens(
+            &request
+                .context
+                .model_messages_excluding(excluded_item_ids, supports_images),
+        );
+        let before_request_tokens =
+            ContextWindowTokenStatus::for_request(request_template, 0).active_context_tokens;
+        let checkpoint_reserve = "x".repeat(COMPACTION_CHECKPOINT_RESERVE_TOKENS * 4);
+        let mut projections = HashMap::<usize, CompactionPrefixProjection>::new();
+        let mut projection_for = |unit_count| -> Result<CompactionPrefixProjection, AgentError> {
+            if let Some(projection) = projections.get(&unit_count) {
+                return Ok(*projection);
+            }
+            let projection = self.compaction_prefix_projection(
+                request,
+                step,
+                tool_plan,
+                goal,
+                units,
+                excluded_item_ids,
+                supports_images,
+                unit_count,
+                before_context_tokens,
+                before_request_tokens,
+                &checkpoint_reserve,
+            )?;
+            projections.insert(unit_count, projection);
+            Ok(projection)
+        };
+        let minimum_gap_safe_count =
+            first_monotonic_prefix_count(1, max_retry_count, &mut |unit_count| -> Result<
+                bool,
+                AgentError,
+            > {
+                let projection = projection_for(unit_count)?;
+                Ok(projection.after_context_tokens < before_context_tokens
+                    && projection
+                        .projected_request_tokens
+                        .saturating_add(observed_prompt_gap)
+                        < working_limit)
+            })?;
+        let largest_source_safe_count = last_monotonic_prefix_count(
+            1,
+            max_retry_count,
+            &mut |unit_count| -> Result<bool, AgentError> {
+                let projection = projection_for(unit_count)?;
+                Ok(
+                    projection.source_request_tokens < failed_source_request_tokens
+                        && projection
+                            .source_request_tokens
+                            .saturating_add(observed_prompt_gap)
+                            < working_limit,
+                )
+            },
+        )?;
+        let (Some(retry_count), Some(largest_source_safe_count)) =
+            (minimum_gap_safe_count, largest_source_safe_count)
+        else {
+            return Ok(None);
+        };
+        if retry_count > largest_source_safe_count {
+            return Ok(None);
+        }
+        let projection = projection_for(retry_count)?;
+        Ok((projection.after_context_tokens < before_context_tokens
+            && projection
+                .projected_request_tokens
+                .saturating_add(observed_prompt_gap)
+                < working_limit
+            && projection.source_request_tokens < failed_source_request_tokens
+            && projection
+                .source_request_tokens
+                .saturating_add(observed_prompt_gap)
+                < working_limit)
+            .then_some(retry_count))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compaction_prefix_projection(
+        &self,
+        request: &AgentRunRequest,
+        step: &step_context::StepContext,
+        tool_plan: &crate::tool::spec_plan::ToolSpecPlan,
+        goal: Option<&goal_steering::GoalSnapshot>,
+        units: &[Vec<HistoryItemId>],
+        excluded_item_ids: &HashSet<HistoryItemId>,
+        supports_images: bool,
+        unit_count: usize,
+        before_context_tokens: u32,
+        before_request_tokens: u32,
+        checkpoint_reserve: &str,
+    ) -> Result<CompactionPrefixProjection, AgentError> {
+        let selected_item_ids = flatten_compaction_unit_prefix(units, unit_count);
+        let preserved_user_messages = bounded_compaction_user_messages(
+            &request
+                .context
+                .compaction_user_messages_for_items(&selected_item_ids),
+        );
+        let after_context_tokens =
+            estimate_model_messages_tokens(&request.context.model_messages_after_compaction(
+                request.session.session.id,
+                request.turn_id(),
+                preserved_user_messages,
+                checkpoint_reserve.to_string(),
+                selected_item_ids.clone(),
+                excluded_item_ids,
+                supports_images,
+            ));
+        let projected_request_tokens = before_request_tokens
+            .saturating_sub(before_context_tokens)
+            .saturating_add(after_context_tokens);
+        let source_messages = request
+            .context
+            .model_messages_for_items(&selected_item_ids, supports_images);
+        let source_template = self
+            .chat_request(request, step, &source_messages, tool_plan, goal)?
+            .chat_request;
+        let source_request =
+            compaction_request_with_messages(&source_template, source_template.messages.clone());
+        let source_request_tokens =
+            ContextWindowTokenStatus::for_request(&source_request, 0).active_context_tokens;
+        Ok(CompactionPrefixProjection {
+            after_context_tokens,
+            projected_request_tokens,
+            source_request_tokens,
+        })
+    }
+
     async fn summarize_compaction_history(
         &self,
         request: &AgentRunRequest,
         request_template: &ChatRequest,
         model_request_count: &mut usize,
+        latest_usage: &mut Option<TokenUsage>,
         sink: &mut dyn RunEventSink,
-    ) -> Result<String, AgentError> {
-        let mut messages = request_template.messages.clone();
-        loop {
-            match self
-                .run_compaction_request(
-                    request,
-                    compaction_request_with_messages(request_template, messages.clone()),
-                    model_request_count,
-                    sink,
-                )
-                .await
-            {
-                Ok(summary) => return Ok(summary),
-                Err(AgentError::Llm(error))
-                    if error.is_context_window_exceeded()
-                        && has_removable_compaction_message(&messages) =>
-                {
-                    remove_oldest_compaction_message(&mut messages);
-                }
-                Err(error) => return Err(error),
+    ) -> Result<CompactionSummaryOutcome, AgentError> {
+        let compaction_request =
+            compaction_request_with_messages(request_template, request_template.messages.clone());
+        let local_request_tokens =
+            ContextWindowTokenStatus::for_request(&compaction_request, 0).active_context_tokens;
+        match self
+            .run_compaction_request(
+                request,
+                compaction_request,
+                model_request_count,
+                latest_usage,
+                sink,
+            )
+            .await
+        {
+            Err(AgentError::Llm(error)) if error.is_context_window_exceeded() => {
+                Ok(CompactionSummaryOutcome::SourceContextOverflow {
+                    error,
+                    local_request_tokens,
+                })
             }
+            outcome => outcome,
         }
     }
 
@@ -1364,8 +1727,9 @@ impl AgentLoop {
         request: &AgentRunRequest,
         mut compaction_request: ChatRequest,
         model_request_count: &mut usize,
+        latest_usage: &mut Option<TokenUsage>,
         sink: &mut dyn RunEventSink,
-    ) -> Result<String, AgentError> {
+    ) -> Result<CompactionSummaryOutcome, AgentError> {
         sink.emit(RunEvent::ModelRequestPrepared {
             session_id: request.session.session.id,
             diagnostics: request_diagnostics(
@@ -1405,12 +1769,45 @@ impl AgentLoop {
         };
         self.attach_provider_api_key(request, &mut compaction_request)?;
 
+        let effective_context_limit = request.turn.policy.model.effective_context_token_limit;
+        let local_request_tokens =
+            ContextWindowTokenStatus::for_request(&compaction_request, 0).active_context_tokens;
         let mut collector = CompactionResponseCollector::new(ModelResponseId::new(), sink);
-        let response = self
+        let response = match self
             .llm
             .stream_chat(compaction_request, request.cancel_token(), &mut collector)
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(usage) = error.token_usage() {
+                    *latest_usage = Some(usage.clone());
+                    if let Some(goal) = request.turn.goal() {
+                        self.store
+                            .session_repo()
+                            .account_thread_goal_usage_for_goal(
+                                request.session.session.id,
+                                goal_token_delta(Some(usage)),
+                                Some(goal.goal_id()),
+                            )
+                            .await?;
+                    }
+                }
+                return Err(error.into());
+            }
+        };
+        *latest_usage = response.usage.clone();
         let collector = collector.into_inner();
+        if let Some(goal) = request.turn.goal() {
+            self.store
+                .session_repo()
+                .account_thread_goal_usage_for_goal(
+                    request.session.session.id,
+                    goal_token_delta(response.usage.as_ref()),
+                    Some(goal.goal_id()),
+                )
+                .await?;
+        }
         if response.finish_reason == FinishReason::Cancelled {
             return Err(AgentError::Message(
                 "semantic compaction was cancelled; canonical history was left unchanged"
@@ -1428,6 +1825,14 @@ impl AgentLoop {
         }
         let summary = collector.text.trim().to_string();
         if summary.is_empty() {
+            if let Some(usage) =
+                reasoning_only_saturated_usage(response.usage.as_ref(), effective_context_limit)
+            {
+                return Ok(CompactionSummaryOutcome::ReasoningOnlySaturation {
+                    usage,
+                    local_request_tokens,
+                });
+            }
             return Err(AgentError::Message(
                 "semantic compaction returned an empty summary".to_string(),
             ));
@@ -1437,17 +1842,10 @@ impl AgentLoop {
                 "semantic compaction checkpoint failed structural review: {error}; canonical history was left unchanged"
             ))
         })?;
-        if let Some(goal) = request.turn.goal() {
-            self.store
-                .session_repo()
-                .account_thread_goal_usage_for_goal(
-                    request.session.session.id,
-                    goal_token_delta(response.usage.as_ref()),
-                    Some(goal.goal_id()),
-                )
-                .await?;
-        }
-        Ok(summary)
+        Ok(CompactionSummaryOutcome::Summary {
+            text: summary,
+            prompt_gap: provider_prompt_gap(response.usage.as_ref(), local_request_tokens),
+        })
     }
 
     async fn handle_tool_call(
@@ -2110,123 +2508,101 @@ fn insert_before_final_compaction_summary(
     messages.insert(insertion_index, transient);
 }
 
-fn remove_oldest_compaction_message(messages: &mut Vec<ModelMessage>) {
-    enum OldestNativeItem {
-        AssistantContent,
-        AssistantCall(String),
-        EmptyAssistant,
-        ToolOutput(String),
-        Other,
-    }
-
-    let Some(oldest_index) = messages.iter().position(|message| {
-        !matches!(
-            message,
-            ModelMessage::System { .. } | ModelMessage::Developer { .. }
-        )
-    }) else {
-        return;
-    };
-    let oldest = &messages[oldest_index];
-    let oldest = match oldest {
-        ModelMessage::AssistantToolCalls {
-            content,
-            tool_calls,
-        } if content
-            .as_deref()
-            .is_some_and(|content| !content.is_empty()) =>
-        {
-            OldestNativeItem::AssistantContent
+fn first_monotonic_prefix_count<E>(
+    mut low: usize,
+    mut high: usize,
+    predicate: &mut impl FnMut(usize) -> Result<bool, E>,
+) -> Result<Option<usize>, E> {
+    let mut result = None;
+    for _ in 0..COMPACTION_PREFIX_SEARCH_MAX_EVALUATIONS {
+        if low > high {
+            break;
         }
-        ModelMessage::AssistantToolCalls { tool_calls, .. } => tool_calls
-            .first()
-            .map(|call| OldestNativeItem::AssistantCall(call.call_id.clone()))
-            .unwrap_or(OldestNativeItem::EmptyAssistant),
-        ModelMessage::Tool { call_id, .. } => OldestNativeItem::ToolOutput(call_id.clone()),
-        _ => OldestNativeItem::Other,
-    };
-
-    match oldest {
-        OldestNativeItem::AssistantContent => {
-            let ModelMessage::AssistantToolCalls {
-                content,
-                tool_calls,
-            } = &mut messages[oldest_index]
-            else {
-                unreachable!("classified assistant content")
-            };
-            if tool_calls.is_empty() {
-                messages.remove(oldest_index);
-            } else {
-                *content = None;
+        let middle = low + (high - low) / 2;
+        if predicate(middle)? {
+            result = Some(middle);
+            if middle == 0 {
+                break;
             }
-        }
-        OldestNativeItem::AssistantCall(call_id) => {
-            let ModelMessage::AssistantToolCalls { tool_calls, .. } = &mut messages[oldest_index]
-            else {
-                unreachable!("classified assistant tool call")
-            };
-            tool_calls.remove(0);
-            if let Some(output_index) = messages.iter().position(
-                |message| matches!(message, ModelMessage::Tool { call_id: candidate, .. } if candidate == &call_id),
-            ) {
-                messages.remove(output_index);
-            }
-            normalize_compaction_assistant_group(messages, oldest_index);
-        }
-        OldestNativeItem::EmptyAssistant | OldestNativeItem::Other => {
-            messages.remove(oldest_index);
-        }
-        OldestNativeItem::ToolOutput(call_id) => {
-            messages.remove(oldest_index);
-            let Some(assistant_index) = messages.iter().position(|message| {
-                matches!(
-                    message,
-                    ModelMessage::AssistantToolCalls { tool_calls, .. }
-                        if tool_calls.iter().any(|call| call.call_id == call_id)
-                )
-            }) else {
-                return;
-            };
-            let ModelMessage::AssistantToolCalls { tool_calls, .. } =
-                &mut messages[assistant_index]
-            else {
-                unreachable!("matched assistant tool-call message")
-            };
-            if let Some(call_index) = tool_calls.iter().position(|call| call.call_id == call_id) {
-                tool_calls.remove(call_index);
-            }
-            normalize_compaction_assistant_group(messages, assistant_index);
+            high = middle - 1;
+        } else {
+            low = middle.saturating_add(1);
         }
     }
+    debug_assert!(low > high || high == usize::MAX);
+    Ok(result)
 }
 
-fn has_removable_compaction_message(messages: &[ModelMessage]) -> bool {
-    messages.iter().any(|message| {
-        !matches!(
-            message,
-            ModelMessage::System { .. } | ModelMessage::Developer { .. }
-        )
-    })
+fn last_monotonic_prefix_count<E>(
+    mut low: usize,
+    mut high: usize,
+    predicate: &mut impl FnMut(usize) -> Result<bool, E>,
+) -> Result<Option<usize>, E> {
+    let mut result = None;
+    for _ in 0..COMPACTION_PREFIX_SEARCH_MAX_EVALUATIONS {
+        if low > high {
+            break;
+        }
+        let middle = low + (high - low) / 2;
+        if predicate(middle)? {
+            result = Some(middle);
+            low = middle.saturating_add(1);
+        } else {
+            if middle == 0 {
+                break;
+            }
+            high = middle - 1;
+        }
+    }
+    debug_assert!(low > high || high == usize::MAX);
+    Ok(result)
 }
 
-fn normalize_compaction_assistant_group(messages: &mut Vec<ModelMessage>, index: usize) {
-    let Some(ModelMessage::AssistantToolCalls {
-        content,
-        tool_calls,
-    }) = messages.get_mut(index)
-    else {
-        return;
-    };
-    if !tool_calls.is_empty() {
-        return;
-    }
-    let content = content.take().filter(|content| !content.is_empty());
-    if let Some(content) = content {
-        messages[index] = ModelMessage::Assistant { content };
-    } else {
-        messages.remove(index);
-    }
+fn flatten_compaction_unit_prefix(
+    units: &[Vec<HistoryItemId>],
+    unit_count: usize,
+) -> Vec<HistoryItemId> {
+    let mut seen_item_ids = HashSet::new();
+    units
+        .iter()
+        .take(unit_count)
+        .flatten()
+        .copied()
+        .filter(|item_id| seen_item_ids.insert(*item_id))
+        .collect()
+}
+
+fn provider_prompt_gap(usage: Option<&TokenUsage>, local_request_tokens: u32) -> u32 {
+    usage
+        .map(|usage| usage.prompt_tokens.saturating_sub(local_request_tokens))
+        .unwrap_or_default()
+}
+
+fn reasoning_only_saturated_usage(
+    usage: Option<&TokenUsage>,
+    effective_context_limit: u32,
+) -> Option<TokenUsage> {
+    let usage = usage?;
+    (usage.completion_tokens > 0
+        && usage.reasoning_tokens == Some(usage.completion_tokens)
+        && usage.total_tokens >= effective_context_limit)
+        .then(|| usage.clone())
+}
+
+fn reasoning_only_compaction_error(
+    usage: &TokenUsage,
+    effective_context_limit: u32,
+    observed_prompt_gap: u32,
+) -> AgentError {
+    AgentError::Message(format!(
+        "semantic compaction returned an empty summary after host-owned reasoning consumed the entire completion near the context limit (prompt {}, completion {}, reasoning {}, total {}, effective input limit {}, observed provider/local prompt gap {}); no smaller safe semantic-unit prefix was available and canonical history was left unchanged",
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.reasoning_tokens.unwrap_or_default(),
+        usage.total_tokens,
+        effective_context_limit,
+        observed_prompt_gap,
+    ))
 }
 
 fn compaction_request_with_messages(
@@ -4067,6 +4443,98 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         request.tools.iter().map(|tool| tool.name.clone()).collect()
     }
 
+    fn request_contains_model_call(request: &ChatRequest, expected_call_id: &str) -> bool {
+        request.messages.iter().any(|message| {
+            matches!(
+                message,
+                ModelMessage::AssistantToolCalls { tool_calls, .. }
+                    if tool_calls
+                        .iter()
+                        .any(|call| call.call_id == expected_call_id)
+            )
+        })
+    }
+
+    fn history_tool_unit_ids(
+        history: &[HistoryItem],
+        expected_model_call_id: &str,
+    ) -> [HistoryItemId; 2] {
+        let (call_item_id, call_id) = history
+            .iter()
+            .find_map(|item| match &item.payload {
+                HistoryItemPayload::ToolCall {
+                    call_id,
+                    model_call_id,
+                    ..
+                } if model_call_id == expected_model_call_id => Some((item.id, *call_id)),
+                _ => None,
+            })
+            .expect("canonical tool call");
+        let output_item_id = history
+            .iter()
+            .find_map(|item| match &item.payload {
+                HistoryItemPayload::ToolOutput {
+                    call_id: output_call_id,
+                    ..
+                } if *output_call_id == call_id => Some(item.id),
+                _ => None,
+            })
+            .expect("canonical tool output");
+        [call_item_id, output_item_id]
+    }
+
+    fn local_request_projection_after_hypothetical_compaction(
+        run: &ScriptedRun,
+        final_request_index: usize,
+        selected_unit_count: usize,
+        checkpoint: String,
+        final_assistant_text: &str,
+    ) -> u32 {
+        let history = run
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(run.session_id)
+            .expect("canonical history");
+        let pre_final_history = history
+            .iter()
+            .filter(|item| {
+                !matches!(
+                    &item.payload,
+                    HistoryItemPayload::AssistantMessage { content, .. }
+                        if content_text(content) == final_assistant_text
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let context = context_manager::ContextManager::rehydrate(pre_final_history);
+        let units = context.semantic_compaction_units();
+        assert!(selected_unit_count <= units.len());
+        let selected_item_ids = flatten_compaction_unit_prefix(&units, selected_unit_count);
+        let preserved_user_messages = bounded_compaction_user_messages(
+            &context.compaction_user_messages_for_items(&selected_item_ids),
+        );
+        let turn_id = context
+            .history_items()
+            .iter()
+            .find_map(HistoryItem::turn_id)
+            .expect("fixture turn");
+        let before_context_tokens = estimate_model_messages_tokens(&context.model_messages(false));
+        let after_context_tokens =
+            estimate_model_messages_tokens(&context.model_messages_after_compaction(
+                run.session_id,
+                turn_id,
+                preserved_user_messages,
+                checkpoint,
+                selected_item_ids,
+                &HashSet::new(),
+                false,
+            ));
+        ContextWindowTokenStatus::for_request(&run.requests[final_request_index], 0)
+            .active_context_tokens
+            .saturating_sub(before_context_tokens)
+            .saturating_add(after_context_tokens)
+    }
+
     #[tokio::test]
     async fn proactive_root_tool_surface_is_stable_when_plan_validation_fails() {
         let mut config = ResolvedConfig::default();
@@ -4759,129 +5227,113 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[test]
-    fn removing_the_oldest_compaction_item_matches_provider_native_granularity() {
-        let assistant = ModelMessage::AssistantToolCalls {
-            content: Some("inspect both files".to_string()),
-            tool_calls: vec![
-                ModelToolCall {
-                    call_id: "call-1".to_string(),
-                    tool_name: "read".to_string(),
-                    arguments_json: r#"{"path":"a.txt"}"#.to_string(),
-                },
-                ModelToolCall {
-                    call_id: "call-2".to_string(),
-                    tool_name: "read".to_string(),
-                    arguments_json: r#"{"path":"b.txt"}"#.to_string(),
-                },
-            ],
-        };
-        let first_output = ModelMessage::Tool {
-            call_id: "call-1".to_string(),
-            tool_name: "read".to_string(),
-            result: "a".to_string(),
-            metadata: serde_json::Value::Null,
-        };
-        let second_output = ModelMessage::Tool {
-            call_id: "call-2".to_string(),
-            tool_name: "read".to_string(),
-            result: "b".to_string(),
-            metadata: serde_json::Value::Null,
-        };
-        let newest = ModelMessage::User {
-            content: "latest instruction".to_string(),
-        };
+    fn semantic_prefix_search_stays_logarithmic_for_large_histories() {
+        const UNIT_COUNT: usize = 1_000_000;
+        const FIRST_SAFE: usize = 456_789;
+        const LAST_BOUNDED: usize = 765_432;
+        let mut first_evaluations = 0;
+        let first =
+            first_monotonic_prefix_count(1, UNIT_COUNT, &mut |count| -> Result<bool, AgentError> {
+                first_evaluations += 1;
+                Ok(count >= FIRST_SAFE)
+            })
+            .expect("bounded first-prefix search");
+        let mut last_evaluations = 0;
+        let last = last_monotonic_prefix_count(FIRST_SAFE, UNIT_COUNT, &mut |count| -> Result<
+            bool,
+            AgentError,
+        > {
+            last_evaluations += 1;
+            Ok(count <= LAST_BOUNDED)
+        })
+        .expect("bounded last-prefix search");
 
-        let mut messages = vec![
-            assistant.clone(),
-            first_output.clone(),
-            second_output.clone(),
-            newest.clone(),
+        assert_eq!(first, Some(FIRST_SAFE));
+        assert_eq!(last, Some(LAST_BOUNDED));
+        assert!(first_evaluations <= 20);
+        assert!(last_evaluations <= 20);
+    }
+
+    #[test]
+    fn reasoning_only_saturation_uses_effective_context_boundaries() {
+        for (advertised_context_window, expected_effective_limit) in
+            [(131_072, 124_518), (32_768, 31_129)]
+        {
+            let mut config = ResolvedConfig::default();
+            config.model.context_window = advertised_context_window;
+            config.session.overflow_margin_tokens = 128;
+            let effective_limit = crate::llm::model_policy::ModelPolicy::from_config(&config)
+                .effective_context_token_limit;
+            assert_eq!(effective_limit, expected_effective_limit);
+            let usage = TokenUsage {
+                prompt_tokens: effective_limit - 128,
+                completion_tokens: 128,
+                total_tokens: effective_limit,
+                reasoning_tokens: Some(128),
+            };
+
+            assert!(reasoning_only_saturated_usage(Some(&usage), effective_limit).is_some());
+        }
+    }
+
+    #[test]
+    fn reasoning_only_saturation_rejects_nonmatching_usage_shapes() {
+        let effective_limit = 31_129;
+        let cases = [
+            ("missing usage", None),
+            (
+                "ordinary completion",
+                Some(TokenUsage {
+                    prompt_tokens: effective_limit - 100,
+                    completion_tokens: 100,
+                    total_tokens: effective_limit,
+                    reasoning_tokens: Some(0),
+                }),
+            ),
+            (
+                "partial reasoning",
+                Some(TokenUsage {
+                    prompt_tokens: effective_limit - 100,
+                    completion_tokens: 100,
+                    total_tokens: effective_limit,
+                    reasoning_tokens: Some(99),
+                }),
+            ),
+            (
+                "zero completion",
+                Some(TokenUsage {
+                    prompt_tokens: effective_limit,
+                    completion_tokens: 0,
+                    total_tokens: effective_limit,
+                    reasoning_tokens: Some(0),
+                }),
+            ),
+            (
+                "absent reasoning",
+                Some(TokenUsage {
+                    prompt_tokens: effective_limit - 100,
+                    completion_tokens: 100,
+                    total_tokens: effective_limit,
+                    reasoning_tokens: None,
+                }),
+            ),
+            (
+                "below effective limit",
+                Some(TokenUsage {
+                    prompt_tokens: effective_limit - 101,
+                    completion_tokens: 100,
+                    total_tokens: effective_limit - 1,
+                    reasoning_tokens: Some(100),
+                }),
+            ),
         ];
-        remove_oldest_compaction_message(&mut messages);
-        assert!(matches!(
-            messages.as_slice(),
-            [
-                ModelMessage::AssistantToolCalls { content: None, tool_calls },
-                ModelMessage::Tool { call_id: first, .. },
-                ModelMessage::Tool { call_id: second, .. },
-                ModelMessage::User { content },
-            ] if tool_calls.len() == 2
-                && first == "call-1"
-                && second == "call-2"
-                && content == "latest instruction"
-        ));
-        remove_oldest_compaction_message(&mut messages);
-        assert!(matches!(
-            messages.as_slice(),
-            [
-                ModelMessage::AssistantToolCalls { content: None, tool_calls },
-                ModelMessage::Tool { call_id, .. },
-                ModelMessage::User { content },
-            ] if matches!(tool_calls.as_slice(), [ModelToolCall { call_id: remaining, .. }] if remaining == "call-2")
-                && call_id == "call-2"
-                && content == "latest instruction"
-        ));
-        remove_oldest_compaction_message(&mut messages);
-        assert!(matches!(
-            messages.as_slice(),
-            [ModelMessage::User { content }] if content == "latest instruction"
-        ));
 
-        let mut output_first = vec![first_output, assistant, second_output];
-        remove_oldest_compaction_message(&mut output_first);
-        assert!(matches!(
-            output_first.as_slice(),
-            [
-                ModelMessage::AssistantToolCalls { content: Some(content), tool_calls },
-                ModelMessage::Tool { call_id, .. },
-            ] if content == "inspect both files"
-                && matches!(tool_calls.as_slice(), [ModelToolCall { call_id: remaining, .. }] if remaining == "call-2")
-                && call_id == "call-2"
-        ));
-
-        let system = ModelMessage::System {
-            content: "base instructions".to_string(),
-        };
-        let oldest = ModelMessage::User {
-            content: "oldest".to_string(),
-        };
-        let mut ordinary = vec![
-            system.clone(),
-            ModelMessage::Developer {
-                content: "current developer context".to_string(),
-            },
-            oldest.clone(),
-            newest.clone(),
-        ];
-        remove_oldest_compaction_message(&mut ordinary);
-        assert!(matches!(
-            ordinary.as_slice(),
-            [
-                ModelMessage::System { content: base },
-                ModelMessage::Developer { content: developer },
-                ModelMessage::User { content: latest }
-            ] if base == "base instructions"
-                && developer == "current developer context"
-                && latest == "latest instruction"
-        ));
-        remove_oldest_compaction_message(&mut ordinary);
-        assert!(matches!(
-            ordinary.as_slice(),
-            [
-                ModelMessage::System { content: base },
-                ModelMessage::Developer { content: developer },
-            ] if base == "base instructions"
-                && developer == "current developer context"
-        ));
-        remove_oldest_compaction_message(&mut ordinary);
-        assert!(matches!(
-            ordinary.as_slice(),
-            [
-                ModelMessage::System { content: base },
-                ModelMessage::Developer { content: developer },
-            ] if base == "base instructions" && developer == "current developer context"
-        ));
-        assert!(!has_removable_compaction_message(&ordinary));
+        for (label, usage) in cases {
+            assert!(
+                reasoning_only_saturated_usage(usage.as_ref(), effective_limit).is_none(),
+                "{label} must not trigger the reasoning-only saturation retry"
+            );
+        }
     }
 
     #[test]
@@ -5400,29 +5852,28 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
-    async fn compaction_retries_context_overflow_after_removing_the_oldest_item() {
+    async fn compaction_retries_context_overflow_with_smaller_aligned_unit_prefix() {
         const CHECKPOINT: &str = VALID_C8_COMPACTION_CHECKPOINT;
 
         let mut config = ResolvedConfig::default();
         config.model.context_window = 68_000;
         config.model.max_output_tokens = 512;
         config.session.overflow_margin_tokens = 128;
+        let mut second_read = scripted_read_call("overflow-read-newer");
+        second_read.events.push(LlmEvent::Finished {
+            finish_reason: FinishReason::ToolCall,
+            usage: Some(TokenUsage {
+                prompt_tokens: 54_900,
+                completion_tokens: 100,
+                total_tokens: 55_000,
+                reasoning_tokens: None,
+            }),
+        });
         let run = run_scripted_internal_with_pending_steers(
             config,
             vec![
-                ScriptedOutcome::Response(ScriptedResponse {
-                    events: vec![
-                        LlmEvent::ToolCallStart {
-                            call_id: "overflow-read".to_string(),
-                            tool_name: "read".to_string(),
-                        },
-                        LlmEvent::ToolCallArgsDelta {
-                            call_id: "overflow-read".to_string(),
-                            delta: "{}".to_string(),
-                        },
-                    ],
-                    finish_reason: FinishReason::ToolCall,
-                }),
+                ScriptedOutcome::Response(scripted_read_call("overflow-read-oldest")),
+                ScriptedOutcome::Response(second_read),
                 ScriptedOutcome::Error(LlmError::ProviderRejected {
                     status: Some(400),
                     code: Some("context_length_exceeded".to_string()),
@@ -5443,7 +5894,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             crate::cli::ReviewDecision::Approved,
             RunControl::new(),
             Some(Arc::new(LargeReadOutputTool {
-                output_chars: 250_000,
+                output_chars: 30_000,
             })),
             false,
         )
@@ -5451,52 +5902,758 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         .expect("scripted context-overflow retry run");
 
         run.summary.expect("run succeeds after compact retry");
-        assert_eq!(run.requests.len(), 4);
-        let compact = &run.requests[1];
-        let retry = &run.requests[2];
-        assert_eq!(retry.messages.len(), compact.messages.len() - 1);
+        assert_eq!(run.requests.len(), 5);
+        let compact = &run.requests[2];
+        let retry = &run.requests[3];
+        let resumed = &run.requests[4];
         assert_eq!(retry.system_prompt, compact.system_prompt);
-        assert!(matches!(
-            (compact.messages.first(), retry.messages.first()),
-            (
-                Some(ModelMessage::Developer { .. }),
-                Some(ModelMessage::Developer { .. })
-            )
+        assert!(request_contains_model_call(compact, "overflow-read-oldest"));
+        assert!(request_contains_model_call(compact, "overflow-read-newer"));
+        assert!(request_contains_model_call(retry, "overflow-read-oldest"));
+        assert!(!request_contains_model_call(retry, "overflow-read-newer"));
+        assert!(!request_contains_model_call(
+            resumed,
+            "overflow-read-oldest"
         ));
-        let leading_user_anchors = |request: &ChatRequest| {
-            request
-                .messages
-                .iter()
-                .skip_while(|message| matches!(message, ModelMessage::Developer { .. }))
-                .take_while(|message| {
-                    matches!(message, ModelMessage::User { content } if content == "write hello.txt")
-                })
-                .count()
-        };
-        assert_eq!(leading_user_anchors(compact), 1);
-        assert_eq!(
-            leading_user_anchors(retry),
-            leading_user_anchors(compact) - 1,
-            "typed overflow retry removes exactly the oldest provider-native item"
-        );
-        assert_eq!(
-            leading_user_anchors(retry),
-            0,
-            "the one canonical objective anchor is the oldest provider-native retry item"
-        );
-        assert!(matches!(
-            (compact.messages.last(), retry.messages.last()),
-            (
-                Some(ModelMessage::User { content: first_prompt }),
-                Some(ModelMessage::User { content: retry_prompt }),
-            ) if first_prompt == include_str!("../../assets/prompts/compaction.md").trim()
-                && retry_prompt == first_prompt
-        ));
+        assert!(request_contains_model_call(resumed, "overflow-read-newer"));
+        let history = run
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(run.session_id)
+            .expect("canonical history");
+        let replacement_item_ids = history
+            .iter()
+            .find_map(|item| match &item.payload {
+                HistoryItemPayload::Compaction {
+                    replacement_item_ids,
+                    ..
+                } => Some(replacement_item_ids),
+                _ => None,
+            })
+            .expect("durable compaction");
+        for item_id in history_tool_unit_ids(&history, "overflow-read-oldest") {
+            assert!(replacement_item_ids.contains(&item_id));
+        }
+        for item_id in history_tool_unit_ids(&history, "overflow-read-newer") {
+            assert!(!replacement_item_ids.contains(&item_id));
+        }
         assert!(run.events.iter().any(|event| matches!(
             event,
             RunEvent::RuntimeNotice { message, .. }
                 if message == COMPACTION_ACCURACY_WARNING
         )));
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_compaction_retries_one_gap_safe_aligned_unit_prefix() {
+        const CHECKPOINT: &str = VALID_C8_COMPACTION_CHECKPOINT;
+        const SATURATED_PROMPT_TOKENS: u32 = 63_600;
+        const SATURATED_TOTAL_TOKENS: u32 = 64_600;
+
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 68_000;
+        config.model.max_output_tokens = 512;
+        config.session.overflow_margin_tokens = 128;
+        let working_limit =
+            crate::llm::model_policy::ModelPolicy::from_config(&config).working_context_token_limit;
+        let mut second_read = scripted_read_call("reasoning-read-newer");
+        second_read.events.push(LlmEvent::Finished {
+            finish_reason: FinishReason::ToolCall,
+            usage: Some(TokenUsage {
+                prompt_tokens: 54_900,
+                completion_tokens: 100,
+                total_tokens: 55_000,
+                reasoning_tokens: None,
+            }),
+        });
+        let run = run_scripted_internal_with_pending_steers(
+            config,
+            vec![
+                ScriptedOutcome::Response(scripted_read_call("reasoning-read-oldest")),
+                ScriptedOutcome::Response(second_read),
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![LlmEvent::Finished {
+                        finish_reason: FinishReason::Stop,
+                        usage: Some(TokenUsage {
+                            prompt_tokens: SATURATED_PROMPT_TOKENS,
+                            completion_tokens: 1_000,
+                            total_tokens: SATURATED_TOTAL_TOKENS,
+                            reasoning_tokens: Some(1_000),
+                        }),
+                    }],
+                    finish_reason: FinishReason::Stop,
+                }),
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(CHECKPOINT.to_string())],
+                    finish_reason: FinishReason::Stop,
+                }),
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
+                    finish_reason: FinishReason::Stop,
+                }),
+            ],
+            Some(("finish after compaction", ThreadGoalStatus::Active, None)),
+            Vec::new(),
+            crate::cli::ReviewDecision::Approved,
+            RunControl::new(),
+            Some(Arc::new(LargeReadOutputTool {
+                output_chars: 30_000,
+            })),
+            false,
+        )
+        .await
+        .expect("scripted reasoning-only compaction retry run");
+
+        run.summary.expect("run succeeds after aligned retry");
+        assert_eq!(run.requests.len(), 5);
+        let compact = &run.requests[2];
+        let retry = &run.requests[3];
+        let resumed = &run.requests[4];
+        assert!(request_contains_model_call(
+            compact,
+            "reasoning-read-oldest"
+        ));
+        assert!(request_contains_model_call(compact, "reasoning-read-newer"));
+        assert!(request_contains_model_call(retry, "reasoning-read-oldest"));
+        assert!(!request_contains_model_call(retry, "reasoning-read-newer"));
+        let compact_estimate =
+            ContextWindowTokenStatus::for_request(compact, 0).active_context_tokens;
+        let observed_prompt_gap = SATURATED_PROMPT_TOKENS.saturating_sub(compact_estimate);
+        assert!(observed_prompt_gap > 0);
+        assert!(
+            ContextWindowTokenStatus::for_request(retry, 0)
+                .active_context_tokens
+                .saturating_add(observed_prompt_gap)
+                < working_limit,
+            "the retry source must preserve headroom after the observed provider/local gap"
+        );
+        assert!(
+            ContextWindowTokenStatus::for_request(resumed, 0)
+                .active_context_tokens
+                .saturating_add(observed_prompt_gap)
+                < working_limit,
+            "the projected normal request must remain safe under the observed gap"
+        );
+        let history = run
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(run.session_id)
+            .expect("canonical history");
+        let replacement_item_ids = history
+            .iter()
+            .find_map(|item| match &item.payload {
+                HistoryItemPayload::Compaction {
+                    replacement_item_ids,
+                    ..
+                } => Some(replacement_item_ids),
+                _ => None,
+            })
+            .expect("durable compaction");
+        for item_id in history_tool_unit_ids(&history, "reasoning-read-oldest") {
+            assert!(replacement_item_ids.contains(&item_id));
+        }
+        for item_id in history_tool_unit_ids(&history, "reasoning-read-newer") {
+            assert!(!replacement_item_ids.contains(&item_id));
+        }
+        let goal = run
+            .store
+            .session_repo()
+            .get_thread_goal(run.session_id)
+            .await
+            .expect("goal")
+            .expect("stored goal");
+        assert_eq!(
+            goal.tokens_used, 119_645,
+            "the failed reasoning-only compaction attempt must be accounted once"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_retry_rejects_actual_summary_that_exceeds_gap_safe_projection() {
+        let oversized_checkpoint = format!(
+            "{}\n{}",
+            VALID_C8_COMPACTION_CHECKPOINT,
+            "summary-padding".repeat(600)
+        );
+        assert!(estimate_text_tokens(&oversized_checkpoint) > COMPACTION_CHECKPOINT_RESERVE_TOKENS);
+        compaction::validate_checkpoint_structure(&oversized_checkpoint)
+            .expect("oversized checkpoint remains structurally valid");
+
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 68_000;
+        config.model.max_output_tokens = 512;
+        config.session.overflow_margin_tokens = 128;
+        let working_limit =
+            crate::llm::model_policy::ModelPolicy::from_config(&config).working_context_token_limit;
+        let mut second_read = scripted_read_call("actual-summary-read-newer");
+        second_read.events.push(LlmEvent::Finished {
+            finish_reason: FinishReason::ToolCall,
+            usage: Some(TokenUsage {
+                prompt_tokens: 54_900,
+                completion_tokens: 100,
+                total_tokens: 55_000,
+                reasoning_tokens: None,
+            }),
+        });
+        let run = run_scripted_internal_with_pending_steers(
+            config,
+            vec![
+                ScriptedOutcome::Response(scripted_read_call("actual-summary-read-oldest")),
+                ScriptedOutcome::Response(second_read),
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![LlmEvent::Finished {
+                        finish_reason: FinishReason::Stop,
+                        usage: Some(TokenUsage {
+                            prompt_tokens: 63_600,
+                            completion_tokens: 1_000,
+                            total_tokens: 64_600,
+                            reasoning_tokens: Some(1_000),
+                        }),
+                    }],
+                    finish_reason: FinishReason::Stop,
+                }),
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(oversized_checkpoint.clone())],
+                    finish_reason: FinishReason::Stop,
+                }),
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(
+                        "done without committing an unsafe checkpoint".to_string(),
+                    )],
+                    finish_reason: FinishReason::Stop,
+                }),
+            ],
+            Some(("finish after compaction", ThreadGoalStatus::Active, None)),
+            Vec::new(),
+            crate::cli::ReviewDecision::Approved,
+            RunControl::new(),
+            Some(Arc::new(LargeReadOutputTool {
+                output_chars: 30_000,
+            })),
+            false,
+        )
+        .await
+        .expect("scripted actual-summary gate run");
+
+        run.summary
+            .expect("the turn can continue below the effective hard limit");
+        assert_eq!(run.requests.len(), 5);
+        let history = run
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(run.session_id)
+            .expect("canonical history");
+        let pre_final_history = history
+            .iter()
+            .filter(|item| {
+                !matches!(
+                    &item.payload,
+                    HistoryItemPayload::AssistantMessage { content, .. }
+                        if content_text(content)
+                            == "done without committing an unsafe checkpoint"
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let context = context_manager::ContextManager::rehydrate(pre_final_history);
+        let units = context.semantic_compaction_units();
+        assert_eq!(units.len(), 3, "user plus two completed tool responses");
+        let selected_item_ids = flatten_compaction_unit_prefix(&units, 2);
+        let preserved_user_messages = bounded_compaction_user_messages(
+            &context.compaction_user_messages_for_items(&selected_item_ids),
+        );
+        let turn_id = context
+            .history_items()
+            .iter()
+            .find_map(HistoryItem::turn_id)
+            .expect("fixture turn");
+        let before_context_tokens = estimate_model_messages_tokens(&context.model_messages(false));
+        let after_context_tokens =
+            estimate_model_messages_tokens(&context.model_messages_after_compaction(
+                run.session_id,
+                turn_id,
+                preserved_user_messages,
+                oversized_checkpoint,
+                selected_item_ids,
+                &HashSet::new(),
+                false,
+            ));
+        let before_request_tokens =
+            ContextWindowTokenStatus::for_request(&run.requests[4], 0).active_context_tokens;
+        let local_projected_request_tokens = before_request_tokens
+            .saturating_sub(before_context_tokens)
+            .saturating_add(after_context_tokens);
+        let observed_prompt_gap = 63_600u32.saturating_sub(
+            ContextWindowTokenStatus::for_request(&run.requests[2], 0).active_context_tokens,
+        );
+        assert!(local_projected_request_tokens < working_limit);
+        assert!(
+            local_projected_request_tokens.saturating_add(observed_prompt_gap) >= working_limit,
+            "the fixture must be rejected only after carrying the observed gap to the actual-summary gate"
+        );
+        assert!(run.events.iter().any(|event| matches!(
+            event,
+            RunEvent::RecoverableRuntimeFeedback { message, .. }
+                if message.contains("provider-adjusted projected request")
+                    && message.contains("observed prompt gap")
+        )));
+        assert!(
+            history
+                .into_iter()
+                .all(|item| !matches!(item.payload, HistoryItemPayload::Compaction { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_initial_compaction_prompt_gap_reaches_commit_gate() {
+        const CHECKPOINT: &str = VALID_C8_COMPACTION_CHECKPOINT;
+        const SUCCESS_PROMPT_TOKENS: u32 = 63_000;
+        const FINAL_TEXT: &str = "done without the unsafe initial checkpoint";
+
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 68_000;
+        config.model.max_output_tokens = 512;
+        config.session.overflow_margin_tokens = 128;
+        let working_limit =
+            crate::llm::model_policy::ModelPolicy::from_config(&config).working_context_token_limit;
+        let mut second_read = scripted_read_call("success-gap-read-newer");
+        second_read.events.push(LlmEvent::Finished {
+            finish_reason: FinishReason::ToolCall,
+            usage: Some(TokenUsage {
+                prompt_tokens: 43_900,
+                completion_tokens: 100,
+                total_tokens: 44_000,
+                reasoning_tokens: None,
+            }),
+        });
+        let run = run_scripted_with_control_and_tool(
+            config,
+            vec![
+                scripted_read_call("success-gap-read-oldest"),
+                second_read,
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::TextDelta(CHECKPOINT.to_string()),
+                        LlmEvent::Finished {
+                            finish_reason: FinishReason::Stop,
+                            usage: Some(TokenUsage {
+                                prompt_tokens: SUCCESS_PROMPT_TOKENS,
+                                completion_tokens: 200,
+                                total_tokens: 63_200,
+                                reasoning_tokens: None,
+                            }),
+                        },
+                    ],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(FINAL_TEXT.to_string())],
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            RunControl::new(),
+            Arc::new(LargeReadOutputTool {
+                output_chars: 70_000,
+            }),
+        )
+        .await
+        .expect("scripted successful-compaction gap run");
+
+        run.summary
+            .as_ref()
+            .expect("the turn continues below the effective hard limit");
+        assert_eq!(run.requests.len(), 4);
+        let compact = &run.requests[2];
+        assert!(request_contains_model_call(
+            compact,
+            "success-gap-read-oldest"
+        ));
+        assert!(!request_contains_model_call(
+            compact,
+            "success-gap-read-newer"
+        ));
+        let prompt_gap = SUCCESS_PROMPT_TOKENS.saturating_sub(
+            ContextWindowTokenStatus::for_request(compact, 0).active_context_tokens,
+        );
+        assert!(prompt_gap > 0);
+        let local_projection = local_request_projection_after_hypothetical_compaction(
+            &run,
+            3,
+            2,
+            CHECKPOINT.to_string(),
+            FINAL_TEXT,
+        );
+        assert!(local_projection < working_limit);
+        assert!(
+            local_projection.saturating_add(prompt_gap) >= working_limit,
+            "successful first-attempt usage must reach the final checkpoint gate"
+        );
+        assert!(run.events.iter().any(|event| matches!(
+            event,
+            RunEvent::RecoverableRuntimeFeedback { message, .. }
+                if message.contains("provider-adjusted projected request")
+        )));
+        assert!(
+            run.store
+                .protocol_event_store()
+                .list_history_items_for_session(run.session_id)
+                .expect("canonical history")
+                .into_iter()
+                .all(|item| !matches!(item.payload, HistoryItemPayload::Compaction { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_overflow_retry_prompt_gap_reaches_commit_gate() {
+        const CHECKPOINT: &str = VALID_C8_COMPACTION_CHECKPOINT;
+        const SUCCESS_PROMPT_TOKENS: u32 = 63_000;
+        const FINAL_TEXT: &str = "done without the unsafe overflow-retry checkpoint";
+
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 68_000;
+        config.model.max_output_tokens = 512;
+        config.session.overflow_margin_tokens = 128;
+        let working_limit =
+            crate::llm::model_policy::ModelPolicy::from_config(&config).working_context_token_limit;
+        let mut second_read = scripted_read_call("overflow-success-gap-read-newer");
+        second_read.events.push(LlmEvent::Finished {
+            finish_reason: FinishReason::ToolCall,
+            usage: Some(TokenUsage {
+                prompt_tokens: 54_900,
+                completion_tokens: 100,
+                total_tokens: 55_000,
+                reasoning_tokens: None,
+            }),
+        });
+        let run = run_scripted_internal_with_pending_steers(
+            config,
+            vec![
+                ScriptedOutcome::Response(scripted_read_call("overflow-success-gap-read-oldest")),
+                ScriptedOutcome::Response(second_read),
+                ScriptedOutcome::Error(LlmError::ProviderRejected {
+                    status: Some(400),
+                    code: Some("context_length_exceeded".to_string()),
+                    param: None,
+                    message: "maximum context length exceeded".to_string(),
+                }),
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![
+                        LlmEvent::TextDelta(CHECKPOINT.to_string()),
+                        LlmEvent::Finished {
+                            finish_reason: FinishReason::Stop,
+                            usage: Some(TokenUsage {
+                                prompt_tokens: SUCCESS_PROMPT_TOKENS,
+                                completion_tokens: 200,
+                                total_tokens: 63_200,
+                                reasoning_tokens: None,
+                            }),
+                        },
+                    ],
+                    finish_reason: FinishReason::Stop,
+                }),
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta(FINAL_TEXT.to_string())],
+                    finish_reason: FinishReason::Stop,
+                }),
+            ],
+            None,
+            Vec::new(),
+            crate::cli::ReviewDecision::Approved,
+            RunControl::new(),
+            Some(Arc::new(LargeReadOutputTool {
+                output_chars: 30_000,
+            })),
+            false,
+        )
+        .await
+        .expect("scripted successful overflow-retry gap run");
+
+        run.summary
+            .as_ref()
+            .expect("the turn continues below the effective hard limit");
+        assert_eq!(run.requests.len(), 5);
+        let retry = &run.requests[3];
+        assert!(request_contains_model_call(
+            retry,
+            "overflow-success-gap-read-oldest"
+        ));
+        assert!(!request_contains_model_call(
+            retry,
+            "overflow-success-gap-read-newer"
+        ));
+        let prompt_gap = SUCCESS_PROMPT_TOKENS
+            .saturating_sub(ContextWindowTokenStatus::for_request(retry, 0).active_context_tokens);
+        assert!(prompt_gap > 0);
+        let local_projection = local_request_projection_after_hypothetical_compaction(
+            &run,
+            4,
+            2,
+            CHECKPOINT.to_string(),
+            FINAL_TEXT,
+        );
+        assert!(local_projection < working_limit);
+        assert!(
+            local_projection.saturating_add(prompt_gap) >= working_limit,
+            "successful typed-overflow retry usage must reach the final checkpoint gate"
+        );
+        assert!(
+            run.store
+                .protocol_event_store()
+                .list_history_items_for_session(run.session_id)
+                .expect("canonical history")
+                .into_iter()
+                .all(|item| !matches!(item.payload, HistoryItemPayload::Compaction { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_accounts_incomplete_response_usage_before_returning_error() {
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 68_000;
+        config.model.max_output_tokens = 512;
+        config.session.overflow_margin_tokens = 128;
+        let incomplete_usage = TokenUsage {
+            prompt_tokens: 20,
+            completion_tokens: 17,
+            total_tokens: 37,
+            reasoning_tokens: Some(17),
+        };
+        let run = run_scripted_internal_with_pending_steers(
+            config,
+            vec![
+                ScriptedOutcome::Response(scripted_read_call("incomplete-compaction-read")),
+                ScriptedOutcome::Response(ScriptedResponse {
+                    events: vec![LlmEvent::Finished {
+                        finish_reason: FinishReason::Error,
+                        usage: Some(incomplete_usage.clone()),
+                    }],
+                    finish_reason: FinishReason::Error,
+                }),
+            ],
+            Some(("finish after compaction", ThreadGoalStatus::Active, None)),
+            Vec::new(),
+            crate::cli::ReviewDecision::Approved,
+            RunControl::new(),
+            Some(Arc::new(LargeReadOutputTool {
+                output_chars: 350_000,
+            })),
+            false,
+        )
+        .await
+        .expect("scripted incomplete compaction run");
+
+        assert!(matches!(
+            run.summary,
+            Err(AgentError::Llm(LlmError::IncompleteResponse { .. }))
+        ));
+        assert_eq!(run.requests.len(), 2);
+        let goal = run
+            .store
+            .session_repo()
+            .get_thread_goal(run.session_id)
+            .await
+            .expect("goal")
+            .expect("stored goal");
+        assert_eq!(
+            goal.tokens_used, 52,
+            "ordinary generation 15 plus incomplete compaction 37 are each accounted once"
+        );
+        let terminal = run
+            .store
+            .protocol_event_store()
+            .list_runtime_events_for_session(run.session_id)
+            .expect("runtime events")
+            .into_iter()
+            .rev()
+            .find_map(|event| match event.msg {
+                crate::protocol::RuntimeEventMsg::TurnTerminal { terminal } => Some(*terminal),
+                _ => None,
+            })
+            .expect("canonical failure terminal");
+        assert_eq!(terminal.final_response_id, None);
+        assert_eq!(terminal.metrics.token_usage, Some(incomplete_usage));
+    }
+
+    #[tokio::test]
+    async fn rejected_successful_compaction_usage_remains_terminal_telemetry() {
+        let empty_usage = TokenUsage {
+            prompt_tokens: 21,
+            completion_tokens: 4,
+            total_tokens: 25,
+            reasoning_tokens: None,
+        };
+        let malformed_usage = TokenUsage {
+            prompt_tokens: 31,
+            completion_tokens: 7,
+            total_tokens: 38,
+            reasoning_tokens: None,
+        };
+        let cases = vec![
+            (
+                "empty",
+                ScriptedResponse {
+                    events: vec![LlmEvent::Finished {
+                        finish_reason: FinishReason::Stop,
+                        usage: Some(empty_usage.clone()),
+                    }],
+                    finish_reason: FinishReason::Stop,
+                },
+                "semantic compaction returned an empty summary",
+                empty_usage,
+            ),
+            (
+                "structural",
+                ScriptedResponse {
+                    events: vec![
+                        LlmEvent::TextDelta(
+                            "A summary without the required checkpoint structure.".to_string(),
+                        ),
+                        LlmEvent::Finished {
+                            finish_reason: FinishReason::Stop,
+                            usage: Some(malformed_usage.clone()),
+                        },
+                    ],
+                    finish_reason: FinishReason::Stop,
+                },
+                "failed structural review",
+                malformed_usage,
+            ),
+        ];
+
+        for (label, compaction_response, expected_error, expected_usage) in cases {
+            let mut config = ResolvedConfig::default();
+            config.model.context_window = 68_000;
+            config.model.max_output_tokens = 512;
+            config.session.overflow_margin_tokens = 128;
+            let run = run_scripted_with_control_and_tool(
+                config,
+                vec![
+                    scripted_read_call(&format!("{label}-compaction-read")),
+                    compaction_response,
+                ],
+                RunControl::new(),
+                Arc::new(LargeReadOutputTool {
+                    output_chars: 350_000,
+                }),
+            )
+            .await
+            .expect("scripted rejected compaction run");
+
+            assert!(
+                run.summary
+                    .expect_err("hard-limit compaction rejection must fail the turn")
+                    .to_string()
+                    .contains(expected_error),
+                "{label} rejection"
+            );
+            assert_eq!(run.requests.len(), 2, "{label} request count");
+            let terminal = run
+                .store
+                .protocol_event_store()
+                .list_runtime_events_for_session(run.session_id)
+                .expect("runtime events")
+                .into_iter()
+                .rev()
+                .find_map(|event| match event.msg {
+                    crate::protocol::RuntimeEventMsg::TurnTerminal { terminal } => Some(*terminal),
+                    _ => None,
+                })
+                .expect("canonical failure terminal");
+            assert_eq!(terminal.final_response_id, None, "{label} final response");
+            assert_eq!(
+                terminal.metrics.token_usage,
+                Some(expected_usage),
+                "{label} terminal usage"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_compaction_allows_at_most_one_aligned_retry() {
+        let mut config = ResolvedConfig::default();
+        config.model.context_window = 68_000;
+        config.model.max_output_tokens = 512;
+        config.session.overflow_margin_tokens = 128;
+        let mut second_read = scripted_read_call("retry-limit-read-newer");
+        second_read.events.push(LlmEvent::Finished {
+            finish_reason: FinishReason::ToolCall,
+            usage: Some(TokenUsage {
+                prompt_tokens: 57_900,
+                completion_tokens: 100,
+                total_tokens: 58_000,
+                reasoning_tokens: None,
+            }),
+        });
+        let first_usage = TokenUsage {
+            prompt_tokens: 63_600,
+            completion_tokens: 1_000,
+            total_tokens: 64_600,
+            reasoning_tokens: Some(1_000),
+        };
+        let second_usage = TokenUsage {
+            prompt_tokens: 63_400,
+            completion_tokens: 1_200,
+            total_tokens: 64_600,
+            reasoning_tokens: Some(1_200),
+        };
+        let reasoning_only = |usage| ScriptedResponse {
+            events: vec![LlmEvent::Finished {
+                finish_reason: FinishReason::Stop,
+                usage: Some(usage),
+            }],
+            finish_reason: FinishReason::Stop,
+        };
+        let run = run_scripted_with_control_and_tool(
+            config,
+            vec![
+                scripted_read_call("retry-limit-read-oldest"),
+                second_read,
+                reasoning_only(first_usage),
+                reasoning_only(second_usage.clone()),
+            ],
+            RunControl::new(),
+            Arc::new(LargeReadOutputTool {
+                output_chars: 30_000,
+            }),
+        )
+        .await
+        .expect("scripted bounded retry run");
+
+        let error = run
+            .summary
+            .expect_err("the second empty summary must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("no smaller safe semantic-unit prefix was available")
+        );
+        assert_eq!(
+            run.requests.len(),
+            4,
+            "one initial compaction attempt and one aligned retry are the hard maximum"
+        );
+        assert!(
+            run.store
+                .protocol_event_store()
+                .list_history_items_for_session(run.session_id)
+                .expect("canonical history")
+                .into_iter()
+                .all(|item| !matches!(item.payload, HistoryItemPayload::Compaction { .. }))
+        );
+        let terminal = run
+            .store
+            .protocol_event_store()
+            .list_runtime_events_for_session(run.session_id)
+            .expect("runtime events")
+            .into_iter()
+            .rev()
+            .find_map(|event| match event.msg {
+                crate::protocol::RuntimeEventMsg::TurnTerminal { terminal } => Some(*terminal),
+                _ => None,
+            })
+            .expect("canonical failure terminal");
+        assert_eq!(terminal.final_response_id, None);
+        assert_eq!(terminal.metrics.token_usage, Some(second_usage));
     }
 
     #[tokio::test]
@@ -5551,29 +6708,28 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
-    async fn oversized_automatic_compaction_uses_one_native_codex_request() {
+    async fn automatic_compaction_bounds_source_to_oldest_semantic_prefix() {
         const CHECKPOINT: &str = VALID_C8_COMPACTION_CHECKPOINT;
 
         let mut config = ResolvedConfig::default();
-        config.model.context_window = 72_000;
+        config.model.context_window = 68_000;
         config.model.max_output_tokens = 512;
         config.session.overflow_margin_tokens = 128;
+        let mut second_read = scripted_read_call("bounded-read-newer");
+        second_read.events.push(LlmEvent::Finished {
+            finish_reason: FinishReason::ToolCall,
+            usage: Some(TokenUsage {
+                prompt_tokens: 43_900,
+                completion_tokens: 100,
+                total_tokens: 44_000,
+                reasoning_tokens: None,
+            }),
+        });
         let run = run_scripted_with_control_and_tool(
             config,
             vec![
-                ScriptedResponse {
-                    events: vec![
-                        LlmEvent::ToolCallStart {
-                            call_id: "oversized-read".to_string(),
-                            tool_name: "read".to_string(),
-                        },
-                        LlmEvent::ToolCallArgsDelta {
-                            call_id: "oversized-read".to_string(),
-                            delta: "{}".to_string(),
-                        },
-                    ],
-                    finish_reason: FinishReason::ToolCall,
-                },
+                scripted_read_call("bounded-read-oldest"),
+                second_read,
                 ScriptedResponse {
                     events: vec![LlmEvent::TextDelta(CHECKPOINT.to_string())],
                     finish_reason: FinishReason::Stop,
@@ -5585,60 +6741,46 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             ],
             RunControl::new(),
             Arc::new(LargeReadOutputTool {
-                output_chars: 350_000,
+                output_chars: 70_000,
             }),
         )
         .await
-        .expect("scripted oversized compaction run");
+        .expect("scripted bounded compaction run");
         let summary = run.summary.as_ref().expect("run succeeds after compaction");
 
         assert_eq!(summary.status(), SessionStatus::Completed);
         assert_eq!(summary.metrics().model_request_count, run.requests.len());
-        assert_eq!(run.requests.len(), 3);
+        assert_eq!(run.requests.len(), 4);
         let first = &run.requests[0];
-        let compact = &run.requests[1];
-        let resumed = &run.requests[2];
+        let compact = &run.requests[2];
+        let resumed = &run.requests[3];
         assert_eq!(compact.system_prompt, first.system_prompt);
         assert!(compact.tools.is_empty());
         assert!(compact.tool_choice.is_none());
         assert!(!compact.parallel_tool_calls);
+        assert!(request_contains_model_call(compact, "bounded-read-oldest"));
+        assert!(!request_contains_model_call(compact, "bounded-read-newer"));
         assert!(matches!(
-            &compact.messages[compact.messages.len() - 3..],
-            [
-                ModelMessage::AssistantToolCalls { tool_calls, .. },
-                ModelMessage::Tool { result, .. },
-                ModelMessage::User { content: prompt },
-            ] if matches!(tool_calls.as_slice(), [ModelToolCall { tool_name, .. }] if tool_name == "read")
-                && result.len() == 350_000
-                && prompt == include_str!("../../assets/prompts/compaction.md").trim()
+            compact.messages.last(),
+            Some(ModelMessage::User { content })
+                if content == include_str!("../../assets/prompts/compaction.md").trim()
         ));
         assert!(!compact.messages.iter().any(|message| matches!(
             message,
             ModelMessage::User { content } if content.contains("[partial summary")
         )));
-
-        let (checkpoint_message, anchors) = resumed
-            .messages
-            .split_last()
-            .expect("resumed request has a checkpoint");
-        assert!(matches!(
-            anchors,
-            [
-                ModelMessage::Developer { .. },
-                ModelMessage::Developer { .. },
-                ModelMessage::User { content },
-            ] if content == "write hello.txt"
-        ));
-        assert!(context_manager::is_semantic_compaction_message(
-            checkpoint_message
-        ));
-        assert!(matches!(
-            checkpoint_message,
-            ModelMessage::User { content }
-                if content.starts_with(
-                    include_str!("../../assets/prompts/compaction_summary_prefix.md").trim()
-                ) && content.ends_with(CHECKPOINT)
-        ));
+        assert!(!request_contains_model_call(resumed, "bounded-read-oldest"));
+        assert!(request_contains_model_call(resumed, "bounded-read-newer"));
+        assert!(resumed.messages.iter().any(|message| {
+            context_manager::is_semantic_compaction_message(message)
+                && matches!(
+                    message,
+                    ModelMessage::User { content }
+                        if content.starts_with(
+                            include_str!("../../assets/prompts/compaction_summary_prefix.md").trim()
+                        ) && content.ends_with(CHECKPOINT)
+                )
+        }));
 
         let history = run
             .store
@@ -5676,6 +6818,12 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert_eq!(preserved_user_messages, &["write hello.txt"]);
         assert_eq!(durable_summary, CHECKPOINT);
         assert!(replacement_item_ids.contains(&user_id));
+        for item_id in history_tool_unit_ids(&history, "bounded-read-oldest") {
+            assert!(replacement_item_ids.contains(&item_id));
+        }
+        for item_id in history_tool_unit_ids(&history, "bounded-read-newer") {
+            assert!(!replacement_item_ids.contains(&item_id));
+        }
         assert!(run.events.iter().any(|event| matches!(
             event,
             RunEvent::RuntimeNotice { message, .. }
@@ -8897,32 +10045,20 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
-    async fn provider_context_overflow_exhausts_oldest_items_without_history_loss() {
+    async fn provider_context_overflow_without_a_smaller_safe_unit_preserves_history() {
         let mut config = ResolvedConfig::default();
         config.model.context_window = 131_072;
         config.model.max_output_tokens = 512;
         config.session.overflow_margin_tokens = 128;
-        let mut outcomes = vec![ScriptedOutcome::Response(ScriptedResponse {
-            events: vec![
-                LlmEvent::ToolCallStart {
-                    call_id: "overflow-read".to_string(),
-                    tool_name: "read".to_string(),
-                },
-                LlmEvent::ToolCallArgsDelta {
-                    call_id: "overflow-read".to_string(),
-                    delta: "{}".to_string(),
-                },
-            ],
-            finish_reason: FinishReason::ToolCall,
-        })];
-        outcomes.extend((0..8).map(|_| {
+        let outcomes = vec![
+            ScriptedOutcome::Response(scripted_read_call("overflow-read")),
             ScriptedOutcome::Error(LlmError::ProviderRejected {
                 status: Some(400),
                 code: Some("context_length_exceeded".to_string()),
                 param: None,
                 message: "maximum context length exceeded".to_string(),
-            })
-        }));
+            }),
+        ];
         let run = run_scripted_internal_with_pending_steers(
             config,
             outcomes,
@@ -8951,34 +10087,19 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         );
         assert_eq!(
             run.requests.len(),
-            4,
-            "the assistant call and matching tool output are one provider-native item"
+            2,
+            "an indivisible response/tool-output unit has no smaller safe aligned retry"
         );
-        assert!(
-            run.requests
-                .iter()
-                .skip(1)
-                .all(|request| request.system_prompt == run.requests[1].system_prompt)
-        );
+        let compact = &run.requests[1];
         assert!(matches!(
-            run.requests.last().and_then(|request| request.messages.last()),
+            compact.messages.last(),
             Some(ModelMessage::User { content })
                 if content == include_str!("../../assets/prompts/compaction.md").trim()
         ));
-        let exhausted = run
-            .requests
-            .last()
-            .expect("instruction-only compaction attempt");
-        assert!(
-            exhausted.messages[..exhausted.messages.len() - 1]
-                .iter()
-                .all(|message| matches!(message, ModelMessage::Developer { .. })),
-            "durable developer instructions are retained after provider-native history is exhausted"
-        );
+        assert!(request_contains_model_call(compact, "overflow-read"));
         assert!(matches!(
-            exhausted.messages.last(),
-            Some(ModelMessage::User { content })
-                if content == include_str!("../../assets/prompts/compaction.md").trim()
+            &compact.messages[compact.messages.len() - 2],
+            ModelMessage::Tool { result, .. } if result.len() == 530_000
         ));
         assert!(
             !run.events

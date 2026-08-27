@@ -6,6 +6,7 @@ import { createProviderConnectionLiveScenario } from "./scenarios/provider_conne
 import { createLmStudioThinkingScenario } from "./scenarios/provider_lm_studio_thinking.mjs";
 import { createPermissionRestartGuardianScenario } from "./scenarios/permission_restart_guardian.mjs";
 import { createProviderChatToolContinuationScenario } from "./scenarios/provider_chat_tool_continuation.mjs";
+import { createProviderResponsesCompactionRetryScenario } from "./scenarios/provider_responses_compaction_retry.mjs";
 import { createProviderResponsesProgressScenario } from "./scenarios/provider_responses_progress.mjs";
 import { createProviderRestartScenario } from "./scenarios/provider_restart.mjs";
 import { createRunNextTurnScenario } from "./scenarios/run_next_turn.mjs";
@@ -32,6 +33,7 @@ const factories = new Map([
   ["prompt-review.cancel", createPromptReviewCancelScenario],
   ["permission.restart-guardian", createPermissionRestartGuardianScenario],
   ["provider.chat-tool-continuation", createProviderChatToolContinuationScenario],
+  ["provider.responses-compaction-retry", createProviderResponsesCompactionRetryScenario],
   ["provider.responses-progress", createProviderResponsesProgressScenario],
   ["provider.restart", createProviderRestartScenario],
   ["settings.docling-readiness", createSettingsDoclingReadinessScenario],
