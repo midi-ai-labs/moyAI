@@ -29,8 +29,6 @@ export const SESSION_ROOT_ALPHA_RESPONSE = "ALPHA_OK";
 export const SESSION_ROOT_BETA_RESPONSE = "BETA_OK";
 export const SESSION_CONTEXT_BEFORE = "";
 export const SESSION_CONTEXT_AFTER = "65537";
-export const SESSION_MAX_OUTPUT_BEFORE = "";
-export const SESSION_MAX_OUTPUT_AFTER = "1025";
 export const SESSION_RESTART_STABILITY_MS = 500;
 export const SESSION_PROVIDER_PROFILE = "openai_responses";
 export const SESSION_PROVIDER_API_KEY_ENV = "";
@@ -93,10 +91,6 @@ const BASE_URL = Object.freeze({
 const CONTEXT_WINDOW = Object.freeze({
   selector: '[data-modal="session-settings"] input[data-session-setting="context-window"]',
   identity: { tag: "INPUT", sessionSetting: "context-window" },
-});
-const MAX_OUTPUT_TOKENS = Object.freeze({
-  selector: '[data-modal="session-settings"] input[data-session-setting="max-output-tokens"]',
-  identity: { tag: "INPUT", sessionSetting: "max-output-tokens" },
 });
 const APPLY_SESSION_SETTINGS = Object.freeze({
   selector: '[data-modal="session-settings"] button[data-action="apply-session-settings"]',
@@ -754,7 +748,6 @@ export function restoredSessionSettingsPanelDecision(sample, expected) {
     ["api-key-env", "restart-panel-api-key-env-mismatch", panel?.api_key_env, required.expectedApiKeyEnv, sessionSettings?.api_key_env],
     ["access-mode", "restart-panel-access-mode-mismatch", panel?.access_mode, required.expectedAccessMode, sessionSettings?.access_mode],
     ["context-window", "restart-panel-context-window-mismatch", panel?.context_window, SESSION_CONTEXT_AFTER, sessionSettings?.context_window],
-    ["max-output-tokens", "restart-panel-max-output-tokens-mismatch", panel?.max_output_tokens, SESSION_MAX_OUTPUT_AFTER, sessionSettings?.max_output_tokens],
   ];
   const gates = [
     settingsGate("surface-errors", "restart-restored-surface-error", errorFree(surface), {
@@ -827,14 +820,10 @@ export function restoredSessionSettingsPanelDecision(sample, expected) {
     settingsGate("api-key-env-projection", "restart-restored-api-key-env-mismatch", sessionSettings?.api_key_env === required.expectedApiKeyEnv, required.expectedApiKeyEnv, sessionSettings?.api_key_env ?? null),
     settingsGate("access-mode-projection", "restart-restored-access-mode-mismatch", sessionSettings?.access_mode === required.expectedAccessMode, required.expectedAccessMode, sessionSettings?.access_mode ?? null),
     settingsGate("context-window-projection", "restart-restored-context-window-mismatch", sessionSettings?.context_window === SESSION_CONTEXT_AFTER, SESSION_CONTEXT_AFTER, sessionSettings?.context_window ?? null),
-    settingsGate("max-output-tokens-projection", "restart-restored-max-output-tokens-mismatch", sessionSettings?.max_output_tokens === SESSION_MAX_OUTPUT_AFTER, SESSION_MAX_OUTPUT_AFTER, sessionSettings?.max_output_tokens ?? null),
-    settingsGate("inheritance", "restart-restored-inheritance-mismatch", sessionSettings?.context_window_inherited === false
-      && sessionSettings?.max_output_tokens_inherited === false, {
+    settingsGate("inheritance", "restart-restored-inheritance-mismatch", sessionSettings?.context_window_inherited === false, {
       context_window_inherited: false,
-      max_output_tokens_inherited: false,
     }, {
       context_window_inherited: sessionSettings?.context_window_inherited ?? null,
-      max_output_tokens_inherited: sessionSettings?.max_output_tokens_inherited ?? null,
     }),
     settingsGate("scope", "restart-panel-scope-mismatch", panel?.scope_count === 1
       && panel.scope_visible === true
@@ -1103,7 +1092,6 @@ export async function observeSessionSettingsSurface(cdp) {
 export function sessionSettingsPanelReady(surface, {
   expectedTarget,
   contextWindow,
-  maxOutputTokens,
   dirty = false,
   inherited = null,
 } = {}) {
@@ -1142,9 +1130,8 @@ export function sessionSettingsPanelReady(surface, {
     && surface.panel.context_window.count === 1
     && surface.panel.context_window.visible === true
     && surface.panel.context_window.value === contextWindow
-    && surface.panel.max_output_tokens.count === 1
-    && surface.panel.max_output_tokens.visible === true
-    && surface.panel.max_output_tokens.value === maxOutputTokens
+    && surface.panel.max_output_tokens.count === 0
+    && surface.panel.max_output_tokens.visible === false
     && surface.panel.apply.count === 1
     && surface.panel.apply.visible === true
     && surface.panel.apply.enabled === dirty
@@ -1160,10 +1147,7 @@ export function sessionSettingsPanelReady(surface, {
     && surface.panel.save_global_count === 0
     && surface?.confirmation?.count === 0
     && surface?.visible_dialog_count === 1
-    && (inherited === null || (
-      projection.context_window_inherited === inherited
-      && projection.max_output_tokens_inherited === inherited
-    ));
+    && (inherited === null || projection.context_window_inherited === inherited);
 }
 
 export function sessionSettingsDirtyGuardReady(surface, expectedTarget) {
@@ -1176,8 +1160,9 @@ export function sessionSettingsDirtyGuardReady(surface, expectedTarget) {
     && surface.panel.provider_profile.value === SESSION_PROVIDER_PROFILE
     && sameValue(surface.panel.provider_profile.options, SESSION_PROVIDER_PROFILE_OPTIONS)
     && surface.panel.api_key_env.value === SESSION_PROVIDER_API_KEY_ENV
-    && surface.panel.context_window.value === SESSION_CONTEXT_BEFORE
-    && surface.panel.max_output_tokens.value === SESSION_MAX_OUTPUT_AFTER
+    && surface.panel.context_window.value === SESSION_CONTEXT_AFTER
+    && surface.panel.max_output_tokens.count === 0
+    && surface.panel.max_output_tokens.visible === false
     && surface.panel.apply.enabled === true
     && surface.panel.discard.count === 1
     && surface?.confirmation?.count === 1
@@ -1205,7 +1190,6 @@ export function expectedSessionSettingsApplyCommand(surface) {
         apiKeyEnv: panel.api_key_env.value,
         accessMode: panel.access_mode.value,
         contextWindow: panel.context_window.value,
-        maxOutputTokens: panel.max_output_tokens.value,
       },
       expectedTarget: structuredClone(target),
     },
@@ -1600,18 +1584,14 @@ export function restartedSessionSettingsCloseDecision(
       && projection?.session_settings?.api_key_env === required.expectedApiKeyEnv
       && projection?.session_settings?.access_mode === required.expectedAccessMode
       && projection?.session_settings?.context_window === SESSION_CONTEXT_AFTER
-      && projection?.session_settings?.max_output_tokens === SESSION_MAX_OUTPUT_AFTER
-      && projection?.session_settings?.context_window_inherited === false
-      && projection?.session_settings?.max_output_tokens_inherited === false, {
+      && projection?.session_settings?.context_window_inherited === false, {
       base_url: required.expectedBaseUrl,
       model: required.expectedModel,
       provider_profile: required.expectedProviderProfile,
       api_key_env: required.expectedApiKeyEnv,
       access_mode: required.expectedAccessMode,
       context_window: SESSION_CONTEXT_AFTER,
-      max_output_tokens: SESSION_MAX_OUTPUT_AFTER,
       context_window_inherited: false,
-      max_output_tokens_inherited: false,
     }, projection?.session_settings ?? null),
     settingsGate("triggers", "restart-close-trigger-owner-drift", exactSessionSettingsTriggersReady(surface), {
       model: "exact visible enabled",
@@ -1833,15 +1813,13 @@ export function createSettingsSessionScenario() {
         const alphaOpen = await openSessionSettings(firstInput, firstCommands, firstCdp, {
           expectedTarget: alphaTarget,
           contextWindow: SESSION_CONTEXT_BEFORE,
-          maxOutputTokens: SESSION_MAX_OUTPUT_BEFORE,
           dirty: false,
           inherited: true,
         }, "root alpha Session Settings");
-        await trustedReplaceDigits(firstInput, MAX_OUTPUT_TOKENS, SESSION_MAX_OUTPUT_AFTER);
+        await trustedReplaceDigits(firstInput, CONTEXT_WINDOW, SESSION_CONTEXT_AFTER);
         const dirtyAlpha = await waitForPanel(firstCdp, {
           expectedTarget: alphaTarget,
-          contextWindow: SESSION_CONTEXT_BEFORE,
-          maxOutputTokens: SESSION_MAX_OUTPUT_AFTER,
+          contextWindow: SESSION_CONTEXT_AFTER,
           dirty: true,
           inherited: true,
         }, "dirty root alpha Session Settings");
@@ -1865,8 +1843,7 @@ export function createSettingsSessionScenario() {
         });
         const explicitGuardCancel = await cancelDirtySessionSettingsCloseGuard(firstInput, firstCdp, {
           expectedTarget: alphaTarget,
-          contextWindow: SESSION_CONTEXT_BEFORE,
-          maxOutputTokens: SESSION_MAX_OUTPUT_AFTER,
+          contextWindow: SESSION_CONTEXT_AFTER,
           dirty: true,
           inherited: true,
         }, "cancelled Session Settings dirty close");
@@ -1882,8 +1859,7 @@ export function createSettingsSessionScenario() {
         await assertNoCommandsStable(firstCommands, guardCommandStart);
         const escapeGuardCancel = await cancelDirtySessionSettingsCloseGuard(firstInput, firstCdp, {
           expectedTarget: alphaTarget,
-          contextWindow: SESSION_CONTEXT_BEFORE,
-          maxOutputTokens: SESSION_MAX_OUTPUT_AFTER,
+          contextWindow: SESSION_CONTEXT_AFTER,
           dirty: true,
           inherited: true,
         }, "cancelled Session Settings Escape dirty close");
@@ -1891,18 +1867,15 @@ export function createSettingsSessionScenario() {
         await waitForPanel(firstCdp, {
           expectedTarget: alphaTarget,
           contextWindow: SESSION_CONTEXT_BEFORE,
-          maxOutputTokens: SESSION_MAX_OUTPUT_BEFORE,
           dirty: false,
           inherited: true,
         }, "discarded root alpha Session Settings draft");
         await assertNoCommandsStable(firstCommands, guardCommandStart);
 
         await trustedReplaceDigits(firstInput, CONTEXT_WINDOW, SESSION_CONTEXT_AFTER);
-        await trustedReplaceDigits(firstInput, MAX_OUTPUT_TOKENS, SESSION_MAX_OUTPUT_AFTER);
         const applyableAlpha = await waitForPanel(firstCdp, {
           expectedTarget: alphaTarget,
           contextWindow: SESSION_CONTEXT_AFTER,
-          maxOutputTokens: SESSION_MAX_OUTPUT_AFTER,
           dirty: true,
           inherited: true,
         }, "applyable root alpha Session Settings");
@@ -1918,7 +1891,6 @@ export function createSettingsSessionScenario() {
           accept: (surface) => advancedSessionSettingsTarget(surface?.projection?.session_settings?.target, alphaTarget)
             && sessionSettingsPanelReady(surface, {
               contextWindow: SESSION_CONTEXT_AFTER,
-              maxOutputTokens: SESSION_MAX_OUTPUT_AFTER,
               dirty: false,
               inherited: false,
             }),
@@ -1996,7 +1968,6 @@ export function createSettingsSessionScenario() {
         const betaOpen = await openSessionSettings(firstInput, firstCommands, firstCdp, {
           expectedTarget: betaTarget,
           contextWindow: SESSION_CONTEXT_BEFORE,
-          maxOutputTokens: SESSION_MAX_OUTPUT_BEFORE,
           dirty: false,
           inherited: true,
         }, "root beta non-leaking Session Settings");
@@ -2041,7 +2012,6 @@ export function createSettingsSessionScenario() {
         });
         const alphaReopened = await openSessionSettings(firstInput, firstCommands, firstCdp, {
           contextWindow: SESSION_CONTEXT_AFTER,
-          maxOutputTokens: SESSION_MAX_OUTPUT_AFTER,
           dirty: false,
           inherited: false,
         }, "root alpha durable Session Settings after root switch");

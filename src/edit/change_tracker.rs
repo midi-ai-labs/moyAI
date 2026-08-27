@@ -132,13 +132,11 @@ impl ChangeTracker {
 }
 
 pub(crate) fn path_for_change_storage(path: &Utf8Path, workspace_root: &Utf8Path) -> Utf8PathBuf {
-    if let Some(relative) = crate::workspace::project::workspace_relative_key_for_match(
-        path.as_str(),
-        workspace_root.as_str(),
-    ) {
-        if !relative.is_empty() {
-            return Utf8PathBuf::from(relative);
-        }
+    if let Some(relative) =
+        crate::workspace::PathGuard::relative_path_from_root(path, workspace_root)
+        && !relative.as_str().is_empty()
+    {
+        return relative;
     }
     path.strip_prefix(workspace_root)
         .map(|relative| relative.to_path_buf())
@@ -247,7 +245,30 @@ mod tests {
 
     use crate::session::{ChangeId, ChangeKind};
 
-    use super::ChangeSummary;
+    use super::{ChangeSummary, path_for_change_storage};
+
+    #[test]
+    fn change_storage_path_preserves_display_casing() {
+        let workspace_root = Utf8PathBuf::from("C:/workspace");
+        let path = workspace_root.join("Nested/THINKING_SMOKE.md");
+
+        assert_eq!(
+            path_for_change_storage(&path, &workspace_root),
+            Utf8PathBuf::from("Nested/THINKING_SMOKE.md")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn change_storage_path_matches_windows_root_case_insensitively_without_lowercasing_child() {
+        assert_eq!(
+            path_for_change_storage(
+                camino::Utf8Path::new("C:/WorkSpace/Nested/THINKING_SMOKE.md"),
+                camino::Utf8Path::new("c:/workspace"),
+            ),
+            Utf8PathBuf::from("Nested/THINKING_SMOKE.md")
+        );
+    }
 
     #[test]
     fn project_relative_storage_renders_from_nested_authority() {

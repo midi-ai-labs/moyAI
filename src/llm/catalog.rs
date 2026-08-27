@@ -47,15 +47,15 @@ mod tests {
 
     #[test]
     fn catalog_does_not_inherit_capabilities_for_an_id_only_override() {
-        let config = ResolvedConfig::default();
+        let mut config = ResolvedConfig::default();
+        config.model.supports_reasoning = true;
+        config.model.max_output_tokens = 65_536;
         let catalog = ConfigModelCatalog::new(config.clone());
 
         let profile = catalog.default_model().expect("configured profile");
         assert_eq!(profile.name, config.model.model);
-        assert_eq!(
-            profile.capabilities.supports_reasoning,
-            config.model.supports_reasoning
-        );
+        assert!(!profile.capabilities.supports_reasoning);
+        assert_ne!(profile.max_output_tokens, config.model.max_output_tokens);
         let error = catalog
             .resolve(Some("unprofiled-model"))
             .expect_err("id-only override must fail closed");

@@ -53,7 +53,6 @@ const PROVIDER_STEP_KEYS = new Set([
   "model.provider_profile",
   "model.api_key_env",
   "model.context_window",
-  "model.max_output_tokens",
 ]);
 
 export function createInitialSetupState(): InitialSetupState {

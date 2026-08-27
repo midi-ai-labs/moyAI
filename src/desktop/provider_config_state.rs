@@ -57,7 +57,6 @@ pub struct DesktopProviderConfigState {
     pub provider_profile_input: ProviderProfile,
     pub provider_api_key_env_input: String,
     pub provider_context_window_input: String,
-    pub provider_max_output_tokens_input: String,
     pub provider_selected_model_id_input: String,
     pub provider_loaded_base_url: Option<String>,
     pub provider_loaded_profile: Option<ProviderProfile>,
@@ -82,7 +81,6 @@ impl DesktopProviderConfigState {
             .clone()
             .unwrap_or_default();
         let provider_context_window_input = effective_config.model.context_window.to_string();
-        let provider_max_output_tokens_input = effective_config.model.max_output_tokens.to_string();
         let provider_selected_model_id_input = effective_config.model.model.clone();
         let provider_status = DesktopProviderStatus::idle(
             "Provider 設定を確認できます",
@@ -98,7 +96,6 @@ impl DesktopProviderConfigState {
             provider_profile_input,
             provider_api_key_env_input,
             provider_context_window_input,
-            provider_max_output_tokens_input,
             provider_selected_model_id_input,
             provider_loaded_base_url: None,
             provider_loaded_profile: None,
@@ -136,7 +133,6 @@ impl DesktopProviderConfigState {
         self.provider_profile_input = config.model.provider_profile;
         self.provider_api_key_env_input = config.model.api_key_env.clone().unwrap_or_default();
         self.provider_context_window_input = config.model.context_window.to_string();
-        self.provider_max_output_tokens_input = config.model.max_output_tokens.to_string();
         self.provider_selected_model_id_input = config.model.model.clone();
         self.provider_loaded_base_url = preserve_loaded_catalog.then_some(normalized_base_url);
         self.provider_loaded_profile =

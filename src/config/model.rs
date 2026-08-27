@@ -361,6 +361,30 @@ pub struct ModelConfig {
     pub extra_body_json: Option<serde_json::Value>,
 }
 
+impl ModelConfig {
+    /// Removes compatibility-only values that used to let moyAI override the
+    /// provider host's generation policy.
+    ///
+    /// The fields remain on the in-memory type temporarily so older persisted
+    /// inputs and internal callers can still be decoded without a schema
+    /// migration. Runtime owners must only observe this canonical inert form.
+    pub(crate) fn clear_legacy_generation_settings(&mut self) {
+        self.chat_completions_reasoning_parameters = None;
+        self.reasoning_effort = None;
+        self.reasoning_summary = ReasoningSummary::None;
+        self.max_output_tokens = DEFAULT_MODEL_MAX_OUTPUT_TOKENS;
+        self.temperature = None;
+        self.top_p = None;
+        self.top_k = None;
+        self.presence_penalty = None;
+        self.frequency_penalty = None;
+        self.seed = None;
+        self.stop_sequences.clear();
+        self.supports_reasoning = false;
+        self.extra_body_json = None;
+    }
+}
+
 impl std::fmt::Debug for ModelConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -536,6 +560,7 @@ pub struct ResolvedConfig {
 
 impl ResolvedConfig {
     pub(crate) fn normalize_and_validate_provider_runtime(&mut self) -> Result<(), String> {
+        self.model.clear_legacy_generation_settings();
         let model = self.model.model.trim();
         if model.is_empty() {
             return Err("config field `model.model` must not be empty".to_string());
@@ -554,14 +579,6 @@ impl ResolvedConfig {
             return Err(
                 "config field `model.context_window` must be greater than zero".to_string(),
             );
-        }
-        for (field, value) in [
-            ("model.temperature", self.model.temperature),
-            ("model.top_p", self.model.top_p),
-            ("model.presence_penalty", self.model.presence_penalty),
-            ("model.frequency_penalty", self.model.frequency_penalty),
-        ] {
-            validate_optional_provider_float(field, value)?;
         }
         Ok(())
     }
@@ -739,9 +756,7 @@ impl Default for ResolvedConfig {
                 supports_images: true,
                 parallel_tool_calls: true,
                 max_parallel_predictions: 1,
-                extra_body_json: Some(
-                    serde_json::json!({ "num_ctx": DEFAULT_MODEL_CONTEXT_WINDOW }),
-                ),
+                extra_body_json: None,
             },
             session: SessionConfig {
                 overflow_margin_tokens: 1_024,
@@ -891,8 +906,14 @@ pub struct PartialModelConfig {
     /// Deserialize-only compatibility input. Normalize it into `provider_profile` before merge.
     #[serde(skip_serializing)]
     pub(crate) provider_api_mode: Option<ProviderApiMode>,
+    /// Deserialize-only compatibility input; provider-host generation policy is authoritative.
+    #[serde(skip_serializing)]
     pub chat_completions_reasoning_parameters: Option<ChatCompletionsReasoningParameters>,
+    /// Deserialize-only compatibility input; provider-host generation policy is authoritative.
+    #[serde(skip_serializing)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Deserialize-only compatibility input; provider-host generation policy is authoritative.
+    #[serde(skip_serializing)]
     pub reasoning_summary: Option<ReasoningSummary>,
     pub api_key_env: Option<Option<String>>,
     pub extra_headers: Option<BTreeMap<String, String>>,
@@ -903,19 +924,39 @@ pub struct PartialModelConfig {
     pub connect_timeout_ms: Option<u64>,
     pub max_retries: Option<u8>,
     pub context_window: Option<u32>,
+    /// Deserialize-only compatibility input; provider-host generation policy is authoritative.
+    #[serde(skip_serializing)]
     pub max_output_tokens: Option<u32>,
+    /// Deserialize-only compatibility input; provider-host generation policy is authoritative.
+    #[serde(skip_serializing)]
     pub temperature: Option<f64>,
+    /// Deserialize-only compatibility input; provider-host generation policy is authoritative.
+    #[serde(skip_serializing)]
     pub top_p: Option<f64>,
+    /// Deserialize-only compatibility input; provider-host generation policy is authoritative.
+    #[serde(skip_serializing)]
     pub top_k: Option<u32>,
+    /// Deserialize-only compatibility input; provider-host generation policy is authoritative.
+    #[serde(skip_serializing)]
     pub presence_penalty: Option<f64>,
+    /// Deserialize-only compatibility input; provider-host generation policy is authoritative.
+    #[serde(skip_serializing)]
     pub frequency_penalty: Option<f64>,
+    /// Deserialize-only compatibility input; provider-host generation policy is authoritative.
+    #[serde(skip_serializing)]
     pub seed: Option<u64>,
+    /// Deserialize-only compatibility input; provider-host generation policy is authoritative.
+    #[serde(skip_serializing)]
     pub stop_sequences: Option<Vec<String>>,
     pub supports_tools: Option<bool>,
+    /// Deserialize-only compatibility input; provider-host generation policy is authoritative.
+    #[serde(skip_serializing)]
     pub supports_reasoning: Option<bool>,
     pub supports_images: Option<bool>,
     pub parallel_tool_calls: Option<bool>,
     pub max_parallel_predictions: Option<u32>,
+    /// Deserialize-only compatibility input; provider-host generation policy is authoritative.
+    #[serde(skip_serializing)]
     pub extra_body_json: Option<serde_json::Value>,
 }
 
@@ -1466,6 +1507,7 @@ mod reasoning_contract_tests {
         assert_eq!(model.reasoning_effort, None);
         assert_eq!(model.reasoning_summary, ReasoningSummary::None);
         assert!(!model.supports_reasoning);
+        assert_eq!(model.extra_body_json, None);
     }
 
     #[test]

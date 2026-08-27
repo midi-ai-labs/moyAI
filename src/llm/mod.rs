@@ -22,9 +22,8 @@ pub use image_validation::{
 };
 pub use model_probe::{
     ModelAvailabilityReport, ModelAvailabilityStatus, ProviderModelInfo, ProviderModelLoadState,
-    apply_provider_model_info_to_config, check_model_availability, extra_body_with_num_ctx,
-    fetch_openai_models, fetch_provider_model_infos, normalize_provider_base_url,
-    validate_model_availability_report,
+    apply_provider_model_info_to_config, check_model_availability, fetch_openai_models,
+    fetch_provider_model_infos, normalize_provider_base_url, validate_model_availability_report,
 };
 pub use openai_compat::OpenAiCompatClient;
 pub use provider::{

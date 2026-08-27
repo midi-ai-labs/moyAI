@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { createReadStream } from "node:fs";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -24,9 +25,9 @@ import {
 import {
   assertCase52PhysicalFileIdentity,
   case52EvaluatorWorkspaceDiff,
-  case52EffectiveExtraBodyFailures,
   case52EvidenceOptions,
   case52ExpectedMainGlobalSave,
+  case52ExternalLmStudioObservation,
   case52ExtraBodyEvidence,
   case52ForbiddenWorkspacePaths,
   case52FixtureConfig,
@@ -34,10 +35,13 @@ import {
   case52NewRequestComposerSurfaceReady,
   case52NewTurnAcquisitionAccepted,
   case52PhysicalFileIdentity,
+  case52ProviderHostFingerprint,
+  case52LmStudioLoadedContext,
   case52ProviderControlTokenLeaks,
   case52ProviderControlTokenLeakEvidence,
   case52ProviderModelState,
   case52ProviderCleanupPlan,
+  case52ProviderSummaryEvidence,
   case52SideProviderSummary,
   case52SideScreenshotSurfaceReady,
   case52ProviderControlTokenLeakFailure,
@@ -47,6 +51,8 @@ import {
   normalizeCase52PromptText,
   normalizeCase52Options,
   readCase52ExternalOutput,
+  loadMainProvider,
+  providerMustKeepSideUnloaded,
   settleCase52MainCommandProbe,
   settleCase52WorkspaceEvaluator,
   unloadMainProvider,
@@ -157,8 +163,7 @@ test("manual.case5_2 options and Quality config are explicit, portable, and reje
   assert.match(config, /model = "qwen\/qwen3\.6-27b"/);
   assert.match(config, /request_timeout_ms = 3600000/);
   assert.match(config, /context_window = 131072/);
-  assert.match(config, /max_output_tokens = 32768/);
-  assert.match(config, /num_ctx = 131072/);
+  assert.doesNotMatch(config, /max_(?:output_)?tokens|reasoning_(?:effort|summary)|supports_reasoning|temperature|top_p|top_k|presence_penalty|frequency_penalty|seed\s*=|stop(?:_sequences)?\s*=|\[model\.extra_body_json\]|num_ctx/);
   assert.match(config, /access_mode = "auto_review"/);
   assert.match(config, /\[multi_agent\]\nenabled = false/);
   assert.match(config, /\[docling\]\nenabled = false/);
@@ -166,6 +171,27 @@ test("manual.case5_2 options and Quality config are explicit, portable, and reje
   assert.doesNotMatch(config, /stream_idle_timeout_ms/);
   assert.throws(() => normalizeCase52Options({}), /fixture_source/);
   assert.throws(() => normalizeCase52Options({ ...case52OptionsForFailure(), run_number: 95 }), /unknown/);
+});
+
+test("manual.case5_2 preserves legacy execution-owned LM Studio and accepts an explicit external-unmanaged lifecycle", () => {
+  const legacy = normalizeCase52Options(case52OptionsForFailure());
+  assert.equal(legacy.providerLifecycle, "execution-owned");
+  assert.equal(legacy.scenarioConfigProfile, "legacy-lm-studio-six-field");
+
+  const external = normalizeCase52Options({
+    ...case52OptionsForFailure(),
+    provider_profile: "lm_studio",
+    provider_lifecycle: "external-unmanaged",
+    configure_main_via_gui: true,
+  });
+  assert.equal(external.providerLifecycle, "external-unmanaged");
+  assert.equal(external.scenarioConfigProfile, "lm-studio-native-external-unmanaged");
+  assert.equal(external.configureMainViaGui, true);
+  assert.match(case52FixtureConfig(external), /base_url = "http:\/\/127\.0\.0\.1:9"/);
+  assert.throws(
+    () => normalizeCase52Options({ ...case52OptionsForFailure(), provider_lifecycle: "host-owned" }),
+    /provider_lifecycle/,
+  );
 });
 
 test("manual.case5_2 accepts an external-unmanaged OpenAI-compatible /v1 provider without LM Studio fields", () => {
@@ -186,8 +212,6 @@ test("manual.case5_2 accepts an external-unmanaged OpenAI-compatible /v1 provide
     providerLifecycle: "external-unmanaged",
     scenarioConfigProfile: "openai-compatible-v1",
     configureMainViaGui: false,
-    extraBodyJson: null,
-    extraBodyJsonCompact: null,
   });
   const config = case52FixtureConfig(normalized);
   assert.match(config, /provider_profile = "openai_compatible"/);
@@ -230,6 +254,16 @@ test("manual.case5_2 accepts an external-unmanaged OpenAI-compatible /v1 provide
     }),
     /configure_main_via_gui is supported only by lm_studio/,
   );
+  assert.throws(
+    () => normalizeCase52Options({
+      fixture_source: "C:\\fixture",
+      provider_profile: "openai_compatible",
+      provider_lifecycle: "execution-owned",
+      provider_base_url: "http://192.0.2.10:8119/v1",
+      main_model: "Qwen3.8-27B-4bit",
+    }),
+    /supports only provider_lifecycle external-unmanaged/,
+  );
 });
 
 test("manual.case5_2 can seed a neutral connection for same-execution trusted Main Preferences input", () => {
@@ -245,8 +279,7 @@ test("manual.case5_2 can seed a neutral connection for same-execution trusted Ma
   assert.doesNotMatch(config, /base_url = "http:\/\/192\.0\.2\.1:1234"/);
   assert.doesNotMatch(config, /model = "main"/);
   assert.match(config, /context_window = 131072/);
-  assert.match(config, /max_output_tokens = 32768/);
-  assert.match(config, /num_ctx = 131072/);
+  assert.doesNotMatch(config, /max_(?:output_)?tokens|reasoning_(?:effort|summary)|supports_reasoning|temperature|top_p|top_k|presence_penalty|frequency_penalty|seed\s*=|stop(?:_sequences)?\s*=|\[model\.extra_body_json\]|num_ctx/);
   const explicitFalse = normalizeCase52Options({
     ...case52OptionsForFailure(),
     provider_profile: "lm_studio",
@@ -542,111 +575,39 @@ test("manual.case5_2 product-owns only reachable Side screenshot observation mis
   );
 });
 
-test("manual.case5_2 isolates an optional JSON-safe OpenAI-compatible generation body in the Desktop environment", () => {
-  const extraBody = {
-    chat_template_kwargs: {
-      enable_thinking: false,
-      preserve_thinking: false,
-    },
-  };
+test("manual.case5_2 leaves generation settings to the host and rejects client overrides", () => {
   const raw = {
     fixture_source: "C:\\fixture",
     provider_profile: "openai_compatible",
     provider_base_url: "http://192.0.2.10:8119/v1",
     main_model: "Qwen3.8-27B-4bit",
-    extra_body_json: extraBody,
   };
   const normalized = normalizeCase52Options(raw);
-  assert.deepEqual(normalized.extraBodyJson, extraBody);
-  assert.equal(
-    normalized.extraBodyJsonCompact,
-    '{"chat_template_kwargs":{"enable_thinking":false,"preserve_thinking":false}}',
-  );
-  assert.deepEqual(createCase52Scenario(raw).environment, {
-    MOYAI_EXTRA_BODY_JSON: '{"chat_template_kwargs":{"enable_thinking":false,"preserve_thinking":false}}',
-  });
+  assert.deepEqual(createCase52Scenario(raw).environment, {});
   const config = case52FixtureConfig(normalized);
-  assert.doesNotMatch(config, /chat_template_kwargs|enable_thinking|preserve_thinking/);
-  const metadata = case52ExtraBodyEvidence(normalized);
-  assert.equal(metadata.configured, true);
-  assert.equal(metadata.environment_key, "MOYAI_EXTRA_BODY_JSON");
-  assert.match(metadata.compact_json_sha256, /^[a-f0-9]{64}$/);
-  assert.equal(metadata.compact_json_size_bytes, Buffer.byteLength(normalized.extraBodyJsonCompact));
-  assert.deepEqual(metadata.generation_fields, [
-    "chat_template_kwargs.enable_thinking",
-    "chat_template_kwargs.preserve_thinking",
-  ]);
+  assert.doesNotMatch(config, /max_(?:output_)?tokens|reasoning_(?:effort|summary)|supports_reasoning|temperature|top_p|top_k|presence_penalty|frequency_penalty|seed\s*=|stop(?:_sequences)?\s*=|\[model\.extra_body_json\]|num_ctx/);
+  const metadata = case52ExtraBodyEvidence();
+  assert.deepEqual(metadata, {
+    configured: false,
+    environment_key: null,
+    compact_json_sha256: null,
+    compact_json_size_bytes: 0,
+    generation_fields: [],
+    allowlist_profile: null,
+  });
   const evidenceOptions = case52EvidenceOptions(normalized);
-  assert.equal(Object.hasOwn(evidenceOptions, "extraBodyJson"), false);
-  assert.equal(Object.hasOwn(evidenceOptions, "extraBodyJsonCompact"), false);
   assert.deepEqual(evidenceOptions.extra_body_json, metadata);
-  assert.doesNotMatch(JSON.stringify(evidenceOptions), /"enable_thinking":false|"preserve_thinking":false/);
-
-  for (const invalid of [null, [], "{}", 1]) {
-    assert.throws(() => normalizeCase52Options({ ...raw, extra_body_json: invalid }), /must be a JSON object/);
-  }
-  for (const invalid of [
-    { value: undefined },
-    { value: Number.NaN },
-    { value: Number.POSITIVE_INFINITY },
-    { value: 1n },
-    { value: new Date(0) },
-  ]) {
-    assert.throws(() => normalizeCase52Options({ ...raw, extra_body_json: invalid }), /JSON|finite|plain/);
-  }
-  const cyclic = {};
-  cyclic.self = cyclic;
-  assert.throws(() => normalizeCase52Options({ ...raw, extra_body_json: cyclic }), /cycle/);
-  assert.throws(
-    () => normalizeCase52Options({ ...case52OptionsForFailure(), extra_body_json: extraBody }),
-    /only by openai_compatible/,
-  );
-  for (const secretBearing of [
-    { api_key: "secret" },
-    { authorization: "Bearer secret" },
-    { chat_template_kwargs: { secret: "value" } },
-    { chat_template_kwargs: { enable_thinking: false, token: "secret" } },
-  ]) {
-    assert.throws(
-      () => normalizeCase52Options({ ...raw, extra_body_json: secretBearing }),
-      /non-generation field/,
-    );
-  }
   assert.throws(
     () => normalizeCase52Options({
       ...raw,
-      extra_body_json: { chat_template_kwargs: { enable_thinking: "false" } },
+      extra_body_json: { chat_template_kwargs: { enable_thinking: false } },
     }),
-    /must be boolean/,
+    /unknown manual\.case5_2 option: extra_body_json/,
   );
-
-  const matchingProjection = {
-    config_fields: [{
-      key: "model.extra_body_json",
-      value: '{"chat_template_kwargs":{"preserve_thinking":false,"enable_thinking":false}}',
-    }],
-  };
-  assert.deepEqual(case52EffectiveExtraBodyFailures(matchingProjection, normalized), []);
-
-  for (const actual of [
-    "",
-    '{"chat_template_kwargs":{"enable_thinking":true,"preserve_thinking":false}}',
-    '{"api_key":"must-not-leak"}',
-    "not-json-must-not-leak",
-  ]) {
-    const failures = case52EffectiveExtraBodyFailures({
-      config_fields: [{ key: "model.extra_body_json", value: actual }],
-    }, normalized);
-    assert.equal(failures.length, 1);
-    const evidence = JSON.stringify(failures);
-    assert.doesNotMatch(evidence, /api_key|must-not-leak|not-json/);
-    assert.match(evidence, /model\.extra_body_json/);
-  }
-
-  const lmStudio = normalizeCase52Options(case52OptionsForFailure());
-  assert.deepEqual(case52EffectiveExtraBodyFailures({
-    config_fields: [{ key: "model.extra_body_json", value: '{"num_ctx":131072}' }],
-  }, lmStudio), []);
+  assert.throws(
+    () => normalizeCase52Options({ ...case52OptionsForFailure(), extra_body_json: {} }),
+    /unknown manual\.case5_2 option: extra_body_json/,
+  );
 });
 
 test("manual.case5_2 detects only exact chat-template control tokens in assistant bodies", () => {
@@ -890,6 +851,259 @@ function providerModels(mainIds = [], sideIds = []) {
   };
 }
 
+function externalLmStudioOptions(overrides = {}) {
+  return {
+    providerProfile: "lm_studio",
+    providerLifecycle: "external-unmanaged",
+    providerBaseUrl: "http://192.0.2.1:1234",
+    mainModel: "main",
+    sideModel: "side",
+    expectedMainVariant: "main@q6",
+    expectedSideVariant: "side@q4",
+    ...overrides,
+  };
+}
+
+function externalLmStudioSnapshot({
+  capturedAt = "2026-08-27T00:00:00.000Z",
+  elapsedMs = 1,
+  context = 169_728,
+  mainVariant = "main@q6",
+  sideVariant = "side@q4",
+  mainLoaded = true,
+  sideLoaded = false,
+  volatileTimestamp = "2026-08-27T00:00:00.000Z",
+} = {}) {
+  const mainInstances = mainLoaded ? [{
+    id: "main",
+    config: {
+      context_length: context,
+      parallel: 4,
+      loaded_at: volatileTimestamp,
+    },
+    elapsed_ms: elapsedMs,
+  }] : [];
+  const sideInstances = sideLoaded ? [{ id: "side", config: { context_length: context } }] : [];
+  return {
+    captured_at: capturedAt,
+    v1: {
+      endpoint: "http://192.0.2.1:1234/api/v1/models",
+      status: 200,
+      elapsed_ms: elapsedMs,
+      value: {
+        models: [
+          {
+            key: "main",
+            type: "llm",
+            selected_variant: mainVariant,
+            loaded_instances: mainInstances,
+            updated_at: volatileTimestamp,
+          },
+          {
+            key: "side",
+            type: "llm",
+            selected_variant: sideVariant,
+            loaded_instances: sideInstances,
+          },
+        ],
+      },
+    },
+    v0: {
+      endpoint: "http://192.0.2.1:1234/api/v0/models",
+      status: 200,
+      elapsed_ms: elapsedMs,
+      value: {
+        data: [
+          {
+            id: "main",
+            state: mainLoaded ? "loaded" : "not-loaded",
+            ...(mainLoaded ? { loaded_context_length: context } : {}),
+            loaded_at: volatileTimestamp,
+          },
+          { id: "side", state: sideLoaded ? "loaded" : "not-loaded" },
+        ],
+      },
+    },
+  };
+}
+
+test("manual.case5_2 external LM Studio fingerprint excludes observation timing but detects host drift", () => {
+  const options = externalLmStudioOptions();
+  const firstSnapshot = externalLmStudioSnapshot();
+  const secondSnapshot = externalLmStudioSnapshot({
+    capturedAt: "2026-08-27T01:00:00.000Z",
+    elapsedMs: 999,
+    volatileTimestamp: "2026-08-27T01:00:00.000Z",
+  });
+  const first = case52ProviderHostFingerprint(firstSnapshot, options);
+  const second = case52ProviderHostFingerprint(secondSnapshot, options);
+  assert.equal(first.sha256, second.sha256);
+  assert.equal(first.excluded_fields.some((field) => field.endsWith("loaded_at")), true);
+  assert.equal(first.excluded_fields.some((field) => field.endsWith("elapsed_ms")), true);
+
+  const drifted = case52ProviderHostFingerprint(externalLmStudioSnapshot({ context: 262_144 }), options);
+  assert.notEqual(first.sha256, drifted.sha256);
+});
+
+test("manual.case5_2 external LM Studio observation requires exact load ownership, variants, and sufficient reported context", () => {
+  const options = externalLmStudioOptions();
+  const snapshot = externalLmStudioSnapshot();
+  const fingerprint = case52ProviderHostFingerprint(snapshot, options);
+  const observation = case52ExternalLmStudioObservation(snapshot, options, fingerprint);
+  assert.deepEqual(observation.failures, []);
+  assert.equal(observation.host_context.requested, null);
+  assert.equal(observation.host_context.applied, null);
+  assert.equal(observation.host_context.reported_loaded, 169_728);
+  assert.deepEqual(observation.lifecycle_actions, {
+    load_attempted: false,
+    unload_attempted: false,
+    unload_authorized: false,
+  });
+  assert.equal(observation.host_fingerprint_stable, true);
+  assert.deepEqual(case52LmStudioLoadedContext(observation.models), {
+    reported: true,
+    candidates: [
+      { field: "loaded_instances[0].config.context_length", value: 169_728 },
+      { field: "main_v0.loaded_context_length", value: 169_728 },
+    ],
+    effective: 169_728,
+    conflict: false,
+  });
+
+  assert.match(
+    case52ExternalLmStudioObservation(externalLmStudioSnapshot({ context: 65_536 }), options).failures.join(","),
+    /main-loaded-context-below-local-budget/,
+  );
+  assert.match(
+    case52ExternalLmStudioObservation(externalLmStudioSnapshot({ mainLoaded: false }), options).failures.join(","),
+    /main-load-state-mismatch/,
+  );
+  assert.match(
+    case52ExternalLmStudioObservation(externalLmStudioSnapshot({ sideLoaded: true }), options).failures.join(","),
+    /side-model-loaded/,
+  );
+  assert.match(
+    case52ExternalLmStudioObservation(externalLmStudioSnapshot({ mainVariant: "main@q4" }), options).failures.join(","),
+    /main-variant-mismatch/,
+  );
+  const conflictingContext = externalLmStudioSnapshot();
+  conflictingContext.v0.value.data[0].loaded_context_length = 262_144;
+  assert.match(
+    case52ExternalLmStudioObservation(conflictingContext, options).failures.join(","),
+    /main-loaded-context-conflict/,
+  );
+});
+
+test("manual.case5_2 external LM Studio preflight is GET-observation-only and seals two stable samples", async () => {
+  const options = externalLmStudioOptions();
+  const snapshots = [
+    externalLmStudioSnapshot(),
+    externalLmStudioSnapshot({
+      capturedAt: "2026-08-27T00:00:01.000Z",
+      elapsedMs: 12,
+      volatileTimestamp: "2026-08-27T00:00:01.000Z",
+    }),
+  ];
+  let loadCalls = 0;
+  const writes = [];
+  const state = {
+    providerLoadAttempted: false,
+    providerHostFingerprintSamples: [],
+  };
+  await loadMainProvider({
+    options,
+    sink: {
+      writeJson: async (...args) => { writes.push(["write", ...args]); },
+      record: async (...args) => { writes.push(["record", ...args]); },
+    },
+    state,
+    phase: "preparing",
+    providerIo: {
+      capture: async () => ({ snapshot: snapshots.shift() }),
+      load: async () => { loadCalls += 1; throw new Error("external provider load must not run"); },
+    },
+  });
+  assert.equal(loadCalls, 0);
+  assert.equal(snapshots.length, 0);
+  assert.equal(state.providerLoadAttempted, false);
+  assert.equal(state.providerExternalPreflightObserved, true);
+  assert.equal(state.providerEffectiveContext, 169_728);
+  assert.equal(state.providerHostFingerprintSamples.length, 2);
+  assert.equal(writes.length, 2);
+  assert.deepEqual(case52ProviderSummaryEvidence(options, state), {
+    provider_requested_context: null,
+    provider_applied_context: null,
+    provider_reported_context_capacity: null,
+    provider_reported_loaded_context: 169_728,
+    provider_lifecycle_actions: {
+      load_attempted: false,
+      unload_attempted: false,
+      unload_authorized: false,
+    },
+    provider_host_fingerprint: state.providerHostFingerprint,
+    provider_host_fingerprint_samples: state.providerHostFingerprintSamples,
+  });
+});
+
+test("manual.case5_2 external LM Studio preflight rejects fingerprint drift without issuing a load", async () => {
+  const options = externalLmStudioOptions();
+  const snapshots = [
+    externalLmStudioSnapshot(),
+    externalLmStudioSnapshot({ context: 262_144 }),
+  ];
+  let loadCalls = 0;
+  await assert.rejects(
+    () => loadMainProvider({
+      options,
+      sink: { writeJson: async () => {}, record: async () => {} },
+      state: { providerLoadAttempted: false, providerHostFingerprintSamples: [] },
+      phase: "preparing",
+      providerIo: {
+        capture: async () => ({ snapshot: snapshots.shift() }),
+        load: async () => { loadCalls += 1; },
+      },
+    }),
+    (error) => error?.owner === "environment"
+      && error?.code === "case5_2-provider-preflight"
+      && error?.evidence?.failures?.includes("confirmation:provider-host-fingerprint-drift"),
+  );
+  assert.equal(loadCalls, 0);
+});
+
+test("manual.case5_2 external LM Studio checkpoints reject drift without repair", async () => {
+  const options = externalLmStudioOptions();
+  const baselineSnapshot = externalLmStudioSnapshot();
+  const baseline = case52ProviderHostFingerprint(baselineSnapshot, options);
+  const state = {
+    providerHostFingerprint: baseline,
+    providerHostFingerprintSamples: [],
+    sideProviderSamples: [],
+  };
+  const sink = { writeJson: async () => ({ sha256: "evidence" }) };
+  const stable = await providerMustKeepSideUnloaded({
+    options,
+    sink,
+    state,
+    name: "desktop-ready",
+    providerIo: { capture: async () => ({ snapshot: externalLmStudioSnapshot({ elapsedMs: 9 }) }) },
+  });
+  assert.deepEqual(stable.failures, []);
+  assert.equal(state.sideProviderSamples[0].host_fingerprint_stable, true);
+
+  await assert.rejects(
+    () => providerMustKeepSideUnloaded({
+      options,
+      sink,
+      state,
+      name: "final-terminal",
+      providerIo: { capture: async () => ({ snapshot: externalLmStudioSnapshot({ context: 262_144 }) }) },
+    }),
+    (error) => error?.owner === "product"
+      && error?.code === "case5_2-provider-runtime-drift"
+      && error?.evidence?.failures?.includes("provider-host-fingerprint-drift"),
+  );
+});
+
 test("manual.case5_2 provider cleanup replans after snapshot failure and late Main/Side load", async () => {
   const options = {
     providerBaseUrl: "http://192.0.2.1:1234",
@@ -1043,6 +1257,101 @@ test("manual.case5_2 external provider cleanup verifies availability without loa
   assert.equal(result.resources[0].lifecycle, "external-unmanaged");
   assert.equal(result.resources[0].load_attempted, false);
   assert.equal(result.resources[0].unload_attempted, false);
+});
+
+test("manual.case5_2 external LM Studio quiesce observes the stable host without unload or repair", async () => {
+  const options = externalLmStudioOptions();
+  const snapshot = externalLmStudioSnapshot();
+  const fingerprint = case52ProviderHostFingerprint(snapshot, options);
+  let unloadCalls = 0;
+  const result = await unloadMainProvider({
+    options,
+    state: {
+      providerExternalPreflightObserved: true,
+      providerHostFingerprint: fingerprint,
+      providerComparabilityDeviations: ["provider-lifecycle-external-unmanaged"],
+    },
+    providerIo: {
+      capture: async () => ({ snapshot: externalLmStudioSnapshot({ elapsedMs: 42 }) }),
+      unload: async () => { unloadCalls += 1; },
+    },
+  });
+  assert.equal(result.input, "pass");
+  assert.equal(unloadCalls, 0);
+  assert.equal(result.resources[0].kind, "lm-studio-external-model");
+  assert.equal(result.resources[0].host_context.requested, null);
+  assert.equal(result.resources[0].host_context.applied, null);
+  assert.equal(result.resources[0].host_context.reported_loaded, 169_728);
+  assert.equal(result.resources[0].host_fingerprint_stable, true);
+  assert.equal(result.resources[0].load_attempted, false);
+  assert.equal(result.resources[0].unload_attempted, false);
+  assert.equal(result.resources[0].unload_authorized, false);
+
+  const drift = await unloadMainProvider({
+    options,
+    state: {
+      providerExternalPreflightObserved: true,
+      providerHostFingerprint: fingerprint,
+      providerComparabilityDeviations: ["provider-lifecycle-external-unmanaged"],
+    },
+    providerIo: {
+      capture: async () => ({ snapshot: externalLmStudioSnapshot({ context: 262_144 }) }),
+      unload: async () => { unloadCalls += 1; },
+    },
+  });
+  assert.equal(drift.input, "fail");
+  assert.match(drift.resources[0].failures.join(","), /provider-host-fingerprint-drift/);
+  assert.equal(unloadCalls, 0);
+});
+
+test("manual.case5_2 external LM Studio provider lifecycle emits catalog GETs only", async (context) => {
+  const source = externalLmStudioSnapshot();
+  const requests = [];
+  const server = createServer((request, response) => {
+    requests.push({ method: request.method, url: request.url });
+    const value = request.url === "/api/v1/models"
+      ? source.v1.value
+      : request.url === "/api/v0/models"
+        ? source.v0.value
+        : null;
+    const status = value === null ? 404 : 200;
+    const body = JSON.stringify(value ?? { error: "unexpected route" });
+    response.writeHead(status, {
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(body),
+      connection: "close",
+    });
+    response.end(body);
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  context.after(() => new Promise((resolve, reject) => {
+    server.close((error) => error === undefined ? resolve() : reject(error));
+  }));
+  const address = server.address();
+  assert.notEqual(address, null);
+  const options = externalLmStudioOptions({ providerBaseUrl: `http://127.0.0.1:${address.port}` });
+  const state = {
+    providerLoadAttempted: false,
+    providerHostFingerprintSamples: [],
+    sideProviderSamples: [],
+  };
+  const sink = { writeJson: async () => ({ sha256: "evidence" }), record: async () => {} };
+
+  await loadMainProvider({ options, sink, state, phase: "preparing" });
+  await providerMustKeepSideUnloaded({ options, sink, state, name: "desktop-ready" });
+  const quiesce = await unloadMainProvider({ options, state });
+
+  assert.equal(quiesce.input, "pass");
+  assert.equal(requests.length, 8);
+  assert.equal(requests.every((request) => request.method === "GET"), true);
+  assert.deepEqual(
+    [...new Set(requests.map((request) => request.url))].sort(),
+    ["/api/v0/models", "/api/v1/models"],
+  );
+  assert.equal(requests.some((request) => /(?:load|unload|config)/i.test(request.url)), false);
 });
 
 async function streamSha256(candidate) {

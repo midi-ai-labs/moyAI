@@ -158,7 +158,6 @@ export function providerCapabilities(
     | "provider_catalog_profile"
     | "provider_catalog_api_key_env"
     | "provider_context_window"
-    | "provider_max_output_tokens"
     | "provider_selected_index"
     | "provider_apply_enabled"
     | "config_draft"
@@ -168,8 +167,7 @@ export function providerCapabilities(
   } = {},
 ): Pick<UiCapabilities, "canLoadProviderModels" | "canApplyProvider"> {
   const urlValid = validateProviderBaseUrl(state.provider_base_url).ok;
-  const limitsValid = positiveInteger(state.provider_context_window)
-    && positiveInteger(state.provider_max_output_tokens);
+  const limitsValid = positiveInteger(state.provider_context_window);
   return {
     canLoadProviderModels: !state.provider_loading && urlValid && limitsValid,
     canApplyProvider: state.config_draft.external_owner_mutation_open
@@ -431,7 +429,6 @@ export function providerDraftPayload(
       providerProfile: draft.providerProfile,
       apiKeyEnv: draft.apiKeyEnv,
       contextWindow: draft.contextWindow,
-      maxOutputTokens: draft.maxOutputTokens,
       selectedModelId: draft.selectedModelId,
     },
     expectedTarget,
@@ -641,7 +638,6 @@ export function deriveUiCapabilities(state: DesktopWebState, uiState: UiLocalSta
     provider_catalog_profile: state.provider_catalog_profile,
     provider_catalog_api_key_env: state.provider_catalog_api_key_env,
     provider_context_window: provider.contextWindow,
-    provider_max_output_tokens: provider.maxOutputTokens,
     provider_selected_index: selectedModelIndex,
     provider_apply_enabled: state.provider_apply_enabled,
     config_draft: configDraft,
@@ -697,7 +693,6 @@ export function projectViewState(state: DesktopWebState, uiState: UiLocalState):
     provider_profile: providerDraft.providerProfile,
     provider_api_key_env: providerDraft.apiKeyEnv,
     provider_context_window: providerDraft.contextWindow,
-    provider_max_output_tokens: providerDraft.maxOutputTokens,
     provider_loading: providerLoading,
     provider_catalog_base_url: providerCatalogAccepted ? state.provider_catalog_base_url : null,
     provider_catalog_profile: providerCatalogAccepted ? state.provider_catalog_profile : null,
@@ -814,7 +809,6 @@ function providerDraftFromConfigFields(
       : fallback.providerProfile,
     apiKeyEnv: values.get("model.api_key_env") ?? fallback.apiKeyEnv,
     contextWindow: values.get("model.context_window") ?? fallback.contextWindow,
-    maxOutputTokens: values.get("model.max_output_tokens") ?? fallback.maxOutputTokens,
     selectedModelId: values.get("model.model") ?? fallback.selectedModelId,
   };
 }
@@ -824,7 +818,6 @@ function sameProviderDraft(left: ProviderDraft, right: ProviderDraft): boolean {
     && left.providerProfile === right.providerProfile
     && left.apiKeyEnv === right.apiKeyEnv
     && left.contextWindow === right.contextWindow
-    && left.maxOutputTokens === right.maxOutputTokens
     && left.selectedModelId === right.selectedModelId;
 }
 
@@ -877,7 +870,6 @@ function hydrateProviderDraft(draft: ProviderDraft, state: DesktopWebState): voi
   draft.providerProfile = state.provider_profile;
   draft.apiKeyEnv = state.provider_api_key_env;
   draft.contextWindow = state.provider_context_window;
-  draft.maxOutputTokens = state.provider_max_output_tokens;
   draft.selectedModelId = selectedProviderModelId(state);
 }
 
@@ -892,8 +884,7 @@ function providerLimitDraftTargetsEffectiveProvider(
       === normalizeApiKeyEnv(state.provider_effective_api_key_env)
     && draft.selectedModelId === state.provider_effective_model_id;
   if (!targetMatches) return false;
-  return draft.contextWindow.trim() !== state.provider_effective_context_window.trim()
-    || draft.maxOutputTokens.trim() !== state.provider_effective_max_output_tokens.trim();
+  return draft.contextWindow.trim() !== state.provider_effective_context_window.trim();
 }
 
 function selectedProviderModelId(state: DesktopWebState): string {

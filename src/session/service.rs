@@ -1813,19 +1813,6 @@ fn normalize_session_settings_patch(
     if let Some(connection) = &provider_connection {
         connection.validate().map_err(SessionError::Message)?;
     }
-    if let Some(value) = patch.temperature {
-        validate_finite_non_negative("session settings temperature", value)?;
-    }
-    if let Some(value) = patch.top_p {
-        validate_finite_range("session settings top_p", value, 0.0, 1.0)?;
-    }
-    if let Some(value) = patch.top_k
-        && value == 0
-    {
-        return Err(SessionError::Message(
-            "session settings top_k must be greater than zero".to_string(),
-        ));
-    }
     if let Some(value) = patch.context_window
         && value == 0
     {
@@ -1840,30 +1827,12 @@ fn normalize_session_settings_patch(
         access_mode: patch.access_mode,
         provider_connection,
         reset_model_parameters: patch.reset_model_parameters,
-        temperature: patch.temperature,
-        top_p: patch.top_p,
-        top_k: patch.top_k,
+        temperature: None,
+        top_p: None,
+        top_k: None,
         context_window: patch.context_window,
-        max_output_tokens: patch.max_output_tokens,
+        max_output_tokens: None,
     })
-}
-
-fn validate_finite_non_negative(label: &str, value: f64) -> Result<(), SessionError> {
-    if !value.is_finite() || value < 0.0 {
-        return Err(SessionError::Message(format!(
-            "{label} must be finite and non-negative"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_finite_range(label: &str, value: f64, min: f64, max: f64) -> Result<(), SessionError> {
-    if !value.is_finite() || value < min || value > max {
-        return Err(SessionError::Message(format!(
-            "{label} must be finite and between {min} and {max}"
-        )));
-    }
-    Ok(())
 }
 
 trait NonEmptySetting {
@@ -2521,7 +2490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_root_settings_cas_validates_context_and_rejects_a_stale_revision() {
+    async fn exact_root_settings_cas_validates_context_ignores_generation_and_rejects_stale() {
         let (service, workspace, _) = service_fixture().await;
         let session = create_session(&service, &workspace).await;
         let revision = session.session.session_settings_revision;
@@ -2546,6 +2515,9 @@ mod tests {
                 SessionSettingsPatch {
                     context_window: Some(131_072),
                     max_output_tokens: Some(0),
+                    temperature: Some(f64::NAN),
+                    top_p: Some(f64::INFINITY),
+                    top_k: Some(0),
                     ..Default::default()
                 },
             )
@@ -2557,7 +2529,10 @@ mod tests {
             updated.session.model_parameters.context_window,
             Some(131_072)
         );
-        assert_eq!(updated.session.model_parameters.max_output_tokens, Some(0));
+        assert_eq!(updated.session.model_parameters.max_output_tokens, None);
+        assert_eq!(updated.session.model_parameters.temperature, None);
+        assert_eq!(updated.session.model_parameters.top_p, None);
+        assert_eq!(updated.session.model_parameters.top_k, None);
         assert_eq!(updated.session.session_settings_revision, revision + 1);
 
         let stale = service

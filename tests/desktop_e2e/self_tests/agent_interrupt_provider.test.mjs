@@ -7,7 +7,6 @@ import {
   SCRIPTED_PROVIDER_AGENT_INTERRUPT_MESSAGE,
   SCRIPTED_PROVIDER_AGENT_INTERRUPT_ROOT_RESPONSE,
   SCRIPTED_PROVIDER_AGENT_INTERRUPT_TASK_NAME,
-  SCRIPTED_PROVIDER_MAX_OUTPUT_TOKENS,
   SCRIPTED_PROVIDER_MODEL_ID,
   createAgentInterruptProviderScript,
   startScriptedProvider,
@@ -58,7 +57,6 @@ function request(input) {
     tools: tools(),
     tool_choice: "auto",
     parallel_tool_calls: false,
-    max_output_tokens: SCRIPTED_PROVIDER_MAX_OUTPUT_TOKENS,
     store: false,
     stream: true,
   };

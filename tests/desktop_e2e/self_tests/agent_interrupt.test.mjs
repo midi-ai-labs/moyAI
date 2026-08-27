@@ -431,6 +431,7 @@ test("agent interrupt scenario enables only the bounded multi-agent provider sur
   assert.match(config, /max_concurrent_agents = 2/);
   assert.match(config, /max_concurrent_model_requests = 2/);
   assert.match(config, /max_retries = 0/);
+  assert.doesNotMatch(config, /max_(?:output_)?tokens|reasoning_(?:effort|summary)|supports_reasoning|temperature|top_p|top_k|presence_penalty|frequency_penalty|seed\s*=|stop(?:_sequences)?\s*=|\[model\.extra_body_json\]/);
   assert.doesNotMatch(config, /run[-_ ]?\d+/i);
 
   const scenario = createAgentInterruptScenario();

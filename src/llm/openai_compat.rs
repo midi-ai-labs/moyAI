@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::model::{ProviderApiMode, ProviderReasoningCapability};
 use crate::error::{LlmError, ProviderStreamLimit};
-use crate::llm::contract::{ReasoningRequest, validate_chat_completions_reasoning_request};
+use crate::llm::contract::ReasoningRequest;
 use crate::llm::dto::{
     OpenAiChatChunk, OpenAiChatRequest, OpenAiContent, OpenAiContentPart, OpenAiErrorPayload,
     OpenAiFunctionSchema, OpenAiImageUrl, OpenAiMessage, OpenAiMessageToolCall,
@@ -35,6 +35,7 @@ const PROVIDER_FAILURE_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES: usize = 243;
 const PROVIDER_STREAM_SUMMARY_SCAN_LIMIT_BYTES: usize = PROVIDER_FAILURE_SUMMARY_LIMIT_BYTES * 4;
 const CHATML_ARTIFACT_HOLDBACK_MAX_BYTES: usize = 256;
+const CHATML_BARE_START_ARTIFACT: &str = "<|im_start|>";
 const CHATML_ROLE_BOUNDARY_ARTIFACTS: [&str; 6] = [
     "<|im_start|>system",
     "<|im_start|>developer",
@@ -53,7 +54,6 @@ pub struct OpenAiCompatClient {
 
 struct StartedResponse {
     response: reqwest::Response,
-    deadline: OperationDeadline,
 }
 
 impl OpenAiCompatClient {
@@ -112,7 +112,7 @@ impl OpenAiCompatClient {
         )?;
         let body = bytes::Bytes::from(body);
 
-        let Some(StartedResponse { response, deadline }) = self
+        let Some(StartedResponse { response }) = self
             .send_request(&request, "v1/chat/completions", body, &cancel, sink)
             .await?
         else {
@@ -124,9 +124,10 @@ impl OpenAiCompatClient {
         };
 
         let stream_limits = request.provider_target().stream_limits();
+        let stream_idle_timeout_ms = request.provider_target().deadlines().request_timeout_ms;
         let mut stream =
             bounded_response_bytes(response, stream_limits.max_raw_bytes).eventsource();
-        let mut stream_budget = ProviderStreamBudget::new(stream_limits, deadline);
+        let mut stream_budget = ProviderStreamBudget::new(stream_limits, stream_idle_timeout_ms);
         let mut usage = None;
         let mut saw_terminal_signal = false;
         let mut ended_by_eof = false;
@@ -286,7 +287,7 @@ impl OpenAiCompatClient {
             &body,
         )?;
         let body = bytes::Bytes::from(body);
-        let Some(StartedResponse { response, deadline }) = self
+        let Some(StartedResponse { response }) = self
             .send_request(&request, "v1/responses", body, &cancel, sink)
             .await?
         else {
@@ -298,9 +299,10 @@ impl OpenAiCompatClient {
         };
 
         let stream_limits = request.provider_target().stream_limits();
+        let stream_idle_timeout_ms = request.provider_target().deadlines().request_timeout_ms;
         let mut stream =
             bounded_response_bytes(response, stream_limits.max_raw_bytes).eventsource();
-        let mut stream_budget = ProviderStreamBudget::new(stream_limits, deadline);
+        let mut stream_budget = ProviderStreamBudget::new(stream_limits, stream_idle_timeout_ms);
         let mut accumulator =
             ResponsesStreamAccumulator::new(stream_limits.max_tool_call_argument_bytes);
 
@@ -395,7 +397,6 @@ impl OpenAiCompatClient {
                         response_id,
                         code,
                         message,
-                        max_output_tokens: request.effective_max_output_tokens(),
                     });
                 }
                 Some(ResponsesTerminal::Incomplete { reason, usage, .. }) => {
@@ -470,7 +471,7 @@ impl OpenAiCompatClient {
                 Ok(response) => {
                     trace.phase(ProviderPhase::HeadersReceived)?;
                     if response.status().is_success() {
-                        return Ok(Some(StartedResponse { response, deadline }));
+                        return Ok(Some(StartedResponse { response }));
                     }
                     let Some(failure) =
                         parse_response_failure_until_cancelled(response, cancel, &deadline).await?
@@ -608,6 +609,23 @@ impl<'a> ProviderTraceSink<'a> {
             }
             other => other,
         };
+        let last_progress_projection_error = if let Some(elapsed_ms) = self.last_progress_elapsed_ms
+        {
+            self.current_phase = ProviderPhase::LastProgress;
+            self.project_provider_phase(ProviderPhaseEvent {
+                request_id: self.request_id.clone(),
+                endpoint: self.endpoint.clone(),
+                phase: ProviderPhase::LastProgress,
+                attempt: self.attempt,
+                elapsed_ms,
+                terminal_status: None,
+                usage: None,
+                failure: None,
+            })
+            .err()
+        } else {
+            None
+        };
         let (result, provider_failure) = match result {
             Ok(summary) => (Ok(summary), None),
             Err(source)
@@ -621,7 +639,7 @@ impl<'a> ProviderTraceSink<'a> {
                 (Err(source), None)
             }
             Err(source) => {
-                let failure = self.failure_for(&source);
+                let failure = self.provider_failure_for(&source);
                 (
                     Err(LlmError::ProviderFailure {
                         failure: failure.clone(),
@@ -631,20 +649,8 @@ impl<'a> ProviderTraceSink<'a> {
                 )
             }
         };
-        if let Some(elapsed_ms) = self.last_progress_elapsed_ms {
-            self.current_phase = ProviderPhase::LastProgress;
-            if let Err(source) = self.project_provider_phase(ProviderPhaseEvent {
-                request_id: self.request_id.clone(),
-                endpoint: self.endpoint.clone(),
-                phase: ProviderPhase::LastProgress,
-                attempt: self.attempt,
-                elapsed_ms,
-                terminal_status: None,
-                usage: None,
-                failure: None,
-            }) {
-                return Err(self.normalize_projection_failure(source, result.err()));
-            }
+        if let Some(source) = last_progress_projection_error {
+            return Err(self.normalize_projection_failure(source, result.err()));
         }
 
         match result {
@@ -709,9 +715,20 @@ impl<'a> ProviderTraceSink<'a> {
     }
 
     fn failure_for(&self, source: &LlmError) -> ProviderFailure {
-        let (kind, status, code) = if self.failure_origin
-            == Some(ProviderTraceFailureOrigin::EventProjection)
-        {
+        self.failure_for_origin(source, self.failure_origin)
+    }
+
+    fn provider_failure_for(&self, source: &LlmError) -> ProviderFailure {
+        self.failure_for_origin(source, None)
+    }
+
+    fn failure_for_origin(
+        &self,
+        source: &LlmError,
+        failure_origin: Option<ProviderTraceFailureOrigin>,
+    ) -> ProviderFailure {
+        let projection_failed = failure_origin == Some(ProviderTraceFailureOrigin::EventProjection);
+        let (kind, status, code) = if projection_failed {
             (ProviderFailureKind::EventProjection, None, None)
         } else {
             match source {
@@ -740,10 +757,14 @@ impl<'a> ProviderTraceSink<'a> {
                     (ProviderFailureKind::Generation, None, None)
                 }
                 LlmError::Json(_) => (ProviderFailureKind::Decode, None, None),
-                LlmError::Message(_) if self.current_phase == ProviderPhase::FirstProgress => {
-                    (ProviderFailureKind::Protocol, None, None)
-                }
-                LlmError::Message(_) if self.current_phase == ProviderPhase::HeadersReceived => {
+                LlmError::Message(_)
+                    if matches!(
+                        self.current_phase,
+                        ProviderPhase::HeadersReceived
+                            | ProviderPhase::FirstProgress
+                            | ProviderPhase::LastProgress
+                    ) =>
+                {
                     (ProviderFailureKind::Protocol, None, None)
                 }
                 _ => (ProviderFailureKind::Other, None, None),
@@ -928,18 +949,19 @@ fn bounded_response_bytes(
 
 struct ProviderStreamBudget {
     limits: crate::config::ProviderStreamLimits,
-    deadline: OperationDeadline,
+    idle_timeout_ms: u64,
+    idle_deadline: OperationDeadline,
     event_count: u64,
     tool_calls: HashSet<String>,
     tool_argument_bytes: HashMap<String, u64>,
 }
 
 impl ProviderStreamBudget {
-    fn new(limits: crate::config::ProviderStreamLimits, deadline: OperationDeadline) -> Self {
-        debug_assert_eq!(limits.max_duration_ms, deadline.timeout_ms);
+    fn new(limits: crate::config::ProviderStreamLimits, idle_timeout_ms: u64) -> Self {
         Self {
             limits,
-            deadline,
+            idle_timeout_ms,
+            idle_deadline: OperationDeadline::new(idle_timeout_ms),
             event_count: 0,
             tool_calls: HashSet::new(),
             tool_argument_bytes: HashMap::new(),
@@ -947,16 +969,17 @@ impl ProviderStreamBudget {
     }
 
     fn wait_timeout(&self) -> Option<Duration> {
-        self.deadline.remaining()
+        self.idle_deadline.remaining()
     }
 
     fn timeout_error(&self) -> LlmError {
-        LlmError::ProviderRequestTimeout {
-            timeout_ms: self.limits.max_duration_ms,
+        LlmError::ProviderStreamIdleTimeout {
+            timeout_ms: self.idle_timeout_ms,
         }
     }
 
     fn record_event(&mut self) -> Result<(), LlmError> {
+        self.idle_deadline = OperationDeadline::new(self.idle_timeout_ms);
         self.event_count = self.event_count.saturating_add(1);
         ensure_stream_limit(
             ProviderStreamLimit::EventCount,
@@ -1426,7 +1449,9 @@ impl ChatAssistantTextHoldback {
         }
 
         self.pending.push_str(&delta);
-        if classify_chatml_artifact_candidate(&self.pending) == ChatmlArtifactCandidate::No {
+        if classify_chatml_artifact_candidate(&self.pending) == ChatmlArtifactCandidate::No
+            && !is_complete_chatml_artifact_sequence(&self.pending)
+        {
             self.flush_pending(events);
             self.passthrough = true;
         }
@@ -1444,8 +1469,7 @@ impl ChatAssistantTextHoldback {
 
         let suppress = finish_reason == FinishReason::ToolCall
             && has_complete_tool_calls
-            && classify_chatml_artifact_candidate(&self.pending)
-                == ChatmlArtifactCandidate::Complete;
+            && is_complete_chatml_artifact_sequence(&self.pending);
         if suppress {
             self.pending.clear();
         } else {
@@ -1499,6 +1523,31 @@ fn classify_chatml_artifact_candidate(mut value: &str) -> ChatmlArtifactCandidat
         } else {
             ChatmlArtifactCandidate::No
         };
+    }
+}
+
+fn is_complete_chatml_artifact_sequence(mut value: &str) -> bool {
+    // A bare start token is complete structural content at a tool terminal, but it is also the
+    // prefix of every role-qualified marker while chunks are still arriving. Keep this terminal
+    // grammar separate from the prefix classifier so `<|im_start|>us` remains held for `user`.
+    loop {
+        value = value.trim_start_matches(char::is_whitespace);
+        if value.is_empty() {
+            return true;
+        }
+
+        if let Some(artifact) = CHATML_ROLE_BOUNDARY_ARTIFACTS
+            .iter()
+            .find(|artifact| value.starts_with(**artifact))
+        {
+            value = &value[artifact.len()..];
+            continue;
+        }
+        if let Some(remaining) = value.strip_prefix(CHATML_BARE_START_ARTIFACT) {
+            value = remaining;
+            continue;
+        }
+        return false;
     }
 }
 
@@ -1689,12 +1738,10 @@ fn to_openai_request(request: &ChatRequest) -> Result<Value, LlmError> {
 
 pub(crate) fn to_openai_request_with_reasoning(
     request: &ChatRequest,
-    reasoning_request: Option<&ReasoningRequest>,
-    reasoning_capability: ProviderReasoningCapability,
+    _reasoning_request: Option<&ReasoningRequest>,
+    _reasoning_capability: ProviderReasoningCapability,
 ) -> Result<Value, LlmError> {
     request.validate_provider_lifecycle()?;
-    let reasoning =
-        validate_chat_completions_reasoning_request(reasoning_request, reasoning_capability)?;
     let mut messages = Vec::with_capacity(request.messages.len() + 1);
     let mut system_segments = vec![request.system_prompt.clone()];
     let mut non_system_messages = Vec::with_capacity(request.messages.len());
@@ -1804,14 +1851,14 @@ pub(crate) fn to_openai_request_with_reasoning(
         },
         n: 1,
         messages,
-        max_tokens: Some(request.effective_max_output_tokens()),
-        temperature: request.temperature,
-        top_p: request.top_p,
-        top_k: request.top_k,
-        presence_penalty: request.presence_penalty,
-        frequency_penalty: request.frequency_penalty,
-        seed: request.seed,
-        stop_sequences: request.stop_sequences.clone(),
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        seed: None,
+        stop_sequences: Vec::new(),
         tools: request.tools.iter().map(openai_tool_schema).collect(),
         parallel_tool_calls: tool_surface_scoped_parallel_tool_calls_projection(
             request.tools.len(),
@@ -1819,29 +1866,9 @@ pub(crate) fn to_openai_request_with_reasoning(
         ),
     };
     let mut body = serde_json::to_value(base)?;
-    if let Some(extra) = &request.extra_body {
-        merge_extra_body(&mut body, extra.clone());
-    }
-    if let Some(reasoning) = reasoning {
-        let body_map = body.as_object_mut().ok_or_else(|| {
-            LlmError::Message(
-                "OpenAI-compatible Chat Completions request must serialize as an object"
-                    .to_string(),
-            )
-        })?;
-        if let Some(effort) = reasoning.effort {
-            body_map.insert(
-                "reasoning_effort".to_string(),
-                serde_json::to_value(effort)?,
-            );
-        }
-        if let Some(summary) = reasoning.summary {
-            body_map.insert(
-                "reasoning_summary".to_string(),
-                serde_json::to_value(summary)?,
-            );
-        }
-    }
+    // Normal generation intentionally inherits the provider host's generation policy. Legacy
+    // sampling, reasoning, and extra-body config remains readable, but the provider wire boundary
+    // owns a stable structural request and never projects those generation overrides.
     if let Some(tool_choice) = request.tool_choice.as_ref().map(provider_tool_choice_json)
         && let Value::Object(base_map) = &mut body
     {
@@ -1886,47 +1913,6 @@ fn apply_extra_headers(
         headers.insert(header_name, header_value);
     }
     Ok(())
-}
-
-fn merge_extra_body(base: &mut Value, extra: Value) {
-    match (base, extra) {
-        (Value::Object(base_map), Value::Object(extra_map)) => {
-            for (key, value) in extra_map {
-                if is_runtime_owned_openai_request_key(&key) {
-                    continue;
-                }
-                base_map.insert(key, value);
-            }
-        }
-        (Value::Object(base_map), value) => {
-            base_map.insert("extra_body_json".to_string(), value);
-        }
-        _ => {}
-    }
-}
-
-fn is_runtime_owned_openai_request_key(key: &str) -> bool {
-    matches!(
-        key,
-        "model"
-            | "stream"
-            | "stream_options"
-            | "n"
-            | "messages"
-            | "max_tokens"
-            | "temperature"
-            | "top_p"
-            | "top_k"
-            | "presence_penalty"
-            | "frequency_penalty"
-            | "seed"
-            | "stop"
-            | "tools"
-            | "tool_choice"
-            | "parallel_tool_calls"
-            | "reasoning_effort"
-            | "reasoning_summary"
-    )
 }
 
 fn parse_finish_reason(value: &str) -> Result<FinishReason, LlmError> {
@@ -2099,8 +2085,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        ChatStreamAccumulator, OpenAiCompatClient, OperationDeadline, PartialToolCall,
-        ProviderStreamBudget, ProviderStreamBudgetStage, parse_finish_reason,
+        ChatStreamAccumulator, OpenAiCompatClient, PartialToolCall, ProviderStreamBudget,
+        ProviderStreamBudgetStage, is_complete_chatml_artifact_sequence, parse_finish_reason,
         resolve_finish_reason, retry_delay_ms, to_openai_request, to_openai_request_with_reasoning,
         to_usage, validate_streamed_tool_calls,
     };
@@ -2131,7 +2117,7 @@ mod tests {
     }
 
     fn fresh_stream_budget(limits: ProviderStreamLimits) -> ProviderStreamBudget {
-        ProviderStreamBudget::new(limits, OperationDeadline::new(limits.max_duration_ms))
+        ProviderStreamBudget::new(limits, 30_000)
     }
 
     fn concatenated_text(events: &[LlmEvent]) -> String {
@@ -2378,7 +2364,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_enabled_payload_uses_configured_output_budget() {
+    fn chat_wire_omits_configured_output_budget_for_tool_and_toolless_requests() {
         let model = ModelProfile {
             name: "openai-compatible-fixture-model".to_string(),
             context_window: 131_072,
@@ -2433,8 +2419,8 @@ mod tests {
         request.extra_body = None;
         let no_tool_body = to_openai_request(&request).expect("request serialization succeeds");
 
-        assert_eq!(tool_body["max_tokens"].as_u64(), Some(131_072));
-        assert_eq!(no_tool_body["max_tokens"].as_u64(), Some(131_072));
+        assert!(tool_body.get("max_tokens").is_none());
+        assert!(no_tool_body.get("max_tokens").is_none());
         assert!(
             tool_body["tools"][0]["function"].get("strict").is_none(),
             "Chat Completions tool schemas must not contain an unsupported strict field"
@@ -2442,135 +2428,76 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_fields_are_omitted_without_an_explicit_typed_provider_contract() {
-        let request = reasoning_fixture_request();
-
-        let body = to_openai_request(&request).expect("request serialization succeeds");
-
-        assert!(body.get("reasoning_effort").is_none());
-        assert!(body.get("reasoning_summary").is_none());
-    }
-
-    #[test]
-    fn typed_chat_completions_reasoning_serializes_verified_wire_fields() {
-        let request = reasoning_fixture_request();
-        let effort_only = ReasoningRequest {
-            effort: Some(ReasoningEffort::Medium),
-            summary: ReasoningSummary::None,
-        };
-
-        let effort_only_body = to_openai_request_with_reasoning(
-            &request,
-            Some(&effort_only),
-            ProviderReasoningCapability::ChatCompletions {
-                parameters: ChatCompletionsReasoningParameters::EffortOnly,
-            },
-        )
-        .expect("provider-verified effort field");
-        assert_eq!(effort_only_body["reasoning_effort"], "medium");
-        assert!(effort_only_body.get("reasoning_summary").is_none());
-
-        let effort_and_summary = ReasoningRequest {
+    fn chat_request_omits_legacy_generation_overrides_and_keeps_structural_fields() {
+        let mut request = reasoning_fixture_request();
+        request.temperature = Some(0.2);
+        request.top_p = Some(0.8);
+        request.top_k = Some(40);
+        request.presence_penalty = Some(0.1);
+        request.frequency_penalty = Some(0.3);
+        request.seed = Some(7);
+        request.stop_sequences = vec!["DONE".to_string(), "STOP".to_string()];
+        request.reasoning = Some(ReasoningRequest {
             effort: Some(ReasoningEffort::High),
-            summary: ReasoningSummary::Concise,
-        };
-        let effort_and_summary_body = to_openai_request_with_reasoning(
+            summary: ReasoningSummary::Detailed,
+        });
+        request.extra_body = Some(serde_json::json!({
+            "temperature": 1.9,
+            "top_p": 0.95,
+            "top_k": 80,
+            "presence_penalty": 1.0,
+            "frequency_penalty": 1.0,
+            "seed": 99,
+            "stop": ["overridden"],
+            "reasoning_effort": "ultra",
+            "reasoning_summary": "detailed",
+            "chat_template_kwargs": { "enable_thinking": true },
+            "num_ctx": 8192,
+            "min_p": 0.05,
+            "n": 2,
+            "stream_options": { "include_usage": false }
+        }));
+
+        let body = to_openai_request_with_reasoning(
             &request,
-            Some(&effort_and_summary),
+            Some(&ReasoningRequest {
+                effort: Some(ReasoningEffort::Medium),
+                summary: ReasoningSummary::Concise,
+            }),
             ProviderReasoningCapability::ChatCompletions {
                 parameters: ChatCompletionsReasoningParameters::EffortAndSummary,
             },
         )
-        .expect("provider-verified effort and summary fields");
-        assert_eq!(effort_and_summary_body["reasoning_effort"], "high");
-        assert_eq!(effort_and_summary_body["reasoning_summary"], "concise");
-    }
-
-    #[test]
-    fn enabled_reasoning_fails_closed_for_unsupported_or_mismatched_transports() {
-        let request = reasoning_fixture_request();
-        let reasoning = ReasoningRequest {
-            effort: Some(ReasoningEffort::Low),
-            summary: ReasoningSummary::None,
-        };
-
-        assert!(
-            to_openai_request_with_reasoning(
-                &request,
-                Some(&reasoning),
-                ProviderReasoningCapability::Unsupported,
-            )
-            .is_err()
-        );
-        assert!(
-            to_openai_request_with_reasoning(
-                &request,
-                Some(&reasoning),
-                ProviderReasoningCapability::Responses {
-                    supports_summary: true,
-                },
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn extra_body_cannot_own_or_override_reasoning_wire_fields() {
-        let mut request = reasoning_fixture_request();
-        request.extra_body = Some(serde_json::json!({
-            "reasoning_effort": "ultra",
-            "reasoning_summary": "detailed",
-            "num_ctx": 8192
-        }));
-
-        let disabled_body = to_openai_request(&request).expect("disabled reasoning payload");
-        assert!(disabled_body.get("reasoning_effort").is_none());
-        assert!(disabled_body.get("reasoning_summary").is_none());
-        assert_eq!(disabled_body["num_ctx"], 8192);
-
-        let typed_body = to_openai_request_with_reasoning(
-            &request,
-            Some(&ReasoningRequest {
-                effort: Some(ReasoningEffort::Medium),
-                summary: ReasoningSummary::None,
-            }),
-            ProviderReasoningCapability::ChatCompletions {
-                parameters: ChatCompletionsReasoningParameters::EffortOnly,
-            },
-        )
-        .expect("typed reasoning owns wire field");
-        assert_eq!(typed_body["reasoning_effort"], "medium");
-        assert!(typed_body.get("reasoning_summary").is_none());
-        assert_eq!(typed_body["num_ctx"], 8192);
-
-        let disabled_thinking_body = to_openai_request_with_reasoning(
-            &request,
-            Some(&ReasoningRequest {
-                effort: Some(ReasoningEffort::None),
-                summary: ReasoningSummary::None,
-            }),
-            ProviderReasoningCapability::ChatCompletions {
-                parameters: ChatCompletionsReasoningParameters::EffortOnly,
-            },
-        )
-        .expect("typed none reasoning effort owns the disable wire field");
-        assert_eq!(disabled_thinking_body["reasoning_effort"], "none");
-    }
-
-    #[test]
-    fn chat_request_forces_one_choice_and_extra_body_cannot_override_it() {
-        let mut request = reasoning_fixture_request();
-        request.extra_body = Some(json!({
-            "n": 2,
-            "stream_options": { "include_usage": false },
-            "num_ctx": 8192
-        }));
-
-        let body = to_openai_request(&request).expect("one-choice Chat request");
+        .expect("legacy generation overrides must not affect serialization");
 
         assert_eq!(body["n"], 1);
         assert_eq!(body["stream_options"], json!({ "include_usage": true }));
-        assert_eq!(body["num_ctx"], 8192);
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["messages"][0]["role"], json!("system"));
+        assert_eq!(body["messages"][1]["role"], json!("user"));
+        for key in [
+            "max_output_tokens",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "presence_penalty",
+            "frequency_penalty",
+            "seed",
+            "stop",
+            "reasoning",
+            "reasoning_effort",
+            "reasoning_summary",
+            "chat_template_kwargs",
+            "num_ctx",
+            "min_p",
+            "extra_body_json",
+        ] {
+            assert!(
+                body.get(key).is_none(),
+                "legacy generation key `{key}` leaked to Chat Completions wire"
+            );
+        }
     }
 
     #[test]
@@ -2666,6 +2593,147 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_terminal_suppresses_chunked_bare_chatml_start_artifact() {
+        let mut accumulator = ChatStreamAccumulator::default();
+        let mut budget = fresh_stream_budget(ProviderStreamLimits::product_default());
+
+        let prefix = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "content": "\n\n<|im_" },
+                "finish_reason": null
+            }]
+        }))
+        .expect("bare ChatML artifact prefix");
+        assert!(
+            accumulator
+                .apply_chunk(prefix, &mut budget)
+                .expect("bare artifact prefix remains held back")
+                .events
+                .is_empty()
+        );
+
+        let terminal = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": "start|>",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_read",
+                        "function": { "name": "read", "arguments": "{}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("bare ChatML artifact tool terminal");
+        let update = accumulator
+            .apply_chunk(terminal, &mut budget)
+            .expect("complete bare artifact with a valid tool call");
+
+        assert!(update.saw_terminal_signal);
+        assert_eq!(concatenated_text(&update.events), "");
+        assert!(matches!(
+            update.events.as_slice(),
+            [
+                LlmEvent::ToolCallStart { call_id, tool_name },
+                LlmEvent::ToolCallArgsDelta { call_id: args_id, delta },
+            ] if call_id == "call_read"
+                && tool_name == "read"
+                && args_id == "call_read"
+                && delta == "{}"
+        ));
+
+        let mut single_chunk_accumulator = ChatStreamAccumulator::default();
+        let mut single_chunk_budget = fresh_stream_budget(ProviderStreamLimits::product_default());
+        let single_chunk_terminal = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": "\n\n<|im_start|>",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_read_single",
+                        "function": { "name": "read", "arguments": "{}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("single-chunk bare ChatML artifact tool terminal");
+        let single_chunk_update = single_chunk_accumulator
+            .apply_chunk(single_chunk_terminal, &mut single_chunk_budget)
+            .expect("single-chunk bare artifact with a valid tool call");
+        assert!(single_chunk_update.saw_terminal_signal);
+        assert_eq!(concatenated_text(&single_chunk_update.events), "");
+        assert!(matches!(
+            single_chunk_update.events.as_slice(),
+            [
+                LlmEvent::ToolCallStart { call_id, tool_name },
+                LlmEvent::ToolCallArgsDelta { call_id: args_id, delta },
+            ] if call_id == "call_read_single"
+                && tool_name == "read"
+                && args_id == "call_read_single"
+                && delta == "{}"
+        ));
+    }
+
+    #[test]
+    fn tool_call_terminal_preserves_a_truncated_chatml_prefix() {
+        let mut accumulator = ChatStreamAccumulator::default();
+        let mut budget = fresh_stream_budget(ProviderStreamLimits::product_default());
+        let terminal = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": "\n<|im_sta",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_read",
+                        "function": { "name": "read", "arguments": "{}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .expect("truncated ChatML prefix tool terminal");
+        let update = accumulator
+            .apply_chunk(terminal, &mut budget)
+            .expect("truncated control-token text remains provider content");
+
+        assert_eq!(concatenated_text(&update.events), "\n<|im_sta");
+        assert!(matches!(
+            update.events.as_slice(),
+            [
+                LlmEvent::ToolCallStart { call_id, tool_name },
+                LlmEvent::ToolCallArgsDelta { call_id: args_id, delta },
+                LlmEvent::TextDelta(text),
+            ] if call_id == "call_read"
+                && tool_name == "read"
+                && args_id == "call_read"
+                && delta == "{}"
+                && text == "\n<|im_sta"
+        ));
+    }
+
+    #[test]
+    fn tool_terminal_artifact_completion_distinguishes_bare_tokens_from_partial_or_semantic_text() {
+        assert!(is_complete_chatml_artifact_sequence("\n\n<|im_start|>"));
+        assert!(is_complete_chatml_artifact_sequence(
+            "<|im_start|>user\n<|im_end|>"
+        ));
+        assert!(is_complete_chatml_artifact_sequence(
+            "<|im_start|> <|im_start|>"
+        ));
+        assert!(!is_complete_chatml_artifact_sequence("<|im_sta"));
+        assert!(!is_complete_chatml_artifact_sequence("<|im_start|>us"));
+        assert!(!is_complete_chatml_artifact_sequence(
+            "I observed <|im_start|>"
+        ));
+    }
+
+    #[test]
     fn normal_stop_flushes_chatml_literal_and_candidate_bytes_exactly() {
         let explanation = "The literal <|im_start|>user names a ChatML boundary.";
         let mut explanation_accumulator = ChatStreamAccumulator::default();
@@ -2715,6 +2783,21 @@ mod tests {
             concatenated_text(&literal_update.events),
             "\n<|im_start|>user"
         );
+
+        let mut bare_accumulator = ChatStreamAccumulator::default();
+        let mut bare_budget = fresh_stream_budget(ProviderStreamLimits::product_default());
+        let bare_terminal = serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "content": "\n<|im_start|>" },
+                "finish_reason": "stop"
+            }]
+        }))
+        .expect("bare ChatML literal stop terminal");
+        let bare_update = bare_accumulator
+            .apply_chunk(bare_terminal, &mut bare_budget)
+            .expect("normal stop must preserve a bare ChatML literal");
+        assert_eq!(concatenated_text(&bare_update.events), "\n<|im_start|>");
     }
 
     #[test]
@@ -3736,7 +3819,7 @@ mod tests {
                 panic!("original provider failure must be nested below projection failure");
             };
             assert_eq!(provider_failure.kind, ProviderFailureKind::Protocol);
-            assert_eq!(provider_failure.phase, ProviderPhase::FirstProgress);
+            assert_eq!(provider_failure.phase, ProviderPhase::LastProgress);
             assert_eq!(provider_failure.message, SEMANTIC_MESSAGE);
             assert_eq!(
                 provider_failure.request_id.as_str(),
@@ -4154,7 +4237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_transport_posts_typed_wire_and_projects_completed_text_and_summary() {
+    async fn responses_transport_posts_host_default_wire_and_projects_completed_text_and_summary() {
         let response = responses_sse([
             json!({
                 "type": "response.reasoning_summary_text.delta",
@@ -4308,11 +4391,8 @@ mod tests {
                 }]
             }])
         );
-        assert_eq!(
-            wire["reasoning"],
-            json!({ "effort": "high", "summary": "detailed" })
-        );
-        assert_eq!(wire["max_output_tokens"], json!(4_096));
+        assert!(wire.get("reasoning").is_none());
+        assert!(wire.get("max_output_tokens").is_none());
         assert_eq!(wire["store"], json!(false));
         assert_eq!(wire["stream"], json!(true));
         assert!(wire.get("messages").is_none());
@@ -4477,7 +4557,7 @@ mod tests {
         let captured = requests.lock().expect("Responses request capture");
         assert_eq!(captured.len(), 2);
         assert!(captured[0].get("previous_response_id").is_none());
-        assert_eq!(captured[0]["num_ctx"], json!(131_072));
+        assert!(captured[0].get("num_ctx").is_none());
         assert_eq!(
             captured[0]["input"],
             json!([{
@@ -4487,7 +4567,7 @@ mod tests {
             }])
         );
         assert!(captured[1].get("previous_response_id").is_none());
-        assert_eq!(captured[1]["num_ctx"], json!(131_072));
+        assert!(captured[1].get("num_ctx").is_none());
         assert_eq!(
             captured[1]["input"],
             json!([{
@@ -4568,7 +4648,7 @@ mod tests {
         assert!(error.to_string().contains("try again"));
         let failure = error.provider_failure().expect("typed generation failure");
         assert_eq!(failure.kind, ProviderFailureKind::Generation);
-        assert_eq!(failure.phase, ProviderPhase::FirstProgress);
+        assert_eq!(failure.phase, ProviderPhase::LastProgress);
         assert_eq!(failure.status, None);
         assert_eq!(failure.code.as_deref(), Some("server_error"));
         assert_eq!(requests.lock().expect("request capture").len(), 1);
@@ -4602,7 +4682,6 @@ mod tests {
             }],
         );
         request.model.max_output_tokens = 2_048;
-        let expected_max_output_tokens = 2_048;
         let client = OpenAiCompatClient::new(None);
         let mut sink = RecordingLlmEventSink::default();
 
@@ -4614,14 +4693,10 @@ mod tests {
 
         let failure = error.provider_failure().expect("typed generation failure");
         assert_eq!(failure.kind, ProviderFailureKind::Generation);
-        assert_eq!(failure.phase, ProviderPhase::FirstProgress);
+        assert_eq!(failure.phase, ProviderPhase::LastProgress);
         assert_eq!(failure.status, None);
         assert_eq!(failure.code.as_deref(), Some("unknown"));
-        assert!(
-            error
-                .to_string()
-                .contains("configured max_output_tokens=2048")
-        );
+        assert!(!error.to_string().contains("max_output_tokens"));
         assert!(matches!(
             &error,
             LlmError::ProviderFailure { source, .. }
@@ -4631,19 +4706,14 @@ mod tests {
                         response_id: Some(response_id),
                         code: Some(code),
                         message,
-                        max_output_tokens,
                     } if response_id == "resp_tool_parse_failed"
                         && code == "unknown"
                         && message == "Failed to parse tool call: Unexpected end of content."
-                        && *max_output_tokens == expected_max_output_tokens
                 )
         ));
         let requests = requests.lock().expect("request capture");
         assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0]["max_output_tokens"],
-            json!(expected_max_output_tokens)
-        );
+        assert!(requests[0].get("max_output_tokens").is_none());
         assert!(sink.events.is_empty());
         assert!(matches!(
             sink.phases.last(),
@@ -4811,14 +4881,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_completions_reuses_response_start_deadline_until_stream_terminal() {
-        assert_response_start_time_is_charged_to_stream_deadline(ProviderApiMode::ChatCompletions)
-            .await;
+    async fn chat_completions_renews_stream_idle_deadline_while_progress_continues() {
+        assert_progress_renews_stream_idle_deadline(ProviderApiMode::ChatCompletions).await;
     }
 
     #[tokio::test]
-    async fn responses_reuses_response_start_deadline_until_stream_terminal() {
-        assert_response_start_time_is_charged_to_stream_deadline(ProviderApiMode::Responses).await;
+    async fn responses_renews_stream_idle_deadline_while_progress_continues() {
+        assert_progress_renews_stream_idle_deadline(ProviderApiMode::Responses).await;
     }
 
     #[tokio::test]
@@ -4995,6 +5064,10 @@ mod tests {
             error.provider_failure().map(|failure| failure.kind),
             Some(ProviderFailureKind::Protocol)
         );
+        assert_eq!(
+            error.provider_failure().map(|failure| failure.phase),
+            Some(ProviderPhase::LastProgress)
+        );
         assert!(
             error
                 .to_string()
@@ -5018,7 +5091,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_timeout_flushes_split_chatml_candidate_before_typed_error() {
+    async fn chat_stream_idle_timeout_flushes_split_chatml_candidate_before_typed_error() {
         const REQUEST_TIMEOUT_MS: u64 = 100;
         let candidate = [
             format!(
@@ -5081,19 +5154,23 @@ mod tests {
         let error = client
             .stream_chat(request, CancellationToken::new(), &mut sink)
             .await
-            .expect_err("the original request timeout must remain typed");
+            .expect_err("the stream inactivity timeout must remain typed");
         server.abort();
 
         assert_eq!(
             error.provider_failure().map(|failure| failure.kind),
-            Some(ProviderFailureKind::RequestTimeout)
+            Some(ProviderFailureKind::StreamIdleTimeout)
+        );
+        assert_eq!(
+            error.provider_failure().map(|failure| failure.phase),
+            Some(ProviderPhase::LastProgress)
         );
         assert!(matches!(
             error,
             LlmError::ProviderFailure { source, .. }
                 if matches!(
                     *source,
-                    LlmError::ProviderRequestTimeout {
+                    LlmError::ProviderStreamIdleTimeout {
                         timeout_ms: REQUEST_TIMEOUT_MS,
                     }
                 )
@@ -5106,7 +5183,7 @@ mod tests {
         ));
     }
 
-    async fn assert_response_start_time_is_charged_to_stream_deadline(api_mode: ProviderApiMode) {
+    async fn assert_progress_renews_stream_idle_deadline(api_mode: ProviderApiMode) {
         const REQUEST_TIMEOUT_MS: u64 = 400;
         let (first_progress, terminal) = match api_mode {
             ProviderApiMode::ChatCompletions => (
@@ -5115,7 +5192,7 @@ mod tests {
                     json!({
                         "choices": [{
                             "index": 0,
-                            "delta": { "content": "too late" },
+                            "delta": { "content": "still active" },
                             "finish_reason": null
                         }]
                     })
@@ -5140,7 +5217,7 @@ mod tests {
                     "type": "response.output_text.delta",
                     "item_id": "msg_too_late",
                     "output_index": 0,
-                    "delta": "too late"
+                    "delta": "still active"
                 })]),
                 responses_sse([
                     json!({
@@ -5150,7 +5227,7 @@ mod tests {
                             "type": "message",
                             "id": "msg_too_late",
                             "role": "assistant",
-                            "content": [{ "type": "output_text", "text": "too late" }]
+                            "content": [{ "type": "output_text", "text": "still active" }]
                         }
                     }),
                     json!({
@@ -5161,7 +5238,7 @@ mod tests {
                                 "type": "message",
                                 "id": "msg_too_late",
                                 "role": "assistant",
-                                "content": [{ "type": "output_text", "text": "too late" }]
+                                "content": [{ "type": "output_text", "text": "still active" }]
                             }]
                         }
                     }),
@@ -5170,10 +5247,10 @@ mod tests {
         };
         let (base_url, request_count, server) = start_staged_delayed_fixture(
             vec![
-                (Duration::from_millis(100), first_progress),
+                (Duration::from_millis(250), first_progress),
                 (Duration::from_millis(250), terminal),
             ],
-            Duration::from_millis(100),
+            Duration::from_millis(250),
         )
         .await;
         let mut request = match api_mode {
@@ -5185,7 +5262,7 @@ mod tests {
             ProviderApiMode::Responses => responses_fixture_request(
                 &base_url,
                 vec![ModelMessage::User {
-                    content: "Use one request deadline".to_string(),
+                    content: "Keep an active stream alive".to_string(),
                 }],
             ),
         };
@@ -5198,33 +5275,28 @@ mod tests {
             },
         );
         assert_eq!(
-            request.provider_target().stream_limits().max_duration_ms,
+            request.provider_target().deadlines().request_timeout_ms,
             REQUEST_TIMEOUT_MS
         );
         let client = OpenAiCompatClient::new(None);
         let mut sink = RecordingLlmEventSink::default();
 
-        let error = client
+        let summary = client
             .stream_chat(request, CancellationToken::new(), &mut sink)
             .await
-            .expect_err("streaming must consume the response-start portion of the same deadline");
+            .expect("each SSE event must renew the stream inactivity interval");
         server.abort();
 
-        let failure = error.provider_failure().expect("typed provider failure");
-        assert_eq!(failure.kind, ProviderFailureKind::RequestTimeout);
-        assert_eq!(failure.phase, ProviderPhase::FirstProgress);
-        assert!(matches!(
-            error,
-            LlmError::ProviderFailure { source, .. }
-                if matches!(
-                    *source,
-                    LlmError::ProviderRequestTimeout {
-                        timeout_ms: REQUEST_TIMEOUT_MS,
-                    }
-                )
-        ));
+        assert_eq!(summary.finish_reason, FinishReason::Stop);
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         assert!(!sink.events.is_empty());
+        assert_eq!(concatenated_text(&sink.events), "still active");
+        assert!(
+            sink.phases
+                .last()
+                .is_some_and(|event| event.elapsed_ms > REQUEST_TIMEOUT_MS),
+            "the completed stream must outlive the response-start timeout"
+        );
         assert_eq!(
             sink.phases
                 .iter()
@@ -5239,10 +5311,14 @@ mod tests {
                 ProviderPhase::ProviderTerminal,
             ]
         );
+        assert_eq!(
+            sink.phases.last().and_then(|event| event.terminal_status),
+            Some(ProviderTerminalStatus::Completed)
+        );
     }
 
     #[tokio::test]
-    async fn post_header_request_deadline_is_not_retried() {
+    async fn post_header_stream_idle_timeout_is_not_retried() {
         let response = responses_sse([json!({
             "type": "response.completed",
             "response": { "id": "resp_too_late" }
@@ -5269,12 +5345,12 @@ mod tests {
         let error = client
             .stream_chat(request, CancellationToken::new(), &mut sink)
             .await
-            .expect_err("the shared request deadline must terminate the generation request");
+            .expect_err("stream inactivity must terminate the generation request");
         server.abort();
 
         assert_eq!(
             error.provider_failure().map(|failure| failure.kind),
-            Some(ProviderFailureKind::RequestTimeout)
+            Some(ProviderFailureKind::StreamIdleTimeout)
         );
         assert_eq!(
             error.provider_failure().map(|failure| failure.phase),
@@ -5287,7 +5363,7 @@ mod tests {
             LlmError::ProviderFailure { source, .. }
                 if matches!(
                     *source,
-                    LlmError::ProviderRequestTimeout { timeout_ms: 30 }
+                    LlmError::ProviderStreamIdleTimeout { timeout_ms: 30 }
                 )
         ));
         assert_eq!(
@@ -5432,7 +5508,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_request_deadline_terminates_active_stream_without_reposting() {
+    async fn stream_idle_timeout_terminates_inactive_stream_without_reposting() {
         let response = responses_sse([json!({
             "type": "response.completed",
             "response": { "id": "too_late" }
@@ -5459,7 +5535,7 @@ mod tests {
         let error = client
             .stream_chat(request, CancellationToken::new(), &mut sink)
             .await
-            .expect_err("the shared request deadline must bound the active stream");
+            .expect_err("the stream inactivity interval must bound an inactive stream");
         server.abort();
 
         assert!(matches!(
@@ -5467,7 +5543,7 @@ mod tests {
             LlmError::ProviderFailure { source, .. }
                 if matches!(
                     *source,
-                    LlmError::ProviderRequestTimeout { timeout_ms: 30 }
+                    LlmError::ProviderStreamIdleTimeout { timeout_ms: 30 }
                 )
         ));
         assert_eq!(request_count.load(Ordering::SeqCst), 1);

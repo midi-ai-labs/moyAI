@@ -415,22 +415,12 @@ pub fn apply_provider_model_info_to_config(
 ) {
     if let Some(context_window) = model.context_window {
         config.context_window = context_window;
-        config.extra_body_json = Some(extra_body_with_num_ctx(
-            config.extra_body_json.clone(),
-            context_window,
-        ));
-    }
-    if let Some(max_output_tokens) = model.max_output_tokens {
-        config.max_output_tokens = max_output_tokens;
     }
     if let Some(value) = model.supports_images {
         config.supports_images = value;
     }
     if let Some(value) = model.supports_tools {
         config.supports_tools = value;
-    }
-    if let Some(value) = model.supports_reasoning {
-        config.supports_reasoning = value;
     }
     if let Some(value) = model.max_parallel_predictions {
         config.max_parallel_predictions = value.max(1);
@@ -928,17 +918,6 @@ fn bool_field_nested(value: &Value, paths: &[&[&str]]) -> Option<bool> {
     None
 }
 
-pub fn extra_body_with_num_ctx(extra_body: Option<Value>, num_ctx: u32) -> Value {
-    let mut value = extra_body.unwrap_or_else(|| serde_json::json!({}));
-    match &mut value {
-        Value::Object(map) => {
-            map.insert("num_ctx".to_string(), Value::from(num_ctx));
-            value
-        }
-        _ => serde_json::json!({ "num_ctx": num_ctx }),
-    }
-}
-
 fn summarize_body(body: &str) -> String {
     let trimmed = body.trim();
     if trimmed.chars().count() <= 200 {
@@ -1196,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn lmstudio_context_without_output_limit_preserves_configured_max_output() {
+    fn lmstudio_context_hydration_preserves_configured_output_and_legacy_extra_body() {
         let payload = serde_json::json!({
             "models": [
                 {
@@ -1213,6 +1192,11 @@ mod tests {
         let models = parse_lmstudio_model_infos(&payload);
         let mut config = ResolvedConfig::default().model;
         config.max_output_tokens = 4_096;
+        config.extra_body_json = Some(serde_json::json!({
+            "num_ctx": 8_192,
+            "legacy_provider_option": true
+        }));
+        let legacy_extra_body = config.extra_body_json.clone();
 
         apply_provider_model_info_to_config(&mut config, &models[0]);
 
@@ -1220,6 +1204,7 @@ mod tests {
         assert_eq!(models[0].max_output_tokens, None);
         assert_eq!(config.context_window, 131_072);
         assert_eq!(config.max_output_tokens, 4_096);
+        assert_eq!(config.extra_body_json, legacy_extra_body);
     }
 
     #[test]
@@ -1242,6 +1227,34 @@ mod tests {
         apply_provider_model_info_to_config(&mut config, &model);
 
         assert!(!config.supports_tools);
+    }
+
+    #[test]
+    fn provider_model_info_keeps_host_owned_output_and_reasoning_out_of_active_config() {
+        let mut config = ResolvedConfig::default().model;
+        config.max_output_tokens = 4_096;
+        config.supports_reasoning = false;
+        let model = ProviderModelInfo {
+            id: "host-owned-generation-model".to_string(),
+            display_name: None,
+            context_window: Some(65_536),
+            max_output_tokens: Some(8_192),
+            supports_images: Some(true),
+            supports_tools: Some(true),
+            supports_reasoning: Some(true),
+            max_parallel_predictions: Some(4),
+            load_state: ProviderModelLoadState::Loaded,
+            source: "test".to_string(),
+        };
+
+        apply_provider_model_info_to_config(&mut config, &model);
+
+        assert_eq!(config.context_window, 65_536);
+        assert_eq!(config.max_output_tokens, 4_096);
+        assert!(!config.supports_reasoning);
+        assert!(config.supports_images);
+        assert!(config.supports_tools);
+        assert_eq!(config.max_parallel_predictions, 4);
     }
 
     #[tokio::test]

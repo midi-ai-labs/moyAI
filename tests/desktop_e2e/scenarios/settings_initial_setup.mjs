@@ -35,6 +35,21 @@ export const INITIAL_SETUP_PROVIDER_PROFILE_OPTIONS = Object.freeze([
   "openai_responses",
   "lm_studio_chat_completions",
 ]);
+export const INITIAL_SETUP_HOST_OWNED_CONFIG_KEYS = Object.freeze([
+  "model.max_output_tokens",
+  "model.temperature",
+  "model.top_p",
+  "model.top_k",
+  "model.presence_penalty",
+  "model.frequency_penalty",
+  "model.seed",
+  "model.stop_sequences",
+  "model.extra_body_json",
+  "model.supports_reasoning",
+  "model.reasoning_effort",
+  "model.reasoning_summary",
+  "model.chat_completions_reasoning_parameters",
+]);
 
 const NEXT = Object.freeze({
   selector: '[data-surface="initial-setup"] button[data-action="initial-setup-next"]',
@@ -145,6 +160,10 @@ export async function observeInitialSetupSurface(cdp) {
     };
     const wizard = one('[data-surface="initial-setup"]');
     const rect = wizard.node instanceof HTMLElement ? wizard.node.getBoundingClientRect() : null;
+    const hostOwnedConfigKeyCounts = Object.fromEntries(${JSON.stringify(INITIAL_SETUP_HOST_OWNED_CONFIG_KEYS)}.map((key) => [
+      key,
+      rows('[data-surface="initial-setup"] .settings-control[data-config-key="' + key + '"]').length,
+    ]));
     const stepRows = rows('[data-surface="initial-setup"] [data-step]').map((node) => ({
       step: node instanceof HTMLElement ? (node.dataset.step ?? null) : null,
       visible: visible(node),
@@ -171,6 +190,7 @@ export async function observeInitialSetupSurface(cdp) {
           profile: select('[data-surface="initial-setup"] .settings-control[data-config-key="model.provider_profile"]'),
           api_key_env: input('[data-surface="initial-setup"] .settings-control[data-config-key="model.api_key_env"]'),
         },
+        host_owned_config_key_counts: hostOwnedConfigKeyCounts,
       },
       viewport: { width: document.documentElement.clientWidth, height: document.documentElement.clientHeight },
       visible_shell_count: rows('.app-frame > .shell').filter(visible).length,
@@ -241,6 +261,9 @@ export function initialSetupStepReady(surface, ledger, expectedStep, expectedWor
       : surface.wizard.next.count === 1 && surface.wizard.next.visible && surface.wizard.next.enabled)
     && (expectedStep !== "start"
       || (surface.wizard.import_config.count === 1 && surface.wizard.import_config.visible))
+    && INITIAL_SETUP_HOST_OWNED_CONFIG_KEYS.every((key) => (
+      surface.wizard.host_owned_config_key_counts?.[key] === 0
+    ))
     && providerFieldsReady;
 }
 
@@ -355,7 +378,6 @@ export function createSettingsInitialSetupScenario() {
         MOYAI_MODEL: SCRIPTED_PROVIDER_MODEL_ID,
         MOYAI_PROVIDER_PROFILE: INITIAL_SETUP_PROVIDER_PROFILE,
         MOYAI_CONTEXT_WINDOW: "65536",
-        MOYAI_MAX_OUTPUT_TOKENS: "1024",
         MOYAI_DOCLING_ENABLED: "true",
         MOYAI_DOCLING_BASE_URL: state.provider.baseUrl,
       };

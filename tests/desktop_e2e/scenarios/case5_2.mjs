@@ -52,7 +52,6 @@ const OWNER = "scenario:manual.case5_2";
 const scenarioDirectory = path.dirname(fileURLToPath(import.meta.url));
 const caseDirectory = path.resolve(scenarioDirectory, "..", "..", "manual_ST", "case5_2");
 const QUALITY_CONTEXT_WINDOW = 131_072;
-const QUALITY_MAX_OUTPUT_TOKENS = 32_768;
 const QUALITY_REQUEST_TIMEOUT_MS = 3_600_000;
 const STAGE_TIMEOUT_MS = 12 * 60 * 60 * 1000;
 const STAGE_POLL_MS = 5_000;
@@ -66,6 +65,8 @@ const PROVIDER_CLEANUP_POLL_MS = 1_000;
 const PROVIDER_CLEANUP_STABLE_SAMPLES = 2;
 const LM_STUDIO_PROFILE = "lm_studio";
 const OPENAI_COMPATIBLE_PROFILE = "openai_compatible";
+const EXECUTION_OWNED_LIFECYCLE = "execution-owned";
+const EXTERNAL_UNMANAGED_LIFECYCLE = "external-unmanaged";
 const GUI_CONNECTION_BASELINE_BASE_URL = "http://127.0.0.1:9";
 const GUI_CONNECTION_BASELINE_MODEL = "moyai-case5-2-before-gui-save";
 const MAIN_API_KEY_ENV = "";
@@ -360,114 +361,19 @@ function modelIdentity(value, name) {
   return value;
 }
 
-function normalizeJsonSafeValue(value, pathLabel, active) {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new TypeError(`manual.case5_2 ${pathLabel} contains a non-finite number`);
-    return value;
-  }
-  if (typeof value !== "object") {
-    throw new TypeError(`manual.case5_2 ${pathLabel} contains a non-JSON-safe value`);
-  }
-  if (active.has(value)) throw new TypeError(`manual.case5_2 ${pathLabel} contains a cycle`);
-  active.add(value);
-  try {
-    if (Array.isArray(value)) {
-      const keys = Reflect.ownKeys(value);
-      const expectedKeys = Array.from({ length: value.length }, (_, index) => String(index));
-      const actualKeys = keys.filter((key) => key !== "length");
-      if (actualKeys.some((key) => typeof key !== "string")
-        || !sameValue(actualKeys, expectedKeys)) {
-        throw new TypeError(`manual.case5_2 ${pathLabel} contains a sparse or extended array`);
-      }
-      return value.map((entry, index) => normalizeJsonSafeValue(entry, `${pathLabel}[${index}]`, active));
-    }
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
-      throw new TypeError(`manual.case5_2 ${pathLabel} contains a non-plain object`);
-    }
-    const descriptors = Object.getOwnPropertyDescriptors(value);
-    const output = {};
-    for (const key of Reflect.ownKeys(descriptors)) {
-      if (typeof key !== "string") {
-        throw new TypeError(`manual.case5_2 ${pathLabel} contains a symbol key`);
-      }
-      const descriptor = descriptors[key];
-      if (descriptor.enumerable !== true || !Object.hasOwn(descriptor, "value")) {
-        throw new TypeError(`manual.case5_2 ${pathLabel}.${key} is not a JSON data property`);
-      }
-      Object.defineProperty(output, key, {
-        value: normalizeJsonSafeValue(descriptor.value, `${pathLabel}.${key}`, active),
-        enumerable: true,
-        configurable: true,
-        writable: true,
-      });
-    }
-    return output;
-  } finally {
-    active.delete(value);
-  }
-}
-
-function normalizeExtraBodyJson(value) {
-  if (value === undefined) return { value: null, compact: null };
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new TypeError("manual.case5_2 extra_body_json must be a JSON object");
-  }
-  const normalized = normalizeJsonSafeValue(value, "extra_body_json", new WeakSet());
-  const topLevelKeys = Object.keys(normalized);
-  const unknownTopLevel = topLevelKeys.filter((key) => key !== "chat_template_kwargs");
-  if (unknownTopLevel.length > 0) {
-    throw new TypeError(`manual.case5_2 extra_body_json contains a non-generation field: ${unknownTopLevel.join(",")}`);
-  }
-  if (Object.hasOwn(normalized, "chat_template_kwargs")) {
-    const kwargs = normalized.chat_template_kwargs;
-    if (kwargs === null || typeof kwargs !== "object" || Array.isArray(kwargs)) {
-      throw new TypeError("manual.case5_2 extra_body_json.chat_template_kwargs must be an object");
-    }
-    const allowed = new Set(["enable_thinking", "preserve_thinking"]);
-    const unknown = Object.keys(kwargs).filter((key) => !allowed.has(key));
-    if (unknown.length > 0) {
-      throw new TypeError(`manual.case5_2 extra_body_json.chat_template_kwargs contains a non-generation field: ${unknown.join(",")}`);
-    }
-    for (const key of Object.keys(kwargs)) {
-      if (typeof kwargs[key] !== "boolean") {
-        throw new TypeError(`manual.case5_2 extra_body_json.chat_template_kwargs.${key} must be boolean`);
-      }
-    }
-  }
-  return { value: normalized, compact: JSON.stringify(normalized) };
-}
-
-export function case52ExtraBodyEvidence(options) {
-  if (options.extraBodyJsonCompact === null) {
-    return {
-      configured: false,
-      environment_key: null,
-      compact_json_sha256: null,
-      compact_json_size_bytes: 0,
-      generation_fields: [],
-      allowlist_profile: "qwen-chat-template-thinking-v1",
-    };
-  }
-  const kwargs = options.extraBodyJson?.chat_template_kwargs;
-  const generationFields = kwargs === null || typeof kwargs !== "object"
-    ? []
-    : Object.keys(kwargs).sort().map((key) => `chat_template_kwargs.${key}`);
-  const bytes = Buffer.from(options.extraBodyJsonCompact, "utf8");
+export function case52ExtraBodyEvidence() {
   return {
-    configured: true,
-    environment_key: "MOYAI_EXTRA_BODY_JSON",
-    compact_json_sha256: sha256(bytes),
-    compact_json_size_bytes: bytes.byteLength,
-    generation_fields: generationFields,
-    allowlist_profile: "qwen-chat-template-thinking-v1",
+    configured: false,
+    environment_key: null,
+    compact_json_sha256: null,
+    compact_json_size_bytes: 0,
+    generation_fields: [],
+    allowlist_profile: null,
   };
 }
 
 export function case52EvidenceOptions(options) {
-  const { extraBodyJson: _value, extraBodyJsonCompact: _compact, ...safe } = options;
-  return { ...safe, extra_body_json: case52ExtraBodyEvidence(options) };
+  return { ...options, extra_body_json: case52ExtraBodyEvidence() };
 }
 
 export function normalizeCase52Options(options) {
@@ -478,8 +384,8 @@ export function normalizeCase52Options(options) {
     "fixture_source",
     "provider_base_url",
     "provider_profile",
+    "provider_lifecycle",
     "configure_main_via_gui",
-    "extra_body_json",
     "main_model",
     "side_model",
     "expected_main_variant",
@@ -500,6 +406,10 @@ export function normalizeCase52Options(options) {
     && typeof options.configure_main_via_gui !== "boolean") {
     throw new TypeError("manual.case5_2 configure_main_via_gui must be boolean");
   }
+  if (options.provider_lifecycle !== undefined
+    && !new Set([EXECUTION_OWNED_LIFECYCLE, EXTERNAL_UNMANAGED_LIFECYCLE]).has(options.provider_lifecycle)) {
+    throw new TypeError("manual.case5_2 provider_lifecycle must be execution-owned or external-unmanaged");
+  }
   if (Object.hasOwn(options, "configure_main_via_gui") && providerProfile !== LM_STUDIO_PROFILE) {
     throw new TypeError("manual.case5_2 configure_main_via_gui is supported only by lm_studio");
   }
@@ -516,32 +426,30 @@ export function normalizeCase52Options(options) {
     if (legacyFields.length > 0) {
       throw new TypeError(`manual.case5_2 openai_compatible does not accept LM Studio fields: ${legacyFields.join(",")}`);
     }
-    const extraBody = normalizeExtraBodyJson(options.extra_body_json);
+    if (options.provider_lifecycle !== undefined
+      && options.provider_lifecycle !== EXTERNAL_UNMANAGED_LIFECYCLE) {
+      throw new TypeError("manual.case5_2 openai_compatible supports only provider_lifecycle external-unmanaged");
+    }
     return Object.freeze({
       ...common,
       sideModel: common.mainModel,
       expectedMainVariant: null,
       expectedSideVariant: null,
-      providerLifecycle: "external-unmanaged",
+      providerLifecycle: EXTERNAL_UNMANAGED_LIFECYCLE,
       scenarioConfigProfile: "openai-compatible-v1",
-      extraBodyJson: extraBody.value,
-      extraBodyJsonCompact: extraBody.compact,
     });
-  }
-  if (Object.hasOwn(options, "extra_body_json")) {
-    throw new TypeError("manual.case5_2 extra_body_json is supported only by openai_compatible");
   }
   return Object.freeze({
     ...common,
     sideModel: modelIdentity(options.side_model, "side_model"),
     expectedMainVariant: modelIdentity(options.expected_main_variant, "expected_main_variant"),
     expectedSideVariant: modelIdentity(options.expected_side_variant, "expected_side_variant"),
-    providerLifecycle: "execution-owned",
+    providerLifecycle: options.provider_lifecycle ?? EXECUTION_OWNED_LIFECYCLE,
     scenarioConfigProfile: options.provider_profile === undefined
       ? "legacy-lm-studio-six-field"
-      : "lm-studio-native",
-    extraBodyJson: null,
-    extraBodyJsonCompact: null,
+      : options.provider_lifecycle === EXTERNAL_UNMANAGED_LIFECYCLE
+        ? "lm-studio-native-external-unmanaged"
+        : "lm-studio-native",
   });
 }
 
@@ -556,30 +464,18 @@ export function case52FixtureConfig(options) {
     ? `provider_profile = "openai_compatible"`
     : `provider_metadata_mode = "lm_studio_native_required"
 provider_api_mode = "responses"`;
-  const providerExtraBody = options.providerProfile === OPENAI_COMPATIBLE_PROFILE
-    ? ""
-    : `
-[model.extra_body_json]
-num_ctx = ${QUALITY_CONTEXT_WINDOW}
-`;
   return `[model]
 base_url = ${JSON.stringify(initialBaseUrl)}
 model = ${JSON.stringify(initialModel)}
 ${providerConnection}
-reasoning_summary = "none"
 connect_timeout_ms = 10000
 request_timeout_ms = ${QUALITY_REQUEST_TIMEOUT_MS}
 max_retries = 0
 context_window = ${QUALITY_CONTEXT_WINDOW}
-max_output_tokens = ${QUALITY_MAX_OUTPUT_TOKENS}
-temperature = 0.0
 supports_tools = true
-supports_reasoning = false
 supports_images = true
 parallel_tool_calls = false
 max_parallel_predictions = 1
-${providerExtraBody}
-
 [permissions]
 access_mode = "auto_review"
 
@@ -787,6 +683,124 @@ export function case52ProviderModelState(snapshot, options) {
   return { main, side, main_v0: mainV0, side_v0: sideV0 };
 }
 
+function externalProvider(options) {
+  return options.providerLifecycle === EXTERNAL_UNMANAGED_LIFECYCLE
+    || options.providerProfile === OPENAI_COMPATIBLE_PROFILE;
+}
+
+function externalLmStudio(options) {
+  return options.providerProfile === LM_STUDIO_PROFILE && externalProvider(options);
+}
+
+export function case52LmStudioLoadedContext(state) {
+  const instances = state?.main?.loaded_instances;
+  const instance = Array.isArray(instances) && instances.length === 1 ? instances[0] : null;
+  const candidates = [
+    ["loaded_instances[0].config.context_length", instance?.config?.context_length],
+    ["loaded_instances[0].context_length", instance?.context_length],
+    ["main_v0.loaded_context_length", state?.main_v0?.loaded_context_length],
+  ].filter(([, value]) => Number.isInteger(value) && value > 0)
+    .map(([field, value]) => ({ field, value }));
+  const distinct = [...new Set(candidates.map((entry) => entry.value))];
+  return {
+    reported: candidates.length > 0,
+    candidates,
+    effective: distinct.length === 1 ? distinct[0] : null,
+    conflict: distinct.length > 1,
+  };
+}
+
+function volatileHostFingerprintField(key) {
+  const value = key.toLowerCase();
+  return value === "captured_at"
+    || /(?:^|_)timestamp(?:s|_ms)?$/.test(value)
+    || /(?:^|_)(?:captured|created|updated|loaded|unloaded|observed|last_used)_at$/.test(value)
+    || /(?:^|_)elapsed(?:_ms|_seconds)?$/.test(value);
+}
+
+function stableHostFingerprintValue(value, prefix, excludedFields) {
+  if (Array.isArray(value)) {
+    return value.map((entry, index) => stableHostFingerprintValue(entry, `${prefix}[${index}]`, excludedFields));
+  }
+  if (value === null || typeof value !== "object") return value;
+  const result = {};
+  for (const key of Object.keys(value).sort()) {
+    const field = prefix.length === 0 ? key : `${prefix}.${key}`;
+    if (volatileHostFingerprintField(key)) {
+      excludedFields.push(field);
+      continue;
+    }
+    result[key] = stableHostFingerprintValue(value[key], field, excludedFields);
+  }
+  return result;
+}
+
+export function case52ProviderHostFingerprint(snapshot, options) {
+  if (options.providerProfile !== LM_STUDIO_PROFILE) {
+    throw new TypeError("case5_2 host fingerprint is defined only for LM Studio");
+  }
+  const models = case52ProviderModelState(snapshot, options);
+  const excludedFields = [];
+  const value = stableHostFingerprintValue({
+    provider_profile: options.providerProfile,
+    main_model: options.mainModel,
+    side_model: options.sideModel,
+    main: models.main,
+    side: models.side,
+    main_v0: models.main_v0,
+    side_v0: models.side_v0,
+  }, "", excludedFields);
+  const bytes = Buffer.from(JSON.stringify(value), "utf8");
+  return {
+    schema_version: "desktop-e2e.case5_2-provider-host-fingerprint.v1",
+    sha256: sha256(bytes),
+    size_bytes: bytes.byteLength,
+    excluded_fields: excludedFields.sort(),
+    value,
+  };
+}
+
+export function case52ExternalLmStudioObservation(snapshot, options, expectedHostFingerprint = null) {
+  if (!externalLmStudio(options)) {
+    throw new TypeError("case5_2 external LM Studio observation requires the external-unmanaged lifecycle");
+  }
+  const models = case52ProviderModelState(snapshot, options);
+  const context = case52LmStudioLoadedContext(models);
+  const hostFingerprint = case52ProviderHostFingerprint(snapshot, options);
+  const expectedSha256 = typeof expectedHostFingerprint === "string"
+    ? expectedHostFingerprint
+    : expectedHostFingerprint?.sha256 ?? null;
+  const failures = providerCatalogFailures(models, options, { mainLoaded: true });
+  if (!context.reported) failures.push("main-loaded-context-unreported");
+  if (context.conflict) failures.push("main-loaded-context-conflict");
+  if (Number.isInteger(context.effective) && context.effective < QUALITY_CONTEXT_WINDOW) {
+    failures.push("main-loaded-context-below-local-budget");
+  }
+  if (expectedSha256 !== null && hostFingerprint.sha256 !== expectedSha256) {
+    failures.push("provider-host-fingerprint-drift");
+  }
+  return {
+    snapshot,
+    models,
+    host_context: {
+      requested: null,
+      applied: null,
+      reported_loaded: context.effective,
+      metadata: context,
+    },
+    host_fingerprint: hostFingerprint,
+    expected_host_fingerprint_sha256: expectedSha256,
+    host_fingerprint_stable: expectedSha256 === null ? null : hostFingerprint.sha256 === expectedSha256,
+    lifecycle_actions: {
+      load_attempted: false,
+      unload_attempted: false,
+      unload_authorized: false,
+    },
+    ownership_contract: "external-unmanaged-observation-only",
+    failures: [...new Set(failures)],
+  };
+}
+
 function providerCatalogFailures(state, options, { mainLoaded, expectedLoadedContext = null }) {
   const failures = [];
   if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
@@ -848,10 +862,68 @@ export function case52ProviderCleanupPlan(providerState) {
   };
 }
 
-async function loadMainProvider({ options, sink, state, phase }) {
-  if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
+export async function loadMainProvider({ options, sink, state, phase, providerIo = {} }) {
+  const capture = providerIo.capture ?? (async () => {
     const snapshot = await providerSnapshot(options);
-    const models = case52ProviderModelState(snapshot, options);
+    return { snapshot, models: case52ProviderModelState(snapshot, options) };
+  });
+  if (externalLmStudio(options)) {
+    const baselineCapture = await capture();
+    const baseline = case52ExternalLmStudioObservation(baselineCapture.snapshot, options);
+    const confirmationCapture = await capture();
+    const confirmation = case52ExternalLmStudioObservation(
+      confirmationCapture.snapshot,
+      options,
+      baseline.host_fingerprint,
+    );
+    const failures = [
+      ...baseline.failures.map((failure) => `baseline:${failure}`),
+      ...confirmation.failures.map((failure) => `confirmation:${failure}`),
+    ];
+    const effectiveContext = confirmation.host_context.reported_loaded;
+    const deviations = [
+      "provider-lifecycle-external-unmanaged",
+      ...(effectiveContext === QUALITY_CONTEXT_WINDOW ? [] : ["provider-context-capacity-not-exact"]),
+    ];
+    const evidence = {
+      baseline,
+      confirmation,
+      failures,
+      ownership_contract: "external-unmanaged-observation-only",
+      lifecycle_actions: {
+        load_attempted: false,
+        unload_attempted: false,
+        unload_authorized: false,
+      },
+      comparability_deviations: deviations,
+    };
+    await sink.writeJson("case5_2/provider/external-lm-studio-preflight.json", evidence);
+    await sink.record("case5_2-provider-external-lm-studio-preflight", evidence, { phase, owner: OWNER });
+    if (failures.length > 0) {
+      throw new DesktopE2eError(
+        "environment",
+        "case5_2-provider-preflight",
+        "external-unmanaged LM Studio did not retain the exact loaded Main, unloaded Side, variants, context, and host fingerprint",
+        evidence,
+      );
+    }
+    state.providerEffectiveContext = effectiveContext;
+    state.providerProfileExact = deviations.length === 0;
+    state.providerComparabilityDeviations = deviations;
+    state.acceptedProviderLoad = structuredClone(evidence);
+    state.providerExternalPreflightObserved = true;
+    state.providerHostFingerprint = structuredClone(baseline.host_fingerprint);
+    state.providerHostFingerprintSamples ??= [];
+    state.providerHostFingerprintSamples.push(
+      { name: "preflight-baseline", fingerprint: structuredClone(baseline.host_fingerprint) },
+      { name: "preflight-confirmation", fingerprint: structuredClone(confirmation.host_fingerprint) },
+    );
+    return;
+  }
+  if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
+    const captured = await capture();
+    const snapshot = captured.snapshot;
+    const models = captured.models ?? case52ProviderModelState(snapshot, options);
     const failures = providerCatalogFailures(models, options, { mainLoaded: true });
     const effectiveContext = models.context_capacity.effective;
     const deviations = [
@@ -866,14 +938,14 @@ async function loadMainProvider({ options, sink, state, phase }) {
       snapshot,
       models,
       context: {
-        requested: QUALITY_CONTEXT_WINDOW,
+        requested: null,
+        applied: null,
         reported: effectiveContext,
-        exact: effectiveContext === QUALITY_CONTEXT_WINDOW,
         metadata: models.context_capacity,
       },
       failures,
       ownership_contract: "external-unmanaged-observation-only",
-      lifecycle_actions: { load_attempted: false, unload_authorized: false },
+      lifecycle_actions: { load_attempted: false, unload_attempted: false, unload_authorized: false },
       comparability_deviations: deviations,
     };
     await sink.writeJson("case5_2/provider/external-preflight.json", evidence);
@@ -905,10 +977,11 @@ async function loadMainProvider({ options, sink, state, phase }) {
   }
   state.providerLoadAttempted = true;
   const request = { model: options.mainModel, context_length: QUALITY_CONTEXT_WINDOW, echo_load_config: true };
-  const response = await providerJson(options.providerBaseUrl, "/api/v1/models/load", {
+  const issueLoad = providerIo.load ?? ((body) => providerJson(options.providerBaseUrl, "/api/v1/models/load", {
     method: "POST",
-    body: request,
-  });
+    body,
+  }));
+  const response = await issueLoad(request);
   state.providerLoadResponseObserved = true;
   state.mainProviderInstanceId = typeof response.value?.instance_id === "string"
     ? response.value.instance_id
@@ -953,7 +1026,7 @@ async function loadMainProvider({ options, sink, state, phase }) {
 }
 
 export async function unloadMainProvider({ options, state, providerIo = {} }) {
-  if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
+  if (externalProvider(options)) {
     const capture = providerIo.capture ?? (async () => {
       const snapshot = await providerSnapshot(options);
       return { snapshot, models: case52ProviderModelState(snapshot, options) };
@@ -963,23 +1036,37 @@ export async function unloadMainProvider({ options, state, providerIo = {} }) {
     let failures = [];
     try {
       captured = await capture();
-      failures = providerCatalogFailures(captured.models, options, { mainLoaded: true });
+      captured = {
+        ...captured,
+        models: captured.models ?? case52ProviderModelState(captured.snapshot, options),
+      };
+      if (externalLmStudio(options)) {
+        const observation = case52ExternalLmStudioObservation(
+          captured.snapshot,
+          options,
+          state.providerHostFingerprint,
+        );
+        captured = { ...captured, observation };
+        failures = observation.failures;
+      } else {
+        failures = providerCatalogFailures(captured.models, options, { mainLoaded: true });
+      }
     } catch (caught) {
       error = errorObservation(caught);
       failures = ["provider-final-snapshot-failed"];
     }
-    const pass = state.providerExternalPreflightObserved === true
-      && error === null
-      && failures.length === 0;
     if (state.providerExternalPreflightObserved !== true) {
       failures.push("provider-external-preflight-unobserved");
     }
+    const pass = error === null && failures.length === 0;
     return {
       input: pass ? "pass" : "fail",
       resources: [{
-        kind: "openai-compatible-external-model",
+        kind: options.providerProfile === LM_STUDIO_PROFILE
+          ? "lm-studio-external-model"
+          : "openai-compatible-external-model",
         provider_profile: options.providerProfile,
-        lifecycle: "external-unmanaged",
+        lifecycle: EXTERNAL_UNMANAGED_LIFECYCLE,
         main_model: options.mainModel,
         side_model: options.sideModel,
         load_attempted: false,
@@ -987,6 +1074,10 @@ export async function unloadMainProvider({ options, state, providerIo = {} }) {
         unload_authorized: false,
         final_snapshot: captured?.snapshot ?? null,
         models: captured?.models ?? null,
+        host_context: captured?.observation?.host_context ?? null,
+        host_fingerprint: captured?.observation?.host_fingerprint ?? null,
+        expected_host_fingerprint_sha256: captured?.observation?.expected_host_fingerprint_sha256 ?? null,
+        host_fingerprint_stable: captured?.observation?.host_fingerprint_stable ?? null,
         comparability_deviations: state.providerComparabilityDeviations ?? [],
         failures: [...new Set(failures)],
         error,
@@ -2611,71 +2702,8 @@ function configField(projection, key) {
   return rows.length === 1 ? rows[0].value : null;
 }
 
-function canonicalJsonText(value) {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJsonText).join(",")}]`;
-  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJsonText(value[key])}`).join(",")}}`;
-}
-
-function effectiveExtraBodyEvidence(value) {
-  if (value === "") {
-    return {
-      configured: false,
-      valid_allowed_generation_body: true,
-      canonical_json_sha256: null,
-      canonical_json_size_bytes: 0,
-      generation_fields: [],
-    };
-  }
-  if (typeof value !== "string") {
-    return {
-      configured: value !== null,
-      valid_allowed_generation_body: false,
-      canonical_json_sha256: null,
-      canonical_json_size_bytes: 0,
-      generation_fields: [],
-    };
-  }
-  try {
-    const normalized = normalizeExtraBodyJson(JSON.parse(value));
-    const canonical = canonicalJsonText(normalized.value);
-    const kwargs = normalized.value?.chat_template_kwargs;
-    return {
-      configured: true,
-      valid_allowed_generation_body: true,
-      canonical_json_sha256: sha256(Buffer.from(canonical, "utf8")),
-      canonical_json_size_bytes: Buffer.byteLength(canonical, "utf8"),
-      generation_fields: kwargs === null || typeof kwargs !== "object"
-        ? []
-        : Object.keys(kwargs).sort().map((key) => `chat_template_kwargs.${key}`),
-    };
-  } catch {
-    return {
-      configured: value.length > 0,
-      valid_allowed_generation_body: false,
-      canonical_json_sha256: null,
-      canonical_json_size_bytes: 0,
-      generation_fields: [],
-      rejected_value_sha256: sha256(Buffer.from(value, "utf8")),
-      rejected_value_size_bytes: Buffer.byteLength(value, "utf8"),
-    };
-  }
-}
-
-export function case52EffectiveExtraBodyFailures(projection, options) {
-  if (options.providerProfile !== OPENAI_COMPATIBLE_PROFILE) return [];
-  const expectedValue = options.extraBodyJson === null
-    ? ""
-    : canonicalJsonText(options.extraBodyJson);
-  const expected = effectiveExtraBodyEvidence(expectedValue);
-  const actual = effectiveExtraBodyEvidence(configField(projection, "model.extra_body_json"));
-  return sameValue(actual, expected)
-    ? []
-    : [{ key: "model.extra_body_json", expected, actual }];
-}
-
 function mainConfigurationFailures(projection, options, { sessionRequired = false } = {}) {
-  const failures = case52EffectiveExtraBodyFailures(projection, options);
+  const failures = [];
   const expectedFields = new Map([
     ["model.base_url", options.providerBaseUrl],
     ["model.model", options.mainModel],
@@ -2683,9 +2711,7 @@ function mainConfigurationFailures(projection, options, { sessionRequired = fals
     ["model.request_timeout_ms", String(QUALITY_REQUEST_TIMEOUT_MS)],
     ["model.max_retries", "0"],
     ["model.context_window", String(QUALITY_CONTEXT_WINDOW)],
-    ["model.max_output_tokens", String(QUALITY_MAX_OUTPUT_TOKENS)],
     ["model.supports_tools", "true"],
-    ["model.supports_reasoning", "false"],
     ["model.parallel_tool_calls", "false"],
     ["permissions.access_mode", "auto_review"],
     ["multi_agent.enabled", "false"],
@@ -2696,13 +2722,10 @@ function mainConfigurationFailures(projection, options, { sessionRequired = fals
     const actual = configField(projection, key);
     if (actual !== expected) failures.push({ key, expected, actual });
   }
-  const temperature = configField(projection, "model.temperature");
-  if (!new Set(["0", "0.0"]).has(temperature)) failures.push({ key: "model.temperature", expected: "0 or 0.0", actual: temperature });
   for (const [key, expected, actual] of [
     ["provider_effective_base_url", options.providerBaseUrl, projection?.provider_effective_base_url],
     ["provider_effective_model_id", options.mainModel, projection?.provider_effective_model_id],
     ["provider_effective_context_window", String(QUALITY_CONTEXT_WINDOW), projection?.provider_effective_context_window],
-    ["provider_effective_max_output_tokens", String(QUALITY_MAX_OUTPUT_TOKENS), projection?.provider_effective_max_output_tokens],
     ["provider_effective_profile", options.providerProfile, projection?.provider_effective_profile],
   ]) {
     if (actual !== expected) failures.push({ key, expected, actual });
@@ -2716,9 +2739,7 @@ function mainConfigurationFailures(projection, options, { sessionRequired = fals
       ["session_settings.provider_profile", options.providerProfile, settings?.provider_profile],
       ["session_settings.access_mode", "auto_review", settings?.access_mode],
       ["session_settings.context_window", "", settings?.context_window],
-      ["session_settings.max_output_tokens", "", settings?.max_output_tokens],
       ["session_settings.context_window_inherited", true, settings?.context_window_inherited],
-      ["session_settings.max_output_tokens_inherited", true, settings?.max_output_tokens_inherited],
     ]) {
       if (actual !== expected) failures.push({ key, expected, actual });
     }
@@ -3784,9 +3805,52 @@ async function expandRestartHistory({
   return { projection: current.projection, pages, initial: initial.value.page.metadata };
 }
 
-async function providerMustKeepSideUnloaded({ options, sink, state, name }) {
-  const snapshot = await providerSnapshot(options);
-  const models = case52ProviderModelState(snapshot, options);
+export async function providerMustKeepSideUnloaded({ options, sink, state, name, providerIo = {} }) {
+  const capture = providerIo.capture ?? (async () => {
+    const snapshot = await providerSnapshot(options);
+    return { snapshot, models: case52ProviderModelState(snapshot, options) };
+  });
+  const captured = await capture();
+  const snapshot = captured.snapshot;
+  const models = captured.models ?? case52ProviderModelState(snapshot, options);
+  if (externalLmStudio(options)) {
+    const observation = case52ExternalLmStudioObservation(
+      snapshot,
+      options,
+      state.providerHostFingerprint,
+    );
+    const sample = {
+      name,
+      captured_at: snapshot.captured_at,
+      selected_side_model: options.sideModel,
+      side_loaded_instance_ids: Array.isArray(models.side?.loaded_instances)
+        ? models.side.loaded_instances.map((entry) => entry?.id ?? null)
+        : null,
+      side_v0_state: models.side_v0?.state ?? null,
+      main_loaded_instance_ids: Array.isArray(models.main?.loaded_instances)
+        ? models.main.loaded_instances.map((entry) => entry?.id ?? null)
+        : null,
+      reported_loaded_context: observation.host_context.reported_loaded,
+      host_fingerprint_sha256: observation.host_fingerprint.sha256,
+      host_fingerprint_stable: observation.host_fingerprint_stable,
+      lifecycle_actions: structuredClone(observation.lifecycle_actions),
+    };
+    state.sideProviderSamples.push(sample);
+    state.providerHostFingerprintSamples ??= [];
+    state.providerHostFingerprintSamples.push({
+      name,
+      fingerprint: structuredClone(observation.host_fingerprint),
+    });
+    const identity = await sink.writeJson(`case5_2/provider/${name}.json`, observation);
+    if (observation.failures.length > 0) {
+      throw productFailure(
+        "case5_2-provider-runtime-drift",
+        "external-unmanaged LM Studio host state drifted during the scored run; no repair action was issued",
+        { name, failures: observation.failures, observation, identity },
+      );
+    }
+    return { snapshot, models, failures: observation.failures, identity, observation };
+  }
   if (options.providerProfile === OPENAI_COMPATIBLE_PROFILE) {
     state.sideProviderSamples.push({
       name,
@@ -3837,6 +3901,33 @@ export function case52SideProviderSummary(options, samples) {
   };
 }
 
+export function case52ProviderSummaryEvidence(options, state) {
+  const executionOwnedLmStudio = options.providerProfile === LM_STUDIO_PROFILE
+    && !externalProvider(options);
+  const unmanagedLmStudio = externalLmStudio(options);
+  return {
+    provider_requested_context: executionOwnedLmStudio ? QUALITY_CONTEXT_WINDOW : null,
+    provider_applied_context: executionOwnedLmStudio ? state.providerEffectiveContext ?? null : null,
+    provider_reported_context_capacity: options.providerProfile === OPENAI_COMPATIBLE_PROFILE
+      ? state.providerEffectiveContext ?? null
+      : null,
+    provider_reported_loaded_context: unmanagedLmStudio
+      ? state.providerEffectiveContext ?? null
+      : null,
+    provider_lifecycle_actions: {
+      load_attempted: executionOwnedLmStudio && state.providerLoadAttempted === true,
+      unload_attempted: false,
+      unload_authorized: executionOwnedLmStudio,
+    },
+    provider_host_fingerprint: unmanagedLmStudio
+      ? structuredClone(state.providerHostFingerprint ?? null)
+      : null,
+    provider_host_fingerprint_samples: unmanagedLmStudio
+      ? structuredClone(state.providerHostFingerprintSamples ?? [])
+      : [],
+  };
+}
+
 async function cleanupWebviewInput(input, state, label) {
   if (input === null) return;
   if (state.inputCleanupAttempts.has(input)) return;
@@ -3869,6 +3960,8 @@ export function createCase52Scenario(rawOptions = {}) {
     providerEffectiveContext: null,
     providerProfileExact: false,
     providerComparabilityDeviations: [],
+    providerHostFingerprint: null,
+    providerHostFingerprintSamples: [],
     sideProviderSamples: [],
     externalProcessOwner: {
       started: 0,
@@ -3892,11 +3985,7 @@ export function createCase52Scenario(rawOptions = {}) {
     manualGate: "pending",
     databaseRequired: true,
     requestGracefulExit,
-    get environment() {
-      return options.extraBodyJsonCompact === null
-        ? {}
-        : { MOYAI_EXTRA_BODY_JSON: options.extraBodyJsonCompact };
-    },
+    environment: {},
     async prepare({ context, sink, phase }) {
       const task = await fileIdentity(path.join(caseDirectory, "task.md"), { includeBytes: true });
       const oracleSource = await fileIdentity(path.join(caseDirectory, "oracle", "test_cancel_contract.py"), { includeBytes: true });
@@ -3952,28 +4041,29 @@ export function createCase52Scenario(rawOptions = {}) {
       });
 
       await loadMainProvider({ options, sink, state, phase });
+      const providerEvidence = case52ProviderSummaryEvidence(options, state);
       await sink.record("case5_2-prepared", {
         options: case52EvidenceOptions(options),
         provider_contract: {
           profile: options.providerProfile,
           lifecycle: options.providerLifecycle,
           scenario_config_profile: options.scenarioConfigProfile,
-          extra_body: case52ExtraBodyEvidence(options),
+          extra_body: case52ExtraBodyEvidence(),
           comparability_deviations: state.providerComparabilityDeviations,
+          lifecycle_actions: providerEvidence.provider_lifecycle_actions,
+          host_fingerprint: providerEvidence.provider_host_fingerprint,
         },
         quality_profile: {
           context_window: QUALITY_CONTEXT_WINDOW,
-          provider_num_ctx: options.providerProfile === LM_STUDIO_PROFILE ? QUALITY_CONTEXT_WINDOW : null,
-          provider_applied_context: options.providerProfile === LM_STUDIO_PROFILE
-            ? state.providerEffectiveContext
-            : null,
-          provider_reported_context_capacity: options.providerProfile === OPENAI_COMPATIBLE_PROFILE
-            ? state.providerEffectiveContext
-            : null,
+          provider_num_ctx: providerEvidence.provider_requested_context,
+          provider_requested_context: providerEvidence.provider_requested_context,
+          provider_applied_context: providerEvidence.provider_applied_context,
+          provider_reported_context_capacity: providerEvidence.provider_reported_context_capacity,
+          provider_reported_loaded_context: providerEvidence.provider_reported_loaded_context,
+          lifecycle_actions: providerEvidence.provider_lifecycle_actions,
           provider_profile_exact: state.providerProfileExact,
-          max_output_tokens: QUALITY_MAX_OUTPUT_TOKENS,
+          output_limit_owner: "provider",
           request_timeout_ms: QUALITY_REQUEST_TIMEOUT_MS,
-          temperature: 0,
           max_retries: 0,
           access_mode: "auto_review",
           multi_agent_enabled: false,
@@ -4249,6 +4339,7 @@ export function createCase52Scenario(rawOptions = {}) {
           throw productFailure("case5_2-safety-scope", "case5_2 detected forbidden frontend/dependency/workspace-external/fixture mutation", safety);
         }
 
+        const providerEvidence = case52ProviderSummaryEvidence(options, state);
         const summary = {
           schema_version: "desktop-e2e.case5_2-summary.v1",
           options: case52EvidenceOptions(options),
@@ -4270,17 +4361,11 @@ export function createCase52Scenario(rawOptions = {}) {
           transcript,
           evaluation,
           safety,
-          provider_requested_context: QUALITY_CONTEXT_WINDOW,
-          provider_applied_context: options.providerProfile === LM_STUDIO_PROFILE
-            ? state.providerEffectiveContext
-            : null,
-          provider_reported_context_capacity: options.providerProfile === OPENAI_COMPATIBLE_PROFILE
-            ? state.providerEffectiveContext
-            : null,
+          ...providerEvidence,
           provider_profile_exact: state.providerProfileExact,
           provider_profile: options.providerProfile,
           provider_lifecycle: options.providerLifecycle,
-          provider_extra_body: case52ExtraBodyEvidence(options),
+          provider_extra_body: case52ExtraBodyEvidence(),
           provider_comparability_deviations: state.providerComparabilityDeviations,
           provider_effective_load_config: state.acceptedProviderLoad?.response?.value?.load_config ?? null,
           provider_final: finalProvider.models,

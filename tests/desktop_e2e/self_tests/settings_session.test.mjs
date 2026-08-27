@@ -4,8 +4,6 @@ import test from "node:test";
 import {
   SESSION_CONTEXT_AFTER,
   SESSION_CONTEXT_BEFORE,
-  SESSION_MAX_OUTPUT_AFTER,
-  SESSION_MAX_OUTPUT_BEFORE,
   SESSION_PROVIDER_API_KEY_ENV,
   SESSION_PROVIDER_PROFILE,
   SESSION_PROVIDER_PROFILE_OPTIONS,
@@ -88,7 +86,6 @@ function trigger(triggerName) {
 
 function surface({
   contextWindow = SESSION_CONTEXT_BEFORE,
-  maxOutputTokens = SESSION_MAX_OUTPUT_BEFORE,
   inherited = true,
   dirty = false,
   targetValue = target,
@@ -114,9 +111,7 @@ function surface({
         api_key_env: SESSION_PROVIDER_API_KEY_ENV,
         access_mode: "default",
         context_window: inherited ? SESSION_CONTEXT_BEFORE : contextWindow,
-        max_output_tokens: inherited ? SESSION_MAX_OUTPUT_BEFORE : maxOutputTokens,
         context_window_inherited: inherited,
-        max_output_tokens_inherited: inherited,
         target: { ...targetValue },
       },
     },
@@ -133,7 +128,7 @@ function surface({
       api_key_env: panelField(SESSION_PROVIDER_API_KEY_ENV),
       access_mode: panelField("default"),
       context_window: panelField(contextWindow),
-      max_output_tokens: panelField(maxOutputTokens),
+      max_output_tokens: { count: 0, visible: false, enabled: false, value: null, options: [] },
       apply: { count: 1, visible: true, enabled: dirty },
       discard: { count: dirty ? 1 : 0, visible: dirty, enabled: dirty },
       preferences: { count: 1, visible: true, enabled: true },
@@ -194,7 +189,6 @@ function restartedSurface({
 } = {}) {
   const base = surface({
     contextWindow: inherited ? SESSION_CONTEXT_BEFORE : SESSION_CONTEXT_AFTER,
-    maxOutputTokens: inherited ? SESSION_MAX_OUTPUT_BEFORE : SESSION_MAX_OUTPUT_AFTER,
     inherited,
     targetValue,
   });
@@ -463,11 +457,9 @@ test("project-root navigation waits for absence and rejects duplicate semantic o
 
 test("Session Settings panel predicate binds root target, local badge, fields, and no global save", () => {
   assert.equal(SESSION_CONTEXT_BEFORE, "");
-  assert.equal(SESSION_MAX_OUTPUT_BEFORE, "");
   assert.equal(sessionSettingsPanelReady(surface(), {
     expectedTarget: target,
     contextWindow: SESSION_CONTEXT_BEFORE,
-    maxOutputTokens: SESSION_MAX_OUTPUT_BEFORE,
     dirty: false,
     inherited: true,
   }), true);
@@ -476,7 +468,6 @@ test("Session Settings panel predicate binds root target, local badge, fields, a
   }), {
     expectedTarget: target,
     contextWindow: SESSION_CONTEXT_BEFORE,
-    maxOutputTokens: SESSION_MAX_OUTPUT_BEFORE,
     dirty: false,
     inherited: true,
   }), false);
@@ -484,7 +475,6 @@ test("Session Settings panel predicate binds root target, local badge, fields, a
     overrides: { panel: { ...surface().panel, save_global_count: 1 } },
   }), {
     contextWindow: SESSION_CONTEXT_BEFORE,
-    maxOutputTokens: SESSION_MAX_OUTPUT_BEFORE,
   }), false);
   assert.equal(sessionSettingsPanelReady(surface({
     overrides: {
@@ -495,16 +485,14 @@ test("Session Settings panel predicate binds root target, local badge, fields, a
     },
   }), {
     contextWindow: SESSION_CONTEXT_BEFORE,
-    maxOutputTokens: SESSION_MAX_OUTPUT_BEFORE,
   }), false, "Connection type requires the complete four-profile selector");
 });
 
 test("dirty close guard preserves the exact root draft behind one inert panel", () => {
-  const dirty = surface({ maxOutputTokens: SESSION_MAX_OUTPUT_AFTER, dirty: true });
+  const dirty = surface({ contextWindow: SESSION_CONTEXT_AFTER, dirty: true });
   const dirtyPanel = {
     expectedTarget: target,
-    contextWindow: SESSION_CONTEXT_BEFORE,
-    maxOutputTokens: SESSION_MAX_OUTPUT_AFTER,
+    contextWindow: SESSION_CONTEXT_AFTER,
     dirty: true,
     inherited: true,
   };
@@ -557,10 +545,9 @@ test("dirty close guard preserves the exact root draft behind one inert panel", 
   }, target), false);
 });
 
-test("Session Settings apply command captures the complete seven-field connection and exact target", () => {
+test("Session Settings apply command captures the complete host-neutral connection and exact target", () => {
   const applyable = surface({
     contextWindow: SESSION_CONTEXT_AFTER,
-    maxOutputTokens: SESSION_MAX_OUTPUT_AFTER,
     dirty: true,
   });
   assert.deepEqual(expectedSessionSettingsApplyCommand(applyable), {
@@ -573,7 +560,6 @@ test("Session Settings apply command captures the complete seven-field connectio
         apiKeyEnv: SESSION_PROVIDER_API_KEY_ENV,
         accessMode: "default",
         contextWindow: SESSION_CONTEXT_AFTER,
-        maxOutputTokens: SESSION_MAX_OUTPUT_AFTER,
       },
       expectedTarget: target,
     },
@@ -782,7 +768,7 @@ test("restored root panel decision exposes every durable owner, value, control, 
   const ledger = acceptedLedger();
   const exact = restoredSessionSettingsPanelDecision({ surface: restored, ledger }, restoredExpected);
   assert.equal(exact.status, "pass");
-  assert.equal(exact.gates.length, 33);
+  assert.equal(exact.gates.length, 31);
   assert.equal(exact.gates.every((gate) => gate.pass), true);
   assert.equal(exact.gates.find((gate) => gate.id === "target-owner").actual.target.configGeneration, "1");
   assert.equal(exact.gates.find((gate) => gate.id === "target-owner").actual.target.runtimeOwnerToken, "idle:0");

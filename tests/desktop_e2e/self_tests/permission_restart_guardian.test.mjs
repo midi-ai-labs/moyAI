@@ -113,6 +113,7 @@ test("permission restart Guardian fixture selects LM Studio Responses, tools, an
   assert.match(config, /supports_tools = true/);
   assert.match(config, /\[permissions\][\s\S]*access_mode = "auto_review"/);
   assert.match(config, /max_retries = 0/);
+  assert.doesNotMatch(config, /max_(?:output_)?tokens|reasoning_(?:effort|summary)|supports_reasoning|temperature|top_p|top_k|presence_penalty|frequency_penalty|seed\s*=|stop(?:_sequences)?\s*=|\[model\.extra_body_json\]/);
 });
 
 test("permission restart Guardian ledger accepts only the exact four ordered provider roles", () => {

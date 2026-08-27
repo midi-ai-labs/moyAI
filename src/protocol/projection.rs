@@ -371,7 +371,11 @@ pub fn project_turn_item_for_run_event(
             if *tool == ToolName::UpdatePlan
                 && let Some((explanation, plan)) = plan_from_metadata(metadata)
             {
-                TurnItemPayload::Plan { explanation, plan }
+                TurnItemPayload::Plan {
+                    call_id: Some(*tool_call_id),
+                    explanation,
+                    plan,
+                }
             } else {
                 tool_status(
                     *tool_call_id,
@@ -756,9 +760,10 @@ mod tests {
 
     #[test]
     fn update_plan_is_a_typed_turn_projection() {
+        let call_id = ToolCallId::new();
         let projection = project_protocol_run_event(
             &RunEvent::ToolCallCompleted {
-                tool_call_id: ToolCallId::new(),
+                tool_call_id: call_id,
                 tool: ToolName::UpdatePlan,
                 title: "Plan updated".to_string(),
                 summary: "Plan updated".to_string(),
@@ -777,8 +782,32 @@ mod tests {
         .expect("projection");
         assert!(matches!(
             projection.turn_item.map(|item| item.payload),
-            Some(TurnItemPayload::Plan { plan, .. })
-                if plan.len() == 1 && plan[0].status == PlanStepStatus::InProgress
+            Some(TurnItemPayload::Plan {
+                call_id: Some(projected_call_id),
+                plan,
+                ..
+            }) if projected_call_id == call_id
+                && plan.len() == 1
+                && plan[0].status == PlanStepStatus::InProgress
+        ));
+    }
+
+    #[test]
+    fn legacy_plan_without_call_id_remains_decodable() {
+        let payload = serde_json::from_value::<TurnItemPayload>(serde_json::json!({
+            "kind": "plan",
+            "explanation": "legacy",
+            "plan": [{"step": "Inspect", "status": "in_progress"}]
+        }))
+        .expect("legacy plan payload");
+
+        assert!(matches!(
+            payload,
+            TurnItemPayload::Plan {
+                call_id: None,
+                explanation: Some(explanation),
+                plan,
+            } if explanation == "legacy" && plan.len() == 1
         ));
     }
 

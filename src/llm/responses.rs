@@ -3,11 +3,10 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Map, Value, json};
 
 use crate::config::ProviderStreamLimits;
-use crate::config::model::{ProviderApiMode, ProviderReasoningCapability, ReasoningSummary};
+use crate::config::model::{ProviderApiMode, ProviderReasoningCapability};
 use crate::error::{LlmError, ProviderStreamLimit};
 use crate::llm::contract::{
     ChatRequest, LlmEvent, ModelContentPart, ModelMessage, ProviderToolChoice, ReasoningRequest,
-    validate_responses_reasoning_request,
 };
 use crate::session::{FinishReason, TokenUsage};
 
@@ -39,7 +38,7 @@ impl<'a> ResponsesRequestOptions<'a> {
 
 pub fn to_responses_request(
     request: &ChatRequest,
-    options: ResponsesRequestOptions<'_>,
+    _options: ResponsesRequestOptions<'_>,
 ) -> Result<Value, LlmError> {
     request.validate_provider_lifecycle()?;
     if request.provider_target().api_mode() != ProviderApiMode::Responses {
@@ -47,8 +46,6 @@ pub fn to_responses_request(
             "Responses request serialization requires provider_api_mode=responses".to_string(),
         ));
     }
-
-    let reasoning = responses_reasoning(options)?;
 
     let mut input = Vec::new();
     for message in request.messages.iter().filter(|message| {
@@ -96,121 +93,14 @@ pub fn to_responses_request(
             json!(request.parallel_tool_calls),
         );
     }
-    body.insert(
-        "max_output_tokens".to_string(),
-        json!(request.effective_max_output_tokens()),
-    );
     body.insert("store".to_string(), Value::Bool(false));
     body.insert("stream".to_string(), Value::Bool(true));
 
-    if let Some(temperature) = request.temperature {
-        body.insert("temperature".to_string(), json!(temperature));
-    }
-    if let Some(top_p) = request.top_p {
-        body.insert("top_p".to_string(), json!(top_p));
-    }
-    // LM Studio and other OpenAI-compatible providers may expose sampling
-    // extensions beyond the standard Responses surface. Preserve explicit
-    // request settings instead of silently dropping them when the transport
-    // changes from Chat Completions to Responses.
-    if let Some(top_k) = request.top_k {
-        body.insert("top_k".to_string(), json!(top_k));
-    }
-    if let Some(presence_penalty) = request.presence_penalty {
-        body.insert("presence_penalty".to_string(), json!(presence_penalty));
-    }
-    if let Some(frequency_penalty) = request.frequency_penalty {
-        body.insert("frequency_penalty".to_string(), json!(frequency_penalty));
-    }
-    if let Some(seed) = request.seed {
-        body.insert("seed".to_string(), json!(seed));
-    }
-    if !request.stop_sequences.is_empty() {
-        body.insert("stop".to_string(), json!(request.stop_sequences));
-    }
-
-    if let Some(reasoning) = reasoning {
-        body.insert("reasoning".to_string(), reasoning);
-    }
-    if let Some(extra) = &request.extra_body {
-        merge_extra_body(&mut body, extra.clone());
-    }
+    // Normal generation intentionally inherits the provider host's generation policy. Legacy
+    // sampling, reasoning, and extra-body config remains readable, but the provider wire boundary
+    // owns a stable structural request and never projects those generation overrides.
 
     Ok(Value::Object(body))
-}
-
-fn merge_extra_body(body: &mut Map<String, Value>, extra: Value) {
-    match extra {
-        Value::Object(extra) => {
-            for (key, value) in extra {
-                if !is_runtime_owned_responses_request_key(&key) {
-                    body.insert(key, value);
-                }
-            }
-        }
-        value => {
-            body.insert("extra_body_json".to_string(), value);
-        }
-    }
-}
-
-fn is_runtime_owned_responses_request_key(key: &str) -> bool {
-    matches!(
-        key,
-        "model"
-            | "instructions"
-            | "input"
-            | "messages"
-            | "tools"
-            | "tool_choice"
-            | "parallel_tool_calls"
-            | "max_output_tokens"
-            | "max_tokens"
-            | "store"
-            | "stream"
-            | "temperature"
-            | "top_p"
-            | "top_k"
-            | "presence_penalty"
-            | "frequency_penalty"
-            | "seed"
-            | "stop"
-            | "reasoning"
-            | "reasoning_effort"
-            | "reasoning_summary"
-            | "previous_response_id"
-    )
-}
-
-fn responses_reasoning(options: ResponsesRequestOptions<'_>) -> Result<Option<Value>, LlmError> {
-    let Some(reasoning) = validate_responses_reasoning_request(
-        options.reasoning_request,
-        options.reasoning_capability,
-    )?
-    else {
-        return Ok(None);
-    };
-
-    let mut value = Map::new();
-    if let Some(effort) = reasoning.effort {
-        value.insert("effort".to_string(), json!(effort.as_str()));
-    }
-    if let Some(summary) = reasoning.summary {
-        value.insert(
-            "summary".to_string(),
-            json!(reasoning_summary_name(summary)),
-        );
-    }
-    Ok(Some(Value::Object(value)))
-}
-
-fn reasoning_summary_name(summary: ReasoningSummary) -> &'static str {
-    match summary {
-        ReasoningSummary::None => "none",
-        ReasoningSummary::Auto => "auto",
-        ReasoningSummary::Concise => "concise",
-        ReasoningSummary::Detailed => "detailed",
-    }
 }
 
 fn instructions(request: &ChatRequest) -> String {
@@ -1878,7 +1768,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
     use super::*;
-    use crate::config::model::ReasoningEffort;
+    use crate::config::model::{ReasoningEffort, ReasoningSummary};
     use crate::config::{ProviderDeadlines, ProviderProfile, ProviderTarget};
     use crate::error::ProviderStreamLimit;
     use crate::llm::contract::{ModelCapabilities, ModelProfile, ModelToolCall, ToolSchema};
@@ -1983,11 +1873,8 @@ mod tests {
         assert_eq!(wire["store"], json!(false));
         assert_eq!(wire["stream"], json!(true));
         assert_eq!(wire["parallel_tool_calls"], json!(true));
-        assert_eq!(wire["max_output_tokens"], json!(4_096));
-        assert_eq!(
-            wire["reasoning"],
-            json!({ "effort": "high", "summary": "detailed" })
-        );
+        assert!(wire.get("max_output_tokens").is_none());
+        assert!(wire.get("reasoning").is_none());
         assert_eq!(
             wire["tool_choice"],
             json!({ "type": "function", "name": "read_file" })
@@ -2090,7 +1977,7 @@ mod tests {
     }
 
     #[test]
-    fn request_preserves_sampling_and_extra_body_without_overriding_runtime_fields() {
+    fn request_omits_legacy_generation_overrides_and_keeps_structural_fields() {
         let mut request = request(vec![ModelMessage::User {
             content: "Inspect the repository".to_string(),
         }]);
@@ -2104,6 +1991,7 @@ mod tests {
         request.extra_body = Some(json!({
             "num_ctx": 131_072,
             "min_p": 0.05,
+            "chat_template_kwargs": { "enable_thinking": true },
             "model": "overridden",
             "input": "overridden",
             "previous_response_id": "overridden",
@@ -2123,24 +2011,39 @@ mod tests {
                 reasoning_capability: responses_capability(),
             },
         )
-        .expect("request should preserve explicit provider settings");
+        .expect("legacy generation overrides must not affect serialization");
 
         assert_eq!(wire["model"], json!("gpt-test"));
         assert_eq!(wire["input"][0]["role"], json!("user"));
         assert!(wire.get("previous_response_id").is_none());
+        assert!(wire.get("max_output_tokens").is_none());
         assert_eq!(
-            wire["reasoning"],
-            json!({ "effort": "high", "summary": "concise" })
+            wire["tool_choice"],
+            json!({ "type": "function", "name": "read_file" })
         );
-        assert_eq!(wire["temperature"], json!(0.2));
-        assert_eq!(wire["top_p"], json!(0.8));
-        assert_eq!(wire["top_k"], json!(40));
-        assert_eq!(wire["presence_penalty"], json!(0.1));
-        assert_eq!(wire["frequency_penalty"], json!(0.3));
-        assert_eq!(wire["seed"], json!(7));
-        assert_eq!(wire["stop"], json!(["DONE", "STOP"]));
-        assert_eq!(wire["num_ctx"], json!(131_072));
-        assert_eq!(wire["min_p"], json!(0.05));
+        for key in [
+            "max_output_tokens",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "presence_penalty",
+            "frequency_penalty",
+            "seed",
+            "stop",
+            "reasoning",
+            "reasoning_effort",
+            "reasoning_summary",
+            "num_ctx",
+            "min_p",
+            "chat_template_kwargs",
+            "extra_body_json",
+        ] {
+            assert!(
+                wire.get(key).is_none(),
+                "legacy generation key `{key}` leaked to Responses wire"
+            );
+        }
 
         let no_thinking = ReasoningRequest {
             effort: Some(ReasoningEffort::None),
@@ -2155,8 +2058,8 @@ mod tests {
                 },
             },
         )
-        .expect("typed none reasoning effort should serialize on Responses");
-        assert_eq!(no_thinking_wire["reasoning"], json!({ "effort": "none" }));
+        .expect("typed none reasoning remains a legacy override");
+        assert!(no_thinking_wire.get("reasoning").is_none());
     }
 
     #[test]
@@ -2194,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn request_rejects_invalid_reasoning_capability() {
+    fn request_ignores_legacy_reasoning_even_with_an_unverified_capability() {
         let request = request(vec![ModelMessage::System {
             content: "Only system".to_string(),
         }]);
@@ -2202,15 +2105,16 @@ mod tests {
             effort: Some(ReasoningEffort::Medium),
             summary: ReasoningSummary::None,
         };
-        let wrong_capability = to_responses_request(
+        let wire = to_responses_request(
             &request,
             ResponsesRequestOptions {
                 reasoning_request: Some(&reasoning),
                 reasoning_capability: ProviderReasoningCapability::Unsupported,
                 ..ResponsesRequestOptions::default()
             },
-        );
-        assert!(wrong_capability.is_err());
+        )
+        .expect("reasoning capability is not consulted by the host-default wire contract");
+        assert!(wire.get("reasoning").is_none());
     }
 
     #[test]

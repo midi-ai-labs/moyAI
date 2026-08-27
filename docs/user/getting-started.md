@@ -81,23 +81,24 @@ model transportの既定値は次の通り。
 ```toml
 [model]
 provider_profile = "lm_studio"
-reasoning_summary = "none"
 request_timeout_ms = 3600000
 ```
 
-`request_timeout_ms`は1回のprovider generation request全体を所有する単一deadlineで、最初のPOST attemptから
-connect retry待機、request body送信、response header待ち、stream terminalまでを含み、header受信時に時計を
-リセットしない。既定値は3,600,000ms（60分）で、設定可能な上限も同じ値。Desktop Settings、TUI、
+`request_timeout_ms`はmoyAI client側の通信生存判定を所有する。最初のPOST attemptから成功response headerまでは
+connect retry待機、request body送信、header待ちを含む単一deadlineとして働く。成功header後は同じ値を
+decoded SSE event間の最大無進捗時間として使い、eventを受け取るたびに更新するため、進捗中のgenerationを
+総所要時間だけで終了しない。この値はhostへ送信しない。既定値は3,600,000ms（60分）で、設定可能な上限も同じ値。Desktop Settings、TUI、
 ImportしたTOML、`MOYAI_REQUEST_TIMEOUT_MS`は同じ値を使う。旧`stream_idle_timeout_ms` TOML keyと
 `MOYAI_STREAM_IDLE_TIMEOUT_MS` environment variableは移行入力としてだけ受理し、旧keyだけならcanonical値へ昇格、
 新旧が同値なら受理、異なる値ならconfig errorとする。
-`max_output_tokens`は通常文だけでなくreasoningとtool-call引数のserialized output全体を制限する。
-文書全体を`write`するようなtool-heavy runではproviderごとに検証済みのbudgetを使い、製品既定値は
-`32768`とする。LM Studioが
+出力量はホスティング側が所有する。moyAIはResponsesの`max_output_tokens`とChat Completionsの
+`max_tokens`を送らないため、通常文、reasoning、tool-call引数のserialized outputはいずれもLM Studio、
+oMLX等で設定された上限を使う。旧TOML/sessionの生成設定は読取互換入力として破棄し、旧environment
+variableも無視するため、起動可否、turn、診断、設定保存、provider wireには影響しない。LM Studioが
 `Failed to parse tool call: Unexpected end of content`等を`response.failed`で返した場合、moyAIは
-設定中のbudgetを含むgeneration failureとして表示し、不完全なtool callをlocal commit・実行しない。
+providerのcode/messageをgeneration failureとして表示し、不完全なtool callをlocal commit・実行しない。
 `max_retries`はHTTP responseを受ける前のretry可能な接続/transport失敗だけに適用し、retry待機は1回最大30,000ms。
-response-start timeout、HTTP 429/5xxを含むHTTP error response、SSE開始後の失敗では、同じ生成requestを自動再送しない。
+response-start timeout、HTTP 429/5xxを含むHTTP error response、SSE開始後の無進捗timeoutや失敗では、同じ生成requestを自動再送しない。
 model availability checkは別操作として1 requestあたり120,000msの専用probe timeoutを使い、通常turnの
 admissionには含まれない。設定した`Connection type`に対応するmetadata endpointだけを確認し、tool callやvisionの
 試験生成は行わない。moyAIは設定済みURLを外部HTTP serviceとして扱い、LM Studio processを起動・停止・監督しない。
@@ -122,8 +123,9 @@ exact tool name、effect、permissionをlocalに検証してからdispatchする
 再送せず、assistant conversation historyにも保存しない。reasoning summaryも非永続のruntime-only表示eventであり、
 再起動後のmodel context ownerにはしない。同じprovider responseのassistant messageと全tool callは
 `ModelResponseId`で結び、tool callはproviderの`tool_name` / `arguments_json`原文を保持する。typed tool名、
-JSON parse、schema validationはcommit後の実行時だけ行う。reasoning対応modelでsummaryが必要な場合だけ、例えば
-`reasoning_effort = "medium"`と`reasoning_summary = "concise"`を設定する。
+JSON parse、schema validationはcommit後の実行時だけ行う。sampling、thinking、reasoning effort / summary、
+stop sequence、output length、provider固有の追加request bodyはホスティング側が所有する。moyAIはこれらをprovider wireへ送らず、
+旧configやenvironment、session metadataに残る値も互換読込だけを行う。LM Studio等のホスト側で設定する。
 canonical contextではSystem / Developer sectionを論理的に区別して保持する。OpenAI-compatible wire境界では
 その順序を保ち、Responsesはtop-level `instructions`へ、Chat Completionsは先頭の単一`system` messageへfoldし、
 `developer` wire roleを送らない。
@@ -136,13 +138,14 @@ generation operationがまだresponse headerへ到達していないことまで
 という意味ではない。LM Studio serverがHTTP応答できること、対象modelがcatalogへ登録されていること、model instanceが
 load済みであることも別状態である。このphaseだけではprovider側のon-demand model load、queue、request upload、長いprompt
 prefillを区別できないため、内訳が必要な場合はLM Studio側のload状態とserver logを確認する。moyAIはPOST前にrequest
-wire/image/schema等をbounded validationし、stream開始後もraw byte/event/tool-call/argument/absolute durationを制限する。
+wire/image/schema等をbounded validationし、stream開始後はraw stream byte、decoded event、tool-call count、argument byteを
+固定上限で制限する。`request_timeout_ms`はdecoded SSE event間のrolling inactivityとして働き、eventが進む限り総所要時間に
+上限を課さない。
 providerがusageを返した正常terminalではprovider報告token usageも投影する。prepared-request diagnosticsはlogical model
 message数と、exact HTTP wireのinput item数・serialized body byte数を分けて記録し、request body自体は保持しない。
 
-Chat Completionsのreasoning wire fieldはproviderごとに異なるため、利用する場合は
-`chat_completions_reasoning_parameters = "effort_only"`または`"effort_and_summary"`を明示する。
-未確認のproviderへ推測したreasoning fieldを送るfallbackは行わない。
+`context_window`はmoyAIのlocal input accountingとcompactionにだけ使う。providerのcontext、model load、
+sampling、thinking、出力量を変更するfieldではなく、generation wireにも送らない。
 
 HTTP MCPを有効にする場合は、各server toolのeffectを`[[mcp.servers.tool_routes]]`の`name`と
 `effect = "read"` / `"mutation"` / `"destructive"`で明示する。未設定routeは推測せず拒否し、内部Plan modeでは明示read routeだけを
@@ -159,7 +162,7 @@ Desktop:
 - Markdown export: transcript 表示中に export ボタンまたは `F9`。
 - 停止: 実行中に stop button を押すと、表示時のworkspace / root session / run generation / Agent Tree epochが一致するexact current root executionだけを停止する。実行中またはdetachedなchildへcascadeしない。画面更新後の古いStopは新しいrunへ適用されず、tree全体の停止は別名の明示的なtree-stop操作として扱う。
 - Settings: 「設定フォルダーを開く」はglobal `config.toml`の場所を開き、「データフォルダーを開く」はSQLite、履歴、harness等を保存するRoaming data directory（`MOYAI_DATA_DIR`指定時はそのdirectory）を開く。初回起動のInitial Setupでは「設定を保存して開始」を推奨の完了方法として表示し、「この起動中だけ適用」は再起動後へ引き継がない。Initial Setupは保存または一時適用が完了するまで閉じず、TOML設定Importのfile pickerをcancelした場合は設定を変更しない。Importでは、`config(1).toml`や`config_202608.toml`など`.toml` extensionを持つ任意名のfileを選択でき、TOML schemaと設定値を検証してからglobal `config.toml`へ取り込む。
-- Provider接続: 現在のURL・Connection type・modelを変えずにContext windowまたはMax output tokensだけを編集した場合、モデル一覧を再取得せずにsessionへ適用または設定ファイルへ保存できる。URL・Connection type・modelを変更してもlocal-validな手入力値は保存でき、catalog rowから選ぶ場合だけ対応する明示「モデル読込」のevidenceを使う。
+- Provider接続: 現在のURL・Connection type・modelを変えずにmoyAI local context budgetだけを編集した場合、モデル一覧を再取得せずにsessionへ適用または設定ファイルへ保存できる。URL・Connection type・modelを変更してもlocal-validな手入力値は保存でき、catalog rowから選ぶ場合だけ対応する明示「モデル読込」のevidenceを使う。sampling、thinking、output lengthはGUIに持たず、host側の設定をそのまま使う。
 - サイドチャット: sessionを開き、左サイドバーの`設定`にある`Side Chat` sectionで専用のLLM URLを入力して`モデル読込`を押し、取得した一覧からmodelを選択する。一覧に現れない互換modelは`一覧にないモデルIDを入力`からIDを直接指定できる。選択後に設定を適用する。右ペインの`サイドチャット`は設定済みmodelと会話を表示し、未設定時はSettingsへの導線だけを表示する。停止中は同じsectionからmodelを更新できるが、実行中・削除中は変更できない。設定・履歴・未送信draft・実行・Stopはowning session単位で保存され、メインtaskのmodel設定・composer・実行・Stopとは分離される。取得したmodel一覧も選択中sessionとURLに紐づけて表示し、別sessionや別URLの結果を混ぜないが、app再起動後は必要に応じて`モデル読込`を再実行する。サイドチャットはtext-onlyかつtool-lessで、workspaceの読取・変更やpermission dialogを行わない。現行のside provider設定は認証不要のendpointを対象とし、main providerのAPI keyやcustom headerを継承・転送しない。ペインを隠す、sessionを移動する、windowを閉じる操作では履歴を削除しない。`サイドチャットを削除`を確認した場合だけ、sideのcanonical conversationと未送信draftを破棄し、メインsessionとworkspaceは残す。
 
 Git repository内のsubdirectoryをworkspaceとして選んだ場合、選択したdirectoryがtoolとsandboxの境界になる。ancestorのGit rootはproject一覧、履歴、Git機能、ancestor instruction探索に使うが、選択directoryのsiblingをworkspace内にはしない。同じsessionを開き直した場合も、保存済みdirectoryからこの境界を復元する。built-in reviewがshell用に提示するGit commandも、末尾の`-- .`で選択directoryへscopeされる。

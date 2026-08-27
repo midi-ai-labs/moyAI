@@ -155,11 +155,11 @@ Default Windows config path:
 %APPDATA%\midi-ai-labs\moyai\config\config.toml
 ```
 
-The release folder and workspace folders do not need their own config file. Desktop, TUI, and CLI share the user-wide baseline; a Desktop root session may additionally retain its own complete provider connection (connection type, URL, model, optional API-key environment-variable name, and custom headers), context window, maximum output, and access-mode values when reopened. Provider/model/context/output changes affect turns admitted after Apply. A committed access-mode change affects the next permission decision, including one made later by an already-running root or child, while an existing pending decision and an already-admitted effect keep their original policy.
+The release folder and workspace folders do not need their own config file. Desktop, TUI, and CLI share the user-wide baseline; a Desktop root session may additionally retain its own complete provider connection (connection type, URL, model, optional API-key environment-variable name, and custom headers), moyAI-local context budget, and access-mode values when reopened. Provider/model/context changes affect turns admitted after Apply. A committed access-mode change affects the next permission decision, including one made later by an already-running root or child, while an existing pending decision and an already-admitted effect keep their original policy.
 
 Initial Setup TOML import is read-only until Finish: the selected file is strictly parsed into the local wizard draft without materializing environment overrides, and neither the source nor the current global configuration is mutated by choosing it. Only a successful Finish persists the validated draft and clears the first-run setup requirement. Less common typed fields remain editable in the wizard's collapsed Advanced area, which opens when one of those fields needs correction.
 
-In Session Settings, leaving **Context window** or **Maximum output** blank removes that root-session override and inherits the global value. Blank is distinct from an explicit `0` where that field permits zero; clearing one limit does not erase the session's other model parameters.
+In Session Settings, leaving **moyAI local context budget** blank removes that root-session override and inherits the global value. This budget controls local input accounting and compaction only; it is not sent to the provider as a context-window or model-load setting.
 
 Example:
 
@@ -169,15 +169,10 @@ base_url = "http://127.0.0.1:1234"
 model = "qwen/qwen3.6-27b"
 provider_profile = "lm_studio"
 # api_key_env = "OPENAI_API_KEY" # optional; names an environment variable
-reasoning_summary = "none"
 request_timeout_ms = 3600000
 context_window = 131072
 supports_tools = true
 supports_images = true
-max_output_tokens = 32768
-
-[model.extra_body_json]
-num_ctx = 131072
 
 [permissions]
 access_mode = "default"
@@ -196,20 +191,21 @@ base_url = "http://127.0.0.1:8123"
 enabled = false
 ```
 
-`request_timeout_ms` is the single deadline for one provider generation request. It starts with the
-first POST attempt and covers eligible retry delays, request-body upload, response headers, and the
-stream through its terminal event without resetting at the header boundary. It defaults to 3,600,000 ms
-(60 minutes), which is also the maximum accepted value. Desktop Settings, TUI, imported TOML,
-and `MOYAI_REQUEST_TIMEOUT_MS` all use this same owner. The legacy `stream_idle_timeout_ms` TOML key and
+`request_timeout_ms` is moyAI's client-side liveness timeout. From the first POST attempt through a
+successful response header it is one absolute deadline covering eligible retry delays, request upload,
+and header wait. After a successful header, the same value becomes the maximum interval between decoded
+SSE events and is renewed whenever stream progress arrives; a progressing generation therefore has no
+total-duration cutoff. The value is never sent to the host. It defaults to 3,600,000 ms (60 minutes),
+which is also the maximum accepted value. Desktop Settings, TUI, imported TOML, and
+`MOYAI_REQUEST_TIMEOUT_MS` all use this same owner. The legacy `stream_idle_timeout_ms` TOML key and
 `MOYAI_STREAM_IDLE_TIMEOUT_MS` environment variable remain accepted for migration only: a legacy-only
 value becomes the request timeout, equal old/new values are accepted, and conflicting values are rejected
 with a config error instead of silently choosing one.
-`max_output_tokens` bounds the complete model output, including reasoning and serialized tool-call
-arguments. Tool-heavy runs that write a whole document need the provider's verified profile budget;
-the product default uses `32768`. A provider-side
-`response.failed` such as `Failed to parse tool call: Unexpected end of content` is reported as a
-generation failure with the configured budget and is not treated as a locally parsed or executed
-tool call.
+Maximum output length is owned by the hosting provider. moyAI omits both Responses
+`max_output_tokens` and Chat Completions `max_tokens`, so ordinary text, reasoning, and serialized
+tool-call arguments use the limit configured in LM Studio, oMLX, or the selected host. A provider-side
+`response.failed` such as `Failed to parse tool call: Unexpected end of content` is reported with the
+provider code/message and is not treated as a locally parsed or executed tool call.
 `max_retries` applies only to retryable connection/transport failures before any HTTP response, with
 every retry delay capped at 30,000 ms. A response-start timeout, any HTTP error response (including
 429/5xx), or a failure after an SSE response starts is terminal and is not replayed automatically.
@@ -233,10 +229,10 @@ never a JavaScript number. Preferences Apply builds one complete temporary `Reso
 Global Save merges only dirty fields into the current TOML document.
 
 Session Settings has a separate frontend draft limited to the complete provider connection, access mode,
-context window, and maximum output. Apply sends those values together with the exact workspace, root-session
+and moyAI-local context budget. Apply sends those values together with the exact workspace, root-session
 ID, durable settings revision, config generation, and runtime owner token. Rust derives the canonical
-patch and performs a root-only revision CAS; blank limits remove that root override and inherit the
-global value. Only a correlated success matching the latest local revision and target clears either
+patch and performs a root-only revision CAS; a blank local budget removes that root override and inherits
+the global value. Only a correlated success matching the latest local revision and target clears either
 draft, and a stale async response cannot mutate or clear a different draft.
 
 When MCP is enabled, each callable server tool needs an explicit effect route. Unlisted routes fail
@@ -266,15 +262,11 @@ Common environment variables:
 - `MOYAI_MODEL`
 - `MOYAI_PROVIDER_PROFILE`
 - `MOYAI_API_KEY_ENV`
-- `MOYAI_CHAT_COMPLETIONS_REASONING_PARAMETERS`
-- `MOYAI_REASONING_EFFORT`
-- `MOYAI_REASONING_SUMMARY`
 - `MOYAI_CONFIG_PATH`
 - `MOYAI_DATA_DIR`
 - `MOYAI_ACCESS_MODE`
 - `MOYAI_REQUEST_TIMEOUT_MS`
 - `MOYAI_CONTEXT_WINDOW`
-- `MOYAI_MAX_OUTPUT_TOKENS`
 - `MOYAI_SUPPORTS_IMAGES`
 - `MOYAI_MULTI_AGENT_ENABLED`
 - `MOYAI_MULTI_AGENT_MODE`
@@ -348,17 +340,16 @@ product default: copy it to an isolated config, update the endpoint/model for th
 and select it with `MOYAI_CONFIG_PATH` without overwriting the user-wide config.
 The Tauri Desktop provider surfaces expose one **Connection type** selector, the base URL, optional
 API-key environment-variable name, and model. They do not expose a second Responses/Chat switch.
-It also owns `context_window` and `max_output_tokens` inputs so vLLM/vLLM-MLX limits can be managed
-inside moyAI instead of relying on shell environment variables. Current vLLM-MLX `/health` and
-`/v1/status` responses expose the hosted model name, but not the server startup `--max-tokens` /
-`--max-request-tokens` values, so moyAI auto-detects the model and keeps request limits as managed
-config unless a provider exposes those fields in `/v1/models`.
+It also exposes `context_window` solely as moyAI's local input-accounting and compaction budget. It is
+not sent as a provider context-window or model-load setting. Output length and every generation
+parameter remain host-owned; provider metadata may report those facts for diagnostics, but moyAI does
+not turn them into client-side request overrides.
 
 The `lm_studio` and `openai_responses` profiles use the Responses transport; the
 `openai_compatible` and `lm_studio_chat_completions` profiles use Chat Completions. The HTTP Responses transport sends the complete current
 canonical input on every request, including any compaction checkpoint, and does not send
 `previous_response_id`. Raw reasoning text is neither replayed nor stored as assistant context. A
-requested typed reasoning summary is a runtime-only client event, not a durable conversation or
+provider-emitted reasoning summary is a runtime-only client event, not a durable conversation or
 runtime row.
 
 Every generation request has a runtime-only provider request ID and reports the phases
@@ -369,9 +360,10 @@ logical model-message count separate from the exact HTTP wire input-item count a
 size, without retaining the body. These are transport
 boundaries observed by moyAI; they do not infer provider-process startup, server-side acceptance, or
 model-instance loading. A long `request_in_flight` phase establishes only that the operation has not
-reached response headers. Before POST, moyAI bounds messages, tools, schemas, extra body, stop data,
-images, and the exact serialized wire bytes. After headers, it also bounds raw stream bytes, events,
-tool calls, arguments, and the remaining portion of the same request deadline.
+reached response headers. Before POST, moyAI bounds messages, tools, schemas, images, and the exact
+serialized wire bytes. After headers, fixed limits bound raw stream bytes, decoded events, tool-call
+count, and argument bytes. `request_timeout_ms` separately becomes a rolling inactivity interval between
+decoded SSE events; each event renews it, so a progressing stream has no client-side total-duration cutoff.
 For an explicit task-local audit, set `MOYAI_HTTP_REQUEST_CAPTURE_DIR` to an absolute directory.
 The HTTP transport then writes the exact prepared outbound request JSON plus
 API-mode/endpoint/byte-count, capture-stage, and provider-request-ID metadata. The shared request ID
@@ -382,10 +374,14 @@ permissions. On Windows, the directory and files inherit Windows ACLs, so choose
 ACL grants access only to the intended account. When capture is explicitly enabled, a capture-write
 failure fails request preparation instead of silently losing the evidence.
 
-Reasoning controls are optional. A reasoning-capable model can use, for example,
-`reasoning_effort = "medium"` and `reasoning_summary = "concise"`. Responses has a standard typed
-contract. Chat Completions varies by provider, so reasoning parameters remain fail-closed unless
-`chat_completions_reasoning_parameters = "effort_only"` or `"effort_and_summary"` is configured.
+Sampling, thinking, and output length are owned by the hosting provider. moyAI does not send
+temperature, top-p, top-k, penalties, seed, stop sequences, reasoning effort/summary,
+`max_output_tokens` / `max_tokens`, or provider-specific extra request body values. Older
+TOML and session values for those fields remain readable only as discarded compatibility input;
+legacy environment variables are ignored. None of them affect runtime policy, admission,
+diagnostics, persistence updates, or either provider wire. Configure such behavior in LM Studio, oMLX, or the
+selected hosting service. `context_window` remains a moyAI-local input-accounting capacity and is not
+used to load or reconfigure a provider model.
 Canonical System and Developer sections remain distinct in the logical model context. At the
 OpenAI-compatible wire boundary, moyAI folds them in order into top-level `instructions` for
 Responses or one leading `system` message for Chat Completions; it never emits a `developer` role.
@@ -421,8 +417,8 @@ URL, effective format/OCR/image/page options, and credential-presence flag. Secr
 If redaction or invalid configuration makes the executable effect incomplete, AutoReview denies before
 calling either the Guardian or a human. The Guardian request includes the current `WorldState`, bounded
 active canonical task context, the current exact committed response/call, and bounded results of prior
-tools in that same response. It has no tools, reasoning, or continuation, does not inherit task-generation
-sampling/stop/arbitrary-extra-body controls, and has a 90-second total deadline.
+tools in that same response. It has no tools or continuation, sends no sampling/thinking override,
+accepts host-provided reasoning as non-authoritative transport output, and has a 90-second total deadline.
 
 Desktop binds an access update to the current root session and exact runtime epoch. Within the same
 epoch, natural `root:N` to `tree:N`/`idle:N` and `tree:N` to `root:N`/`idle:N` settlements are accepted;
@@ -612,10 +608,10 @@ history remains stored. If cancellation occurs or summarization otherwise fails,
 unchanged. A non-empty summary is also rejected when the projected replacement is not smaller or the
 projected complete request still reaches the 90% working target. Automatic compaction is attempted at
 most once in that turn; below the hard limit the original history continues, and at the hard limit
-the run fails explicitly. The working target is 90% of the advertised context window and the
+the run fails explicitly. The working target is 90% of moyAI's configured local context budget and the
 Codex-style effective full input limit is 95%; an additional configured overflow margin is applied
-only when it keeps the hard limit strictly above the working target. `max_output_tokens` is solely a
-generation cap and does not reserve input tokens or lower either context limit.
+only when it keeps the hard limit strictly above the working target. Host-owned output limits do not
+reserve input tokens or lower either local context limit.
 
 An active session goal is not declared successful after an arbitrary number of idle continuations. It
 continues until the goal state, its token/elapsed budget, cancellation, or a typed terminal provides a

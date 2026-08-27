@@ -751,6 +751,12 @@ pub enum TurnItemPayload {
         text: String,
     },
     Plan {
+        /// Exact tool-call owner for plans projected from `update_plan`.
+        ///
+        /// Legacy and synthetic plan projections predate this identity, so the
+        /// field remains optional for backward-compatible decoding.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<ToolCallId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         explanation: Option<String>,
         plan: Vec<PlanStep>,
@@ -841,6 +847,7 @@ impl TurnItemPayload {
 pub fn turn_item_internal_projection_roles_are_not_primary_display_fixture_passes() -> bool {
     let internal = [
         TurnItemPayload::Plan {
+            call_id: None,
             explanation: Some("plan cache".to_string()),
             plan: vec![PlanStep {
                 step: "inspect the relevant contract".to_string(),

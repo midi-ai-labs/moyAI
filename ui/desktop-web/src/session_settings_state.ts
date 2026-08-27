@@ -15,7 +15,6 @@ export interface SessionSettingsDraft {
   providerProfile: ProviderProfile;
   apiKeyEnv: string;
   contextWindow: string;
-  maxOutputTokens: string;
   accessMode: SessionAccessMode;
 }
 
@@ -72,7 +71,6 @@ const SESSION_FIELD_DESCRIPTORS: Readonly<Record<SessionSettingsDraftField, Conf
   ),
   apiKeyEnv: configField("model.api_key_env", "string", false, null, null, []),
   contextWindow: configField("model.context_window", "integer", false, 1, U32_MAX, []),
-  maxOutputTokens: configField("model.max_output_tokens", "integer", false, 0, U32_MAX, []),
   accessMode: configField(
     "permissions.access_mode",
     "enum",
@@ -207,10 +205,6 @@ export function validateSessionSettingsDraft(
       SESSION_FIELD_DESCRIPTORS.contextWindow,
       draft.contextWindow,
     ),
-    maxOutputTokens: validateConfigInput(
-      SESSION_FIELD_DESCRIPTORS.maxOutputTokens,
-      draft.maxOutputTokens,
-    ),
     accessMode: validateConfigInput(SESSION_FIELD_DESCRIPTORS.accessMode, draft.accessMode),
   };
   const orderedFields: readonly SessionSettingsDraftField[] = [
@@ -219,7 +213,6 @@ export function validateSessionSettingsDraft(
     "apiKeyEnv",
     "model",
     "contextWindow",
-    "maxOutputTokens",
     "accessMode",
   ];
   const invalidField = orderedFields.find((field) => !validations[field].ok) ?? null;
@@ -318,7 +311,6 @@ function sameSessionSettingsDraft(
     && expected.providerProfile === actual.providerProfile
     && expected.apiKeyEnv === actual.apiKeyEnv
     && expected.contextWindow === actual.contextWindow
-    && expected.maxOutputTokens === actual.maxOutputTokens
     && expected.accessMode === actual.accessMode;
 }
 

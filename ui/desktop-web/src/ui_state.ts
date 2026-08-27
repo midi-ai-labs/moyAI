@@ -50,7 +50,6 @@ export interface ProviderDraft {
   providerProfile: DesktopWebState["provider_profile"];
   apiKeyEnv: string;
   contextWindow: string;
-  maxOutputTokens: string;
   selectedModelId: string;
 }
 
@@ -305,7 +304,6 @@ export function createUiLocalState(): UiLocalState {
         providerProfile: "openai_compatible",
         apiKeyEnv: "",
         contextWindow: "",
-        maxOutputTokens: "",
         selectedModelId: "",
       },
       composerRevision: 0,
@@ -611,7 +609,6 @@ export function sessionSettingsDraftFromProjection(
     providerProfile: projection.provider_profile,
     apiKeyEnv: projection.api_key_env,
     contextWindow: projection.context_window,
-    maxOutputTokens: projection.max_output_tokens,
     accessMode: projection.access_mode,
   };
 }
@@ -657,8 +654,7 @@ export function sessionSettingsMutationAvailability(
     || draft.model !== baseline.model
     || draft.providerProfile !== baseline.providerProfile
     || draft.apiKeyEnv !== baseline.apiKeyEnv
-    || draft.contextWindow !== baseline.contextWindow
-    || draft.maxOutputTokens !== baseline.maxOutputTokens;
+    || draft.contextWindow !== baseline.contextWindow;
   const accessChanged = draft.accessMode !== baseline.accessMode;
   if (providerChanged && !projection.provider_mutation_enabled) {
     return {
@@ -666,7 +662,7 @@ export function sessionSettingsMutationAvailability(
       staleTarget: false,
       providerChanged,
       accessChanged,
-      reason: "実行中はProvider・Model・Context・出力量を変更できません。Access modeだけを適用できます。",
+      reason: "実行中はProvider・Model・moyAI local context budgetを変更できません。Access modeだけを適用できます。",
     };
   }
   if (accessChanged && !projection.access_mutation_enabled) {

@@ -179,18 +179,13 @@ base_url = ${JSON.stringify(baseUrl)}
 model = ${JSON.stringify(SCRIPTED_PROVIDER_MODEL_ID)}
 provider_metadata_mode = "openai_compatible_only"
 provider_api_mode = "responses"
-reasoning_summary = "none"
 connect_timeout_ms = 1000
 request_timeout_ms = 30000
 max_retries = 0
 context_window = ${DOCLING_READINESS_CONTEXT_WINDOW}
-max_output_tokens = 1024
 supports_tools = false
-supports_reasoning = false
 supports_images = false
 parallel_tool_calls = false
-
-[model.extra_body_json]
 
 [permissions]
 access_mode = "default"

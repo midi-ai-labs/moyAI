@@ -12,6 +12,7 @@ import {
   normalizeProviderConnectionLiveOptions,
   parseCurrentTimeWorkSummary,
   providerConnectionLiveFixtureConfig,
+  providerConnectionLiveControlTokenLeaks,
   restoredProviderConnectionReady,
   savedProviderConnectionReady,
 } from "../scenarios/provider_connection_live.mjs";
@@ -38,7 +39,7 @@ const CONFIG_FIELDS = Object.freeze([
   { key: "model.provider_profile", value: "openai_compatible" },
   { key: "model.api_key_env", value: "" },
   { key: "model.context_window", value: "32768" },
-  { key: "model.max_output_tokens", value: "1024" },
+  { key: "model.max_output_tokens", value: "32768" },
   { key: "model.supports_tools", value: "true" },
   { key: "docling.enabled", value: "false" },
 ]);
@@ -171,6 +172,7 @@ test("fixture is deterministic, tool-capable, and starts from a distinct credent
   assert.match(config, /supports_tools = true/);
   assert.match(config, /max_retries = 0/);
   assert.doesNotMatch(config, /provider_(?:metadata|api)_mode/);
+  assert.doesNotMatch(config, /max_(?:output_)?tokens|reasoning_(?:effort|summary)|supports_reasoning|temperature|top_p|top_k|presence_penalty|frequency_penalty|seed\s*=|stop(?:_sequences)?\s*=|\[model\.extra_body_json\]/);
   assert.doesNotMatch(config, /192\.0\.2\.10|example\/Qwen-27B/);
 });
 
@@ -275,6 +277,42 @@ test("completed work summary is the single current_time evidence owner", () => {
       ],
     },
   }).projection), null);
+});
+
+test("live provider smoke rejects exact chat-template tokens in every assistant transcript row", () => {
+  for (const marker of ["<|im_start|>", "<|im_end|>"]) {
+    const leaked = terminalSurface({
+      projection: {
+        transcript_rows: [
+          { row_kind: "assistant", body: `intermediate tool call ${marker}assistant` },
+          { row_kind: "work_summary_completed", title: "1s作業しました", body: WORK_SUMMARY },
+          { row_kind: "assistant", body: ASSISTANT },
+        ],
+      },
+    });
+    assert.deepEqual(providerConnectionLiveControlTokenLeaks(leaked.projection), [{
+      row_index: 0,
+      markers: [marker],
+    }]);
+    assert.equal(liveCurrentTimeTerminalAccepted(leaked), false);
+    assert.equal(liveCurrentTimeTerminalDecision(leaked), "fail");
+  }
+});
+
+test("live provider smoke allows lookalike tokens and exact markers outside assistant rows", () => {
+  const accepted = terminalSurface({
+    projection: {
+      transcript_rows: [
+        { row_kind: "assistant", body: "intermediate <|tool_call|> payload" },
+        { row_kind: "tool", body: "tool output containing <|im_start|> and <|im_end|>" },
+        { row_kind: "work_summary_completed", title: "1s作業しました", body: WORK_SUMMARY },
+        { row_kind: "assistant", body: ASSISTANT },
+      ],
+    },
+  });
+  assert.deepEqual(providerConnectionLiveControlTokenLeaks(accepted.projection), []);
+  assert.equal(liveCurrentTimeTerminalAccepted(accepted), true);
+  assert.equal(liveCurrentTimeTerminalDecision(accepted), "pass");
 });
 
 test("live terminal helper classifies deterministic pass, pending, and product failure without network", () => {

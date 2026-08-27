@@ -85,10 +85,7 @@ const TYPED_CONFIG_KEYS: readonly string[] = Object.freeze([
   "model.context_window",
   "model.max_output_tokens",
   "model.request_timeout_ms",
-  "model.temperature",
-  "model.top_p",
   "model.supports_tools",
-  "model.supports_reasoning",
   "model.supports_images",
   "model.parallel_tool_calls",
   "permissions.access_mode",
@@ -114,6 +111,22 @@ const TYPED_CONFIG_KEYS: readonly string[] = Object.freeze([
   "mcp.servers_json",
 ]);
 
+const HOST_OWNED_MODEL_KEYS = new Set([
+  "model.max_output_tokens",
+  "model.temperature",
+  "model.top_p",
+  "model.top_k",
+  "model.presence_penalty",
+  "model.frequency_penalty",
+  "model.seed",
+  "model.stop_sequences",
+  "model.extra_body_json",
+  "model.supports_reasoning",
+  "model.reasoning_effort",
+  "model.reasoning_summary",
+  "model.chat_completions_reasoning_parameters",
+]);
+
 const INITIAL_SETUP_PROVIDER_KEYS = new Set([
   "model.base_url",
   "model.provider_profile",
@@ -130,7 +143,6 @@ const PROVIDER_PROFILE_LABELS: Readonly<Record<string, string>> = Object.freeze(
 const INITIAL_SETUP_MODEL_PRIMARY_KEYS = new Set([
   "model.model",
   "model.supports_tools",
-  "model.supports_reasoning",
   "model.supports_images",
   "model.parallel_tool_calls",
 ]);
@@ -464,8 +476,14 @@ function renderInitialSetupProviderStep(state: DesktopViewState): string {
           "API keyそのものではなく、環境変数名（例: OPENAI_API_KEY）を入力します。認証不要なら空欄です。",
           { initialSetup: true },
         )}
-        ${renderConfigTextField(state, "model.context_window", "Context window", "number", "", { initialSetup: true })}
-        ${renderConfigTextField(state, "model.max_output_tokens", "Max output tokens", "number", "", { initialSetup: true })}
+        ${renderConfigTextField(
+          state,
+          "model.context_window",
+          "moyAI local context budget",
+          "number",
+          "Providerへは送信せず、moyAI内の入力整理にだけ使用します。",
+          { initialSetup: true },
+        )}
       </div>
       <div class="initial-setup-note">ProviderへのHTTP requestはこのstepを進むだけでは送信されません。</div>
     </section>
@@ -489,13 +507,14 @@ function renderInitialSetupModelStep(state: DesktopViewState): string {
     field.key.startsWith("model.")
     && !INITIAL_SETUP_PROVIDER_KEYS.has(field.key)
     && !INITIAL_SETUP_MODEL_PRIMARY_KEYS.has(field.key)
+    && !HOST_OWNED_MODEL_KEYS.has(field.key)
   ));
   return `
     <section class="initial-setup-section" aria-labelledby="initial-setup-model-heading">
       <div class="settings-section-head initial-setup-intro">
         <div>
           <h2 id="initial-setup-model-heading">使用するModel</h2>
-          <p>モデル一覧の取得は任意です。一覧がなくてもModel IDを直接入力できます。</p>
+          <p>モデル一覧の取得は任意です。一覧がなくてもModel IDを直接入力できます。sampling / thinking / 出力量はホスティング側の設定をそのまま使用します。</p>
         </div>
         <button data-action="load-provider-models">${state.provider_loading ? "読込中…" : "モデル一覧を読み込む"}</button>
       </div>
@@ -517,7 +536,6 @@ function renderInitialSetupModelStep(state: DesktopViewState): string {
       ` : renderMissingConfigField("model.model")}
       <div class="settings-toggle-grid initial-setup-capabilities">
         ${renderConfigToggleField(state, "model.supports_tools", "Tools", { initialSetup: true })}
-        ${renderConfigToggleField(state, "model.supports_reasoning", "Reasoning", { initialSetup: true })}
         ${renderConfigToggleField(state, "model.supports_images", "Images", { initialSetup: true })}
         ${renderConfigToggleField(state, "model.parallel_tool_calls", "Parallel tool calls", { initialSetup: true })}
       </div>
@@ -1748,14 +1766,9 @@ function renderSessionSettingsOverlay(
                 <small id="session-settings-model-help" class="settings-field-help">このsessionで使用するModel IDです。</small>
               </div>
               <div class="settings-field">
-                <label for="session-settings-context-window">Context window <span class="inherited-badge" data-settings-passive="session-context-inherited-badge" ${projection.context_window_inherited ? "" : "hidden"}>継承中</span></label>
+                <label for="session-settings-context-window">moyAI local context budget <span class="inherited-badge" data-settings-passive="session-context-inherited-badge" ${projection.context_window_inherited ? "" : "hidden"}>継承中</span></label>
                 <input id="session-settings-context-window" class="session-settings-control" data-session-setting="context-window" inputmode="numeric" value="${escapeHtml(draft.contextWindow)}" placeholder="Preferencesを継承" aria-describedby="session-settings-context-window-help session-settings-status" ${fieldInvalid("contextWindow") ? 'aria-invalid="true"' : ""} ${providerDisabled ? "disabled" : ""} />
-                <small id="session-settings-context-window-help" class="settings-field-help" data-settings-passive="session-context-inherited-help">${escapeHtml(inheritedHelp(projection.context_window_inherited, "Context window"))}</small>
-              </div>
-              <div class="settings-field">
-                <label for="session-settings-max-output-tokens">Max output tokens <span class="inherited-badge" data-settings-passive="session-max-output-inherited-badge" ${projection.max_output_tokens_inherited ? "" : "hidden"}>継承中</span></label>
-                <input id="session-settings-max-output-tokens" class="session-settings-control" data-session-setting="max-output-tokens" inputmode="numeric" value="${escapeHtml(draft.maxOutputTokens)}" placeholder="Preferencesを継承" aria-describedby="session-settings-max-output-tokens-help session-settings-status" ${fieldInvalid("maxOutputTokens") ? 'aria-invalid="true"' : ""} ${providerDisabled ? "disabled" : ""} />
-                <small id="session-settings-max-output-tokens-help" class="settings-field-help" data-settings-passive="session-max-output-inherited-help">${escapeHtml(inheritedHelp(projection.max_output_tokens_inherited, "最大出力量"))}</small>
+                <small id="session-settings-context-window-help" class="settings-field-help" data-settings-passive="session-context-inherited-help">${escapeHtml(inheritedHelp(projection.context_window_inherited, "moyAI内の入力整理上限"))} Providerへは送信しません。</small>
               </div>
             </div>
           </section>
@@ -1821,12 +1834,9 @@ function renderProviderOverlay(
         <small id="provider-api-key-env-help" class="provider-url-help">API keyそのものではなく、起動環境に設定した環境変数名を入力します。認証不要なら空欄です。</small>
         <div class="provider-limit-grid">
           <div>
-            <label class="field-label" for="provider-context-window">Context window</label>
+            <label class="field-label" for="provider-context-window">moyAI local context budget</label>
             <input id="provider-context-window" inputmode="numeric" value="${escapeHtml(state.provider_context_window)}" />
-          </div>
-          <div>
-            <label class="field-label" for="provider-max-output-tokens">Max output tokens</label>
-            <input id="provider-max-output-tokens" inputmode="numeric" value="${escapeHtml(state.provider_max_output_tokens)}" />
+            <small class="provider-url-help">Providerへは送信せず、moyAI内の入力整理にだけ使用します。</small>
           </div>
         </div>
         <div class="split-actions">
@@ -2102,24 +2112,26 @@ function renderConfigOverlay(
             <section id="settings-model" class="settings-section" aria-labelledby="settings-model-title" aria-describedby="settings-model-help">
               <div>
                 <h3 id="settings-model-title">Model</h3>
-                <p id="settings-model-help">メインチャットLLMのcontext、出力量、sampling、対応capabilityを設定します。</p>
+                <p id="settings-model-help">moyAI内の入力整理とAPI機能を設定します。sampling / thinking / 出力量はホスティング側の設定をそのまま使用します。</p>
               </div>
               <div class="settings-grid-two">
-                ${renderConfigTextField(state, "model.context_window", "Context window", "number")}
-                ${renderConfigTextField(state, "model.max_output_tokens", "Max output tokens", "number")}
+                ${renderConfigTextField(
+                  state,
+                  "model.context_window",
+                  "moyAI local context budget",
+                  "number",
+                  "Providerへは送信せず、moyAI内の入力整理にだけ使用します。",
+                )}
                 ${renderConfigTextField(
                   state,
                   "model.request_timeout_ms",
-                  "LLM応答タイムアウト",
+                  "LLM応答無進捗タイムアウト",
                   "number",
-                  "最初の送信開始からstream完了までのLLM応答全体に適用する総上限です（ms）。",
+                  "応答headerまでの待機と、応答中のSSE event間の最大無進捗時間です（ms）。進捗中の総所要時間は制限せず、hostへも送信しません。",
                 )}
-                ${renderConfigTextField(state, "model.temperature", "Temperature", "number")}
-                ${renderConfigTextField(state, "model.top_p", "Top P", "number")}
               </div>
               <div class="settings-toggle-grid">
                 ${renderConfigToggleField(state, "model.supports_tools", "Tools")}
-                ${renderConfigToggleField(state, "model.supports_reasoning", "Reasoning")}
                 ${renderConfigToggleField(state, "model.supports_images", "Images")}
                 ${renderConfigToggleField(state, "model.parallel_tool_calls", "Parallel tool calls")}
               </div>
@@ -2230,7 +2242,10 @@ function renderConfigOverlay(
                 <div class="settings-raw-grid">
                   ${state.config_fields
                     .map((field, index) => ({ field, index }))
-                    .filter(({ field }) => !TYPED_CONFIG_KEYS.includes(field.key))
+                    .filter(({ field }) => (
+                      !TYPED_CONFIG_KEYS.includes(field.key)
+                      && !HOST_OWNED_MODEL_KEYS.has(field.key)
+                    ))
                     .map(({ field, index }) => renderRawConfigField(state, field, index))
                     .join("")}
                 </div>

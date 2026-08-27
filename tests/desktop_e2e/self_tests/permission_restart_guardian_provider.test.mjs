@@ -3,7 +3,6 @@ import crypto from "node:crypto";
 import test from "node:test";
 
 import {
-  SCRIPTED_PROVIDER_MAX_OUTPUT_TOKENS,
   SCRIPTED_PROVIDER_MODEL_ID,
   SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND,
   SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_MAX_RESPONSES,
@@ -83,7 +82,6 @@ function taskRequest(input) {
     tools: shellTools(),
     tool_choice: "auto",
     parallel_tool_calls: false,
-    max_output_tokens: SCRIPTED_PROVIDER_MAX_OUTPUT_TOKENS,
     store: false,
     stream: true,
   };
@@ -137,10 +135,8 @@ function guardianRequest(call, transform = (value) => value) {
     model: SCRIPTED_PROVIDER_MODEL_ID,
     instructions: GUARDIAN_INSTRUCTIONS,
     input: [userMessage(JSON.stringify(payload))],
-    max_output_tokens: 512,
     store: false,
     stream: true,
-    reasoning: { effort: "none" },
   };
 }
 
@@ -277,7 +273,7 @@ test("permission restart Guardian script serves native metadata and exact four-r
     ["guardian_continuation", true, "completed", 200],
   ]);
   assert.equal(responseRows[2].contract.role_evidence.payload.authority_matches, true);
-  assert.equal(responseRows[2].contract.reasoning_none, true);
+  assert.equal(responseRows[2].contract.reasoning_absent, true);
   assert.equal(responseRows[3].contract.role_evidence.tool_output_sha256, sha256(SHELL_OUTPUT));
 
   const resource = provider.resourceObservation();
@@ -342,6 +338,14 @@ test("permission restart Guardian script fails closed on order, replay, and evid
   ]));
   assert.equal(initial.status, 200);
   const exactCall = parseSse(await initial.text())[0].item;
+  const clientReasoningOverride = await post(drift, {
+    ...guardianRequest(exactCall),
+    reasoning: { effort: "none" },
+  });
+  assert.equal(clientReasoningOverride.status, 422);
+  assert.deepEqual(await clientReasoningOverride.json(), { error: "request_contract_mismatch" });
+  assert.equal(drift.requestLedger.at(-1).contract.role, "guardian_review");
+  assert.equal(drift.requestLedger.at(-1).contract.reasoning_absent, false);
   const drifted = await post(drift, guardianRequest(exactCall, (payload) => ({
     ...payload,
     task_context: JSON.stringify({

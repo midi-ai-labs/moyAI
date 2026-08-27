@@ -6809,6 +6809,52 @@ mod tests {
     }
 
     #[test]
+    fn plan_tool_call_identity_round_trips_through_turn_item_storage() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(connection);
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let call_id = crate::session::ToolCallId::new();
+        let turn_item = TurnItem {
+            id: TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 0,
+            payload: TurnItemPayload::Plan {
+                call_id: Some(call_id),
+                explanation: Some("stored plan".to_string()),
+                plan: Vec::new(),
+            },
+        };
+
+        store
+            .seed_turn_item_for_test(&turn_item)
+            .expect("turn item append");
+
+        let stored = store
+            .list_turn_items(session_id, turn_id)
+            .expect("stored turn item");
+        assert!(matches!(
+            stored.as_slice(),
+            [TurnItem {
+                payload: TurnItemPayload::Plan {
+                    call_id: Some(stored_call_id),
+                    explanation: Some(explanation),
+                    ..
+                },
+                ..
+            }] if *stored_call_id == call_id && explanation == "stored plan"
+        ));
+    }
+
+    #[test]
     fn recording_projection_rejects_atomic_owner_payloads_without_writing_any_stream() {
         let connection = Arc::new(Mutex::new(
             Connection::open_in_memory().expect("in-memory db"),

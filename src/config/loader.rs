@@ -12,12 +12,11 @@ use crate::config::merge::{
     apply_patch, normalize_provider_profile_alias, normalize_request_timeout_alias,
 };
 use crate::config::model::{
-    AccessMode, ChatCompletionsReasoningParameters, PartialDoclingConfig, PartialFileGuardConfig,
-    PartialFormatConfig, PartialInspectionConfig, PartialInstructionConfig, PartialLoggingConfig,
-    PartialMcpConfig, PartialModelConfig, PartialMultiAgentConfig, PartialPermissionsConfig,
-    PartialResolvedConfig, PartialSessionConfig, PartialShellConfig, PartialToolOutputConfig,
-    PartialWorkspaceConfig, ProviderApiMode, ProviderProfile, ReasoningEffort, ReasoningSummary,
-    ResolvedConfig,
+    AccessMode, PartialDoclingConfig, PartialFileGuardConfig, PartialFormatConfig,
+    PartialInspectionConfig, PartialInstructionConfig, PartialLoggingConfig, PartialMcpConfig,
+    PartialModelConfig, PartialMultiAgentConfig, PartialPermissionsConfig, PartialResolvedConfig,
+    PartialSessionConfig, PartialShellConfig, PartialToolOutputConfig, PartialWorkspaceConfig,
+    ProviderApiMode, ProviderProfile, ResolvedConfig,
 };
 use crate::error::ConfigError;
 
@@ -331,11 +330,9 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
             provider_profile: Some(config.model.provider_profile),
             provider_metadata_mode: None,
             provider_api_mode: None,
-            chat_completions_reasoning_parameters: config
-                .model
-                .chat_completions_reasoning_parameters,
-            reasoning_effort: config.model.reasoning_effort.clone(),
-            reasoning_summary: Some(config.model.reasoning_summary),
+            chat_completions_reasoning_parameters: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
             api_key_env: config.model.api_key_env.clone().map(Some),
             extra_headers: Some(config.model.extra_headers.clone()),
             request_timeout_ms: Some(config.model.request_timeout_ms),
@@ -343,20 +340,20 @@ fn default_config_patch(config: &ResolvedConfig) -> PartialResolvedConfig {
             connect_timeout_ms: Some(config.model.connect_timeout_ms),
             max_retries: Some(config.model.max_retries),
             context_window: Some(config.model.context_window),
-            max_output_tokens: Some(config.model.max_output_tokens),
-            temperature: config.model.temperature,
-            top_p: config.model.top_p,
-            top_k: config.model.top_k,
-            presence_penalty: config.model.presence_penalty,
-            frequency_penalty: config.model.frequency_penalty,
-            seed: config.model.seed,
-            stop_sequences: Some(config.model.stop_sequences.clone()),
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            stop_sequences: None,
             supports_tools: Some(config.model.supports_tools),
-            supports_reasoning: Some(config.model.supports_reasoning),
+            supports_reasoning: None,
             supports_images: Some(config.model.supports_images),
             parallel_tool_calls: Some(config.model.parallel_tool_calls),
             max_parallel_predictions: Some(config.model.max_parallel_predictions),
-            extra_body_json: config.model.extra_body_json.clone(),
+            extra_body_json: None,
         }),
         session: Some(PartialSessionConfig {
             overflow_margin_tokens: Some(config.session.overflow_margin_tokens),
@@ -434,7 +431,6 @@ fn validate_env_overrides() -> Result<(), ConfigError> {
         "MOYAI_MULTI_AGENT_ENABLED",
         "MOYAI_SHELL_HIDE_WINDOWS",
         "MOYAI_SUPPORTS_TOOLS",
-        "MOYAI_SUPPORTS_REASONING",
         "MOYAI_SUPPORTS_IMAGES",
         "MOYAI_PARALLEL_TOOL_CALLS",
         "MOYAI_INSPECTION_INCLUDE_HIDDEN",
@@ -457,7 +453,6 @@ fn validate_env_overrides() -> Result<(), ConfigError> {
         "MOYAI_REQUEST_TIMEOUT_MS",
         "MOYAI_STREAM_IDLE_TIMEOUT_MS",
         "MOYAI_CONNECT_TIMEOUT_MS",
-        "MOYAI_SEED",
         "MOYAI_MAX_INLINE_READ_BYTES",
         "MOYAI_LARGE_FILE_WARNING_BYTES",
         "MOYAI_DOCLING_TIMEOUT_MS",
@@ -465,23 +460,8 @@ fn validate_env_overrides() -> Result<(), ConfigError> {
         validate_parsed_env::<u64>(name)?;
     }
     validate_parsed_env::<u8>("MOYAI_MAX_RETRIES")?;
-    for name in [
-        "MOYAI_CONTEXT_WINDOW",
-        "MOYAI_MAX_OUTPUT_TOKENS",
-        "MOYAI_TOP_K",
-        "MOYAI_MAX_PARALLEL_PREDICTIONS",
-    ] {
+    for name in ["MOYAI_CONTEXT_WINDOW", "MOYAI_MAX_PARALLEL_PREDICTIONS"] {
         validate_parsed_env::<u32>(name)?;
-    }
-    for name in [
-        "MOYAI_TEMPERATURE",
-        "MOYAI_TOP_P",
-        "MOYAI_PRESENCE_PENALTY",
-        "MOYAI_FREQUENCY_PENALTY",
-    ] {
-        if let Some(value) = env_utf8(name)? {
-            validate_provider_float_env_value(name, &value)?;
-        }
     }
 
     validate_with("MOYAI_ACCESS_MODE", |value| {
@@ -499,21 +479,9 @@ fn validate_env_overrides() -> Result<(), ConfigError> {
     validate_with("MOYAI_PROVIDER_API_MODE", |value| {
         parse_provider_api_mode(value).is_some()
     })?;
-    validate_with("MOYAI_CHAT_COMPLETIONS_REASONING_PARAMETERS", |value| {
-        parse_chat_completions_reasoning_parameters(value).is_some()
-    })?;
-    validate_with("MOYAI_REASONING_EFFORT", |value| {
-        parse_reasoning_effort(value).is_some()
-    })?;
-    validate_with("MOYAI_REASONING_SUMMARY", |value| {
-        parse_reasoning_summary(value).is_some()
-    })?;
     for name in ["MOYAI_EXTRA_HEADERS", "MOYAI_DOCLING_HEADERS"] {
         validate_with(name, |value| parse_string_map_json(value).is_some())?;
     }
-    validate_with("MOYAI_EXTRA_BODY_JSON", |value| {
-        serde_json::from_str::<serde_json::Value>(value).is_ok()
-    })?;
     validate_with("MOYAI_MCP_SERVERS_JSON", |value| {
         serde_json::from_str::<Vec<crate::config::McpServerConfig>>(value).is_ok()
     })?;
@@ -532,7 +500,6 @@ fn validate_env_overrides() -> Result<(), ConfigError> {
     // behaving as if the variable were absent.
     for name in [
         "MOYAI_BASE_URL",
-        "MOYAI_STOP_SEQUENCES",
         "MOYAI_BLOCKED_READ_EXTENSIONS",
         "MOYAI_STRUCTURED_DOCUMENT_EXTENSIONS",
         "MOYAI_DOCLING_BASE_URL",
@@ -550,12 +517,6 @@ where
         value.parse::<T>().map_err(|_| invalid_env(name))?;
     }
     Ok(())
-}
-
-fn validate_provider_float_env_value(name: &str, value: &str) -> Result<(), ConfigError> {
-    let parsed = value.parse::<f64>().map_err(|_| invalid_env(name))?;
-    crate::config::model::validate_optional_provider_float(name, Some(parsed))
-        .map_err(|_| invalid_env(name))
 }
 
 fn validate_with(name: &str, validate: impl FnOnce(&str) -> bool) -> Result<(), ConfigError> {
@@ -640,13 +601,11 @@ fn env_patch() -> Result<PartialResolvedConfig, ConfigError> {
             patch.model.get_or_insert_default().provider_metadata_mode = Some(parsed);
         }
     }
-    apply_reasoning_env_overrides(
-        &mut patch,
-        env::var("MOYAI_PROVIDER_API_MODE").ok(),
-        env::var("MOYAI_CHAT_COMPLETIONS_REASONING_PARAMETERS").ok(),
-        env::var("MOYAI_REASONING_EFFORT").ok(),
-        env::var("MOYAI_REASONING_SUMMARY").ok(),
-    );
+    if let Ok(value) = env::var("MOYAI_PROVIDER_API_MODE")
+        && let Some(parsed) = parse_provider_api_mode(&value)
+    {
+        patch.model.get_or_insert_default().provider_api_mode = Some(parsed);
+    }
     if let Ok(value) = env::var("MOYAI_API_KEY_ENV") {
         patch.model.get_or_insert_default().api_key_env = Some(Some(value));
     }
@@ -675,58 +634,9 @@ fn env_patch() -> Result<PartialResolvedConfig, ConfigError> {
             patch.model.get_or_insert_default().context_window = Some(parsed);
         }
     }
-    if let Ok(value) = env::var("MOYAI_MAX_OUTPUT_TOKENS") {
-        if let Ok(parsed) = value.parse() {
-            patch.model.get_or_insert_default().max_output_tokens = Some(parsed);
-        }
-    }
-    if let Ok(value) = env::var("MOYAI_TEMPERATURE") {
-        if let Ok(parsed) = value.parse() {
-            patch.model.get_or_insert_default().temperature = Some(parsed);
-        }
-    }
-    if let Ok(value) = env::var("MOYAI_TOP_P") {
-        if let Ok(parsed) = value.parse() {
-            patch.model.get_or_insert_default().top_p = Some(parsed);
-        }
-    }
-    if let Ok(value) = env::var("MOYAI_TOP_K") {
-        if let Ok(parsed) = value.parse() {
-            patch.model.get_or_insert_default().top_k = Some(parsed);
-        }
-    }
-    if let Ok(value) = env::var("MOYAI_PRESENCE_PENALTY") {
-        if let Ok(parsed) = value.parse() {
-            patch.model.get_or_insert_default().presence_penalty = Some(parsed);
-        }
-    }
-    if let Ok(value) = env::var("MOYAI_FREQUENCY_PENALTY") {
-        if let Ok(parsed) = value.parse() {
-            patch.model.get_or_insert_default().frequency_penalty = Some(parsed);
-        }
-    }
-    if let Ok(value) = env::var("MOYAI_SEED") {
-        if let Ok(parsed) = value.parse() {
-            patch.model.get_or_insert_default().seed = Some(parsed);
-        }
-    }
-    if let Ok(value) = env::var("MOYAI_STOP_SEQUENCES") {
-        let parsed = value
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        patch.model.get_or_insert_default().stop_sequences = Some(parsed);
-    }
     if let Ok(value) = env::var("MOYAI_SUPPORTS_TOOLS") {
         if let Ok(parsed) = value.parse() {
             patch.model.get_or_insert_default().supports_tools = Some(parsed);
-        }
-    }
-    if let Ok(value) = env::var("MOYAI_SUPPORTS_REASONING") {
-        if let Ok(parsed) = value.parse() {
-            patch.model.get_or_insert_default().supports_reasoning = Some(parsed);
         }
     }
     if let Ok(value) = env::var("MOYAI_SUPPORTS_IMAGES") {
@@ -742,11 +652,6 @@ fn env_patch() -> Result<PartialResolvedConfig, ConfigError> {
     if let Ok(value) = env::var("MOYAI_MAX_PARALLEL_PREDICTIONS") {
         if let Ok(parsed) = value.parse() {
             patch.model.get_or_insert_default().max_parallel_predictions = Some(parsed);
-        }
-    }
-    if let Ok(value) = env::var("MOYAI_EXTRA_BODY_JSON") {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&value) {
-            patch.model.get_or_insert_default().extra_body_json = Some(parsed);
         }
     }
     if let Ok(value) = env::var("MOYAI_INSPECTION_MAX_DEPTH") {
@@ -882,38 +787,6 @@ fn apply_request_timeout_env_overrides(
     .map_err(ConfigError::Message)
 }
 
-fn apply_reasoning_env_overrides(
-    patch: &mut PartialResolvedConfig,
-    provider_api_mode: Option<String>,
-    chat_completions_reasoning_parameters: Option<String>,
-    reasoning_effort: Option<String>,
-    reasoning_summary: Option<String>,
-) {
-    if let Some(value) = provider_api_mode
-        && let Some(parsed) = parse_provider_api_mode(&value)
-    {
-        patch.model.get_or_insert_default().provider_api_mode = Some(parsed);
-    }
-    if let Some(value) = chat_completions_reasoning_parameters
-        && let Some(parsed) = parse_chat_completions_reasoning_parameters(&value)
-    {
-        patch
-            .model
-            .get_or_insert_default()
-            .chat_completions_reasoning_parameters = Some(parsed);
-    }
-    if let Some(value) = reasoning_effort
-        && let Some(parsed) = parse_reasoning_effort(&value)
-    {
-        patch.model.get_or_insert_default().reasoning_effort = Some(parsed);
-    }
-    if let Some(value) = reasoning_summary
-        && let Some(parsed) = parse_reasoning_summary(&value)
-    {
-        patch.model.get_or_insert_default().reasoning_summary = Some(parsed);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -962,12 +835,28 @@ mod tests {
         assert!(text.contains("provider_profile = \"lm_studio\""));
         assert!(!text.contains("provider_metadata_mode"));
         assert!(!text.contains("provider_api_mode"));
-        assert!(text.contains("reasoning_summary = \"none\""));
-        assert!(!text.contains("chat_completions_reasoning_parameters"));
-        assert!(!text.contains("reasoning_effort"));
+        for host_owned_key in [
+            "chat_completions_reasoning_parameters",
+            "reasoning_effort",
+            "reasoning_summary",
+            "max_output_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "presence_penalty",
+            "frequency_penalty",
+            "seed",
+            "stop_sequences",
+            "supports_reasoning",
+            "extra_body_json",
+        ] {
+            assert!(
+                !text.contains(host_owned_key),
+                "new config must not advertise the legacy host-owned key {host_owned_key}"
+            );
+        }
         assert!(text.contains("request_timeout_ms = 3600000"));
         assert!(!text.contains("stream_idle_timeout_ms"));
-        assert!(text.contains("max_output_tokens = 32768"));
         assert!(!text.contains("prompt_profile"));
         assert!(!text.contains("max_steps_per_turn"));
         assert!(text.contains("[docling]"));
@@ -1209,22 +1098,6 @@ mod tests {
                 "[model]\nrequest_timeout_ms = 3600001\n",
                 "model.request_timeout_ms",
             ),
-            (
-                "nan-temperature",
-                "[model]\ntemperature = nan\n",
-                "model.temperature",
-            ),
-            ("infinite-top-p", "[model]\ntop_p = inf\n", "model.top_p"),
-            (
-                "negative-infinite-presence-penalty",
-                "[model]\npresence_penalty = -inf\n",
-                "model.presence_penalty",
-            ),
-            (
-                "nan-frequency-penalty",
-                "[model]\nfrequency_penalty = nan\n",
-                "model.frequency_penalty",
-            ),
         ] {
             let path = Utf8PathBuf::from_path_buf(temp.path().join(format!("{name}.toml")))
                 .expect("utf8 path");
@@ -1234,6 +1107,108 @@ mod tests {
             let diagnostic = error.to_string();
             assert!(diagnostic.contains(field));
             assert!(diagnostic.contains(path.as_str()));
+        }
+    }
+
+    #[test]
+    fn legacy_generation_toml_fields_are_typed_but_runtime_inert() {
+        let text = r#"
+[model]
+context_window = 65536
+chat_completions_reasoning_parameters = "effort_and_summary"
+reasoning_effort = "high"
+reasoning_summary = "detailed"
+max_output_tokens = 1
+temperature = nan
+top_p = inf
+top_k = 0
+presence_penalty = -inf
+frequency_penalty = nan
+seed = 42
+stop_sequences = ["legacy-stop"]
+supports_reasoning = true
+extra_body_json = { chat_template_kwargs = { enable_thinking = false } }
+"#;
+        let parsed = parse_global_config_text(Utf8Path::new("legacy-generation.toml"), text)
+            .expect("well-typed legacy fields remain readable");
+        let encoded = toml::to_string(&parsed).expect("compatibility patch serializes");
+        for legacy_key in [
+            "chat_completions_reasoning_parameters",
+            "reasoning_effort",
+            "reasoning_summary",
+            "max_output_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "presence_penalty",
+            "frequency_penalty",
+            "seed",
+            "stop_sequences",
+            "supports_reasoning",
+            "extra_body_json",
+        ] {
+            assert!(
+                !encoded.contains(legacy_key),
+                "compatibility input must not be generated again: {legacy_key}"
+            );
+        }
+
+        let resolved = ConfigLoader::resolve_global_config_text_without_environment(
+            Utf8Path::new("legacy-generation.toml"),
+            text,
+        )
+        .expect("well-typed legacy generation config is accepted");
+        let defaults = ResolvedConfig::default();
+        assert_eq!(resolved.model.context_window, 65_536);
+        assert_eq!(
+            resolved.model.chat_completions_reasoning_parameters,
+            defaults.model.chat_completions_reasoning_parameters
+        );
+        assert_eq!(
+            resolved.model.reasoning_effort,
+            defaults.model.reasoning_effort
+        );
+        assert_eq!(
+            resolved.model.reasoning_summary,
+            defaults.model.reasoning_summary
+        );
+        assert_eq!(
+            resolved.model.max_output_tokens,
+            defaults.model.max_output_tokens
+        );
+        assert_eq!(resolved.model.temperature, defaults.model.temperature);
+        assert_eq!(resolved.model.top_p, defaults.model.top_p);
+        assert_eq!(resolved.model.top_k, defaults.model.top_k);
+        assert_eq!(
+            resolved.model.presence_penalty,
+            defaults.model.presence_penalty
+        );
+        assert_eq!(
+            resolved.model.frequency_penalty,
+            defaults.model.frequency_penalty
+        );
+        assert_eq!(resolved.model.seed, defaults.model.seed);
+        assert_eq!(resolved.model.stop_sequences, defaults.model.stop_sequences);
+        assert_eq!(
+            resolved.model.supports_reasoning,
+            defaults.model.supports_reasoning
+        );
+        assert_eq!(
+            resolved.model.extra_body_json,
+            defaults.model.extra_body_json
+        );
+
+        for invalid in [
+            "[model]\ntemperature = \"0.5\"\n",
+            "[model]\nmax_output_tokens = \"4096\"\n",
+            "[model]\nstop_sequences = [1]\n",
+            "[model]\nunknown_generation_knob = true\n",
+        ] {
+            ConfigLoader::resolve_global_config_text_without_environment(
+                Utf8Path::new("invalid-legacy-generation.toml"),
+                invalid,
+            )
+            .expect_err("wrong types and unknown keys must remain rejected");
         }
     }
 
@@ -1256,20 +1231,76 @@ mod tests {
     }
 
     #[test]
-    fn provider_float_environment_values_share_the_finite_runtime_contract() {
-        for name in [
-            "MOYAI_TEMPERATURE",
-            "MOYAI_TOP_P",
-            "MOYAI_PRESENCE_PENALTY",
-            "MOYAI_FREQUENCY_PENALTY",
-        ] {
-            assert!(validate_provider_float_env_value(name, "0.5").is_ok());
-            for non_finite in ["NaN", "inf", "-inf"] {
-                let error = validate_provider_float_env_value(name, non_finite)
-                    .expect_err("non-finite environment value must fail closed");
-                assert!(error.to_string().contains(name));
-            }
+    fn legacy_generation_environment_values_are_ignored_without_validation() {
+        const CHILD_MARKER: &str = "MOYAI_LEGACY_GENERATION_ENV_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let resolved = ConfigLoader::resolve_global_config_text_with_environment(
+                Utf8Path::new("legacy-generation-env.toml"),
+                "[model]\ncontext_window = 65536\n",
+            )
+            .expect("legacy generation environment values are not parsed");
+            let defaults = ResolvedConfig::default();
+            assert_eq!(resolved.model.context_window, 65_536);
+            assert_eq!(
+                resolved.model.max_output_tokens,
+                defaults.model.max_output_tokens
+            );
+            assert_eq!(resolved.model.temperature, defaults.model.temperature);
+            assert_eq!(resolved.model.top_p, defaults.model.top_p);
+            assert_eq!(resolved.model.top_k, defaults.model.top_k);
+            assert_eq!(
+                resolved.model.presence_penalty,
+                defaults.model.presence_penalty
+            );
+            assert_eq!(
+                resolved.model.frequency_penalty,
+                defaults.model.frequency_penalty
+            );
+            assert_eq!(resolved.model.seed, defaults.model.seed);
+            assert_eq!(resolved.model.stop_sequences, defaults.model.stop_sequences);
+            assert_eq!(
+                resolved.model.supports_reasoning,
+                defaults.model.supports_reasoning
+            );
+            assert_eq!(
+                resolved.model.extra_body_json,
+                defaults.model.extra_body_json
+            );
+            return;
         }
+
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test exe"));
+        command
+            .args([
+                "--exact",
+                "config::loader::tests::legacy_generation_environment_values_are_ignored_without_validation",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER, "1");
+        for (name, value) in [
+            ("MOYAI_CHAT_COMPLETIONS_REASONING_PARAMETERS", "not-a-mode"),
+            ("MOYAI_REASONING_EFFORT", ""),
+            ("MOYAI_REASONING_SUMMARY", "not-a-summary"),
+            ("MOYAI_MAX_OUTPUT_TOKENS", "not-an-integer"),
+            ("MOYAI_TEMPERATURE", "not-a-number"),
+            ("MOYAI_TOP_P", "not-a-number"),
+            ("MOYAI_TOP_K", "not-an-integer"),
+            ("MOYAI_PRESENCE_PENALTY", "not-a-number"),
+            ("MOYAI_FREQUENCY_PENALTY", "not-a-number"),
+            ("MOYAI_SEED", "not-an-integer"),
+            ("MOYAI_STOP_SEQUENCES", "legacy,values"),
+            ("MOYAI_SUPPORTS_REASONING", "not-a-boolean"),
+            ("MOYAI_EXTRA_BODY_JSON", "not-json"),
+        ] {
+            command.env(name, value);
+        }
+        let output = command.output().expect("isolated environment test");
+        assert!(
+            output.status.success(),
+            "isolated environment test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -1624,32 +1655,20 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_environment_overrides_are_typed_and_keep_model_capability_independent() {
+    fn legacy_provider_api_mode_environment_input_still_selects_the_connection_format() {
         let mut patch = PartialResolvedConfig::default();
-        apply_reasoning_env_overrides(
-            &mut patch,
-            Some("chat-completions".to_string()),
-            Some("effort-and-summary".to_string()),
-            Some("HIGH".to_string()),
-            Some("concise".to_string()),
-        );
+        patch.model.get_or_insert_default().provider_api_mode =
+            parse_provider_api_mode("chat-completions");
 
         let resolved = apply_patch(ResolvedConfig::default(), patch);
         assert_eq!(
             resolved.model.provider_profile,
             ProviderProfile::LmStudioChatCompletions
         );
-        assert_eq!(
-            resolved.model.chat_completions_reasoning_parameters,
-            Some(ChatCompletionsReasoningParameters::EffortAndSummary)
-        );
-        assert_eq!(resolved.model.reasoning_effort, Some(ReasoningEffort::High));
-        assert_eq!(resolved.model.reasoning_summary, ReasoningSummary::Concise);
-        assert!(!resolved.model.supports_reasoning);
     }
 
     #[test]
-    fn reasoning_environment_value_parsers_cover_supported_contracts() {
+    fn provider_api_mode_environment_parser_covers_legacy_connection_values() {
         assert_eq!(
             parse_provider_api_mode("auto"),
             Some(ProviderApiMode::Responses)
@@ -1658,32 +1677,7 @@ mod tests {
             parse_provider_api_mode("responses"),
             Some(ProviderApiMode::Responses)
         );
-        assert_eq!(
-            parse_chat_completions_reasoning_parameters("effort_only"),
-            Some(ChatCompletionsReasoningParameters::EffortOnly)
-        );
-        assert_eq!(
-            parse_chat_completions_reasoning_parameters("effort-and-summary"),
-            Some(ChatCompletionsReasoningParameters::EffortAndSummary)
-        );
-        assert_eq!(
-            parse_reasoning_effort("medium"),
-            Some(ReasoningEffort::Medium)
-        );
-        assert_eq!(
-            parse_reasoning_effort("provider_future_effort"),
-            Some(ReasoningEffort::Custom(
-                "provider_future_effort".to_string()
-            ))
-        );
-        assert_eq!(
-            parse_reasoning_summary("detailed"),
-            Some(ReasoningSummary::Detailed)
-        );
         assert_eq!(parse_provider_api_mode("invalid"), None);
-        assert_eq!(parse_chat_completions_reasoning_parameters("invalid"), None);
-        assert_eq!(parse_reasoning_effort("  "), None);
-        assert_eq!(parse_reasoning_summary("invalid"), None);
     }
 }
 
@@ -1712,45 +1706,6 @@ fn parse_provider_api_mode(value: &str) -> Option<ProviderApiMode> {
         "auto" => Some(ProviderApiMode::Responses),
         "chat_completions" | "chat-completions" | "chat" => Some(ProviderApiMode::ChatCompletions),
         "responses" | "response" => Some(ProviderApiMode::Responses),
-        _ => None,
-    }
-}
-
-fn parse_chat_completions_reasoning_parameters(
-    value: &str,
-) -> Option<ChatCompletionsReasoningParameters> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "effort_only" | "effort-only" | "effort" => {
-            Some(ChatCompletionsReasoningParameters::EffortOnly)
-        }
-        "effort_and_summary" | "effort-and-summary" | "summary" => {
-            Some(ChatCompletionsReasoningParameters::EffortAndSummary)
-        }
-        _ => None,
-    }
-}
-
-fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffort> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let normalized = trimmed.to_ascii_lowercase();
-    match normalized.as_str() {
-        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" => {
-            normalized.parse().ok()
-        }
-        "x_high" | "x-high" => Some(ReasoningEffort::XHigh),
-        _ => trimmed.parse().ok(),
-    }
-}
-
-fn parse_reasoning_summary(value: &str) -> Option<ReasoningSummary> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "none" => Some(ReasoningSummary::None),
-        "auto" => Some(ReasoningSummary::Auto),
-        "concise" => Some(ReasoningSummary::Concise),
-        "detailed" => Some(ReasoningSummary::Detailed),
         _ => None,
     }
 }

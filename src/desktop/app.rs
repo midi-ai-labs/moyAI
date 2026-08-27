@@ -28,8 +28,8 @@ use crate::config::{
 };
 use crate::error::{AppRunError, CliPromptError, CliRenderError, SessionError, StorageError};
 use crate::llm::{
-    ProviderModelInfo, apply_provider_model_info_to_config, extra_body_with_num_ctx,
-    fetch_provider_model_infos, normalize_provider_base_url,
+    ProviderModelInfo, apply_provider_model_info_to_config, fetch_provider_model_infos,
+    normalize_provider_base_url,
 };
 #[cfg(test)]
 use crate::protocol::TurnInterruptionCause;
@@ -2251,10 +2251,10 @@ mod command_projection_owner_tests {
         assert_eq!(candidate.model.context_window, global.model.context_window);
         assert_eq!(
             candidate.model.max_output_tokens,
-            global.model.max_output_tokens
+            crate::config::DEFAULT_MODEL_MAX_OUTPUT_TOKENS
         );
         assert_eq!(candidate.model.supports_tools, global.model.supports_tools);
-        assert_eq!(candidate.model.temperature, global.model.temperature);
+        assert_eq!(candidate.model.temperature, None);
         assert_eq!(
             candidate.permissions.access_mode,
             global.permissions.access_mode
@@ -2275,11 +2275,25 @@ mod command_projection_owner_tests {
         let values = DesktopController::load_initial_setup_config_toml_path(&path)
             .expect("validated initial-setup draft");
 
-        assert_eq!(values.len(), ConfigField::ALL.len());
-        for field in ConfigField::ALL {
+        let current_gui_fields = ConfigField::ALL
+            .into_iter()
+            .filter(|field| !field.is_host_owned_generation())
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), current_gui_fields.len());
+        for field in current_gui_fields {
             assert!(
                 values.iter().any(|(key, _)| key == field.label()),
-                "all current ConfigField values must be projected: {}",
+                "all current GUI ConfigField values must be projected: {}",
+                field.label()
+            );
+        }
+        for field in ConfigField::ALL
+            .into_iter()
+            .filter(|field| field.is_host_owned_generation())
+        {
+            assert!(
+                values.iter().all(|(key, _)| key != field.label()),
+                "host-owned generation field must not enter the imported GUI draft: {}",
                 field.label()
             );
         }
@@ -4026,7 +4040,7 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
-    async fn provider_limit_only_apply_does_not_require_a_catalog_reload() {
+    async fn provider_local_context_apply_does_not_require_a_catalog_reload() {
         let (_temp, _root, mut controller) = empty_access_test_controller().await;
         let baseline = controller
             .state
@@ -4035,14 +4049,12 @@ mod command_projection_owner_tests {
             .model
             .clone();
         let next_context_window = baseline.context_window.saturating_add(1);
-        let next_max_output_tokens = baseline.max_output_tokens.saturating_add(1);
 
         controller.accept_provider_action_input(
             baseline.base_url.clone(),
             baseline.provider_profile,
             baseline.api_key_env.clone().unwrap_or_default(),
             next_context_window.to_string(),
-            next_max_output_tokens.to_string(),
             baseline.model.clone(),
         );
 
@@ -4054,19 +4066,12 @@ mod command_projection_owner_tests {
         assert!(controller.apply_provider_session());
         let applied = &controller.state.provider_config.effective_config.model;
         assert_eq!(applied.context_window, next_context_window);
-        assert_eq!(applied.max_output_tokens, next_max_output_tokens);
-        assert_eq!(
-            applied
-                .extra_body_json
-                .as_ref()
-                .and_then(|value| value.get("num_ctx"))
-                .and_then(serde_json::Value::as_u64),
-            Some(u64::from(next_context_window))
-        );
+        assert_eq!(applied.max_output_tokens, baseline.max_output_tokens);
+        assert_eq!(applied.extra_body_json, None);
     }
 
     #[tokio::test]
-    async fn provider_manual_target_apply_clears_headers_without_catalog_evidence() {
+    async fn provider_manual_target_apply_clears_hidden_provider_state_without_catalog_evidence() {
         let (_temp, _root, mut controller) = empty_access_test_controller().await;
         controller
             .state
@@ -4099,7 +4104,6 @@ mod command_projection_owner_tests {
             ProviderProfile::OpenAiCompatible,
             String::new(),
             baseline.context_window.to_string(),
-            baseline.max_output_tokens.to_string(),
             baseline.model,
         );
 
@@ -4110,22 +4114,11 @@ mod command_projection_owner_tests {
         assert_eq!(applied.base_url, "http://127.0.0.1:8119");
         assert_eq!(applied.provider_profile, ProviderProfile::OpenAiCompatible);
         assert!(applied.extra_headers.is_empty());
-        assert!(
-            applied
-                .extra_body_json
-                .as_ref()
-                .is_some_and(|body| body.get("api_key").is_none())
-        );
-        assert!(
-            applied
-                .extra_body_json
-                .as_ref()
-                .is_some_and(|body| body.get("num_ctx").is_some())
-        );
+        assert_eq!(applied.extra_body_json, None);
     }
 
     #[tokio::test]
-    async fn provider_same_target_key_and_limit_edits_preserve_headers() {
+    async fn provider_same_target_key_and_local_context_edits_drop_legacy_generation_state() {
         let (_temp, _root, mut controller) = empty_access_test_controller().await;
         controller
             .state
@@ -4134,6 +4127,15 @@ mod command_projection_owner_tests {
             .model
             .extra_headers
             .insert("X-Provider-Tenant".to_string(), "tenant-a".to_string());
+        controller
+            .state
+            .provider_config
+            .effective_config
+            .model
+            .extra_body_json = Some(serde_json::json!({
+            "num_ctx": 8192,
+            "legacy_provider_option": true
+        }));
         let baseline = controller
             .state
             .provider_config
@@ -4146,7 +4148,6 @@ mod command_projection_owner_tests {
             baseline.provider_profile,
             "OPENAI_API_KEY".to_string(),
             baseline.context_window.saturating_add(1).to_string(),
-            baseline.max_output_tokens.to_string(),
             baseline.model,
         );
 
@@ -4159,6 +4160,7 @@ mod command_projection_owner_tests {
                 .map(String::as_str),
             Some("tenant-a")
         );
+        assert_eq!(applied.extra_body_json, None);
     }
 
     #[tokio::test]
@@ -4191,7 +4193,53 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
-    async fn provider_limit_only_apply_does_not_consume_stale_catalog_metadata() {
+    async fn provider_global_persistence_does_not_reapply_legacy_host_generation_fields() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let mut global = controller.state.global_config().clone();
+        global.model.max_output_tokens = 4_096;
+        global.model.temperature = Some(0.2);
+        global.model.top_p = Some(0.8);
+        global.model.top_k = Some(40);
+        global.model.supports_reasoning = true;
+        global.model.extra_body_json = Some(serde_json::json!({
+            "chat_template_kwargs": { "enable_thinking": false }
+        }));
+        controller.state.replace_global_config(global.clone());
+        let mut provider_selection = global.clone();
+        provider_selection.model.max_output_tokens = 8_192;
+        provider_selection.model.temperature = Some(0.9);
+        provider_selection.model.top_p = Some(0.95);
+        provider_selection.model.top_k = Some(80);
+        provider_selection.model.supports_reasoning = false;
+        provider_selection.model.extra_body_json = None;
+
+        let candidate = controller
+            .provider_config_persistence_candidate(&provider_selection)
+            .expect("provider persistence candidate");
+        let resolved = candidate
+            .build_resolved_config(&global)
+            .expect("resolved provider persistence candidate");
+        let defaults = ResolvedConfig::default();
+
+        assert_eq!(
+            resolved.model.max_output_tokens,
+            defaults.model.max_output_tokens
+        );
+        assert_eq!(resolved.model.temperature, defaults.model.temperature);
+        assert_eq!(resolved.model.top_p, defaults.model.top_p);
+        assert_eq!(resolved.model.top_k, defaults.model.top_k);
+        assert_eq!(
+            resolved.model.supports_reasoning,
+            defaults.model.supports_reasoning
+        );
+        assert_eq!(
+            resolved.model.extra_body_json,
+            defaults.model.extra_body_json
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_local_context_apply_does_not_consume_stale_catalog_metadata() {
         let (_temp, _root, mut controller) = empty_access_test_controller().await;
         let baseline = controller
             .state
@@ -4205,7 +4253,6 @@ mod command_projection_owner_tests {
             baseline.provider_profile,
             baseline.api_key_env.clone().unwrap_or_default(),
             baseline.context_window.to_string(),
-            baseline.max_output_tokens.to_string(),
             baseline.model.clone(),
         );
         controller
@@ -4234,7 +4281,6 @@ mod command_projection_owner_tests {
             baseline.provider_profile,
             baseline.api_key_env.clone().unwrap_or_default(),
             baseline.context_window.saturating_add(1).to_string(),
-            baseline.max_output_tokens.saturating_add(1).to_string(),
             baseline.model.clone(),
         );
 
@@ -4250,7 +4296,7 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
-    async fn provider_limit_only_apply_preserves_metadata_from_the_effective_config() {
+    async fn provider_local_context_apply_preserves_metadata_from_the_effective_config() {
         let (_temp, _root, mut controller) = empty_access_test_controller().await;
         let baseline = controller
             .state
@@ -4281,7 +4327,6 @@ mod command_projection_owner_tests {
             baseline.provider_profile,
             baseline.api_key_env.clone().unwrap_or_default(),
             baseline.context_window.saturating_add(1).to_string(),
-            baseline.max_output_tokens.saturating_add(1).to_string(),
             baseline.model.clone(),
         );
 
@@ -8650,7 +8695,6 @@ fn side_chat_request_profile(binding: &SideChatBinding) -> SideChatRequestProfil
         connect_timeout_ms: binding.connect_timeout_ms,
         max_retries: binding.max_retries,
         context_window: binding.context_window,
-        max_output_tokens: binding.max_output_tokens,
         // Side-chat provider credentials are deliberately isolated from the main task target.
         // A future credential surface must persist its own reference rather than inheriting the
         // main provider's environment variable or request headers.
@@ -9147,7 +9191,6 @@ impl DesktopController {
         model_config.api_key_env = None;
         model_config.extra_headers.clear();
         model_config.supports_tools = false;
-        model_config.supports_reasoning = false;
         model_config.supports_images = false;
         model_config.parallel_tool_calls = false;
         let target =
@@ -11400,7 +11443,6 @@ impl DesktopController {
         profile: ProviderProfile,
         api_key_env: String,
         context_window: String,
-        max_output_tokens: String,
         selected_model_id: String,
     ) {
         let target_changed = self.state.accept_provider_action_input(
@@ -11408,7 +11450,6 @@ impl DesktopController {
             profile,
             api_key_env,
             context_window,
-            max_output_tokens,
             selected_model_id,
         );
         if target_changed {
@@ -11453,7 +11494,7 @@ impl DesktopController {
     pub(crate) fn apply_provider_session(&mut self) -> bool {
         if !self.state.can_apply_provider_selection() {
             self.state.set_status_message(
-                "enter a valid provider URL, connection type, limits, and model before applying",
+                "enter a valid provider URL, connection type, local context budget, and model before applying",
             );
             return false;
         }
@@ -11473,7 +11514,7 @@ impl DesktopController {
     pub(crate) fn save_provider_global(&mut self) -> bool {
         if !self.state.can_save_provider_selection_global() {
             self.state.set_status_message(
-                "enter a valid provider URL, connection type, limits, and model before saving",
+                "enter a valid provider URL, connection type, local context budget, and model before saving",
             );
             return false;
         }
@@ -12018,11 +12059,7 @@ impl DesktopController {
             && patch.model.is_none()
             && patch.base_url.is_none()
             && !patch.reset_model_parameters
-            && patch.temperature.is_none()
-            && patch.top_p.is_none()
-            && patch.top_k.is_none()
-            && patch.context_window.is_none()
-            && patch.max_output_tokens.is_none();
+            && patch.context_window.is_none();
         let config_generation_delta = self
             .state
             .root_session_settings_config_generation_delta(&current, &patch);
@@ -12087,6 +12124,7 @@ impl DesktopController {
             .map_err(|error| error.to_string())?;
         Ok(ConfigField::ALL
             .into_iter()
+            .filter(|field| !field.is_host_owned_generation())
             .map(|field| (field.label().to_string(), field.value(&config)))
             .collect())
     }
@@ -12452,23 +12490,12 @@ impl DesktopController {
                 return None;
             }
         };
-        let max_output_tokens = match parse_provider_limit_input(
-            "max_output_tokens",
-            &self.state.provider_config.provider_max_output_tokens_input,
-        ) {
-            Ok(value) => value,
-            Err(message) => {
-                self.state.set_status_message(message);
-                return None;
-            }
-        };
         let baseline_model = &baseline.model;
         let connection_target_changed = normalize_provider_base_url(&baseline_model.base_url)
             != base_url
             || baseline_model.provider_profile != self.state.provider_config.provider_profile_input;
-        let limit_only_update = input_matches_baseline
-            && (context_window != baseline_model.context_window
-                || max_output_tokens != baseline_model.max_output_tokens);
+        let limit_only_update =
+            input_matches_baseline && context_window != baseline_model.context_window;
         let mut hydrated_model_config = baseline_model.clone();
         hydrated_model_config.base_url = base_url.clone();
         hydrated_model_config.model = model.clone();
@@ -12477,7 +12504,6 @@ impl DesktopController {
             non_empty_trimmed_owned(&self.state.provider_config.provider_api_key_env_input);
         if connection_target_changed {
             hydrated_model_config.extra_headers.clear();
-            hydrated_model_config.extra_body_json = None;
         }
         if self.state.provider_catalog_owns_current_target()
             && !limit_only_update
@@ -12486,11 +12512,6 @@ impl DesktopController {
             apply_provider_model_info_to_config(&mut hydrated_model_config, info);
         }
         hydrated_model_config.context_window = context_window;
-        hydrated_model_config.max_output_tokens = max_output_tokens;
-        hydrated_model_config.extra_body_json = Some(extra_body_with_num_ctx(
-            hydrated_model_config.extra_body_json.clone(),
-            context_window,
-        ));
         Some(PartialResolvedConfig {
             model: Some(PartialModelConfig {
                 base_url: Some(base_url),
@@ -12499,13 +12520,10 @@ impl DesktopController {
                 api_key_env: Some(hydrated_model_config.api_key_env.clone()),
                 extra_headers: Some(hydrated_model_config.extra_headers.clone()),
                 context_window: Some(hydrated_model_config.context_window),
-                max_output_tokens: Some(hydrated_model_config.max_output_tokens),
                 supports_tools: Some(hydrated_model_config.supports_tools),
-                supports_reasoning: Some(hydrated_model_config.supports_reasoning),
                 supports_images: Some(hydrated_model_config.supports_images),
                 parallel_tool_calls: Some(hydrated_model_config.parallel_tool_calls),
                 max_parallel_predictions: Some(hydrated_model_config.max_parallel_predictions),
-                extra_body_json: hydrated_model_config.extra_body_json.clone(),
                 ..PartialModelConfig::default()
             }),
             ..PartialResolvedConfig::default()
@@ -12558,16 +12576,8 @@ impl DesktopController {
                     config.model.context_window.to_string(),
                 ),
                 (
-                    ConfigField::MaxOutputTokens.label().to_string(),
-                    config.model.max_output_tokens.to_string(),
-                ),
-                (
                     ConfigField::SupportsTools.label().to_string(),
                     config.model.supports_tools.to_string(),
-                ),
-                (
-                    ConfigField::SupportsReasoning.label().to_string(),
-                    config.model.supports_reasoning.to_string(),
                 ),
                 (
                     ConfigField::SupportsImages.label().to_string(),
@@ -12580,15 +12590,6 @@ impl DesktopController {
                 (
                     ConfigField::MaxParallelPredictions.label().to_string(),
                     config.model.max_parallel_predictions.to_string(),
-                ),
-                (
-                    ConfigField::ExtraBodyJson.label().to_string(),
-                    config
-                        .model
-                        .extra_body_json
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .unwrap_or_default(),
                 ),
             ],
         )
@@ -15343,6 +15344,7 @@ fn provider_catalog_probe_config(
     config.model.base_url = base_url;
     config.model.provider_profile = provider_profile;
     config.model.api_key_env = api_key_env;
+    config.model.clear_legacy_generation_settings();
     config
 }
 
@@ -15763,7 +15765,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_catalog_probe_preserves_hidden_headers_only_for_the_same_target() {
+    fn provider_catalog_probe_preserves_headers_but_not_legacy_generation_state_for_same_target() {
         let mut config = ResolvedConfig::default();
         config.model.base_url = "http://127.0.0.1:8110/v1/".to_string();
         config.model.provider_profile = ProviderProfile::OpenAiCompatible;
@@ -15780,10 +15782,7 @@ mod tests {
             None,
         );
         assert_eq!(same_target.model.extra_headers, config.model.extra_headers);
-        assert_eq!(
-            same_target.model.extra_body_json,
-            config.model.extra_body_json
-        );
+        assert_eq!(same_target.model.extra_body_json, None);
 
         let changed_profile = provider_catalog_probe_config(
             config,

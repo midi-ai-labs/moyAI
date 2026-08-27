@@ -54,6 +54,14 @@ impl ConfigEditorState {
         }
     }
 
+    pub fn from_tui_config(config: &ResolvedConfig) -> Self {
+        let mut editor = Self::from_config(config);
+        editor
+            .fields
+            .retain(|field| !field.key.is_host_owned_generation());
+        editor
+    }
+
     pub fn from_config_values(
         config: &ResolvedConfig,
         values: Vec<(String, String)>,
@@ -430,8 +438,8 @@ mod tests {
     }
 
     #[test]
-    fn config_editor_excludes_removed_model_behavior_guards() {
-        let editor = ConfigEditorState::from_config(&ResolvedConfig::default());
+    fn config_editor_excludes_host_owned_generation_settings() {
+        let editor = ConfigEditorState::from_tui_config(&ResolvedConfig::default());
         let labels = editor
             .fields
             .iter()
@@ -440,6 +448,26 @@ mod tests {
 
         assert!(!labels.contains(&"model.prompt_profile"));
         assert!(!labels.contains(&"session.max_steps_per_turn"));
+        for field in ConfigField::ALL
+            .into_iter()
+            .filter(|field| field.is_host_owned_generation())
+        {
+            assert!(
+                !labels.contains(&field.label()),
+                "{} must not be editable in the TUI",
+                field.label()
+            );
+        }
+        for absent_legacy_key in [
+            "model.reasoning_effort",
+            "model.reasoning_summary",
+            "model.chat_completions_reasoning_parameters",
+        ] {
+            assert!(
+                !labels.contains(&absent_legacy_key),
+                "{absent_legacy_key} must not become a TUI field"
+            );
+        }
     }
 
     #[test]
@@ -459,8 +487,18 @@ mod tests {
             .expect("canonical LLM response timeout field");
 
         assert_eq!(response_timeout.value, "3600000");
-        assert_eq!(response_timeout.key.display_label(), "LLM response timeout");
-        assert!(response_timeout.key.help().contains("stream完了"));
+        assert_eq!(
+            response_timeout.key.display_label(),
+            "LLM response inactivity timeout"
+        );
+        assert!(
+            response_timeout
+                .key
+                .help()
+                .contains("SSE event間の最大無進捗時間")
+        );
+        assert!(response_timeout.key.help().contains("総所要時間は制限せず"));
+        assert!(response_timeout.key.help().contains("hostへも送信しません"));
         assert!(
             editor
                 .fields
@@ -519,19 +557,16 @@ mod tests {
     }
 
     #[test]
-    fn complete_session_candidate_preserves_explicit_optional_absence() {
+    fn complete_session_candidate_discards_hidden_host_generation_values() {
         let mut base = ResolvedConfig::default();
         base.model.temperature = Some(0.7);
         base.model.extra_body_json = Some(serde_json::json!({"num_ctx": 32768}));
         let candidate = ConfigEditorState::from_config_values(
             &base,
-            vec![
-                (ConfigField::Temperature.label().to_string(), String::new()),
-                (
-                    ConfigField::ExtraBodyJson.label().to_string(),
-                    String::new(),
-                ),
-            ],
+            vec![(
+                ConfigField::Model.label().to_string(),
+                "changed-model".to_string(),
+            )],
         )
         .expect("complete config values");
 
@@ -541,7 +576,7 @@ mod tests {
 
         assert_eq!(resolved.model.temperature, None);
         assert_eq!(resolved.model.extra_body_json, None);
-        assert_eq!(resolved.model.model, base.model.model);
+        assert_eq!(resolved.model.model, "changed-model");
     }
 
     #[test]
@@ -1021,10 +1056,6 @@ mod tests {
             (ConfigField::MaxParallelPredictions, "0"),
             (ConfigField::MultiAgentMaxAgents, "0"),
             (ConfigField::MultiAgentMaxModelRequests, "0"),
-            (ConfigField::Temperature, "NaN"),
-            (ConfigField::TopP, "inf"),
-            (ConfigField::PresencePenalty, "-inf"),
-            (ConfigField::FrequencyPenalty, "NaN"),
         ] {
             std::fs::write(&path, sentinel).expect("reset config sentinel");
             let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
@@ -1107,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn clearing_dirty_optional_field_removes_only_that_override() {
+    fn saving_visible_field_preserves_hidden_generation_override() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
             .expect("utf8 temp path");
@@ -1117,20 +1148,20 @@ mod tests {
         )
         .expect("seed config");
         let mut editor = ConfigEditorState::from_config(&ResolvedConfig::default());
-        let temperature = editor
+        let model = editor
             .fields
             .iter_mut()
-            .find(|field| field.key == ConfigField::Temperature)
-            .expect("temperature field");
-        temperature.value.clear();
-        temperature.dirty = true;
+            .find(|field| field.key == ConfigField::Model)
+            .expect("model field");
+        model.value = "changed-model".to_string();
+        model.dirty = true;
 
-        save_config_sections(&path, &editor).expect("clear temperature override");
+        save_config_sections(&path, &editor).expect("save visible field");
 
         let saved = std::fs::read_to_string(&path).expect("read saved config");
         let saved: toml::Value = toml::from_str(&saved).expect("parse saved config");
-        assert!(saved["model"].get("temperature").is_none());
-        assert_eq!(saved["model"]["model"].as_str(), Some("keep-model"));
+        assert_eq!(saved["model"]["temperature"].as_float(), Some(0.7));
+        assert_eq!(saved["model"]["model"].as_str(), Some("changed-model"));
     }
 
     #[test]

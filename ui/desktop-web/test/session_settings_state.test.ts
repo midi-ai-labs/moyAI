@@ -31,7 +31,6 @@ const VALUES: SessionSettingsDraft = {
   providerProfile: "openai_compatible",
   apiKeyEnv: "",
   contextWindow: "32768",
-  maxOutputTokens: "4096",
   accessMode: "default",
 };
 
@@ -61,16 +60,13 @@ test("session draft owns baseline, dirty state, and typed local validation for o
   assert.equal(sessionSettingsApplyEnabled(state), false);
 });
 
-test("validation accepts inherited empty limits, Rust integer bounds, and the three access modes", () => {
+test("validation accepts an inherited local context budget, Rust integer bounds, and the three access modes", () => {
   assert.equal(validateSessionSettingsDraft({ ...VALUES, contextWindow: "" }).ok, true);
-  assert.equal(validateSessionSettingsDraft({ ...VALUES, maxOutputTokens: "" }).ok, true);
   assert.equal(validateSessionSettingsDraft({ ...VALUES, contextWindow: "0" }).invalidField, "contextWindow");
   assert.equal(
     validateSessionSettingsDraft({ ...VALUES, contextWindow: "4294967296" }).invalidField,
     "contextWindow",
   );
-  assert.equal(validateSessionSettingsDraft({ ...VALUES, maxOutputTokens: "-1" }).invalidField, "maxOutputTokens");
-  assert.equal(validateSessionSettingsDraft({ ...VALUES, maxOutputTokens: "0" }).ok, true);
   assert.equal(validateSessionSettingsDraft({ ...VALUES, accessMode: "auto_review" }).ok, true);
   assert.equal(validateSessionSettingsDraft({ ...VALUES, accessMode: "full_access" }).ok, true);
   assert.equal(validateSessionSettingsDraft({
@@ -83,13 +79,11 @@ test("clearing a numeric override remains a valid dirty payload for Rust to rest
   const state = createSessionSettingsState();
   reconcileSessionSettings(state, TARGET, VALUES);
   assert.equal(updateSessionSettingsDraft(state, TARGET, "contextWindow", ""), true);
-  assert.equal(updateSessionSettingsDraft(state, TARGET, "maxOutputTokens", ""), true);
   assert.equal(state.validation?.ok, true);
   assert.equal(sessionSettingsApplyEnabled(state), true);
   const request = beginSessionSettingsMutation(state, TARGET);
   assert.ok(request);
   assert.equal(request.draft.contextWindow, "");
-  assert.equal(request.draft.maxOutputTokens, "");
 });
 
 test("stale input targets cannot edit another root or another settings revision", () => {

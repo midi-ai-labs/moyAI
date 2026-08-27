@@ -4,17 +4,14 @@ model = "qwen/qwen3.6-27b"
 provider_profile = "lm_studio"
 # Optional: name of an environment variable that contains the API key.
 # api_key_env = "OPENAI_API_KEY"
-reasoning_summary = "none"
 connect_timeout_ms = 10000
 request_timeout_ms = 3600000
 max_retries = 2
 context_window = 131072
-max_output_tokens = 32768
 supports_tools = true
 supports_images = true
-
-[model.extra_body_json]
-num_ctx = 131072
+# context_window is used only for moyAI's local input accounting and compaction.
+# Sampling, thinking, stop, output length, and provider-specific generation settings are configured on the host.
 
 [permissions]
 # default = ask for approval, auto_review = let the AI guardian decide,

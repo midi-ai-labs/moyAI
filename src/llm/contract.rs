@@ -181,84 +181,6 @@ impl ReasoningRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ValidatedChatCompletionsReasoningRequest {
-    pub effort: Option<ReasoningEffort>,
-    pub summary: Option<ReasoningSummary>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ValidatedResponsesReasoningRequest {
-    pub effort: Option<ReasoningEffort>,
-    pub summary: Option<ReasoningSummary>,
-}
-
-pub(crate) fn validate_chat_completions_reasoning_request(
-    request: Option<&ReasoningRequest>,
-    capability: ProviderReasoningCapability,
-) -> Result<Option<ValidatedChatCompletionsReasoningRequest>, LlmError> {
-    let Some(request) = request.filter(|request| !request.is_disabled()) else {
-        return Ok(None);
-    };
-
-    match capability {
-        ProviderReasoningCapability::Unsupported => Err(LlmError::Message(
-            "reasoning parameters were requested for a provider that does not advertise a typed reasoning request contract"
-                .to_string(),
-        )),
-        ProviderReasoningCapability::ChatCompletions { parameters } => {
-            if request.summary != ReasoningSummary::None && !parameters.supports_summary() {
-                return Err(LlmError::Message(
-                    "reasoning summary was requested for a Chat Completions provider that supports effort only"
-                        .to_string(),
-                ));
-            }
-            Ok(Some(ValidatedChatCompletionsReasoningRequest {
-                effort: request.effort.clone(),
-                summary: (request.summary != ReasoningSummary::None).then_some(request.summary),
-            }))
-        }
-        ProviderReasoningCapability::Responses { .. } => Err(LlmError::Message(
-            "Responses reasoning capability cannot be used with the Chat Completions transport"
-                .to_string(),
-        )),
-    }
-}
-
-pub(crate) fn validate_responses_reasoning_request(
-    request: Option<&ReasoningRequest>,
-    capability: ProviderReasoningCapability,
-) -> Result<Option<ValidatedResponsesReasoningRequest>, LlmError> {
-    let Some(request) = request.filter(|request| !request.is_disabled()) else {
-        return Ok(None);
-    };
-
-    match capability {
-        ProviderReasoningCapability::Unsupported => Err(LlmError::Message(
-            "reasoning parameters were requested for a provider that does not advertise a typed reasoning request contract"
-                .to_string(),
-        )),
-        ProviderReasoningCapability::ChatCompletions { .. } => Err(LlmError::Message(
-            "Chat Completions reasoning capability cannot be used with the Responses transport"
-                .to_string(),
-        )),
-        ProviderReasoningCapability::Responses {
-            supports_summary, ..
-        } => {
-            if request.summary != ReasoningSummary::None && !supports_summary {
-                return Err(LlmError::Message(
-                    "reasoning summary was requested for a Responses provider that does not advertise summary support"
-                        .to_string(),
-                ));
-            }
-            Ok(Some(ValidatedResponsesReasoningRequest {
-                effort: request.effort.clone(),
-                summary: (request.summary != ReasoningSummary::None).then_some(request.summary),
-            }))
-        }
-    }
-}
-
 impl ChatRequest {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -318,14 +240,6 @@ impl ChatRequest {
     #[cfg(test)]
     pub(crate) fn replace_extra_headers(&mut self, headers: BTreeMap<String, String>) {
         self.extra_headers = headers;
-    }
-
-    pub fn effective_max_output_tokens(&self) -> u32 {
-        effective_max_output_tokens_for_request(self).0
-    }
-
-    pub fn output_budget_reason(&self) -> &'static str {
-        effective_max_output_tokens_for_request(self).1
     }
 
     pub fn validate_provider_lifecycle(&self) -> Result<(), LlmError> {
@@ -600,10 +514,6 @@ impl Write for BoundedJsonBuffer {
     }
 }
 
-pub fn effective_max_output_tokens_for_request(request: &ChatRequest) -> (u32, &'static str) {
-    (request.model.max_output_tokens, "configured_model_limit")
-}
-
 pub fn effective_parallel_tool_calls(
     tool_surface_len: usize,
     parallel_tool_calls_enabled: bool,
@@ -760,14 +670,10 @@ pub trait LlmClient: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatRequest, LlmResponseSummary, ModelCapabilities, ModelMessage, ModelProfile,
-        ReasoningRequest, ToolSchema, validate_chat_completions_reasoning_request,
-        validate_responses_reasoning_request, validate_toolless_text_response,
+        ChatRequest, LlmResponseSummary, ModelCapabilities, ModelMessage, ModelProfile, ToolSchema,
+        validate_toolless_text_response,
     };
-    use crate::config::model::{
-        ChatCompletionsReasoningParameters, ProviderReasoningCapability, ReasoningEffort,
-        ReasoningSummary,
-    };
+    use crate::config::model::ProviderReasoningCapability;
     use crate::config::{
         ProviderDeadlines, ProviderProfile, ProviderRequestLimits, ProviderTarget,
     };
@@ -1052,119 +958,5 @@ mod tests {
             validate_toolless_text_response("test operation", &summary, true),
             Err(LlmError::ToollessTextShape { .. })
         ));
-    }
-
-    #[test]
-    fn disabled_reasoning_request_is_omitted_for_every_provider_capability() {
-        let disabled = ReasoningRequest::default();
-        for capability in [
-            ProviderReasoningCapability::Unsupported,
-            ProviderReasoningCapability::ChatCompletions {
-                parameters: ChatCompletionsReasoningParameters::EffortOnly,
-            },
-            ProviderReasoningCapability::Responses {
-                supports_summary: true,
-            },
-        ] {
-            assert!(
-                validate_chat_completions_reasoning_request(Some(&disabled), capability)
-                    .expect("disabled reasoning must not require provider support")
-                    .is_none()
-            );
-        }
-    }
-
-    #[test]
-    fn reasoning_request_requires_an_explicit_compatible_provider_contract() {
-        let effort = ReasoningRequest {
-            effort: Some(ReasoningEffort::Medium),
-            summary: ReasoningSummary::None,
-        };
-        assert!(
-            validate_chat_completions_reasoning_request(
-                Some(&effort),
-                ProviderReasoningCapability::Unsupported,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_chat_completions_reasoning_request(
-                Some(&effort),
-                ProviderReasoningCapability::Responses {
-                    supports_summary: true,
-                },
-            )
-            .is_err()
-        );
-
-        let validated = validate_chat_completions_reasoning_request(
-            Some(&effort),
-            ProviderReasoningCapability::ChatCompletions {
-                parameters: ChatCompletionsReasoningParameters::EffortOnly,
-            },
-        )
-        .expect("typed Chat Completions reasoning")
-        .expect("enabled request");
-        assert_eq!(validated.effort, Some(ReasoningEffort::Medium));
-        assert_eq!(validated.summary, None);
-    }
-
-    #[test]
-    fn effort_only_chat_contract_rejects_reasoning_summary() {
-        let request = ReasoningRequest {
-            effort: Some(ReasoningEffort::High),
-            summary: ReasoningSummary::Concise,
-        };
-        assert!(
-            validate_chat_completions_reasoning_request(
-                Some(&request),
-                ProviderReasoningCapability::ChatCompletions {
-                    parameters: ChatCompletionsReasoningParameters::EffortOnly,
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_chat_completions_reasoning_request(
-                Some(&request),
-                ProviderReasoningCapability::ChatCompletions {
-                    parameters: ChatCompletionsReasoningParameters::EffortAndSummary,
-                },
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn responses_reasoning_contract_validates_summary_support() {
-        let request = ReasoningRequest {
-            effort: Some(ReasoningEffort::High),
-            summary: ReasoningSummary::Concise,
-        };
-        assert!(
-            validate_responses_reasoning_request(
-                Some(&request),
-                ProviderReasoningCapability::Responses {
-                    supports_summary: true,
-                },
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_responses_reasoning_request(
-                Some(&request),
-                ProviderReasoningCapability::Responses {
-                    supports_summary: false,
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_responses_reasoning_request(
-                Some(&request),
-                ProviderReasoningCapability::Unsupported,
-            )
-            .is_err()
-        );
     }
 }

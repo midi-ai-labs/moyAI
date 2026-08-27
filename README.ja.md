@@ -156,11 +156,11 @@ Windows の既定 config path:
 %APPDATA%\midi-ai-labs\moyai\config\config.toml
 ```
 
-Desktop、TUI、CLIは同じuser-wide baselineを参照します。Desktopのroot sessionには完全なprovider接続（接続方式、URL、model、任意のAPI key環境変数名、custom header）、context window、max output、access modeを別途保存でき、sessionを開き直した場合も復元されます。provider / model / context / outputの変更はApply後にadmitされるturnから反映します。commit済みaccess modeは、既に実行中のroot / childを含む次のpermission decisionから反映しますが、表示中のpending decisionとadmit済みeffectは元のpolicyを維持します。
+Desktop、TUI、CLIは同じuser-wide baselineを参照します。Desktopのroot sessionには完全なprovider接続（接続方式、URL、model、任意のAPI key環境変数名、custom header）、moyAI local context budget、access modeを別途保存でき、sessionを開き直した場合も復元されます。provider / model / local context budgetの変更はApply後にadmitされるturnから反映します。commit済みaccess modeは、既に実行中のroot / childを含む次のpermission decisionから反映しますが、表示中のpending decisionとadmit済みeffectは元のpolicyを維持します。
 
 Initial SetupのTOML ImportはFinishまでread-onlyです。選択したfileをenvironment override適用前の値としてstrictにparseし、wizardのlocal draftへ取り込みますが、source fileとcurrent global configは変更しません。validation済みdraftをFinishで正常に保存した場合だけ、初回setup requirementを解除します。通常stepに出ないtyped fieldはcollapsed Advancedから編集でき、該当fieldの修正が必要な場合はその導線を開きます。
 
-Session Settingsの **Context window** または **Maximum output** を空欄にすると、そのroot-session overrideを解除してglobal値を継承します。空欄は、そのfieldが許可する明示的な`0`とは区別します。片方のlimitを解除しても、sessionの他のmodel parameterは削除しません。
+Session Settingsの **moyAI local context budget** を空欄にすると、そのroot-session overrideを解除してglobal値を継承します。この値はmoyAI内のinput accountingとcompactionだけに使い、providerのcontext windowやmodel load設定として送信しません。
 
 設定例:
 
@@ -170,15 +170,10 @@ base_url = "http://127.0.0.1:1234"
 model = "qwen/qwen3.6-27b"
 provider_profile = "lm_studio"
 # api_key_env = "OPENAI_API_KEY" # 任意。環境変数の名前を指定
-reasoning_summary = "none"
 request_timeout_ms = 3600000
 context_window = 131072
 supports_tools = true
 supports_images = true
-max_output_tokens = 32768
-
-[model.extra_body_json]
-num_ctx = 131072
 
 [permissions]
 access_mode = "default"
@@ -197,16 +192,17 @@ base_url = "http://127.0.0.1:8123"
 enabled = false
 ```
 
-`request_timeout_ms`は、1回のprovider generation request全体を所有する単一deadlineです。最初のPOST attemptから
-connect retry待機、request body送信、response header待ち、stream terminalまでを含み、header受信時に時計を
-リセットしません。既定値は3,600,000ms（60分）で、設定可能な上限も同じ値です。Desktop Settings、
+`request_timeout_ms`はmoyAI client側の通信生存判定を所有します。最初のPOST attemptから成功response headerまでは、
+connect retry待機、request body送信、header待ちを含む単一deadlineです。成功header後は同じ値をdecoded SSE event間の
+最大無進捗時間として使い、eventを受け取るたびに更新するため、進捗中のgenerationを総所要時間だけで終了しません。
+この値はhostへ送信しません。既定値は3,600,000ms（60分）で、設定可能な上限も同じ値です。Desktop Settings、
 TUI、ImportしたTOML、`MOYAI_REQUEST_TIMEOUT_MS`は同じ値を使います。旧`stream_idle_timeout_ms` TOML keyと
 `MOYAI_STREAM_IDLE_TIMEOUT_MS` environment variableは移行入力としてだけ受理します。旧keyだけならrequest timeoutへ
 昇格し、新旧が同値なら受理し、異なる値なら黙って片方を選ばずconfig errorを返します。
-`max_output_tokens`は通常文だけでなくreasoningとtool-call引数のserialized output全体を制限します。
-文書全体を`write`するようなtool-heavy runではproviderごとに検証済みのbudgetを使い、製品既定値は
-`32768`です。provider側の`response.failed`、例えば
-`Failed to parse tool call: Unexpected end of content`は設定中のbudgetを含むgeneration failureとして表示し、
+出力量はホスティング側が所有します。moyAIはResponsesの`max_output_tokens`とChat Completionsの`max_tokens`を
+送らないため、通常文、reasoning、tool-call引数のserialized outputはいずれもLM Studio、oMLX等で設定された上限を
+使います。provider側の`response.failed`、例えば`Failed to parse tool call: Unexpected end of content`はproviderの
+code/messageを含むgeneration failureとして表示し、
 不完全なtool callをmoyAIがlocal parse・commit・実行したものとして扱いません。
 `max_retries`が適用されるのはHTTP response前のretry可能な接続/transport失敗だけで、retry待機は1回最大30,000msです。
 response-start timeout、HTTP 429/5xxを含むHTTP error response、SSE response開始後の失敗は終端となり、同じ生成requestを自動再送しません。
@@ -226,9 +222,9 @@ config targetを同一commandで送り、remembered Access / Provider Apply・Sa
 config generationはRust/TypeScript間を正確な`u64` decimal stringで往復し、JavaScript numberにしません。Preferences Applyは
 一時的な完全`ResolvedConfig`を作り、global Saveはdirty fieldだけをcurrent TOMLへmergeします。
 
-Session Settingsは完全なprovider接続、access mode、context window、max outputだけの別frontend draftを持ちます。Applyは値と
+Session Settingsは完全なprovider接続、access mode、moyAI local context budgetだけの別frontend draftを持ちます。Applyは値と
 workspace、root session ID、durable settings revision、config generation、runtime owner tokenを同一commandで送り、Rustが
-canonical patchを作ってroot-only revision CASします。limitの空欄はroot override解除とglobal継承を意味します。latest local
+canonical patchを作ってroot-only revision CASします。local context budgetの空欄はroot override解除とglobal継承を意味します。latest local
 revision/targetと一致するcorrelated successだけが各draftをclearし、古いasync応答は別ownerのdraftを収束させません。
 
 MCPを有効にする場合、呼び出し可能なserver toolごとにeffect routeを明示します。未設定routeは
@@ -258,15 +254,11 @@ effect = "read"
 - `MOYAI_MODEL`
 - `MOYAI_PROVIDER_PROFILE`
 - `MOYAI_API_KEY_ENV`
-- `MOYAI_CHAT_COMPLETIONS_REASONING_PARAMETERS`
-- `MOYAI_REASONING_EFFORT`
-- `MOYAI_REASONING_SUMMARY`
 - `MOYAI_CONFIG_PATH`
 - `MOYAI_DATA_DIR`
 - `MOYAI_ACCESS_MODE`
 - `MOYAI_REQUEST_TIMEOUT_MS`
 - `MOYAI_CONTEXT_WINDOW`
-- `MOYAI_MAX_OUTPUT_TOKENS`
 - `MOYAI_SUPPORTS_IMAGES`
 - `MOYAI_MULTI_AGENT_ENABLED`
 - `MOYAI_MULTI_AGENT_MODE`
@@ -324,16 +316,14 @@ providerへの到達、catalogへのmodel登録、model instanceのload状態は
 OpenAI-compatible catalogだけからload状態を推測せず`unknown`とし、catalog登録をon-demand load済みとはみなしません。
 Tauri Desktopのprovider設定では単一の **Connection type**、base URL、任意のAPI key環境変数名、modelを
 まとめて設定します。別のResponses / Chat selectorは表示しません。
-同じ overlay で `context_window` と `max_output_tokens` も管理できます。vLLM / vLLM-MLX の
-request limit を PowerShell の `$env:` ではなく moyAI の設定として保存・適用できます。
-現在の vLLM-MLX は `/health` と `/v1/status` から hosted model name は取得できますが、server 起動時の
-`--max-tokens` / `--max-request-tokens` は API に出ていません。そのため moyAI は model name を自動取得し、
-provider が `/v1/models` に limit field を出す場合だけ自動反映し、それ以外は moyAI 管理の明示設定を使います。
+同じoverlayで`context_window`を、moyAI内のinput accountingとcompactionにだけ使うlocal budgetとして管理できます。
+providerのcontext windowやmodel load設定としては送信しません。出力量とすべてのgeneration parameterはhost側が所有します。
+provider metadataがそれらをdiagnostic情報として返すことはありますが、moyAIはclient request overrideへ変換しません。
 
 `lm_studio`と`openai_responses`はResponses transportを、`openai_compatible`と
 `lm_studio_chat_completions`はChat Completionsを使います。HTTP Responses transportはcompaction checkpointを含むcurrent canonical input全体を毎request送信し、
 `previous_response_id`は送りません。raw reasoning textはassistant contextとして再送・保存せず、
-summaryを要求した場合だけ非永続のruntime-only typed reasoning-summary eventを公開します。
+providerがreasoning summaryを返した場合だけ非永続のruntime-only typed reasoning-summary eventを公開します。
 
 各generation requestはruntime-only request IDと`attempt_started` / `request_in_flight` / `headers_received` /
 `first_progress` / `last_progress` / `provider_terminal` phase、attempt、elapsed、sanitized endpointを投影します。
@@ -341,8 +331,9 @@ providerがusageを返した正常terminalではprovider報告token usageも投�
 logical model message数と、exact HTTP wireのinput item数・serialized body byte数を分けて記録し、body自体は保持しません。
 これはmoyAIが観測したclient transport境界であり、LM Studio processの起動、server側のrequest受理、model instanceの
 load開始を推測するものではありません。`request_in_flight`が長い場合に分かるのは、generation operationがまだ
-response headerへ到達していないことまでです。requestはmessage/tool/schema/extra body/stop/image/serialized wire byteを
-POST前にbounded validationし、stream開始後もraw byte、event、tool call、argument、absolute durationを制限します。
+response headerへ到達していないことまでです。requestはmessage/tool/schema/imageとexact structural wire byteを
+POST前にbounded validationし、stream開始後もraw byte、event、tool call、argumentの固定上限とrolling SSE inactivityを
+制限します。進捗eventを受信し続けているgenerationに総所要時間だけの上限は設けません。
 明示的なtask-local監査では、`MOYAI_HTTP_REQUEST_CAPTURE_DIR`へabsolute directoryを設定できます。
 HTTP transportは各requestのprepared outbound DTOであるexact serialized JSONと、API mode / endpoint /
 byte count / capture stage / provider request ID metadataを保存します。同じrequest IDでruntimeのattempt /
@@ -352,10 +343,11 @@ terminal phaseと対応付けられますが、capture file単独ではnetwork a
 directoryを選んでください。captureを明示した場合の書込み失敗は証跡を黙って欠損させずrequest preparationを
 失敗させます。
 
-reasoning controlは任意です。reasoning対応modelでは、例えば`reasoning_effort = "medium"`と
-`reasoning_summary = "concise"`を設定できます。Responsesはtyped standard contractを使います。
-Chat Completionsはprovider差があるため、`chat_completions_reasoning_parameters = "effort_only"`または
-`"effort_and_summary"`を明示しない限り、reasoning parameterの送信をfail-closedにします。
+sampling、thinking、出力量はホスティング側が所有します。moyAIはtemperature、top-p、top-k、penalty、seed、
+stop sequence、reasoning effort / summary、`max_output_tokens` / `max_tokens`、provider固有の追加request bodyを
+送信しません。旧TOML/sessionの該当値は読取互換入力として破棄し、旧environment variableも無視するため、runtime
+policy、admission、diagnostics、設定更新、いずれのprovider wireにも影響しません。LM Studio、oMLX等のhost側で設定します。
+`context_window`はmoyAI local input accountingの容量であり、provider modelのloadや再設定には使いません。
 
 canonical contextではSystem / Developer sectionを論理的に区別したまま保持します。OpenAI-compatible wire境界では
 その順序を保って、Responsesはtop-level `instructions`へ、Chat Completionsは先頭の単一`system` messageへfoldし、
@@ -385,7 +377,8 @@ normalized full arguments、configured target、exact tool name、credential pre
 source URL、effective format/OCR/image/page options、credential presenceを保持し、secret値は渡しません。redactionやinvalid configにより
 実行effectをcompleteに表せない場合はGuardianもhumanも呼ばずdenyします。Guardian inputはcurrent `WorldState`、active canonical
 historyからbounded samplingしたtask context、current exact committed response/call、同じresponse内のbounded prior tool resultsを含みます。
-tools / reasoning / continuationを持たず、task generationのsampling / stop / arbitrary extra bodyを継承せず、90秒total deadlineを使います。
+tool / continuationを持たず、sampling / thinking overrideを送信しません。hostが返すreasoningはnon-authoritativeな
+transport outputとして受信し、90秒total deadlineを使います。
 
 Desktopのaccess更新はcurrent root sessionとexact runtime epochへ束ねます。同じepochのnatural settlementとして
 `root:N`→`tree:N` / `idle:N`と`tree:N`→`root:N` / `idle:N`を受理し、idleからactiveへの遷移、新しいepoch、別session / workspace /
@@ -528,8 +521,8 @@ commitし、元historyは保持します。cancel、空summary、tool call混入
 戻らない場合はcommitしません。同一turnのautomatic compactionは一度だけ試し、hard limit未満なら元の
 canonical historyで続行し、hard limit到達時は明示的に失敗します。working targetはadvertised context
 windowの90%、Codex型effective full input limitは95%です。追加のconfigured overflow marginはhard limitを
-working targetより後に保てる場合だけ適用します。`max_output_tokens`は生成上限だけを表し、input tokenを
-予約したりどちらのcontext limitも縮めたりしません。
+working targetより後に保てる場合だけ適用します。host側が所有するoutput limitはinput tokenを予約したり、
+どちらのlocal context limitも縮めたりしません。
 
 Activeなsession goalは、任意回数のidle continuation後に成功扱いにはしません。goal state、token/elapsed budget、
 cancellation、typed terminalのいずれかがsemanticな終了条件になるまで継続します。

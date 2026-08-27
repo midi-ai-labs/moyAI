@@ -22,6 +22,10 @@ use super::session_repo::{
 pub const MAX_SIDE_CHAT_DRAFT_BYTES: usize = 1024 * 1024;
 pub const MAX_SIDE_CHAT_PROJECTION_MESSAGES: usize = 100;
 
+// V55/V60 require a positive value in the retired column. It is preserved for
+// old database compatibility only and is never projected into a request.
+const RETIRED_MAX_OUTPUT_TOKENS_PLACEHOLDER: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SideChatId(pub Ulid);
@@ -81,13 +85,11 @@ pub struct SideChatProviderTarget {
     pub model: String,
     pub provider_profile: ProviderProfile,
     pub context_window: u32,
-    pub max_output_tokens: u32,
     pub request_timeout_ms: u64,
     pub connect_timeout_ms: u64,
     pub max_retries: u8,
     pub supports_images: bool,
     pub supports_tools: bool,
-    pub supports_reasoning: bool,
 }
 
 impl SideChatProviderTarget {
@@ -102,9 +104,9 @@ impl SideChatProviderTarget {
                 "side chat model must not be empty".to_string(),
             ));
         }
-        if self.context_window == 0 || self.max_output_tokens == 0 {
+        if self.context_window == 0 {
             return Err(StorageError::Message(
-                "side chat context and output limits must be positive".to_string(),
+                "side chat context limit must be positive".to_string(),
             ));
         }
         if self.request_timeout_ms == 0 || self.request_timeout_ms > i64::MAX as u64 {
@@ -130,13 +132,11 @@ impl TryFrom<&ModelConfig> for SideChatProviderTarget {
             model: config.model.clone(),
             provider_profile: config.provider_profile,
             context_window: config.context_window,
-            max_output_tokens: config.max_output_tokens,
             request_timeout_ms: config.request_timeout_ms,
             connect_timeout_ms: config.connect_timeout_ms,
             max_retries: config.max_retries,
             supports_images: config.supports_images,
             supports_tools: config.supports_tools,
-            supports_reasoning: config.supports_reasoning,
         }
         .validate()
     }
@@ -151,12 +151,14 @@ pub struct SideChatBinding {
     pub model: String,
     pub provider_profile: ProviderProfile,
     pub context_window: u32,
+    /// Retired V55/V60 compatibility column. Runtime requests ignore it.
     pub max_output_tokens: u32,
     pub request_timeout_ms: u64,
     pub connect_timeout_ms: u64,
     pub max_retries: u8,
     pub supports_images: bool,
     pub supports_tools: bool,
+    /// Retired V55/V60 compatibility column. Runtime requests ignore it.
     pub supports_reasoning: bool,
     pub persisted_draft: String,
     pub draft_revision: u64,
@@ -174,13 +176,11 @@ impl SideChatBinding {
             model: self.model.clone(),
             provider_profile: self.provider_profile,
             context_window: self.context_window,
-            max_output_tokens: self.max_output_tokens,
             request_timeout_ms: self.request_timeout_ms,
             connect_timeout_ms: self.connect_timeout_ms,
             max_retries: self.max_retries,
             supports_images: self.supports_images,
             supports_tools: self.supports_tools,
-            supports_reasoning: self.supports_reasoning,
         }
     }
 }
@@ -276,19 +276,13 @@ impl SqliteSideChatRepository {
                 "UPDATE sessions
                  SET model_name = ?2,
                      base_url = ?3,
-                     model_parameters_json = json_set(
-                         model_parameters_json,
-                         '$.max_output_tokens',
-                         ?4
-                     ),
-                     provider_connection_json = ?5,
-                     updated_at_ms = MAX(updated_at_ms, ?6)
+                     provider_connection_json = ?4,
+                     updated_at_ms = MAX(updated_at_ms, ?5)
                  WHERE id = ?1",
                 params![
                     existing.conversation_session_id.to_string(),
                     target.model.as_str(),
                     target.base_url.as_str(),
-                    i64::from(target.max_output_tokens),
                     provider_connection_json.as_str(),
                     now_ms,
                 ],
@@ -299,14 +293,12 @@ impl SqliteSideChatRepository {
                      model = ?4,
                      provider_profile = ?5,
                      context_window = ?6,
-                     max_output_tokens = ?7,
-                     request_timeout_ms = ?8,
-                     connect_timeout_ms = ?9,
-                     max_retries = ?10,
-                     supports_images = ?11,
-                     supports_tools = ?12,
-                     supports_reasoning = ?13,
-                     updated_at_ms = MAX(updated_at_ms, ?14)
+                     request_timeout_ms = ?7,
+                     connect_timeout_ms = ?8,
+                     max_retries = ?9,
+                     supports_images = ?10,
+                     supports_tools = ?11,
+                     updated_at_ms = MAX(updated_at_ms, ?12)
                  WHERE id = ?1 AND owner_session_id = ?2",
                 params![
                     existing.id.to_string(),
@@ -315,13 +307,11 @@ impl SqliteSideChatRepository {
                     target.model.as_str(),
                     target.provider_profile.as_str(),
                     i64::from(target.context_window),
-                    i64::from(target.max_output_tokens),
                     target.request_timeout_ms as i64,
                     target.connect_timeout_ms as i64,
                     i64::from(target.max_retries),
                     target.supports_images,
                     target.supports_tools,
-                    target.supports_reasoning,
                     now_ms,
                 ],
             )?;
@@ -358,19 +348,6 @@ impl SqliteSideChatRepository {
                 provider_connection: Some(provider_connection.clone()),
             };
             insert_session_in_transaction(&transaction, conversation_session_id, &draft, now_ms)?;
-            transaction.execute(
-                "UPDATE sessions
-                 SET model_parameters_json = json_set(
-                         model_parameters_json,
-                         '$.max_output_tokens',
-                         ?2
-                     )
-                 WHERE id = ?1",
-                params![
-                    conversation_session_id.to_string(),
-                    i64::from(target.max_output_tokens),
-                ],
-            )?;
             let side_chat_id = SideChatId::new();
             transaction.execute(
                 "INSERT INTO side_chat_bindings (
@@ -394,13 +371,13 @@ impl SqliteSideChatRepository {
                     target.model.as_str(),
                     target.provider_profile.as_str(),
                     i64::from(target.context_window),
-                    i64::from(target.max_output_tokens),
+                    i64::from(RETIRED_MAX_OUTPUT_TOKENS_PLACEHOLDER),
                     target.request_timeout_ms as i64,
                     target.connect_timeout_ms as i64,
                     i64::from(target.max_retries),
                     target.supports_images,
                     target.supports_tools,
-                    target.supports_reasoning,
+                    false,
                     SideChatContextScope::General.as_str(),
                     now_ms,
                 ],
@@ -1306,14 +1283,31 @@ mod tests {
             model: model.to_string(),
             provider_profile: ProviderProfile::LmStudioChatCompletions,
             context_window: 65_536,
-            max_output_tokens: 8_192,
             request_timeout_ms: 60_000,
             connect_timeout_ms: 5_000,
             max_retries: 1,
             supports_images: true,
             supports_tools: false,
-            supports_reasoning: true,
         }
+    }
+
+    #[test]
+    fn model_generation_compatibility_fields_do_not_change_side_chat_target() {
+        let mut first = crate::config::ResolvedConfig::default().model;
+        first.base_url = "http://localhost:1234/v1".to_string();
+        first.model = "gemma".to_string();
+        first.max_output_tokens = 65_536;
+        first.supports_reasoning = true;
+        first.reasoning_effort = Some(crate::config::ReasoningEffort::High);
+        let mut second = first.clone();
+        second.max_output_tokens = 1;
+        second.supports_reasoning = false;
+        second.reasoning_effort = None;
+
+        assert_eq!(
+            SideChatProviderTarget::try_from(&first).expect("first target"),
+            SideChatProviderTarget::try_from(&second).expect("second target")
+        );
     }
 
     fn user_turn(turn_id: TurnId, text: &str) -> UserTurn {
@@ -1392,6 +1386,12 @@ mod tests {
             .await
             .expect("hidden canonical session");
         assert_eq!(
+            second.max_output_tokens,
+            RETIRED_MAX_OUTPUT_TOKENS_PLACEHOLDER
+        );
+        assert!(!second.supports_reasoning);
+        assert_eq!(hidden_record.model_parameters.max_output_tokens, None);
+        assert_eq!(
             hidden_record.provider_connection,
             Some(SessionProviderConnection {
                 profile: ProviderProfile::OpenAiResponses,
@@ -1443,6 +1443,48 @@ mod tests {
                 .iter()
                 .all(|session| session.session.id != second.conversation_session_id)
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_generation_columns_remain_readable_but_do_not_affect_target_or_admission() {
+        let (_store, repo, owner) = fixture();
+        let configured = repo.configure(owner, target("gemma")).expect("configure");
+        {
+            let connection = repo.connection.lock().expect("sqlite mutex");
+            connection
+                .execute(
+                    "UPDATE side_chat_bindings
+                     SET max_output_tokens = 65536,
+                         supports_reasoning = 1,
+                         updated_at_ms = updated_at_ms + 1
+                     WHERE owner_session_id = ?1",
+                    [owner.to_string()],
+                )
+                .expect("inject legacy generation columns");
+        }
+
+        let legacy = repo
+            .get_by_owner(owner)
+            .expect("read legacy binding")
+            .expect("binding");
+        assert_eq!(legacy.max_output_tokens, 65_536);
+        assert!(legacy.supports_reasoning);
+        assert_eq!(
+            legacy.provider_target(),
+            target("gemma").validate().expect("canonical target")
+        );
+
+        let turn_id = TurnId::new();
+        repo.claim_and_admit_request(
+            owner,
+            configured.id,
+            0,
+            0,
+            turn_id,
+            &user_turn(turn_id, "legacy columns must be inert"),
+        )
+        .await
+        .expect("legacy columns must not block admission");
     }
 
     #[tokio::test]

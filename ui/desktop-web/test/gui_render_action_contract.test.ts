@@ -585,7 +585,6 @@ function representativeSurfaces(): RenderedSurface[] {
     apiKeyEnv: "",
     accessMode: "default" as const,
     contextWindow: "131072",
-    maxOutputTokens: "8192",
   };
   const sessionTarget = {
     workspacePath: "C:/workspace",
@@ -605,7 +604,7 @@ function representativeSurfaces(): RenderedSurface[] {
       api_key_env: sessionDraft.apiKeyEnv,
       access_mode: sessionDraft.accessMode,
       context_window: sessionDraft.contextWindow,
-      max_output_tokens: sessionDraft.maxOutputTokens,
+      max_output_tokens: "8192",
       context_window_inherited: true,
       max_output_tokens_inherited: true,
       provider_mutation_enabled: true,
@@ -824,14 +823,13 @@ test("initial setup is a six-step blocking shell and session settings exposes st
   const session = surfaces.get("overlay-session_settings") ?? "";
   assert.match(session, /class="modal settings-modal session-settings-modal" data-modal="session-settings" data-surface="session-settings"/);
   assert.match(session, /data-session-scope="root-only">このセッションだけ/);
-  assert.equal(Array.from(session.matchAll(/placeholder="Preferencesを継承"/g)).length, 2);
+  assert.equal(Array.from(session.matchAll(/placeholder="Preferencesを継承"/g)).length, 1);
   assert.match(session, /保存後の次のpermission decisionからrootと子Agentへ反映/);
   for (const field of [
     "base-url",
     "model",
     "access-mode",
     "context-window",
-    "max-output-tokens",
   ]) {
     assert.match(session, new RegExp(`data-session-setting="${field}"`));
   }
@@ -911,7 +909,6 @@ test("Session Settings keeps an Apply failure visible inside the exact dirty pan
     apiKeyEnv: "",
     accessMode: "default" as const,
     contextWindow: "",
-    maxOutputTokens: "",
   };
   const state = representativeState({
     confirmation_visible: false,
@@ -1018,6 +1015,12 @@ test("Wizard Advanced sections enumerate typed hidden fields and open at the rep
       field("model.request_timeout_ms", "120000", "integer"),
       field("model.temperature", "0.2", "number"),
       field("model.top_p", "0.9", "number"),
+      field("model.top_k", "40", "integer"),
+      field("model.presence_penalty", "0.1", "number"),
+      field("model.frequency_penalty", "0.2", "number"),
+      field("model.seed", "42", "integer"),
+      field("model.stop_sequences", "END", "string", false),
+      field("model.extra_body_json", "{}", "json", false),
       field("permissions.access_mode", "default", "enum", true, ["default"]),
       field("docling.enabled", "true", "boolean"),
       field("docling.base_url", "http://127.0.0.1:5001", "string"),
@@ -1038,9 +1041,28 @@ test("Wizard Advanced sections enumerate typed hidden fields and open at the rep
   const tools = renderStep("tools");
   const finish = renderStep("finish");
 
-  for (const key of ["model.request_timeout_ms", "model.temperature", "model.top_p"]) {
+  assert.match(model, /data-config-key="model\.request_timeout_ms"/);
+  for (const key of [
+    "model.temperature",
+    "model.top_p",
+    "model.top_k",
+    "model.presence_penalty",
+    "model.frequency_penalty",
+    "model.seed",
+    "model.stop_sequences",
+    "model.extra_body_json",
+    "model.supports_reasoning",
+    "model.max_output_tokens",
+    "model.reasoning_effort",
+    "model.reasoning_summary",
+    "model.chat_completions_reasoning_parameters",
+  ]) {
+    assert.doesNotMatch(model, new RegExp(`data-config-key="${key.replace(".", "\\.")}"`));
+  }
+  for (const key of ["model.supports_tools", "model.supports_images", "model.parallel_tool_calls"]) {
     assert.match(model, new RegExp(`data-config-key="${key.replace(".", "\\.")}"`));
   }
+  assert.match(model, /sampling \/ thinking \/ 出力量はホスティング側の設定をそのまま使用します。/);
   assert.match(tools, /data-config-key="docling\.headers_json"/);
   assert.match(
     finish,
@@ -1071,7 +1093,6 @@ test("a stale session-settings owner disables editors while keeping Discard and 
     apiKeyEnv: "",
     accessMode: "default" as const,
     contextWindow: "131072",
-    maxOutputTokens: "8192",
   };
   const state = representativeState({
     confirmation_visible: false,
@@ -1118,7 +1139,6 @@ test("a stale session-settings owner disables editors while keeping Discard and 
     "model",
     "access-mode",
     "context-window",
-    "max-output-tokens",
   ]) {
     assert.match(html, new RegExp(`data-session-setting="${field}"[^>]*disabled`));
   }
@@ -1142,7 +1162,6 @@ test("an unavailable Session Settings underlay becomes inert below its dirty-clo
     apiKeyEnv: "",
     accessMode: "default" as const,
     contextWindow: "131072",
-    maxOutputTokens: "8192",
   };
   const state = representativeState({
     confirmation_visible: false,

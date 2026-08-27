@@ -9,7 +9,7 @@
 - `project_sandbox/<task>/case3/workspace/` に fresh workspace を作る。
 - case1 相当の `calculator.py` と `test_calculator.py` を配置し、開始前の `python -m unittest` が成功することを確認する。
 - config/data directory を fresh にする。
-- provider requestはcurrent product defaultを使い、effective snapshotへ記録する。明示overrideを検証するscenarioでない限り、`max_output_tokens = 32768`、単一の`request_timeout_ms = 3600000`とする。historical profileの`8192`や短いtimeoutへ縮小したrunはcurrent release smokeの代替にしない。
+- provider requestはcurrent product defaultを使い、effective snapshotへ記録する。単一の`request_timeout_ms = 3600000`とmoyAI local context budgetを使い、sampling / thinking / output lengthはhost側の設定を変更せずそのまま利用する。historical profileの短いtimeoutや縮小したlocal context budgetはcurrent release smokeの代替にしない。
 - stage1 から stage3 は同一 Project Chat session で実行する。
 
 ## Stage 1 request

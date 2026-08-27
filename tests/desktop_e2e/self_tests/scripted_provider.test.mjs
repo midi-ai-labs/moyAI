@@ -4,8 +4,8 @@ import test from "node:test";
 
 import {
   SCRIPTED_PROVIDER_MODEL_ID,
-  SCRIPTED_PROVIDER_MAX_OUTPUT_TOKENS,
   SCRIPTED_PROVIDER_MAX_TURNS,
+  SCRIPTED_PROVIDER_CLIENT_GENERATION_KEYS,
   SCRIPTED_PROVIDER_PROMPT,
   SCRIPTED_PROVIDER_RESPONSE,
   scriptedProviderPortIsFetchSafe,
@@ -112,7 +112,6 @@ function responsesRequest(prompt = SCRIPTED_PROVIDER_PROMPT) {
       role: "user",
       content: [{ type: "input_text", text: prompt }],
     }],
-    max_output_tokens: SCRIPTED_PROVIDER_MAX_OUTPUT_TOKENS,
     store: false,
     stream: true,
   };
@@ -273,7 +272,7 @@ test("scripted provider serves one exact Responses turn without retaining reques
   assert.equal(ledger[1].contract.model_sha256, sha256(Buffer.from(SCRIPTED_PROVIDER_MODEL_ID)));
   assert.equal(ledger[1].contract.input_text_sha256, sha256(Buffer.from(SCRIPTED_PROVIDER_PROMPT)));
   assert.equal(ledger[1].contract.instructions_sha256, sha256(Buffer.from("Deterministic fixture instructions.")));
-  assert.deepEqual(ledger[1].contract.top_level_keys, ["input", "instructions", "max_output_tokens", "model", "store", "stream"]);
+  assert.deepEqual(ledger[1].contract.top_level_keys, ["input", "instructions", "model", "store", "stream"]);
   assert.deepEqual(ledger[1].contract.forbidden_fields_present, []);
   const serializedLedger = JSON.stringify(ledger);
   assert.doesNotMatch(serializedLedger, /must-never-enter-the-ledger/);
@@ -326,13 +325,21 @@ test("scripted provider serves a bounded ordered multi-root turn script", async 
 test("scripted provider rejects omitted, drifted, and forbidden fixed-config request fields", async (context) => {
   const provider = await startScriptedProvider();
   context.after(() => provider.close());
+  const generationBodies = SCRIPTED_PROVIDER_CLIENT_GENERATION_KEYS.map((key) => ({
+    ...responsesRequest(),
+    [key]: key === "reasoning"
+      ? { effort: "low" }
+      : key === "stop" || key === "stop_sequences"
+        ? ["STOP"]
+        : key === "chat_template_kwargs" || key === "extra_body" || key === "extra_body_json"
+          ? { enable_thinking: false }
+          : true,
+  }));
   const invalidBodies = [
     (() => { const body = responsesRequest(); delete body.instructions; return body; })(),
-    { ...responsesRequest(), max_output_tokens: SCRIPTED_PROVIDER_MAX_OUTPUT_TOKENS + 1 },
+    ...generationBodies,
     { ...responsesRequest(), tools: [] },
     { ...responsesRequest(), previous_response_id: "must-not-be-sent" },
-    { ...responsesRequest(), temperature: 0 },
-    { ...responsesRequest(), seed: 7 },
   ];
   for (const body of invalidBodies) {
     const response = await fetch(`${provider.baseUrl}/v1/responses`, {
@@ -346,10 +353,16 @@ test("scripted provider rejects omitted, drifted, and forbidden fixed-config req
   const ledger = provider.requestLedger;
   assert.equal(ledger.length, invalidBodies.length);
   assert.equal(ledger.every((row) => row.contract?.pass === false && row.response_status === 422), true);
-  assert.deepEqual(ledger[2].contract.forbidden_fields_present, ["tools"]);
-  assert.deepEqual(ledger[3].contract.forbidden_fields_present, ["previous_response_id"]);
-  assert.deepEqual(ledger[4].contract.forbidden_fields_present, ["temperature"]);
-  assert.deepEqual(ledger[5].contract.forbidden_fields_present, ["seed"]);
+  for (let index = 0; index < SCRIPTED_PROVIDER_CLIENT_GENERATION_KEYS.length; index += 1) {
+    const key = SCRIPTED_PROVIDER_CLIENT_GENERATION_KEYS[index];
+    const contract = ledger[index + 1].contract;
+    assert.deepEqual(contract.client_generation_fields_present, [key], key);
+    assert.equal(contract.client_generation_fields_absent, false, key);
+    assert.equal(contract.forbidden_fields_present.includes(key), true, key);
+  }
+  const structuralOffset = 1 + SCRIPTED_PROVIDER_CLIENT_GENERATION_KEYS.length;
+  assert.deepEqual(ledger[structuralOffset].contract.forbidden_fields_present, ["tools"]);
+  assert.deepEqual(ledger[structuralOffset + 1].contract.forbidden_fields_present, ["previous_response_id"]);
 });
 
 test("scripted provider rejects non-exact routes, methods, and oversized bodies", async (context) => {

@@ -623,7 +623,6 @@ async function applySessionSettings(
           apiKeyEnv: request.draft.apiKeyEnv,
           accessMode: request.draft.accessMode,
           contextWindow: request.draft.contextWindow,
-          maxOutputTokens: request.draft.maxOutputTokens,
         },
         expectedTarget: request.target,
       },

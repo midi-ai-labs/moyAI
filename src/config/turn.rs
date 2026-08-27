@@ -4,13 +4,16 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::model::{DEFAULT_MODEL_REQUEST_TIMEOUT_MS, MAX_MODEL_REQUEST_TIMEOUT_MS};
+use super::model::MAX_MODEL_REQUEST_TIMEOUT_MS;
 use super::{ProviderApiMode, ProviderMetadataMode, ProviderProfile, ResolvedConfig};
 
 /// Immutable provider timing policy captured together with a turn admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderDeadlines {
-    /// One budget shared by connection attempts, retry delays, response headers, and the stream.
+    /// Bounds response start (including retries) and each period of stream inactivity.
+    ///
+    /// A progressing stream may run longer than this value; every decoded SSE event renews the
+    /// inactivity interval. This is a client-side liveness policy and is never sent to the host.
     pub request_timeout_ms: u64,
     pub connect_timeout_ms: u64,
     pub max_connect_retries: u8,
@@ -84,22 +87,15 @@ pub struct ProviderStreamLimits {
     pub max_events: u64,
     pub max_tool_calls: u64,
     pub max_tool_call_argument_bytes: u64,
-    /// Projection of the canonical request deadline for limit diagnostics; it does not restart.
-    pub max_duration_ms: u64,
 }
 
 impl ProviderStreamLimits {
     pub const fn product_default() -> Self {
-        Self::for_request_timeout(DEFAULT_MODEL_REQUEST_TIMEOUT_MS)
-    }
-
-    pub const fn for_request_timeout(request_timeout_ms: u64) -> Self {
         Self {
             max_raw_bytes: 16 * 1024 * 1024,
             max_events: 100_000,
             max_tool_calls: 256,
             max_tool_call_argument_bytes: 1024 * 1024,
-            max_duration_ms: request_timeout_ms,
         }
     }
 }
@@ -304,7 +300,7 @@ impl ProviderTarget {
             profile,
             deadlines,
             request_limits: ProviderRequestLimits::product_default(),
-            stream_limits: ProviderStreamLimits::for_request_timeout(deadlines.request_timeout_ms),
+            stream_limits: ProviderStreamLimits::product_default(),
         })
     }
 
@@ -363,8 +359,7 @@ impl ProviderTarget {
     }
 
     #[cfg(test)]
-    pub(crate) fn replace_stream_limits(&mut self, mut stream_limits: ProviderStreamLimits) {
-        stream_limits.max_duration_ms = self.deadlines.request_timeout_ms;
+    pub(crate) fn replace_stream_limits(&mut self, stream_limits: ProviderStreamLimits) {
         self.stream_limits = stream_limits;
     }
 }
@@ -523,6 +518,50 @@ mod tests {
     }
 
     #[test]
+    fn complete_turn_capture_discards_legacy_host_generation_values() {
+        let mut config = ResolvedConfig::default();
+        config.model.chat_completions_reasoning_parameters =
+            Some(crate::config::ChatCompletionsReasoningParameters::EffortAndSummary);
+        config.model.reasoning_effort = Some(crate::config::ReasoningEffort::High);
+        config.model.reasoning_summary = crate::config::ReasoningSummary::Detailed;
+        config.model.max_output_tokens = 1;
+        config.model.temperature = Some(f64::NAN);
+        config.model.top_p = Some(f64::INFINITY);
+        config.model.top_k = Some(0);
+        config.model.presence_penalty = Some(f64::NEG_INFINITY);
+        config.model.frequency_penalty = Some(f64::NAN);
+        config.model.seed = Some(42);
+        config.model.stop_sequences = vec!["legacy-stop".to_string()];
+        config.model.supports_reasoning = true;
+        config.model.extra_body_json = Some(serde_json::json!({
+            "chat_template_kwargs": { "enable_thinking": false }
+        }));
+
+        let turn = ResolvedTurnConfig::capture(config)
+            .expect("legacy generation values cannot reject turn admission");
+        let model = &turn.runtime_config().model;
+        assert_eq!(model.chat_completions_reasoning_parameters, None);
+        assert_eq!(model.reasoning_effort, None);
+        assert_eq!(
+            model.reasoning_summary,
+            crate::config::ReasoningSummary::None
+        );
+        assert_eq!(
+            model.max_output_tokens,
+            crate::config::DEFAULT_MODEL_MAX_OUTPUT_TOKENS
+        );
+        assert_eq!(model.temperature, None);
+        assert_eq!(model.top_p, None);
+        assert_eq!(model.top_k, None);
+        assert_eq!(model.presence_penalty, None);
+        assert_eq!(model.frequency_penalty, None);
+        assert_eq!(model.seed, None);
+        assert!(model.stop_sequences.is_empty());
+        assert!(!model.supports_reasoning);
+        assert_eq!(model.extra_body_json, None);
+    }
+
+    #[test]
     fn complete_turn_capture_owns_canonical_model_and_request_deadline() {
         let mut canonical = ResolvedConfig::default();
         canonical.model.model = "  canonical-model  ".to_string();
@@ -660,7 +699,6 @@ mod tests {
                 max_connect_retries: 4,
             }
         );
-        assert_eq!(turn.provider().stream_limits().max_duration_ms, 91_000);
         assert_eq!(turn.provider().profile(), ProviderProfile::OpenAiCompatible);
         assert_eq!(
             turn.provider().metadata_mode(),
@@ -671,10 +709,8 @@ mod tests {
         let mut provider = turn.provider().clone();
         let mut replacement = ProviderStreamLimits::product_default();
         replacement.max_events = 7;
-        replacement.max_duration_ms = 1;
         provider.replace_stream_limits(replacement);
         assert_eq!(provider.stream_limits().max_events, 7);
-        assert_eq!(provider.stream_limits().max_duration_ms, 91_000);
     }
 
     #[test]

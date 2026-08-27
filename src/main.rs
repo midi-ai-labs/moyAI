@@ -405,10 +405,10 @@ fn to_app_command(
                 ),
                 access_mode: args.access_mode,
                 reset_model_parameters: args.reset_model_parameters,
-                temperature: args.temperature,
-                top_p: args.top_p,
-                top_k: args.top_k,
-                max_output_tokens: args.max_output_tokens,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                max_output_tokens: None,
             })
         }
         CliCommand::SessionTitle(args) => {

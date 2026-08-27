@@ -46,14 +46,12 @@ base_url = ${JSON.stringify(baseUrl)}
 model = ${JSON.stringify(SCRIPTED_PROVIDER_MODEL_ID)}
 provider_metadata_mode = "openai_compatible_only"
 provider_api_mode = "responses"
-reasoning_summary = "none"
 connect_timeout_ms = 1000
 request_timeout_ms = 30000
 max_retries = 0
 context_window = 65536
 max_output_tokens = 1024
 supports_tools = ${supportsTools}
-supports_reasoning = false
 supports_images = false
 parallel_tool_calls = false
 
@@ -116,13 +114,16 @@ export function relevantProviderHistory(projection) {
   };
 }
 
-export function exactFreshProviderHistory(history) {
+export function exactFreshProviderHistory(history, {
+  expectedPrompt = PROVIDER_RESTART_PROMPT,
+  expectedResponse = SCRIPTED_PROVIDER_RESPONSE,
+} = {}) {
   const durableIdentities = [history?.user_identities?.[0], history?.completed_summary_identities?.[0]];
   return Array.isArray(history?.rows)
     && history.rows.length === 3
     && sameValue(history.rows.map((row) => row.kind), ["user", "work_summary_completed", "assistant"])
-    && sameValue(history.users, [PROVIDER_RESTART_PROMPT])
-    && sameValue(history.assistants, [SCRIPTED_PROVIDER_RESPONSE])
+    && sameValue(history.users, [expectedPrompt])
+    && sameValue(history.assistants, [expectedResponse])
     && history.completed_summaries === 1
     && history.user_identities.length === 1
     && history.assistant_identities.length === 1
@@ -131,7 +132,7 @@ export function exactFreshProviderHistory(history) {
     && new Set(durableIdentities).size === durableIdentities.length;
 }
 
-export function settledCompletedProviderTurn(projection) {
+export function settledCompletedProviderTurn(projection, expectations = {}) {
   const history = relevantProviderHistory(projection);
   return projection?.run_status_key === "completed"
     && projection?.task_activity_state === "idle"
@@ -152,7 +153,7 @@ export function settledCompletedProviderTurn(projection) {
     && projection?.draft_prompt === ""
     && projection?.composer_submit_mode === "new_request"
     && projection?.can_submit === true
-    && exactFreshProviderHistory(history);
+    && exactFreshProviderHistory(history, expectations);
 }
 
 function catalogRowAccepted(row) {
@@ -281,7 +282,10 @@ function exactIdentityForKind(history, kind) {
   return identities.length === 1 ? identities[0] : null;
 }
 
-export function providerTurnDomAccepted(surface, history, identity) {
+export function providerTurnDomAccepted(surface, history, identity, {
+  expectedPrompt = PROVIDER_RESTART_PROMPT,
+  expectedResponse = SCRIPTED_PROVIDER_RESPONSE,
+} = {}) {
   const expectedAction = identity?.project_id === null ? "chat-session" : "session";
   const expectedFocusKey = typeof identity?.session_id === "string"
     ? `${expectedAction}:${identity.session_id}:select`
@@ -292,11 +296,11 @@ export function providerTurnDomAccepted(surface, history, identity) {
   return surface?.thread_count === 1
     && surface?.users?.length === 1
     && surface.users[0].visible === true
-    && surface.users[0].text === PROVIDER_RESTART_PROMPT
+    && surface.users[0].text === expectedPrompt
     && surface.users[0].history_identity === userIdentity
     && surface?.assistants?.length === 1
     && surface.assistants[0].visible === true
-    && surface.assistants[0].text === SCRIPTED_PROVIDER_RESPONSE
+    && surface.assistants[0].text === expectedResponse
     && surface.assistants[0].history_identity === assistantIdentity
     && surface?.completed_summaries?.length === 1
     && surface.completed_summaries[0].visible === true

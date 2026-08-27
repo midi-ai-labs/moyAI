@@ -38,7 +38,7 @@ core / agent-loop / release の広い regression では、必要に応じて `ca
 ## Common execution
 
 1. `tests/desktop_e2e/` の共通runnerで `project_sandbox/<task>/<execution-id>/` に fresh workspace、fresh config/data/WebView profile、artifact directory を作る。
-2. 対象 build と provider/model/configを`RESULTS.md`に記録する。provider/modelはcurrent verified profileを起点とし、別用途fixtureの縮小したcontext/output budgetを流用しない。意図的なoverrideは既定/profileとの差分と理由を明記する。
+2. 対象 build と provider/model/configを`RESULTS.md`に記録する。provider/modelはcurrent verified profileを起点とし、別用途fixtureの縮小したmoyAI local context budgetを流用しない。host側generation設定は観測できる範囲で記録し、moyAIから変更しない。
 3. visible Tauri Desktop を起動し、scenario の canonical user request を GUI から送る。
 4. pointer、keyboard、attachment、confirmation など scenario に必要な操作を実際に行う。
 5. scenario 内の required verification を moyAI の tool evidence と外部 command の両方で確認する。
@@ -47,7 +47,7 @@ core / agent-loop / release の広い regression では、必要に応じて `ca
 
 外部verification commandはexecution-owned `TEMP` / `TMP` / `TMPDIR`で起動し、Windows Jobがrootと全descendantを所有する。command終了後のroot / descendant zeroまでをmachine gateに含め、scenario固有のprocess listやglobal killへ分岐しない。
 
-`case5_2` のcurrent execution ownerは `tests/desktop_e2e/` の `manual.case5_2` scenarioである。operator指定fixtureとprovider/modelはhash付きscenario configで渡し、旧 `prepare-fixture.ps1` / `launch-desktop.ps1` / `cdp-action.mjs` をrun controllerとして組み合わせない。旧helperはhistorical/manual diagnosis用であり、fresh context、dynamic CDP、restart generation、SQLite audit、provider cleanup、sealを共通ownerから分離しない。LM Studio routeではrequested contextとload response / catalogのapplied contextを分けてsealする。`openai_compatible` routeではcredential-freeな`/v1` base URLを使い、external-unmanaged modelをload / unloadせず、`/v1/models`のexact IDとmetadataがあればreported context capacityをpreflight、時点sample、cleanupで確認する。reported capacityがrequested 131072未満またはmetadata内で競合する場合はenvironment block、未報告またはrequested以上だが非exactの場合とexternal lifecycle / wire差分はcomparability deviationとして`RESULTS.md`へ明記する。
+`case5_2` のcurrent execution ownerは `tests/desktop_e2e/` の `manual.case5_2` scenarioである。operator指定fixtureとprovider/modelはhash付きscenario configで渡し、旧 `prepare-fixture.ps1` / `launch-desktop.ps1` / `cdp-action.mjs` をrun controllerとして組み合わせない。旧helperはhistorical/manual diagnosis用であり、fresh context、dynamic CDP、restart generation、SQLite audit、provider cleanup、sealを共通ownerから分離しない。LM Studioはlifecycle未指定の後方互換`execution-owned` routeに加え、明示的な`provider_lifecycle: "external-unmanaged"`を受理する。external routeは既存のhost設定を変更せず、Main exact 1 loaded、Side unloaded、両variant、reported loaded context 131072以上、時刻・elapsedを除いたstable host fingerprintをpreflight／各checkpoint／final／quiesceでGET観測し、drift時にもload / unloadによる修復を行わない。`openai_compatible`はexternal-unmanagedのみで、credential-freeな`/v1` base URLのexact IDとmetadataがあればreported context capacityをpreflight、時点sample、cleanupで確認する。reported capacityがlocal budget 131072未満またはmetadata内で競合する場合はenvironment block、未報告または131072以上だが非exactの場合とexternal lifecycle / wire差分はcomparability deviationとして`RESULTS.md`へ明記する。
 
 `manual.case5_2` はStage 1〜4のmachine predicateとcleanupが成立した時点でも`manual_pending`を返す。transcript、成果物、公開・hidden evaluator evidenceをtask-local rubricで人手採点し、その結果を`RESULTS.md`へ確定するまではfull PASSではない。
 
@@ -55,7 +55,7 @@ core / agent-loop / release の広い regression では、必要に応じて `ca
 
 Side Chat Sendはscenarioの操作経路に含めず、restart復元時とStage 4 terminalのpersisted message countがexact 0であることを要求して記録する。LM Studioではselected Side modelのunloaded sampleを要求し、OpenAI-compatibleでは同じMain modelのcatalog availability sampleへ置き換える。trusted Side Sendを独立event ledgerから集計しているわけではなく、remote providerにもtraffic ledgerがないためgeneration request 0そのものはmachine証明せず、`RESULTS.md`で観測済み事実と未検証境界を分ける。
 
-scenario configのcurrent discriminatorは`provider_profile`である。`lm_studio`は従来のSide model / variant 3fieldを追加で要求し、既存のdiscriminatorなし6fieldも後方互換に受理する。Main接続を同一executionのPreferencesで直接設定する場合はoptional `configure_main_via_gui: true`を使い、Stage 1前にtrusted GUI input、exact global Save、persisted/effective projectionをsealする。`openai_compatible`は`fixture_source`、`provider_profile`、`provider_base_url`、`main_model`を必須とし、generation-only allowlistのboolean thinking制御だけを`extra_body_json`としてoptionalに受理する。credential / secret / unknown keyは拒否する。optional bodyはcompact JSONとして隔離Desktopの`MOYAI_EXTRA_BODY_JSON`へ渡し、fixture configへ固定せず、sealed prepared / summaryにはhash、byte size、許可field名だけを残す。summary v1の`selected_model_unloaded_samples`は維持し、profile横断sampleはadditive fieldへ記録する。exact JSON例は`../desktop_e2e/README.md`を正とする。
+scenario configの`provider_profile`は接続形式、optional `provider_lifecycle`はprovider資源の所有権を表す。`lm_studio`は従来のSide model / variant 3fieldを追加で要求し、lifecycle未指定と既存のdiscriminatorなし6fieldは`execution-owned`として後方互換に受理する。既にload済みのhostをその設定のまま使う場合は`provider_lifecycle: "external-unmanaged"`を明示する。Main接続を同一executionのPreferencesで直接設定するoptional `configure_main_via_gui: true`は両LM Studio lifecycleで使い、Stage 1前にtrusted GUI input、exact global Save、persisted/effective projectionをsealする。`openai_compatible`は`fixture_source`、`provider_profile`、`provider_base_url`、`main_model`を必須とし、lifecycleはexternal-unmanaged以外を拒否する。`extra_body_json`を含むclient generation overrideとcredential / secret / unknown keyは拒否し、sampling / thinking / output lengthはprovider host設定を使用する。execution-owned LM Studioだけがrequested contextをload指定し、external routeはrequested / applied host contextを`null`、reported loaded contextと全falseの`provider_lifecycle_actions`、host fingerprint samplesをsummary v1へadditiveに記録する。Desktop fixture configへtemperature、reasoning summary、max output、`model.extra_body_json.num_ctx`を固定しない。summary v1の互換projectionとしてextra body evidenceは`configured: false`固定、`selected_model_unloaded_samples`は維持し、profile横断sampleはadditive fieldへ記録する。
 
 Windows Jobが証明するのはexternal evaluatorのroot / descendant lifecycleであり、filesystem / network sandboxではない。比較条件を変えない通常のexternal CPython / pytestでは、workspace、fixture seed、Python site roots、known dependency/runtime pathをmachine比較し、任意のworkspace外namespace全体についてはcanonical transcriptと人手rubricで裁定する。targeted evidenceだけからworkspace外mutation全般のPASSを宣言しない。
 
@@ -70,7 +70,7 @@ CLI から Desktop を起動する場合の current option は `moyai desktop --
 - transcript Markdown export または同等の canonical session evidence
 - required verification の stdout / stderr / exit code
 - workspace output と diff summary
-- provider/image変更時の model capability と request diagnostics（requestedとapplied/effective context、configured/effective `max_output_tokens`を含む）
+- provider/image変更時の model capability と request diagnostics（moyAI local context budget、provider-reported context/output metadata、generation wireにhost-owned fieldがないことを含む）
 
 release package の gate artifact は `Manual ST Gate: PASS` を含め、`scripts/package-release.ps1` の入力条件を満たす。`manual_pending`のmachine artifactだけではこのgateを満たさない。
 

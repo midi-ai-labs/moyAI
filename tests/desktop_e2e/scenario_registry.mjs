@@ -3,7 +3,10 @@ import { createNativeDialogCancelScenario } from "./scenarios/native_dialog_canc
 import { createPointerKeyboardScenario } from "./scenarios/pointer_keyboard.mjs";
 import { createPromptReviewCancelScenario } from "./scenarios/prompt_review_cancel.mjs";
 import { createProviderConnectionLiveScenario } from "./scenarios/provider_connection_live.mjs";
+import { createLmStudioThinkingScenario } from "./scenarios/provider_lm_studio_thinking.mjs";
 import { createPermissionRestartGuardianScenario } from "./scenarios/permission_restart_guardian.mjs";
+import { createProviderChatToolContinuationScenario } from "./scenarios/provider_chat_tool_continuation.mjs";
+import { createProviderResponsesProgressScenario } from "./scenarios/provider_responses_progress.mjs";
 import { createProviderRestartScenario } from "./scenarios/provider_restart.mjs";
 import { createRunNextTurnScenario } from "./scenarios/run_next_turn.mjs";
 import { createRunStopScenario } from "./scenarios/run_stop.mjs";
@@ -24,9 +27,12 @@ const factories = new Map([
   ["input.pointer-keyboard", createPointerKeyboardScenario],
   ["manual.case5_2", createCase52Scenario],
   ["manual.provider-openai-compatible", createProviderConnectionLiveScenario],
+  ["manual.provider-lm-studio-thinking", createLmStudioThinkingScenario],
   ["native-dialog.cancel", createNativeDialogCancelScenario],
   ["prompt-review.cancel", createPromptReviewCancelScenario],
   ["permission.restart-guardian", createPermissionRestartGuardianScenario],
+  ["provider.chat-tool-continuation", createProviderChatToolContinuationScenario],
+  ["provider.responses-progress", createProviderResponsesProgressScenario],
   ["provider.restart", createProviderRestartScenario],
   ["settings.docling-readiness", createSettingsDoclingReadinessScenario],
   ["settings.initial-setup", createSettingsInitialSetupScenario],
@@ -35,7 +41,11 @@ const factories = new Map([
   ["run.next-turn", createRunNextTurnScenario],
   ["run.stop", createRunStopScenario],
 ]);
-const configurableScenarios = new Set(["manual.case5_2", "manual.provider-openai-compatible"]);
+const configurableScenarios = new Set([
+  "manual.case5_2",
+  "manual.provider-openai-compatible",
+  "manual.provider-lm-studio-thinking",
+]);
 
 export const scenarioIds = Object.freeze([...factories.keys()]);
 

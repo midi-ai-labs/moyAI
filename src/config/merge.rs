@@ -116,15 +116,6 @@ fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfi
                 .unwrap_or_else(|| target.provider_profile.api_mode()),
         );
     }
-    if let Some(value) = patch.chat_completions_reasoning_parameters {
-        target.chat_completions_reasoning_parameters = Some(value);
-    }
-    if let Some(value) = patch.reasoning_effort {
-        target.reasoning_effort = Some(value);
-    }
-    if let Some(value) = patch.reasoning_summary {
-        target.reasoning_summary = value;
-    }
     if let Some(value) = patch.api_key_env {
         target.api_key_env = value;
     }
@@ -143,35 +134,8 @@ fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfi
     if let Some(value) = patch.context_window {
         target.context_window = value;
     }
-    if let Some(value) = patch.max_output_tokens {
-        target.max_output_tokens = value;
-    }
-    if let Some(value) = patch.temperature {
-        target.temperature = Some(value);
-    }
-    if let Some(value) = patch.top_p {
-        target.top_p = Some(value);
-    }
-    if let Some(value) = patch.top_k {
-        target.top_k = Some(value);
-    }
-    if let Some(value) = patch.presence_penalty {
-        target.presence_penalty = Some(value);
-    }
-    if let Some(value) = patch.frequency_penalty {
-        target.frequency_penalty = Some(value);
-    }
-    if let Some(value) = patch.seed {
-        target.seed = Some(value);
-    }
-    if let Some(value) = patch.stop_sequences {
-        target.stop_sequences = value;
-    }
     if let Some(value) = patch.supports_tools {
         target.supports_tools = value;
-    }
-    if let Some(value) = patch.supports_reasoning {
-        target.supports_reasoning = value;
     }
     if let Some(value) = patch.supports_images {
         target.supports_images = value;
@@ -181,9 +145,6 @@ fn apply_model(target: &mut crate::config::ModelConfig, patch: PartialModelConfi
     }
     if let Some(value) = patch.max_parallel_predictions {
         target.max_parallel_predictions = value.max(1);
-    }
-    if let Some(value) = patch.extra_body_json {
-        target.extra_body_json = Some(value);
     }
 }
 
@@ -411,6 +372,7 @@ pub fn apply_patch(mut target: ResolvedConfig, patch: PartialResolvedConfig) -> 
     if let Some(value) = patch.logging {
         apply_logging(&mut target.logging, value);
     }
+    target.model.clear_legacy_generation_settings();
     target
 }
 
@@ -424,9 +386,9 @@ mod tests {
     };
 
     #[test]
-    fn model_reasoning_patch_merges_without_changing_output_capability() {
+    fn legacy_generation_patch_is_accepted_but_runtime_inert() {
         let defaults = ResolvedConfig::default();
-        assert!(!defaults.model.supports_reasoning);
+        let expected_generation = defaults.model.clone();
 
         let resolved = apply_patch(
             defaults,
@@ -438,6 +400,18 @@ mod tests {
                     ),
                     reasoning_effort: Some(ReasoningEffort::High),
                     reasoning_summary: Some(ReasoningSummary::Detailed),
+                    max_output_tokens: Some(1),
+                    temperature: Some(0.7),
+                    top_p: Some(0.8),
+                    top_k: Some(40),
+                    presence_penalty: Some(0.1),
+                    frequency_penalty: Some(0.2),
+                    seed: Some(42),
+                    stop_sequences: Some(vec!["legacy-stop".to_string()]),
+                    supports_reasoning: Some(true),
+                    extra_body_json: Some(serde_json::json!({
+                        "chat_template_kwargs": { "enable_thinking": false }
+                    })),
                     ..PartialModelConfig::default()
                 }),
                 ..PartialResolvedConfig::default()
@@ -450,11 +424,44 @@ mod tests {
         );
         assert_eq!(
             resolved.model.chat_completions_reasoning_parameters,
-            Some(ChatCompletionsReasoningParameters::EffortAndSummary)
+            expected_generation.chat_completions_reasoning_parameters
         );
-        assert_eq!(resolved.model.reasoning_effort, Some(ReasoningEffort::High));
-        assert_eq!(resolved.model.reasoning_summary, ReasoningSummary::Detailed);
-        assert!(!resolved.model.supports_reasoning);
+        assert_eq!(
+            resolved.model.reasoning_effort,
+            expected_generation.reasoning_effort
+        );
+        assert_eq!(
+            resolved.model.reasoning_summary,
+            expected_generation.reasoning_summary
+        );
+        assert_eq!(
+            resolved.model.max_output_tokens,
+            expected_generation.max_output_tokens
+        );
+        assert_eq!(resolved.model.temperature, expected_generation.temperature);
+        assert_eq!(resolved.model.top_p, expected_generation.top_p);
+        assert_eq!(resolved.model.top_k, expected_generation.top_k);
+        assert_eq!(
+            resolved.model.presence_penalty,
+            expected_generation.presence_penalty
+        );
+        assert_eq!(
+            resolved.model.frequency_penalty,
+            expected_generation.frequency_penalty
+        );
+        assert_eq!(resolved.model.seed, expected_generation.seed);
+        assert_eq!(
+            resolved.model.stop_sequences,
+            expected_generation.stop_sequences
+        );
+        assert_eq!(
+            resolved.model.supports_reasoning,
+            expected_generation.supports_reasoning
+        );
+        assert_eq!(
+            resolved.model.extra_body_json,
+            expected_generation.extra_body_json
+        );
     }
 
     #[test]
@@ -548,10 +555,7 @@ mod tests {
             Some("PROVIDER_A_KEY")
         );
         assert_eq!(same_canonical_url.model.extra_headers.len(), 1);
-        assert_eq!(
-            same_canonical_url.model.extra_body_json,
-            base.model.extra_body_json
-        );
+        assert_eq!(same_canonical_url.model.extra_body_json, None);
 
         let changed_profile_with_explicit_key = apply_patch(
             base,

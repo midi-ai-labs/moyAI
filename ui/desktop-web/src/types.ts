@@ -190,9 +190,7 @@ export interface SessionSettingsProjection {
   api_key_env: string;
   access_mode: "default" | "auto_review" | "full_access";
   context_window: string;
-  max_output_tokens: string;
   context_window_inherited: boolean;
-  max_output_tokens_inherited: boolean;
   provider_mutation_enabled: boolean;
   access_mutation_enabled: boolean;
   unavailable_reason: string;
@@ -461,13 +459,11 @@ export interface DesktopWebState {
   provider_effective_profile: ProviderProfile;
   provider_effective_api_key_env: string;
   provider_effective_context_window: string;
-  provider_effective_max_output_tokens: string;
   provider_effective_model_id: string;
   provider_catalog_base_url: string | null;
   provider_catalog_profile: ProviderProfile | null;
   provider_catalog_api_key_env: string | null;
   provider_context_window: string;
-  provider_max_output_tokens: string;
   provider_models: string[];
   provider_model_ids: string[];
   provider_selected_index: number;

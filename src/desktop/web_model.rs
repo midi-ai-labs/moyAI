@@ -392,9 +392,7 @@ pub struct DesktopSessionSettingsProjection {
     pub api_key_env: String,
     pub access_mode: AccessMode,
     pub context_window: String,
-    pub max_output_tokens: String,
     pub context_window_inherited: bool,
-    pub max_output_tokens_inherited: bool,
     pub provider_mutation_enabled: bool,
     pub access_mutation_enabled: bool,
     pub unavailable_reason: String,
@@ -590,13 +588,11 @@ pub struct DesktopWebState {
     pub provider_effective_profile: String,
     pub provider_effective_api_key_env: String,
     pub provider_effective_context_window: String,
-    pub provider_effective_max_output_tokens: String,
     pub provider_effective_model_id: String,
     pub provider_catalog_base_url: Option<String>,
     pub provider_catalog_profile: Option<String>,
     pub provider_catalog_api_key_env: Option<String>,
     pub provider_context_window: String,
-    pub provider_max_output_tokens: String,
     pub provider_models: Vec<String>,
     pub provider_model_ids: Vec<String>,
     pub provider_selected_index: i32,
@@ -1081,12 +1077,6 @@ pub(crate) fn desktop_web_state_with_permission(
             .model
             .context_window
             .to_string(),
-        provider_effective_max_output_tokens: state
-            .provider_config
-            .effective_config
-            .model
-            .max_output_tokens
-            .to_string(),
         provider_effective_model_id: state.provider_config.effective_config.model.model.clone(),
         provider_catalog_base_url: state.provider_config.provider_loaded_base_url.clone(),
         provider_catalog_profile: state
@@ -1095,10 +1085,6 @@ pub(crate) fn desktop_web_state_with_permission(
             .map(|profile| profile.as_str().to_string()),
         provider_catalog_api_key_env: state.provider_config.provider_loaded_api_key_env.clone(),
         provider_context_window: state.provider_config.provider_context_window_input.clone(),
-        provider_max_output_tokens: state
-            .provider_config
-            .provider_max_output_tokens_input
-            .clone(),
         provider_models: provider_model_labels(state),
         provider_model_ids: state.provider_config.provider_models.clone(),
         provider_selected_index: state.provider_config.provider_selected_index,
@@ -1114,6 +1100,7 @@ pub(crate) fn desktop_web_state_with_permission(
         docling_readiness: state.docling_readiness.clone(),
         config_fields: ConfigField::ALL
             .into_iter()
+            .filter(|field| !field.is_host_owned_generation())
             .map(|field| config_field_projection(field, state.global_config()))
             .collect(),
         config_target: DesktopConfigMutationTargetProjection {
@@ -1266,9 +1253,7 @@ fn session_settings_projection(
                 .permissions
                 .access_mode,
             context_window: String::new(),
-            max_output_tokens: String::new(),
             context_window_inherited: true,
-            max_output_tokens_inherited: true,
             provider_mutation_enabled: false,
             access_mutation_enabled: false,
             unavailable_reason:
@@ -1316,13 +1301,7 @@ fn session_settings_projection(
             .context_window
             .map(|value| value.to_string())
             .unwrap_or_default(),
-        max_output_tokens: session
-            .model_parameters
-            .max_output_tokens
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
         context_window_inherited: session.model_parameters.context_window.is_none(),
-        max_output_tokens_inherited: session.model_parameters.max_output_tokens.is_none(),
         provider_mutation_enabled,
         access_mutation_enabled,
         unavailable_reason: String::new(),
@@ -1492,9 +1471,8 @@ fn provider_status_details(state: &DesktopState) -> String {
         }
     };
     let limits = format!(
-        "Managed request limits: context_window={}, max_output_tokens={}.",
+        "moyAI local context budget: {}. Output length and generation behavior use the Provider host settings.",
         state.provider_config.provider_context_window_input,
-        state.provider_config.provider_max_output_tokens_input
     );
     [
         state.provider_config.provider_status.details.as_str(),
@@ -1529,7 +1507,7 @@ fn provider_selected_model_summary(state: &DesktopState) -> Vec<String> {
                 .unwrap_or_else(|| "unknown".to_string())
         ),
         format!(
-            "Max output: {}",
+            "Provider metadata max output: {}",
             info.max_output_tokens
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
@@ -1596,11 +1574,10 @@ fn token_meter_projection(
             level_label
         ),
         title: format!(
-            "概算 token 使用量: {} / {} ({}%). 設定output上限: {}、configured overflow margin: {}、残り推定: {}。",
+            "概算 token 使用量: {} / {} ({}%). configured overflow margin: {}、残り推定: {}。出力量はProvider側の設定を使用します。",
             status.active_context_tokens,
             status.full_context_window_limit,
             percent,
-            status.configured_max_output_tokens,
             status.overflow_margin_tokens,
             status.tokens_until_limit
         ),
@@ -1877,6 +1854,9 @@ mod tests {
         let details = provider_status_details(&state);
 
         assert!(details.contains("OpenAI-compatible (Chat Completions)"));
+        assert!(details.contains("moyAI local context budget"));
+        assert!(details.contains("Provider host settings"));
+        assert!(!details.contains("max_output_tokens"));
         assert!(!details.contains("language"));
         assert!(!details.contains("no-thinking"));
     }
@@ -1982,6 +1962,47 @@ mod tests {
         assert!(ConfigField::Model.descriptor().required());
         assert!(!ConfigField::Temperature.descriptor().required());
         assert!(!ConfigField::ExtraBodyJson.descriptor().required());
+    }
+
+    #[test]
+    fn desktop_web_state_does_not_project_host_owned_generation_fields() {
+        let state = DesktopState::new(
+            super::super::models::DesktopSnapshot {
+                workspace_path: "C:/workspace".to_string(),
+                provider_label: String::new(),
+                model_label: String::new(),
+                command_rows: Vec::new(),
+                project_rows: Vec::new(),
+                selected_project_index: 0,
+                session_rows: Vec::new(),
+                chat_session_rows: Vec::new(),
+                session_details: Vec::new(),
+                selected_session_index: 0,
+            },
+            ResolvedConfig::default(),
+        );
+
+        let projection = desktop_web_state(&state, &DesktopRuntimeProjection::default());
+        let host_owned = ConfigField::ALL
+            .into_iter()
+            .filter(|field| field.is_host_owned_generation())
+            .collect::<Vec<_>>();
+
+        assert_eq!(host_owned.len(), 10);
+        assert_eq!(
+            projection.config_fields.len(),
+            ConfigField::ALL.len() - host_owned.len()
+        );
+        for field in host_owned {
+            assert!(
+                projection
+                    .config_fields
+                    .iter()
+                    .all(|projected| projected.key != field.label()),
+                "{} must not cross the Desktop GUI DTO boundary",
+                field.label()
+            );
+        }
     }
 
     #[test]
@@ -2597,7 +2618,7 @@ mod tests {
     }
 
     #[test]
-    fn inherited_session_limits_project_as_blank_optional_overrides() {
+    fn inherited_session_local_context_projects_as_a_blank_optional_override() {
         let mut global = crate::config::ResolvedConfig::default();
         global.model.context_window = 32_768;
         global.model.max_output_tokens = 2_048;
@@ -2664,9 +2685,7 @@ mod tests {
             session_settings_projection(&state, &DesktopRuntimeProjection::default(), true, true);
 
         assert!(projection.context_window_inherited);
-        assert!(projection.max_output_tokens_inherited);
         assert_eq!(projection.context_window, "");
-        assert_eq!(projection.max_output_tokens, "");
     }
 
     #[test]
@@ -3111,7 +3130,7 @@ mod tests {
             source: crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
             active_context_tokens: 12_345,
             full_context_window_limit: 124_518,
-            configured_max_output_tokens: 8_192,
+            configured_max_output_tokens: None,
             overflow_margin_tokens: 1_024,
             tokens_until_limit: 112_173,
             token_limit_reached: false,
@@ -3122,7 +3141,12 @@ mod tests {
         assert_eq!(projection.label, "12.3k / 124k 低い");
         assert_eq!(projection.level, "low");
         assert!(projection.title.contains("12345 / 124518"));
-        assert!(projection.title.contains("設定output上限: 8192"));
+        assert!(
+            projection
+                .title
+                .contains("出力量はProvider側の設定を使用します")
+        );
+        assert!(!projection.title.contains("設定output上限"));
         assert!(
             projection
                 .title
@@ -3137,7 +3161,7 @@ mod tests {
             source: crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
             active_context_tokens: 125_000,
             full_context_window_limit: 124_518,
-            configured_max_output_tokens: 8_192,
+            configured_max_output_tokens: None,
             overflow_margin_tokens: 1_024,
             tokens_until_limit: -482,
             token_limit_reached: true,

@@ -145,18 +145,13 @@ export function settingsPreferencesFixtureConfig(baseUrl) {
 base_url = ${JSON.stringify(baseUrl)}
 model = ${JSON.stringify(SCRIPTED_PROVIDER_MODEL_ID)}
 provider_profile = ${JSON.stringify(SETTINGS_PROVIDER_PROFILE)}
-reasoning_summary = "none"
 connect_timeout_ms = 1000
 request_timeout_ms = 30000
 max_retries = 0
 context_window = ${PROVIDER_CONTEXT_BEFORE}
-max_output_tokens = 1024
 supports_tools = false
-supports_reasoning = false
 supports_images = false
 parallel_tool_calls = false
-
-[model.extra_body_json]
 
 [permissions]
 access_mode = "default"
@@ -253,6 +248,7 @@ export async function observeSettingsPreferencesSurface(cdp) {
         profile: select('[role="dialog"][aria-labelledby="provider-dialog-title"] #provider-profile'),
         api_key_env: input('[role="dialog"][aria-labelledby="provider-dialog-title"] #provider-api-key-env'),
         context: input('[role="dialog"][aria-labelledby="provider-dialog-title"] #provider-context-window'),
+        max_output_tokens: input('[role="dialog"][aria-labelledby="provider-dialog-title"] #provider-max-output-tokens'),
         save: button('[role="dialog"][aria-labelledby="provider-dialog-title"] button[data-action="save-provider-global"]'),
         load_models: button('[role="dialog"][aria-labelledby="provider-dialog-title"] button[data-action="load-provider-models"]'),
         close: button('[role="dialog"][aria-labelledby="provider-dialog-title"] button[data-action="close-overlay"]'),
@@ -264,6 +260,7 @@ export async function observeSettingsPreferencesSurface(cdp) {
         profile: select('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.provider_profile"]'),
         api_key_env: input('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.api_key_env"]'),
         context: input('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.context_window"]'),
+        max_output_tokens: input('[role="dialog"][aria-labelledby="config-dialog-title"] .settings-control[data-config-key="model.max_output_tokens"]'),
         docling: input('[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[data-config-key="docling.enabled"]'),
         docling_label: {
           count: doclingLabel.count,
@@ -365,6 +362,8 @@ export function providerEditorReady(surface, ledger, expectedContext = PROVIDER_
     && surface.provider.context.visible === true
     && surface.provider.context.enabled === true
     && surface.provider.context.value === expectedContext
+    && surface.provider.max_output_tokens.count === 0
+    && surface.provider.max_output_tokens.visible === false
     && surface.provider.save.count === 1
     && surface.provider.save.visible === true
     && surface.provider.load_models.count === 1
@@ -389,6 +388,8 @@ export function preferencesReady(surface, ledger, { contextWindow, doclingEnable
     && surface.settings.api_key_env.value === SETTINGS_PROVIDER_API_KEY_ENV
     && surface.settings.context.count === 1
     && surface.settings.context.value === contextWindow
+    && surface.settings.max_output_tokens.count === 0
+    && surface.settings.max_output_tokens.visible === false
     && surface.settings.docling.count === 1
     && surface.settings.docling.checked === doclingEnabled
     && surface.settings.dirty_badge_visible === false
@@ -493,7 +494,6 @@ export function expectedProviderGlobalSave(surface, contextWindow = PROVIDER_CON
         providerProfile: projection.provider_profile,
         apiKeyEnv: projection.provider_api_key_env,
         contextWindow,
-        maxOutputTokens: projection.provider_max_output_tokens,
         selectedModelId,
       },
       expectedTarget: structuredClone(projection.config_target),

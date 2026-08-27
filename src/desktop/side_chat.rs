@@ -27,6 +27,10 @@ use crate::storage::session_repo::{
 };
 
 const SIDE_CHAT_SYSTEM_PROMPT: &str = include_str!("../../assets/prompts/side_chat.md");
+// `ModelProfile` still carries this retired compatibility field. Provider
+// serializers omit it, so side chat supplies a fixed inert value instead of a
+// legacy moyAI generation setting.
+const RETIRED_MAX_OUTPUT_TOKENS_PLACEHOLDER: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SideChatHistoryMessage {
@@ -43,7 +47,6 @@ pub(crate) struct SideChatRequestProfile {
     pub connect_timeout_ms: u64,
     pub max_retries: u8,
     pub context_window: u32,
-    pub max_output_tokens: u32,
     pub api_key_env: Option<String>,
     pub extra_headers: BTreeMap<String, String>,
 }
@@ -59,7 +62,6 @@ impl std::fmt::Debug for SideChatRequestProfile {
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("max_retries", &self.max_retries)
             .field("context_window", &self.context_window)
-            .field("max_output_tokens", &self.max_output_tokens)
             .field("api_key_env", &self.api_key_env)
             .field("extra_header_count", &self.extra_headers.len())
             .finish()
@@ -470,7 +472,7 @@ pub(crate) async fn run_side_chat_request(
     let model = ModelProfile {
         name: profile.model,
         context_window: profile.context_window,
-        max_output_tokens: profile.max_output_tokens,
+        max_output_tokens: RETIRED_MAX_OUTPUT_TOKENS_PLACEHOLDER,
         provider_profile: profile.provider_profile,
         capabilities: ModelCapabilities {
             supports_tools: false,
@@ -579,6 +581,11 @@ mod tests {
             assert!(request.extra_body.is_none());
             assert!(request.temperature.is_none());
             assert!(request.top_p.is_none());
+            assert_eq!(
+                request.model.max_output_tokens,
+                RETIRED_MAX_OUTPUT_TOKENS_PLACEHOLDER
+            );
+            assert!(!request.model.capabilities.supports_reasoning);
             for event in self.events.clone() {
                 sink.push(event)?;
             }
@@ -599,7 +606,6 @@ mod tests {
             connect_timeout_ms: 10_000,
             max_retries: 0,
             context_window: 131_072,
-            max_output_tokens: 8_192,
             api_key_env: None,
             extra_headers: BTreeMap::new(),
         }
@@ -642,6 +648,7 @@ mod tests {
     async fn side_chat_is_toolless_and_does_not_inject_reasoning_or_sampling() {
         let client = FixtureClient {
             events: vec![
+                LlmEvent::ReasoningSummaryDelta("provider-owned reasoning".to_string()),
                 LlmEvent::TextDelta("短い".to_string()),
                 LlmEvent::TextDelta("回答".to_string()),
             ],

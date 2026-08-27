@@ -172,6 +172,28 @@ impl ConfigField {
         ConfigField::McpServersJson,
     ];
 
+    /// Compatibility-only fields that used to let moyAI override generation
+    /// behavior owned by the provider host.
+    ///
+    /// They stay in `ALL` so older config documents remain typed and can be
+    /// consumed by the neutral parser, but current user interfaces must not
+    /// project them or materialize new values for them.
+    pub(crate) const fn is_host_owned_generation(self) -> bool {
+        matches!(
+            self,
+            ConfigField::Temperature
+                | ConfigField::TopP
+                | ConfigField::TopK
+                | ConfigField::PresencePenalty
+                | ConfigField::FrequencyPenalty
+                | ConfigField::Seed
+                | ConfigField::StopSequences
+                | ConfigField::MaxOutputTokens
+                | ConfigField::SupportsReasoning
+                | ConfigField::ExtraBodyJson
+        )
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             ConfigField::BaseUrl => "model.base_url",
@@ -286,7 +308,7 @@ impl ConfigField {
         match self {
             ConfigField::ProviderProfile => "Connection type",
             ConfigField::ApiKeyEnv => "API key environment variable (optional)",
-            ConfigField::RequestTimeoutMs => "LLM response timeout",
+            ConfigField::RequestTimeoutMs => "LLM response inactivity timeout",
             _ => self.label(),
         }
     }
@@ -300,7 +322,7 @@ impl ConfigField {
                 "API keyそのものではなく、起動環境に設定した環境変数名（例: OPENAI_API_KEY）を入力します。認証不要なら空欄にします。"
             }
             ConfigField::RequestTimeoutMs => {
-                "最初の送信開始からstream完了までのLLM応答全体に適用する総上限（ms）です。"
+                "応答headerまでの待機と、応答中のSSE event間の最大無進捗時間（ms）です。進捗中の総所要時間は制限せず、hostへも送信しません。"
             }
             _ => "",
         }
@@ -876,6 +898,31 @@ mod tests {
             assert!(keys.insert(descriptor.key()));
             assert_eq!(descriptor.required(), !field.allows_empty_complete_value());
         }
+    }
+
+    #[test]
+    fn host_owned_generation_classification_keeps_compatibility_fields_out_of_current_uis() {
+        let classified = ConfigField::ALL
+            .into_iter()
+            .filter(|field| field.is_host_owned_generation())
+            .map(ConfigField::label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            classified,
+            vec![
+                "model.temperature",
+                "model.top_p",
+                "model.top_k",
+                "model.presence_penalty",
+                "model.frequency_penalty",
+                "model.seed",
+                "model.stop_sequences",
+                "model.max_output_tokens",
+                "model.supports_reasoning",
+                "model.extra_body_json",
+            ]
+        );
     }
 
     #[test]

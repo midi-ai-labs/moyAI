@@ -16,11 +16,22 @@ export const SCRIPTED_PROVIDER_TOOL_ERROR_RECOVERY_KIND = "tool_error_recovery";
 export const SCRIPTED_PROVIDER_TOOL_ERROR_RECOVERY_MAX_RESPONSES = 2;
 export const SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND = "permission_restart_guardian";
 export const SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_MAX_RESPONSES = 4;
+export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND = "chat_tool_continuation";
+export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_MAX_RESPONSES = 2;
+export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT =
+  "Use current_time exactly once with {}. After the tool result, reply only CHAT_TOOL_CONTINUATION_OK.";
+export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_RESPONSE = "CHAT_TOOL_CONTINUATION_OK";
+export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_CALL_ID = "call_chat_current_time";
 export const SCRIPTED_PROVIDER_RESPONSE_BEHAVIORS = Object.freeze([
   "complete",
   "hold_until_release",
   "hold_until_peer_close",
 ]);
+export const SCRIPTED_PROVIDER_RESPONSE_PACING_LIMITS = Object.freeze({
+  maximum_cadence_ms: 5_000,
+  maximum_delta_count: 32,
+  maximum_total_duration_ms: 30_000,
+});
 
 const LOOPBACK_HOST = "127.0.0.1";
 const FETCH_FORBIDDEN_PORTS = new Set([
@@ -89,6 +100,33 @@ function responseBehavior(value) {
     throw new TypeError(`unknown scripted provider response behavior: ${value}`);
   }
   return value;
+}
+
+function responsePacing(value) {
+  if (value === null || value === undefined) return null;
+  if (!exactKeys(value, ["cadenceMs", "deltaCount"])) {
+    throw new TypeError("scripted provider responsePacing must use its exact schema");
+  }
+  const cadenceMs = positiveInteger(value.cadenceMs, "responsePacing.cadenceMs");
+  const deltaCount = positiveInteger(value.deltaCount, "responsePacing.deltaCount");
+  if (cadenceMs > SCRIPTED_PROVIDER_RESPONSE_PACING_LIMITS.maximum_cadence_ms) {
+    throw new TypeError(
+      `responsePacing.cadenceMs must not exceed ${SCRIPTED_PROVIDER_RESPONSE_PACING_LIMITS.maximum_cadence_ms}`,
+    );
+  }
+  if (deltaCount < 2 || deltaCount > SCRIPTED_PROVIDER_RESPONSE_PACING_LIMITS.maximum_delta_count) {
+    throw new TypeError(
+      `responsePacing.deltaCount must be between 2 and ${SCRIPTED_PROVIDER_RESPONSE_PACING_LIMITS.maximum_delta_count}`,
+    );
+  }
+  const totalDurationMs = cadenceMs * (deltaCount + 1);
+  if (!Number.isSafeInteger(totalDurationMs)
+    || totalDurationMs > SCRIPTED_PROVIDER_RESPONSE_PACING_LIMITS.maximum_total_duration_ms) {
+    throw new TypeError(
+      `responsePacing total duration must not exceed ${SCRIPTED_PROVIDER_RESPONSE_PACING_LIMITS.maximum_total_duration_ms}ms`,
+    );
+  }
+  return Object.freeze({ cadenceMs, deltaCount, totalDurationMs });
 }
 
 function exactKeys(value, expected) {
@@ -171,12 +209,24 @@ function permissionRestartGuardianScript(value) {
   });
 }
 
+function chatToolContinuationScript(value) {
+  const expectedKeys = ["kind"];
+  if (!exactKeys(value, expectedKeys)
+    || value.kind !== SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
+    throw new TypeError("Chat tool continuation scripted provider mode must use its exact schema");
+  }
+  return Object.freeze({ kind: value.kind });
+}
+
 function providerScript(value) {
   if (value === null || value === undefined) return null;
   if (value?.kind === SCRIPTED_PROVIDER_AGENT_INTERRUPT_KIND) return agentInterruptScript(value);
   if (value?.kind === SCRIPTED_PROVIDER_TOOL_ERROR_RECOVERY_KIND) return toolErrorRecoveryScript(value);
   if (value?.kind === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND) {
     return permissionRestartGuardianScript(value);
+  }
+  if (value?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
+    return chatToolContinuationScript(value);
   }
   throw new TypeError("scripted provider mode must use a known kind and its exact schema");
 }
@@ -187,6 +237,9 @@ function scriptedResponseMaximum(script) {
   }
   if (script?.kind === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND) {
     return SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_MAX_RESPONSES;
+  }
+  if (script?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
+    return SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_MAX_RESPONSES;
   }
   return SCRIPTED_PROVIDER_AGENT_INTERRUPT_MAX_RESPONSES;
 }
@@ -233,6 +286,12 @@ export function createPermissionRestartGuardianProviderScript({
     command,
     justification,
     responseText,
+  });
+}
+
+export function createChatToolContinuationProviderScript() {
+  return chatToolContinuationScript({
+    kind: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND,
   });
 }
 
@@ -328,34 +387,42 @@ function exactUserInput(body) {
 const EXPECTED_RESPONSES_KEYS = Object.freeze([
   "input",
   "instructions",
-  "max_output_tokens",
   "model",
   "store",
   "stream",
 ]);
-const FORBIDDEN_RESPONSES_KEYS = Object.freeze([
+export const SCRIPTED_PROVIDER_CLIENT_GENERATION_KEYS = Object.freeze([
+  "chat_template_kwargs",
+  "enable_thinking",
+  "extra_body",
   "extra_body_json",
   "frequency_penalty",
+  "max_output_tokens",
   "max_tokens",
-  "messages",
-  "parallel_tool_calls",
+  "min_p",
+  "num_ctx",
   "presence_penalty",
-  "previous_response_id",
   "reasoning",
   "reasoning_effort",
   "reasoning_summary",
   "seed",
   "stop",
+  "stop_sequences",
   "temperature",
-  "tool_choice",
-  "tools",
   "top_k",
   "top_p",
+]);
+const FORBIDDEN_RESPONSES_KEYS = Object.freeze([
+  ...SCRIPTED_PROVIDER_CLIENT_GENERATION_KEYS,
+  "messages",
+  "parallel_tool_calls",
+  "previous_response_id",
+  "tool_choice",
+  "tools",
 ]);
 const TOOL_RESPONSES_KEYS = Object.freeze([
   "input",
   "instructions",
-  "max_output_tokens",
   "model",
   "parallel_tool_calls",
   "store",
@@ -376,14 +443,30 @@ const PERMISSION_RESTART_GUARDIAN_ALLOW = Object.freeze({
 const GUARDIAN_RESPONSES_KEYS = Object.freeze([
   "input",
   "instructions",
-  "max_output_tokens",
   "model",
-  "reasoning",
   "store",
   "stream",
 ]);
+const CHAT_TOOL_CONTINUATION_KEYS = Object.freeze([
+  "messages",
+  "model",
+  "n",
+  "parallel_tool_calls",
+  "stream",
+  "stream_options",
+  "tools",
+]);
+const CHAT_TOOL_OUTPUT_MAX_BYTES = 512;
 
-function requestContract(body, modelId, expectedPrompt, expectedMaxOutputTokens) {
+function clientGenerationContract(body) {
+  const present = SCRIPTED_PROVIDER_CLIENT_GENERATION_KEYS.filter((key) => Object.hasOwn(body ?? {}, key));
+  return {
+    client_generation_fields_present: present,
+    client_generation_fields_absent: present.length === 0,
+  };
+}
+
+function requestContract(body, modelId, expectedPrompt) {
   const model = typeof body?.model === "string" ? body.model : null;
   const inputText = exactUserInput(body);
   const instructions = typeof body?.instructions === "string" ? body.instructions : null;
@@ -391,7 +474,9 @@ function requestContract(body, modelId, expectedPrompt, expectedMaxOutputTokens)
     ? Object.keys(body).sort()
     : [];
   const forbiddenFieldsPresent = FORBIDDEN_RESPONSES_KEYS.filter((key) => Object.hasOwn(body ?? {}, key));
+  const generation = clientGenerationContract(body);
   const contract = {
+    ...generation,
     model_sha256: model === null ? null : sha256(Buffer.from(model, "utf8")),
     input_text_sha256: inputText === null ? null : sha256(Buffer.from(inputText, "utf8")),
     instructions_sha256: instructions === null ? null : sha256(Buffer.from(instructions, "utf8")),
@@ -401,17 +486,18 @@ function requestContract(body, modelId, expectedPrompt, expectedMaxOutputTokens)
     input_matches: inputText === expectedPrompt,
     instructions_non_empty: instructions !== null && instructions.trim().length > 0,
     top_level_keys_match: JSON.stringify(topLevelKeys) === JSON.stringify(EXPECTED_RESPONSES_KEYS),
-    max_output_tokens_matches: body?.max_output_tokens === expectedMaxOutputTokens,
+    max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
     stream_true: body?.stream === true,
     store_false: body?.store === false,
   };
   return {
     ...contract,
-    pass: contract.model_matches
+    pass: contract.client_generation_fields_absent
+      && contract.model_matches
       && contract.input_matches
       && contract.instructions_non_empty
       && contract.top_level_keys_match
-      && contract.max_output_tokens_matches
+      && contract.max_output_tokens_absent
       && contract.stream_true
       && contract.store_false,
   };
@@ -459,7 +545,6 @@ function orderedConversationRequestContract(
   modelId,
   turns,
   currentTurnIndex,
-  expectedMaxOutputTokens,
 ) {
   const model = typeof body?.model === "string" ? body.model : null;
   const instructions = typeof body?.instructions === "string" ? body.instructions : null;
@@ -468,7 +553,9 @@ function orderedConversationRequestContract(
     : [];
   const forbiddenFieldsPresent = FORBIDDEN_RESPONSES_KEYS.filter((key) => Object.hasOwn(body ?? {}, key));
   const conversation = orderedConversationInputContract(body?.input, turns, currentTurnIndex);
+  const generation = clientGenerationContract(body);
   const contract = {
+    ...generation,
     ordered_conversation: conversation,
     model_sha256: model === null ? null : sha256(Buffer.from(model, "utf8")),
     instructions_sha256: instructions === null ? null : sha256(Buffer.from(instructions, "utf8")),
@@ -477,17 +564,18 @@ function orderedConversationRequestContract(
     model_matches: model === modelId,
     instructions_non_empty: instructions !== null && instructions.trim().length > 0,
     top_level_keys_match: JSON.stringify(topLevelKeys) === JSON.stringify(EXPECTED_RESPONSES_KEYS),
-    max_output_tokens_matches: body?.max_output_tokens === expectedMaxOutputTokens,
+    max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
     stream_true: body?.stream === true,
     store_false: body?.store === false,
   };
   return {
     ...contract,
-    pass: conversation.matches
+    pass: contract.client_generation_fields_absent
+      && conversation.matches
       && contract.model_matches
       && contract.instructions_non_empty
       && contract.top_level_keys_match
-      && contract.max_output_tokens_matches
+      && contract.max_output_tokens_absent
       && contract.stream_true
       && contract.store_false,
   };
@@ -672,6 +760,167 @@ function shellToolsContract(tools) {
   };
 }
 
+function currentTimeToolSchemaPass(tool) {
+  const definition = tool?.function;
+  const parameters = definition?.parameters;
+  return exactKeys(tool, ["function", "type"])
+    && tool.type === "function"
+    && exactKeys(definition, ["description", "name", "parameters"])
+    && definition.name === "current_time"
+    && typeof definition.description === "string"
+    && definition.description.trim().length > 0
+    && exactKeys(parameters, ["properties", "type"])
+    && parameters.type === "object"
+    && exactKeys(parameters.properties, []);
+}
+
+function chatToolsContract(tools) {
+  const functions = Array.isArray(tools) ? tools.map((tool) => tool?.function) : [];
+  const names = functions.map((definition) => typeof definition?.name === "string"
+    ? definition.name
+    : null);
+  const genericShapePass = Array.isArray(tools)
+    && tools.length > 0
+    && tools.every((tool) => exactKeys(tool, ["function", "type"])
+      && tool.type === "function"
+      && exactKeys(tool.function, ["description", "name", "parameters"])
+      && typeof tool.function.name === "string"
+      && tool.function.name.length > 0
+      && typeof tool.function.description === "string"
+      && tool.function.description.length > 0
+      && tool.function.parameters !== null
+      && typeof tool.function.parameters === "object"
+      && !Array.isArray(tool.function.parameters));
+  const uniqueNames = names.every((name) => name !== null) && new Set(names).size === names.length;
+  const currentTimeTools = Array.isArray(tools)
+    ? tools.filter((tool) => tool?.function?.name === "current_time")
+    : [];
+  return {
+    tool_count: Array.isArray(tools) ? tools.length : null,
+    tool_names_sha256: names.every((name) => name !== null)
+      ? sha256(Buffer.from([...names].sort().join("\n"), "utf8"))
+      : null,
+    unique_tool_names: uniqueNames,
+    current_time_present: currentTimeTools.length === 1,
+    current_time_schema_matches: currentTimeTools.length === 1
+      && currentTimeToolSchemaPass(currentTimeTools[0]),
+    pass: genericShapePass
+      && uniqueNames
+      && currentTimeTools.length === 1
+      && currentTimeToolSchemaPass(currentTimeTools[0]),
+  };
+}
+
+function exactChatTextMessage(message, role) {
+  return exactKeys(message, ["content", "role"])
+    && message.role === role
+    && typeof message.content === "string"
+    ? message.content
+    : null;
+}
+
+function currentTimeToolOutputShape(value) {
+  if (typeof value !== "string") return false;
+  const sizeBytes = Buffer.byteLength(value, "utf8");
+  if (sizeBytes < 1 || sizeBytes > CHAT_TOOL_OUTPUT_MAX_BYTES) return false;
+  return /^local: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}\r?\nutc: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\r?\ntimezone: [+-]\d{2}:\d{2}\r?\nunix_ms: \d{10,16}$/.test(value);
+}
+
+function chatToolContinuationRole(body) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  const systemText = exactChatTextMessage(messages[0], "system");
+  const userText = exactChatTextMessage(messages[1], "user");
+  const assistant = messages[2];
+  const tool = messages[3];
+  const toolCall = Array.isArray(assistant?.tool_calls) && assistant.tool_calls.length === 1
+    ? assistant.tool_calls[0]
+    : null;
+  const callMatches = exactKeys(assistant, ["role", "tool_calls"])
+    && assistant.role === "assistant"
+    && !Object.hasOwn(assistant, "content")
+    && exactKeys(toolCall, ["function", "id", "type"])
+    && toolCall.id === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_CALL_ID
+    && toolCall.type === "function"
+    && exactKeys(toolCall.function, ["arguments", "name"])
+    && toolCall.function.name === "current_time"
+    && toolCall.function.arguments === "{}";
+  const toolOutput = exactKeys(tool, ["content", "role", "tool_call_id"])
+    && tool.role === "tool"
+    && tool.tool_call_id === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_CALL_ID
+    && typeof tool.content === "string"
+    ? tool.content
+    : null;
+  const initial = messages.length === 2
+    && systemText !== null
+    && systemText.trim().length > 0
+    && userText === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT;
+  const continuation = messages.length === 4
+    && systemText !== null
+    && systemText.trim().length > 0
+    && userText === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT
+    && callMatches
+    && currentTimeToolOutputShape(toolOutput);
+  return {
+    role: initial ? "chat_tool_initial" : continuation ? "chat_continuation" : null,
+    evidence: {
+      message_count: messages.length,
+      message_roles: messages.map((message) => typeof message?.role === "string" ? message.role : null),
+      system_content_sha256: systemText === null ? null : sha256(Buffer.from(systemText, "utf8")),
+      system_content_non_empty: systemText !== null && systemText.trim().length > 0,
+      user_content_sha256: userText === null ? null : sha256(Buffer.from(userText, "utf8")),
+      user_prompt_matches: userText === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT,
+      assistant_content_absent: assistant !== null
+        && typeof assistant === "object"
+        && !Array.isArray(assistant)
+        && !Object.hasOwn(assistant, "content"),
+      current_time_call_matches: callMatches,
+      tool_output_shape_matches: currentTimeToolOutputShape(toolOutput),
+      tool_output_size_bytes: toolOutput === null ? null : Buffer.byteLength(toolOutput, "utf8"),
+      tool_output_sha256: toolOutput === null ? null : sha256(Buffer.from(toolOutput, "utf8")),
+    },
+  };
+}
+
+function chatToolContinuationRequestContract(body, modelId, script) {
+  const model = typeof body?.model === "string" ? body.model : null;
+  const topLevelKeys = body !== null && typeof body === "object" && !Array.isArray(body)
+    ? Object.keys(body).sort()
+    : [];
+  const classified = chatToolContinuationRole(body);
+  const tools = chatToolsContract(body?.tools);
+  const generation = clientGenerationContract(body);
+  const contract = {
+    ...generation,
+    script_kind: script.kind,
+    role: classified.role,
+    role_evidence: classified.evidence,
+    model_sha256: model === null ? null : sha256(Buffer.from(model, "utf8")),
+    top_level_keys: topLevelKeys,
+    model_matches: model === modelId,
+    top_level_keys_match: JSON.stringify(topLevelKeys) === JSON.stringify(CHAT_TOOL_CONTINUATION_KEYS),
+    stream_true: body?.stream === true,
+    include_usage_true: exactKeys(body?.stream_options, ["include_usage"])
+      && body.stream_options.include_usage === true,
+    n_one: body?.n === 1,
+    max_tokens_absent: !Object.hasOwn(body ?? {}, "max_tokens"),
+    parallel_tool_calls_false: body?.parallel_tool_calls === false,
+    tools,
+  };
+  return {
+    ...contract,
+    pass: contract.client_generation_fields_absent
+      && contract.role !== null
+      && contract.model_matches
+      && contract.top_level_keys_match
+      && contract.stream_true
+      && contract.include_usage_true
+      && contract.n_one
+      && contract.max_tokens_absent
+      && contract.parallel_tool_calls_false
+      && contract.tools.pass,
+  };
+}
+
 function agentInterruptExpected(script) {
   const childPath = `/root/${script.childTaskName}`;
   const spawnArguments = JSON.stringify({
@@ -729,7 +978,7 @@ function agentInterruptRole(body, expectedPrompt, script) {
   };
 }
 
-function agentInterruptRequestContract(body, modelId, expectedPrompt, expectedMaxOutputTokens, script) {
+function agentInterruptRequestContract(body, modelId, expectedPrompt, script) {
   const model = typeof body?.model === "string" ? body.model : null;
   const instructions = typeof body?.instructions === "string" ? body.instructions : null;
   const topLevelKeys = body !== null && typeof body === "object" && !Array.isArray(body)
@@ -737,7 +986,9 @@ function agentInterruptRequestContract(body, modelId, expectedPrompt, expectedMa
     : [];
   const tools = toolsContract(body?.tools);
   const classified = agentInterruptRole(body, expectedPrompt, script);
+  const generation = clientGenerationContract(body);
   const contract = {
+    ...generation,
     script_kind: script.kind,
     role: classified.role,
     role_evidence: classified.evidence,
@@ -747,7 +998,7 @@ function agentInterruptRequestContract(body, modelId, expectedPrompt, expectedMa
     model_matches: model === modelId,
     instructions_non_empty: instructions !== null && instructions.trim().length > 0,
     top_level_keys_match: JSON.stringify(topLevelKeys) === JSON.stringify(TOOL_RESPONSES_KEYS),
-    max_output_tokens_matches: body?.max_output_tokens === expectedMaxOutputTokens,
+    max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
     stream_true: body?.stream === true,
     store_false: body?.store === false,
     tool_choice_auto: body?.tool_choice === "auto",
@@ -756,11 +1007,12 @@ function agentInterruptRequestContract(body, modelId, expectedPrompt, expectedMa
   };
   return {
     ...contract,
-    pass: contract.role !== null
+    pass: contract.client_generation_fields_absent
+      && contract.role !== null
       && contract.model_matches
       && contract.instructions_non_empty
       && contract.top_level_keys_match
-      && contract.max_output_tokens_matches
+      && contract.max_output_tokens_absent
       && contract.stream_true
       && contract.store_false
       && contract.tool_choice_auto
@@ -816,7 +1068,7 @@ function toolErrorRecoveryRole(body, expectedPrompt, script) {
   };
 }
 
-function toolErrorRecoveryRequestContract(body, modelId, expectedPrompt, expectedMaxOutputTokens, script) {
+function toolErrorRecoveryRequestContract(body, modelId, expectedPrompt, script) {
   const model = typeof body?.model === "string" ? body.model : null;
   const instructions = typeof body?.instructions === "string" ? body.instructions : null;
   const topLevelKeys = body !== null && typeof body === "object" && !Array.isArray(body)
@@ -824,7 +1076,9 @@ function toolErrorRecoveryRequestContract(body, modelId, expectedPrompt, expecte
     : [];
   const tools = readToolsContract(body?.tools);
   const classified = toolErrorRecoveryRole(body, expectedPrompt, script);
+  const generation = clientGenerationContract(body);
   const contract = {
+    ...generation,
     script_kind: script.kind,
     role: classified.role,
     role_evidence: classified.evidence,
@@ -834,7 +1088,7 @@ function toolErrorRecoveryRequestContract(body, modelId, expectedPrompt, expecte
     model_matches: model === modelId,
     instructions_non_empty: instructions !== null && instructions.trim().length > 0,
     top_level_keys_match: JSON.stringify(topLevelKeys) === JSON.stringify(TOOL_RESPONSES_KEYS),
-    max_output_tokens_matches: body?.max_output_tokens === expectedMaxOutputTokens,
+    max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
     stream_true: body?.stream === true,
     store_false: body?.store === false,
     tool_choice_auto: body?.tool_choice === "auto",
@@ -843,11 +1097,12 @@ function toolErrorRecoveryRequestContract(body, modelId, expectedPrompt, expecte
   };
   return {
     ...contract,
-    pass: contract.role !== null
+    pass: contract.client_generation_fields_absent
+      && contract.role !== null
       && contract.model_matches
       && contract.instructions_non_empty
       && contract.top_level_keys_match
-      && contract.max_output_tokens_matches
+      && contract.max_output_tokens_absent
       && contract.stream_true
       && contract.store_false
       && contract.tool_choice_auto
@@ -1056,7 +1311,6 @@ function permissionRestartGuardianReviewRole(body, script) {
 function permissionRestartGuardianRequestContract(
   body,
   modelId,
-  expectedMaxOutputTokens,
   script,
 ) {
   const guardianShape = Object.hasOwn(body ?? {}, "reasoning")
@@ -1071,7 +1325,9 @@ function permissionRestartGuardianRequestContract(
     : [];
   const expectedKeys = guardianShape ? GUARDIAN_RESPONSES_KEYS : TOOL_RESPONSES_KEYS;
   const tools = guardianShape ? null : shellToolsContract(body?.tools);
+  const generation = clientGenerationContract(body);
   const common = {
+    ...generation,
     script_kind: script.kind,
     role: classified.role,
     role_evidence: classified.evidence,
@@ -1088,22 +1344,22 @@ function permissionRestartGuardianRequestContract(
     const guardian = {
       ...common,
       guardian_instructions_match: instructions?.includes("independent permission guardian") === true,
-      max_output_tokens_matches: body?.max_output_tokens === Math.min(expectedMaxOutputTokens, 512),
-      reasoning_none: exactKeys(body?.reasoning, ["effort"])
-        && body.reasoning.effort === "none",
+      max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
+      reasoning_absent: !Object.hasOwn(body ?? {}, "reasoning"),
       tools_absent: !Object.hasOwn(body ?? {}, "tools")
         && !Object.hasOwn(body ?? {}, "tool_choice")
         && !Object.hasOwn(body ?? {}, "parallel_tool_calls"),
     };
     return {
       ...guardian,
-      pass: guardian.role === "guardian_review"
+      pass: guardian.client_generation_fields_absent
+        && guardian.role === "guardian_review"
         && guardian.model_matches
         && guardian.instructions_non_empty
         && guardian.guardian_instructions_match
         && guardian.top_level_keys_match
-        && guardian.max_output_tokens_matches
-        && guardian.reasoning_none
+        && guardian.max_output_tokens_absent
+        && guardian.reasoning_absent
         && guardian.tools_absent
         && guardian.stream_true
         && guardian.store_false,
@@ -1111,18 +1367,19 @@ function permissionRestartGuardianRequestContract(
   }
   const task = {
     ...common,
-    max_output_tokens_matches: body?.max_output_tokens === expectedMaxOutputTokens,
+    max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
     tool_choice_auto: body?.tool_choice === "auto",
     parallel_tool_calls_false: body?.parallel_tool_calls === false,
     tools,
   };
   return {
     ...task,
-    pass: task.role !== null
+    pass: task.client_generation_fields_absent
+      && task.role !== null
       && task.model_matches
       && task.instructions_non_empty
       && task.top_level_keys_match
-      && task.max_output_tokens_matches
+      && task.max_output_tokens_absent
       && task.tool_choice_auto
       && task.parallel_tool_calls_false
       && task.tools.pass
@@ -1167,24 +1424,26 @@ function lmStudioCatalog(modelId, supportsTools = false) {
   };
 }
 
-function responsesSse(responseText, {
+function responsesEvents(responseText, {
   itemId = "msg_main_ok",
   responseId = "resp_main_ok",
   streamedText = responseText,
+  streamedDeltas = null,
 } = {}) {
+  const deltas = streamedDeltas === null ? [streamedText] : streamedDeltas;
   const item = {
     type: "message",
     id: itemId,
     role: "assistant",
     content: [{ type: "output_text", text: responseText }],
   };
-  const events = [
-    {
+  return [
+    ...deltas.map((delta) => ({
       type: "response.output_text.delta",
       item_id: item.id,
       output_index: 0,
-      delta: streamedText,
-    },
+      delta,
+    })),
     { type: "response.output_item.done", output_index: 0, item },
     {
       type: "response.completed",
@@ -1200,7 +1459,202 @@ function responsesSse(responseText, {
       },
     },
   ];
+}
+
+function responsesSse(responseText, options = {}) {
+  const events = responsesEvents(responseText, options);
   return events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+}
+
+function splitPacedResponseText(responseText, deltaCount) {
+  const characters = Array.from(responseText);
+  if (characters.length < deltaCount) {
+    throw new TypeError(
+      `paced response text must contain at least ${deltaCount} Unicode characters`,
+    );
+  }
+  return Array.from({ length: deltaCount }, (_, index) => {
+    const start = Math.floor((index * characters.length) / deltaCount);
+    const end = Math.floor(((index + 1) * characters.length) / deltaCount);
+    return characters.slice(start, end).join("");
+  });
+}
+
+function elapsedMonotonicMs(startedAt) {
+  return Number((process.hrtime.bigint() - startedAt) / 1_000_000n);
+}
+
+function waitForPacingIntervalOrClose(milliseconds, closePromise) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish("elapsed"), milliseconds);
+    closePromise.then(() => finish("closed"));
+  });
+}
+
+async function writePacedResponses(response, row, responseText, pacing, options = {}) {
+  const startedAt = process.hrtime.bigint();
+  const deltas = splitPacedResponseText(responseText, pacing.deltaCount);
+  const events = responsesEvents(responseText, { ...options, streamedDeltas: deltas });
+  const observation = {
+    schema_version: "desktop-e2e.scripted-provider-response-stream.v1",
+    cadence_ms: pacing.cadenceMs,
+    delta_count: pacing.deltaCount,
+    configured_total_duration_ms: pacing.totalDurationMs,
+    expected_event_count: events.length,
+    headers_sent_elapsed_ms: null,
+    events: [],
+    terminal_sent: false,
+    terminal_elapsed_ms: null,
+    response_finished: false,
+    response_finished_elapsed_ms: null,
+    peer_close_observed: false,
+    peer_close_elapsed_ms: null,
+    peer_closed_before_terminal: false,
+  };
+  row.response_stream = observation;
+
+  let resolveClose;
+  let resolveFinish;
+  const closePromise = new Promise((resolve) => { resolveClose = resolve; });
+  const finishPromise = new Promise((resolve) => { resolveFinish = resolve; });
+  const markPeerClose = () => {
+    if (observation.response_finished || observation.peer_close_observed) return;
+    observation.peer_close_observed = true;
+    observation.peer_close_elapsed_ms = elapsedMonotonicMs(startedAt);
+    observation.peer_closed_before_terminal = !observation.terminal_sent;
+    resolveClose();
+  };
+  response.once("close", markPeerClose);
+  response.once("error", markPeerClose);
+  response.once("finish", () => {
+    observation.response_finished = true;
+    observation.response_finished_elapsed_ms = elapsedMonotonicMs(startedAt);
+    resolveFinish();
+  });
+
+  response.sendDate = false;
+  response.writeHead(200, {
+    "cache-control": "no-store",
+    connection: "close",
+    "content-type": "text/event-stream",
+  });
+  response.flushHeaders();
+  row.response_phase = "streaming";
+  row.response_status = 200;
+  observation.headers_sent_elapsed_ms = elapsedMonotonicMs(startedAt);
+
+  for (let index = 0; index < events.length; index += 1) {
+    if (index > 0) {
+      const outcome = await waitForPacingIntervalOrClose(pacing.cadenceMs, closePromise);
+      if (outcome === "closed") {
+        row.response_phase = "peer_closed";
+        return false;
+      }
+    }
+    if (response.destroyed || response.socket?.destroyed === true) {
+      markPeerClose();
+      row.response_phase = "peer_closed";
+      return false;
+    }
+    const event = events[index];
+    const bytes = Buffer.from(`data: ${JSON.stringify(event)}\n\n`, "utf8");
+    response.write(bytes);
+    const elapsedMs = elapsedMonotonicMs(startedAt);
+    observation.events.push({
+      sequence: index + 1,
+      event_type: event.type,
+      elapsed_ms: elapsedMs,
+      size_bytes: bytes.byteLength,
+    });
+    if (event.type === "response.completed") {
+      observation.terminal_sent = true;
+      observation.terminal_elapsed_ms = elapsedMs;
+    }
+  }
+
+  response.end();
+  const outcome = await Promise.race([
+    finishPromise.then(() => "finished"),
+    closePromise.then(() => "closed"),
+  ]);
+  if (outcome !== "finished") {
+    row.response_phase = "peer_closed";
+    return false;
+  }
+  row.response_phase = "completed";
+  return true;
+}
+
+function chatCompletionSse(chunks) {
+  return chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("");
+}
+
+function chatToolContinuationCallSse(modelId) {
+  const common = {
+    id: "chatcmpl_chat_tool_initial",
+    object: "chat.completion.chunk",
+    model: modelId,
+  };
+  return chatCompletionSse([
+    {
+      ...common,
+      choices: [{
+        index: 0,
+        delta: { content: "\n\n<|im_" },
+        finish_reason: null,
+      }],
+    },
+    {
+      ...common,
+      choices: [{
+        index: 0,
+        delta: {
+          content: "start|>",
+          tool_calls: [{
+            index: 0,
+            id: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_CALL_ID,
+            type: "function",
+            function: { name: "current_time", arguments: "{}" },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }],
+    },
+    {
+      ...common,
+      choices: [],
+      usage: { prompt_tokens: 8, completion_tokens: 6, total_tokens: 14 },
+    },
+  ]);
+}
+
+function chatToolContinuationFinalSse(modelId) {
+  return chatCompletionSse([
+    {
+      id: "chatcmpl_chat_continuation",
+      object: "chat.completion.chunk",
+      model: modelId,
+      choices: [{
+        index: 0,
+        delta: { content: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_RESPONSE },
+        finish_reason: "stop",
+      }],
+    },
+    {
+      id: "chatcmpl_chat_continuation",
+      object: "chat.completion.chunk",
+      model: modelId,
+      choices: [],
+      usage: { prompt_tokens: 16, completion_tokens: 4, total_tokens: 20 },
+    },
+  ]);
 }
 
 function agentInterruptSpawnSse(script) {
@@ -1298,6 +1752,7 @@ function routeFor(target) {
   if (target.pathname === "/v1/models") return "models";
   if (target.pathname === "/api/v1/models") return "lm_studio_models";
   if (target.pathname === "/v1/responses") return "responses";
+  if (target.pathname === "/v1/chat/completions") return "chat_completions";
   if (target.pathname === "/ready") return "docling_readiness";
   return "unknown";
 }
@@ -1408,8 +1863,8 @@ export class ScriptedProvider {
     expectedPrompt = SCRIPTED_PROVIDER_PROMPT,
     responseText = SCRIPTED_PROVIDER_RESPONSE,
     maxBodyBytes = SCRIPTED_PROVIDER_MAX_BODY_BYTES,
-    expectedMaxOutputTokens = SCRIPTED_PROVIDER_MAX_OUTPUT_TOKENS,
     responseBehavior: configuredResponseBehavior = "complete",
+    responsePacing: configuredResponsePacing = null,
     doclingReadinessStatus = null,
     turns = null,
     orderedConversation = false,
@@ -1427,31 +1882,50 @@ export class ScriptedProvider {
     }
     this.orderedConversation = orderedConversation;
     this.maxBodyBytes = positiveInteger(maxBodyBytes, "maxBodyBytes");
-    this.expectedMaxOutputTokens = positiveInteger(expectedMaxOutputTokens, "expectedMaxOutputTokens");
     this.responseBehavior = responseBehavior(configuredResponseBehavior);
+    this.responsePacing = responsePacing(configuredResponsePacing);
     this.#doclingReadinessStatus = optionalHttpStatus(doclingReadinessStatus, "doclingReadinessStatus");
     this.#doclingReadinessRelease = new Promise((resolve) => { this.#releaseDoclingReadiness = resolve; });
     this.script = providerScript(script);
+    if (this.responsePacing !== null && this.responseBehavior !== "complete") {
+      throw new TypeError("paced Responses require complete response behavior");
+    }
+    if (this.responsePacing !== null && this.script !== null) {
+      throw new TypeError("paced Responses cannot use a scripted provider mode");
+    }
+    if (this.responsePacing !== null) {
+      for (const turn of this.turns) {
+        splitPacedResponseText(turn.responseText, this.responsePacing.deltaCount);
+      }
+    }
     const releaseHeldToolErrorInitial = this.script?.kind === SCRIPTED_PROVIDER_TOOL_ERROR_RECOVERY_KIND
       && this.responseBehavior === "hold_until_release";
     const releaseHeldGuardianToolInitial = this.script?.kind
       === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND
       && this.responseBehavior === "hold_until_release";
+    const releaseHeldChatContinuation = this.script?.kind
+      === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND
+      && this.responseBehavior === "hold_until_release";
+    if (this.script?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND
+      && !releaseHeldChatContinuation) {
+      throw new TypeError("Chat tool continuation script requires hold_until_release behavior");
+    }
     if (this.script !== null
       && this.responseBehavior !== "complete"
       && !releaseHeldToolErrorInitial
-      && !releaseHeldGuardianToolInitial) {
+      && !releaseHeldGuardianToolInitial
+      && !releaseHeldChatContinuation) {
       throw new TypeError("scripted provider mode owns its response lifecycle");
     }
     if (this.script !== null && turns !== null) {
       throw new TypeError("scripted provider mode cannot use ordinary turns");
     }
     if (this.responseBehavior === "hold_until_release") {
-      if (releaseHeldGuardianToolInitial) {
+      if (releaseHeldGuardianToolInitial || releaseHeldChatContinuation) {
         let release;
         const promise = new Promise((resolve) => { release = resolve; });
         this.#scriptRoleRelease = {
-          role: "guardian_tool_initial",
+          role: releaseHeldGuardianToolInitial ? "guardian_tool_initial" : "chat_continuation",
           promise,
           release,
           released: false,
@@ -1554,6 +2028,20 @@ export class ScriptedProvider {
         released: this.#scriptRoleRelease.released,
         released_by_cleanup: this.#scriptRoleRelease.releasedByCleanup,
       },
+      paced_response_configured: this.responsePacing !== null,
+      paced_response_pacing: this.responsePacing === null ? null : {
+        cadence_ms: this.responsePacing.cadenceMs,
+        delta_count: this.responsePacing.deltaCount,
+        configured_total_duration_ms: this.responsePacing.totalDurationMs,
+      },
+      paced_response_streams: this.#ledger
+        .filter((row) => row.response_stream !== null)
+        .map((row) => ({
+          request_sequence: row.sequence,
+          response_phase: row.response_phase,
+          response_status: row.response_status,
+          ...structuredClone(row.response_stream),
+        })),
     };
   }
 
@@ -1581,7 +2069,8 @@ export class ScriptedProvider {
     if (release === null) throw new Error("scripted role response release is not configured");
     if (role !== release.role) throw new Error("scripted role response release target is invalid");
     if (release.released) throw new Error("scripted role response was already released");
-    const rows = this.#ledger.filter((row) => row.route === "responses"
+    const expectedRoute = role === "chat_continuation" ? "chat_completions" : "responses";
+    const rows = this.#ledger.filter((row) => row.route === expectedRoute
       && row.contract?.pass === true
       && row.contract?.role === role);
     if (rows.length !== 1 || rows[0].response_phase !== "held" || rows[0].response_status !== null) {
@@ -1667,10 +2156,21 @@ export class ScriptedProvider {
       contract: null,
       response_phase: null,
       response_status: null,
+      response_stream: null,
     };
     this.#ledger.push(row);
 
     if (route === "unknown") {
+      row.response_phase = "rejected";
+      row.response_status = 404;
+      fixedError(response, 404, "not_found");
+      request.resume();
+      return;
+    }
+    const chatToolContinuationMode = this.script?.kind
+      === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND;
+    if ((route === "chat_completions" && !chatToolContinuationMode)
+      || (route === "responses" && chatToolContinuationMode)) {
       row.response_phase = "rejected";
       row.response_status = 404;
       fixedError(response, 404, "not_found");
@@ -1772,7 +2272,6 @@ export class ScriptedProvider {
           decoded.value,
           this.modelId,
           this.expectedPrompt,
-          this.expectedMaxOutputTokens,
           this.script,
         );
       } else if (this.script.kind === SCRIPTED_PROVIDER_TOOL_ERROR_RECOVERY_KIND) {
@@ -1780,14 +2279,18 @@ export class ScriptedProvider {
           decoded.value,
           this.modelId,
           this.expectedPrompt,
-          this.expectedMaxOutputTokens,
+          this.script,
+        );
+      } else if (this.script.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
+        row.contract = chatToolContinuationRequestContract(
+          decoded.value,
+          this.modelId,
           this.script,
         );
       } else {
         row.contract = permissionRestartGuardianRequestContract(
           decoded.value,
           this.modelId,
-          this.expectedMaxOutputTokens,
           this.script,
         );
       }
@@ -1801,6 +2304,8 @@ export class ScriptedProvider {
         await this.#handleAgentInterruptResponse(response, row);
       } else if (this.script.kind === SCRIPTED_PROVIDER_TOOL_ERROR_RECOVERY_KIND) {
         await this.#handleToolErrorRecoveryResponse(response, row);
+      } else if (this.script.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
+        await this.#handleChatToolContinuationResponse(response, row);
       } else {
         await this.#handlePermissionRestartGuardianResponse(response, row);
       }
@@ -1820,9 +2325,8 @@ export class ScriptedProvider {
         this.modelId,
         this.turns,
         this.#acceptedResponseCount,
-        this.expectedMaxOutputTokens,
       )
-      : requestContract(decoded.value, this.modelId, turn.prompt, this.expectedMaxOutputTokens);
+      : requestContract(decoded.value, this.modelId, turn.prompt);
     if (!row.contract.pass) {
       row.response_phase = "rejected";
       row.response_status = 422;
@@ -1842,13 +2346,29 @@ export class ScriptedProvider {
       await this.#responseReleases[turnIndex].promise;
     }
 
+    const responseOptions = {
+      itemId: turnIndex === 0 ? "msg_main_ok" : `msg_main_ok_${turnIndex + 1}`,
+      responseId: turnIndex === 0 ? "resp_main_ok" : `resp_main_ok_${turnIndex + 1}`,
+    };
+    if (this.responsePacing !== null) {
+      const completed = await writePacedResponses(
+        response,
+        row,
+        turn.responseText,
+        this.responsePacing,
+        responseOptions,
+      );
+      if (completed) this.#successfulResponseCount += 1;
+      return;
+    }
+
     this.#successfulResponseCount += 1;
     row.response_phase = "completed";
     row.response_status = 200;
-    writeResponse(response, 200, "text/event-stream", responsesSse(turn.responseText, {
-      itemId: turnIndex === 0 ? "msg_main_ok" : `msg_main_ok_${turnIndex + 1}`,
-      responseId: turnIndex === 0 ? "resp_main_ok" : `resp_main_ok_${turnIndex + 1}`,
-    }));
+    writeResponse(response, 200, "text/event-stream", responsesSse(
+      turn.responseText,
+      responseOptions,
+    ));
   }
 
   async #handleAgentInterruptResponse(response, row) {
@@ -1930,6 +2450,45 @@ export class ScriptedProvider {
         responseId: "resp_tool_error_recovery_done",
         streamedText: this.script.streamedPrefix,
       });
+    writeResponse(response, 200, "text/event-stream", payload);
+  }
+
+  async #handleChatToolContinuationResponse(response, row) {
+    if (!row.contract.pass) {
+      row.response_phase = "rejected";
+      row.response_status = 422;
+      fixedError(response, 422, "request_contract_mismatch");
+      return;
+    }
+    const role = row.contract.role;
+    if (this.#acceptedRoles.has(role)) {
+      row.response_phase = "rejected";
+      row.response_status = 409;
+      fixedError(response, 409, "script_role_already_consumed");
+      return;
+    }
+    if (role === "chat_continuation" && !this.#acceptedRoles.has("chat_tool_initial")) {
+      row.response_phase = "rejected";
+      row.response_status = 409;
+      fixedError(response, 409, "script_role_prerequisite_missing");
+      return;
+    }
+
+    this.#acceptedRoles.add(role);
+    this.#acceptedResponseCount += 1;
+    if (role === "chat_continuation") {
+      if (this.#scriptRoleRelease?.role !== role) {
+        throw new Error("Chat tool continuation release owner is missing");
+      }
+      row.response_phase = "held";
+      await this.#scriptRoleRelease.promise;
+    }
+    this.#successfulResponseCount += 1;
+    row.response_phase = "completed";
+    row.response_status = 200;
+    const payload = role === "chat_tool_initial"
+      ? chatToolContinuationCallSse(this.modelId)
+      : chatToolContinuationFinalSse(this.modelId);
     writeResponse(response, 200, "text/event-stream", payload);
   }
 

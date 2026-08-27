@@ -2006,6 +2006,7 @@ mod tests {
                 source_item_id: None,
                 sequence_no: 1,
                 payload: TurnItemPayload::Plan {
+                    call_id: None,
                     explanation: None,
                     plan: Vec::new(),
                 },

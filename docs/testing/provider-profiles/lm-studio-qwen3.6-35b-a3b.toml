@@ -9,18 +9,14 @@ request_timeout_ms = 300000
 connect_timeout_ms = 10000
 max_retries = 2
 context_window = 131072
-max_output_tokens = 8192
-stop_sequences = []
+# Local input-accounting/compaction budget only; this is not sent as a provider model setting.
 supports_tools = true
-supports_reasoning = false
 supports_images = true
 parallel_tool_calls = true
 max_parallel_predictions = 1
 
 [model.extra_headers]
 
-[model.extra_body_json]
-num_ctx = 131072
 
 [session]
 overflow_margin_tokens = 1024

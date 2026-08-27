@@ -110,10 +110,6 @@ pub struct SessionSettingsArgs {
     pub provider_connection_override: ProviderConnectionOverrideArgs,
     pub access_mode: Option<AccessMode>,
     pub reset_model_parameters: bool,
-    pub temperature: Option<f64>,
-    pub top_p: Option<f64>,
-    pub top_k: Option<u32>,
-    pub max_output_tokens: Option<u32>,
     pub output_mode: OutputMode,
 }
 
@@ -461,30 +457,9 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                     && provider_connection_override.is_empty()
                     && args.access_mode.is_none()
                     && !args.reset_model_parameters
-                    && args.temperature.is_none()
-                    && args.top_p.is_none()
-                    && args.top_k.is_none()
-                    && args.max_output_tokens.is_none()
                 {
                     return Err(CliUsageError::Message(
                         "session settings requires at least one setting flag".to_string(),
-                    ));
-                }
-                if let Some(value) = args.temperature {
-                    validate_cli_finite_non_negative("session settings --temperature", value)?;
-                }
-                if let Some(value) = args.top_p {
-                    validate_cli_finite_range("session settings --top-p", value, 0.0, 1.0)?;
-                }
-                if args.top_k == Some(0) {
-                    return Err(CliUsageError::Message(
-                        "session settings --top-k must be greater than zero".to_string(),
-                    ));
-                }
-                if args.max_output_tokens == Some(0) {
-                    return Err(CliUsageError::Message(
-                        "session settings --max-output-tokens must be greater than zero"
-                            .to_string(),
                     ));
                 }
                 Ok(CliCommand::SessionSettings(SessionSettingsArgs {
@@ -500,10 +475,6 @@ pub fn parse() -> Result<CliCommand, CliUsageError> {
                         .map(parse_cli_access_mode)
                         .transpose()?,
                     reset_model_parameters: args.reset_model_parameters,
-                    temperature: args.temperature,
-                    top_p: args.top_p,
-                    top_k: args.top_k,
-                    max_output_tokens: args.max_output_tokens,
                     output_mode: args.output_mode,
                 }))
             }
@@ -794,29 +765,6 @@ fn parse_cli_goal_status(value: &str) -> Result<ThreadGoalStatus, CliUsageError>
     }
 }
 
-fn validate_cli_finite_non_negative(label: &str, value: f64) -> Result<(), CliUsageError> {
-    if !value.is_finite() || value < 0.0 {
-        return Err(CliUsageError::Message(format!(
-            "{label} must be finite and non-negative"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_cli_finite_range(
-    label: &str,
-    value: f64,
-    min: f64,
-    max: f64,
-) -> Result<(), CliUsageError> {
-    if !value.is_finite() || value < min || value > max {
-        return Err(CliUsageError::Message(format!(
-            "{label} must be finite and between {min} and {max}"
-        )));
-    }
-    Ok(())
-}
-
 #[derive(Parser)]
 #[command(name = "moyai", version)]
 struct RootCli {
@@ -1028,14 +976,6 @@ struct SessionSettingsCommand {
     access_mode: Option<String>,
     #[arg(long = "reset-model-parameters")]
     reset_model_parameters: bool,
-    #[arg(long = "temperature")]
-    temperature: Option<f64>,
-    #[arg(long = "top-p")]
-    top_p: Option<f64>,
-    #[arg(long = "top-k")]
-    top_k: Option<u32>,
-    #[arg(long = "max-output-tokens")]
-    max_output_tokens: Option<u32>,
     #[arg(long = "format", value_enum, default_value_t = OutputMode::Human)]
     output_mode: OutputMode,
 }
@@ -1405,6 +1345,15 @@ mod tests {
             Some(ProviderProfile::LmStudioChatCompletions)
         );
         assert_eq!(availability.api_key_env.as_deref(), Some("PROVIDER_KEY"));
+    }
+
+    #[test]
+    fn session_settings_does_not_expose_host_generation_knobs() {
+        for flag in ["--temperature", "--top-p", "--top-k", "--max-output-tokens"] {
+            let result =
+                RootCli::try_parse_from(["moyai", "session", "settings", "session-id", flag, "1"]);
+            assert!(result.is_err(), "{flag} must not be an active CLI setting");
+        }
     }
 
     #[test]

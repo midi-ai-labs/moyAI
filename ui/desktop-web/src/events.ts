@@ -479,11 +479,6 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
     context.uiState.drafts.providerRevision += 1;
     updateProviderActionButtons(context);
   });
-  document.querySelector<HTMLInputElement>("#provider-max-output-tokens")?.addEventListener("input", (event) => {
-    context.uiState.drafts.provider.maxOutputTokens = (event.currentTarget as HTMLInputElement).value;
-    context.uiState.drafts.providerRevision += 1;
-    updateProviderActionButtons(context);
-  });
   const settingsControls = collectSettingsControls();
   if (settingsControls.length > 0) {
     validateSettingsForm(context, state.config_fields, false);
@@ -1199,7 +1194,6 @@ function sessionSettingsDraftField(value: string): SessionSettingsDraftField | n
   if (value === "provider-profile") return "providerProfile";
   if (value === "api-key-env") return "apiKeyEnv";
   if (value === "context-window") return "contextWindow";
-  if (value === "max-output-tokens") return "maxOutputTokens";
   if (value === "access-mode") return "accessMode";
   return null;
 }

@@ -27,6 +27,7 @@ const BASELINE_API_KEY_ENV = "MOYAI_E2E_UNUSED_PROVIDER_KEY";
 const SENTINEL_NAME = "E2E_PROVIDER_OPENAI_COMPATIBLE.txt";
 const SETTINGS_STABILITY_MS = 500;
 const LIVE_TURN_TIMEOUT_MS = 420_000;
+const OPENAI_CHAT_TEMPLATE_CONTROL_TOKENS = Object.freeze(["<|im_start|>", "<|im_end|>"]);
 
 export const PROVIDER_OPENAI_COMPATIBLE_PROMPT = "接続確認です。必ず built-in の current_time ツールを引数 {} でちょうど1回だけ呼び出してください。その結果に含まれる local、utc、timezone の値をそのまま使い、回答を必ず「接続確認完了：local=... / utc=... / timezone=... です。」という日本語の1文にしてください（... はそれぞれの実値に置き換えてください）。ファイル操作、shell、他のツールは使わないでください。";
 
@@ -139,18 +140,13 @@ base_url = ${JSON.stringify(BASELINE_BASE_URL)}
 model = ${JSON.stringify(BASELINE_MODEL)}
 provider_profile = ${JSON.stringify(BASELINE_PROFILE)}
 api_key_env = ${JSON.stringify(BASELINE_API_KEY_ENV)}
-reasoning_summary = "none"
 connect_timeout_ms = 10000
 request_timeout_ms = 180000
 max_retries = 0
 context_window = 32768
-max_output_tokens = 1024
 supports_tools = true
-supports_reasoning = false
 supports_images = false
 parallel_tool_calls = false
-
-[model.extra_body_json]
 
 [permissions]
 access_mode = "default"
@@ -399,6 +395,15 @@ function finalAssistant(projection) {
   return rows.filter((row) => row?.row_kind === "assistant" && typeof row.body === "string").at(-1)?.body.trim() ?? "";
 }
 
+export function providerConnectionLiveControlTokenLeaks(projection) {
+  const rows = Array.isArray(projection?.transcript_rows) ? projection.transcript_rows : [];
+  return rows.flatMap((row, rowIndex) => {
+    if (row?.row_kind !== "assistant" || typeof row.body !== "string") return [];
+    const markers = OPENAI_CHAT_TEMPLATE_CONTROL_TOKENS.filter((marker) => row.body.includes(marker));
+    return markers.length === 0 ? [] : [{ row_index: rowIndex, markers }];
+  });
+}
+
 function completedWorkSummaries(projection) {
   const rows = Array.isArray(projection?.transcript_rows) ? projection.transcript_rows : [];
   return rows.filter((row) => row?.row_kind === "work_summary_completed");
@@ -443,7 +448,9 @@ function liveCurrentTimeProjectionAccepted(surface) {
   const projection = surface?.projection;
   const summaries = completedWorkSummaries(projection);
   const time = currentTimeFromCompletedProjection(projection);
-  if (time === null || !surfaceErrorFree(surface)) return false;
+  if (time === null
+    || !surfaceErrorFree(surface)
+    || providerConnectionLiveControlTokenLeaks(projection).length > 0) return false;
   const assistant = finalAssistant(projection);
   return projection?.run_status_key === "completed"
     && projection?.task_activity_state === "idle"

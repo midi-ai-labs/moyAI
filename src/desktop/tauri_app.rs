@@ -3421,7 +3421,6 @@ struct DesktopProviderActionInput {
     provider_profile: String,
     api_key_env: String,
     context_window: String,
-    max_output_tokens: String,
     selected_model_id: String,
 }
 
@@ -3436,7 +3435,6 @@ impl std::fmt::Debug for DesktopProviderActionInput {
             .field("provider_profile", &self.provider_profile)
             .field("api_key_env", &self.api_key_env)
             .field("context_window", &self.context_window)
-            .field("max_output_tokens", &self.max_output_tokens)
             .field("selected_model_id", &self.selected_model_id)
             .finish()
     }
@@ -3484,7 +3482,6 @@ fn accept_provider_action_input(
         provider_profile,
         api_key_env.unwrap_or_default(),
         input.context_window,
-        input.max_output_tokens,
         input.selected_model_id,
     );
     Ok(())
@@ -3656,7 +3653,6 @@ struct DesktopSessionSettingsInput {
     api_key_env: String,
     access_mode: crate::config::AccessMode,
     context_window: String,
-    max_output_tokens: String,
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
@@ -3697,7 +3693,16 @@ fn complete_config_draft_is_dirty(
     effective_config: &crate::config::ResolvedConfig,
     values: &[DesktopConfigValueInput],
 ) -> Result<bool, DesktopCommandConflict> {
-    if values.len() != crate::config::ConfigField::ALL.len() {
+    let expected_field_count = crate::config::ConfigField::ALL
+        .into_iter()
+        .filter(|field| !field.is_host_owned_generation())
+        .count();
+    let contains_only_current_gui_fields = values.iter().all(|value| {
+        crate::config::ConfigField::ALL
+            .into_iter()
+            .any(|field| !field.is_host_owned_generation() && field.label() == value.key.as_str())
+    });
+    if values.len() != expected_field_count || !contains_only_current_gui_fields {
         return Err(DesktopCommandConflict::new(
             "the complete settings draft must accompany the configuration owner target",
         ));
@@ -3978,27 +3983,18 @@ fn parse_optional_session_settings_u32(
 fn session_model_parameter_patch(
     current: &crate::session::SessionModelParameters,
     context_window: Option<u32>,
-    max_output_tokens: Option<u32>,
 ) -> SessionSettingsPatch {
-    let clears_existing_override = (current.context_window.is_some() && context_window.is_none())
-        || (current.max_output_tokens.is_some() && max_output_tokens.is_none());
+    let clears_existing_override = current.context_window.is_some() && context_window.is_none();
     if clears_existing_override {
         return SessionSettingsPatch {
             reset_model_parameters: true,
-            temperature: current.temperature,
-            top_p: current.top_p,
-            top_k: current.top_k,
             context_window,
-            max_output_tokens,
             ..SessionSettingsPatch::default()
         };
     }
     SessionSettingsPatch {
         context_window: (context_window != current.context_window)
             .then_some(context_window)
-            .flatten(),
-        max_output_tokens: (max_output_tokens != current.max_output_tokens)
-            .then_some(max_output_tokens)
             .flatten(),
         ..SessionSettingsPatch::default()
     }
@@ -4011,10 +4007,8 @@ fn session_settings_patch_for_values(
     provider_connection: crate::session::SessionProviderConnection,
     access_mode: crate::config::AccessMode,
     context_window: Option<u32>,
-    max_output_tokens: Option<u32>,
 ) -> (SessionSettingsPatch, bool) {
-    let mut patch =
-        session_model_parameter_patch(&session.model_parameters, context_window, max_output_tokens);
+    let mut patch = session_model_parameter_patch(&session.model_parameters, context_window);
     patch.base_url = (base_url != session.base_url).then_some(base_url);
     patch.model = (model != session.model).then_some(model);
     patch.provider_connection = (session.provider_connection.as_ref()
@@ -4025,8 +4019,7 @@ fn session_settings_patch_for_values(
         || patch.model.is_some()
         || patch.provider_connection.is_some()
         || patch.reset_model_parameters
-        || patch.context_window.is_some()
-        || patch.max_output_tokens.is_some();
+        || patch.context_window.is_some();
     (patch, changes_turn_config)
 }
 
@@ -4097,8 +4090,6 @@ fn build_session_settings_patch(
     };
     let context_window =
         parse_optional_session_settings_u32("context window", &input.context_window, true)?;
-    let max_output_tokens =
-        parse_optional_session_settings_u32("max output tokens", &input.max_output_tokens, false)?;
     Ok(session_settings_patch_for_values(
         session,
         base_url,
@@ -4106,7 +4097,6 @@ fn build_session_settings_patch(
         provider_connection,
         input.access_mode,
         context_window,
-        max_output_tokens,
     ))
 }
 
@@ -5072,7 +5062,7 @@ mod tests {
     }
 
     #[test]
-    fn session_settings_blank_limit_clears_only_that_override() {
+    fn session_settings_blank_local_context_does_not_resave_legacy_generation_values() {
         let current = crate::session::SessionModelParameters {
             temperature: Some(0.4),
             top_p: Some(0.8),
@@ -5081,15 +5071,15 @@ mod tests {
             max_output_tokens: Some(4_096),
         };
 
-        let patch = session_model_parameter_patch(&current, None, Some(8_192));
+        let patch = session_model_parameter_patch(&current, None);
         let next = patch.apply_to_model_parameters(&current);
 
         assert!(patch.reset_model_parameters);
-        assert_eq!(next.temperature, current.temperature);
-        assert_eq!(next.top_p, current.top_p);
-        assert_eq!(next.top_k, current.top_k);
+        assert_eq!(next.temperature, None);
+        assert_eq!(next.top_p, None);
+        assert_eq!(next.top_k, None);
         assert_eq!(next.context_window, None);
-        assert_eq!(next.max_output_tokens, Some(8_192));
+        assert_eq!(next.max_output_tokens, None);
         assert_eq!(
             parse_optional_session_settings_u32("context window", "  ", true)
                 .expect("blank inherits"),
@@ -5098,7 +5088,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_session_limits_do_not_reset_other_model_parameters() {
+    fn unchanged_session_local_context_does_not_resave_legacy_model_parameters() {
         let current = crate::session::SessionModelParameters {
             temperature: Some(0.4),
             top_p: Some(0.8),
@@ -5107,11 +5097,16 @@ mod tests {
             max_output_tokens: Some(4_096),
         };
 
-        let mut patch = session_model_parameter_patch(&current, None, Some(4_096));
+        let mut patch = session_model_parameter_patch(&current, None);
         patch.access_mode = Some(crate::config::AccessMode::FullAccess);
 
         assert!(!patch.reset_model_parameters);
-        assert_eq!(patch.apply_to_model_parameters(&current), current);
+        let next = patch.apply_to_model_parameters(&current);
+        assert_eq!(next.context_window, current.context_window);
+        assert_eq!(next.temperature, None);
+        assert_eq!(next.top_p, None);
+        assert_eq!(next.top_k, None);
+        assert_eq!(next.max_output_tokens, None);
     }
 
     #[test]
@@ -5149,7 +5144,6 @@ mod tests {
                 .clone()
                 .expect("provider snapshot"),
             session.access_mode,
-            None,
             None,
         );
 
@@ -6479,6 +6473,7 @@ mod tests {
         let mut values = editor
             .fields
             .iter()
+            .filter(|field| !field.key.is_host_owned_generation())
             .map(|field| DesktopConfigValueInput {
                 key: field.key.label().to_string(),
                 text: field.value.clone(),
@@ -6492,6 +6487,17 @@ mod tests {
             .expect("model field")
             .text = "locally-edited-model".to_string();
         assert!(complete_config_draft_is_dirty(&config, &values).expect("dirty full draft"));
+        let last = values.last_mut().expect("visible config field");
+        let current_last = last.clone();
+        *last = DesktopConfigValueInput {
+            key: crate::config::ConfigField::Temperature.label().to_string(),
+            text: "0.7".to_string(),
+        };
+        assert!(
+            complete_config_draft_is_dirty(&config, &values).is_err(),
+            "a compatibility-only generation field cannot replace a current GUI draft field"
+        );
+        *values.last_mut().expect("visible config field") = current_last;
         values.pop();
         assert!(complete_config_draft_is_dirty(&config, &values).is_err());
     }

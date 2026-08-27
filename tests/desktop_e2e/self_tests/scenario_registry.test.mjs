@@ -16,6 +16,10 @@ const liveProviderOptions = Object.freeze({
   provider_base_url: "http://192.0.2.10:8119/v1",
   model: "example/Qwen-27B",
 });
+const lmStudioThinkingOptions = Object.freeze({
+  provider_base_url: "http://127.0.0.1:1234",
+  model: "qwen/qwen3.8-27b",
+});
 const case52OpenAiOptions = Object.freeze({
   fixture_source: "C:\\fixture",
   provider_profile: "openai_compatible",
@@ -32,9 +36,12 @@ test("one registry binds every reusable scenario to the common runner contract",
     "input.pointer-keyboard",
     "manual.case5_2",
     "manual.provider-openai-compatible",
+    "manual.provider-lm-studio-thinking",
     "native-dialog.cancel",
     "prompt-review.cancel",
     "permission.restart-guardian",
+    "provider.chat-tool-continuation",
+    "provider.responses-progress",
     "provider.restart",
     "settings.docling-readiness",
     "settings.initial-setup",
@@ -48,6 +55,8 @@ test("one registry binds every reusable scenario to the common runner contract",
       ? case52Options
       : id === "manual.provider-openai-compatible"
         ? liveProviderOptions
+        : id === "manual.provider-lm-studio-thinking"
+          ? lmStudioThinkingOptions
         : {};
     const scenario = createScenario(id, options);
     assert.equal(scenario.id, id);
@@ -67,6 +76,14 @@ test("one registry binds every reusable scenario to the common runner contract",
     createScenario("permission.restart-guardian"),
     createScenario("permission.restart-guardian"),
   );
+  assert.notEqual(
+    createScenario("provider.chat-tool-continuation"),
+    createScenario("provider.chat-tool-continuation"),
+  );
+  assert.notEqual(
+    createScenario("provider.responses-progress"),
+    createScenario("provider.responses-progress"),
+  );
   assert.notEqual(createScenario("run.next-turn"), createScenario("run.next-turn"));
   assert.notEqual(createScenario("run.stop"), createScenario("run.stop"));
   assert.notEqual(createScenario("agent.interrupt"), createScenario("agent.interrupt"));
@@ -79,8 +96,16 @@ test("one registry binds every reusable scenario to the common runner contract",
     createScenario("manual.provider-openai-compatible", liveProviderOptions),
     createScenario("manual.provider-openai-compatible", liveProviderOptions),
   );
+  assert.notEqual(
+    createScenario("manual.provider-lm-studio-thinking", lmStudioThinkingOptions),
+    createScenario("manual.provider-lm-studio-thinking", lmStudioThinkingOptions),
+  );
   assert.throws(
     () => createScenario("manual.provider-openai-compatible"),
+    /provider_base_url must be a non-empty string/,
+  );
+  assert.throws(
+    () => createScenario("manual.provider-lm-studio-thinking"),
     /provider_base_url must be a non-empty string/,
   );
   assert.throws(() => createScenario("run-95"), /unknown Desktop E2E scenario/);

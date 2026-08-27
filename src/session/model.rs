@@ -153,15 +153,19 @@ pub struct SessionSpawnEdge {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionModelParameters {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Deserialize-only compatibility input. Generation policy belongs to the provider host.
+    #[serde(default, skip_serializing)]
     pub temperature: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Deserialize-only compatibility input. Generation policy belongs to the provider host.
+    #[serde(default, skip_serializing)]
     pub top_p: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Deserialize-only compatibility input. Generation policy belongs to the provider host.
+    #[serde(default, skip_serializing)]
     pub top_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Deserialize-only compatibility input. Generation policy belongs to the provider host.
+    #[serde(default, skip_serializing)]
     pub max_output_tokens: Option<u32>,
 }
 
@@ -243,6 +247,7 @@ pub fn resolved_config_for_session(
     session: &SessionRecord,
 ) -> ResolvedConfig {
     let mut effective = global.clone();
+    effective.model.clear_legacy_generation_settings();
     let endpoint_changed = match (
         ProviderEndpoint::parse(&effective.model.base_url),
         ProviderEndpoint::parse(&session.base_url),
@@ -269,28 +274,12 @@ pub fn resolved_config_for_session(
     if let Some(value) = session.model_parameters.context_window {
         effective.model.context_window = value;
     }
-    if let Some(value) = session.model_parameters.max_output_tokens {
-        effective.model.max_output_tokens = value;
-    }
-    if let Some(value) = session.model_parameters.temperature {
-        effective.model.temperature = Some(value);
-    }
-    if let Some(value) = session.model_parameters.top_p {
-        effective.model.top_p = Some(value);
-    }
-    if let Some(value) = session.model_parameters.top_k {
-        effective.model.top_k = Some(value);
-    }
     effective
 }
 
 impl SessionModelParameters {
     pub fn is_empty(&self) -> bool {
-        self.temperature.is_none()
-            && self.top_p.is_none()
-            && self.top_k.is_none()
-            && self.context_window.is_none()
-            && self.max_output_tokens.is_none()
+        self.context_window.is_none()
     }
 }
 
@@ -308,15 +297,19 @@ pub struct SessionSettingsPatch {
     pub provider_connection: Option<SessionProviderConnection>,
     #[serde(default)]
     pub reset_model_parameters: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Deserialize-only compatibility input. Generation policy belongs to the provider host.
+    #[serde(default, skip_serializing)]
     pub temperature: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Deserialize-only compatibility input. Generation policy belongs to the provider host.
+    #[serde(default, skip_serializing)]
     pub top_p: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Deserialize-only compatibility input. Generation policy belongs to the provider host.
+    #[serde(default, skip_serializing)]
     pub top_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Deserialize-only compatibility input. Generation policy belongs to the provider host.
+    #[serde(default, skip_serializing)]
     pub max_output_tokens: Option<u32>,
 }
 
@@ -353,36 +346,21 @@ impl SessionSettingsPatch {
             && self.access_mode.is_none()
             && self.provider_connection.is_none()
             && !self.reset_model_parameters
-            && self.temperature.is_none()
-            && self.top_p.is_none()
-            && self.top_k.is_none()
             && self.context_window.is_none()
-            && self.max_output_tokens.is_none()
     }
 
     pub fn apply_to_model_parameters(
         &self,
         current: &SessionModelParameters,
     ) -> SessionModelParameters {
-        let mut next = if self.reset_model_parameters {
-            SessionModelParameters::default()
-        } else {
-            current.clone()
+        let mut next = SessionModelParameters {
+            context_window: (!self.reset_model_parameters)
+                .then_some(current.context_window)
+                .flatten(),
+            ..SessionModelParameters::default()
         };
-        if let Some(value) = self.temperature {
-            next.temperature = Some(value);
-        }
-        if let Some(value) = self.top_p {
-            next.top_p = Some(value);
-        }
-        if let Some(value) = self.top_k {
-            next.top_k = Some(value);
-        }
         if let Some(value) = self.context_window {
             next.context_window = Some(value);
-        }
-        if let Some(value) = self.max_output_tokens {
-            next.max_output_tokens = Some(value);
         }
         next
     }
@@ -1431,19 +1409,33 @@ mod tests {
     }
 
     #[test]
-    fn session_model_parameters_round_trip_optional_context_window() {
+    fn session_model_parameters_read_legacy_generation_but_only_serialize_local_context() {
         let parameters = SessionModelParameters {
+            temperature: Some(0.2),
+            top_p: Some(0.8),
+            top_k: Some(40),
             context_window: Some(131_072),
             max_output_tokens: Some(8_192),
-            ..SessionModelParameters::default()
         };
 
         let encoded = serde_json::to_string(&parameters).expect("serialize session parameters");
         let decoded: SessionModelParameters =
             serde_json::from_str(&encoded).expect("deserialize session parameters");
 
-        assert_eq!(decoded, parameters);
+        assert_eq!(encoded, r#"{"context_window":131072}"#);
         assert_eq!(decoded.context_window, Some(131_072));
+        assert_eq!(decoded.temperature, None);
+        assert_eq!(decoded.max_output_tokens, None);
+
+        let legacy: SessionModelParameters = serde_json::from_str(
+            r#"{"temperature":0.2,"top_p":0.8,"top_k":40,"context_window":65536,"max_output_tokens":4096}"#,
+        )
+        .expect("legacy session model parameters remain readable");
+        assert_eq!(legacy.temperature, Some(0.2));
+        assert_eq!(legacy.top_p, Some(0.8));
+        assert_eq!(legacy.top_k, Some(40));
+        assert_eq!(legacy.context_window, Some(65_536));
+        assert_eq!(legacy.max_output_tokens, Some(4_096));
     }
 
     #[test]
@@ -1478,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_session_resolution_uses_its_exact_provider_snapshot_and_model_settings() {
+    fn durable_session_resolution_uses_provider_snapshot_and_local_context_only() {
         let mut global = ResolvedConfig::default();
         global.model.base_url = "https://global.example/v1".to_string();
         global.model.model = "global-model".to_string();
@@ -1539,7 +1531,13 @@ mod tests {
             Some("session-secret")
         );
         assert_eq!(effective.model.context_window, 131_072);
-        assert_eq!(effective.model.max_output_tokens, 8_192);
+        assert_eq!(
+            effective.model.max_output_tokens,
+            crate::config::DEFAULT_MODEL_MAX_OUTPUT_TOKENS
+        );
+        assert_eq!(effective.model.temperature, None);
+        assert_eq!(effective.model.top_p, None);
+        assert_eq!(effective.model.top_k, None);
         assert_eq!(effective.permissions.access_mode, AccessMode::FullAccess);
     }
 

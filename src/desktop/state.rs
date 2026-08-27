@@ -144,7 +144,7 @@ fn root_session_settings_match(
         && current.model == persisted.model
         && current.base_url == persisted.base_url
         && current.access_mode == persisted.access_mode
-        && current.model_parameters == persisted.model_parameters
+        && current.model_parameters.context_window == persisted.model_parameters.context_window
         && current.session_settings_revision == persisted.session_settings_revision
 }
 
@@ -934,7 +934,6 @@ impl DesktopState {
         profile: ProviderProfile,
         api_key_env: String,
         context_window: String,
-        max_output_tokens: String,
         selected_model_id: String,
     ) -> bool {
         let normalized = normalize_provider_base_url(&base_url);
@@ -952,7 +951,6 @@ impl DesktopState {
         self.provider_config.provider_profile_input = profile;
         self.provider_config.provider_api_key_env_input = api_key_env;
         self.provider_config.provider_context_window_input = context_window;
-        self.provider_config.provider_max_output_tokens_input = max_output_tokens;
         self.provider_config.provider_selected_model_id_input = selected_model_id.clone();
         if let Some(index) = self
             .provider_config
@@ -1044,6 +1042,11 @@ impl DesktopState {
         let preserve_current_projection = self.app_state.current_session_id == Some(session.id);
         if preserve_current_projection {
             self.app_state.refresh_plan_from_turn_items(&turn_items);
+            self.app_state
+                .reconcile_compactions_from_canonical_turn_items(
+                    &turn_items,
+                    active_turn_expectation.latest_turn_id(),
+                );
         } else {
             self.app_state
                 .load_turn_items_with_active_turn(&session, &turn_items, active_turn_id);
@@ -1669,8 +1672,6 @@ impl DesktopState {
             global_config.model.api_key_env.clone().unwrap_or_default();
         self.provider_config.provider_context_window_input =
             self.global_config.model.context_window.to_string();
-        self.provider_config.provider_max_output_tokens_input =
-            self.global_config.model.max_output_tokens.to_string();
         self.provider_config.provider_selected_model_id_input = global_config.model.model.clone();
         self.provider_config.provider_models = ensure_current_model(
             self.provider_config.provider_models.clone(),
@@ -2174,12 +2175,6 @@ impl DesktopState {
             .model
             .context_window
             .to_string();
-        self.provider_config.provider_max_output_tokens_input = self
-            .provider_config
-            .effective_config
-            .model
-            .max_output_tokens
-            .to_string();
         self.provider_config.provider_loaded_base_url = None;
         self.provider_config.provider_loaded_profile = None;
         self.provider_config.provider_loaded_api_key_env = None;
@@ -2230,10 +2225,6 @@ fn session_provider_settings_match(current: &ResolvedConfig, next: &ResolvedConf
         && current.model.api_key_env == next.model.api_key_env
         && current.model.extra_headers == next.model.extra_headers
         && current.model.context_window == next.model.context_window
-        && current.model.max_output_tokens == next.model.max_output_tokens
-        && current.model.temperature == next.model.temperature
-        && current.model.top_p == next.model.top_p
-        && current.model.top_k == next.model.top_k
 }
 
 const fn session_status_from_run_status(status: RunStatus) -> SessionStatus {
@@ -2305,10 +2296,10 @@ fn provider_info_from_config(config: &ResolvedConfig) -> ProviderModelInfo {
         id: config.model.model.clone(),
         display_name: Some(config.model.model.clone()),
         context_window: Some(config.model.context_window),
-        max_output_tokens: Some(config.model.max_output_tokens),
+        max_output_tokens: None,
         supports_images: Some(config.model.supports_images),
         supports_tools: Some(config.model.supports_tools),
-        supports_reasoning: Some(config.model.supports_reasoning),
+        supports_reasoning: None,
         max_parallel_predictions: Some(config.model.max_parallel_predictions),
         load_state: ProviderModelLoadState::Unknown,
         source: "config".to_string(),
@@ -2406,7 +2397,7 @@ mod tests {
             source: crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
             active_context_tokens,
             full_context_window_limit: 131_072,
-            configured_max_output_tokens: 8_192,
+            configured_max_output_tokens: None,
             overflow_margin_tokens: 1_024,
             tokens_until_limit: 121_856 - i64::from(active_context_tokens),
             token_limit_reached: false,
@@ -3044,6 +3035,76 @@ mod tests {
     }
 
     #[test]
+    fn terminal_reload_rebuilds_compaction_after_an_older_page_is_merged() {
+        let session_id = SessionId::new();
+        let turn_id = crate::protocol::TurnId::new();
+        let session = session_record(session_id);
+        let user_item = turn_item(
+            session_id,
+            turn_id,
+            1,
+            TurnItemPayload::UserMessage {
+                text: "inspect the repository".to_string(),
+            },
+        );
+        let compaction_item = turn_item(
+            session_id,
+            turn_id,
+            2,
+            TurnItemPayload::ContextCompaction {
+                summary: "retained repository evidence".to_string(),
+            },
+        );
+        let assistant_item = turn_item(
+            session_id,
+            turn_id,
+            3,
+            TurnItemPayload::AgentMessage {
+                text: "done".to_string(),
+            },
+        );
+        let terminal_item = turn_item(
+            session_id,
+            turn_id,
+            4,
+            TurnItemPayload::Terminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
+            },
+        );
+        let mut latest_page =
+            canonical_read(&session, Vec::new(), vec![assistant_item, terminal_item]);
+        latest_page.turns.offset = 2;
+        latest_page.turns.limit = 2;
+        latest_page.turns.total = 4;
+        latest_page.latest_turn_id = Some(turn_id);
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![session_row(
+                    session_id,
+                    &session.title,
+                    SessionStatus::Completed,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+
+        state.load_open_session(&latest_page);
+        assert_eq!(state.app_state.progress.compactions, 0);
+
+        let mut older_page = canonical_read(&session, Vec::new(), vec![user_item, compaction_item]);
+        older_page.turns.offset = 0;
+        older_page.turns.limit = 2;
+        older_page.turns.total = 4;
+        older_page.turns.has_more = true;
+        older_page.latest_turn_id = Some(turn_id);
+
+        assert!(state.load_open_session_preserving_history(&older_page));
+        assert_eq!(state.app_state.progress.compactions, 1);
+        assert!(state.selected_detail().progress_text.contains("圧縮: 1"));
+    }
+
+    #[test]
     fn stale_terminal_page_cannot_reconcile_a_newer_terminal_summary() {
         let session_id = SessionId::new();
         let stale_turn_id = crate::protocol::TurnId::new();
@@ -3336,13 +3397,12 @@ mod tests {
         assert!(state.async_polling_required());
         state.finish_provider_model_load(initial_provider_model_infos(&config));
         assert!(state.can_apply_provider_selection());
-        assert_eq!(
-            state
-                .selected_provider_model_info()
-                .expect("config-derived provider model")
-                .load_state,
-            ProviderModelLoadState::Unknown
-        );
+        let config_info = state
+            .selected_provider_model_info()
+            .expect("config-derived provider model");
+        assert_eq!(config_info.load_state, ProviderModelLoadState::Unknown);
+        assert_eq!(config_info.max_output_tokens, None);
+        assert_eq!(config_info.supports_reasoning, None);
         assert_eq!(
             state.startup.status,
             super::super::startup::DesktopStartupStatus::Ready
@@ -3359,10 +3419,9 @@ mod tests {
         assert!(state.can_apply_provider_selection());
 
         state.provider_config.provider_context_window_input = "65536".to_string();
-        state.provider_config.provider_max_output_tokens_input = "8192".to_string();
         assert!(
             state.can_apply_provider_selection(),
-            "limit-only edits keep the current provider target eligible"
+            "local context edits keep the current provider target eligible"
         );
 
         state.provider_config.provider_base_url_input = "http://127.0.0.1:5678".to_string();
@@ -3447,10 +3506,6 @@ mod tests {
         assert_eq!(
             state.provider_config.provider_context_window_input,
             global.model.context_window.to_string()
-        );
-        assert_eq!(
-            state.provider_config.provider_max_output_tokens_input,
-            global.model.max_output_tokens.to_string()
         );
         assert!(state.provider_input_matches_global_target());
         assert!(!state.provider_input_matches_effective_target());
@@ -4447,7 +4502,6 @@ mod tests {
             config.model.provider_profile,
             config.model.api_key_env.clone().unwrap_or_default(),
             config.model.context_window.to_string(),
-            config.model.max_output_tokens.to_string(),
             config.model.model.clone(),
         ));
         assert!(state.provider_model_load_pending());
@@ -4457,7 +4511,6 @@ mod tests {
             config.model.provider_profile,
             config.model.api_key_env.clone().unwrap_or_default(),
             config.model.context_window.to_string(),
-            config.model.max_output_tokens.to_string(),
             config.model.model,
         ));
         assert!(!state.provider_model_load_pending());

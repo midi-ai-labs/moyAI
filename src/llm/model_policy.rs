@@ -3,9 +3,7 @@ use std::collections::BTreeSet;
 
 use crate::agent::mode::CollaborationMode;
 use crate::config::ResolvedConfig;
-use crate::config::model::{
-    ProviderApiMode, ProviderReasoningCapability, ReasoningEffort, ReasoningSummary,
-};
+use crate::config::model::{ProviderApiMode, ProviderReasoningCapability, ReasoningSummary};
 use crate::error::AgentError;
 use crate::llm::{ModelCapabilities, ModelProfile, ReasoningRequest};
 
@@ -20,19 +18,21 @@ pub enum InputModality {
 pub struct ModelPolicy {
     pub id: String,
     pub base_instructions: String,
-    pub default_reasoning: Option<ReasoningEffort>,
-    /// Provider-advertised context window before Codex-style input headroom.
+    /// moyAI-local input-accounting budget before Codex-style headroom.
     pub context_window: u32,
     pub working_context_token_limit: u32,
     /// Effective full input limit after Codex's 95% headroom and any
     /// non-inverting configured overflow margin.
     pub effective_context_token_limit: u32,
-    pub max_output_tokens: u32,
     pub input_modalities: BTreeSet<InputModality>,
     pub supports_tools: bool,
-    pub supports_reasoning: bool,
     pub supports_parallel_tool_calls: bool,
 }
+
+// `ModelProfile` retains this field for old serialized/request-construction
+// compatibility. Provider transports do not serialize it, and policy must not
+// copy a legacy moyAI generation setting into a new request.
+const RETIRED_MAX_OUTPUT_TOKENS_PLACEHOLDER: u32 = 1;
 
 impl ModelPolicy {
     pub fn from_config(config: &ResolvedConfig) -> Self {
@@ -51,14 +51,11 @@ impl ModelPolicy {
                 include_str!("../../assets/prompts/system.md").trim(),
                 include_str!("../../assets/prompts/profile_default.md").trim()
             ),
-            default_reasoning: config.model.reasoning_effort.clone(),
             context_window: config.model.context_window,
             working_context_token_limit: context_limits.working,
             effective_context_token_limit: context_limits.effective_full,
-            max_output_tokens: config.model.max_output_tokens,
             input_modalities,
             supports_tools: config.model.supports_tools,
-            supports_reasoning: config.model.supports_reasoning,
             supports_parallel_tool_calls: config.model.parallel_tool_calls,
         }
     }
@@ -69,15 +66,15 @@ impl ModelPolicy {
     ) -> ModelProfile {
         ModelProfile {
             name: self.id.clone(),
-            // Transport admission receives the immutable effective input
-            // window. The advertised value remains on ModelPolicy and in the
-            // resolved config used for provider-specific `num_ctx`.
+            // Transport admission receives the immutable effective input-accounting
+            // window. Provider load-time context remains host-owned and is not derived
+            // from this value or projected as a generation override.
             context_window: self.effective_context_token_limit,
-            max_output_tokens: self.max_output_tokens,
+            max_output_tokens: RETIRED_MAX_OUTPUT_TOKENS_PLACEHOLDER,
             provider_profile,
             capabilities: ModelCapabilities {
                 supports_tools: self.supports_tools,
-                supports_reasoning: self.supports_reasoning,
+                supports_reasoning: false,
                 supports_images: self.input_modalities.contains(&InputModality::Image),
             },
         }
@@ -85,9 +82,9 @@ impl ModelPolicy {
 }
 
 /// The single owner of the relationship between advertised, working, and hard
-/// context limits.
+/// local input-accounting limits.
 ///
-/// Codex starts automatic compaction at 90% of the advertised context and
+/// Codex starts automatic compaction at 90% of the local context budget and
 /// treats 95% as the effective full input window. A configured overflow margin
 /// may lower the hard limit only when the result remains strictly above the
 /// working limit. `max_output_tokens` is intentionally absent: it is a
@@ -136,19 +133,9 @@ pub struct ProviderCapabilities {
 impl ProviderCapabilities {
     pub fn from_config(config: &ResolvedConfig) -> Self {
         let api_mode = config.model.provider_profile.api_mode();
-        let reasoning = match api_mode {
-            ProviderApiMode::ChatCompletions => config
-                .model
-                .chat_completions_reasoning_parameters
-                .map(|parameters| ProviderReasoningCapability::ChatCompletions { parameters })
-                .unwrap_or(ProviderReasoningCapability::Unsupported),
-            ProviderApiMode::Responses => ProviderReasoningCapability::Responses {
-                supports_summary: true,
-            },
-        };
         Self {
             api_mode,
-            reasoning,
+            reasoning: ProviderReasoningCapability::Unsupported,
         }
     }
 }
@@ -165,7 +152,7 @@ impl ResolvedTurnPolicy {
         mode: &CollaborationMode,
         model: ModelPolicy,
         provider: ProviderCapabilities,
-        reasoning_summary: ReasoningSummary,
+        _reasoning_summary: ReasoningSummary,
     ) -> Result<Self, AgentError> {
         if let Some(model_override) = &mode.model_override {
             if model_override.trim() != model.id {
@@ -174,33 +161,10 @@ impl ResolvedTurnPolicy {
                 )));
             }
         }
-        let effort = mode
-            .reasoning_effort_override
-            .clone()
-            .or_else(|| model.default_reasoning.clone());
-        let reasoning = ReasoningRequest {
-            effort,
-            summary: reasoning_summary,
-        };
-        let reasoning = (!reasoning.is_disabled()).then_some(reasoning);
-        if reasoning.is_some() && !model.supports_reasoning {
-            return Err(AgentError::Message(format!(
-                "reasoning was requested for model `{}`, but its configured capability profile does not support reasoning",
-                model.id
-            )));
-        }
-        if reasoning.is_some()
-            && matches!(provider.reasoning, ProviderReasoningCapability::Unsupported)
-        {
-            return Err(AgentError::Message(format!(
-                "reasoning was requested for model `{}`, but the selected provider mode does not support it",
-                model.id
-            )));
-        }
         Ok(Self {
             model,
             provider,
-            reasoning,
+            reasoning: None,
         })
     }
 }
@@ -236,31 +200,69 @@ mod tests {
             resolved.model.supports_parallel_tool_calls,
             config.model.parallel_tool_calls
         );
+    }
+
+    #[test]
+    fn legacy_generation_config_does_not_change_transport_policy() {
+        let mut first = ResolvedConfig::default();
+        first.model.max_output_tokens = 65_536;
+        first.model.supports_reasoning = true;
+        first.model.reasoning_effort = Some(crate::config::ReasoningEffort::High);
+        first.model.chat_completions_reasoning_parameters =
+            Some(crate::config::ChatCompletionsReasoningParameters::EffortAndSummary);
+        let mut second = first.clone();
+        second.model.max_output_tokens = 1_024;
+        second.model.supports_reasoning = false;
+        second.model.reasoning_effort = None;
+        second.model.chat_completions_reasoning_parameters = None;
+
+        let first_policy = ModelPolicy::from_config(&first);
+        let second_policy = ModelPolicy::from_config(&second);
+        let first_profile = first_policy.transport_profile(first.model.provider_profile);
+        let second_profile = second_policy.transport_profile(second.model.provider_profile);
+
         assert_eq!(
-            resolved.model.supports_reasoning,
-            config.model.supports_reasoning
+            first_profile.max_output_tokens,
+            RETIRED_MAX_OUTPUT_TOKENS_PLACEHOLDER
+        );
+        assert_eq!(
+            first_profile.max_output_tokens,
+            second_profile.max_output_tokens
+        );
+        assert!(!first_profile.capabilities.supports_reasoning);
+        assert!(!second_profile.capabilities.supports_reasoning);
+        assert_eq!(
+            ProviderCapabilities::from_config(&first).reasoning,
+            ProviderReasoningCapability::Unsupported
+        );
+        assert_eq!(
+            ProviderCapabilities::from_config(&second).reasoning,
+            ProviderReasoningCapability::Unsupported
         );
     }
 
     #[test]
-    fn model_reasoning_capability_is_independent_from_default_reasoning_request() {
+    fn legacy_reasoning_config_and_mode_override_do_not_affect_turn_admission() {
         let mut config = ResolvedConfig::default();
-        config.model.supports_reasoning = true;
-        config.model.reasoning_effort = None;
-        assert!(
-            ModelPolicy::from_config(&config)
-                .transport_profile(config.model.provider_profile)
-                .capabilities
-                .supports_reasoning
-        );
-
+        config.model.provider_profile = crate::config::ProviderProfile::OpenAiCompatible;
         config.model.supports_reasoning = false;
-        config.model.reasoning_effort = Some(ReasoningEffort::High);
-        assert!(
-            !ModelPolicy::from_config(&config)
-                .transport_profile(config.model.provider_profile)
-                .capabilities
-                .supports_reasoning
+        config.model.reasoning_effort = Some(crate::config::ReasoningEffort::High);
+        config.model.reasoning_summary = ReasoningSummary::Detailed;
+        let mut mode = CollaborationMode::resolve(ModeKind::Default);
+        mode.reasoning_effort_override = Some(crate::config::ReasoningEffort::Low);
+
+        let resolved = ResolvedTurnPolicy::resolve(
+            &mode,
+            ModelPolicy::from_config(&config),
+            ProviderCapabilities::from_config(&config),
+            config.model.reasoning_summary,
+        )
+        .expect("legacy reasoning config must not participate in turn admission");
+
+        assert!(resolved.reasoning.is_none());
+        assert_eq!(
+            resolved.provider.reasoning,
+            ProviderReasoningCapability::Unsupported
         );
     }
 

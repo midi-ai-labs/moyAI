@@ -3,7 +3,6 @@ import crypto from "node:crypto";
 import test from "node:test";
 
 import {
-  SCRIPTED_PROVIDER_MAX_OUTPUT_TOKENS,
   SCRIPTED_PROVIDER_MODEL_ID,
   SCRIPTED_PROVIDER_TOOL_ERROR_RECOVERY_KIND,
   SCRIPTED_PROVIDER_TOOL_ERROR_RECOVERY_MAX_RESPONSES,
@@ -63,7 +62,6 @@ function request(input) {
     tools: tools(),
     tool_choice: "auto",
     parallel_tool_calls: false,
-    max_output_tokens: SCRIPTED_PROVIDER_MAX_OUTPUT_TOKENS,
     store: false,
     stream: true,
   };

@@ -61,7 +61,6 @@ const TOOL_CANCELLATION_CLEANUP_TIMEOUT: Duration =
     crate::tool::process::MANAGED_PROCESS_CLEANUP_GRACE;
 const PERMISSION_GUARDIAN_TOTAL_DEADLINE: Duration = Duration::from_secs(90);
 const COMPACTION_ACCURACY_WARNING: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
-const AUTOMATIC_COMPACTION_MAX_OUTPUT_TOKENS: u32 = 8_192;
 
 #[cfg(test)]
 type ProviderApiKeyResolver =
@@ -1183,8 +1182,6 @@ impl AgentLoop {
         tool_plan: &crate::tool::spec_plan::ToolSpecPlan,
         goal: Option<&goal_steering::GoalSnapshot>,
     ) -> Result<PreparedChatRequest, AgentError> {
-        let reasoning = request.turn.policy.reasoning.clone();
-        let reasoning_capability = request.turn.policy.provider.reasoning;
         let model = request.model_profile();
         let resolved_model = &request.turn.resolved_config().runtime_config().model;
         let provider_target = request.turn.provider_target();
@@ -1208,19 +1205,11 @@ impl AgentLoop {
             system_prompt,
             request_messages,
             tool_plan.model_visible_specs().to_vec(),
-            reasoning,
-            reasoning_capability,
+            None,
+            crate::config::ProviderReasoningCapability::Unsupported,
             resolved_model.extra_headers.clone(),
         );
         chat_request.parallel_tool_calls = tool_plan.parallel_tool_calls();
-        chat_request.temperature = resolved_model.temperature;
-        chat_request.top_p = resolved_model.top_p;
-        chat_request.top_k = resolved_model.top_k;
-        chat_request.presence_penalty = resolved_model.presence_penalty;
-        chat_request.frequency_penalty = resolved_model.frequency_penalty;
-        chat_request.seed = resolved_model.seed;
-        chat_request.stop_sequences = resolved_model.stop_sequences.clone();
-        chat_request.extra_body = resolved_model.extra_body_json.clone();
         chat_request.validate_provider_lifecycle()?;
         Ok(PreparedChatRequest {
             chat_request,
@@ -2251,10 +2240,6 @@ fn compaction_request_with_messages(
             .to_string(),
     });
     request.messages = messages;
-    request.model.max_output_tokens = request
-        .model
-        .max_output_tokens
-        .min(AUTOMATIC_COMPACTION_MAX_OUTPUT_TOKENS);
     request.tools.clear();
     request.tool_choice = None;
     request.parallel_tool_calls = false;
@@ -2676,7 +2661,7 @@ impl AgentPermissionGuardian<'_> {
             != GuardianIsolationTransport::LmStudioResponses
         {
             return Err(PermissionGuardianError::Request(
-                "non-thinking automatic permission review is only verified for the LM Studio native Responses transport; this provider/API mode was not contacted"
+                "isolated automatic permission review is only verified for the LM Studio native Responses transport; this provider/API mode was not contacted"
                     .to_string(),
             ));
         }
@@ -2698,31 +2683,8 @@ impl AgentPermissionGuardian<'_> {
             "action_evidence": action_evidence,
         }))
         .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
-        let mut model = self.request.model_profile();
-        model.max_output_tokens = model.max_output_tokens.clamp(1, 512);
-        // The task profile may intentionally suppress typed reasoning. The Guardian owns one
-        // explicit `none` request instead: the current LM Studio Responses contract was live-
-        // verified to turn a host-default 17-token reasoning response into zero reasoning tokens.
-        // A provider that rejects this explicit disable fails the review closed after the durable
-        // claim is established; it must never silently inherit task-generation Thinking.
-        model.capabilities.supports_reasoning = true;
+        let model = self.request.model_profile();
         let resolved_model = &self.request.turn.resolved_config().runtime_config().model;
-        let guardian_reasoning = crate::llm::ReasoningRequest {
-            effort: Some(crate::config::ReasoningEffort::None),
-            summary: crate::config::ReasoningSummary::None,
-        };
-        let guardian_reasoning_capability = match resolved_model.provider_profile.api_mode() {
-            crate::config::ProviderApiMode::Responses => {
-                crate::config::ProviderReasoningCapability::Responses {
-                    supports_summary: false,
-                }
-            }
-            crate::config::ProviderApiMode::ChatCompletions => {
-                crate::config::ProviderReasoningCapability::ChatCompletions {
-                    parameters: crate::config::ChatCompletionsReasoningParameters::EffortOnly,
-                }
-            }
-        };
         let mut guardian_request = ChatRequest::new(
             self.request.turn.provider_target().clone(),
             model,
@@ -2731,12 +2693,10 @@ impl AgentPermissionGuardian<'_> {
                 .to_string(),
             vec![ModelMessage::User { content: input }],
             Vec::new(),
-            Some(guardian_reasoning),
-            guardian_reasoning_capability,
+            None,
+            crate::config::ProviderReasoningCapability::Unsupported,
             resolved_model.extra_headers.clone(),
         );
-        guardian_request.extra_body =
-            permission_guardian_context_extra_body(resolved_model.extra_body_json.as_ref());
         guardian_request
             .validate_provider_lifecycle()
             .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
@@ -2852,17 +2812,6 @@ impl AgentPermissionGuardian<'_> {
             }
         };
         let collector = collector.into_inner();
-        if response
-            .usage
-            .as_ref()
-            .and_then(|usage| usage.reasoning_tokens)
-            .is_some_and(|tokens| tokens > 0)
-            || collector.reasoning_summary_seen
-        {
-            return Err(PermissionGuardianError::Request(
-                "provider did not honor the Guardian's explicit non-thinking request".to_string(),
-            ));
-        }
         crate::llm::validate_toolless_text_response(
             "automatic permission review",
             &response,
@@ -3014,19 +2963,6 @@ fn permission_retry_fence_outcome(
             | PermissionGuardianError::UnfencedAdmission(_),
         ) => None,
     }
-}
-
-fn permission_guardian_context_extra_body(configured: Option<&Value>) -> Option<Value> {
-    let mut isolated = serde_json::Map::new();
-    if let Some(configured) = configured.and_then(Value::as_object)
-        && let Some((key, value)) = ["num_ctx", "numCtx"]
-            .into_iter()
-            .find_map(|key| configured.get(key).map(|value| (key, value)))
-        && value.as_u64().is_some()
-    {
-        isolated.insert(key.to_string(), value.clone());
-    }
-    (!isolated.is_empty()).then_some(Value::Object(isolated))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3284,7 +3220,6 @@ struct ResponseCollector {
     tool_call_args: HashMap<String, String>,
     tool_call_names: HashMap<String, String>,
     provider_phases: Vec<crate::llm::ProviderPhaseEvent>,
-    reasoning_summary_seen: bool,
 }
 
 impl LlmEventSink for ResponseCollector {
@@ -3293,9 +3228,7 @@ impl LlmEventSink for ResponseCollector {
             LlmEvent::TextDelta(delta) => {
                 self.text.push_str(&delta);
             }
-            LlmEvent::ReasoningSummaryDelta(_) => {
-                self.reasoning_summary_seen = true;
-            }
+            LlmEvent::ReasoningSummaryDelta(_) => {}
             LlmEvent::ToolCallStart { call_id, tool_name } => {
                 if !self.tool_call_order.iter().any(|seen| seen == &call_id) {
                     self.tool_call_order.push(call_id.clone());
@@ -3493,11 +3426,13 @@ fn request_diagnostics(
         base_url: request.provider_target().sanitized_endpoint().to_string(),
         request_timeout_ms,
         stream_idle_timeout_ms: request_timeout_ms,
-        configured_max_output_tokens: Some(request.model.max_output_tokens),
-        effective_max_output_tokens: Some(request.effective_max_output_tokens()),
-        output_budget_reason: Some(request.output_budget_reason().to_string()),
+        configured_max_output_tokens: None,
+        effective_max_output_tokens: None,
+        output_budget_reason: None,
         supports_tools: Some(request.model.capabilities.supports_tools),
-        supports_reasoning: Some(request.model.capabilities.supports_reasoning),
+        // Historical diagnostics may contain this field, but new requests do
+        // not project a moyAI-owned reasoning setting or capability decision.
+        supports_reasoning: None,
         supports_images: Some(request.model.capabilities.supports_images),
         system_prompt_chars: request.system_prompt.chars().count(),
         tool_count: request.tools.len(),
@@ -4797,7 +4732,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert_eq!(prompt_only.system_prompt, template.system_prompt);
         assert_eq!(
             prompt_only.model.max_output_tokens, 32,
-            "compaction must preserve a configured budget below its purpose-specific cap"
+            "legacy output metadata must remain unchanged because generation policy is host-owned"
         );
         assert!(matches!(
             prompt_only.messages.as_slice(),
@@ -4807,16 +4742,13 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[test]
-    fn automatic_compaction_caps_only_its_cloned_request_output_budget() {
+    fn automatic_compaction_does_not_override_host_owned_output_policy() {
         let mut template = compaction_request_template();
         template.model.max_output_tokens = 32_768;
 
         let compact = compaction_request_with_messages(&template, Vec::new());
 
-        assert_eq!(
-            compact.model.max_output_tokens,
-            AUTOMATIC_COMPACTION_MAX_OUTPUT_TOKENS
-        );
+        assert_eq!(compact.model.max_output_tokens, 32_768);
         assert_eq!(
             template.model.max_output_tokens, 32_768,
             "the normal request template must retain its configured output budget"
@@ -6615,6 +6547,16 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 _ => None,
             })
             .expect("first request diagnostics");
+        assert_eq!(first_request_diagnostics.configured_max_output_tokens, None);
+        assert_eq!(first_request_diagnostics.effective_max_output_tokens, None);
+        assert_eq!(first_request_diagnostics.supports_reasoning, None);
+        assert_eq!(
+            first_request_diagnostics
+                .context_window
+                .as_ref()
+                .and_then(|status| status.configured_max_output_tokens),
+            None
+        );
         assert_eq!(first_request_diagnostics.tool_names, requested_tool_names);
         assert_eq!(
             first_request_diagnostics.tool_schemas.len(),
@@ -6634,6 +6576,9 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         config.model.frequency_penalty = Some(0.4);
         config.model.seed = Some(42);
         config.model.stop_sequences = vec!["}".to_string()];
+        config.model.supports_reasoning = false;
+        config.model.reasoning_effort = Some(crate::config::ReasoningEffort::Low);
+        config.model.reasoning_summary = crate::config::ReasoningSummary::Auto;
         config.model.extra_body_json = Some(serde_json::json!({
             "num_ctx": 8_192,
             "response_format": {"type": "text"},
@@ -6673,21 +6618,28 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             &[ToolLifecycleStatus::Completed],
         );
         assert_eq!(run.requests.len(), 3);
+        for task_request in [&run.requests[0], &run.requests[2]] {
+            assert!(task_request.reasoning.is_none());
+            assert_eq!(
+                task_request.reasoning_capability,
+                crate::config::ProviderReasoningCapability::Unsupported
+            );
+            assert!(task_request.temperature.is_none());
+            assert!(task_request.top_p.is_none());
+            assert!(task_request.top_k.is_none());
+            assert!(task_request.presence_penalty.is_none());
+            assert!(task_request.frequency_penalty.is_none());
+            assert!(task_request.seed.is_none());
+            assert!(task_request.stop_sequences.is_empty());
+            assert!(task_request.extra_body.is_none());
+        }
         let guardian_request = &run.requests[1];
         assert!(guardian_request.tools.is_empty());
         assert!(!guardian_request.parallel_tool_calls);
-        assert_eq!(
-            guardian_request.reasoning,
-            Some(crate::llm::ReasoningRequest {
-                effort: Some(crate::config::ReasoningEffort::None),
-                summary: crate::config::ReasoningSummary::None,
-            })
-        );
+        assert!(guardian_request.reasoning.is_none());
         assert_eq!(
             guardian_request.reasoning_capability,
-            crate::config::ProviderReasoningCapability::Responses {
-                supports_summary: false,
-            }
+            crate::config::ProviderReasoningCapability::Unsupported
         );
         assert!(guardian_request.temperature.is_none());
         assert!(guardian_request.top_p.is_none());
@@ -6696,14 +6648,12 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert!(guardian_request.frequency_penalty.is_none());
         assert!(guardian_request.seed.is_none());
         assert!(guardian_request.stop_sequences.is_empty());
+        assert!(guardian_request.extra_body.is_none());
         assert_eq!(
-            guardian_request.extra_body,
-            Some(serde_json::json!({
-                "num_ctx": 8_192,
-            }))
+            guardian_request.model.max_output_tokens,
+            run.requests[0].model.max_output_tokens
         );
-        assert_eq!(guardian_request.model.max_output_tokens, 512);
-        assert!(guardian_request.model.capabilities.supports_reasoning);
+        assert!(!guardian_request.model.capabilities.supports_reasoning);
         assert_eq!(
             guardian_request
                 .extra_headers()
@@ -6792,22 +6742,6 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             assert!(!public_session.contains(secret));
             assert!(!public_events.contains(secret));
         }
-    }
-
-    #[test]
-    fn permission_guardian_extra_body_only_preserves_context_size() {
-        assert_eq!(permission_guardian_context_extra_body(None), None);
-        assert_eq!(
-            permission_guardian_context_extra_body(Some(&serde_json::json!({
-                "enable_thinking": true,
-                "numCtx": 16_384,
-                "previous_response_id": "must-not-reach-the-guardian",
-                "temperature": 0.9,
-            }))),
-            Some(serde_json::json!({
-                "numCtx": 16_384,
-            }))
-        );
     }
 
     #[tokio::test]
@@ -7519,18 +7453,19 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
-    async fn auto_review_rejects_nonzero_reasoning_after_explicit_none() {
+    async fn auto_review_accepts_a_valid_decision_with_host_reasoning_telemetry() {
         let mut config = ResolvedConfig::default();
         config.permissions.access_mode = AccessMode::AutoReview;
         let run = run_scripted(
             config,
             vec![
                 scripted_escalated_shell_call(
-                    "guardian_reasoning_not_disabled",
-                    "echo must-not-run",
+                    "guardian_host_reasoning",
+                    "echo guardian-host-reasoning",
                 ),
                 ScriptedResponse {
                     events: vec![
+                        LlmEvent::ReasoningSummaryDelta("reviewed scoped effect".to_string()),
                         LlmEvent::TextDelta(
                             r#"{"decision":"allow","rationale":"looks scoped"}"#.to_string(),
                         ),
@@ -7547,22 +7482,27 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                     finish_reason: FinishReason::Stop,
                 },
                 ScriptedResponse {
-                    events: vec![LlmEvent::TextDelta(
-                        "reported failed Thinking isolation".to_string(),
-                    )],
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
                     finish_reason: FinishReason::Stop,
                 },
             ],
         )
         .await
-        .expect("reasoning isolation failure run");
+        .expect("host-default Guardian reasoning run");
         let summary = run.summary.expect("completed summary");
 
         assert_eq!(summary.status(), SessionStatus::Completed);
+        assert_eq!(run.requests.len(), 3);
+        assert!(run.requests[1].reasoning.is_none());
+        assert!(run.requests[1].tools.is_empty());
+        assert_eq!(
+            run.requests[1].model.max_output_tokens,
+            run.requests[0].model.max_output_tokens
+        );
         assert_canonical_tool_statuses(
             &run.store,
             run.session_id,
-            &[ToolLifecycleStatus::Declined],
+            &[ToolLifecycleStatus::Completed],
         );
     }
 

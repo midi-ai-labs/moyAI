@@ -221,7 +221,7 @@ pub enum LlmError {
         message: String,
     },
     #[error(
-        "provider generation failed{response_text}{code_text} with configured max_output_tokens={max_output_tokens}: {message}",
+        "provider generation failed{response_text}{code_text}: {message}",
         response_text = response_id.as_ref().map(|value| format!(" for response {value}")).unwrap_or_default(),
         code_text = code.as_ref().map(|value| format!(" ({value})")).unwrap_or_default()
     )]
@@ -229,7 +229,6 @@ pub enum LlmError {
         response_id: Option<String>,
         code: Option<String>,
         message: String,
-        max_output_tokens: u32,
     },
     #[error(
         "{operation} expected a complete tool-less text response, but provider finish reason was {finish_reason:?}"
@@ -317,7 +316,6 @@ mod llm_error_tests {
             response_id: Some("resp-overflow".to_string()),
             code: Some("context_length_exceeded".to_string()),
             message: "maximum context length exceeded".to_string(),
-            max_output_tokens: 8_192,
         };
         assert!(streamed.is_context_window_exceeded());
 
@@ -337,7 +335,6 @@ mod llm_error_tests {
                 response_id: Some("resp-wrapped-overflow".to_string()),
                 code: Some("context_length_exceeded".to_string()),
                 message: "maximum context length exceeded".to_string(),
-                max_output_tokens: 8_192,
             }),
         };
         assert!(nested.is_context_window_exceeded());

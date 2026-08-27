@@ -629,23 +629,10 @@ fn human_session_record_line(session: &SessionRecord) -> String {
 }
 
 fn human_model_parameters(parameters: &crate::session::SessionModelParameters) -> String {
-    if parameters.is_empty() {
-        return "model_params=-".to_string();
-    }
-    let mut parts = Vec::new();
-    if let Some(value) = parameters.temperature {
-        parts.push(format!("temperature={value}"));
-    }
-    if let Some(value) = parameters.top_p {
-        parts.push(format!("top_p={value}"));
-    }
-    if let Some(value) = parameters.top_k {
-        parts.push(format!("top_k={value}"));
-    }
-    if let Some(value) = parameters.max_output_tokens {
-        parts.push(format!("max_output_tokens={value}"));
-    }
-    format!("model_params={}", parts.join(","))
+    parameters
+        .context_window
+        .map(|value| format!("local_context_budget={value}"))
+        .unwrap_or_else(|| "local_context_budget=-".to_string())
 }
 
 fn human_loaded_session_summary_line(summary: &crate::session::LoadedSessionSummary) -> String {
@@ -855,6 +842,22 @@ pub fn cli_human_renderer_neutralizes_terminal_controls_fixture_passes() -> bool
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn human_session_summary_exposes_only_the_local_context_budget() {
+        let parameters = crate::session::SessionModelParameters {
+            temperature: Some(0.2),
+            top_p: Some(0.8),
+            top_k: Some(40),
+            context_window: Some(65_536),
+            max_output_tokens: Some(4_096),
+        };
+
+        assert_eq!(
+            super::human_model_parameters(&parameters),
+            "local_context_budget=65536"
+        );
+    }
+
     #[test]
     fn cli_history_renderer_uses_canonical_history_projection() {
         assert!(super::cli_history_renderer_uses_canonical_history_projection_fixture_passes());

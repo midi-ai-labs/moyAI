@@ -32,7 +32,10 @@ pub struct ContextWindowTokenStatus {
     pub source: ActiveContextTokenSource,
     pub active_context_tokens: u32,
     pub full_context_window_limit: u32,
-    pub configured_max_output_tokens: u32,
+    /// Retained only to deserialize historical request diagnostics. New
+    /// diagnostics leave this unset because output limits are host-owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_max_output_tokens: Option<u32>,
     pub overflow_margin_tokens: u32,
     pub tokens_until_limit: i64,
     pub token_limit_reached: bool,
@@ -88,7 +91,6 @@ impl ContextWindowTokenStatus {
         source: ActiveContextTokenSource,
     ) -> Self {
         let full_context_window_limit = request.model.context_window;
-        let configured_max_output_tokens = request.model.max_output_tokens;
         let overflow_margin_tokens = overflow_margin_tokens.min(u32::MAX as usize) as u32;
         // ModelPolicy has already projected the advertised context window into
         // the immutable Codex-style effective full input limit, including any
@@ -100,7 +102,7 @@ impl ContextWindowTokenStatus {
             source,
             active_context_tokens,
             full_context_window_limit,
-            configured_max_output_tokens,
+            configured_max_output_tokens: None,
             overflow_margin_tokens,
             tokens_until_limit,
             token_limit_reached: tokens_until_limit <= 0,
@@ -422,6 +424,7 @@ mod tests {
             status.source,
             super::ActiveContextTokenSource::FullPreparedRequestEstimate
         );
+        assert_eq!(status.configured_max_output_tokens, Some(100));
     }
 
     #[test]
@@ -484,8 +487,8 @@ mod tests {
             large_output.tokens_until_limit,
             small_output.tokens_until_limit
         );
-        assert_eq!(large_output.configured_max_output_tokens, 65_536);
-        assert_eq!(small_output.configured_max_output_tokens, 8_192);
+        assert_eq!(large_output.configured_max_output_tokens, None);
+        assert_eq!(small_output.configured_max_output_tokens, None);
     }
 
     #[test]

@@ -83,6 +83,7 @@ test("provider restart fixture intentionally covers legacy split-mode normalizat
   assert.doesNotMatch(config, /provider_profile\s*=/);
   assert.match(config, /supports_tools = false/);
   assert.match(config, /\[model\.extra_body_json\]\r?\n\r?\n\[permissions\]/);
+  assert.doesNotMatch(config, /reasoning_(?:effort|summary)|supports_reasoning|temperature|top_p|top_k|presence_penalty|frequency_penalty|seed\s*=|stop(?:_sequences)?\s*=/);
 
   const toolEnabled = providerRestartFixtureConfig("http://127.0.0.1:19454", { supportsTools: true });
   assert.match(toolEnabled, /supports_tools = true/);

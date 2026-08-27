@@ -74,18 +74,13 @@ export function permissionRestartGuardianFixtureConfig(baseUrl) {
 base_url = ${JSON.stringify(baseUrl)}
 model = "e2e/scripted-responses"
 provider_profile = "lm_studio"
-reasoning_summary = "none"
 connect_timeout_ms = 1000
 request_timeout_ms = 30000
 max_retries = 0
 context_window = 65536
-max_output_tokens = 1024
 supports_tools = true
-supports_reasoning = false
 supports_images = false
 parallel_tool_calls = false
-
-[model.extra_body_json]
 
 [permissions]
 access_mode = "auto_review"

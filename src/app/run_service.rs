@@ -2882,25 +2882,6 @@ async fn durable_run_summary_for_turn(
     Ok(terminal.map(|terminal| RunSummary::from_terminal(session_id, protocol_turn_id, terminal)))
 }
 
-#[cfg(test)]
-fn apply_session_model_parameters(
-    model: &mut ModelConfig,
-    parameters: &crate::session::SessionModelParameters,
-) {
-    if let Some(value) = parameters.temperature {
-        model.temperature = Some(value);
-    }
-    if let Some(value) = parameters.top_p {
-        model.top_p = Some(value);
-    }
-    if let Some(value) = parameters.top_k {
-        model.top_k = Some(value);
-    }
-    if let Some(value) = parameters.max_output_tokens {
-        model.max_output_tokens = value;
-    }
-}
-
 async fn resolve_session_collaboration_mode(
     session_service: &crate::session::SessionService,
     session_id: crate::session::SessionId,
@@ -2977,28 +2958,44 @@ fn materialize_run_config(
 }
 
 #[cfg(test)]
-fn app_session_model_parameters_override_runtime_config_fixture_passes() -> bool {
-    let mut model = ModelConfig {
+fn app_session_model_parameters_are_runtime_inert_fixture_passes() -> bool {
+    let mut base = ResolvedConfig::default();
+    base.model = ModelConfig {
         temperature: Some(1.0),
         top_p: Some(1.0),
         top_k: Some(8),
         max_output_tokens: 1024,
         ..crate::config::ResolvedConfig::default().model
     };
-    apply_session_model_parameters(
-        &mut model,
-        &crate::session::SessionModelParameters {
+    let session = SessionRecord {
+        id: crate::session::SessionId::new(),
+        project_id: crate::session::ProjectId::new(),
+        title: "Session".to_string(),
+        status: SessionStatus::Completed,
+        cwd: Utf8PathBuf::from("C:/workspace"),
+        model: base.model.model.clone(),
+        base_url: base.model.base_url.clone(),
+        access_mode: crate::config::AccessMode::Default,
+        provider_connection: None,
+        model_parameters: crate::session::SessionModelParameters {
             temperature: Some(0.2),
             top_p: Some(0.8),
             top_k: Some(40),
-            context_window: None,
+            context_window: Some(65_536),
             max_output_tokens: Some(4096),
         },
-    );
-    model.temperature == Some(0.2)
-        && model.top_p == Some(0.8)
-        && model.top_k == Some(40)
-        && model.max_output_tokens == 4096
+        session_settings_revision: 0,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        completed_at_ms: Some(1),
+    };
+
+    let effective = crate::session::resolved_config_for_session(&base, &session);
+    effective.model.context_window == 65_536
+        && effective.model.temperature.is_none()
+        && effective.model.top_p.is_none()
+        && effective.model.top_k.is_none()
+        && effective.model.max_output_tokens == crate::config::DEFAULT_MODEL_MAX_OUTPUT_TOKENS
 }
 
 #[cfg(test)]
@@ -3050,8 +3047,8 @@ fn app_config_override_wins_over_session_settings_fixture_passes() -> bool {
         compose_run_effective_config(base, Some(&session), Some(override_config), "", "");
     effective.model.model == "override-model"
         && effective.model.base_url == "http://override:1234"
-        && effective.model.temperature == Some(0.7)
-        && effective.model.max_output_tokens == 4096
+        && effective.model.temperature.is_none()
+        && effective.model.max_output_tokens == crate::config::DEFAULT_MODEL_MAX_OUTPUT_TOKENS
         && effective.permissions.access_mode == crate::config::AccessMode::Default
 }
 
@@ -3658,7 +3655,6 @@ mod tests {
     use base64::Engine as _;
     use camino::Utf8PathBuf;
 
-    use crate::config::model::ReasoningEffort;
     use crate::config::{ProviderProfile, ResolvedConfig, ResolvedTurnConfig};
     use crate::protocol::{ModeKind, ProtocolEventStore};
     use crate::session::{
@@ -4848,14 +4844,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_turn_policy_fails_before_durable_run_admission() {
+    async fn invalid_turn_model_fails_before_durable_run_admission() {
         let mut config = ResolvedConfig::default();
-        config.model.model = "policy-error-model".to_string();
+        config.model.model.clear();
         config.model.base_url = "http://local".to_string();
         config.model.provider_profile = ProviderProfile::OpenAiCompatible;
-        config.model.chat_completions_reasoning_parameters = None;
-        config.model.reasoning_effort = Some(ReasoningEffort::Medium);
-        config.model.supports_reasoning = true;
         config.multi_agent.enabled = false;
 
         let (run_service, store, workspace, _process_agent_runtime) =
@@ -4894,13 +4887,13 @@ mod tests {
                 &mut prompt,
             )
             .await
-            .expect_err("unsupported reasoning policy must reject the run");
+            .expect_err("blank model must reject the run");
 
-        assert!(error.to_string().contains("does not support it"));
+        assert!(error.to_string().contains("model.model` must not be empty"));
         assert!(matches!(
             run_control.cause(),
             Some(crate::runtime::RunCancellationCause::Failure(message))
-                if message.contains("does not support it")
+                if message.contains("model.model` must not be empty")
         ));
         let sessions = store
             .session_repo()
@@ -5908,8 +5901,8 @@ mod tests {
     }
 
     #[test]
-    fn session_model_parameters_override_runtime_config() {
-        assert!(super::app_session_model_parameters_override_runtime_config_fixture_passes());
+    fn session_model_parameters_are_runtime_inert_except_for_local_context() {
+        assert!(super::app_session_model_parameters_are_runtime_inert_fixture_passes());
     }
 
     #[test]

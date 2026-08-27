@@ -174,7 +174,7 @@ fn commit_tui_global_config_save_result(
     result: Result<GlobalConfigSaveResult, String>,
 ) -> Result<String, String> {
     let saved = result?;
-    let next_editor = ConfigEditorState::from_config(&saved.resolved_config);
+    let next_editor = ConfigEditorState::from_tui_config(&saved.resolved_config);
     *app_config = saved.resolved_config.clone();
     *base_config = saved.resolved_config.clone();
     *effective_config = saved.resolved_config;
@@ -394,7 +394,7 @@ impl TuiController {
             composer: build_composer(),
             review_editor: build_composer(),
             workspace_picker: build_composer(),
-            config_editor: ConfigEditorState::from_config(&effective_config),
+            config_editor: ConfigEditorState::from_tui_config(&effective_config),
             base_config,
             effective_config,
             root_run_lifecycle: TuiRootRunLifecycle::default(),
@@ -491,7 +491,7 @@ impl TuiController {
                 self.refresh_sessions().await?;
             }
             KeyCode::F(3) => {
-                self.config_editor = ConfigEditorState::from_config(&self.effective_config);
+                self.config_editor = ConfigEditorState::from_tui_config(&self.effective_config);
                 self.state.modal = Modal::ConfigEditor;
             }
             KeyCode::F(1) => {
@@ -849,7 +849,7 @@ impl TuiController {
                 if !commit_tui_effective_config(&mut self.effective_config, candidate, true) {
                     return Ok(());
                 }
-                self.config_editor = ConfigEditorState::from_config(&self.effective_config);
+                self.config_editor = ConfigEditorState::from_tui_config(&self.effective_config);
                 self.state.status_message = Some(if self.state.current_session_id.is_some() {
                     "applied session override and remembered its provider connection and access mode; changes apply to turns admitted later"
                         .to_string()
@@ -1124,12 +1124,7 @@ impl TuiController {
             provider_connection: Some(
                 crate::session::SessionProviderConnection::from_model_config(&candidate.model),
             ),
-            reset_model_parameters: true,
-            temperature: candidate.model.temperature,
-            top_p: candidate.model.top_p,
-            top_k: candidate.model.top_k,
             context_window: Some(candidate.model.context_window),
-            max_output_tokens: Some(candidate.model.max_output_tokens),
             ..Default::default()
         };
         match self
@@ -1188,7 +1183,7 @@ impl TuiController {
 
     fn apply_access_mode_owner(&mut self, access_mode: crate::config::AccessMode) {
         self.effective_config.permissions.access_mode = access_mode;
-        self.config_editor = ConfigEditorState::from_config(&self.effective_config);
+        self.config_editor = ConfigEditorState::from_tui_config(&self.effective_config);
     }
 
     fn restore_global_access_mode_owner(&mut self) {
@@ -1233,7 +1228,7 @@ impl TuiController {
         self.base_config = self.app.config.clone();
         self.effective_config = self.base_config.clone();
         self.root_run_lifecycle = TuiRootRunLifecycle::default();
-        self.config_editor = ConfigEditorState::from_config(&self.effective_config);
+        self.config_editor = ConfigEditorState::from_tui_config(&self.effective_config);
         self.state = AppState::default();
         self.sync_file_change_display_roots();
         self.composer = build_composer();
@@ -2045,7 +2040,7 @@ impl TuiController {
         self.align_workspace_to_session(&read.session).await?;
         self.effective_config =
             crate::session::resolved_config_for_session(&self.base_config, &read.session);
-        self.config_editor = ConfigEditorState::from_config(&self.effective_config);
+        self.config_editor = ConfigEditorState::from_tui_config(&self.effective_config);
         self.state.load_canonical_session_read(&read);
         self.state.modal = Modal::None;
         Ok(())
@@ -2078,7 +2073,7 @@ impl TuiController {
             self.app = app;
             self.base_config = self.app.config.clone();
             self.effective_config = self.base_config.clone();
-            self.config_editor = ConfigEditorState::from_config(&self.effective_config);
+            self.config_editor = ConfigEditorState::from_tui_config(&self.effective_config);
         }
         self.sync_file_change_display_roots();
         Ok(())
@@ -2166,7 +2161,7 @@ impl TuiController {
         let read = session_view(&self.app.session_service, session_id).await?;
         self.effective_config =
             crate::session::resolved_config_for_session(&self.base_config, &read.session);
-        self.config_editor = ConfigEditorState::from_config(&self.effective_config);
+        self.config_editor = ConfigEditorState::from_tui_config(&self.effective_config);
         self.state.load_canonical_session_read(&read);
         self.state.status_message = Some(format!("rejoined running session {session_id}"));
         self.state.modal = Modal::None;
@@ -3974,10 +3969,13 @@ mod key_tests {
         );
         assert_eq!(effective.model.extra_body_json, None);
         assert_eq!(effective.model.context_window, 131_072);
-        assert_eq!(effective.model.max_output_tokens, 8_192);
-        assert_eq!(effective.model.temperature, Some(0.2));
-        assert_eq!(effective.model.top_p, Some(0.8));
-        assert_eq!(effective.model.top_k, Some(40));
+        assert_eq!(
+            effective.model.max_output_tokens,
+            crate::config::DEFAULT_MODEL_MAX_OUTPUT_TOKENS
+        );
+        assert_eq!(effective.model.temperature, None);
+        assert_eq!(effective.model.top_p, None);
+        assert_eq!(effective.model.top_k, None);
         assert_eq!(
             effective.permissions.access_mode,
             crate::config::AccessMode::FullAccess
@@ -4008,7 +4006,7 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn f2_persists_one_complete_provider_snapshot_before_committing_effective_config() {
+    async fn f2_persists_supported_settings_without_saving_legacy_generation_parameters() {
         let (_temp, mut controller, session_id) =
             tui_controller_with_session("f2-provider-snapshot").await;
         let mut candidate = controller.effective_config.clone();
@@ -4027,7 +4025,7 @@ mod key_tests {
         candidate.model.top_k = Some(32);
         candidate.permissions.access_mode = crate::config::AccessMode::FullAccess;
         controller.effective_config = candidate.clone();
-        controller.config_editor = ConfigEditorState::from_config(&candidate);
+        controller.config_editor = ConfigEditorState::from_tui_config(&candidate);
 
         controller
             .handle_config_editor_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
@@ -4044,10 +4042,10 @@ mod key_tests {
         assert_eq!(durable.model, "openai-compatible-model");
         assert_eq!(durable.access_mode, crate::config::AccessMode::FullAccess);
         assert_eq!(durable.model_parameters.context_window, Some(65_536));
-        assert_eq!(durable.model_parameters.max_output_tokens, Some(4_096));
-        assert_eq!(durable.model_parameters.temperature, Some(0.3));
-        assert_eq!(durable.model_parameters.top_p, Some(0.7));
-        assert_eq!(durable.model_parameters.top_k, Some(32));
+        assert_eq!(durable.model_parameters.max_output_tokens, None);
+        assert_eq!(durable.model_parameters.temperature, None);
+        assert_eq!(durable.model_parameters.top_p, None);
+        assert_eq!(durable.model_parameters.top_k, None);
         let connection = durable
             .provider_connection
             .as_ref()
@@ -4073,6 +4071,13 @@ mod key_tests {
             Some("OMLX_API_KEY")
         );
         assert_eq!(controller.effective_config.model.extra_body_json, None);
+        assert_eq!(
+            controller.effective_config.model.max_output_tokens,
+            crate::config::DEFAULT_MODEL_MAX_OUTPUT_TOKENS
+        );
+        assert_eq!(controller.effective_config.model.temperature, None);
+        assert_eq!(controller.effective_config.model.top_p, None);
+        assert_eq!(controller.effective_config.model.top_k, None);
     }
 
     fn set_tui_access_mode_field(controller: &mut TuiController, value: &str) {
@@ -6285,7 +6290,7 @@ mod key_tests {
         base_config.model.model = "base-owner".to_string();
         let mut effective_config = ResolvedConfig::default();
         effective_config.model.model = "effective-owner".to_string();
-        let mut editor = ConfigEditorState::from_config(&effective_config);
+        let mut editor = ConfigEditorState::from_tui_config(&effective_config);
         let model = editor
             .fields
             .iter_mut()
@@ -6321,7 +6326,7 @@ mod key_tests {
         let mut app_config = ResolvedConfig::default();
         let mut base_config = ResolvedConfig::default();
         let mut effective_config = ResolvedConfig::default();
-        let mut editor = ConfigEditorState::from_config(&effective_config);
+        let mut editor = ConfigEditorState::from_tui_config(&effective_config);
         let mut adopted = ResolvedConfig::default();
         adopted.model.model = "adopted-model".to_string();
         adopted.permissions.access_mode = AccessMode::FullAccess;

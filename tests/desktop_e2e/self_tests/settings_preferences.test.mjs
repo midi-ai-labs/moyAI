@@ -39,7 +39,7 @@ function projection(overrides = {}) {
       { key: "model.provider_profile", value: SETTINGS_PROVIDER_PROFILE },
       { key: "model.api_key_env", value: SETTINGS_PROVIDER_API_KEY_ENV },
       { key: "model.context_window", value: PROVIDER_CONTEXT_AFTER },
-      { key: "model.max_output_tokens", value: "1024" },
+      { key: "model.max_output_tokens", value: "32768" },
       { key: "docling.enabled", value: "false" },
       { key: "docling.base_url", value: "http://127.0.0.1:43111" },
     ],
@@ -47,7 +47,7 @@ function projection(overrides = {}) {
     provider_profile: SETTINGS_PROVIDER_PROFILE,
     provider_api_key_env: SETTINGS_PROVIDER_API_KEY_ENV,
     provider_context_window: PROVIDER_CONTEXT_BEFORE,
-    provider_max_output_tokens: "1024",
+    provider_max_output_tokens: "32768",
     provider_model_ids: ["moyai-e2e-scripted"],
     provider_selected_index: 0,
     ...overrides,
@@ -63,6 +63,7 @@ function cleanSurface(overrides = {}) {
       profile: { count: 1, visible: true, enabled: true, value: SETTINGS_PROVIDER_PROFILE, options: [...PROVIDER_PROFILE_OPTIONS] },
       api_key_env: { count: 1, visible: true, enabled: true, value: SETTINGS_PROVIDER_API_KEY_ENV },
       context: { count: 1, value: PROVIDER_CONTEXT_AFTER },
+      max_output_tokens: { count: 0, visible: false, enabled: false, value: null },
       docling: { count: 1, checked: false },
       docling_label: { count: 1, visible: false, text: "Docling を有効化" },
       dirty_badge_visible: false,
@@ -114,6 +115,7 @@ test("fixture binds provider and Docling to one loopback zero-request ledger", (
   assert.doesNotMatch(config, /provider_(?:metadata|api)_mode/);
   assert.match(config, /\[docling\]\nenabled = false/);
   assert.match(config, /timeout_ms = 1000/);
+  assert.doesNotMatch(config, /max_(?:output_)?tokens|reasoning_(?:effort|summary)|supports_reasoning|temperature|top_p|top_k|presence_penalty|frequency_penalty|seed\s*=|stop(?:_sequences)?\s*=|\[model\.extra_body_json\]/);
 });
 
 test("Docling label activation includes the browser-forwarded trusted checkbox click", () => {
@@ -147,6 +149,7 @@ test("shell, provider, and clean Preferences predicates reject network and visib
       profile: { count: 1, visible: true, enabled: true, value: SETTINGS_PROVIDER_PROFILE, options: [...PROVIDER_PROFILE_OPTIONS] },
       api_key_env: { count: 1, visible: true, enabled: true, value: SETTINGS_PROVIDER_API_KEY_ENV },
       context: { count: 1, visible: true, enabled: true, value: PROVIDER_CONTEXT_BEFORE },
+      max_output_tokens: { count: 0, visible: false, enabled: false, value: null },
       save: { count: 1, visible: true, enabled: true },
       load_models: { count: 1, visible: true, enabled: true },
       close: { count: 1, visible: true, enabled: true },
@@ -207,6 +210,7 @@ test("command expectations preserve complete ordered values and exact config tar
   assert.equal(providerCommand.args.input.contextWindow, PROVIDER_CONTEXT_AFTER);
   assert.equal(providerCommand.args.input.providerProfile, SETTINGS_PROVIDER_PROFILE);
   assert.equal(providerCommand.args.input.apiKeyEnv, SETTINGS_PROVIDER_API_KEY_ENV);
+  assert.equal(Object.hasOwn(providerCommand.args.input, "maxOutputTokens"), false);
   assert.equal(Object.hasOwn(providerCommand.args.input, "metadataMode"), false);
   assert.deepEqual(providerCommand.args.expectedTarget, target);
   assert.equal(providerCommand.args.draftValues.find((row) => row.key === "docling.enabled").text, "false");

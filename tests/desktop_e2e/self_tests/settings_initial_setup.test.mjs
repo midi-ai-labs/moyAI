@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  INITIAL_SETUP_HOST_OWNED_CONFIG_KEYS,
   INITIAL_SETUP_PROVIDER_API_KEY_ENV,
   INITIAL_SETUP_PROVIDER_PROFILE,
   INITIAL_SETUP_PROVIDER_PROFILE_OPTIONS,
@@ -74,6 +75,9 @@ function surface(step = "start", overrides = {}) {
           value: step === "provider" ? INITIAL_SETUP_PROVIDER_API_KEY_ENV : null,
         },
       },
+      host_owned_config_key_counts: Object.fromEntries(
+        INITIAL_SETUP_HOST_OWNED_CONFIG_KEYS.map((key) => [key, 0]),
+      ),
     },
     viewport: { width: 1440, height: 900 },
     visible_shell_count: 0,
@@ -119,6 +123,17 @@ test("Initial Setup predicate requires the exact fullscreen six-step zero-networ
       },
     },
   }), [], "provider", workspace), false, "the optional API-key env field remains directly editable");
+  for (const key of INITIAL_SETUP_HOST_OWNED_CONFIG_KEYS) {
+    assert.equal(initialSetupStepReady(surface("model", {
+      wizard: {
+        ...surface("model").wizard,
+        host_owned_config_key_counts: {
+          ...surface("model").wizard.host_owned_config_key_counts,
+          [key]: 1,
+        },
+      },
+    }), [], "model", workspace), false, `${key} must remain absent from Initial Setup`);
+  }
 });
 
 test("Initial Setup Finish expectation carries all values and both exact targets", () => {

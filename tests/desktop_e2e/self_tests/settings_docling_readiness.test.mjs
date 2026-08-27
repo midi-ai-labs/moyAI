@@ -87,6 +87,7 @@ test("Docling readiness fixture uses one enabled loopback target without implici
   assert.match(config, /\[docling\]\nenabled = true/);
   assert.match(config, /context_window = 65536/);
   assert.match(config, /timeout_ms = 5000/);
+  assert.doesNotMatch(config, /max_(?:output_)?tokens|reasoning_(?:effort|summary)|supports_reasoning|temperature|top_p|top_k|presence_penalty|frequency_penalty|seed\s*=|stop(?:_sequences)?\s*=|\[model\.extra_body_json\]/);
 });
 
 test("Docling readiness ledger accepts only one exact held then completed GET", () => {

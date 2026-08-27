@@ -346,6 +346,10 @@ impl AppState {
             SessionStatus::Failed => RunStatus::Failed,
         };
         self.progress = progress_from_loaded_state(self.run_status, &self.tool_statuses);
+        self.reconcile_compactions_from_canonical_turn_items(
+            turn_items,
+            active_turn_id.or(latest_turn_id),
+        );
         if previous_session_id != Some(session.id) || session.status == SessionStatus::Running {
             self.last_summary = None;
         }
@@ -399,6 +403,10 @@ impl AppState {
             transcript_entries_from_turn_items_with_roots(&read.turns.items, roots);
         self.transcript_entries = transcript_entries;
         self.pending_turn_inputs = read.pending_turn_inputs.clone();
+        self.reconcile_compactions_from_canonical_turn_items(
+            &read.turns.items,
+            read.active_turn_id.or(read.latest_turn_id),
+        );
         self.active_turn_expectation = read.active_turn_id.map_or(
             ActiveTurnExpectation::Idle {
                 latest_turn_id: read.latest_turn_id,
@@ -473,6 +481,33 @@ impl AppState {
 
     pub fn refresh_plan_from_turn_items(&mut self, turn_items: &[TurnItem]) {
         self.current_plan = latest_plan_from_turn_items(turn_items);
+    }
+
+    pub(crate) fn reconcile_compactions_from_canonical_turn_items(
+        &mut self,
+        turn_items: &[TurnItem],
+        turn_id: Option<TurnId>,
+    ) {
+        let Some(turn_id) = turn_id else {
+            self.progress.compactions = 0;
+            return;
+        };
+        let canonical_count = turn_items
+            .iter()
+            .filter(|item| {
+                item.turn_id == turn_id
+                    && matches!(&item.payload, TurnItemPayload::ContextCompaction { .. })
+            })
+            .count();
+        let projected_turn_id = self
+            .active_turn_expectation
+            .latest_turn_id()
+            .or_else(|| self.last_summary.as_ref().map(RunSummary::turn_id));
+        self.progress.compactions = if projected_turn_id == Some(turn_id) {
+            self.progress.compactions.max(canonical_count)
+        } else {
+            canonical_count
+        };
     }
 
     pub fn apply_run_event(&mut self, event: &RunEvent) {
@@ -1064,8 +1099,10 @@ impl AppState {
             return false;
         }
 
-        let tool_statuses = tool_statuses_from_turn_items_for_turn(turn_items, Some(turn_id));
-        if tool_statuses.len() != summary.tool_call_count()
+        let tool_projection = canonical_tool_projection_for_turn(turn_items, Some(turn_id));
+        let tool_statuses = tool_projection.statuses;
+        if tool_projection.identity_conflict
+            || tool_statuses.len() != summary.tool_call_count()
             || tool_statuses.iter().any(|tool| {
                 matches!(
                     tool.status,
@@ -1101,6 +1138,7 @@ impl AppState {
         self.progress.tool_calls_declined = declined;
         self.progress.tool_calls_cancelled = cancelled;
         self.progress.tool_calls_failed = failed;
+        self.reconcile_compactions_from_canonical_turn_items(turn_items, Some(turn_id));
         true
     }
 }
@@ -1244,7 +1282,9 @@ pub fn latest_plan_from_turn_items(turn_items: &[TurnItem]) -> Option<PlanView> 
         .into_iter()
         .rev()
         .find_map(|item| match &item.payload {
-            TurnItemPayload::Plan { explanation, plan } => Some(PlanView {
+            TurnItemPayload::Plan {
+                explanation, plan, ..
+            } => Some(PlanView {
                 explanation: explanation.clone(),
                 steps: plan.clone(),
             }),
@@ -1480,44 +1520,126 @@ pub fn tool_statuses_from_turn_items(turn_items: &[TurnItem]) -> Vec<ToolStatusV
     tool_statuses_from_turn_items_for_turn(turn_items, None)
 }
 
+#[derive(Debug, Default)]
+struct CanonicalToolProjection {
+    statuses: Vec<ToolStatusView>,
+    identity_conflict: bool,
+}
+
 fn tool_statuses_from_turn_items_for_turn(
     turn_items: &[TurnItem],
     selected_turn_id: Option<TurnId>,
 ) -> Vec<ToolStatusView> {
-    let mut statuses = Vec::new();
+    canonical_tool_projection_for_turn(turn_items, selected_turn_id).statuses
+}
+
+fn canonical_tool_projection_for_turn(
+    turn_items: &[TurnItem],
+    selected_turn_id: Option<TurnId>,
+) -> CanonicalToolProjection {
+    let mut projection = CanonicalToolProjection::default();
     for item in turn_items_in_projection_order(turn_items) {
         if selected_turn_id.is_some_and(|turn_id| turn_id != item.turn_id) {
             continue;
         }
-        if let TurnItemPayload::ToolStatus {
-            call_id,
-            tool,
-            status,
-            title,
-            summary,
-        } = &item.payload
-        {
-            let status = session_tool_status_from_lifecycle(*status);
-            update_tool_status(
-                &mut statuses,
-                *call_id,
-                *tool,
-                title,
+        match &item.payload {
+            TurnItemPayload::ToolStatus {
+                call_id,
+                tool,
                 status,
-                (status == ToolCallStatus::Completed).then_some(if summary.trim().is_empty() {
-                    title.clone()
+                title,
+                summary,
+            } => {
+                let status = session_tool_status_from_lifecycle(*status);
+                if projection
+                    .statuses
+                    .iter()
+                    .any(|existing| existing.tool_call_id == *call_id && existing.tool != *tool)
+                {
+                    projection.identity_conflict = true;
+                    continue;
+                }
+                update_tool_status(
+                    &mut projection.statuses,
+                    *call_id,
+                    *tool,
+                    title,
+                    status,
+                    (status == ToolCallStatus::Completed).then_some(if summary.trim().is_empty() {
+                        title.clone()
+                    } else {
+                        summary.clone()
+                    }),
+                    (status == ToolCallStatus::Failed).then_some(if summary.trim().is_empty() {
+                        title.clone()
+                    } else {
+                        summary.clone()
+                    }),
+                );
+            }
+            // Current Plan items carry the exact update_plan call identity. Legacy items
+            // omitted it, so only settle those when the prefix has one unambiguous owner.
+            TurnItemPayload::Plan { call_id, .. } => {
+                let target = if let Some(call_id) = call_id {
+                    match projection
+                        .statuses
+                        .iter()
+                        .position(|status| status.tool_call_id == *call_id)
+                    {
+                        Some(index) if projection.statuses[index].tool == ToolName::UpdatePlan => {
+                            Some(index)
+                        }
+                        Some(_) => {
+                            projection.identity_conflict = true;
+                            None
+                        }
+                        None => {
+                            projection.statuses.push(ToolStatusView {
+                                tool_call_id: *call_id,
+                                tool: ToolName::UpdatePlan,
+                                title: "Plan updated".to_string(),
+                                status: ToolCallStatus::Completed,
+                                summary: Some("Plan updated".to_string()),
+                                error: None,
+                            });
+                            None
+                        }
+                    }
                 } else {
-                    summary.clone()
-                }),
-                (status == ToolCallStatus::Failed).then_some(if summary.trim().is_empty() {
-                    title.clone()
-                } else {
-                    summary.clone()
-                }),
-            );
+                    let unresolved = projection
+                        .statuses
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, status)| {
+                            (status.tool == ToolName::UpdatePlan
+                                && matches!(
+                                    status.status,
+                                    ToolCallStatus::Pending | ToolCallStatus::Running
+                                ))
+                            .then_some(index)
+                        })
+                        .collect::<Vec<_>>();
+                    match unresolved.as_slice() {
+                        [index] => Some(*index),
+                        [] => None,
+                        _ => {
+                            projection.identity_conflict = true;
+                            None
+                        }
+                    }
+                };
+                if let Some(index) = target {
+                    let status = &mut projection.statuses[index];
+                    status.status = ToolCallStatus::Completed;
+                    status.title = "Plan updated".to_string();
+                    status.summary = Some("Plan updated".to_string());
+                    status.error = None;
+                }
+            }
+            _ => {}
         }
     }
-    statuses
+    projection
 }
 
 pub fn tui_primary_transcript_omits_internal_projection_items_fixture_passes() -> bool {
@@ -1541,6 +1663,7 @@ pub fn tui_primary_transcript_omits_internal_projection_items_fixture_passes() -
             source_item_id: None,
             sequence_no: 2,
             payload: TurnItemPayload::Plan {
+                call_id: None,
                 explanation: Some("internal plan cache".to_string()),
                 plan: Vec::new(),
             },
@@ -1861,6 +1984,56 @@ mod tests {
     }
 
     #[test]
+    fn terminal_reload_rebuilds_latest_turn_compactions_from_canonical_items() {
+        let session_id = SessionId::new();
+        let previous_turn_id = TurnId::new();
+        let turn_id = TurnId::new();
+        let item = |turn_id, sequence_no, payload| TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no,
+            payload,
+        };
+        let items = vec![
+            item(
+                previous_turn_id,
+                1,
+                TurnItemPayload::ContextCompaction {
+                    summary: "previous turn".to_string(),
+                },
+            ),
+            item(
+                turn_id,
+                1,
+                TurnItemPayload::UserMessage {
+                    text: "latest turn".to_string(),
+                },
+            ),
+            item(
+                turn_id,
+                2,
+                TurnItemPayload::ContextCompaction {
+                    summary: "latest turn compacted".to_string(),
+                },
+            ),
+            item(
+                turn_id,
+                3,
+                TurnItemPayload::Terminal {
+                    outcome: TurnTerminalOutcome::Completed,
+                },
+            ),
+        ];
+        let mut state = AppState::default();
+
+        state.load_turn_items(&test_session(session_id), &items);
+
+        assert_eq!(state.progress.compactions, 1);
+    }
+
+    #[test]
     fn tui_primary_transcript_omits_internal_projection_items() {
         assert!(super::tui_primary_transcript_omits_internal_projection_items_fixture_passes());
     }
@@ -2054,6 +2227,318 @@ mod tests {
             state.last_summary.as_ref().map(RunSummary::turn_id),
             Some(turn_id)
         );
+    }
+
+    #[test]
+    fn terminal_reconciliation_rebuilds_compaction_without_a_live_increment() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let terminal = DurableTurnTerminal {
+            outcome: TurnTerminalOutcome::Completed,
+            final_response_id: None,
+            tool_call_count: 0,
+            failed_tool_count: 0,
+            change_count: 0,
+            metrics: Default::default(),
+        };
+        let mut state = AppState {
+            current_session_id: Some(session_id),
+            ..AppState::default()
+        };
+        state.apply_run_summary(RunSummary::from_terminal(session_id, turn_id, terminal));
+        let items = vec![
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 1,
+                payload: TurnItemPayload::ContextCompaction {
+                    summary: "retained compact context".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 2,
+                payload: TurnItemPayload::Terminal {
+                    outcome: TurnTerminalOutcome::Completed,
+                },
+            },
+        ];
+
+        assert_eq!(state.progress.compactions, 0);
+        assert!(state.reconcile_terminal_tool_projection(session_id, Some(turn_id), &items));
+        assert_eq!(state.progress.compactions, 1);
+    }
+
+    #[test]
+    fn terminal_tool_reconciliation_settles_update_plan_calls_from_typed_plan_items() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let first_plan_call_id = ToolCallId::new();
+        let patch_call_id = ToolCallId::new();
+        let final_plan_call_id = ToolCallId::new();
+        let terminal = DurableTurnTerminal {
+            outcome: TurnTerminalOutcome::Completed,
+            final_response_id: None,
+            tool_call_count: 3,
+            failed_tool_count: 0,
+            change_count: 1,
+            metrics: Default::default(),
+        };
+        let mut state = AppState {
+            current_session_id: Some(session_id),
+            ..AppState::default()
+        };
+        state.apply_run_summary(RunSummary::from_terminal(session_id, turn_id, terminal));
+        let tool_status =
+            |sequence_no, call_id, tool, status, title: &str, summary: &str| TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id,
+                source_item_id: None,
+                sequence_no,
+                payload: TurnItemPayload::ToolStatus {
+                    call_id,
+                    tool,
+                    status,
+                    title: title.to_string(),
+                    summary: summary.to_string(),
+                },
+            };
+        let plan_item = |sequence_no, call_id| TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no,
+            payload: TurnItemPayload::Plan {
+                call_id: Some(call_id),
+                explanation: None,
+                plan: Vec::new(),
+            },
+        };
+        let items = vec![
+            tool_status(
+                1,
+                first_plan_call_id,
+                ToolName::UpdatePlan,
+                ToolLifecycleStatus::Pending,
+                "update_plan",
+                "",
+            ),
+            plan_item(2, first_plan_call_id),
+            tool_status(
+                3,
+                patch_call_id,
+                ToolName::ApplyPatch,
+                ToolLifecycleStatus::Pending,
+                "apply_patch",
+                "",
+            ),
+            tool_status(
+                4,
+                patch_call_id,
+                ToolName::ApplyPatch,
+                ToolLifecycleStatus::Completed,
+                "Applied 1 change(s)",
+                "Added THINKING_SMOKE.md",
+            ),
+            tool_status(
+                5,
+                final_plan_call_id,
+                ToolName::UpdatePlan,
+                ToolLifecycleStatus::Pending,
+                "update_plan",
+                "",
+            ),
+            plan_item(6, final_plan_call_id),
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 7,
+                payload: TurnItemPayload::Terminal {
+                    outcome: TurnTerminalOutcome::Completed,
+                },
+            },
+        ];
+
+        assert!(state.reconcile_terminal_tool_projection(session_id, Some(turn_id), &items));
+        assert_eq!(
+            state
+                .tool_statuses
+                .iter()
+                .map(|status| (status.tool_call_id, status.tool, status.status))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    first_plan_call_id,
+                    ToolName::UpdatePlan,
+                    ToolCallStatus::Completed
+                ),
+                (
+                    patch_call_id,
+                    ToolName::ApplyPatch,
+                    ToolCallStatus::Completed
+                ),
+                (
+                    final_plan_call_id,
+                    ToolName::UpdatePlan,
+                    ToolCallStatus::Completed
+                ),
+            ]
+        );
+        assert_eq!(state.tool_statuses[0].title, "Plan updated");
+        assert_eq!(
+            state.tool_statuses[0].summary.as_deref(),
+            Some("Plan updated")
+        );
+        assert_eq!(state.progress.tool_calls_started, 3);
+        assert_eq!(state.progress.tool_calls_completed, 3);
+        assert_eq!(state.progress.tool_calls_failed, 0);
+    }
+
+    #[test]
+    fn typed_plan_call_identity_survives_interleaving_and_page_boundaries() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let first_call_id = ToolCallId::new();
+        let second_call_id = ToolCallId::new();
+        let pending = |sequence_no, call_id| TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no,
+            payload: TurnItemPayload::ToolStatus {
+                call_id,
+                tool: ToolName::UpdatePlan,
+                status: ToolLifecycleStatus::Pending,
+                title: "update_plan".to_string(),
+                summary: String::new(),
+            },
+        };
+        let plan = |sequence_no, call_id| TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no,
+            payload: TurnItemPayload::Plan {
+                call_id: Some(call_id),
+                explanation: None,
+                plan: Vec::new(),
+            },
+        };
+
+        let interleaved = canonical_tool_projection_for_turn(
+            &[
+                pending(1, first_call_id),
+                pending(2, second_call_id),
+                plan(3, second_call_id),
+                plan(4, first_call_id),
+            ],
+            Some(turn_id),
+        );
+
+        assert!(!interleaved.identity_conflict);
+        assert_eq!(interleaved.statuses.len(), 2);
+        assert!(interleaved.statuses.iter().all(|status| {
+            status.tool == ToolName::UpdatePlan && status.status == ToolCallStatus::Completed
+        }));
+
+        let completion_page =
+            canonical_tool_projection_for_turn(&[plan(3, second_call_id)], Some(turn_id));
+        assert!(!completion_page.identity_conflict);
+        assert_eq!(completion_page.statuses.len(), 1);
+        assert_eq!(completion_page.statuses[0].tool_call_id, second_call_id);
+        assert_eq!(
+            completion_page.statuses[0].status,
+            ToolCallStatus::Completed
+        );
+
+        let mismatched_owner = canonical_tool_projection_for_turn(
+            &[
+                TurnItem {
+                    payload: TurnItemPayload::ToolStatus {
+                        call_id: first_call_id,
+                        tool: ToolName::ApplyPatch,
+                        status: ToolLifecycleStatus::Pending,
+                        title: "apply_patch".to_string(),
+                        summary: String::new(),
+                    },
+                    ..pending(1, first_call_id)
+                },
+                plan(2, first_call_id),
+            ],
+            Some(turn_id),
+        );
+        assert!(mismatched_owner.identity_conflict);
+        assert_eq!(mismatched_owner.statuses.len(), 1);
+        assert_eq!(mismatched_owner.statuses[0].tool, ToolName::ApplyPatch);
+        assert_eq!(mismatched_owner.statuses[0].status, ToolCallStatus::Pending);
+    }
+
+    #[test]
+    fn legacy_plan_completion_is_inferred_only_for_one_unresolved_call() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let first_call_id = ToolCallId::new();
+        let second_call_id = ToolCallId::new();
+        let pending = |sequence_no, call_id| TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no,
+            payload: TurnItemPayload::ToolStatus {
+                call_id,
+                tool: ToolName::UpdatePlan,
+                status: ToolLifecycleStatus::Pending,
+                title: "update_plan".to_string(),
+                summary: String::new(),
+            },
+        };
+        let legacy_plan = |sequence_no| TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no,
+            payload: TurnItemPayload::Plan {
+                call_id: None,
+                explanation: None,
+                plan: Vec::new(),
+            },
+        };
+
+        let unique = canonical_tool_projection_for_turn(
+            &[pending(1, first_call_id), legacy_plan(2)],
+            Some(turn_id),
+        );
+        assert!(!unique.identity_conflict);
+        assert_eq!(unique.statuses[0].status, ToolCallStatus::Completed);
+
+        let ambiguous = canonical_tool_projection_for_turn(
+            &[
+                pending(1, first_call_id),
+                pending(2, second_call_id),
+                legacy_plan(3),
+            ],
+            Some(turn_id),
+        );
+        assert!(ambiguous.identity_conflict);
+        assert!(ambiguous.statuses.iter().all(|status| {
+            matches!(
+                status.status,
+                ToolCallStatus::Pending | ToolCallStatus::Running
+            )
+        }));
     }
 
     #[test]
@@ -2272,6 +2757,7 @@ mod tests {
             source_item_id: None,
             sequence_no: 1,
             payload: TurnItemPayload::Plan {
+                call_id: None,
                 explanation: Some("Inspect before editing".to_string()),
                 plan: vec![PlanStep {
                     step: "Read the state owner".to_string(),
@@ -2386,7 +2872,7 @@ mod tests {
             source: crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
             active_context_tokens: 2_100,
             full_context_window_limit: 131_072,
-            configured_max_output_tokens: 8_192,
+            configured_max_output_tokens: None,
             overflow_margin_tokens: 1_024,
             tokens_until_limit: 119_756,
             token_limit_reached: false,
@@ -2412,7 +2898,7 @@ mod tests {
                 source: crate::context::ActiveContextTokenSource::FullPreparedRequestEstimate,
                 active_context_tokens: 2_100,
                 full_context_window_limit: 131_072,
-                configured_max_output_tokens: 8_192,
+                configured_max_output_tokens: None,
                 overflow_margin_tokens: 1_024,
                 tokens_until_limit: 119_756,
                 token_limit_reached: false,

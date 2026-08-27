@@ -1,9 +1,8 @@
 use std::future::Future;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{ResolvedConfig, ResolvedTurnConfig};
+use crate::config::{ProviderReasoningCapability, ResolvedConfig, ResolvedTurnConfig};
 use crate::error::LlmError;
-use crate::llm::model_policy::ProviderCapabilities;
 use crate::llm::{
     ChatRequest, ConfigModelCatalog, LlmClient, LlmEvent, LlmEventSink, ModelCatalog, ModelMessage,
     OpenAiCompatClient, check_model_availability, resolve_api_key_from_env,
@@ -22,31 +21,9 @@ pub async fn enhance_prompt(
     let turn_config = ResolvedTurnConfig::from_effective(config)
         .map_err(|error| LlmError::Message(error.to_string()))?;
     let runtime_config = turn_config.runtime_config();
-    let provider_target = turn_config.provider();
     let api_key = resolve_api_key_from_env(runtime_config.model.api_key_env.as_deref())?;
     let client = OpenAiCompatClient::new(api_key);
-    let model = ConfigModelCatalog::new(runtime_config.clone()).resolve(None)?;
-    let provider_capabilities = ProviderCapabilities::from_config(runtime_config);
-    let mut request = ChatRequest::new(
-        provider_target.clone(),
-        model,
-        PROMPT_ENHANCER_SYSTEM_PROMPT.trim().to_string(),
-        vec![ModelMessage::User {
-            content: raw_prompt.to_string(),
-        }],
-        Vec::new(),
-        None,
-        provider_capabilities.reasoning,
-        runtime_config.model.extra_headers.clone(),
-    );
-    request.temperature = runtime_config.model.temperature;
-    request.top_p = runtime_config.model.top_p;
-    request.top_k = runtime_config.model.top_k;
-    request.presence_penalty = runtime_config.model.presence_penalty;
-    request.frequency_penalty = runtime_config.model.frequency_penalty;
-    request.seed = runtime_config.model.seed;
-    request.stop_sequences = runtime_config.model.stop_sequences.clone();
-    request.extra_body = runtime_config.model.extra_body_json.clone();
+    let request = prompt_enhance_request(&turn_config, raw_prompt)?;
     let mut sink = PromptEnhanceSink::default();
     let summary = client.stream_chat(request, cancellation, &mut sink).await?;
     crate::llm::validate_toolless_text_response("prompt enhancer", &summary, sink.saw_tool_call)?;
@@ -57,6 +34,29 @@ pub async fn enhance_prompt(
         ));
     }
     Ok(output)
+}
+
+fn prompt_enhance_request(
+    turn_config: &ResolvedTurnConfig,
+    raw_prompt: &str,
+) -> Result<ChatRequest, LlmError> {
+    let runtime_config = turn_config.runtime_config();
+    let provider_target = turn_config.provider();
+    let model = ConfigModelCatalog::new(runtime_config.clone()).resolve(None)?;
+    let request = ChatRequest::new(
+        provider_target.clone(),
+        model,
+        PROMPT_ENHANCER_SYSTEM_PROMPT.trim().to_string(),
+        vec![ModelMessage::User {
+            content: raw_prompt.to_string(),
+        }],
+        Vec::new(),
+        None,
+        ProviderReasoningCapability::Unsupported,
+        runtime_config.model.extra_headers.clone(),
+    );
+    request.validate_provider_lifecycle()?;
+    Ok(request)
 }
 
 pub(crate) async fn enhance_prompt_for_captured_idle<F, Fut>(
@@ -183,6 +183,54 @@ mod tests {
             .await
             .expect("session");
         (temp, service, store, session.session.id)
+    }
+
+    #[test]
+    fn prompt_enhancer_inherits_host_generation_settings() {
+        let mut config = ResolvedConfig::default();
+        config.model.temperature = Some(0.2);
+        config.model.top_p = Some(0.8);
+        config.model.top_k = Some(40);
+        config.model.presence_penalty = Some(0.1);
+        config.model.frequency_penalty = Some(0.3);
+        config.model.seed = Some(7);
+        config.model.stop_sequences = vec!["STOP".to_string()];
+        config.model.reasoning_effort = Some(crate::config::ReasoningEffort::High);
+        config.model.reasoning_summary = crate::config::ReasoningSummary::Detailed;
+        config.model.extra_body_json = Some(serde_json::json!({
+            "chat_template_kwargs": { "enable_thinking": false },
+            "min_p": 0.05,
+        }));
+        config
+            .model
+            .extra_headers
+            .insert("X-Provider".to_string(), "preserved".to_string());
+        let turn_config = ResolvedTurnConfig::from_effective(&config).expect("turn config");
+
+        let request = prompt_enhance_request(&turn_config, "improve this prompt")
+            .expect("prompt enhancer request");
+
+        assert!(request.tools.is_empty());
+        assert!(request.reasoning.is_none());
+        assert_eq!(
+            request.reasoning_capability,
+            ProviderReasoningCapability::Unsupported
+        );
+        assert!(request.temperature.is_none());
+        assert!(request.top_p.is_none());
+        assert!(request.top_k.is_none());
+        assert!(request.presence_penalty.is_none());
+        assert!(request.frequency_penalty.is_none());
+        assert!(request.seed.is_none());
+        assert!(request.stop_sequences.is_empty());
+        assert!(request.extra_body.is_none());
+        assert_eq!(
+            request
+                .extra_headers()
+                .get("X-Provider")
+                .map(String::as_str),
+            Some("preserved")
+        );
     }
 
     #[tokio::test]

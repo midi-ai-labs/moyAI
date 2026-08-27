@@ -3834,7 +3834,7 @@ test("provider URL typing updates accessible feedback and restores the current t
   }
 });
 
-test("provider manual target and limit edits can be committed without loading a catalog", () => {
+test("provider manual target and local context edits can be committed without loading a catalog", () => {
   const currentWithoutCatalog = projection({
     provider_apply_enabled: true,
     provider_catalog_base_url: null,
@@ -3857,11 +3857,6 @@ test("provider manual target and limit edits can be committed without loading a 
     "catalog diagnostics do not own a complete connection",
   );
 
-  ui.drafts.provider.maxOutputTokens = "4096";
-  assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, true);
-  ui.drafts.provider.maxOutputTokens = "0";
-  assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, false);
-  ui.drafts.provider.maxOutputTokens = "4096";
   ui.drafts.provider.baseUrl = "http://127.0.0.1:4321";
   assert.equal(projectViewState(currentWithoutCatalog, ui).provider_apply_enabled, true);
   ui.drafts.provider.baseUrl = currentWithoutCatalog.provider_base_url;
@@ -3876,7 +3871,6 @@ test("provider manual target and limit edits can be committed without loading a 
 
   const failedSave = projection({
     provider_context_window: "65536",
-    provider_max_output_tokens: "4096",
     provider_apply_enabled: true,
     provider_catalog_base_url: null,
     provider_catalog_profile: null,
@@ -3886,7 +3880,7 @@ test("provider manual target and limit edits can be committed without loading a 
   assert.equal(
     projectViewState(failedSave, failedSaveUi).provider_apply_enabled,
     true,
-    "a failed command keeps limits dirty against the effective provider baseline",
+    "a failed command keeps the local context budget dirty against the effective provider baseline",
   );
 
   const failedCatalogSwitch = projection({
@@ -3903,7 +3897,7 @@ test("provider manual target and limit edits can be committed without loading a 
   assert.equal(
     projectViewState(failedCatalogSwitch, failedCatalogSwitchUi).provider_apply_enabled,
     true,
-    "returning from a failed catalog target can commit limits against the effective provider",
+    "returning from a failed catalog target can commit the local context budget against the effective provider",
   );
 
   const rustRejected = projection({
@@ -3936,7 +3930,6 @@ test("provider Apply and Save submit a complete hand-entered connection without 
   ui.drafts.provider.providerProfile = "openai_compatible";
   ui.drafts.provider.apiKeyEnv = "OPENAI_API_KEY";
   ui.drafts.provider.contextWindow = "65536";
-  ui.drafts.provider.maxOutputTokens = "4096";
   ui.drafts.provider.selectedModelId = "model-a";
   const view = projectViewState(projected, ui);
   assert.equal(view.provider_apply_enabled, true);
@@ -3965,7 +3958,6 @@ test("provider Apply and Save submit a complete hand-entered connection without 
       providerProfile: "openai_compatible",
       apiKeyEnv: "OPENAI_API_KEY",
       contextWindow: "65536",
-      maxOutputTokens: "4096",
       selectedModelId: "model-a",
     },
     expectedTarget: projected.config_target,
@@ -4672,7 +4664,7 @@ test("Help exposes a Rust-owned accessible About dialog", () => {
   assert.equal((html.match(/data-action="close-overlay"/g) ?? []).length, 3);
 });
 
-test("settings renders one typed LLM response timeout with total-response help", () => {
+test("settings renders one typed LLM response inactivity timeout with host-neutral help", () => {
   const html = renderOverlay(projection({
     overlay: "config",
     config_fields: [{
@@ -4687,8 +4679,8 @@ test("settings renders one typed LLM response timeout with total-response help",
     }],
   }));
 
-  assert.match(html, /LLM応答タイムアウト/);
-  assert.match(html, /最初の送信開始からstream完了までのLLM応答全体に適用する総上限です（ms）。/);
+  assert.match(html, /LLM応答無進捗タイムアウト/);
+  assert.match(html, /応答headerまでの待機と、応答中のSSE event間の最大無進捗時間です（ms）。進捗中の総所要時間は制限せず、hostへも送信しません。/);
   assert.match(html, /data-config-key="model\.request_timeout_ms"[^>]+value="3600000"/);
   assert.doesNotMatch(html, /model\.stream_idle_timeout_ms/);
   assert.doesNotMatch(html, /settings-raw-value[^>]+model\.request_timeout_ms/);
@@ -4950,9 +4942,129 @@ test("every Preferences field has unique connected help, validation, and explici
       options: [],
     },
     {
+      key: "model.top_p",
+      value: "0.9",
+      env_override: null,
+      value_type: "number",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.top_k",
+      value: "40",
+      env_override: "MOYAI_TOP_K",
+      value_type: "integer",
+      required: false,
+      min_value: 0,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.presence_penalty",
+      value: "0.1",
+      env_override: null,
+      value_type: "number",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.frequency_penalty",
+      value: "0.2",
+      env_override: null,
+      value_type: "number",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.seed",
+      value: "42",
+      env_override: "MOYAI_SEED",
+      value_type: "integer",
+      required: false,
+      min_value: 0,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.stop_sequences",
+      value: "END",
+      env_override: "MOYAI_STOP_SEQUENCES",
+      value_type: "string",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.extra_body_json",
+      value: "{}",
+      env_override: "MOYAI_EXTRA_BODY_JSON",
+      value_type: "json",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.max_output_tokens",
+      value: "4096",
+      env_override: "MOYAI_MAX_OUTPUT_TOKENS",
+      value_type: "integer",
+      required: false,
+      min_value: 0,
+      max_value: 4294967295,
+      options: [],
+    },
+    {
+      key: "model.request_timeout_ms",
+      value: "120000",
+      env_override: "MOYAI_REQUEST_TIMEOUT_MS",
+      value_type: "integer",
+      required: false,
+      min_value: 1,
+      max_value: 3600000,
+      options: [],
+    },
+    {
       key: "model.supports_tools",
       value: "true",
       env_override: "MOYAI_SUPPORTS_TOOLS",
+      value_type: "boolean",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.supports_reasoning",
+      value: "true",
+      env_override: "MOYAI_SUPPORTS_REASONING",
+      value_type: "boolean",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.supports_images",
+      value: "true",
+      env_override: "MOYAI_SUPPORTS_IMAGES",
+      value_type: "boolean",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    },
+    {
+      key: "model.parallel_tool_calls",
+      value: "false",
+      env_override: "MOYAI_PARALLEL_TOOL_CALLS",
       value_type: "boolean",
       required: false,
       min_value: null,
@@ -5030,7 +5142,7 @@ test("every Preferences field has unique connected help, validation, and explici
     html.matchAll(/<(?:input|select|textarea)\b[^>]*class="[^"]*(?:settings-control|side-chat-settings-control)[^"]*"[^>]*>/g),
     (match) => match[0],
   );
-  assert.equal(controls.length, 15, "ten fields, duplicate Main model controls, and four Side controls");
+  assert.equal(controls.length, 17, "twelve visible fields, duplicate Main model controls, and four Side controls");
   for (const control of controls) {
     const id = /\bid="([^"]+)"/.exec(control)?.[1];
     const describedBy = /\baria-describedby="([^"]+)"/.exec(control)?.[1];
@@ -5043,7 +5155,7 @@ test("every Preferences field has unique connected help, validation, and explici
   }
 
   const mainControls = controls.filter((control) => control.includes("data-config-key="));
-  assert.equal(mainControls.length, 11);
+  assert.equal(mainControls.length, 13);
   for (const control of mainControls) assert.match(control, /aria-describedby="[^"]*settings-validation/);
   const modelHelpReferences = mainControls
     .filter((control) => control.includes('data-config-key="model.model"'))
@@ -5062,6 +5174,33 @@ test("every Preferences field has unique connected help, validation, and explici
   assert.match(contextHelp, /形式: 整数/);
   assert.match(contextHelp, /範囲: 0以上4294967295以下/);
   assert.match(contextHelp, /環境変数: MOYAI_CONTEXT_WINDOW/);
+  for (const key of [
+    "model.temperature",
+    "model.top_p",
+    "model.top_k",
+    "model.presence_penalty",
+    "model.frequency_penalty",
+    "model.seed",
+    "model.stop_sequences",
+    "model.extra_body_json",
+    "model.supports_reasoning",
+    "model.max_output_tokens",
+    "model.reasoning_effort",
+    "model.reasoning_summary",
+    "model.chat_completions_reasoning_parameters",
+  ]) {
+    assert.doesNotMatch(html, new RegExp(`data-config-key="${escapeRegExp(key)}"`));
+  }
+  for (const key of [
+    "model.context_window",
+    "model.request_timeout_ms",
+    "model.supports_tools",
+    "model.supports_images",
+    "model.parallel_tool_calls",
+  ]) {
+    assert.match(html, new RegExp(`data-config-key="${escapeRegExp(key)}"`));
+  }
+  assert.match(html, /moyAI内の入力整理とAPI機能を設定します。sampling \/ thinking \/ 出力量はホスティング側の設定をそのまま使用します。/);
   assert.match(html, /id="settings-validation"[^>]*role="status"[^>]*aria-live="polite"/);
   for (const section of ["provider", "model", "side-chat", "permissions", "agents", "tools", "files", "advanced"]) {
     assert.match(
