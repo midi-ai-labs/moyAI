@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.2.1"><img alt="Release" src="https://img.shields.io/badge/release-v1.2.1-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.0.1"><img alt="Release" src="https://img.shields.io/badge/release-v2.0.1-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.ja.md">日本語 README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.2.1">Download release</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.0.1">Download release</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -83,12 +83,14 @@ moyAI is designed around those constraints:
 
 The current release is available here:
 
-[**moyAI v1.2.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v1.2.1)
+[**moyAI v2.0.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v2.0.1)
 
-v1.2.1 makes `qwen/qwen3.6-27b` the shipped default and the primary behaviorally validated local-LLM
-profile. It adds structured, validation-gated compaction checkpoints; keeps model-visible tool failures
-bounded; improves generic recovery hints for malformed patches and missing reads; and preserves typed
-edit baselines across shell commands so external replacement is rejected instead of overwritten.
+v2.0.1 adds a tool-less Side Chat with persisted per-session settings, history, and drafts;
+completes first-run, global, and per-session settings workflows; and unifies provider discovery
+and generation under typed connection profiles. It also improves long-running local-model work
+with progress-aware streaming, exact generation-fenced Stop, settled-history restoration and
+next-turn admission after Desktop restart, terminal projection reconciliation, and bounded
+semantic-prefix compaction.
 
 The Windows release zip includes:
 
@@ -136,7 +138,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 1.2.1 -ManualGuiStResultsPath path\to\RESULTS.md
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 2.0.1 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
 
 Run packaging from the clean source commit for that release. If `v<version>` already exists, the

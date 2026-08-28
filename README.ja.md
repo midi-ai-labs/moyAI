@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.2.1"><img alt="Release" src="https://img.shields.io/badge/release-v1.2.1-6d8cff"></a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.0.1"><img alt="Release" src="https://img.shields.io/badge/release-v2.0.1-6d8cff"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-f74c00">
   <img alt="Desktop" src="https://img.shields.io/badge/Desktop-Tauri-24c8db">
@@ -19,7 +19,7 @@
 <p align="center">
   <a href="README.md">English README</a>
   ·
-  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v1.2.1">release をダウンロード</a>
+  <a href="https://github.com/midi-ai-labs/moyAI/releases/tag/v2.0.1">release をダウンロード</a>
   ·
   <a href="#quick-start">Quick Start</a>
   ·
@@ -84,12 +84,13 @@ moyAI は、そうした環境でも使いやすい開発用の相棒を目指�
 
 現在の release を公開しています。
 
-[**moyAI v1.2.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v1.2.1)
+[**moyAI v2.0.1 release**](https://github.com/midi-ai-labs/moyAI/releases/tag/v2.0.1)
 
-v1.2.1では、`qwen/qwen3.6-27b`を製品defaultかつ主なbehavioral validation対象としました。
-構造化・validation付きcompaction checkpoint、model-visible tool failureのbounded化、malformed patchと
-missing readへの汎用的なrecovery hint、shell commandをまたいで保持されるtyped edit baselineを追加し、
-外部replacementを上書きせず拒否します。
+v2.0.1では、session単位の設定・履歴・未送信draftを永続化するtool-less Side Chat、
+初回・global・session別の設定workflow、provider discoveryとgenerationを統合するtyped
+connection profileを追加しました。progress-aware streaming、generationでfenceされたexact Stop、
+Desktop再起動後のsettled history復元と次turn admission、terminal projection reconciliation、
+boundedなsemantic-prefix compactionにより、長時間のlocal-model taskも強化しています。
 
 Windows 向け release zip には、次のものが含まれています。
 
@@ -137,7 +138,7 @@ cargo build --release --bin moyai --bin moyai-desktop --bin moyai-cleanup
 Windows release package:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 1.2.1 -ManualGuiStResultsPath path\to\RESULTS.md
+powershell -ExecutionPolicy Bypass -File scripts/package-release.ps1 -Version 2.0.1 -ManualGuiStResultsPath path\to\RESULTS.md
 ```
 
 packageはそのrelease用のclean source commitから作成します。`v<version>` tagが既に存在する場合、
