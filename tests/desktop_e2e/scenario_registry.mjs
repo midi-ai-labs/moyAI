@@ -5,6 +5,10 @@ import { createPromptReviewCancelScenario } from "./scenarios/prompt_review_canc
 import { createProviderConnectionLiveScenario } from "./scenarios/provider_connection_live.mjs";
 import { createLmStudioThinkingScenario } from "./scenarios/provider_lm_studio_thinking.mjs";
 import { createPermissionRestartGuardianScenario } from "./scenarios/permission_restart_guardian.mjs";
+import {
+  createPermissionTempEscalationLmStudioScenario,
+  createPermissionTempEscalationScenario,
+} from "./scenarios/permission_temp_escalation.mjs";
 import { createProviderChatToolContinuationScenario } from "./scenarios/provider_chat_tool_continuation.mjs";
 import { createProviderResponsesCompactionRetryScenario } from "./scenarios/provider_responses_compaction_retry.mjs";
 import { createProviderResponsesProgressScenario } from "./scenarios/provider_responses_progress.mjs";
@@ -29,9 +33,11 @@ const factories = new Map([
   ["manual.case5_2", createCase52Scenario],
   ["manual.provider-openai-compatible", createProviderConnectionLiveScenario],
   ["manual.provider-lm-studio-thinking", createLmStudioThinkingScenario],
+  ["manual.permission-temp-escalation-lm-studio", createPermissionTempEscalationLmStudioScenario],
   ["native-dialog.cancel", createNativeDialogCancelScenario],
   ["prompt-review.cancel", createPromptReviewCancelScenario],
   ["permission.restart-guardian", createPermissionRestartGuardianScenario],
+  ["permission.temp-escalation", createPermissionTempEscalationScenario],
   ["provider.chat-tool-continuation", createProviderChatToolContinuationScenario],
   ["provider.responses-compaction-retry", createProviderResponsesCompactionRetryScenario],
   ["provider.responses-progress", createProviderResponsesProgressScenario],
@@ -47,6 +53,7 @@ const configurableScenarios = new Set([
   "manual.case5_2",
   "manual.provider-openai-compatible",
   "manual.provider-lm-studio-thinking",
+  "manual.permission-temp-escalation-lm-studio",
 ]);
 
 export const scenarioIds = Object.freeze([...factories.keys()]);

@@ -420,7 +420,8 @@ If redaction or invalid configuration makes the executable effect incomplete, Au
 calling either the Guardian or a human. The Guardian request includes the current `WorldState`, bounded
 active canonical task context, the current exact committed response/call, and bounded results of prior
 tools in that same response. It has no tools or continuation, sends no sampling/thinking override,
-accepts host-provided reasoning as non-authoritative transport output, and has a 90-second total deadline.
+accepts host-provided reasoning as non-authoritative transport output, and uses the turn-captured client-side
+`model.request_timeout_ms` as its absolute total deadline without sending that limit to the host.
 
 Desktop binds an access update to the current root session and exact runtime epoch. Within the same
 epoch, natural `root:N` to `tree:N`/`idle:N` and `tree:N` to `root:N`/`idle:N` settlements are accepted;

@@ -379,7 +379,8 @@ source URL、effective format/OCR/image/page options、credential presenceを保
 実行effectをcompleteに表せない場合はGuardianもhumanも呼ばずdenyします。Guardian inputはcurrent `WorldState`、active canonical
 historyからbounded samplingしたtask context、current exact committed response/call、同じresponse内のbounded prior tool resultsを含みます。
 tool / continuationを持たず、sampling / thinking overrideを送信しません。hostが返すreasoningはnon-authoritativeな
-transport outputとして受信し、90秒total deadlineを使います。
+transport outputとして受信し、turn開始時にcaptureしたclient-side `model.request_timeout_ms`を
+hostへ送信しないabsolute total deadlineとして使います。
 
 Desktopのaccess更新はcurrent root sessionとexact runtime epochへ束ねます。同じepochのnatural settlementとして
 `root:N`→`tree:N` / `idle:N`と`tree:N`→`root:N` / `idle:N`を受理し、idleからactiveへの遷移、新しいepoch、別session / workspace /

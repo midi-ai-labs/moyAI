@@ -674,7 +674,11 @@ fn plan_from_metadata(metadata: &Value) -> Option<(Option<String>, Vec<PlanStep>
 }
 
 fn metadata_success(metadata: &Value) -> Option<bool> {
-    metadata.get("success").and_then(Value::as_bool)
+    metadata
+        .get("tool_metadata")
+        .and_then(|value| value.get("success"))
+        .and_then(Value::as_bool)
+        .or_else(|| metadata.get("success").and_then(Value::as_bool))
 }
 
 fn permission_decision(approved: bool) -> PermissionDecision {
@@ -725,6 +729,28 @@ mod tests {
     use super::*;
     use crate::protocol::{PlanStepStatus, UserInputItem, UserTurn};
     use crate::session::ToolCallId;
+
+    #[test]
+    fn nested_tool_outcome_overrides_legacy_outer_success() {
+        assert_eq!(
+            metadata_success(&serde_json::json!({
+                "success": true,
+                "tool_metadata": {"success": false, "exit_code": 1}
+            })),
+            Some(false)
+        );
+        assert_eq!(
+            metadata_success(&serde_json::json!({
+                "success": false,
+                "tool_metadata": {"success": true, "exit_code": 0}
+            })),
+            Some(true)
+        );
+        assert_eq!(
+            metadata_success(&serde_json::json!({"success": false})),
+            Some(false)
+        );
+    }
 
     #[test]
     fn pending_tool_call_preserves_raw_provider_name_and_arguments() {

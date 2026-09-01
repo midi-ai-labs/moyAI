@@ -167,8 +167,8 @@ pub enum PermissionGuardianError {
     Cancelled,
     #[error("guardian returned an invalid decision: {0}")]
     InvalidDecision(String),
-    #[error("permission review exceeded its total deadline of {seconds} seconds")]
-    TotalDeadline { seconds: u64 },
+    #[error("permission review exceeded its total deadline of {milliseconds} milliseconds")]
+    TotalDeadline { milliseconds: u64 },
     #[error("permission retry fence blocked the equivalent elevated effect: {0}")]
     RetryFenced(String),
     #[error(

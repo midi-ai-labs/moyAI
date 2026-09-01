@@ -37,9 +37,11 @@ test("one registry binds every reusable scenario to the common runner contract",
     "manual.case5_2",
     "manual.provider-openai-compatible",
     "manual.provider-lm-studio-thinking",
+    "manual.permission-temp-escalation-lm-studio",
     "native-dialog.cancel",
     "prompt-review.cancel",
     "permission.restart-guardian",
+    "permission.temp-escalation",
     "provider.chat-tool-continuation",
     "provider.responses-compaction-retry",
     "provider.responses-progress",
@@ -58,7 +60,9 @@ test("one registry binds every reusable scenario to the common runner contract",
         ? liveProviderOptions
         : id === "manual.provider-lm-studio-thinking"
           ? lmStudioThinkingOptions
-        : {};
+          : id === "manual.permission-temp-escalation-lm-studio"
+            ? lmStudioThinkingOptions
+            : {};
     const scenario = createScenario(id, options);
     assert.equal(scenario.id, id);
     for (const method of ["prepare", "execute", "requestGracefulExit", "quiesce", "cleanup"]) {
@@ -76,6 +80,10 @@ test("one registry binds every reusable scenario to the common runner contract",
   assert.notEqual(
     createScenario("permission.restart-guardian"),
     createScenario("permission.restart-guardian"),
+  );
+  assert.notEqual(
+    createScenario("permission.temp-escalation"),
+    createScenario("permission.temp-escalation"),
   );
   assert.notEqual(
     createScenario("provider.chat-tool-continuation"),
@@ -105,12 +113,20 @@ test("one registry binds every reusable scenario to the common runner contract",
     createScenario("manual.provider-lm-studio-thinking", lmStudioThinkingOptions),
     createScenario("manual.provider-lm-studio-thinking", lmStudioThinkingOptions),
   );
+  assert.notEqual(
+    createScenario("manual.permission-temp-escalation-lm-studio", lmStudioThinkingOptions),
+    createScenario("manual.permission-temp-escalation-lm-studio", lmStudioThinkingOptions),
+  );
   assert.throws(
     () => createScenario("manual.provider-openai-compatible"),
     /provider_base_url must be a non-empty string/,
   );
   assert.throws(
     () => createScenario("manual.provider-lm-studio-thinking"),
+    /provider_base_url must be a non-empty string/,
+  );
+  assert.throws(
+    () => createScenario("manual.permission-temp-escalation-lm-studio"),
     /provider_base_url must be a non-empty string/,
   );
   assert.throws(() => createScenario("run-95"), /unknown Desktop E2E scenario/);

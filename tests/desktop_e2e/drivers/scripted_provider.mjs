@@ -16,6 +16,9 @@ export const SCRIPTED_PROVIDER_TOOL_ERROR_RECOVERY_KIND = "tool_error_recovery";
 export const SCRIPTED_PROVIDER_TOOL_ERROR_RECOVERY_MAX_RESPONSES = 2;
 export const SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND = "permission_restart_guardian";
 export const SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_MAX_RESPONSES = 4;
+export const SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND = "permission_temp_escalation";
+export const SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_RESPONSES = 4;
+export const SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_GUARDIAN_DELAY_MS = 300_000;
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND = "chat_tool_continuation";
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_MAX_RESPONSES = 2;
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT =
@@ -98,6 +101,13 @@ function sha256(value) {
 
 function positiveInteger(value, name) {
   if (!Number.isSafeInteger(value) || value <= 0) throw new TypeError(`${name} must be a positive safe integer`);
+  return value;
+}
+
+function nonNegativeInteger(value, name) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(`${name} must be a non-negative safe integer`);
+  }
   return value;
 }
 
@@ -254,6 +264,38 @@ function permissionRestartGuardianScript(value) {
   });
 }
 
+function permissionTempEscalationScript(value) {
+  const expectedKeys = [
+    "command",
+    "guardianDelayMs",
+    "justification",
+    "kind",
+    "responseText",
+    "taskPrompt",
+  ];
+  if (!exactKeys(value, expectedKeys)
+    || value.kind !== SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
+    throw new TypeError("permission TEMP escalation scripted provider mode must use its exact schema");
+  }
+  const guardianDelayMs = nonNegativeInteger(
+    value.guardianDelayMs,
+    "script.guardianDelayMs",
+  );
+  if (guardianDelayMs > SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_GUARDIAN_DELAY_MS) {
+    throw new TypeError(
+      `script.guardianDelayMs must not exceed ${SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_GUARDIAN_DELAY_MS}`,
+    );
+  }
+  return Object.freeze({
+    kind: value.kind,
+    taskPrompt: nonEmptyString(value.taskPrompt, "script.taskPrompt"),
+    command: nonEmptyString(value.command, "script.command"),
+    justification: nonEmptyString(value.justification, "script.justification"),
+    responseText: nonEmptyString(value.responseText, "script.responseText"),
+    guardianDelayMs,
+  });
+}
+
 function chatToolContinuationScript(value) {
   const expectedKeys = ["kind"];
   if (!exactKeys(value, expectedKeys)
@@ -304,6 +346,9 @@ function providerScript(value) {
   if (value?.kind === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND) {
     return permissionRestartGuardianScript(value);
   }
+  if (value?.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
+    return permissionTempEscalationScript(value);
+  }
   if (value?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
     return chatToolContinuationScript(value);
   }
@@ -319,6 +364,9 @@ function scriptedResponseMaximum(script) {
   }
   if (script?.kind === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND) {
     return SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_MAX_RESPONSES;
+  }
+  if (script?.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
+    return SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_RESPONSES;
   }
   if (script?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
     return SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_MAX_RESPONSES;
@@ -371,6 +419,23 @@ export function createPermissionRestartGuardianProviderScript({
     command,
     justification,
     responseText,
+  });
+}
+
+export function createPermissionTempEscalationProviderScript({
+  taskPrompt,
+  command,
+  justification,
+  responseText,
+  guardianDelayMs = 0,
+} = {}) {
+  return permissionTempEscalationScript({
+    kind: SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND,
+    taskPrompt,
+    command,
+    justification,
+    responseText,
+    guardianDelayMs,
   });
 }
 
@@ -538,6 +603,14 @@ const TOOL_ERROR_RECOVERY_READ_CALL_ID = "call_tool_error_recovery_read";
 const TOOL_ERROR_RECOVERY_READ_ITEM_ID = "fc_tool_error_recovery_read";
 const PERMISSION_RESTART_GUARDIAN_SHELL_CALL_ID = "call_permission_restart_guardian_shell";
 const PERMISSION_RESTART_GUARDIAN_SHELL_ITEM_ID = "fc_permission_restart_guardian_shell";
+const PERMISSION_TEMP_ESCALATION_RESTRICTED_CALL_ID =
+  "call_permission_temp_escalation_restricted";
+const PERMISSION_TEMP_ESCALATION_RESTRICTED_ITEM_ID =
+  "fc_permission_temp_escalation_restricted";
+const PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID =
+  "call_permission_temp_escalation_elevated";
+const PERMISSION_TEMP_ESCALATION_ELEVATED_ITEM_ID =
+  "fc_permission_temp_escalation_elevated";
 const PERMISSION_RESTART_GUARDIAN_ALLOW = Object.freeze({
   decision: "allow",
   rationale: "bounded deterministic fixture command",
@@ -1741,6 +1814,344 @@ function permissionRestartGuardianRequestContract(
   };
 }
 
+function permissionTempEscalationExpected(script) {
+  return {
+    restrictedArguments: JSON.stringify({
+      command: script.command,
+      sandbox_permissions: "use_default",
+    }),
+    elevatedArguments: JSON.stringify({
+      command: script.command,
+      sandbox_permissions: "require_escalated",
+      justification: script.justification,
+    }),
+  };
+}
+
+function permissionTempEscalationCallMatches(item, callId, argumentsJson) {
+  return exactKeys(item, ["arguments", "call_id", "name", "type"])
+    && item.type === "function_call"
+    && item.call_id === callId
+    && item.name === "shell"
+    && item.arguments === argumentsJson;
+}
+
+function permissionTempEscalationOutput(item, callId) {
+  return exactKeys(item, ["call_id", "output", "type"])
+    && item.type === "function_call_output"
+    && item.call_id === callId
+    && typeof item.output === "string"
+    && item.output.trim().length > 0
+    ? item.output
+    : null;
+}
+
+function permissionTempFailureOutputContract(output, script) {
+  const text = typeof output === "string" ? output : "";
+  const lines = text.split(/\r?\n/u);
+  const noteCount = text.split("Sandbox note:").length - 1;
+  const contract = {
+    output_non_empty: text.trim().length > 0,
+    command_matches: lines.includes(`Command: ${script.command}`),
+    host_non_success: text.includes("Tool outcome (host projection): non-success"),
+    shell_tool: text.includes('tool: "shell"'),
+    completed_lifecycle: text.includes("lifecycle_status: completed"),
+    hint_kind: text.includes("kind: workspace_write_effect_temp_access_denied"),
+    automatic_retry_false: text.includes("automatic_retry: false"),
+    exit_code_one: text.includes("exit_code: 1"),
+    guidance_present: text.includes("guidance: Sandbox note:"),
+    exact_escalation_hint: text.includes("sandbox_permissions=require_escalated"),
+    no_project_workaround_hint: text.includes(
+      "do not change project files solely to bypass this sandbox restriction",
+    ),
+    single_note: noteCount === 1,
+    same_line_windows_signature: /^.*permissionerror: \[winerror 5\].*moyai-sandbox-effect-.*$/imu
+      .test(text),
+  };
+  return {
+    ...contract,
+    output_size_bytes: output === null ? null : Buffer.byteLength(text, "utf8"),
+    output_sha256: output === null ? null : sha256(Buffer.from(text, "utf8")),
+    pass: Object.values(contract).every((value) => value === true),
+  };
+}
+
+function permissionTempSuccessOutputContract(output, script) {
+  const text = typeof output === "string" ? output : "";
+  const lines = text.split(/\r?\n/u);
+  const contract = {
+    output_non_empty: text.trim().length > 0,
+    command_matches: lines.includes(`Command: ${script.command}`),
+    exit_code_zero: text.includes("Exit code: 0"),
+    pytest_passed: /(?:^|\n)1 passed(?:\s|$)/u.test(text),
+    effect_temp_absent: !text.includes("moyai-sandbox-effect-"),
+    sandbox_note_absent: !text.includes("Sandbox note:"),
+  };
+  return {
+    ...contract,
+    output_size_bytes: output === null ? null : Buffer.byteLength(text, "utf8"),
+    output_sha256: output === null ? null : sha256(Buffer.from(text, "utf8")),
+    pass: Object.values(contract).every((value) => value === true),
+  };
+}
+
+function permissionTempEscalationMainRole(body, script) {
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const expected = permissionTempEscalationExpected(script);
+  const taskUser = exactInputText(input[0]);
+  const restrictedCall = input[1];
+  const restrictedOutputItem = input[2];
+  const elevatedCall = input[3];
+  const elevatedOutputItem = input[4];
+  const restrictedCallMatches = permissionTempEscalationCallMatches(
+    restrictedCall,
+    PERMISSION_TEMP_ESCALATION_RESTRICTED_CALL_ID,
+    expected.restrictedArguments,
+  );
+  const restrictedOutput = permissionTempEscalationOutput(
+    restrictedOutputItem,
+    PERMISSION_TEMP_ESCALATION_RESTRICTED_CALL_ID,
+  );
+  const restrictedOutputContract = permissionTempFailureOutputContract(restrictedOutput, script);
+  const elevatedCallMatches = permissionTempEscalationCallMatches(
+    elevatedCall,
+    PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID,
+    expected.elevatedArguments,
+  );
+  const elevatedOutput = permissionTempEscalationOutput(
+    elevatedOutputItem,
+    PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID,
+  );
+  const elevatedOutputContract = permissionTempSuccessOutputContract(elevatedOutput, script);
+  const initial = input.length === 1 && taskUser === script.taskPrompt;
+  const escalation = input.length === 3
+    && taskUser === script.taskPrompt
+    && restrictedCallMatches
+    && restrictedOutputContract.pass;
+  const continuation = input.length === 5
+    && taskUser === script.taskPrompt
+    && restrictedCallMatches
+    && restrictedOutputContract.pass
+    && elevatedCallMatches
+    && elevatedOutputContract.pass;
+  const role = initial
+    ? "temp_initial"
+    : escalation
+      ? "temp_escalation"
+      : continuation
+        ? "temp_continuation"
+        : null;
+  return {
+    role,
+    evidence: {
+      input_count: input.length,
+      input_item_types: input.map((item) => typeof item?.type === "string" ? item.type : null),
+      task_prompt_sha256: taskUser === null ? null : sha256(Buffer.from(taskUser, "utf8")),
+      task_prompt_matches: taskUser === script.taskPrompt,
+      restricted_call_matches: restrictedCallMatches,
+      restricted_output: restrictedOutputContract,
+      elevated_call_matches: elevatedCallMatches,
+      elevated_output: elevatedOutputContract,
+    },
+  };
+}
+
+function permissionTempGuardianPayloadContract(inputText, script) {
+  let payload = null;
+  let taskContext = null;
+  try {
+    payload = JSON.parse(inputText);
+    taskContext = typeof payload?.task_context === "string"
+      ? JSON.parse(payload.task_context)
+      : null;
+  } catch {
+    // Invalid or wrapped evidence fails the exact Guardian request contract below.
+  }
+  const payloadKeysMatch = exactKeys(payload, [
+    "action_evidence",
+    "permission_request",
+    "recent_committed_response",
+    "task_context",
+    "trusted_world_state",
+  ]);
+  const authority = Array.isArray(taskContext?.canonical_user_authority)
+    ? taskContext.canonical_user_authority
+    : [];
+  const authorityTexts = authority.map((item) => typeof item?.text === "string" ? item.text : null);
+  const authorityIds = authority.map((item) => typeof item?.history_item_id === "string"
+    ? item.history_item_id
+    : null);
+  const authorityMatches = exactKeys(taskContext, ["authority_session_id", "canonical_user_authority"])
+    && typeof taskContext.authority_session_id === "string"
+    && taskContext.authority_session_id.length > 0
+    && authority.length === 1
+    && authority.every((item) => exactKeys(item, ["history_item_id", "kind", "text"])
+      && item.kind === "user_turn"
+      && typeof item.history_item_id === "string"
+      && item.history_item_id.length > 0)
+    && authorityTexts[0] === script.taskPrompt
+    && new Set(authorityIds).size === authorityIds.length;
+  const recent = payload?.recent_committed_response;
+  const toolRequest = recent?.tool_request;
+  const expected = permissionTempEscalationExpected(script);
+  const recentMatches = exactKeys(recent, [
+    "assistant_text",
+    "prior_committed_tool_results",
+    "response_id",
+    "tool_request",
+  ])
+    && typeof recent.response_id === "string"
+    && recent.response_id.length > 0
+    && typeof recent.assistant_text === "string"
+    && Array.isArray(recent.prior_committed_tool_results)
+    && recent.prior_committed_tool_results.length === 0
+    && exactKeys(toolRequest, ["arguments_json", "call_id", "tool_name"])
+    && toolRequest.call_id === PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID
+    && toolRequest.tool_name === "shell"
+    && toolRequest.arguments_json === expected.elevatedArguments;
+  const permission = payload?.permission_request;
+  const permissionMatches = exactKeys(permission, [
+    "access",
+    "details",
+    "outside_workspace",
+    "risks",
+    "summary",
+    "targets",
+  ])
+    && permission.access === "shell"
+    && typeof permission.summary === "string"
+    && permission.summary.trim().length > 0
+    && Array.isArray(permission.details)
+    && permission.details.some((detail) => (
+      detail === `Requested sandbox elevation: ${script.justification}`
+    ))
+    && Array.isArray(permission.targets)
+    && permission.targets.length > 0
+    && permission.targets.every((target) => typeof target === "string" && target.length > 0)
+    && permission.outside_workspace === true
+    && Array.isArray(permission.risks)
+    && permission.risks.length === 0;
+  const evidenceMatches = exactKeys(payload?.action_evidence, ["kind"])
+    && payload.action_evidence.kind === "permission_request";
+  const worldStateMatches = payload?.trusted_world_state !== null
+    && typeof payload?.trusted_world_state === "object"
+    && !Array.isArray(payload.trusted_world_state)
+    && Object.keys(payload.trusted_world_state).length > 0;
+  return {
+    json_valid: payload !== null,
+    payload_keys_match: payloadKeysMatch,
+    authority_count: authority.length,
+    authority_text_hashes: authorityTexts.map((text) => text === null
+      ? null
+      : sha256(Buffer.from(text, "utf8"))),
+    authority_identity_hashes: authorityIds.map((id) => id === null
+      ? null
+      : sha256(Buffer.from(id, "utf8"))),
+    authority_matches: authorityMatches,
+    recent_committed_response_matches: recentMatches,
+    permission_request_matches: permissionMatches,
+    action_evidence_matches: evidenceMatches,
+    trusted_world_state_matches: worldStateMatches,
+    pass: payloadKeysMatch
+      && authorityMatches
+      && recentMatches
+      && permissionMatches
+      && evidenceMatches
+      && worldStateMatches,
+  };
+}
+
+function permissionTempEscalationGuardianRole(body, script) {
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const inputText = input.length === 1 ? exactInputText(input[0]) : null;
+  const payload = permissionTempGuardianPayloadContract(inputText ?? "", script);
+  return {
+    role: input.length === 1 && payload.pass ? "temp_guardian" : null,
+    evidence: {
+      input_count: input.length,
+      input_text_size_bytes: inputText === null ? null : Buffer.byteLength(inputText, "utf8"),
+      input_text_sha256: inputText === null ? null : sha256(Buffer.from(inputText, "utf8")),
+      payload,
+    },
+  };
+}
+
+function permissionTempEscalationRequestContract(body, modelId, script) {
+  const guardianShape = Object.hasOwn(body ?? {}, "reasoning")
+    || !Object.hasOwn(body ?? {}, "tools");
+  const classified = guardianShape
+    ? permissionTempEscalationGuardianRole(body, script)
+    : permissionTempEscalationMainRole(body, script);
+  const model = typeof body?.model === "string" ? body.model : null;
+  const instructions = typeof body?.instructions === "string" ? body.instructions : null;
+  const topLevelKeys = body !== null && typeof body === "object" && !Array.isArray(body)
+    ? Object.keys(body).sort()
+    : [];
+  const expectedKeys = guardianShape ? GUARDIAN_RESPONSES_KEYS : TOOL_RESPONSES_KEYS;
+  const tools = guardianShape ? null : shellToolsContract(body?.tools);
+  const generation = clientGenerationContract(body);
+  const common = {
+    ...generation,
+    script_kind: script.kind,
+    role: classified.role,
+    role_evidence: classified.evidence,
+    model_sha256: model === null ? null : sha256(Buffer.from(model, "utf8")),
+    instructions_sha256: instructions === null ? null : sha256(Buffer.from(instructions, "utf8")),
+    top_level_keys: topLevelKeys,
+    model_matches: model === modelId,
+    instructions_non_empty: instructions !== null && instructions.trim().length > 0,
+    top_level_keys_match: JSON.stringify(topLevelKeys) === JSON.stringify(expectedKeys),
+    stream_true: body?.stream === true,
+    store_false: body?.store === false,
+  };
+  if (guardianShape) {
+    const guardian = {
+      ...common,
+      guardian_instructions_match: instructions?.includes("independent permission guardian") === true,
+      max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
+      reasoning_absent: !Object.hasOwn(body ?? {}, "reasoning"),
+      tools_absent: !Object.hasOwn(body ?? {}, "tools")
+        && !Object.hasOwn(body ?? {}, "tool_choice")
+        && !Object.hasOwn(body ?? {}, "parallel_tool_calls"),
+    };
+    return {
+      ...guardian,
+      pass: guardian.client_generation_fields_absent
+        && guardian.role === "temp_guardian"
+        && guardian.model_matches
+        && guardian.instructions_non_empty
+        && guardian.guardian_instructions_match
+        && guardian.top_level_keys_match
+        && guardian.max_output_tokens_absent
+        && guardian.reasoning_absent
+        && guardian.tools_absent
+        && guardian.stream_true
+        && guardian.store_false,
+    };
+  }
+  const task = {
+    ...common,
+    max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
+    tool_choice_auto: body?.tool_choice === "auto",
+    parallel_tool_calls_false: body?.parallel_tool_calls === false,
+    tools,
+  };
+  return {
+    ...task,
+    pass: task.client_generation_fields_absent
+      && task.role !== null
+      && task.model_matches
+      && task.instructions_non_empty
+      && task.top_level_keys_match
+      && task.max_output_tokens_absent
+      && task.tool_choice_auto
+      && task.parallel_tool_calls_false
+      && task.tools.pass
+      && task.stream_true
+      && task.store_false,
+  };
+}
+
 function catalog(modelId, supportsTools = false) {
   return {
     object: "list",
@@ -1849,6 +2260,44 @@ function waitForPacingIntervalOrClose(milliseconds, closePromise) {
     const timer = setTimeout(() => finish("elapsed"), milliseconds);
     closePromise.then(() => finish("closed"));
   });
+}
+
+async function waitForGuardianResponseDelay(response, row, configuredDelayMs) {
+  const startedAt = process.hrtime.bigint();
+  const observation = {
+    schema_version: "desktop-e2e.scripted-provider-guardian-delay.v1",
+    configured_delay_ms: configuredDelayMs,
+    delay_elapsed_ms: null,
+    delay_completed: false,
+    peer_close_observed: false,
+    headers_sent_elapsed_ms: null,
+  };
+  row.response_delay = observation;
+  let resolveClose;
+  const closePromise = new Promise((resolve) => { resolveClose = resolve; });
+  const markPeerClose = () => {
+    observation.peer_close_observed = true;
+    resolveClose();
+  };
+  response.once("close", markPeerClose);
+  response.once("error", markPeerClose);
+  row.response_phase = "delaying";
+  let outcome = "elapsed";
+  while (outcome === "elapsed") {
+    const remainingMs = configuredDelayMs - elapsedMonotonicMs(startedAt);
+    if (remainingMs <= 0) break;
+    outcome = await waitForPacingIntervalOrClose(remainingMs, closePromise);
+  }
+  observation.delay_elapsed_ms = elapsedMonotonicMs(startedAt);
+  response.off("close", markPeerClose);
+  response.off("error", markPeerClose);
+  if (outcome !== "elapsed" || response.destroyed || response.socket?.destroyed === true) {
+    observation.peer_close_observed = true;
+    row.response_phase = "peer_closed";
+    return null;
+  }
+  observation.delay_completed = true;
+  return { observation, startedAt };
 }
 
 async function writePacedResponses(response, row, responseText, pacing, options = {}) {
@@ -2245,6 +2694,39 @@ function permissionRestartGuardianShellSse(script) {
   return events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
 }
 
+function permissionTempEscalationShellSse(script, elevated) {
+  const expected = permissionTempEscalationExpected(script);
+  const item = {
+    type: "function_call",
+    id: elevated
+      ? PERMISSION_TEMP_ESCALATION_ELEVATED_ITEM_ID
+      : PERMISSION_TEMP_ESCALATION_RESTRICTED_ITEM_ID,
+    call_id: elevated
+      ? PERMISSION_TEMP_ESCALATION_ELEVATED_CALL_ID
+      : PERMISSION_TEMP_ESCALATION_RESTRICTED_CALL_ID,
+    name: "shell",
+    arguments: elevated ? expected.elevatedArguments : expected.restrictedArguments,
+  };
+  const responseStem = elevated ? "elevated" : "restricted";
+  const events = [
+    { type: "response.output_item.done", output_index: 0, item },
+    {
+      type: "response.completed",
+      response: {
+        id: `resp_permission_temp_escalation_${responseStem}`,
+        output: [item],
+        usage: {
+          input_tokens: 8,
+          output_tokens: 6,
+          total_tokens: 14,
+          output_tokens_details: { reasoning_tokens: 0 },
+        },
+      },
+    },
+  ];
+  return events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+}
+
 function parsedTarget(request) {
   const target = new URL(request.url ?? "/", `http://${LOOPBACK_HOST}`);
   return {
@@ -2410,6 +2892,9 @@ export class ScriptedProvider {
     const releaseHeldGuardianToolInitial = this.script?.kind
       === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND
       && this.responseBehavior === "hold_until_release";
+    const releaseHeldTempEscalation = this.script?.kind
+      === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND
+      && this.responseBehavior === "hold_until_release";
     const releaseHeldChatContinuation = this.script?.kind
       === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND
       && this.responseBehavior === "hold_until_release";
@@ -2424,6 +2909,7 @@ export class ScriptedProvider {
       && this.responseBehavior !== "complete"
       && !releaseHeldToolErrorInitial
       && !releaseHeldGuardianToolInitial
+      && !releaseHeldTempEscalation
       && !releaseHeldChatContinuation
       && !releaseHeldResponsesCompaction) {
       throw new TypeError("scripted provider mode owns its response lifecycle");
@@ -2433,6 +2919,7 @@ export class ScriptedProvider {
     }
     if (this.responseBehavior === "hold_until_release") {
       if (releaseHeldGuardianToolInitial
+        || releaseHeldTempEscalation
         || releaseHeldChatContinuation
         || releaseHeldResponsesCompaction) {
         let release;
@@ -2440,7 +2927,9 @@ export class ScriptedProvider {
         this.#scriptRoleRelease = {
           role: releaseHeldGuardianToolInitial
             ? "guardian_tool_initial"
-            : releaseHeldChatContinuation ? "chat_continuation" : "compaction_empty",
+            : releaseHeldTempEscalation
+              ? "temp_escalation"
+              : releaseHeldChatContinuation ? "chat_continuation" : "compaction_empty",
           promise,
           release,
           released: false,
@@ -2675,6 +3164,7 @@ export class ScriptedProvider {
       response_phase: null,
       response_status: null,
       response_stream: null,
+      response_delay: null,
     };
     this.#ledger.push(row);
 
@@ -2812,6 +3302,12 @@ export class ScriptedProvider {
           this.expectedPrompt,
           this.script,
         );
+      } else if (this.script.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
+        row.contract = permissionTempEscalationRequestContract(
+          decoded.value,
+          this.modelId,
+          this.script,
+        );
       } else {
         row.contract = permissionRestartGuardianRequestContract(
           decoded.value,
@@ -2833,6 +3329,8 @@ export class ScriptedProvider {
         await this.#handleChatToolContinuationResponse(response, row);
       } else if (this.script.kind === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND) {
         await this.#handleResponsesCompactionResponse(response, row);
+      } else if (this.script.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
+        await this.#handlePermissionTempEscalationResponse(response, row);
       } else {
         await this.#handlePermissionRestartGuardianResponse(response, row);
       }
@@ -3129,6 +3627,74 @@ export class ScriptedProvider {
         itemId: "msg_responses_compaction_done",
         responseId: "resp_responses_compaction_done",
       });
+    }
+    writeResponse(response, 200, "text/event-stream", payload);
+  }
+
+  async #handlePermissionTempEscalationResponse(response, row) {
+    if (!row.contract.pass) {
+      row.response_phase = "rejected";
+      row.response_status = 422;
+      fixedError(response, 422, "request_contract_mismatch");
+      return;
+    }
+    const role = row.contract.role;
+    if (this.#acceptedRoles.has(role)) {
+      row.response_phase = "rejected";
+      row.response_status = 409;
+      fixedError(response, 409, "script_role_already_consumed");
+      return;
+    }
+    const prerequisites = {
+      temp_initial: [],
+      temp_escalation: ["temp_initial"],
+      temp_guardian: ["temp_initial", "temp_escalation"],
+      temp_continuation: ["temp_initial", "temp_escalation", "temp_guardian"],
+    };
+    if (!Array.isArray(prerequisites[role])
+      || prerequisites[role].some((required) => !this.#acceptedRoles.has(required))) {
+      row.response_phase = "rejected";
+      row.response_status = 409;
+      fixedError(response, 409, "script_role_prerequisite_missing");
+      return;
+    }
+
+    this.#acceptedRoles.add(role);
+    this.#acceptedResponseCount += 1;
+    if (role === "temp_escalation" && this.responseBehavior === "hold_until_release") {
+      if (this.#scriptRoleRelease?.role !== role) {
+        throw new Error("permission TEMP escalation release owner is missing");
+      }
+      row.response_phase = "held";
+      await this.#scriptRoleRelease.promise;
+    }
+    const guardianDelay = role === "temp_guardian"
+      ? await waitForGuardianResponseDelay(response, row, this.script.guardianDelayMs)
+      : null;
+    if (role === "temp_guardian" && guardianDelay === null) return;
+    this.#successfulResponseCount += 1;
+    row.response_phase = "completed";
+    row.response_status = 200;
+    let payload;
+    if (role === "temp_initial") {
+      payload = permissionTempEscalationShellSse(this.script, false);
+    } else if (role === "temp_escalation") {
+      payload = permissionTempEscalationShellSse(this.script, true);
+    } else if (role === "temp_guardian") {
+      payload = responsesSse(JSON.stringify(PERMISSION_RESTART_GUARDIAN_ALLOW), {
+        itemId: "msg_permission_temp_escalation_allow",
+        responseId: "resp_permission_temp_escalation_allow",
+      });
+    } else {
+      payload = responsesSse(this.script.responseText, {
+        itemId: "msg_permission_temp_escalation_done",
+        responseId: "resp_permission_temp_escalation_done",
+      });
+    }
+    if (guardianDelay !== null) {
+      guardianDelay.observation.headers_sent_elapsed_ms = elapsedMonotonicMs(
+        guardianDelay.startedAt,
+      );
     }
     writeResponse(response, 200, "text/event-stream", payload);
   }

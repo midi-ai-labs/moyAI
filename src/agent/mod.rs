@@ -59,7 +59,6 @@ use crate::tool::registry::ToolRegistry;
 
 const TOOL_CANCELLATION_CLEANUP_TIMEOUT: Duration =
     crate::tool::process::MANAGED_PROCESS_CLEANUP_GRACE;
-const PERMISSION_GUARDIAN_TOTAL_DEADLINE: Duration = Duration::from_secs(90);
 const COMPACTION_ACCURACY_WARNING: &str = "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.";
 // Generation policy is owned by the provider host, so a reasoning model may need materially more
 // decode headroom than a non-reasoning model before it emits the checkpoint text. Keep the first
@@ -3213,9 +3212,11 @@ impl crate::tool::permission_guardian::PermissionGuardian for AgentPermissionGua
     > {
         use crate::tool::permission_guardian::PermissionGuardianError;
         let cancel = self.request.cancel_token();
+        let total_deadline =
+            permission_guardian_total_deadline(self.request.turn.provider_target().deadlines());
         let result = permission_guardian_review_with_deadline(
             cancel,
-            PERMISSION_GUARDIAN_TOTAL_DEADLINE,
+            total_deadline,
             self.review_inner(permission_request, action_evidence),
         )
         .await;
@@ -3263,6 +3264,12 @@ impl crate::tool::permission_guardian::PermissionGuardian for AgentPermissionGua
     }
 }
 
+fn permission_guardian_total_deadline(
+    provider_deadlines: crate::config::ProviderDeadlines,
+) -> Duration {
+    Duration::from_millis(provider_deadlines.request_timeout_ms)
+}
+
 async fn permission_guardian_review_with_deadline<F>(
     cancel: CancellationToken,
     deadline: Duration,
@@ -3286,7 +3293,7 @@ where
         result = tokio::time::timeout(deadline, review) => match result {
             Ok(result) => result,
             Err(_) => Err(PermissionGuardianError::TotalDeadline {
-                seconds: deadline.as_secs(),
+                milliseconds: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
             }),
         },
     }
@@ -4129,8 +4136,13 @@ fn tool_result_text(result: &ToolResult) -> String {
 
 fn merge_tool_metadata(mut metadata: Value, result: &ToolResult) -> Value {
     if let Some(object) = metadata.as_object_mut() {
+        let success = result
+            .metadata
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         object.insert("tool_metadata".to_string(), result.metadata.clone());
-        object.insert("success".to_string(), Value::Bool(true));
+        object.insert("success".to_string(), Value::Bool(success));
     }
     metadata
 }
@@ -4167,6 +4179,32 @@ mod tests {
     use crate::tool::context::ToolServices;
     use crate::tool::truncate::ToolTruncator;
     use crate::workspace::WorkspaceDiscovery;
+
+    #[test]
+    fn merged_tool_metadata_preserves_an_explicit_handler_outcome() {
+        for (tool_metadata, expected) in [
+            (serde_json::json!({"success": false, "exit_code": 1}), false),
+            (serde_json::json!({"success": true, "exit_code": 0}), true),
+            (serde_json::json!({"exit_code": 0}), true),
+        ] {
+            let result = ToolResult {
+                title: "shell".to_string(),
+                output_text: String::new(),
+                metadata: tool_metadata.clone(),
+                truncated_output_path: None,
+                recorded_changes: Vec::new(),
+                change_summaries: Vec::new(),
+                _internal_file_lease: None,
+            };
+
+            let merged = merge_tool_metadata(serde_json::json!({}), &result);
+            assert_eq!(
+                merged.get("success").and_then(Value::as_bool),
+                Some(expected)
+            );
+            assert_eq!(merged.get("tool_metadata"), Some(&tool_metadata));
+        }
+    }
 
     #[test]
     fn every_model_tool_call_reopens_all_current_turn_mailbox_delivery() {
@@ -8313,8 +8351,17 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[test]
-    fn auto_review_total_deadline_is_ninety_seconds() {
-        assert_eq!(PERMISSION_GUARDIAN_TOTAL_DEADLINE, Duration::from_secs(90));
+    fn auto_review_total_deadline_uses_the_captured_provider_request_timeout() {
+        let mut config = ResolvedConfig::default();
+        config.model.request_timeout_ms = 420_000;
+        let turn = crate::config::ResolvedTurnConfig::capture(config.clone())
+            .expect("captured turn config");
+        config.model.request_timeout_ms = 1;
+
+        assert_eq!(
+            permission_guardian_total_deadline(turn.provider().deadlines()),
+            Duration::from_millis(420_000)
+        );
     }
 
     #[tokio::test]
@@ -8329,7 +8376,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             result,
             Err(
                 crate::tool::permission_guardian::PermissionGuardianError::TotalDeadline {
-                    seconds: 0
+                    milliseconds: 5
                 }
             )
         ));
@@ -8359,7 +8406,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
 
         assert_eq!(
             permission_retry_fence_outcome(&Err(PermissionGuardianError::TotalDeadline {
-                seconds: 90
+                milliseconds: 90_000
             }),),
             Some(PermissionRetryFenceOutcome::DeadlineExceeded)
         );
