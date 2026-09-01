@@ -73,7 +73,7 @@ moyAI は、そうした環境でも使いやすい開発用の相棒を目指�
 - Git project rootの配下にあるdirectoryを選んだ場合も、そのdirectoryをtoolとsandboxのauthority境界として維持し、sessionを開き直したときも同じdirectoryを復元
 - fileのcreate / update / delete / rollbackは、一つのstable-handle・no-clobber条件付きcommitを使う。並行する外部replacementを上書きせず、target名を復元できない場合は保持したbackup pathを明示する。親directoryは暗黙作成しないため、先に作成する
 - Unixでは、update/delete前に開かれた書込可能descriptorが切り離した旧inodeを参照していないことを証明できない。createは従来どおりだが、既存fileのupdateは新しいtargetを設置し、deleteはtargetを切り離したうえで旧inodeをprivate backup pathに保持し、安全なcleanup成功とはせずtyped partial-commit errorを返す。先に開かれたwriterはそのbackupを後から変更できるため、errorに示されたpathを確認して調整する
-- **承認を求める**（`default`）、**代理で承認**（`auto_review`）、**フルアクセス**（`full_access`）の3種類のpermission mode。承認を求める/代理で承認は同じdeterministic admission policyとWindows `workspace-write` restricted-token / ACL profileを使い、明示した`sandbox_permissions: "require_escalated"` + `justification`または検出したdestructive/network/external/authority effectを、前者はhuman、後者はtask agentと分離したtool-less AI Guardianへ送る。Windows backendはadmitしたrootとselected existing authority carveoutをidentity-pinし、protected regular fileをcontent-pinし、起動する各process/threadへexplicit system-only descriptorを与え、stdio限定継承、resume前のJob process-tree/UI restrictions、unsandboxed retryなしのfail-closedを実装する。ただしこのunelevated profileはfinite existing-object defenseであり、Windows namespace全体やCodex enforcement互換ではない。未作成authority name、別subtreeのnested instruction、先行explicit / inheritance-disabled DACLを持つprotected descendant、未監査outside path、direct socket、同一userのhost process memory、same-desktop synthetic inputは残余であり、ACL preflightの既存tree伝播は同期処理でchild timeoutの対象外である。フルアクセスと承認済みprocess elevationはcurrent userの`Unrestricted`で動くため、そのchild filesystem mutationはtyped file guardを通らない。一方、typed `write` / `apply_patch`、MCP / Docling、process lifecycleは各guardを維持する。commit済みmode切替は次のdecisionへ反映し、pending requestとadmit済みeffectは元の判断/profileを保持する。native process sandboxは現在Windowsのみで、他platformのworkspace-mode effectはfail closedになる。hard boundaryには将来のelevated dedicated-identity / firewall / private-desktop backendが必要である。
+- **承認を求める**（`default`）、**代理で承認**（`auto_review`）、**フルアクセス**（`full_access`）の3種類のpermission mode。承認を求める/代理で承認は同じdeterministic admission policyとWindows `workspace-write` restricted-token / ACL profileを使い、明示した`sandbox_permissions: "require_escalated"` + `justification`または検出したdestructive/network/external/authority effectを、前者はhumanへ送る。後者は、対応するLM Studio native Responses routeではtask agentと分離したtool-less AI Guardianへ送り、その他のprovider profileではGuardian接触前にfail closedする。Windows backendはadmitしたrootとselected existing authority carveoutをidentity-pinし、protected regular fileをcontent-pinし、起動する各process/threadへexplicit system-only descriptorを与え、stdio限定継承、resume前のJob process-tree/UI restrictions、unsandboxed retryなしのfail-closedを実装する。ただしこのunelevated profileはfinite existing-object defenseであり、Windows namespace全体やCodex enforcement互換ではない。未作成authority name、別subtreeのnested instruction、先行explicit / inheritance-disabled DACLを持つprotected descendant、未監査outside path、direct socket、同一userのhost process memory、same-desktop synthetic inputは残余であり、ACL preflightの既存tree伝播は同期処理でchild timeoutの対象外である。フルアクセスと承認済みprocess elevationはcurrent userの`Unrestricted`で動くため、そのchild filesystem mutationはtyped file guardを通らない。一方、typed `write` / `apply_patch`、MCP / Docling、process lifecycleは各guardを維持する。commit済みmode切替は次のdecisionへ反映し、pending requestとadmit済みeffectは元の判断/profileを保持する。native process sandboxは現在Windowsのみで、他platformのworkspace-mode effectはfail closedになる。hard boundaryには将来のelevated dedicated-identity / firewall / private-desktop backendが必要である。
 - vision-capable model での画像添付
 - Docling Serve / HTTP MCP と連携した document workflow
 - `AGENTS.md`、`CLAUDE.md`、`.moyai/rules*`、`.moyai/commands/*.md`、local `SKILL.md` の読み込み
@@ -90,7 +90,9 @@ v2.0.1では、session単位の設定・履歴・未送信draftを永続化す�
 初回・global・session別の設定workflow、provider discoveryとgenerationを統合するtyped
 connection profileを追加しました。progress-aware streaming、generationでfenceされたexact Stop、
 Desktop再起動後のsettled history復元と次turn admission、terminal projection reconciliation、
-boundedなsemantic-prefix compactionにより、長時間のlocal-model taskも強化しています。
+boundedなsemantic-prefix compactionにより、長時間のlocal-model taskも強化しています。restrictedな
+TEMP failureをcanonical projectionでも保持し、AutoReview Guardianには固定90秒ではなくturn開始時に
+captureしたrequest deadlineを適用します。
 
 Windows 向け release zip には、次のものが含まれています。
 
@@ -381,6 +383,10 @@ historyからbounded samplingしたtask context、current exact committed respon
 tool / continuationを持たず、sampling / thinking overrideを送信しません。hostが返すreasoningはnon-authoritativeな
 transport outputとして受信し、turn開始時にcaptureしたclient-side `model.request_timeout_ms`を
 hostへ送信しないabsolute total deadlineとして使います。
+このproduction Guardian pathでprovider接触まで確認済みなのは現在
+`provider_profile = "lm_studio"`のnative Responsesだけです。`openai_compatible`（oMLXを含む）、
+`openai_responses`、`lm_studio_chat_completions`はGuardian provider接触前にfail closedし、human confirmationへ
+fallbackしません。これらのprofileでhuman確認が必要な場合は`default` modeを選択してください。
 
 Desktopのaccess更新はcurrent root sessionとexact runtime epochへ束ねます。同じepochのnatural settlementとして
 `root:N`→`tree:N` / `idle:N`と`tree:N`→`root:N` / `idle:N`を受理し、idleからactiveへの遷移、新しいepoch、別session / workspace /
