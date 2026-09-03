@@ -34,8 +34,8 @@ use crate::llm::{
 #[cfg(test)]
 use crate::protocol::TurnInterruptionCause;
 use crate::protocol::{
-    ProtocolEventStore as _, RuntimeEvent, RuntimeEventMsg, ToolApprovalDecision, TurnId,
-    UserInputItem, UserTurn,
+    ProtocolEventStore as _, ProtocolPageRequest, RuntimeEvent, RuntimeEventMsg,
+    ToolApprovalDecision, TurnId, UserInputItem, UserTurn,
 };
 use crate::runtime::{
     AgentStatus, LocalTaskExecutor, OwnedTaskHandle, RunCancelOutcome, RunCancellationCause,
@@ -73,14 +73,17 @@ use super::query::{
     load_snapshot_for_selection, load_snapshot_for_session_search,
 };
 use super::side_chat::{
-    SideChatRequestProfile, SideChatStreamEvent, execute_admitted_canonical_side_chat,
+    SideChatContextMetadata, SideChatQuoteRequest, SideChatRequestProfile, SideChatStreamEvent,
+    decode_persisted_side_chat_draft, encode_persisted_side_chat_draft,
+    execute_admitted_canonical_side_chat, prepare_side_chat_input,
 };
 use super::state::{DesktopState, DesktopStatusCode};
 #[cfg(test)]
 use super::web_model::desktop_web_state;
 use super::web_model::{
-    DesktopRuntimeProjection, DesktopSideChatMessageProjection, DesktopSideChatProjection,
-    DesktopWebState, access_runtime_owner_terminal_settlement_matches, access_runtime_owner_token,
+    DesktopRuntimeProjection, DesktopSideChatDraftQuoteProjection,
+    DesktopSideChatMessageProjection, DesktopSideChatProjection, DesktopWebState,
+    access_runtime_owner_terminal_settlement_matches, access_runtime_owner_token,
     agent_activity_projection, desktop_web_state_with_permission, navigation_admission_blocker,
 };
 
@@ -2025,7 +2028,7 @@ mod command_projection_owner_tests {
             (ConfigField::PresencePenalty, "-inf"),
             (ConfigField::FrequencyPenalty, "NaN"),
         ] {
-            let original = field.value(&controller.state.provider_config.effective_config);
+            let original = field.editor_value(&controller.state.provider_config.effective_config);
 
             assert!(
                 !controller
@@ -2034,7 +2037,7 @@ mod command_projection_owner_tests {
                 field.label(),
             );
             assert_eq!(
-                field.value(&controller.state.provider_config.effective_config),
+                field.editor_value(&controller.state.provider_config.effective_config),
                 original,
                 "{} changed despite the rejected commit",
                 field.label(),
@@ -2268,12 +2271,30 @@ mod command_projection_owner_tests {
             Utf8PathBuf::from_path_buf(temp.path().join("import.toml")).expect("UTF-8 import path");
         std::fs::write(
             path.as_std_path(),
-            "[model]\nmodel = \"imported-model\"\nbase_url = \"http://127.0.0.1:1234\"\n",
+            "[model]\nmodel = \"imported-model\"\nbase_url = \"http://127.0.0.1:1234\"\nextra_headers = { Authorization = \"INITIAL_SETUP_FILE_IMPORT_SECRET\" }\n",
         )
         .expect("write valid import");
 
-        let values = DesktopController::load_initial_setup_config_toml_path(&path)
+        let config = DesktopController::load_initial_setup_config_toml_path(&path)
             .expect("validated initial-setup draft");
+        assert_eq!(
+            config
+                .model
+                .extra_headers
+                .get("Authorization")
+                .map(String::as_str),
+            Some("INITIAL_SETUP_FILE_IMPORT_SECRET"),
+            "the Rust-only staged owner receives the exact imported secret"
+        );
+        let public_secret = ConfigField::ExtraHeadersJson.public_value(&config);
+        assert!(public_secret.sensitive);
+        assert!(public_secret.configured);
+        assert!(public_secret.value.is_empty());
+        let values = ConfigField::ALL
+            .into_iter()
+            .filter(|field| !field.is_host_owned_generation())
+            .map(|field| (field.label().to_string(), field.public_value(&config).value))
+            .collect::<Vec<_>>();
 
         let current_gui_fields = ConfigField::ALL
             .into_iter()
@@ -2306,6 +2327,134 @@ mod command_projection_owner_tests {
         assert!(
             DesktopController::load_initial_setup_config_toml_path(&path).is_err(),
             "unknown current-schema sections must fail closed"
+        );
+    }
+
+    #[test]
+    fn initial_setup_malformed_toml_error_never_echoes_source_secrets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("secret-import.toml"))
+            .expect("UTF-8 import path");
+        let secret = "INITIAL_SETUP_PARSE_SECRET_SENTINEL";
+        std::fs::write(
+            path.as_std_path(),
+            format!("[model]\nextra_headers = {{ Authorization = \"{secret}\", broken = }}\n"),
+        )
+        .expect("write malformed import");
+
+        let error = DesktopController::load_initial_setup_config_toml_path(&path)
+            .expect_err("malformed TOML must fail closed");
+        assert_eq!(
+            error,
+            "the selected TOML config is invalid or does not match the current config schema"
+        );
+        assert!(!error.contains(secret));
+        assert!(!error.contains(path.as_str()));
+        assert!(!error.contains("Authorization"));
+    }
+
+    #[tokio::test]
+    async fn initial_setup_import_secrets_stay_in_one_generation_fenced_rust_owner() {
+        let (_temp, _root, mut controller) = empty_access_test_controller().await;
+        let first_secret = "INITIAL_IMPORT_SECRET_ONE";
+        let second_secret = "INITIAL_IMPORT_SECRET_TWO";
+        let mut first = ResolvedConfig::default();
+        first
+            .model
+            .extra_headers
+            .insert("X-Import-Secret".to_string(), first_secret.to_string());
+        first
+            .docling
+            .headers
+            .insert("Authorization".to_string(), first_secret.to_string());
+        let (first_generation, public_values) = controller
+            .stage_initial_setup_config_import(first)
+            .expect("stage first import");
+        for key in [
+            ConfigField::ExtraHeadersJson,
+            ConfigField::DoclingHeadersJson,
+        ] {
+            let public = public_values
+                .iter()
+                .find(|value| value.key == key.label())
+                .expect("sensitive public field");
+            assert!(public.sensitive);
+            assert!(public.configured);
+            assert!(public.text.is_empty());
+        }
+        assert!(!format!("{public_values:?}").contains(first_secret));
+
+        let mut second = ResolvedConfig::default();
+        second
+            .model
+            .extra_headers
+            .insert("X-Import-Secret".to_string(), second_secret.to_string());
+        let (second_generation, _) = controller
+            .stage_initial_setup_config_import(second)
+            .expect("stage replacement import");
+        let redacted_values = ConfigField::ALL
+            .into_iter()
+            .filter(|field| !field.is_host_owned_generation())
+            .map(|field| {
+                (
+                    field.label().to_string(),
+                    field.public_value(controller.state.global_config()).value,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            controller
+                .hydrate_initial_setup_import_sensitive_values(
+                    redacted_values.clone(),
+                    Some(first_generation),
+                )
+                .is_err(),
+            "a second import must invalidate the first raw owner"
+        );
+        let hydrated = controller
+            .hydrate_initial_setup_import_sensitive_values(
+                redacted_values.clone(),
+                Some(second_generation),
+            )
+            .expect("current import generation");
+        let headers = hydrated
+            .iter()
+            .find(|(key, _)| key == ConfigField::ExtraHeadersJson.label())
+            .map(|(_, value)| value.as_str())
+            .expect("hydrated headers");
+        assert!(headers.contains(second_secret));
+        assert!(!headers.contains(first_secret));
+
+        let explicit = redacted_values
+            .into_iter()
+            .map(|(key, value)| {
+                if key == ConfigField::ExtraHeadersJson.label() {
+                    (key, "{\"X-Manual\":\"manual-value\"}".to_string())
+                } else {
+                    (key, value)
+                }
+            })
+            .collect();
+        let explicit = controller
+            .hydrate_initial_setup_import_sensitive_values(explicit, Some(second_generation))
+            .expect("explicit sensitive replacement");
+        let headers = explicit
+            .iter()
+            .find(|(key, _)| key == ConfigField::ExtraHeadersJson.label())
+            .map(|(_, value)| value.as_str())
+            .expect("explicit headers");
+        assert!(headers.contains("manual-value"));
+        assert!(!headers.contains(second_secret));
+
+        controller.state.provider_config.config_generation = controller
+            .state
+            .provider_config
+            .config_generation
+            .saturating_add(1);
+        controller.reconcile_pending_initial_setup_config_import_owner();
+        assert!(
+            controller.pending_initial_setup_config_import.is_none(),
+            "raw imported secrets must be dropped as soon as their exact config owner drifts"
         );
     }
 
@@ -3433,6 +3582,350 @@ mod command_projection_owner_tests {
     }
 
     #[tokio::test]
+    async fn side_chat_draft_quote_is_atomic_replaces_without_orphan_and_rehydrates_after_restart()
+    {
+        let (_temp, root, mut controller, owner_session_id) = side_chat_test_controller().await;
+        controller
+            .configure_side_chat(
+                owner_session_id,
+                "http://127.0.0.1:1234".to_string(),
+                "side-model".to_string(),
+                ProviderProfile::OpenAiCompatible,
+            )
+            .expect("configure side chat");
+        let initial = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("initial binding read")
+            .expect("initial binding");
+        let first_quote = SideChatQuoteRequest {
+            source_kind: super::super::side_chat::SideChatQuoteSourceKind::Transcript,
+            source_history_item_id: crate::protocol::HistoryItemId::new(),
+            source_append_position: Some(41),
+            selected_text: "first authority".to_string(),
+        };
+        controller
+            .save_side_chat_draft(
+                owner_session_id,
+                initial.id,
+                initial.draft_revision,
+                "> Side Chat 引用\n> first authority\n\n".to_string(),
+                Some(first_quote),
+            )
+            .expect("persist first typed quote");
+        let after_first = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("first binding read")
+            .expect("first binding");
+        let second_quote = SideChatQuoteRequest {
+            source_kind: super::super::side_chat::SideChatQuoteSourceKind::Artifact,
+            source_history_item_id: crate::protocol::HistoryItemId::new(),
+            source_append_position: Some(42),
+            selected_text: "second authority".to_string(),
+        };
+        let second_text = "> Side Chat 引用\n> second authority\n\nExplain this.".to_string();
+        controller
+            .save_side_chat_draft(
+                owner_session_id,
+                after_first.id,
+                after_first.draft_revision,
+                second_text.clone(),
+                Some(second_quote.clone()),
+            )
+            .expect("replace typed quote atomically");
+        let after_second = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("second binding read")
+            .expect("second binding");
+        let decoded = decode_persisted_side_chat_draft(&after_second.persisted_draft)
+            .expect("decode durable envelope");
+        assert_eq!(decoded.text, second_text);
+        assert_eq!(decoded.quote, Some(second_quote.clone()));
+        assert!(!after_second.persisted_draft.contains("first authority"));
+
+        let projected = controller.side_chat_projection();
+        assert_eq!(projected.draft_text, second_text);
+        assert!(
+            !projected
+                .draft_text
+                .starts_with(super::super::side_chat::SIDE_CHAT_DRAFT_ENVELOPE_PREFIX)
+        );
+        assert_eq!(
+            projected
+                .draft_quote
+                .as_ref()
+                .map(|quote| quote.source_history_item_id.clone()),
+            Some(second_quote.source_history_item_id.to_string())
+        );
+
+        let paths = controller.app.store.paths().clone();
+        drop(controller);
+        let sqlite = crate::storage::SqliteStore::open(&paths).expect("reopen sqlite");
+        sqlite.migrate().expect("audit migrations on reopen");
+        let store = crate::storage::StoreBundle::new(sqlite);
+        let app = build_test_app(&root, store).await;
+        let args = DesktopArgs {
+            directory: Some(root),
+            session_id: Some(owner_session_id),
+            continue_last: false,
+            global_config_existed_at_launch: true,
+        };
+        let mut reopened = DesktopController::new_with_preferences_and_persistence(
+            app,
+            args,
+            DesktopPreferences::default(),
+            false,
+        )
+        .await
+        .expect("reopen controller");
+        let restarted_projection = reopened.side_chat_projection();
+        assert_eq!(restarted_projection.draft_text, second_text);
+        assert_eq!(
+            restarted_projection.draft_quote,
+            Some(DesktopSideChatDraftQuoteProjection {
+                source_kind: "artifact".to_string(),
+                source_history_item_id: second_quote.source_history_item_id.to_string(),
+                source_append_position: Some("42".to_string()),
+                selected_text: "second authority".to_string(),
+            })
+        );
+
+        reopened
+            .save_side_chat_draft(
+                owner_session_id,
+                after_second.id,
+                after_second.draft_revision,
+                "plain text after manual edit".to_string(),
+                None,
+            )
+            .expect("manual edit clears durable quote");
+        let plain = reopened
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("plain binding read")
+            .expect("plain binding");
+        assert_eq!(plain.persisted_draft, "plain text after manual edit");
+        let plain_projection = reopened.side_chat_projection();
+        assert_eq!(plain_projection.draft_text, "plain text after manual edit");
+        assert_eq!(plain_projection.draft_quote, None);
+    }
+
+    #[tokio::test]
+    async fn malformed_side_chat_draft_envelope_is_hidden_blocked_and_recoverable() {
+        let (_temp, _root, mut controller, owner_session_id) = side_chat_test_controller().await;
+        controller
+            .configure_side_chat(
+                owner_session_id,
+                "http://127.0.0.1:9".to_string(),
+                "never-contact-provider".to_string(),
+                ProviderProfile::OpenAiCompatible,
+            )
+            .expect("configure side chat");
+        let initial = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("initial binding read")
+            .expect("initial binding");
+        let quote = SideChatQuoteRequest {
+            source_kind: super::super::side_chat::SideChatQuoteSourceKind::Transcript,
+            source_history_item_id: crate::protocol::HistoryItemId::new(),
+            source_append_position: Some(7),
+            selected_text: "must remain opaque".to_string(),
+        };
+        let mut malformed = encode_persisted_side_chat_draft(
+            "must not reach the provider".to_string(),
+            Some(&quote),
+        )
+        .expect("valid envelope before corruption");
+        assert_eq!(malformed.pop(), Some('}'));
+        let corrupt = controller
+            .app
+            .store
+            .side_chat_repo()
+            .update_draft(
+                owner_session_id,
+                initial.id,
+                initial.draft_revision,
+                malformed.clone(),
+            )
+            .expect("seed corrupt envelope")
+            .binding;
+
+        let projection = controller.side_chat_projection();
+        assert_eq!(projection.draft_text, "");
+        assert_eq!(projection.draft_quote, None);
+        assert!(!projection.can_send);
+        assert_eq!(
+            projection.last_error,
+            "the saved Side Chat draft is invalid; edit and save the draft to recover"
+        );
+        assert!(
+            !projection
+                .last_error
+                .contains("must not reach the provider")
+        );
+
+        let error = controller
+            .start_side_chat(
+                owner_session_id,
+                corrupt.id,
+                corrupt.request_generation,
+                corrupt.draft_revision,
+                None,
+                None,
+                malformed,
+            )
+            .expect_err("malformed durable envelope must stop before provider transport");
+        assert_eq!(
+            error,
+            "the saved Side Chat draft is invalid; edit and save the draft to recover"
+        );
+        assert!(!controller.side_chat_runs.contains_key(&owner_session_id));
+
+        controller
+            .save_side_chat_draft(
+                owner_session_id,
+                corrupt.id,
+                corrupt.draft_revision,
+                "recovered plain draft".to_string(),
+                None,
+            )
+            .expect("overwrite corrupt envelope");
+        let recovered = controller.side_chat_projection();
+        assert_eq!(recovered.draft_text, "recovered plain draft");
+        assert_eq!(recovered.draft_quote, None);
+        assert!(recovered.can_send);
+    }
+
+    #[tokio::test]
+    async fn stale_side_chat_owner_snapshot_is_rejected_before_hidden_admission_or_provider_post() {
+        let (_temp, _root, mut controller, owner_session_id) = side_chat_test_controller().await;
+        controller
+            .configure_side_chat(
+                owner_session_id,
+                "http://127.0.0.1:9".to_string(),
+                "never-contact-provider".to_string(),
+                ProviderProfile::OpenAiCompatible,
+            )
+            .expect("configure side chat");
+        let owner_item = crate::protocol::HistoryItem {
+            id: crate::protocol::HistoryItemId::new(),
+            session_id: owner_session_id,
+            scope: crate::protocol::HistoryScope::Turn {
+                turn_id: TurnId::new(),
+            },
+            sequence_no: 0,
+            created_at_ms: 0,
+            payload: crate::protocol::HistoryItemPayload::UserTurn {
+                content: vec![crate::protocol::ContentPart::Text {
+                    text: "new canonical owner evidence".to_string(),
+                }],
+                prompt_dispatch: None,
+                editor_context: None,
+            },
+        };
+        controller
+            .app
+            .store
+            .protocol_event_store()
+            .seed_history_item_for_test(&owner_item)
+            .expect("owner history");
+        let current_fence = controller
+            .app
+            .store
+            .protocol_event_store()
+            .visit_active_history_pages_for_session(
+                owner_session_id,
+                crate::protocol::MAX_PROTOCOL_PAGE_LIMIT,
+                &mut |_| Ok(()),
+            )
+            .expect("owner fence")
+            .append_fence;
+        controller.side_chat_contexts.insert(
+            owner_session_id,
+            SideChatContextMetadata {
+                owner_session_id,
+                scope: "owner_session",
+                as_of_append_position: Some(current_fence.unwrap_or(0).saturating_sub(1)),
+                truncated: true,
+                owner_unit_count: 1,
+                included_owner_unit_count: 1,
+                quote_source_history_item_id: None,
+            },
+        );
+        let idle_projection = controller.side_chat_projection();
+        assert_eq!(
+            idle_projection.context_as_of_append_position,
+            current_fence.map(|position| position.to_string()),
+            "an idle Side Chat must advertise the current owner fence for its next send"
+        );
+        assert!(
+            !idle_projection.context_truncated,
+            "metadata from a completed request must not make the next request look truncated"
+        );
+        let stale_fence = Some(current_fence.unwrap_or(0).saturating_add(1));
+        let binding = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("binding read")
+            .expect("binding");
+
+        let error = controller
+            .start_side_chat(
+                owner_session_id,
+                binding.id,
+                binding.request_generation,
+                binding.draft_revision,
+                stale_fence,
+                None,
+                "must remain retryable".to_string(),
+            )
+            .expect_err("stale owner context must fail before provider transport");
+        assert!(error.contains("owner context changed"));
+        assert!(!controller.side_chat_runs.contains_key(&owner_session_id));
+        let preserved = controller
+            .app
+            .store
+            .side_chat_repo()
+            .get_by_owner(owner_session_id)
+            .expect("preserved binding read")
+            .expect("preserved binding");
+        assert_eq!(preserved.request_generation, binding.request_generation);
+        assert_eq!(preserved.draft_revision, binding.draft_revision);
+        assert!(preserved.persisted_draft.is_empty());
+        let hidden = controller
+            .app
+            .session_service
+            .get_session(binding.conversation_session_id)
+            .await
+            .expect("hidden session");
+        assert_eq!(hidden.status, SessionStatus::Idle);
+        assert!(
+            controller
+                .app
+                .store
+                .protocol_event_store()
+                .list_history_items_for_session(binding.conversation_session_id)
+                .expect("hidden history")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn side_chat_start_ack_owns_process_and_canonical_admission() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("side provider");
         listener
@@ -3487,6 +3980,8 @@ mod command_projection_owner_tests {
                 binding.id,
                 binding.request_generation,
                 binding.draft_revision,
+                None,
+                None,
                 "canonical side question".to_string(),
             )
             .expect("admitted side chat start");
@@ -3620,6 +4115,8 @@ mod command_projection_owner_tests {
                 initial.id,
                 initial.request_generation,
                 initial.draft_revision,
+                None,
+                None,
                 "delete this side conversation".to_string(),
             )
             .expect("admitted side chat start");
@@ -3788,6 +4285,8 @@ mod command_projection_owner_tests {
                 binding.id,
                 binding.request_generation,
                 draft.draft_revision,
+                None,
+                None,
                 "must not be admitted".to_string(),
             )
             .expect_err("competing process owner must reject start");
@@ -3842,6 +4341,8 @@ mod command_projection_owner_tests {
                 binding.id,
                 binding.request_generation,
                 binding.draft_revision,
+                None,
+                None,
                 "stale submitted text".to_string(),
             )
             .expect_err("stale draft revision must reject submit");
@@ -3910,6 +4411,8 @@ mod command_projection_owner_tests {
                 binding.id,
                 binding.request_generation,
                 draft.draft_revision,
+                None,
+                None,
                 "must not replace the active turn".to_string(),
             )
             .expect_err("active canonical turn must reject admission");
@@ -3990,6 +4493,8 @@ mod command_projection_owner_tests {
                 binding.id,
                 binding.request_generation,
                 saved_draft.draft_revision,
+                None,
+                None,
                 "late canonical question".to_string(),
                 std::time::Duration::from_millis(50),
             )
@@ -4684,6 +5189,7 @@ mod command_projection_owner_tests {
                 },
                 pending_turn_inputs: Vec::new(),
                 turn_elapsed_ms: Default::default(),
+                session_token_usage: Default::default(),
                 latest_turn_id,
                 active_turn_id: None,
                 active_turn_sequence_no: None,
@@ -8680,6 +9186,24 @@ struct DesktopSideChatRun {
     delete_after_finish: bool,
 }
 
+struct PendingInitialSetupConfigImport {
+    generation: u64,
+    workspace_root: Utf8PathBuf,
+    session_id: Option<SessionId>,
+    global_config_path: Option<Utf8PathBuf>,
+    setup_generation: u64,
+    config_generation: u64,
+    config: ResolvedConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InitialSetupConfigPublicValue {
+    pub key: String,
+    pub text: String,
+    pub sensitive: bool,
+    pub configured: bool,
+}
+
 impl DesktopSideChatRun {
     fn owns(&self, side_chat_id: &str, run_generation: u64) -> bool {
         self.side_chat_id == side_chat_id && self.run_generation == run_generation
@@ -8721,7 +9245,10 @@ pub(crate) struct DesktopController {
     composer_commit_generation: u64,
     next_root_run_generation: u64,
     side_chat_runs: HashMap<SessionId, DesktopSideChatRun>,
+    side_chat_contexts: HashMap<SessionId, SideChatContextMetadata>,
     side_chat_errors: HashMap<SessionId, String>,
+    next_initial_setup_import_generation: u64,
+    pending_initial_setup_config_import: Option<PendingInitialSetupConfigImport>,
     next_enhance_request_id: u64,
     next_session_runtime_listener_generation: u64,
     session_runtime_listener: Option<DesktopSessionRuntimeListener>,
@@ -8915,7 +9442,10 @@ impl DesktopController {
             composer_commit_generation: 0,
             next_root_run_generation: 1,
             side_chat_runs: HashMap::new(),
+            side_chat_contexts: HashMap::new(),
             side_chat_errors: HashMap::new(),
+            next_initial_setup_import_generation: 1,
+            pending_initial_setup_config_import: None,
             next_enhance_request_id: 1,
             next_session_runtime_listener_generation: 1,
             session_runtime_listener: None,
@@ -8942,6 +9472,7 @@ impl DesktopController {
 
     pub(crate) fn next_web_state(&mut self) -> Result<DesktopWebState, String> {
         self.discard_terminal_pending_permission();
+        self.reconcile_pending_initial_setup_config_import_owner();
         self.reconcile_attachment_asset_authorizations()?;
         let revision = advance_projection_revision(&mut self.projection_revision)?;
         let mut runtime_projection = DesktopRuntimeProjection {
@@ -9054,6 +9585,20 @@ impl DesktopController {
         let Some(owner_session_id) = self.state.app_state.current_session_id else {
             return DesktopSideChatProjection::default();
         };
+        let current_owner_append_position = self
+            .app
+            .store
+            .protocol_event_store()
+            .canonical_snapshot_for_session(
+                owner_session_id,
+                ProtocolPageRequest::Latest { limit: 1 },
+                ProtocolPageRequest::Latest { limit: 1 },
+            )
+            .ok()
+            .and_then(|snapshot| snapshot.fence.append_position);
+        let context_as_of_append_position =
+            current_owner_append_position.map(|position| position.to_string());
+        let context_truncated = false;
         let default_base_url = self
             .state
             .provider_config
@@ -9084,6 +9629,8 @@ impl DesktopController {
                     status: "failed".to_string(),
                     phase: "storage read failed".to_string(),
                     last_error: error.to_string(),
+                    context_as_of_append_position,
+                    context_truncated,
                     ..DesktopSideChatProjection::default()
                 };
             }
@@ -9100,10 +9647,31 @@ impl DesktopController {
                     .cloned()
                     .unwrap_or_default(),
                 generation: "0".to_string(),
+                context_as_of_append_position,
+                context_truncated,
                 ..DesktopSideChatProjection::default()
             };
         };
         let binding = durable.binding;
+        let (draft_text, draft_quote, draft_error) =
+            match decode_persisted_side_chat_draft(&binding.persisted_draft) {
+                Ok(draft) => (
+                    draft.text,
+                    draft
+                        .quote
+                        .map(|quote| DesktopSideChatDraftQuoteProjection {
+                            source_kind: quote.source_kind.as_str().to_string(),
+                            source_history_item_id: quote.source_history_item_id.to_string(),
+                            source_append_position: quote
+                                .source_append_position
+                                .map(|position| position.to_string()),
+                            selected_text: quote.selected_text,
+                        }),
+                    None,
+                ),
+                Err(error) => (String::new(), None, Some(error)),
+            };
+        let draft_is_valid = draft_error.is_none();
         let mut messages = durable
             .messages
             .into_iter()
@@ -9123,6 +9691,12 @@ impl DesktopController {
             .side_chat_runs
             .get(&owner_session_id)
             .filter(|run| run.side_chat_id == binding.id.to_string());
+        let active_context = active.and_then(|_| self.side_chat_contexts.get(&owner_session_id));
+        let context_as_of_append_position = active_context
+            .and_then(|context| context.as_of_append_position)
+            .or(current_owner_append_position)
+            .map(|position| position.to_string());
+        let context_truncated = active_context.is_some_and(|context| context.truncated);
         if let Some(run) = active
             && !run.streamed_text.is_empty()
         {
@@ -9158,17 +9732,22 @@ impl DesktopController {
                 },
                 |run| run.phase.clone(),
             ),
-            last_error: self
-                .side_chat_errors
-                .get(&owner_session_id)
-                .cloned()
+            last_error: draft_error
+                .or_else(|| self.side_chat_errors.get(&owner_session_id).cloned())
                 .or(durable.last_error)
                 .unwrap_or_default(),
             generation: binding.request_generation.to_string(),
-            draft_text: binding.persisted_draft,
+            draft_text,
+            draft_quote,
             draft_revision: binding.draft_revision.to_string(),
+            context_scope: "owner_session".to_string(),
+            context_as_of_append_position,
+            context_truncated,
             messages,
-            can_send: !deleting && active.is_none() && durable.status != SessionStatus::Running,
+            can_send: draft_is_valid
+                && !deleting
+                && active.is_none()
+                && durable.status != SessionStatus::Running,
             can_cancel: !deleting && active.is_some(),
         }
     }
@@ -9200,6 +9779,7 @@ impl DesktopController {
             .side_chat_repo()
             .configure(owner_session_id, target)
             .map_err(|error| error.to_string())?;
+        self.side_chat_contexts.remove(&owner_session_id);
         self.side_chat_errors.remove(&owner_session_id);
         Ok(())
     }
@@ -9210,8 +9790,10 @@ impl DesktopController {
         side_chat_id: SideChatId,
         expected_draft_revision: u64,
         text: String,
+        quote: Option<SideChatQuoteRequest>,
     ) -> Result<(), String> {
         self.ensure_current_side_chat_owner(owner_session_id)?;
+        let persisted_draft = encode_persisted_side_chat_draft(text, quote.as_ref())?;
         self.app
             .store
             .side_chat_repo()
@@ -9219,7 +9801,7 @@ impl DesktopController {
                 owner_session_id,
                 side_chat_id,
                 expected_draft_revision,
-                text,
+                persisted_draft,
             )
             .map_err(|error| error.to_string())?;
         self.side_chat_errors.remove(&owner_session_id);
@@ -9232,6 +9814,8 @@ impl DesktopController {
         side_chat_id: SideChatId,
         expected_generation: u64,
         expected_draft_revision: u64,
+        expected_owner_append_position: Option<i64>,
+        quote: Option<SideChatQuoteRequest>,
         text: String,
     ) -> Result<(), String> {
         self.start_side_chat_with_ack_timeout(
@@ -9239,6 +9823,8 @@ impl DesktopController {
             side_chat_id,
             expected_generation,
             expected_draft_revision,
+            expected_owner_append_position,
+            quote,
             text,
             SIDE_CHAT_START_ACK_TIMEOUT,
         )
@@ -9250,6 +9836,8 @@ impl DesktopController {
         side_chat_id: SideChatId,
         expected_generation: u64,
         expected_draft_revision: u64,
+        expected_owner_append_position: Option<i64>,
+        quote: Option<SideChatQuoteRequest>,
         text: String,
         admission_ack_timeout: std::time::Duration,
     ) -> Result<(), String> {
@@ -9277,12 +9865,15 @@ impl DesktopController {
                 binding.draft_revision
             ));
         }
+        decode_persisted_side_chat_draft(&binding.persisted_draft)?;
         let provisional_generation = expected_generation
             .checked_add(1)
             .ok_or_else(|| "side chat request generation is exhausted".to_string())?;
         let conversation_session_id = binding.conversation_session_id;
+        let preflight_context_window = binding.context_window;
         let side_chat_id_text = binding.id.to_string();
         let turn_id = TurnId::new();
+        let question = text.clone();
         let user_turn = UserTurn {
             turn_id,
             items: vec![UserInputItem::Text { text }],
@@ -9299,7 +9890,8 @@ impl DesktopController {
         let runtime_tx = self.runtime_tx.clone();
         let control_tx = self.control_tx.clone();
         let (worker_start_tx, worker_start_rx) = tokio::sync::oneshot::channel::<()>();
-        let (admission_ack_tx, admission_ack_rx) = mpsc::sync_channel::<Result<u64, String>>(1);
+        let (admission_ack_tx, admission_ack_rx) =
+            mpsc::sync_channel::<Result<(u64, SideChatContextMetadata), String>>(1);
         let worker =
             self.side_chat_task_runtime
                 .spawn(provisional_generation, move || async move {
@@ -9340,6 +9932,25 @@ impl DesktopController {
                         publish_start_failure(error.to_string());
                         return;
                     }
+                    let prepared = match prepare_side_chat_input(
+                        &store,
+                        stream_owner_session_id,
+                        conversation_session_id,
+                        expected_owner_append_position,
+                        quote,
+                        &question,
+                        preflight_context_window,
+                    )
+                    .await
+                    {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            drop(active_run_lease);
+                            drop(process_run_lease);
+                            publish_start_failure(error);
+                            return;
+                        }
+                    };
                     let admitted = match store
                         .side_chat_repo()
                         .claim_and_admit_request(
@@ -9363,7 +9974,10 @@ impl DesktopController {
                     let run_generation = admitted.generation;
                     let profile = side_chat_request_profile(&admitted.binding);
                     let admission_id = admitted.admission.admission_id;
-                    if admission_ack_tx.send(Ok(run_generation)).is_err() {
+                    if admission_ack_tx
+                        .send(Ok((run_generation, prepared.context.clone())))
+                        .is_err()
+                    {
                         // The command owner disappeared after admission. Preserve canonical truth by
                         // settling the admitted turn instead of leaving an unowned Running session.
                         worker_cancel.cancel();
@@ -9374,6 +9988,7 @@ impl DesktopController {
                         admission_id,
                         turn_id,
                         profile,
+                        prepared.messages,
                         worker_cancel,
                         |event| {
                             let message = match event {
@@ -9414,10 +10029,11 @@ impl DesktopController {
         let (run_generation, phase, start_result) = match admission_ack_rx
             .recv_timeout(admission_ack_timeout)
         {
-            Ok(Ok(run_generation)) if run_generation == provisional_generation => {
+            Ok(Ok((run_generation, context))) if run_generation == provisional_generation => {
+                self.side_chat_contexts.insert(owner_session_id, context);
                 (run_generation, "request admitted".to_string(), Ok(()))
             }
-            Ok(Ok(run_generation)) => {
+            Ok(Ok((run_generation, _))) => {
                 cancel.cancel();
                 (
                     run_generation,
@@ -9509,6 +10125,7 @@ impl DesktopController {
         repository
             .finalize_pending_deletions()
             .map_err(|error| error.to_string())?;
+        self.side_chat_contexts.remove(&owner_session_id);
         self.side_chat_errors.remove(&owner_session_id);
         Ok(())
     }
@@ -11369,7 +11986,18 @@ impl DesktopController {
     pub(crate) fn check_initial_setup_docling_readiness(
         &mut self,
         values: Vec<(String, String)>,
+        expected_import_generation: Option<u64>,
     ) -> bool {
+        let values = match self
+            .hydrate_initial_setup_import_sensitive_values(values, expected_import_generation)
+        {
+            Ok(values) => values,
+            Err(error) => {
+                self.state
+                    .fail_docling_readiness_check(format!("initial setup import error: {error}"));
+                return false;
+            }
+        };
         let config = match build_resolved_config_from_key_values(self.state.global_config(), values)
         {
             Ok(config) => config,
@@ -11995,16 +12623,32 @@ impl DesktopController {
         }
     }
 
-    pub(crate) fn finish_initial_setup(&mut self, values: Vec<(String, String)>) -> bool {
-        let candidate =
-            match ConfigEditorState::from_config_values(self.state.global_config(), values) {
-                Ok(candidate) => candidate,
-                Err(error) => {
-                    self.state
-                        .set_status_message(format!("initial setup could not finish: {error}"));
-                    return false;
-                }
-            };
+    pub(crate) fn finish_initial_setup(
+        &mut self,
+        values: Vec<(String, String)>,
+        expected_import_generation: Option<u64>,
+    ) -> bool {
+        let values = match self
+            .hydrate_initial_setup_import_sensitive_values(values, expected_import_generation)
+        {
+            Ok(values) => values,
+            Err(error) => {
+                self.state
+                    .set_status_message(format!("initial setup could not finish: {error}"));
+                return false;
+            }
+        };
+        let candidate = match ConfigEditorState::from_complete_config_values(
+            self.state.global_config(),
+            values,
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                self.state
+                    .set_status_message(format!("initial setup could not finish: {error}"));
+                return false;
+            }
+        };
         let save_result = candidate.save_global(
             &self.app.workspace.root,
             GlobalConfigAdoptionPolicy::StrictCurrentSchema,
@@ -12017,6 +12661,7 @@ impl DesktopController {
                 return false;
             }
         };
+        self.pending_initial_setup_config_import = None;
         self.state.complete_initial_setup_after_persist();
         if self.state.startup.requires_initial_setup() {
             self.state.set_status_message(
@@ -12099,7 +12744,7 @@ impl DesktopController {
     }
 
     pub(crate) fn pick_global_config_toml_dialog(&mut self) -> Option<Utf8PathBuf> {
-        match pick_config_toml_file() {
+        match pick_config_toml_file(None) {
             Ok(path) => path,
             Err(error) => {
                 self.state.set_typed_status_message(
@@ -12111,22 +12756,104 @@ impl DesktopController {
         }
     }
 
-    pub(crate) fn pick_initial_setup_config_toml_dialog() -> Result<Option<Utf8PathBuf>, String> {
-        pick_config_toml_file()
+    pub(crate) fn pick_initial_setup_config_toml_dialog(
+        start_dir: &Utf8Path,
+    ) -> Result<Option<Utf8PathBuf>, String> {
+        pick_config_toml_file(Some(start_dir))
     }
 
     pub(crate) fn load_initial_setup_config_toml_path(
         path: &Utf8Path,
-    ) -> Result<Vec<(String, String)>, String> {
+    ) -> Result<ResolvedConfig, String> {
         validate_import_config_extension(path)?;
-        let text = read_toml_utf8_bounded(path).map_err(|error| error.to_string())?;
-        let config = ConfigLoader::resolve_global_config_text_without_environment(path, &text)
-            .map_err(|error| error.to_string())?;
-        Ok(ConfigField::ALL
+        let text = read_toml_utf8_bounded(path).map_err(public_config_import_error)?;
+        ConfigLoader::resolve_global_config_text_without_environment(path, &text)
+            .map_err(public_config_import_error)
+    }
+
+    pub(crate) fn stage_initial_setup_config_import(
+        &mut self,
+        config: ResolvedConfig,
+    ) -> Result<(u64, Vec<InitialSetupConfigPublicValue>), String> {
+        let generation = self.next_initial_setup_import_generation;
+        self.next_initial_setup_import_generation = generation
+            .checked_add(1)
+            .ok_or_else(|| "initial setup import generation is exhausted".to_string())?;
+        let values = ConfigField::ALL
             .into_iter()
             .filter(|field| !field.is_host_owned_generation())
-            .map(|field| (field.label().to_string(), field.value(&config)))
-            .collect())
+            .map(|field| {
+                let public = field.public_value(&config);
+                InitialSetupConfigPublicValue {
+                    key: field.label().to_string(),
+                    text: public.value,
+                    sensitive: public.sensitive,
+                    configured: public.configured,
+                }
+            })
+            .collect();
+        self.pending_initial_setup_config_import = Some(PendingInitialSetupConfigImport {
+            generation,
+            workspace_root: self.app.workspace.authority_root().to_path_buf(),
+            session_id: self.state.app_state.current_session_id,
+            global_config_path: self.state.startup.global_config_path.clone(),
+            setup_generation: self.state.startup.setup_generation,
+            config_generation: self.state.provider_config.config_generation,
+            config,
+        });
+        Ok((generation, values))
+    }
+
+    fn reconcile_pending_initial_setup_config_import_owner(&mut self) {
+        let owner_changed = self
+            .pending_initial_setup_config_import
+            .as_ref()
+            .is_some_and(|candidate| {
+                candidate.workspace_root != self.app.workspace.authority_root()
+                    || candidate.session_id != self.state.app_state.current_session_id
+                    || candidate.global_config_path != self.state.startup.global_config_path
+                    || candidate.setup_generation != self.state.startup.setup_generation
+                    || candidate.config_generation != self.state.provider_config.config_generation
+            });
+        if owner_changed {
+            self.pending_initial_setup_config_import = None;
+        }
+    }
+
+    fn hydrate_initial_setup_import_sensitive_values(
+        &self,
+        mut values: Vec<(String, String)>,
+        expected_import_generation: Option<u64>,
+    ) -> Result<Vec<(String, String)>, String> {
+        let Some(expected_generation) = expected_import_generation else {
+            return Ok(values);
+        };
+        let candidate = self
+            .pending_initial_setup_config_import
+            .as_ref()
+            .filter(|candidate| {
+                candidate.generation == expected_generation
+                    && candidate.workspace_root == self.app.workspace.authority_root()
+                    && candidate.session_id == self.state.app_state.current_session_id
+                    && candidate.global_config_path == self.state.startup.global_config_path
+                    && candidate.setup_generation == self.state.startup.setup_generation
+                    && candidate.config_generation == self.state.provider_config.config_generation
+            })
+            .ok_or_else(|| {
+                "the imported configuration owner changed; import the TOML again".to_string()
+            })?;
+        for (key, text) in &mut values {
+            let Some(field) = ConfigField::ALL
+                .into_iter()
+                .find(|field| field.label() == key.as_str())
+            else {
+                continue;
+            };
+            if field.is_sensitive() && text.trim().is_empty() {
+                *text = field.editor_value(&candidate.config);
+            }
+        }
+        Ok(values)
     }
 
     pub(crate) fn import_global_config_toml_path(&mut self, path: &Utf8Path) -> bool {
@@ -12569,7 +13296,7 @@ impl DesktopController {
                 ),
                 (
                     ConfigField::ExtraHeadersJson.label().to_string(),
-                    ConfigField::ExtraHeadersJson.value(config),
+                    ConfigField::ExtraHeadersJson.editor_value(config),
                 ),
                 (
                     ConfigField::ContextWindow.label().to_string(),
@@ -14408,6 +15135,7 @@ impl DesktopController {
                         if delete_after_finish || durable_delete_requested {
                             match repository.finalize_pending_deletions() {
                                 Ok(_) => {
+                                    self.side_chat_contexts.remove(&owner_session_id);
                                     self.side_chat_errors.remove(&owner_session_id);
                                 }
                                 Err(error) => {
@@ -16303,10 +17031,22 @@ mod tests {
         let target =
             Utf8PathBuf::from_path_buf(temp.path().join("config.toml")).expect("utf8 target");
         let sentinel = "[model]\nmodel = \"existing\"\n";
-        std::fs::write(path.as_std_path(), "[model\nmodel =").expect("config fixture");
+        let secret = "GLOBAL_IMPORT_PARSE_SECRET_SENTINEL";
+        std::fs::write(
+            path.as_std_path(),
+            format!("[model]\nextra_headers = {{ Authorization = \"{secret}\", broken = }}\n"),
+        )
+        .expect("config fixture");
         std::fs::write(target.as_std_path(), sentinel).expect("target fixture");
 
-        assert!(import_global_config_toml_to(&path, &target).is_err());
+        let error = import_global_config_toml_to(&path, &target)
+            .expect_err("malformed TOML must fail closed");
+        assert_eq!(
+            error,
+            "the selected TOML config is invalid or does not match the current config schema"
+        );
+        assert!(!error.contains(secret));
+        assert!(!error.contains("Authorization"));
         assert_eq!(
             std::fs::read_to_string(target.as_std_path()).unwrap(),
             sentinel
@@ -16990,11 +17730,12 @@ fn pick_image_file(_start_dir: Option<&Utf8Path>) -> Result<Option<Utf8PathBuf>,
 }
 
 #[cfg(feature = "tauri-desktop")]
-fn pick_config_toml_file() -> Result<Option<Utf8PathBuf>, String> {
-    match rfd::FileDialog::new()
-        .add_filter("moyAI TOML config", &["toml"])
-        .pick_file()
-    {
+fn pick_config_toml_file(start_dir: Option<&Utf8Path>) -> Result<Option<Utf8PathBuf>, String> {
+    let mut dialog = rfd::FileDialog::new().add_filter("moyAI TOML config", &["toml"]);
+    if let Some(directory) = start_dir {
+        dialog = dialog.set_directory(directory.as_std_path());
+    }
+    match dialog.pick_file() {
         Some(path) => Utf8PathBuf::from_path_buf(path)
             .map(Some)
             .map_err(|_| "selected config path is not valid UTF-8".to_string()),
@@ -17003,7 +17744,7 @@ fn pick_config_toml_file() -> Result<Option<Utf8PathBuf>, String> {
 }
 
 #[cfg(not(feature = "tauri-desktop"))]
-fn pick_config_toml_file() -> Result<Option<Utf8PathBuf>, String> {
+fn pick_config_toml_file(_start_dir: Option<&Utf8Path>) -> Result<Option<Utf8PathBuf>, String> {
     Err("desktop config picker requires the tauri-desktop feature".to_string())
 }
 
@@ -17035,9 +17776,24 @@ fn import_global_config_toml_to(source: &Utf8Path, target: &Utf8Path) -> Result<
 
 fn read_import_config_toml(source: &Utf8Path) -> Result<String, String> {
     validate_import_config_extension(source)?;
-    let text = read_toml_utf8_bounded(source).map_err(|error| error.to_string())?;
-    ConfigLoader::validate_global_config_text(source, &text).map_err(|error| error.to_string())?;
+    let text = read_toml_utf8_bounded(source).map_err(public_config_import_error)?;
+    ConfigLoader::validate_global_config_text(source, &text).map_err(public_config_import_error)?;
     Ok(text)
+}
+
+fn public_config_import_error(error: crate::error::ConfigError) -> String {
+    match error {
+        crate::error::ConfigError::Io(_) => "could not read the selected TOML config".to_string(),
+        crate::error::ConfigError::Parse(_) | crate::error::ConfigError::ParseFile { .. } => {
+            "the selected TOML config is invalid or does not match the current config schema"
+                .to_string()
+        }
+        crate::error::ConfigError::Serialize(_) => {
+            "the selected TOML config could not be processed".to_string()
+        }
+        crate::error::ConfigError::Message(message)
+        | crate::error::ConfigError::Workspace(message) => message,
+    }
 }
 
 fn validate_import_config_extension(source: &Utf8Path) -> Result<(), String> {

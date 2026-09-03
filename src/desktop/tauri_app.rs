@@ -27,6 +27,7 @@ use super::query::{
     DESKTOP_HISTORY_PROJECTION_LIMIT, DESKTOP_TURN_PAGE_LIMIT, build_session_detail_with_roots,
     load_latest_session_detail,
 };
+use super::side_chat::{SideChatQuoteRequest, SideChatQuoteSourceKind};
 use super::state::{DesktopOverlay, DesktopStatusCode};
 use super::web_model::{
     DesktopAgentExecutionProjection, DesktopAgentInterruptTarget, DesktopWebState,
@@ -1696,6 +1697,7 @@ async fn save_side_chat_draft(
     chat_id: String,
     expected_draft_revision: String,
     text: String,
+    quote: Option<SideChatQuoteInput>,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     let conflict_owner = owner_session_id.clone();
     mutate_side_chat_controller_checked(controller, conflict_owner, |controller| {
@@ -1710,12 +1712,14 @@ async fn save_side_chat_draft(
         let expected_draft_revision = expected_draft_revision.parse::<u64>().map_err(|error| {
             DesktopCommandConflict::new(format!("invalid side chat draft revision: {error}"))
         })?;
+        let quote = quote.map(parse_side_chat_quote).transpose()?;
         controller
             .save_side_chat_draft(
                 owner_session_id,
                 side_chat_id,
                 expected_draft_revision,
                 text,
+                quote,
             )
             .map_err(DesktopCommandConflict::new)
     })
@@ -1729,6 +1733,8 @@ async fn submit_side_chat(
     chat_id: String,
     expected_generation: String,
     expected_draft_revision: String,
+    expected_owner_append_position: Option<String>,
+    quote: Option<SideChatQuoteInput>,
     text: String,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     let conflict_owner = owner_session_id.clone();
@@ -1738,17 +1744,72 @@ async fn submit_side_chat(
         let expected_draft_revision = expected_draft_revision.parse::<u64>().map_err(|error| {
             DesktopCommandConflict::new(format!("invalid side chat draft revision: {error}"))
         })?;
+        let expected_owner_append_position = parse_side_chat_append_position(
+            expected_owner_append_position.as_deref(),
+            "owner context",
+        )?;
+        let quote = quote.map(parse_side_chat_quote).transpose()?;
         controller
             .start_side_chat(
                 owner_session_id,
                 side_chat_id,
                 expected_generation,
                 expected_draft_revision,
+                expected_owner_append_position,
+                quote,
                 text,
             )
             .map_err(DesktopCommandConflict::new)
     })
     .await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SideChatQuoteInput {
+    source_kind: String,
+    source_history_item_id: String,
+    source_append_position: Option<String>,
+    selected_text: String,
+}
+
+fn parse_side_chat_quote(
+    quote: SideChatQuoteInput,
+) -> Result<SideChatQuoteRequest, DesktopCommandConflict> {
+    let source_kind =
+        SideChatQuoteSourceKind::parse(&quote.source_kind).map_err(DesktopCommandConflict::new)?;
+    let source_history_item_id = quote
+        .source_history_item_id
+        .parse::<crate::protocol::HistoryItemId>()
+        .map_err(|error| {
+            DesktopCommandConflict::new(format!("invalid side chat quote source: {error}"))
+        })?;
+    let source_append_position =
+        parse_side_chat_append_position(quote.source_append_position.as_deref(), "quote source")?;
+    Ok(SideChatQuoteRequest {
+        source_kind,
+        source_history_item_id,
+        source_append_position,
+        selected_text: quote.selected_text,
+    })
+}
+
+fn parse_side_chat_append_position(
+    value: Option<&str>,
+    label: &str,
+) -> Result<Option<i64>, DesktopCommandConflict> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let position = value.parse::<i64>().map_err(|error| {
+        DesktopCommandConflict::new(format!("invalid side chat {label} revision: {error}"))
+    })?;
+    if position < 0 || position.to_string() != value {
+        return Err(DesktopCommandConflict::new(format!(
+            "invalid side chat {label} revision"
+        )));
+    }
+    Ok(Some(position))
 }
 
 #[tauri::command]
@@ -3285,14 +3346,16 @@ async fn load_initial_setup_config_toml(
 
     // Native dialogs and bounded file reads may wait on the user or filesystem.
     // Keep them outside the controller lock, then CAS the exact owners again.
-    let loaded = DesktopController::pick_initial_setup_config_toml_dialog().and_then(|selected| {
-        selected
-            .map(|path| {
-                DesktopController::load_initial_setup_config_toml_path(&path)
-                    .map(|values| (path, values))
-            })
-            .transpose()
-    });
+    let import_start_dir = camino::Utf8PathBuf::from(expected_setup_target.workspace_path.clone());
+    let loaded = DesktopController::pick_initial_setup_config_toml_dialog(&import_start_dir)
+        .and_then(|selected| {
+            selected
+                .map(|path| {
+                    DesktopController::load_initial_setup_config_toml_path(&path)
+                        .map(|config| (path, config))
+                })
+                .transpose()
+        });
 
     let mut controller = controller.lock().await;
     controller.drain_runtime_messages();
@@ -3303,7 +3366,7 @@ async fn load_initial_setup_config_toml(
     if let Err(conflict) = ensure_config_mutation_target(&controller, &expected_config_target) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
-    let Some((path, values)) = (match loaded {
+    let Some((path, config)) = (match loaded {
         Ok(loaded) => loaded,
         Err(error) => {
             let conflict = DesktopCommandConflict::with_status(
@@ -3315,11 +3378,28 @@ async fn load_initial_setup_config_toml(
     }) else {
         return Ok(None);
     };
+    let (import_generation, values) = controller
+        .stage_initial_setup_config_import(config)
+        .map_err(|error| {
+            command_conflict_error(
+                &mut controller,
+                DesktopCommandConflict::with_status(
+                    DesktopStatusCode::ConfigImportFailed,
+                    format!("initial setup import failed: {error}"),
+                ),
+            )
+        })?;
     Ok(Some(DesktopInitialSetupConfigDraft {
         source_path: path.to_string(),
+        import_generation: import_generation.to_string(),
         values: values
             .into_iter()
-            .map(|(key, text)| DesktopConfigValueInput { key, text })
+            .map(|value| DesktopInitialSetupConfigFieldDraft {
+                key: value.key,
+                text: value.text,
+                sensitive: value.sensitive,
+                configured: value.configured,
+            })
             .collect(),
     }))
 }
@@ -3538,16 +3618,20 @@ async fn check_initial_setup_docling_readiness(
     values: Vec<DesktopConfigValueInput>,
     expected_config_target: DesktopConfigMutationTarget,
     expected_setup_target: DesktopInitialSetupMutationTarget,
+    import_generation: Option<String>,
 ) -> Result<DesktopWebState, DesktopCommandError> {
     mutate_controller_checked(controller, |controller| {
         ensure_initial_setup_mutation_target(controller, &expected_setup_target)?;
         ensure_config_mutation_target(controller, &expected_config_target)?;
         validate_complete_config_draft(controller, &values)?;
+        let import_generation =
+            parse_initial_setup_import_generation(import_generation.as_deref())?;
         if !controller.check_initial_setup_docling_readiness(
             values
                 .into_iter()
                 .map(|value| (value.key, value.text))
                 .collect(),
+            import_generation,
         ) {
             return Err(rejected_action(
                 controller,
@@ -3615,7 +3699,17 @@ struct DesktopConfigValueInput {
 #[serde(rename_all = "camelCase")]
 struct DesktopInitialSetupConfigDraft {
     source_path: String,
-    values: Vec<DesktopConfigValueInput>,
+    import_generation: String,
+    values: Vec<DesktopInitialSetupConfigFieldDraft>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopInitialSetupConfigFieldDraft {
+    key: String,
+    text: String,
+    sensitive: bool,
+    configured: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
@@ -3787,6 +3881,25 @@ fn ensure_initial_setup_mutation_target(
             .as_str(),
         controller.state.startup.setup_generation,
     )
+}
+
+fn parse_initial_setup_import_generation(
+    value: Option<&str>,
+) -> Result<Option<u64>, DesktopCommandConflict> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let generation = value.parse::<u64>().map_err(|_| {
+        DesktopCommandConflict::new(
+            "initial setup import generation must be an unsigned decimal integer",
+        )
+    })?;
+    if generation.to_string() != value {
+        return Err(DesktopCommandConflict::new(
+            "initial setup import generation is not canonical",
+        ));
+    }
+    Ok(Some(generation))
 }
 
 fn validate_session_settings_mutation_target(
@@ -4276,6 +4389,7 @@ async fn finish_initial_setup(
     values: Vec<DesktopConfigValueInput>,
     expected_config_target: DesktopConfigMutationTarget,
     expected_setup_target: DesktopInitialSetupMutationTarget,
+    import_generation: Option<String>,
 ) -> Result<(DesktopWebState, bool), DesktopCommandError> {
     let mut controller = controller.lock().await;
     controller.drain_runtime_messages();
@@ -4295,11 +4409,17 @@ async fn finish_initial_setup(
     if let Err(conflict) = validate_complete_config_draft(&controller, &values) {
         return Err(command_conflict_error(&mut controller, conflict));
     }
+    let import_generation =
+        match parse_initial_setup_import_generation(import_generation.as_deref()) {
+            Ok(generation) => generation,
+            Err(conflict) => return Err(command_conflict_error(&mut controller, conflict)),
+        };
     let finished = controller.finish_initial_setup(
         values
             .into_iter()
             .map(|value| (value.key, value.text))
             .collect(),
+        import_generation,
     );
     controller.drain_runtime_messages();
     Ok((
@@ -5235,21 +5355,189 @@ mod tests {
     }
 
     #[test]
-    fn initial_setup_import_draft_serializes_the_camel_case_wire_contract() {
+    fn initial_setup_import_draft_serializes_only_public_sensitive_state() {
+        let mut config = ResolvedConfig::default();
+        let secrets = [
+            "model-header-import-secret",
+            "model-body-import-secret",
+            "docling-header-import-secret",
+            "mcp-header-import-secret",
+        ];
+        config
+            .model
+            .extra_headers
+            .insert("Authorization".to_string(), secrets[0].to_string());
+        config.model.extra_body_json = Some(serde_json::json!({"token": secrets[1]}));
+        config
+            .docling
+            .headers
+            .insert("Authorization".to_string(), secrets[2].to_string());
+        config.mcp.servers[0]
+            .headers
+            .insert("Authorization".to_string(), secrets[3].to_string());
+
+        let mut values = vec![DesktopInitialSetupConfigFieldDraft {
+            key: "model.model".to_string(),
+            text: "draft-model".to_string(),
+            sensitive: false,
+            configured: true,
+        }];
+        values.extend(
+            [
+                crate::config::ConfigField::ExtraHeadersJson,
+                crate::config::ConfigField::ExtraBodyJson,
+                crate::config::ConfigField::DoclingHeadersJson,
+                crate::config::ConfigField::McpServersJson,
+            ]
+            .into_iter()
+            .map(|field| {
+                let public = field.public_value(&config);
+                DesktopInitialSetupConfigFieldDraft {
+                    key: field.label().to_string(),
+                    text: public.value,
+                    sensitive: public.sensitive,
+                    configured: public.configured,
+                }
+            }),
+        );
         let payload = DesktopInitialSetupConfigDraft {
             source_path: "C:/config/import.toml".to_string(),
-            values: vec![DesktopConfigValueInput {
-                key: "model.model".to_string(),
-                text: "draft-model".to_string(),
-            }],
+            import_generation: "9".to_string(),
+            values,
         };
 
+        let debug = format!("{payload:?}");
+        let serialized = serde_json::to_value(&payload).expect("serialize import draft");
+        assert_eq!(serialized["sourcePath"], "C:/config/import.toml");
+        assert_eq!(serialized["importGeneration"], "9");
+        assert_eq!(serialized["values"][0]["key"], "model.model");
+        assert_eq!(serialized["values"][0]["text"], "draft-model");
+        assert_eq!(serialized["values"][0]["sensitive"], false);
+        assert_eq!(serialized["values"][0]["configured"], true);
+
+        let sensitive = serialized["values"]
+            .as_array()
+            .expect("import values")
+            .iter()
+            .filter(|value| value["sensitive"] == true)
+            .collect::<Vec<_>>();
+        assert_eq!(sensitive.len(), 4);
+        for value in sensitive {
+            assert_eq!(value["text"], "");
+            assert_eq!(value["configured"], true);
+        }
+
+        let encoded = serde_json::to_string(&payload).expect("encode import draft");
+        for secret in secrets {
+            assert!(!encoded.contains(secret));
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[test]
+    fn initial_setup_import_generation_accepts_only_optional_canonical_unsigned_decimal() {
         assert_eq!(
-            serde_json::to_value(payload).expect("serialize import draft"),
-            serde_json::json!({
-                "sourcePath": "C:/config/import.toml",
-                "values": [{"key": "model.model", "text": "draft-model"}],
+            parse_initial_setup_import_generation(None).expect("manual setup has no import owner"),
+            None
+        );
+        assert_eq!(
+            parse_initial_setup_import_generation(Some("9")).expect("canonical import generation"),
+            Some(9)
+        );
+
+        for invalid in ["09", "-1", "+9", " 9", "9 ", ""] {
+            assert!(
+                parse_initial_setup_import_generation(Some(invalid)).is_err(),
+                "noncanonical import generation must fail closed: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn side_chat_owner_fence_accepts_only_optional_canonical_nonnegative_decimal() {
+        assert_eq!(
+            parse_side_chat_append_position(None, "owner context")
+                .expect("an absent owner fence is allowed"),
+            None
+        );
+        assert_eq!(
+            parse_side_chat_append_position(Some("0"), "owner context").expect("zero is canonical"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_side_chat_append_position(Some("42"), "owner context")
+                .expect("canonical owner fence"),
+            Some(42)
+        );
+
+        for invalid in ["042", "-1", "+1", " 1", "1 ", ""] {
+            assert!(
+                parse_side_chat_append_position(Some(invalid), "owner context").is_err(),
+                "noncanonical owner fence must fail closed: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn side_chat_quote_parser_requires_typed_source_and_canonical_source_fence() {
+        let history_item_id = crate::protocol::HistoryItemId::new();
+        let quote = parse_side_chat_quote(SideChatQuoteInput {
+            source_kind: "artifact".to_string(),
+            source_history_item_id: history_item_id.to_string(),
+            source_append_position: Some("17".to_string()),
+            selected_text: "selected evidence".to_string(),
+        })
+        .expect("canonical typed quote");
+        assert_eq!(quote.source_kind, SideChatQuoteSourceKind::Artifact);
+        assert_eq!(quote.source_history_item_id, history_item_id);
+        assert_eq!(quote.source_append_position, Some(17));
+        assert_eq!(quote.selected_text, "selected evidence");
+
+        for invalid_position in ["017", "-1", "+17", " 17"] {
+            assert!(
+                parse_side_chat_quote(SideChatQuoteInput {
+                    source_kind: "transcript".to_string(),
+                    source_history_item_id: history_item_id.to_string(),
+                    source_append_position: Some(invalid_position.to_string()),
+                    selected_text: "selected evidence".to_string(),
+                })
+                .is_err(),
+                "noncanonical quote source fence must fail closed: {invalid_position:?}"
+            );
+        }
+
+        for invalid_kind in ["Artifact", "unknown", ""] {
+            assert!(
+                parse_side_chat_quote(SideChatQuoteInput {
+                    source_kind: invalid_kind.to_string(),
+                    source_history_item_id: history_item_id.to_string(),
+                    source_append_position: Some("17".to_string()),
+                    selected_text: "selected evidence".to_string(),
+                })
+                .is_err(),
+                "untyped quote source kind must fail closed: {invalid_kind:?}"
+            );
+        }
+        assert!(
+            parse_side_chat_quote(SideChatQuoteInput {
+                source_kind: "transcript".to_string(),
+                source_history_item_id: "not-a-history-item-id".to_string(),
+                source_append_position: None,
+                selected_text: "selected evidence".to_string(),
             })
+            .is_err(),
+            "a malformed quote source identity must fail closed"
+        );
+        assert!(
+            serde_json::from_value::<SideChatQuoteInput>(serde_json::json!({
+                "sourceKind": "transcript",
+                "sourceHistoryItemId": history_item_id.to_string(),
+                "sourceAppendPosition": "17",
+                "selectedText": "selected evidence",
+                "unexpected": true
+            }))
+            .is_err(),
+            "the quote wire DTO must reject unknown fields"
         );
     }
 

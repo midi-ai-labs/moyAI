@@ -39,6 +39,11 @@ import {
 } from "./quick_chat_delete_focus_continuation.ts";
 import { composerSendTitle, sideChatCatalogStatusText } from "./render.ts";
 import {
+  pendingSideChatQuoteFromDomSelection,
+  sideChatQuoteKeyboardActivation,
+  sideChatQuoteOwnerSessionIdFromTrigger,
+} from "./side_chat_quote.ts";
+import {
   sameSessionSettingsTarget,
   updateSessionSettingsDraft,
   type SessionSettingsDraftField,
@@ -59,6 +64,7 @@ import type {
   DesktopViewState,
   DesktopWebState,
   ProviderProfile,
+  SideChatPendingQuote,
 } from "./types.ts";
 import {
   sideChatConfigurationOpen,
@@ -71,6 +77,7 @@ import {
   sideChatOperationsOpen,
   sideChatOwnerSessionId,
   sessionSettingsMutationAvailability,
+  updateSideChatDraftFromManualEdit,
   type UiLocalState,
 } from "./ui_state.ts";
 import {
@@ -113,6 +120,12 @@ let pendingOpacityPreviewPercent: number | null = null;
 let opacityPreviewFrame: number | null = null;
 let opacityPreviewInFlight = false;
 let delegatedEventsInstalled = false;
+interface CapturedSideChatPointerQuote {
+  ownerSessionId: string;
+  quote: SideChatPendingQuote;
+}
+
+const sideChatPointerQuotes = new WeakMap<Element, CapturedSideChatPointerQuote>();
 const TEXT_MUTATION_DEBOUNCE_MS = 180;
 const SIDE_CHAT_DRAFT_DEBOUNCE_MS = 450;
 const MIN_WINDOW_OPACITY_PERCENT = 50;
@@ -424,8 +437,14 @@ export function wireEvents(state: DesktopViewState, context: ActionContext): voi
   const sideChatDraft = sideChatDraftForState(context.uiState, state);
   document.querySelector<HTMLTextAreaElement>("#side-chat-prompt")?.addEventListener("input", (event) => {
     if (!sideChatDraft || !sideChatOperationsOpen(context.uiState)) return;
-    sideChatDraft.text = (event.currentTarget as HTMLTextAreaElement).value;
-    sideChatDraft.revision += 1;
+    const pendingQuoteCleared = sideChatDraft.pendingQuote !== null;
+    updateSideChatDraftFromManualEdit(
+      sideChatDraft,
+      (event.currentTarget as HTMLTextAreaElement).value,
+    );
+    if (pendingQuoteCleared) {
+      document.querySelector(".side-chat-pending-quote")?.remove();
+    }
     if (sideChatDraft.saveTimer !== null) window.clearTimeout(sideChatDraft.saveTimer);
     sideChatDraft.saveTimer = window.setTimeout(() => {
       sideChatDraft.saveTimer = null;
@@ -669,6 +688,24 @@ function installDelegatedActionEvents(context: ActionContext): void {
   };
   document.addEventListener("input", updateSettingsControl);
   document.addEventListener("change", updateSettingsControl);
+  document.addEventListener("pointerdown", (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    const trigger = target.closest<HTMLElement>('[data-action="quote-selection-to-side-chat"]');
+    const currentState = context.getViewState();
+    if (!trigger || !currentState) return;
+    sideChatPointerQuotes.delete(trigger);
+    const quote = pendingSideChatQuoteFromDomSelection(
+      trigger,
+      window.getSelection(),
+      currentState.side_chat.context_as_of_append_position,
+    );
+    const ownerSessionId = sideChatQuoteOwnerSessionIdFromTrigger(trigger);
+    if (quote && ownerSessionId) {
+      sideChatPointerQuotes.set(trigger, { ownerSessionId, quote });
+      window.setTimeout(() => sideChatPointerQuotes.delete(trigger), 0);
+    }
+  }, true);
   document.addEventListener("click", (event) => {
     const target = event.target;
     if (!(target instanceof Element)) return;
@@ -707,12 +744,57 @@ function installDelegatedActionEvents(context: ActionContext): void {
       ?? node.dataset.providerProfile
       ?? node.dataset.mode
       ?? "";
-    void dispatchAction(action, context, { index, value }).catch((error) => context.reportError(error));
+    const capturedSideChatQuote = action === "quote-selection-to-side-chat"
+      ? sideChatPointerQuotes.get(node) ?? null
+      : null;
+    const sideChatQuote = action === "quote-selection-to-side-chat"
+      ? pendingSideChatQuoteFromDomSelection(
+        node,
+        window.getSelection(),
+        currentState.side_chat.context_as_of_append_position,
+      ) ?? capturedSideChatQuote?.quote ?? null
+      : undefined;
+    const sideChatQuoteOwnerSessionId = action === "quote-selection-to-side-chat"
+      ? sideChatQuoteOwnerSessionIdFromTrigger(node) ?? capturedSideChatQuote?.ownerSessionId ?? null
+      : undefined;
+    if (action === "quote-selection-to-side-chat") sideChatPointerQuotes.delete(node);
+    void dispatchAction(action, context, {
+      index,
+      value,
+      sideChatQuote,
+      sideChatQuoteOwnerSessionId,
+    })
+      .catch((error) => context.reportError(error));
   });
   document.addEventListener("keydown", (event) => {
-    if (event.repeat || (event.key !== "Enter" && event.key !== " ")) return;
     const target = event.target;
     if (!(target instanceof Element)) return;
+    const quoteNode = target.closest<HTMLElement>('[data-action="quote-selection-to-side-chat"]');
+    if (
+      quoteNode
+      && !(quoteNode instanceof HTMLButtonElement && quoteNode.disabled)
+      && sideChatQuoteKeyboardActivation(event.key, event.repeat)
+    ) {
+      const currentState = context.getViewState();
+      if (!currentState) return;
+      const sideChatQuote = pendingSideChatQuoteFromDomSelection(
+        quoteNode,
+        window.getSelection(),
+        currentState.side_chat.context_as_of_append_position,
+      );
+      const sideChatQuoteOwnerSessionId = sideChatQuoteOwnerSessionIdFromTrigger(quoteNode);
+      if (!sideChatQuote || !sideChatQuoteOwnerSessionId) return;
+      event.preventDefault();
+      event.stopPropagation();
+      void dispatchAction("quote-selection-to-side-chat", context, {
+        index: Number(quoteNode.dataset.index ?? "-1"),
+        value: "",
+        sideChatQuote,
+        sideChatQuoteOwnerSessionId,
+      }).catch((error) => context.reportError(error));
+      return;
+    }
+    if (event.repeat || (event.key !== "Enter" && event.key !== " ")) return;
     const node = target.closest<HTMLElement>(
       '[data-action="show-agent-pane"], [data-action="show-agent-list"], [data-action="show-output-pane"], [data-action="jump-history-anchor"]',
     );

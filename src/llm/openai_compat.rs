@@ -196,10 +196,11 @@ impl OpenAiCompatClient {
                         ))
                     })?;
                 if let Some(error) = chunk.error.as_ref() {
-                    return Err(LlmError::Message(format!(
-                        "openai-compatible stream error: {}",
-                        summarize_stream_error(error)
-                    )));
+                    return Err(LlmError::ProviderGenerationFailed {
+                        response_id: None,
+                        code: chat_stream_error_code(error),
+                        message: summarize_stream_error(error),
+                    });
                 }
                 let chunk_usage = chunk.usage.as_ref().map(to_usage).transpose()?;
                 if let (Some(existing), Some(candidate)) = (usage.as_ref(), chunk_usage.as_ref())
@@ -1999,6 +2000,29 @@ fn summarize_stream_error(error: &OpenAiErrorPayload) -> String {
             PROVIDER_STREAM_SUMMARY_SCAN_LIMIT_BYTES,
         )
     }
+}
+
+fn chat_stream_error_code(error: &OpenAiErrorPayload) -> Option<String> {
+    error
+        .code
+        .as_ref()
+        .and_then(Value::as_str)
+        .and_then(compact_stream_error_field)
+        .or_else(|| {
+            error
+                .error_type
+                .as_deref()
+                .and_then(compact_stream_error_field)
+        })
+}
+
+fn compact_stream_error_field(value: &str) -> Option<String> {
+    let value = compact_provider_text_bounded(
+        value,
+        PROVIDER_STREAM_ERROR_FIELD_LIMIT_BYTES,
+        PROVIDER_STREAM_SUMMARY_SCAN_LIMIT_BYTES,
+    );
+    (!value.is_empty()).then_some(value)
 }
 
 fn summarize_stream_error_code(code: &Value) -> String {
@@ -4653,6 +4677,68 @@ mod tests {
         assert_eq!(failure.code.as_deref(), Some("server_error"));
         assert_eq!(requests.lock().expect("request capture").len(), 1);
         assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_transport_classifies_explicit_stream_error_as_generation_without_retry() {
+        let failed = format!(
+            "data: {}\n\n",
+            json!({
+                "error": {
+                    "message": "ANE evaluation failed",
+                    "type": "server_error",
+                    "code": "   "
+                }
+            })
+        );
+        let completed = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "Recovered." },
+                    "finish_reason": "stop"
+                }]
+            })
+        );
+        let (base_url, requests, server) = start_responses_fixture(vec![failed, completed]).await;
+        let mut request = reasoning_fixture_request();
+        replace_provider_endpoint(&mut request, &base_url);
+        let mut deadlines = request.provider_target().deadlines();
+        deadlines.max_connect_retries = 1;
+        replace_provider_deadlines(&mut request, deadlines);
+        let client = OpenAiCompatClient::new(None);
+        let mut sink = RecordingLlmEventSink::default();
+
+        let error = client
+            .stream_chat(request, CancellationToken::new(), &mut sink)
+            .await
+            .expect_err("an explicit stream error must terminate the started generation");
+        server.abort();
+
+        assert!(error.to_string().contains("ANE evaluation failed"));
+        let failure = error.provider_failure().expect("typed generation failure");
+        assert_eq!(failure.kind, ProviderFailureKind::Generation);
+        assert_eq!(failure.phase, ProviderPhase::LastProgress);
+        assert_eq!(failure.status, None);
+        assert_eq!(failure.code.as_deref(), Some("server_error"));
+        assert_eq!(
+            error.public_message(),
+            "The model provider could not complete generation. Check the model state and try again."
+        );
+        assert!(!error.public_message().contains("ANE evaluation failed"));
+        assert_eq!(requests.lock().expect("request capture").len(), 1);
+        assert!(sink.events.is_empty());
+        assert!(matches!(
+            sink.phases.last(),
+            Some(ProviderPhaseEvent {
+                phase: ProviderPhase::ProviderTerminal,
+                terminal_status: Some(ProviderTerminalStatus::Failed),
+                failure: Some(failure),
+                ..
+            }) if failure.kind == ProviderFailureKind::Generation
+                && failure.code.as_deref() == Some("server_error")
+        ));
     }
 
     #[tokio::test]

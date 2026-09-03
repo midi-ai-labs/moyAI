@@ -279,6 +279,83 @@ impl LlmError {
             _ => false,
         }
     }
+
+    /// Stable user-visible text for durable terminals and canonical projections.
+    ///
+    /// `Display` remains a private diagnostic and may include provider-owned details. Public
+    /// consumers must use this method instead of persisting `to_string()`.
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::ProviderFailure { failure, .. } => failure.public_message(),
+            Self::ProviderResponseStartTimeout { .. } | Self::ProviderRequestTimeout { .. } => {
+                "The model provider did not start a response before the request deadline. Check the provider load or increase the response timeout."
+                    .to_string()
+            }
+            Self::ProviderStreamIdleTimeout { .. } => {
+                "The model provider stopped sending response data. Check the provider load and try again."
+                    .to_string()
+            }
+            Self::ProviderRequestLimitExceeded { .. } => {
+                "The model request exceeds a configured safety limit. Reduce the request size and try again."
+                    .to_string()
+            }
+            Self::ProviderRequestImage(_) => {
+                "An image in the model request was rejected. Check its format and size."
+                    .to_string()
+            }
+            Self::ProviderStreamLimitExceeded { .. } => {
+                "The model response exceeded a configured safety limit. Reduce the requested output or adjust the provider limits."
+                    .to_string()
+            }
+            Self::ProviderRejected { status, code, .. } => {
+                let failure = crate::llm::ProviderFailure {
+                    request_id: crate::llm::ProviderRequestId::new(),
+                    endpoint: String::new(),
+                    phase: crate::llm::ProviderPhase::ProviderTerminal,
+                    attempt: 0,
+                    elapsed_ms: 0,
+                    kind: crate::llm::ProviderFailureKind::HttpStatus,
+                    status: *status,
+                    code: code.clone(),
+                    message: String::new(),
+                };
+                failure.public_message()
+            }
+            Self::ProviderGenerationFailed { code, .. } => {
+                let failure = crate::llm::ProviderFailure {
+                    request_id: crate::llm::ProviderRequestId::new(),
+                    endpoint: String::new(),
+                    phase: crate::llm::ProviderPhase::ProviderTerminal,
+                    attempt: 0,
+                    elapsed_ms: 0,
+                    kind: crate::llm::ProviderFailureKind::Generation,
+                    status: None,
+                    code: code.clone(),
+                    message: String::new(),
+                };
+                failure.public_message()
+            }
+            Self::ToollessTextFinish { .. } | Self::ToollessTextShape { .. } => {
+                "The model returned an invalid response for this operation. No action was taken."
+                    .to_string()
+            }
+            Self::IncompleteResponse { .. } => {
+                "The model provider returned an incomplete response. Try again after checking the provider state."
+                    .to_string()
+            }
+            Self::Http(_) => {
+                "The model provider request failed. Check the connection and try again.".to_string()
+            }
+            Self::Json(_) | Self::Message(_) => {
+                "The model provider returned an unsupported or malformed response. Check the configured connection type."
+                    .to_string()
+            }
+            Self::Io(_) => {
+                "The model request could not be completed because of a local I/O error."
+                    .to_string()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +415,32 @@ mod llm_error_tests {
             }),
         };
         assert!(nested.is_context_window_exceeded());
+    }
+
+    #[test]
+    fn public_llm_error_does_not_expose_provider_diagnostic_source() {
+        let secret = "raw-provider-secret";
+        let request_id = ProviderRequestId::new();
+        let error = LlmError::ProviderFailure {
+            failure: ProviderFailure {
+                request_id: request_id.clone(),
+                endpoint: "https://provider.example/private".to_string(),
+                phase: ProviderPhase::ProviderTerminal,
+                attempt: 1,
+                elapsed_ms: 10,
+                kind: ProviderFailureKind::Protocol,
+                status: None,
+                code: Some("private-code".to_string()),
+                message: secret.to_string(),
+            },
+            source: Box::new(LlmError::Message(secret.to_string())),
+        };
+
+        let public = error.public_message();
+        assert!(!public.contains(secret));
+        assert!(!public.contains(request_id.as_str()));
+        assert!(!public.contains("provider.example"));
+        assert!(!public.contains("private-code"));
     }
 }
 
@@ -500,6 +603,44 @@ pub enum AgentError {
     },
     #[error("{0}")]
     Message(String),
+}
+
+impl AgentError {
+    /// Returns the bounded public terminal text. Detailed error strings remain runtime-only.
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::Llm(error) => error.public_message(),
+            Self::ProviderOutputLimit => {
+                "The model stopped because its output limit was reached. Ask for a shorter response or increase the model output limit."
+                    .to_string()
+            }
+            Self::ProviderFinishError | Self::ProviderFinishShape { .. } => {
+                "The model provider returned an invalid completion state. Check the configured connection type."
+                    .to_string()
+            }
+            Self::Tool(_) => {
+                "A tool could not be completed. Review the latest tool result before trying again."
+                    .to_string()
+            }
+            Self::Session(_) | Self::Storage(_) => {
+                "The task state could not be saved safely. Reopen the task before trying again."
+                    .to_string()
+            }
+            Self::Runtime(_) => {
+                "The task runtime stopped unexpectedly. Reopen the task and try again.".to_string()
+            }
+            Self::Workspace(_) => {
+                "The workspace could not be accessed safely. Check the project path and permissions."
+                    .to_string()
+            }
+            Self::RunSuperseded { .. } => {
+                "This run no longer owns the task. Refresh the task before trying again.".to_string()
+            }
+            Self::Message(_) => {
+                "The task could not be completed. Review the task state and try again.".to_string()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Error)]

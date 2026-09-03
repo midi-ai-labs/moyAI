@@ -14,6 +14,7 @@ import {
   exactOwnedWindowDragObserved,
   probeExactOwnedWindow,
   selectFreshOwnedRootWindow,
+  selectFileInOwnedNativeDialog,
   selectFreshForegroundWindow,
   selectSingleOwnedRootWindow,
   sendEscapeToOwnedForegroundWindow,
@@ -248,6 +249,31 @@ test("Escape, drag, UIA dialog close, PNG, and exact-HWND cleanup wrappers prese
         window: candidate,
       };
     }
+    if (action === "SelectFile") {
+      return {
+        attempted: true,
+        attempt_count: 1,
+        request_count: 1,
+        selected_path: parameters.SelectedPath,
+        delivery_verified: true,
+        file_item_selection_verified: true,
+        file_item_default_action_verified: true,
+        default_action_pattern: "InvokePattern.Invoke()",
+        file_item: {
+          name: path.win32.basename(parameters.SelectedPath),
+          control_type: "ControlType.DataItem",
+          process_id: candidate.process_id,
+          enabled: true,
+          offscreen: false,
+          selection_item_pattern: true,
+          invoke_pattern: true,
+        },
+        foreground_required: false,
+        cleanup_only: false,
+        representative_input: true,
+        window: candidate,
+      };
+    }
     if (action === "CloseCleanup") {
       return { requested: true, cleanup_only: true, representative_input: false, window: candidate };
     }
@@ -277,6 +303,16 @@ test("Escape, drag, UIA dialog close, PNG, and exact-HWND cleanup wrappers prese
     { invoke },
   );
   assert.equal(dialogClose.request_count, 1);
+  const selectedFile = await selectFileInOwnedNativeDialog(
+    {
+      executionRoot: "C:\\execution",
+      ownerPath: "C:\\execution\\owner.json",
+      candidate,
+      selectedPath: "C:\\fixtures\\import.toml",
+    },
+    { invoke },
+  );
+  assert.equal(selectedFile.delivery_verified, true);
   const capture = await captureOwnedWindowPng(
     { executionRoot: "C:\\execution", ownerPath: "C:\\execution\\owner.json", candidate },
     { invoke },
@@ -288,7 +324,7 @@ test("Escape, drag, UIA dialog close, PNG, and exact-HWND cleanup wrappers prese
     { invoke },
   );
   assert.equal(cleanup.cleanup_only, true);
-  assert.deepEqual(calls.map((call) => call.action), ["SendEscape", "DragWindow", "CloseDialog", "CapturePng", "CloseCleanup"]);
+  assert.deepEqual(calls.map((call) => call.action), ["SendEscape", "DragWindow", "CloseDialog", "SelectFile", "CapturePng", "CloseCleanup"]);
   for (const call of calls) {
     assert.equal(call.parameters.WindowHandle, candidate.hwnd);
     assert.equal(call.parameters.ExpectedThreadId, candidate.thread_id);

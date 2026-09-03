@@ -20,6 +20,8 @@ export interface InitialSetupAuxiliaryRequest {
 
 interface InitialSetupImportedSource {
   readonly sourcePath: string;
+  readonly importGeneration: string;
+  readonly configuredSensitiveKeys: readonly string[];
   readonly setupTarget: Readonly<InitialSetupMutationTarget>;
   readonly configTarget: Readonly<ConfigMutationTarget>;
 }
@@ -96,12 +98,30 @@ export function recordInitialSetupImportedSource(
   setupTarget: InitialSetupMutationTarget,
   configTarget: ConfigMutationTarget,
   sourcePath: string,
+  importGeneration: string,
+  configuredSensitiveKeys: readonly string[],
 ): void {
   state.importedSource = {
     sourcePath,
+    importGeneration,
+    configuredSensitiveKeys: Object.freeze([...configuredSensitiveKeys]),
     setupTarget: Object.freeze({ ...setupTarget }),
     configTarget: Object.freeze({ ...configTarget }),
   };
+}
+
+export function initialSetupImportedConfigReference(
+  state: InitialSetupAuxiliaryState,
+  setupTarget: InitialSetupMutationTarget | null,
+  configTarget: ConfigMutationTarget,
+): { importGeneration: string; configuredSensitiveKeys: readonly string[] } | null {
+  const owner = state.importedSource;
+  return owner !== null && initialSetupAuxiliaryOwnerMatches(owner, setupTarget, configTarget)
+    ? {
+      importGeneration: owner.importGeneration,
+      configuredSensitiveKeys: owner.configuredSensitiveKeys,
+    }
+    : null;
 }
 
 export function recordInitialSetupDoclingReadinessOwner(

@@ -6,10 +6,16 @@ import {
   INITIAL_SETUP_PROVIDER_API_KEY_ENV,
   INITIAL_SETUP_PROVIDER_PROFILE,
   INITIAL_SETUP_PROVIDER_PROFILE_OPTIONS,
+  INITIAL_SETUP_IMPORT_GENERATION,
+  INITIAL_SETUP_SECRET_SENTINEL,
   INITIAL_SETUP_STEPS,
   createSettingsInitialSetupScenario,
   createStableInitialSetupClosedDecision,
   expectedInitialSetupFinishCommand,
+  importedSecretEditorReady,
+  importedSecretStagedReady,
+  initialSetupImportConfig,
+  initialSetupImportedPublicOverrides,
   initialSetupStepReady,
 } from "../scenarios/settings_initial_setup.mjs";
 
@@ -60,6 +66,7 @@ function surface(step = "start", overrides = {}) {
       back: { count: step === "start" ? 0 : 1, visible: step !== "start", enabled: step !== "start" },
       finish: { count: step === "finish" ? 1 : 0, visible: step === "finish", enabled: step === "finish" },
       import_config: { count: step === "start" ? 1 : 0, visible: step === "start", enabled: step === "start" },
+      import_source: { count: step === "start" ? 1 : 0, visible: step === "start", text: "キャンセルした場合、現在のdraftは変わりません。" },
       provider: {
         profile: {
           count: step === "provider" ? 1 : 0,
@@ -78,7 +85,17 @@ function surface(step = "start", overrides = {}) {
       host_owned_config_key_counts: Object.fromEntries(
         INITIAL_SETUP_HOST_OWNED_CONFIG_KEYS.map((key) => [key, 0]),
       ),
+      sensitive_extra_headers: {
+        count: 0,
+        visible: false,
+        value: null,
+        configured: null,
+        placeholder: null,
+        status_text: null,
+        status_visible: false,
+      },
     },
+    secret_exposure: { projection: false, dom: false },
     viewport: { width: 1440, height: 900 },
     visible_shell_count: 0,
     visible_dialog_count: 0,
@@ -148,12 +165,70 @@ test("Initial Setup Finish expectation carries all values and both exact targets
       ],
       expectedConfigTarget: configTarget,
       expectedSetupTarget: setupTarget,
+      importGeneration: null,
     },
   });
+  assert.equal(
+    expectedInitialSetupFinishCommand(surface("finish"), INITIAL_SETUP_IMPORT_GENERATION).args.importGeneration,
+    INITIAL_SETUP_IMPORT_GENERATION,
+  );
+  const importedPublic = initialSetupImportedPublicOverrides("http://127.0.0.1:43111");
+  const imported = expectedInitialSetupFinishCommand(
+    surface("finish"),
+    INITIAL_SETUP_IMPORT_GENERATION,
+    {
+      "model.base_url": importedPublic["model.base_url"],
+      "model.model": importedPublic["model.model"],
+      "model.provider_profile": importedPublic["model.provider_profile"],
+      "model.api_key_env": importedPublic["model.api_key_env"],
+    },
+  );
+  assert.equal(
+    imported.args.values.find((field) => field.key === "model.api_key_env")?.text,
+    INITIAL_SETUP_PROVIDER_API_KEY_ENV,
+  );
+  assert.equal(importedPublic["docling.enabled"], "false");
   assert.throws(
     () => expectedInitialSetupFinishCommand({ projection: { config_target: configTarget, startup: { setup_target: null } } }),
     /both exact mutation targets/,
   );
+});
+
+test("Initial Setup import keeps a configured secret blank across public projection and editor state", () => {
+  const sourcePath = "C:\\e2e\\workspace\\E2E_INITIAL_SETUP_IMPORT.toml";
+  const importedStart = surface("start", {
+    projection: {
+      ...surface("start").projection,
+      config_fields: [
+        ...surface("start").projection.config_fields,
+        { key: "model.extra_headers_json", value: "", sensitive: true, configured: false },
+      ],
+    },
+    wizard: {
+      ...surface("start").wizard,
+      import_source: { count: 1, visible: true, text: `読込元: ${sourcePath}。内容はまだ保存されていません。` },
+    },
+  });
+  assert.equal(importedSecretStagedReady(importedStart, sourcePath), true);
+  assert.equal(JSON.stringify(importedStart).includes(INITIAL_SETUP_SECRET_SENTINEL), false);
+
+  const editor = surface("model", {
+    wizard: {
+      ...surface("model").wizard,
+      sensitive_extra_headers: {
+        count: 1,
+        visible: true,
+        value: "",
+        configured: "true",
+        placeholder: "設定済み（値は非表示）",
+        status_text: "設定済み・値は非表示",
+        status_visible: true,
+      },
+    },
+  });
+  assert.equal(importedSecretEditorReady(editor), true);
+  const fixture = initialSetupImportConfig("http://127.0.0.1:43111");
+  assert.equal((fixture.match(new RegExp(INITIAL_SETUP_SECRET_SENTINEL, "g")) ?? []).length, 1);
 });
 
 test("Initial Setup restart predicate requires continuous closed wizard and zero network", () => {

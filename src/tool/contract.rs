@@ -269,6 +269,7 @@ pub enum PermissionRisk {
     ProtectedWorkspaceAuthority,
     ExternalMutation,
     ExternalDestructiveOperation,
+    UnclassifiedShell,
 }
 
 impl PermissionRisk {
@@ -282,6 +283,7 @@ impl PermissionRisk {
             Self::ProtectedWorkspaceAuthority => "protected workspace authority",
             Self::ExternalMutation => "external mutation",
             Self::ExternalDestructiveOperation => "destructive external operation",
+            Self::UnclassifiedShell => "unclassified dynamic/indirect shell construct",
         }
     }
 }

@@ -11,9 +11,9 @@ use crate::app::AgentActivityRecord;
 use crate::config::{AccessMode, ConfigField, ProviderProfile, ResolvedConfig};
 use crate::llm::ProviderModelLoadState;
 use crate::runtime::AgentStatus;
-use crate::session::ActiveTurnExpectation;
+use crate::session::{ActiveTurnExpectation, ToolCallStatus};
 use crate::tool::PermissionRequest;
-use crate::tui::state::{PromptReviewPhase, RunStatus};
+use crate::tui::state::{PromptReviewPhase, RunStatus, ToolStatusView, tool_action_label};
 
 const MOYAI_PRODUCT_NAME: &str = "moyAI";
 const BUNDLED_LICENSE_TEXT: &str = include_str!("../../LICENSE");
@@ -80,6 +80,8 @@ pub struct DesktopInitialSetupMutationTargetProjection {
 pub struct DesktopConfigFieldProjection {
     pub key: String,
     pub value: String,
+    pub sensitive: bool,
+    pub configured: bool,
     pub env_override: Option<String>,
     pub value_type: String,
     pub required: bool,
@@ -202,7 +204,11 @@ pub struct DesktopSideChatProjection {
     pub last_error: String,
     pub generation: String,
     pub draft_text: String,
+    pub draft_quote: Option<DesktopSideChatDraftQuoteProjection>,
     pub draft_revision: String,
+    pub context_scope: String,
+    pub context_as_of_append_position: Option<String>,
+    pub context_truncated: bool,
     pub messages: Vec<DesktopSideChatMessageProjection>,
     pub can_send: bool,
     pub can_cancel: bool,
@@ -223,12 +229,24 @@ impl Default for DesktopSideChatProjection {
             last_error: String::new(),
             generation: "0".to_string(),
             draft_text: String::new(),
+            draft_quote: None,
             draft_revision: "0".to_string(),
+            context_scope: "owner_session".to_string(),
+            context_as_of_append_position: None,
+            context_truncated: false,
             messages: Vec::new(),
             can_send: false,
             can_cancel: false,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopSideChatDraftQuoteProjection {
+    pub source_kind: String,
+    pub source_history_item_id: String,
+    pub source_append_position: Option<String>,
+    pub selected_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -528,6 +546,9 @@ pub struct DesktopWebState {
     pub token_meter_label: String,
     pub token_meter_title: String,
     pub token_meter_level: String,
+    pub session_usage_label: String,
+    pub session_usage_title: String,
+    pub session_usage_state: String,
     pub confirmation_visible: bool,
     pub confirmation_id: Option<String>,
     pub confirmation_text: String,
@@ -801,13 +822,7 @@ pub(crate) fn desktop_web_state_with_permission(
     )
     .is_none()
         && state.app_state.prompt_review.is_none();
-    let latest_tool_summary = detail
-        .tool_status_text
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("ツール待機中")
-        .to_string();
+    let latest_tool_summary = latest_tool_public_summary(&state.app_state.tool_statuses);
     let (status_message, status_detail) = if pre_admission_active {
         ("実行を開始しています…".to_string(), String::new())
     } else {
@@ -925,7 +940,7 @@ pub(crate) fn desktop_web_state_with_permission(
         } else {
             display_run_step(&state.app_state.progress.active_step)
         },
-        latest_tool_summary: display_tool_summary(&latest_tool_summary),
+        latest_tool_summary,
         plan: state
             .app_state
             .current_plan
@@ -944,6 +959,9 @@ pub(crate) fn desktop_web_state_with_permission(
         token_meter_label: token_meter.label,
         token_meter_title: token_meter.title,
         token_meter_level: token_meter.level,
+        session_usage_label: detail.session_usage_label,
+        session_usage_title: detail.session_usage_title,
+        session_usage_state: detail.session_usage_state,
         confirmation_visible: pending_permission.is_some(),
         confirmation_id: pending_permission.map(|(id, _)| id.to_string()),
         confirmation_text,
@@ -1148,9 +1166,12 @@ fn config_field_projection(
     config: &ResolvedConfig,
 ) -> DesktopConfigFieldProjection {
     let descriptor = field.descriptor();
+    let public = field.public_value(config);
     DesktopConfigFieldProjection {
         key: descriptor.key().to_string(),
-        value: field.value(config),
+        value: public.value,
+        sensitive: public.sensitive,
+        configured: public.configured,
         env_override: descriptor.env_override().map(ToString::to_string),
         value_type: descriptor.value_type().as_str().to_string(),
         required: descriptor.required(),
@@ -1749,18 +1770,37 @@ fn display_run_step(step: &str) -> String {
     trimmed.to_string()
 }
 
-fn display_tool_summary(summary: &str) -> String {
-    let trimmed = summary.trim();
-    if trimmed.is_empty() {
+fn latest_tool_public_summary(statuses: &[ToolStatusView]) -> String {
+    let selected = statuses
+        .iter()
+        .rev()
+        .find(|tool| {
+            matches!(
+                tool.status,
+                ToolCallStatus::Failed | ToolCallStatus::Declined
+            )
+        })
+        .or_else(|| {
+            statuses.iter().rev().find(|tool| {
+                matches!(
+                    tool.status,
+                    ToolCallStatus::Pending | ToolCallStatus::Running
+                )
+            })
+        })
+        .or_else(|| statuses.last());
+    let Some(tool) = selected else {
         return "ツール待機中".to_string();
+    };
+    let action = tool_action_label(tool.tool);
+    match tool.status {
+        ToolCallStatus::Pending => format!("実行中: {action}"),
+        ToolCallStatus::Running => format!("実行中: {action}"),
+        ToolCallStatus::Completed => format!("完了: {action}"),
+        ToolCallStatus::Declined => format!("要確認: {action}は実行されませんでした"),
+        ToolCallStatus::Cancelled => format!("キャンセル: {action}"),
+        ToolCallStatus::Failed => format!("要確認: {action}を完了できませんでした"),
     }
-    if trimmed == "No tool activity yet." || trimmed == "Tool activity pending" {
-        return "ツール待機中".to_string();
-    }
-    if let Some(rest) = trimmed.strip_prefix("Running ") {
-        return format!("ツール実行中: {}", rest.trim());
-    }
-    trimmed.to_string()
 }
 
 #[cfg(test)]
@@ -1774,8 +1814,38 @@ mod tests {
         assert!(!projection.configured);
         assert_eq!(projection.status, "idle");
         assert_eq!(projection.generation, "0");
+        assert_eq!(projection.draft_quote, None);
         assert!(!projection.can_send);
         assert!(!projection.can_cancel);
+    }
+
+    #[test]
+    fn latest_tool_public_summary_is_failure_first_and_hides_raw_details() {
+        let statuses = vec![
+            crate::tui::state::ToolStatusView {
+                tool_call_id: crate::session::ToolCallId::new(),
+                tool: crate::tool::ToolName::ApplyPatch,
+                title: "C:/private/workspace/secret.rs".to_string(),
+                status: ToolCallStatus::Failed,
+                summary: None,
+                error: Some("request req_123 failed at http://private-host:9443".to_string()),
+            },
+            crate::tui::state::ToolStatusView {
+                tool_call_id: crate::session::ToolCallId::new(),
+                tool: crate::tool::ToolName::Shell,
+                title: "cargo test --all-features".to_string(),
+                status: ToolCallStatus::Completed,
+                summary: Some("complete".to_string()),
+                error: None,
+            },
+        ];
+
+        let summary = latest_tool_public_summary(&statuses);
+
+        assert_eq!(summary, "要確認: ファイルの更新を完了できませんでした");
+        assert!(!summary.contains("req_123"));
+        assert!(!summary.contains("private-host"));
+        assert!(!summary.contains("secret.rs"));
     }
     use crate::config::merge::{apply_patch, normalize_request_timeout_alias};
     use crate::config::model::{MAX_MODEL_REQUEST_TIMEOUT_MS, PartialResolvedConfig};
@@ -1962,6 +2032,50 @@ mod tests {
         assert!(ConfigField::Model.descriptor().required());
         assert!(!ConfigField::Temperature.descriptor().required());
         assert!(!ConfigField::ExtraBodyJson.descriptor().required());
+    }
+
+    #[test]
+    fn sensitive_config_projection_exposes_only_configured_state() {
+        let mut config = ResolvedConfig::default();
+        let secrets = [
+            "model-header-super-secret",
+            "model-body-super-secret",
+            "docling-header-super-secret",
+            "mcp-header-super-secret",
+        ];
+        config
+            .model
+            .extra_headers
+            .insert("Authorization".to_string(), secrets[0].to_string());
+        config.model.extra_body_json = Some(serde_json::json!({"token": secrets[1]}));
+        config
+            .docling
+            .headers
+            .insert("Authorization".to_string(), secrets[2].to_string());
+        config.mcp.servers[0]
+            .headers
+            .insert("Authorization".to_string(), secrets[3].to_string());
+
+        let projected = ConfigField::ALL
+            .into_iter()
+            .map(|field| config_field_projection(field, &config))
+            .collect::<Vec<_>>();
+        for field in projected.iter().filter(|field| field.sensitive) {
+            assert!(field.value.is_empty(), "{} must be redacted", field.key);
+            assert!(
+                field.configured,
+                "{} must retain configured state",
+                field.key
+            );
+        }
+        assert_eq!(projected.iter().filter(|field| field.sensitive).count(), 4);
+
+        let json = serde_json::to_string(&projected).expect("serialize public config projection");
+        let debug = format!("{projected:?}");
+        for secret in secrets {
+            assert!(!json.contains(secret));
+            assert!(!debug.contains(secret));
+        }
     }
 
     #[test]
@@ -2658,6 +2772,7 @@ mod tests {
             },
             pending_turn_inputs: Vec::new(),
             turn_elapsed_ms: std::collections::HashMap::new(),
+            session_token_usage: Default::default(),
             latest_turn_id: None,
             active_turn_id: None,
             active_turn_sequence_no: None,

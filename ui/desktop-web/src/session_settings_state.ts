@@ -335,6 +335,8 @@ function configField(
   return {
     key,
     value: "",
+    sensitive: false,
+    configured: true,
     env_override: null,
     value_type: valueType,
     required,

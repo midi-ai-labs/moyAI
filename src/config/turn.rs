@@ -136,6 +136,8 @@ pub enum ResolvedTurnConfigError {
     #[error("{message}")]
     DoclingRuntime { message: String },
     #[error("{message}")]
+    McpRuntime { message: String },
+    #[error("{message}")]
     WorkspaceBoundary { message: String },
 }
 
@@ -398,6 +400,9 @@ impl ResolvedTurnConfig {
             .normalize_and_validate_docling_runtime()
             .map_err(|message| ResolvedTurnConfigError::DoclingRuntime { message })?;
         effective
+            .normalize_and_validate_mcp_runtime()
+            .map_err(|message| ResolvedTurnConfigError::McpRuntime { message })?;
+        effective
             .validate_workspace_boundary_roots()
             .map_err(|message| ResolvedTurnConfigError::WorkspaceBoundary { message })?;
         let provider = ProviderTarget::from_resolved_config(&effective)?;
@@ -621,6 +626,43 @@ mod tests {
         assert!(diagnostic.contains("docling.base_url"));
         assert!(!diagnostic.contains("super-secret"));
         assert!(!diagnostic.contains("hidden"));
+    }
+
+    #[test]
+    fn complete_turn_capture_rejects_an_invalid_enabled_mcp_origin() {
+        let mut config = ResolvedConfig::default();
+        config.mcp.enabled = true;
+        config.mcp.servers[0].enabled = true;
+        config.mcp.servers[0].base_url =
+            "https://user:super-secret@mcp.example.test/rpc#fragment".to_string();
+
+        let error = ResolvedTurnConfig::capture(config)
+            .expect_err("invalid enabled MCP origin must not enter turn state");
+
+        assert!(matches!(&error, ResolvedTurnConfigError::McpRuntime { .. }));
+        let diagnostic = format!("{error:?}: {error}");
+        assert!(diagnostic.contains("mcp.servers[0].base_url"));
+        assert!(!diagnostic.contains("super-secret"));
+    }
+
+    #[test]
+    fn complete_turn_capture_rejects_mcp_query_tokens_without_disclosure() {
+        const QUERY_TOKEN: &str = "turn-mcp-query-token-must-not-be-disclosed";
+
+        let mut config = ResolvedConfig::default();
+        config.mcp.enabled = true;
+        config.mcp.servers[0].enabled = true;
+        config.mcp.servers[0].base_url =
+            format!("https://mcp.example.test/rpc?api_key={QUERY_TOKEN}");
+
+        let error = ResolvedTurnConfig::capture(config)
+            .expect_err("MCP query tokens must not enter immutable turn state");
+
+        assert!(matches!(&error, ResolvedTurnConfigError::McpRuntime { .. }));
+        let diagnostic = format!("{error:?}: {error}");
+        assert!(diagnostic.contains("mcp.servers[0].base_url"));
+        assert!(diagnostic.contains("query string"));
+        assert!(!diagnostic.contains(QUERY_TOKEN));
     }
 
     #[test]

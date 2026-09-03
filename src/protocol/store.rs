@@ -80,6 +80,18 @@ pub trait ProtocolEventStore {
         limit: usize,
         visitor: &mut dyn FnMut(ActiveHistoryPage) -> Result<(), StorageError>,
     ) -> Result<ActiveHistorySnapshot, StorageError>;
+    /// Visits active model context only when both the append-only source and
+    /// derived active view fit caller-owned hard bounds. The source check runs
+    /// before active-history materialization and the active table retains at
+    /// most `active_item_limit + 1` rows for overflow detection.
+    fn visit_bounded_active_history_pages_for_session(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+        source_item_limit: usize,
+        active_item_limit: usize,
+        visitor: &mut dyn FnMut(ActiveHistoryPage) -> Result<(), StorageError>,
+    ) -> Result<ActiveHistorySnapshot, StorageError>;
     fn history_items_by_id(
         &self,
         session_id: SessionId,
@@ -256,6 +268,7 @@ pub struct CanonicalProtocolSnapshot {
     pub history: ProtocolPage<HistoryItem>,
     pub turns: ProtocolPage<TurnItem>,
     pub turn_elapsed_ms: HashMap<TurnId, u64>,
+    pub session_token_usage: crate::session::CanonicalSessionTokenUsage,
     pub latest_turn_position: Option<(TurnId, i64)>,
 }
 
@@ -1464,6 +1477,29 @@ impl ProtocolEventStore for SqliteProtocolEventStore {
         Ok(stats.snapshot)
     }
 
+    fn visit_bounded_active_history_pages_for_session(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+        source_item_limit: usize,
+        active_item_limit: usize,
+        visitor: &mut dyn FnMut(ActiveHistoryPage) -> Result<(), StorageError>,
+    ) -> Result<ActiveHistorySnapshot, StorageError> {
+        let bounds = ActiveHistoryTraversalBounds::new(source_item_limit, active_item_limit)?;
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction()?;
+        let stats = traverse_active_history_in_transaction_with_bounds(
+            &transaction,
+            session_id,
+            None,
+            limit,
+            Some(bounds),
+            visitor,
+        )?;
+        transaction.commit()?;
+        Ok(stats.snapshot)
+    }
+
     fn history_items_by_id(
         &self,
         session_id: SessionId,
@@ -2635,14 +2671,64 @@ pub(crate) fn canonical_protocol_snapshot_from_connection(
     let turns =
         turn_item_page_from_connection(connection, session_id, turn_request, fence.turn_count)?;
     let turn_elapsed_ms = turn_elapsed_ms_from_connection(connection, session_id, &turns.items)?;
+    let session_token_usage = session_token_usage_from_connection(connection, session_id)?;
     let latest_turn_position = latest_turn_position_for_session(connection, session_id)?;
     Ok(CanonicalProtocolSnapshot {
         fence,
         history,
         turns,
         turn_elapsed_ms,
+        session_token_usage,
         latest_turn_position,
     })
+}
+
+fn session_token_usage_from_connection(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<crate::session::CanonicalSessionTokenUsage, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT msg_json
+         FROM protocol_runtime_events
+         WHERE session_id = ?1
+           AND json_extract(msg_json, '$.kind') = 'turn_terminal'
+         ORDER BY rowid ASC",
+    )?;
+    let rows = statement.query_map(params![session_id.to_string()], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut summary = crate::session::CanonicalSessionTokenUsage::default();
+    for row in rows {
+        let terminal_json = row?;
+        let RuntimeEventMsg::TurnTerminal { terminal } =
+            serde_json::from_str::<RuntimeEventMsg>(&terminal_json)?
+        else {
+            return Err(StorageError::Message(
+                "terminal runtime-event discriminator did not decode as TurnTerminal".to_string(),
+            ));
+        };
+        summary.terminal_turn_count = summary.terminal_turn_count.saturating_add(1);
+        let Some(usage) = terminal.metrics.token_usage.as_ref() else {
+            continue;
+        };
+        summary.measured_turn_count = summary.measured_turn_count.saturating_add(1);
+        summary.prompt_tokens = summary
+            .prompt_tokens
+            .saturating_add(u64::from(usage.prompt_tokens));
+        summary.completion_tokens = summary
+            .completion_tokens
+            .saturating_add(u64::from(usage.completion_tokens));
+        summary.total_tokens = summary
+            .total_tokens
+            .saturating_add(u64::from(usage.total_tokens));
+        if let Some(reasoning_tokens) = usage.reasoning_tokens {
+            summary.reasoning_measured_turn_count =
+                summary.reasoning_measured_turn_count.saturating_add(1);
+            let accumulated = summary.reasoning_tokens.get_or_insert(0);
+            *accumulated = accumulated.saturating_add(u64::from(reasoning_tokens));
+        }
+    }
+    Ok(summary)
 }
 
 fn turn_elapsed_ms_from_connection(
@@ -2720,6 +2806,80 @@ fn protocol_source_count(
         params![session_id.to_string(), source_kind],
         |row| row.get::<_, i64>(0),
     )?;
+    if table_count != append_count || table_count != joined_count {
+        return Err(StorageError::Message(format!(
+            "canonical protocol append-order invariant failed for session {session_id} source {source_kind}: table has {table_count} rows, append order has {append_count}, joined ownership has {joined_count}"
+        )));
+    }
+    usize::try_from(table_count).map_err(|_| {
+        StorageError::Message(format!(
+            "canonical protocol {source_kind} count exceeds this platform's page range"
+        ))
+    })
+}
+
+fn protocol_source_count_bounded(
+    connection: &Connection,
+    session_id: SessionId,
+    table: &'static str,
+    source_kind: &'static str,
+    limit: usize,
+) -> Result<usize, StorageError> {
+    if limit == 0 {
+        return Err(StorageError::Message(
+            "canonical protocol source limit must be greater than zero".to_string(),
+        ));
+    }
+    let fetch_limit = sqlite_page_value(limit.saturating_add(1));
+    let table_count = connection.query_row(
+        &format!(
+            "SELECT COUNT(*)
+             FROM (
+                 SELECT 1
+                 FROM {table}
+                 WHERE session_id = ?1
+                 LIMIT ?2
+             )"
+        ),
+        params![session_id.to_string(), fetch_limit],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let append_count = connection.query_row(
+        "SELECT COUNT(*)
+         FROM (
+             SELECT 1
+             FROM protocol_item_append_order
+             WHERE session_id = ?1 AND source_kind = ?2
+             LIMIT ?3
+         )",
+        params![session_id.to_string(), source_kind, fetch_limit],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let joined_count = connection.query_row(
+        &format!(
+            "SELECT COUNT(*)
+             FROM (
+                 SELECT 1
+                 FROM {table} AS source
+                 INNER JOIN protocol_item_append_order AS append_order
+                   ON append_order.session_id = source.session_id
+                  AND append_order.source_kind = ?2
+                  AND append_order.source_id = source.id
+                 WHERE source.session_id = ?1
+                 LIMIT ?3
+             )"
+        ),
+        params![session_id.to_string(), source_kind, fetch_limit],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if [table_count, append_count, joined_count]
+        .into_iter()
+        .any(|count| count > sqlite_page_value(limit))
+    {
+        return Err(StorageError::Message(format!(
+            "canonical protocol {source_kind} source exceeds the bounded scan limit of {limit} items"
+        )));
+    }
     if table_count != append_count || table_count != joined_count {
         return Err(StorageError::Message(format!(
             "canonical protocol append-order invariant failed for session {session_id} source {source_kind}: table has {table_count} rows, append order has {append_count}, joined ownership has {joined_count}"
@@ -2906,6 +3066,31 @@ fn canonical_user_authority_items_from_connection(
     Ok(items)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ActiveHistoryTraversalBounds {
+    source_item_limit: usize,
+    active_item_limit: usize,
+}
+
+impl ActiveHistoryTraversalBounds {
+    fn new(source_item_limit: usize, active_item_limit: usize) -> Result<Self, StorageError> {
+        if source_item_limit == 0 {
+            return Err(StorageError::Message(
+                "active history source item limit must be greater than zero".to_string(),
+            ));
+        }
+        if active_item_limit == 0 {
+            return Err(StorageError::Message(
+                "active history item limit must be greater than zero".to_string(),
+            ));
+        }
+        Ok(Self {
+            source_item_limit,
+            active_item_limit,
+        })
+    }
+}
+
 fn traverse_active_history_in_transaction(
     transaction: &Transaction<'_>,
     session_id: SessionId,
@@ -2913,8 +3098,26 @@ fn traverse_active_history_in_transaction(
     limit: usize,
     visitor: &mut dyn FnMut(ActiveHistoryPage) -> Result<(), StorageError>,
 ) -> Result<ActiveHistoryTraversalStats, StorageError> {
+    traverse_active_history_in_transaction_with_bounds(
+        transaction,
+        session_id,
+        expected_snapshot,
+        limit,
+        None,
+        visitor,
+    )
+}
+
+fn traverse_active_history_in_transaction_with_bounds(
+    transaction: &Transaction<'_>,
+    session_id: SessionId,
+    expected_snapshot: Option<ActiveHistorySnapshot>,
+    limit: usize,
+    bounds: Option<ActiveHistoryTraversalBounds>,
+    visitor: &mut dyn FnMut(ActiveHistoryPage) -> Result<(), StorageError>,
+) -> Result<ActiveHistoryTraversalStats, StorageError> {
     validate_active_history_page_limit(limit)?;
-    with_prepared_active_history(transaction, session_id, |snapshot| {
+    with_prepared_active_history(transaction, session_id, bounds, |snapshot| {
         if let Some(expected) = expected_snapshot {
             ensure_active_history_snapshot(session_id, expected, snapshot)?;
         }
@@ -2996,6 +3199,7 @@ fn validate_active_history_page_limit(limit: usize) -> Result<(), StorageError> 
 fn with_prepared_active_history<T>(
     connection: &Connection,
     session_id: SessionId,
+    bounds: Option<ActiveHistoryTraversalBounds>,
     operation: impl FnOnce(ActiveHistorySnapshot) -> Result<T, StorageError>,
 ) -> Result<T, StorageError> {
     connection.execute_batch(
@@ -3009,7 +3213,8 @@ fn with_prepared_active_history<T>(
          CREATE INDEX temp.idx_moyai_active_history_traversal_order
              ON moyai_active_history_traversal (effective_position, append_position);",
     )?;
-    let result = prepare_active_history_snapshot(connection, session_id).and_then(operation);
+    let result =
+        prepare_active_history_snapshot(connection, session_id, bounds).and_then(operation);
     let cleanup =
         connection.execute_batch("DROP TABLE IF EXISTS temp.moyai_active_history_traversal;");
     match (result, cleanup) {
@@ -3022,16 +3227,26 @@ fn with_prepared_active_history<T>(
 fn prepare_active_history_snapshot(
     connection: &Connection,
     session_id: SessionId,
+    bounds: Option<ActiveHistoryTraversalBounds>,
 ) -> Result<ActiveHistorySnapshot, StorageError> {
     // Validate append-order ownership exactly once for the traversal. The temp
     // table is transaction-local derived state; canonical history remains the
     // sole durable owner.
-    let canonical_count = protocol_source_count(
-        connection,
-        session_id,
-        "protocol_history_items",
-        "history_item",
-    )?;
+    let canonical_count = match bounds {
+        Some(bounds) => protocol_source_count_bounded(
+            connection,
+            session_id,
+            "protocol_history_items",
+            "history_item",
+            bounds.source_item_limit,
+        )?,
+        None => protocol_source_count(
+            connection,
+            session_id,
+            "protocol_history_items",
+            "history_item",
+        )?,
+    };
     let append_fence = connection.query_row(
         "SELECT MAX(append_position)
          FROM protocol_item_append_order
@@ -3140,12 +3355,28 @@ fn prepare_active_history_snapshot(
          INSERT INTO temp.moyai_active_history_traversal
              (history_id, effective_position, append_position)
          SELECT id, effective_position, append_position
-         FROM active_history",
-        params![session_id.to_string()],
+         FROM active_history
+         LIMIT ?2",
+        params![
+            session_id.to_string(),
+            sqlite_page_value(
+                bounds
+                    .map(|bounds| bounds.active_item_limit.saturating_add(1))
+                    .unwrap_or(usize::MAX)
+            )
+        ],
     )?;
     if active_count > canonical_count {
         return Err(StorageError::Message(format!(
             "active history for session {session_id} contains {active_count} rows but canonical history contains {canonical_count}"
+        )));
+    }
+    if let Some(bounds) = bounds
+        && active_count > bounds.active_item_limit
+    {
+        return Err(StorageError::Message(format!(
+            "active history exceeds the bounded scan limit of {} items",
+            bounds.active_item_limit
         )));
     }
     Ok(ActiveHistorySnapshot {
@@ -3979,6 +4210,15 @@ fn validate_recording_projection(
             }),
             Some(TurnItemPayload::ContextCompaction { .. }),
         ) => history_item.is_some_and(|item| item.id == *item_id) && mode == history_mode,
+        (
+            RuntimeEventMsg::DurableFeedback { feedback },
+            Some(HistoryItemPayload::DurableFeedback {
+                feedback: history_feedback,
+            }),
+            Some(TurnItemPayload::DurableFeedback {
+                feedback: turn_feedback,
+            }),
+        ) => feedback == history_feedback && feedback == turn_feedback,
         _ => false,
     };
     if allowed {
@@ -4007,6 +4247,7 @@ fn runtime_event_kind(message: &RuntimeEventMsg) -> &'static str {
         RuntimeEventMsg::ContextCompacted { .. } => "context_compacted",
         RuntimeEventMsg::FileChangesRecorded { .. } => "file_changes_recorded",
         RuntimeEventMsg::Warning { .. } => "warning",
+        RuntimeEventMsg::DurableFeedback { .. } => "durable_feedback",
         RuntimeEventMsg::TurnTerminal { .. } => "turn_terminal",
     }
 }
@@ -4741,6 +4982,97 @@ mod tests {
                 .latest_turn_position_for_session(session_id)
                 .expect("latest real turn"),
             Some((real_turn_id, 1))
+        );
+    }
+
+    #[test]
+    fn bounded_active_history_rejects_source_and_active_overflow_before_visiting() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(Arc::clone(&connection));
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let items = (0..3)
+            .map(|index| {
+                history_user_turn(
+                    session_id,
+                    turn_id,
+                    i64::from(index),
+                    i64::from(index),
+                    &format!("bounded item {index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        seed_history_batch_for_test(&store, &items[..2]);
+
+        let mut visited = 0usize;
+        let exact = store
+            .visit_bounded_active_history_pages_for_session(session_id, 1, 2, 2, &mut |page| {
+                visited = visited.saturating_add(page.items.len());
+                Ok(())
+            })
+            .expect("the exact source and active bounds remain admissible");
+        assert_eq!(exact.canonical_count, 2);
+        assert_eq!(exact.active_count, 2);
+        assert_eq!(visited, 2);
+
+        seed_history_batch_for_test(&store, &items[2..]);
+        visited = 0;
+        let active_error = store
+            .visit_bounded_active_history_pages_for_session(session_id, 1, 3, 2, &mut |page| {
+                visited = visited.saturating_add(page.items.len());
+                Ok(())
+            })
+            .expect_err("active overflow must fail before the first page");
+        assert!(
+            active_error
+                .to_string()
+                .contains("active history exceeds the bounded scan limit of 2 items")
+        );
+        assert_eq!(visited, 0);
+        assert_eq!(
+            connection
+                .lock()
+                .expect("sqlite mutex")
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM sqlite_temp_master
+                     WHERE type = 'table' AND name = ?1",
+                    params![ACTIVE_HISTORY_TRAVERSAL_TABLE],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("active-overflow traversal cleanup"),
+            0
+        );
+
+        let source_error = store
+            .visit_bounded_active_history_pages_for_session(session_id, 1, 2, 3, &mut |page| {
+                visited = visited.saturating_add(page.items.len());
+                Ok(())
+            })
+            .expect_err("source overflow must fail before active materialization");
+        assert!(source_error.to_string().contains(
+            "canonical protocol history_item source exceeds the bounded scan limit of 2 items"
+        ));
+        assert_eq!(visited, 0);
+        assert_eq!(
+            connection
+                .lock()
+                .expect("sqlite mutex")
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM sqlite_temp_master
+                     WHERE type = 'table' AND name = ?1",
+                    params![ACTIVE_HISTORY_TRAVERSAL_TABLE],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("temporary traversal cleanup"),
+            0
         );
     }
 
@@ -6806,6 +7138,88 @@ mod tests {
             1,
             "one shared turn allocator must advance the session revision exactly once"
         );
+    }
+
+    #[test]
+    fn canonical_session_usage_aggregates_measured_terminal_telemetry_without_zero_filling() {
+        let connection = Arc::new(Mutex::new(
+            Connection::open_in_memory().expect("in-memory db"),
+        ));
+        {
+            let locked = connection.lock().expect("sqlite mutex");
+            crate::storage::migration::run(&locked).expect("migrations");
+        }
+        let store = SqliteProtocolEventStore::new(Arc::clone(&connection));
+        let session_id = SessionId::new();
+        let mut measured = completed_terminal_event(session_id, TurnId::new(), 0);
+        let RuntimeEventMsg::TurnTerminal { terminal } = &mut measured.msg else {
+            unreachable!("completed terminal fixture projects a terminal runtime event");
+        };
+        terminal.metrics.token_usage = Some(crate::session::TokenUsage {
+            prompt_tokens: 1_200,
+            completion_tokens: 300,
+            total_tokens: 1_500,
+            reasoning_tokens: Some(80),
+        });
+        let mut reasoning_unreported = completed_terminal_event(session_id, TurnId::new(), 0);
+        let RuntimeEventMsg::TurnTerminal { terminal } = &mut reasoning_unreported.msg else {
+            unreachable!("completed terminal fixture projects a terminal runtime event");
+        };
+        terminal.metrics.token_usage = Some(crate::session::TokenUsage {
+            prompt_tokens: 400,
+            completion_tokens: 100,
+            total_tokens: 500,
+            reasoning_tokens: None,
+        });
+        let missing = completed_terminal_event(session_id, TurnId::new(), 0);
+        store
+            .seed_runtime_event_for_test(&measured)
+            .expect("measured terminal append");
+        store
+            .seed_runtime_event_for_test(&reasoning_unreported)
+            .expect("reasoning-unreported terminal append");
+        store
+            .seed_runtime_event_for_test(&missing)
+            .expect("unmeasured terminal append");
+
+        let usage = {
+            let locked = connection.lock().expect("sqlite mutex");
+            session_token_usage_from_connection(&locked, session_id)
+                .expect("canonical session usage")
+        };
+
+        assert_eq!(usage.terminal_turn_count, 3);
+        assert_eq!(usage.measured_turn_count, 2);
+        assert_eq!(usage.reasoning_measured_turn_count, 1);
+        assert_eq!(usage.prompt_tokens, 1_600);
+        assert_eq!(usage.completion_tokens, 400);
+        assert_eq!(usage.total_tokens, 2_000);
+        assert_eq!(usage.reasoning_tokens, Some(80));
+
+        let reasoning_missing_session_id = SessionId::new();
+        let mut reasoning_missing =
+            completed_terminal_event(reasoning_missing_session_id, TurnId::new(), 0);
+        let RuntimeEventMsg::TurnTerminal { terminal } = &mut reasoning_missing.msg else {
+            unreachable!("completed terminal fixture projects a terminal runtime event");
+        };
+        terminal.metrics.token_usage = Some(crate::session::TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            reasoning_tokens: None,
+        });
+        store
+            .seed_runtime_event_for_test(&reasoning_missing)
+            .expect("reasoning-missing terminal append");
+
+        let reasoning_missing_usage = {
+            let locked = connection.lock().expect("sqlite mutex");
+            session_token_usage_from_connection(&locked, reasoning_missing_session_id)
+                .expect("canonical reasoning-missing usage")
+        };
+        assert_eq!(reasoning_missing_usage.measured_turn_count, 1);
+        assert_eq!(reasoning_missing_usage.reasoning_measured_turn_count, 0);
+        assert_eq!(reasoning_missing_usage.reasoning_tokens, None);
     }
 
     #[test]

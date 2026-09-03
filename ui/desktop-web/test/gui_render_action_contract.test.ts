@@ -194,6 +194,9 @@ function representativeState(overrides: Partial<DesktopViewState> = {}): Desktop
     token_meter_label: "12%",
     token_meter_title: "Context use 12%",
     token_meter_level: "low",
+    session_usage_label: "セッション累計: 1.2k token（一部）",
+    session_usage_title: "canonical terminal telemetry: 2 / 3 turn計測",
+    session_usage_state: "partial",
     confirmation_visible: true,
     confirmation_id: PERMISSION_ID,
     confirmation_text: "Allow this action?",
@@ -273,7 +276,11 @@ function representativeState(overrides: Partial<DesktopViewState> = {}): Desktop
       last_error: "",
       generation: "6",
       draft_text: "Side question",
+      draft_quote: null,
       draft_revision: "3",
+      context_scope: "owner_session",
+      context_as_of_append_position: "42",
+      context_truncated: false,
       messages: [
         { id: SIDE_MESSAGE_USER, sequence_no: 1, role: "user", content: "Question" },
         { id: SIDE_MESSAGE_ASSISTANT, sequence_no: 2, role: "assistant", content: "Answer" },
@@ -1213,7 +1220,6 @@ test("each primary GUI surface retains its required action routes", () => {
     sidebar: [
       "show-shortcuts",
       "refresh",
-      "show-provider",
       "create-project-from-picker",
       "project",
       "new-project-session",
@@ -1335,6 +1341,53 @@ test("each primary GUI surface retains its required action routes", () => {
     }
   }
   assert.deepEqual(missing, []);
+});
+
+test("the sidebar connection shortcut opens Preferences instead of a duplicate provider editor", () => {
+  const html = renderSidebar(representativeState());
+
+  assert.match(html, /class="rail-item" data-action="show-config" title="PreferencesでメインLLMの既定接続を確認・変更"/);
+  assert.match(html, />接続設定<\/span>/);
+  assert.doesNotMatch(html, /class="rail-item" data-action="show-provider"/);
+});
+
+test("Preferences shows configured sensitive fields without exposing their values", () => {
+  const base = representativeState();
+  const state = representativeState({
+    confirmation_visible: false,
+    overlay: "config",
+    config_fields: [
+      ...base.config_fields,
+      {
+        key: "model.extra_headers_json",
+        value: "",
+        sensitive: true,
+        configured: true,
+        env_override: null,
+        value_type: "json",
+        required: false,
+        min_value: null,
+        max_value: null,
+        options: [],
+      },
+    ],
+  });
+
+  const html = renderOverlay(state, defaultRenderLocal());
+
+  assert.match(html, /data-config-key="model\.extra_headers_json"[^>]*data-sensitive-config="true"/);
+  assert.match(html, /placeholder="設定済み（値は非表示）"/);
+  assert.match(html, />設定済み・値は非表示</);
+  assert.doesNotMatch(html, /model-header-super-secret/);
+});
+
+test("composer shows canonical session usage separately from the context meter", () => {
+  const html = renderComposer(representativeState(), defaultRenderLocal());
+
+  assert.match(html, /class="token-meter low"/);
+  assert.match(html, /class="session-usage partial"/);
+  assert.match(html, /セッション累計: 1\.2k token（一部）/);
+  assert.match(html, /canonical terminal telemetry: 2 \/ 3 turn計測/);
 });
 
 test("Initial Setup Finish and Session Settings Apply render as text-sized primary actions", () => {

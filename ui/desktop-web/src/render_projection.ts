@@ -21,6 +21,7 @@ import type {
   UiRecoverableError,
 } from "./ui_state.ts";
 import type { ProviderProfile } from "./types.ts";
+import type { SideChatPendingQuote } from "./types.ts";
 
 /**
  * Local presentation values consumed while producing Desktop markup.
@@ -56,6 +57,7 @@ export interface DesktopRenderLocalPresentation {
   };
   readonly sideChat: {
     readonly draft: string;
+    readonly pendingQuote: SideChatPendingQuote | null;
     readonly setupBaseUrl: string;
     readonly setupProviderProfile: ProviderProfile;
     readonly setupModel: string;
@@ -123,6 +125,7 @@ export const DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION: Readonly<DesktopRenderLo
     },
     sideChat: {
       draft: "",
+      pendingQuote: null,
       setupBaseUrl: "",
       setupProviderProfile: "openai_compatible",
       setupModel: "",
@@ -223,6 +226,7 @@ function snapshotLocalPresentation(
     },
     sideChat: {
       draft: local.sideChat.draft,
+      pendingQuote: local.sideChat.pendingQuote,
       setupBaseUrl: local.sideChat.setupBaseUrl,
       setupProviderProfile: local.sideChat.setupProviderProfile,
       setupModel: local.sideChat.setupModel,

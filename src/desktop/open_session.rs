@@ -133,6 +133,7 @@ impl OpenSessionView {
         read.turns = turns;
         read.turns.session = read.session.clone();
         read.turn_elapsed_ms = turn_elapsed_ms;
+        read.session_token_usage = incoming.session_token_usage.clone();
         // The queue projection and canonical transcript are read from one
         // repository snapshot. Never merge pending input by visible text or
         // retain it from an older page: the incoming snapshot is authoritative
@@ -170,6 +171,7 @@ impl OpenSessionView {
                 .iter()
                 .map(|(turn_id, elapsed_ms)| (*turn_id, *elapsed_ms)),
         );
+        self.read.session_token_usage = incoming.session_token_usage.clone();
         self.read.turns.session = incoming.turns.session.clone();
         self.read.turns.limit = self.read.turns.limit.max(incoming.turns.limit);
         self.read.turns.total = self.read.turns.total.max(incoming.turns.total);
@@ -230,6 +232,9 @@ impl OpenSessionView {
         detail.turn_page_limit = self.stored_detail.turn_page_limit;
         detail.turn_page_total = self.stored_detail.turn_page_total;
         detail.turn_page_has_more = self.stored_detail.turn_page_has_more;
+        detail.session_usage_label = self.stored_detail.session_usage_label.clone();
+        detail.session_usage_title = self.stored_detail.session_usage_title.clone();
+        detail.session_usage_state = self.stored_detail.session_usage_state.clone();
         if detail.artifacts.is_empty() {
             let fallback = fallback_snapshot_detail.unwrap_or(&self.stored_detail);
             detail.artifacts = fallback.artifacts.clone();
@@ -688,6 +693,7 @@ mod tests {
             },
             pending_turn_inputs: Vec::new(),
             turn_elapsed_ms: Default::default(),
+            session_token_usage: Default::default(),
             latest_turn_id: None,
             active_turn_id: None,
             active_turn_sequence_no: None,
@@ -800,6 +806,44 @@ mod tests {
                 .and_then(|row| row.stable_history_identity.as_deref()),
             Some(expected_identity.as_str())
         );
+    }
+
+    #[test]
+    fn canonical_session_usage_refreshes_and_survives_live_projection() {
+        let session = session();
+        let mut initial = canonical_read(&session, 0, 50, 0, Vec::new());
+        initial.session_token_usage = crate::session::CanonicalSessionTokenUsage {
+            terminal_turn_count: 1,
+            measured_turn_count: 1,
+            reasoning_measured_turn_count: 1,
+            prompt_tokens: 80,
+            completion_tokens: 20,
+            total_tokens: 100,
+            reasoning_tokens: Some(5),
+        };
+        let mut view = OpenSessionView::from_loaded(&initial);
+        let mut incoming = canonical_read(&session, 0, 50, 0, Vec::new());
+        incoming.session_token_usage = crate::session::CanonicalSessionTokenUsage {
+            terminal_turn_count: 2,
+            measured_turn_count: 2,
+            reasoning_measured_turn_count: 2,
+            prompt_tokens: 200,
+            completion_tokens: 50,
+            total_tokens: 250,
+            reasoning_tokens: Some(15),
+        };
+
+        assert!(view.merge_contiguous(&incoming));
+        assert_eq!(view.read.session_token_usage.total_tokens, 250);
+        assert_eq!(view.stored_detail().session_usage_state, "complete");
+        assert_eq!(
+            view.stored_detail().session_usage_label,
+            "セッション累計: 250 token"
+        );
+
+        let live = view.live_detail(&AppState::default(), None);
+        assert_eq!(live.session_usage_state, "complete");
+        assert_eq!(live.session_usage_label, "セッション累計: 250 token");
     }
 
     fn transcript_row(

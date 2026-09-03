@@ -499,8 +499,10 @@ impl AgentLoop {
                                 Some(request.context.revision().as_str().to_string());
                             sink.emit(RunEvent::RecoverableRuntimeFeedback {
                                 session_id: request.session.session.id,
-                                message: format!(
-                                    "semantic compaction failed without changing history; continuing below the hard context limit: {error}"
+                                feedback: crate::session::DurableRuntimeFeedback::new(
+                                    crate::session::DurableFeedbackSeverity::Warning,
+                                    crate::session::DurableFeedbackCategory::Context,
+                                    "Semantic compaction was unavailable, so the task continued with the existing history. If the context fills up, start a new task or reduce the request.",
                                 ),
                             })?;
                         }
@@ -1080,7 +1082,7 @@ impl AgentLoop {
                         return Err(run_superseded_error(&request));
                     }
                 }
-                let failure_message = error.to_string();
+                let failure_message = error.public_message();
                 if request
                     .run_control
                     .request_cancel(RunCancellationCause::Failure(failure_message.clone()))
@@ -3032,14 +3034,7 @@ impl AgentPermissionGuardian<'_> {
             }
         }
 
-        if resolved_guardian_isolation_transport(self.request)
-            != GuardianIsolationTransport::LmStudioResponses
-        {
-            return Err(PermissionGuardianError::Request(
-                "isolated automatic permission review is only verified for the LM Studio native Responses transport; this provider/API mode was not contacted"
-                    .to_string(),
-            ));
-        }
+        let _guardian_transport = resolved_guardian_isolation_transport(self.request)?;
 
         let input = serde_json::to_string_pretty(&serde_json::json!({
             "trusted_world_state": &self.trusted_world_state.snapshot,
@@ -3183,7 +3178,7 @@ impl AgentPermissionGuardian<'_> {
                     error.token_usage(),
                 )
                 .await?;
-                return Err(PermissionGuardianError::Request(error.to_string()));
+                return Err(PermissionGuardianError::Request(error.public_message()));
             }
         };
         let collector = collector.into_inner();
@@ -3192,7 +3187,7 @@ impl AgentPermissionGuardian<'_> {
             &response,
             !collector.tool_calls.is_empty(),
         )
-        .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
+        .map_err(|error| PermissionGuardianError::Request(error.public_message()))?;
         ensure_admission_active(&self.agent_loop.store, self.request)
             .await
             .map_err(|error| PermissionGuardianError::Request(error.to_string()))?;
@@ -3350,16 +3345,21 @@ fn permission_retry_fence_outcome(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GuardianIsolationTransport {
-    LmStudioResponses,
-    Unsupported,
+    Responses,
+    ChatCompletions,
 }
 
-fn resolved_guardian_isolation_transport(request: &AgentRunRequest) -> GuardianIsolationTransport {
-    let model = &request.turn.resolved_config().runtime_config().model;
-    if model.provider_profile == crate::config::ProviderProfile::LmStudio {
-        GuardianIsolationTransport::LmStudioResponses
-    } else {
-        GuardianIsolationTransport::Unsupported
+fn resolved_guardian_isolation_transport(
+    request: &AgentRunRequest,
+) -> Result<GuardianIsolationTransport, crate::tool::permission_guardian::PermissionGuardianError> {
+    // Admission is owned by the immutable ProviderTarget captured for the turn. Matching on the
+    // canonical wire mode (rather than a profile label) admits every verified current profile and
+    // makes any future wire mode an explicit compile-time decision instead of a silent allow.
+    match request.turn.provider_target().api_mode() {
+        crate::config::ProviderApiMode::Responses => Ok(GuardianIsolationTransport::Responses),
+        crate::config::ProviderApiMode::ChatCompletions => {
+            Ok(GuardianIsolationTransport::ChatCompletions)
+        }
     }
 }
 
@@ -5804,9 +5804,10 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         );
         assert!(run.events.iter().any(|event| matches!(
             event,
-            RunEvent::RecoverableRuntimeFeedback { message, .. }
-                if message.contains("did not create a usable checkpoint")
-                    && message.contains("canonical history was left unchanged")
+            RunEvent::RecoverableRuntimeFeedback { feedback, .. }
+                if feedback.severity == crate::session::DurableFeedbackSeverity::Warning
+                    && feedback.category == crate::session::DurableFeedbackCategory::Context
+                    && feedback.public_message.contains("continued with the existing history")
         )));
         assert!(
             run.store
@@ -5870,9 +5871,10 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         );
         assert!(run.events.iter().any(|event| matches!(
             event,
-            RunEvent::RecoverableRuntimeFeedback { message, .. }
-                if message.contains("failed structural review")
-                    && message.contains("canonical history was left unchanged")
+            RunEvent::RecoverableRuntimeFeedback { feedback, .. }
+                if feedback.severity == crate::session::DurableFeedbackSeverity::Warning
+                    && feedback.category == crate::session::DurableFeedbackCategory::Context
+                    && feedback.public_message.contains("continued with the existing history")
         )));
         assert!(
             !run.events
@@ -6231,9 +6233,9 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         );
         assert!(run.events.iter().any(|event| matches!(
             event,
-            RunEvent::RecoverableRuntimeFeedback { message, .. }
-                if message.contains("provider-adjusted projected request")
-                    && message.contains("observed prompt gap")
+            RunEvent::RecoverableRuntimeFeedback { feedback, .. }
+                if feedback.severity == crate::session::DurableFeedbackSeverity::Warning
+                    && feedback.category == crate::session::DurableFeedbackCategory::Context
         )));
         assert!(
             history
@@ -6328,8 +6330,9 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         );
         assert!(run.events.iter().any(|event| matches!(
             event,
-            RunEvent::RecoverableRuntimeFeedback { message, .. }
-                if message.contains("provider-adjusted projected request")
+            RunEvent::RecoverableRuntimeFeedback { feedback, .. }
+                if feedback.severity == crate::session::DurableFeedbackSeverity::Warning
+                    && feedback.category == crate::session::DurableFeedbackCategory::Context
         )));
         assert!(
             run.store
@@ -6746,6 +6749,91 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
+    async fn provider_private_diagnostic_never_enters_durable_terminal_or_markdown_export() {
+        let secret = "RAW_PROVIDER_PAYLOAD_SECRET";
+        let request_id = crate::llm::ProviderRequestId::new();
+        let provider_error = LlmError::ProviderFailure {
+            failure: crate::llm::ProviderFailure {
+                request_id: request_id.clone(),
+                endpoint: "https://provider.example/private-route".to_string(),
+                phase: crate::llm::ProviderPhase::ProviderTerminal,
+                attempt: 1,
+                elapsed_ms: 25,
+                kind: crate::llm::ProviderFailureKind::Protocol,
+                status: None,
+                code: Some("private-provider-code".to_string()),
+                message: secret.to_string(),
+            },
+            source: Box::new(LlmError::Message(secret.to_string())),
+        };
+        let run = run_scripted_internal_with_pending_steers(
+            ResolvedConfig::default(),
+            vec![ScriptedOutcome::Error(provider_error)],
+            None,
+            Vec::new(),
+            crate::cli::ReviewDecision::Approved,
+            RunControl::new(),
+            None,
+            false,
+        )
+        .await
+        .expect("private diagnostic run setup");
+
+        let internal = run
+            .summary
+            .expect_err("provider protocol failure must fail the run")
+            .to_string();
+        assert!(
+            internal.contains(secret),
+            "private diagnostic remains available in memory"
+        );
+        let history = run
+            .store
+            .protocol_event_store()
+            .list_history_items_for_session(run.session_id)
+            .expect("canonical history");
+        let turn_id = history
+            .iter()
+            .find_map(HistoryItem::turn_id)
+            .expect("canonical user turn");
+        let terminal = run
+            .store
+            .session_repo()
+            .durable_terminal_for_turn(run.session_id, turn_id)
+            .await
+            .expect("durable terminal read")
+            .expect("durable terminal");
+        let TurnTerminalOutcome::Failed { error: public } = &terminal.outcome else {
+            panic!("expected failed terminal")
+        };
+        assert!(public.contains("malformed response"));
+        for private in [
+            secret,
+            request_id.as_str(),
+            "provider.example",
+            "private-provider-code",
+        ] {
+            assert!(!public.contains(private), "terminal leaked {private}");
+        }
+
+        let service = crate::session::SessionService::new(run.store.clone());
+        let read =
+            crate::session::markdown::canonical_markdown_export_read(&service, run.session_id)
+                .await
+                .expect("canonical export read");
+        let markdown = crate::session::canonical_session_read_to_markdown(&read);
+        assert!(markdown.contains(public));
+        for private in [
+            secret,
+            request_id.as_str(),
+            "provider.example",
+            "private-provider-code",
+        ] {
+            assert!(!markdown.contains(private), "export leaked {private}");
+        }
+    }
+
+    #[tokio::test]
     async fn automatic_compaction_bounds_source_to_oldest_semantic_prefix() {
         const CHECKPOINT: &str = VALID_C8_COMPACTION_CHECKPOINT;
 
@@ -6914,8 +7002,9 @@ You may also see them addressed as to=/root/..., which indicates your identity i
         assert_eq!(run.requests.len(), 3);
         assert!(run.events.iter().any(|event| matches!(
             event,
-            RunEvent::RecoverableRuntimeFeedback { message, .. }
-                if message.contains("semantic compaction was cancelled")
+            RunEvent::RecoverableRuntimeFeedback { feedback, .. }
+                if feedback.severity == crate::session::DurableFeedbackSeverity::Warning
+                    && feedback.category == crate::session::DurableFeedbackCategory::Context
         )));
         assert!(
             !run.events
@@ -7855,6 +7944,163 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
+    async fn auto_review_all_current_profiles_use_exact_toolless_wire_and_fail_closed() {
+        use crate::config::{ProviderApiMode, ProviderProfile, ProviderReasoningCapability};
+
+        let profiles = [
+            ProviderProfile::LmStudio,
+            ProviderProfile::OpenAiCompatible,
+            ProviderProfile::OpenAiResponses,
+            ProviderProfile::LmStudioChatCompletions,
+        ];
+        let cases = [
+            (
+                "allow",
+                Some(r#"{"decision":"allow","rationale":"authorized"}"#),
+                FinishReason::Stop,
+                ToolLifecycleStatus::Completed,
+            ),
+            (
+                "deny",
+                Some(r#"{"decision":"deny","rationale":"not authorized"}"#),
+                FinishReason::Stop,
+                ToolLifecycleStatus::Declined,
+            ),
+            (
+                "invalid",
+                Some("approval looks fine"),
+                FinishReason::Stop,
+                ToolLifecycleStatus::Declined,
+            ),
+            (
+                "provider_error",
+                None,
+                FinishReason::Error,
+                ToolLifecycleStatus::Declined,
+            ),
+        ];
+
+        for profile in profiles {
+            for (case, output, finish_reason, expected_status) in cases {
+                let mut config = ResolvedConfig::default();
+                config.permissions.access_mode = AccessMode::AutoReview;
+                config.model.provider_profile = profile;
+                let guardian_events = output.map_or_else(
+                    || {
+                        vec![LlmEvent::Finished {
+                            finish_reason: FinishReason::Error,
+                            usage: None,
+                        }]
+                    },
+                    |text| vec![LlmEvent::TextDelta(text.to_string())],
+                );
+                let label = format!("{}_{}", profile.as_str(), case);
+                let run = run_scripted(
+                    config,
+                    vec![
+                        scripted_escalated_shell_call(&label, "echo guardian-matrix"),
+                        ScriptedResponse {
+                            events: guardian_events,
+                            finish_reason,
+                        },
+                        ScriptedResponse {
+                            events: vec![LlmEvent::TextDelta("done".to_string())],
+                            finish_reason: FinishReason::Stop,
+                        },
+                    ],
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+                let summary = run
+                    .summary
+                    .unwrap_or_else(|error| panic!("{label}: {error}"));
+
+                assert_eq!(summary.status(), SessionStatus::Completed, "{label}");
+                assert_eq!(run.confirmations.len(), 0, "{label}");
+                assert_canonical_tool_statuses(&run.store, run.session_id, &[expected_status]);
+                assert_eq!(run.requests.len(), 3, "{label}");
+                let guardian_request = &run.requests[1];
+                assert_eq!(
+                    guardian_request.provider_target().api_mode(),
+                    profile.api_mode(),
+                    "{label}"
+                );
+                assert!(guardian_request.tools.is_empty(), "{label}");
+                assert!(guardian_request.tool_choice.is_none(), "{label}");
+                assert!(!guardian_request.parallel_tool_calls, "{label}");
+                assert!(guardian_request.reasoning.is_none(), "{label}");
+                assert_eq!(
+                    guardian_request.reasoning_capability,
+                    ProviderReasoningCapability::Unsupported,
+                    "{label}"
+                );
+                assert!(guardian_request.temperature.is_none(), "{label}");
+                assert!(guardian_request.top_p.is_none(), "{label}");
+                assert!(guardian_request.top_k.is_none(), "{label}");
+                assert!(guardian_request.presence_penalty.is_none(), "{label}");
+                assert!(guardian_request.frequency_penalty.is_none(), "{label}");
+                assert!(guardian_request.seed.is_none(), "{label}");
+                assert!(guardian_request.stop_sequences.is_empty(), "{label}");
+                assert!(guardian_request.extra_body.is_none(), "{label}");
+                assert!(matches!(
+                    guardian_request.messages.as_slice(),
+                    [ModelMessage::User { .. }]
+                ));
+
+                let wire = match profile.api_mode() {
+                    ProviderApiMode::Responses => crate::llm::responses::to_responses_request(
+                        guardian_request,
+                        crate::llm::responses::ResponsesRequestOptions {
+                            reasoning_request: None,
+                            reasoning_capability: ProviderReasoningCapability::Unsupported,
+                        },
+                    )
+                    .expect("Guardian Responses body"),
+                    ProviderApiMode::ChatCompletions => {
+                        crate::llm::openai_compat::to_openai_request_with_reasoning(
+                            guardian_request,
+                            None,
+                            ProviderReasoningCapability::Unsupported,
+                        )
+                        .expect("Guardian Chat Completions body")
+                    }
+                };
+                let keys = wire
+                    .as_object()
+                    .expect("Guardian request object")
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>();
+                match profile.api_mode() {
+                    ProviderApiMode::Responses => {
+                        assert_eq!(
+                            keys,
+                            ["input", "instructions", "model", "store", "stream"]
+                                .into_iter()
+                                .collect(),
+                            "{label}"
+                        );
+                        assert_eq!(wire["input"].as_array().map(Vec::len), Some(1));
+                        assert_eq!(wire["input"][0]["role"], serde_json::json!("user"));
+                    }
+                    ProviderApiMode::ChatCompletions => {
+                        assert_eq!(
+                            keys,
+                            ["messages", "model", "n", "stream", "stream_options"]
+                                .into_iter()
+                                .collect(),
+                            "{label}"
+                        );
+                        assert_eq!(wire["messages"].as_array().map(Vec::len), Some(2));
+                        assert_eq!(wire["messages"][0]["role"], serde_json::json!("system"));
+                        assert_eq!(wire["messages"][1]["role"], serde_json::json!("user"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn provider_api_key_env_is_resolved_for_each_task_and_guardian_request_without_leak() {
         const ENV_NAME: &str = "MOYAI_ROTATING_PROVIDER_KEY";
         const REQUEST_KEYS: [&str; 3] = [
@@ -8613,7 +8859,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
     }
 
     #[tokio::test]
-    async fn auto_review_unverified_transport_is_fenced_without_a_guardian_provider_request() {
+    async fn auto_review_chat_completions_transport_contacts_the_isolated_guardian() {
         let mut config = ResolvedConfig::default();
         config.permissions.access_mode = AccessMode::AutoReview;
         config.model.provider_profile = crate::config::ProviderProfile::LmStudioChatCompletions;
@@ -8623,27 +8869,35 @@ You may also see them addressed as to=/root/..., which indicates your identity i
                 scripted_escalated_shell_call("guardian_unverified_transport", "echo must-not-run"),
                 ScriptedResponse {
                     events: vec![LlmEvent::TextDelta(
-                        "reported that the Guardian transport is unsupported".to_string(),
+                        r#"{"decision":"allow","rationale":"authorized"}"#.to_string(),
                     )],
+                    finish_reason: FinishReason::Stop,
+                },
+                ScriptedResponse {
+                    events: vec![LlmEvent::TextDelta("done".to_string())],
                     finish_reason: FinishReason::Stop,
                 },
             ],
         )
         .await
-        .expect("unverified Guardian transport run");
+        .expect("Chat Completions Guardian transport run");
         let summary = run.summary.expect("completed summary");
 
         assert_eq!(summary.status(), SessionStatus::Completed);
-        assert_eq!(run.requests.len(), 2);
-        assert!(run.requests.iter().all(|request| {
-            !request
-                .system_prompt
-                .contains("independent permission guardian")
-        }));
+        assert_eq!(run.requests.len(), 3);
+        assert_eq!(
+            run.requests
+                .iter()
+                .filter(|request| request
+                    .system_prompt
+                    .contains("independent permission guardian"))
+                .count(),
+            1
+        );
         assert_canonical_tool_statuses(
             &run.store,
             run.session_id,
-            &[ToolLifecycleStatus::Declined],
+            &[ToolLifecycleStatus::Completed],
         );
     }
 
@@ -9686,7 +9940,7 @@ You may also see them addressed as to=/root/..., which indicates your identity i
             assert!(matches!(
                 run.run_control.cause(),
                 Some(RunCancellationCause::Failure(message))
-                    if message == error.to_string()
+                    if message == error.public_message()
             ));
             assert_eq!(
                 run.store

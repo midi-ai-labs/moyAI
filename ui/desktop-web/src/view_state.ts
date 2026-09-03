@@ -32,6 +32,7 @@ import {
   snapshotDraftActionTarget,
   snapshotPromptReviewMutationTarget,
 } from "./composer_target_contract.ts";
+import { initialSetupImportedConfigReference } from "./initial_setup_auxiliary_state.ts";
 
 const COMPOSER_INVALIDATING_MUTATIONS = new Set([
   "submit_prompt",
@@ -855,9 +856,15 @@ export function activeConfigDraftProjection(
 
 function activeConfigFields(state: DesktopWebState, uiState: UiLocalState) {
   const draftApplies = configDraftAppliesTo(uiState, state.config_target);
+  const importedSensitiveKeys = new Set(initialSetupImportedConfigReference(
+    uiState.initialSetupAuxiliary,
+    state.startup.setup_target,
+    state.config_target,
+  )?.configuredSensitiveKeys ?? []);
   return state.config_fields.map((field) => ({
     ...field,
     value: draftApplies ? (uiState.configDraftValues.get(field.key) ?? field.value) : field.value,
+    configured: field.sensitive && importedSensitiveKeys.has(field.key) ? true : field.configured,
   }));
 }
 

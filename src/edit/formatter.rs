@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{FormatConfig, FormatterRule, NewlineStyle};
 use crate::error::EditError;
+use crate::tool::executable::ResolvedExecutable;
 use crate::tool::os_sandbox::ProcessSandboxPlan;
 use crate::tool::process::{ManagedProcess, ManagedProcessOutput};
 use crate::tool::sandbox_process::{
@@ -28,6 +29,7 @@ pub struct ResolvedFormatterInvocation {
     target: Utf8PathBuf,
     working_directory: Utf8PathBuf,
     command: Vec<String>,
+    executable: ResolvedExecutable,
 }
 
 impl ResolvedFormatterInvocation {
@@ -47,8 +49,10 @@ impl ResolvedFormatterInvocation {
         let argv = serde_json::to_string(&self.command)
             .expect("formatter command strings must serialize as JSON");
         format!(
-            "configured formatter: target={} cwd={} argv={argv}",
-            self.target, self.working_directory
+            "configured formatter: target={} cwd={} executable={} argv={argv}",
+            self.target,
+            self.working_directory,
+            self.executable.path()
         )
     }
 }
@@ -94,6 +98,7 @@ impl Formatter {
         config: &FormatConfig,
         path: &Utf8Path,
         workspace_root: &Utf8Path,
+        shell: &crate::config::ShellConfig,
     ) -> Result<Option<ResolvedFormatterInvocation>, EditError> {
         let Some(rule) = matching_rule(config, path)? else {
             return Ok(None);
@@ -101,10 +106,24 @@ impl Formatter {
         if rule.command.is_empty() {
             return Ok(None);
         }
+        let working_directory = formatter_working_directory(path, workspace_root).to_path_buf();
+        let environment = captured_process_environment(shell);
+        let executable = resolve_formatter_executable(
+            &rule.command[0],
+            &working_directory,
+            &environment,
+            workspace_root,
+        )
+        .map_err(|error| {
+            EditError::Message(format!("formatter executable admission failed: {error}"))
+        })?;
+        let mut command = rule.command.clone();
+        command[0] = executable.path().to_string();
         Ok(Some(ResolvedFormatterInvocation {
             target: path.to_path_buf(),
-            working_directory: formatter_working_directory(path, workspace_root).to_path_buf(),
-            command: rule.command.clone(),
+            working_directory,
+            command,
+            executable,
         }))
     }
 
@@ -151,6 +170,7 @@ impl Formatter {
             let completed = execute_workspace_write(
                 profile.clone(),
                 SandboxedProcessRequest {
+                    executable: invocation.executable.clone(),
                     argv: invocation.command.clone(),
                     cwd: invocation.working_directory.clone(),
                     environment,
@@ -209,7 +229,12 @@ impl Formatter {
             });
         }
 
-        let mut command = Command::new(&invocation.command[0]);
+        invocation.executable.revalidate().map_err(|error| {
+            EditError::Message(format!(
+                "formatter executable identity revalidation failed: {error}"
+            ))
+        })?;
+        let mut command = Command::new(invocation.executable.path());
         command.args(&invocation.command[1..]);
         command.stdin(std::process::Stdio::piped());
         command.current_dir(&invocation.working_directory);
@@ -363,6 +388,20 @@ fn formatter_working_directory<'a>(
         .unwrap_or(workspace_root)
 }
 
+fn resolve_formatter_executable(
+    program: &str,
+    working_directory: &Utf8Path,
+    environment: &std::collections::HashMap<String, String>,
+    workspace_root: &Utf8Path,
+) -> Result<ResolvedExecutable, crate::tool::executable::ExecutableIdentityError> {
+    let path = Utf8Path::new(program);
+    if path.is_absolute() || program.contains(['/', '\\']) {
+        ResolvedExecutable::resolve(program, working_directory, environment)
+    } else {
+        ResolvedExecutable::resolve_from_captured_search_path(program, environment, workspace_root)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use camino::Utf8PathBuf;
@@ -373,7 +412,7 @@ mod tests {
 
     use super::{
         Formatter, FormatterExecutionOptions, ResolvedFormatterInvocation,
-        formatter_working_directory,
+        formatter_working_directory, resolve_formatter_executable,
     };
 
     fn formatter_config(command: Vec<String>) -> FormatConfig {
@@ -393,9 +432,14 @@ mod tests {
         workspace_root: &camino::Utf8Path,
     ) -> (Formatter, ResolvedFormatterInvocation) {
         let config = formatter_config(command);
-        let invocation = Formatter::resolve_invocation(&config, target, workspace_root)
-            .expect("resolve formatter")
-            .expect("matching formatter");
+        let invocation = Formatter::resolve_invocation(
+            &config,
+            target,
+            workspace_root,
+            &crate::config::ResolvedConfig::default().shell,
+        )
+        .expect("resolve formatter")
+        .expect("matching formatter");
         (Formatter::new(config), invocation)
     }
 
@@ -429,28 +473,113 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
         let target = root.join("missing/file.txt");
-        let approved = vec!["approved-formatter".to_string(), "--fix".to_string()];
+        let approved_executable =
+            Utf8PathBuf::from_path_buf(std::env::current_exe().expect("current test executable"))
+                .expect("utf8 current test executable");
+        let approved = vec![approved_executable.to_string(), "--fix".to_string()];
         let mut config = formatter_config(approved.clone());
 
-        let invocation = Formatter::resolve_invocation(&config, &target, &root)
-            .expect("resolve formatter")
-            .expect("matching formatter");
+        let invocation = Formatter::resolve_invocation(
+            &config,
+            &target,
+            &root,
+            &crate::config::ResolvedConfig::default().shell,
+        )
+        .expect("resolve formatter")
+        .expect("matching formatter");
         config.commands[0].command = vec!["replacement-formatter".to_string()];
         std::fs::create_dir_all(target.parent().expect("target parent"))
             .expect("create target parent after approval");
 
         assert_eq!(invocation.target(), target);
         assert_eq!(invocation.working_directory(), root);
-        assert_eq!(invocation.command(), approved);
+        assert_eq!(
+            crate::workspace::PathGuard::stable_identity_key(camino::Utf8Path::new(
+                &invocation.command()[0]
+            )),
+            crate::workspace::PathGuard::stable_identity_key(&approved_executable)
+        );
+        assert_eq!(&invocation.command()[1..], &approved[1..]);
         assert!(
             invocation
                 .permission_detail()
-                .contains("approved-formatter")
+                .contains(&format!("executable={}", invocation.executable.path()))
         );
         assert!(
             !invocation
                 .permission_detail()
                 .contains("replacement-formatter")
+        );
+    }
+
+    #[test]
+    fn bare_formatter_search_skips_workspace_candidates_but_explicit_paths_remain_available() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace =
+            Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 workspace");
+        let trusted =
+            Utf8PathBuf::from_path_buf(temp.path().join("trusted")).expect("utf8 trusted path");
+        std::fs::create_dir_all(&workspace).expect("workspace directory");
+        std::fs::create_dir_all(&trusted).expect("trusted directory");
+        let source = std::env::current_exe().expect("current test executable");
+        let candidate_name = if cfg!(windows) {
+            "formatter.exe"
+        } else {
+            "formatter"
+        };
+        let workspace_candidate = workspace.join(candidate_name);
+        let trusted_candidate = trusted.join(candidate_name);
+        std::fs::copy(&source, &workspace_candidate).expect("workspace formatter fixture");
+        std::fs::copy(&source, &trusted_candidate).expect("trusted formatter fixture");
+        let search_path = std::env::join_paths([workspace.as_std_path(), trusted.as_std_path()])
+            .expect("formatter search path")
+            .to_string_lossy()
+            .into_owned();
+        let mut environment = std::collections::HashMap::from([("PATH".to_string(), search_path)]);
+        if cfg!(windows) {
+            environment.insert("PATHEXT".to_string(), ".EXE".to_string());
+        }
+
+        let implicit =
+            resolve_formatter_executable("formatter", &workspace, &environment, &workspace)
+                .expect("bare formatter must resolve outside workspace");
+        assert_eq!(
+            crate::workspace::PathGuard::stable_identity_key(implicit.path()),
+            crate::workspace::PathGuard::stable_identity_key(&trusted_candidate)
+        );
+        drop(implicit);
+
+        let workspace_only_environment = std::collections::HashMap::from([
+            (
+                "PATH".to_string(),
+                workspace
+                    .as_std_path()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ("PATHEXT".to_string(), ".EXE".to_string()),
+        ]);
+        assert!(
+            resolve_formatter_executable(
+                "formatter",
+                &workspace,
+                &workspace_only_environment,
+                &workspace,
+            )
+            .is_err()
+        );
+
+        let explicit = resolve_formatter_executable(
+            workspace_candidate.as_str(),
+            &workspace,
+            &workspace_only_environment,
+            &workspace,
+        )
+        .expect("path-qualified formatter remains an explicit configuration");
+        assert_eq!(
+            crate::workspace::PathGuard::stable_identity_key(explicit.path()),
+            crate::workspace::PathGuard::stable_identity_key(&workspace_candidate)
         );
     }
 

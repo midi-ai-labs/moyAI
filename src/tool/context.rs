@@ -67,6 +67,7 @@ impl ToolFormatterPlan {
             &config.format,
             &target_guard.absolute,
             workspace.authority_root(),
+            &config.shell,
         )?
         else {
             return Ok(None);

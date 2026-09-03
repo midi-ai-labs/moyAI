@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use camino::Utf8PathBuf;
 use tokio_util::sync::CancellationToken;
 
+use crate::tool::executable::ResolvedExecutable;
 use crate::tool::os_sandbox::WorkspaceWriteSandboxProfile;
 use crate::tool::truncate::BoundedPipeOutput;
 
@@ -20,6 +21,7 @@ pub(crate) fn captured_process_environment(
 
 #[derive(Debug)]
 pub(crate) struct SandboxedProcessRequest {
+    pub executable: ResolvedExecutable,
     pub argv: Vec<String>,
     pub cwd: Utf8PathBuf,
     pub environment: HashMap<String, String>,
@@ -69,8 +71,14 @@ pub enum SandboxExecutionError {
 
 pub(crate) async fn execute_workspace_write(
     profile: WorkspaceWriteSandboxProfile,
-    request: SandboxedProcessRequest,
+    mut request: SandboxedProcessRequest,
 ) -> Result<SandboxedProcessOutput, SandboxExecutionError> {
+    let Some(program) = request.argv.first_mut() else {
+        return Err(SandboxExecutionError::InvalidProfile(
+            "sandbox process request has no executable argument".to_string(),
+        ));
+    };
+    *program = request.executable.path().to_string();
     #[cfg(windows)]
     {
         return tokio::task::spawn_blocking(move || windows::execute(profile, request))
@@ -776,10 +784,11 @@ mod windows {
                 continue;
             }
             let expected_identity = opened_object_identity(read_handle.raw())?;
-            let write_handle = match open_audit_candidate(&candidate, READ_CONTROL | WRITE_DAC) {
-                Ok(handle) => handle,
-                Err(_) => continue,
-            };
+            let write_handle = require_confirmed_world_writable_step(
+                &candidate,
+                "be opened for ACL control",
+                open_audit_candidate(&candidate, READ_CONTROL | WRITE_DAC),
+            )?;
             let write_canonical = opened_identity_path(write_handle.raw(), &candidate)?;
             let write_identity = opened_object_identity(write_handle.raw())?;
             if !same_windows_path(&canonical, &write_canonical)
@@ -789,26 +798,42 @@ mod windows {
                     "Everyone-writable sandbox audit candidate `{candidate}` changed identity"
                 )));
             }
-            let mut deny_applied = true;
             for root in roots.iter().filter(|root| root.deny_outside_root) {
-                if update_opened_path_acl(
-                    write_handle.raw(),
+                require_confirmed_world_writable_step(
                     &candidate,
-                    root.sid.raw(),
-                    AclChange::DenyWriteNonInheriting,
-                )
-                .is_err()
-                {
-                    deny_applied = false;
-                    break;
-                }
+                    "receive the active capability deny",
+                    update_opened_path_acl(
+                        write_handle.raw(),
+                        &candidate,
+                        root.sid.raw(),
+                        AclChange::DenyWriteNonInheriting,
+                    ),
+                )?;
             }
-            if !deny_applied {
-                continue;
+            let final_canonical = opened_identity_path(write_handle.raw(), &candidate)?;
+            let final_identity = opened_object_identity(write_handle.raw())?;
+            if !same_windows_path(&write_canonical, &final_canonical)
+                || write_identity != final_identity
+            {
+                return Err(SandboxExecutionError::Initialization(format!(
+                    "Everyone-writable sandbox audit candidate `{candidate}` changed identity after deny application"
+                )));
             }
             retained.push(write_handle);
         }
         Ok(retained)
+    }
+
+    fn require_confirmed_world_writable_step<T>(
+        candidate: &camino::Utf8Path,
+        action: &str,
+        result: Result<T, SandboxExecutionError>,
+    ) -> Result<T, SandboxExecutionError> {
+        result.map_err(|error| {
+            SandboxExecutionError::Initialization(format!(
+                "Everyone-writable sandbox audit candidate `{candidate}` could not {action} before spawn: {error}"
+            ))
+        })
     }
 
     fn world_writable_audit_candidates(
@@ -2091,6 +2116,11 @@ mod windows {
         if request.cancel.is_cancelled() {
             return Ok(cancelled_before_effect(Vec::new(), true));
         }
+        request.executable.revalidate().map_err(|error| {
+            SandboxExecutionError::Initialization(format!(
+                "sandbox executable identity revalidation failed: {error}"
+            ))
+        })?;
         let spawned = unsafe {
             CreateProcessAsUserW(
                 token.raw(),
@@ -2739,7 +2769,8 @@ mod windows {
             cancelled_before_effect, canonical_windows_path_is_local, capability_sid_for_root,
             create_workspace_write_token, effect_temp_finalization_for_result, environment_block,
             finalize_effect_local_temp, normalize_windows_identity, open_current_process_token,
-            run_with_effect_temp_panic_boundary, token_logon_sid, token_user_sid, world_sid,
+            require_confirmed_world_writable_step, run_with_effect_temp_panic_boundary,
+            token_logon_sid, token_user_sid, world_sid,
         };
         use crate::tool::os_sandbox::{SandboxPathSnapshot, WindowsSandboxObjectIdentity};
         use camino::Utf8PathBuf;
@@ -2780,6 +2811,24 @@ mod windows {
                 "{errors:?}"
             );
             std::fs::remove_dir_all(path).expect("remove retained test directory");
+        }
+
+        #[test]
+        fn confirmed_everyone_writable_acl_failure_is_fail_closed_before_spawn() {
+            let candidate = camino::Utf8Path::new(r"C:\outside\everyone-writable");
+            let result = require_confirmed_world_writable_step::<()>(
+                candidate,
+                "receive the active capability deny",
+                Err(SandboxExecutionError::Initialization(
+                    "fault-injected WRITE_DAC failure".to_string(),
+                )),
+            );
+
+            let error = result.expect_err("confirmed Everyone-write ACL failure must abort");
+            let message = error.to_string();
+            assert!(message.contains("Everyone-writable sandbox audit candidate"));
+            assert!(message.contains("before spawn"));
+            assert!(message.contains("WRITE_DAC failure"));
         }
 
         #[test]
@@ -3025,6 +3074,16 @@ mod integration_tests {
         path.as_str().replace('\'', "''")
     }
 
+    fn test_resolved_powershell() -> crate::tool::executable::ResolvedExecutable {
+        let shell = ResolvedConfig::default().shell;
+        let environment = captured_process_environment(&shell);
+        let cwd =
+            Utf8PathBuf::from_path_buf(std::env::current_dir().expect("current test directory"))
+                .expect("utf8 current test directory");
+        crate::tool::executable::ResolvedExecutable::resolve("powershell.exe", &cwd, &environment)
+            .expect("resolve Windows PowerShell executable")
+    }
+
     #[tokio::test]
     async fn restricted_child_writes_allowed_roots_but_not_outside_or_protected_authority() {
         std::fs::create_dir_all("target").expect("target directory");
@@ -3121,6 +3180,7 @@ mod integration_tests {
         let output = execute_workspace_write(
             profile,
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: vec![
                     "powershell.exe".to_string(),
                     "-NoProfile".to_string(),
@@ -3221,6 +3281,7 @@ mod integration_tests {
             let output = execute_workspace_write(
                 profile.clone(),
                 SandboxedProcessRequest {
+                    executable: test_resolved_powershell(),
                     argv: vec![
                         "powershell.exe".to_string(),
                         "-NoProfile".to_string(),
@@ -3313,6 +3374,7 @@ mod integration_tests {
         let error = execute_workspace_write(
             profile,
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: vec![
                     "powershell.exe".to_string(),
                     "-NoProfile".to_string(),
@@ -3373,6 +3435,7 @@ mod integration_tests {
         let error = execute_workspace_write(
             profile,
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: vec![
                     "powershell.exe".to_string(),
                     "-NoProfile".to_string(),
@@ -3443,6 +3506,7 @@ mod integration_tests {
         let error = execute_workspace_write(
             profile,
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: vec![
                     "powershell.exe".to_string(),
                     "-NoProfile".to_string(),
@@ -3534,6 +3598,7 @@ mod integration_tests {
             execute_workspace_write(
                 first_profile,
                 SandboxedProcessRequest {
+                    executable: test_resolved_powershell(),
                     argv: vec![
                         "powershell.exe".to_string(),
                         "-NoProfile".to_string(),
@@ -3581,6 +3646,7 @@ mod integration_tests {
         let second_result = execute_workspace_write(
             profile,
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: vec![
                     "powershell.exe".to_string(),
                     "-NoProfile".to_string(),
@@ -3676,6 +3742,7 @@ mod integration_tests {
             let output = execute_workspace_write(
                 profile.clone(),
                 SandboxedProcessRequest {
+                    executable: test_resolved_powershell(),
                     argv: vec![
                         "powershell.exe".to_string(),
                         "-NoProfile".to_string(),
@@ -3748,6 +3815,7 @@ mod integration_tests {
         let output = execute_workspace_write(
             profile.clone(),
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: command.clone(),
                 cwd: workspace_root.clone(),
                 environment: captured_process_environment(&config.shell),
@@ -3770,6 +3838,7 @@ mod integration_tests {
         let error = execute_workspace_write(
             profile.clone(),
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: command.clone(),
                 cwd: workspace_root.clone(),
                 environment: captured_process_environment(&config.shell),
@@ -3792,6 +3861,7 @@ mod integration_tests {
         let error = execute_workspace_write(
             profile,
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: command,
                 cwd: workspace_root,
                 environment: captured_process_environment(&config.shell),
@@ -3839,6 +3909,7 @@ mod integration_tests {
         let error = execute_workspace_write(
             profile,
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: vec![
                     "powershell.exe".to_string(),
                     "-NoProfile".to_string(),
@@ -3904,6 +3975,7 @@ mod integration_tests {
         let error = execute_workspace_write(
             profile,
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: vec![
                     "powershell.exe".to_string(),
                     "-NoProfile".to_string(),
@@ -3974,6 +4046,7 @@ mod integration_tests {
         let output = execute_workspace_write(
             profile,
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: vec![
                     "powershell.exe".to_string(),
                     "-NoProfile".to_string(),
@@ -4042,6 +4115,7 @@ mod integration_tests {
             execute_workspace_write(
                 victim_profile,
                 SandboxedProcessRequest {
+                    executable: test_resolved_powershell(),
                     argv: vec![
                         "powershell.exe".to_string(),
                         "-NoProfile".to_string(),
@@ -4097,6 +4171,7 @@ mod integration_tests {
         let attacker = execute_workspace_write(
             attacker_profile,
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: vec![
                     "powershell.exe".to_string(),
                     "-NoProfile".to_string(),
@@ -4184,6 +4259,7 @@ mod integration_tests {
         let output = execute_workspace_write(
             profile,
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: vec![
                     "powershell.exe".to_string(),
                     "-NoProfile".to_string(),
@@ -4236,6 +4312,7 @@ mod integration_tests {
         let output = execute_workspace_write(
             profile,
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: vec![
                     "powershell.exe".to_string(),
                     "-NoProfile".to_string(),
@@ -4321,6 +4398,7 @@ mod integration_tests {
         let output = execute_workspace_write(
             profile,
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: vec![
                     "powershell.exe".to_string(),
                     "-NoProfile".to_string(),
@@ -4376,6 +4454,7 @@ mod integration_tests {
         let output = execute_workspace_write(
             profile,
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: vec![
                     "powershell.exe".to_string(),
                     "-NoProfile".to_string(),
@@ -4448,6 +4527,7 @@ mod integration_tests {
             execute_workspace_write(
                 profile,
                 SandboxedProcessRequest {
+                    executable: test_resolved_powershell(),
                     argv: vec![
                         "powershell.exe".to_string(),
                         "-NoProfile".to_string(),
@@ -4542,6 +4622,7 @@ mod integration_tests {
         let output = execute_workspace_write(
             profile,
             SandboxedProcessRequest {
+                executable: test_resolved_powershell(),
                 argv: vec![
                     "powershell.exe".to_string(),
                     "-NoProfile".to_string(),
@@ -4625,6 +4706,7 @@ mod integration_tests {
             execute_workspace_write(
                 profile,
                 SandboxedProcessRequest {
+                    executable: test_resolved_powershell(),
                     argv: vec![
                         "powershell.exe".to_string(),
                         "-NoProfile".to_string(),

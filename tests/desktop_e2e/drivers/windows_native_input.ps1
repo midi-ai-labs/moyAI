@@ -1,7 +1,7 @@
 #Requires -Version 7.4
 param(
   [Parameter(Mandatory)]
-  [ValidateSet("Snapshot", "ProbeWindow", "SendEscape", "DragWindow", "CloseDialog", "CapturePng", "CloseCleanup")]
+  [ValidateSet("Snapshot", "ProbeWindow", "SendEscape", "DragWindow", "CloseDialog", "SelectFile", "CapturePng", "CloseCleanup")]
   [string]$Action,
   [string]$ExecutionRoot,
   [string]$OwnerPath,
@@ -11,7 +11,8 @@ param(
   [int]$ClientOffsetX = -1,
   [int]$ClientOffsetY = -1,
   [int]$DragDeltaX = 0,
-  [int]$DragDeltaY = 0
+  [int]$DragDeltaY = 0,
+  [string]$SelectedPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -670,6 +671,94 @@ function Resolve-ExactUiaWindowClose {
   }
 }
 
+function Resolve-ExactUiaFileItem {
+  param(
+    [Parameter(Mandatory)][object]$Candidate,
+    [Parameter(Mandatory)][string]$FileName
+  )
+  $window = Resolve-ExactUiaWindowClose -Candidate $Candidate
+  $descendants = $window.element.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    [System.Windows.Automation.Condition]::TrueCondition
+  )
+  $matches = [Collections.Generic.List[object]]::new()
+  foreach ($element in $descendants) {
+    if (
+      [string]$element.Current.Name -ceq $FileName -and
+      [int]$element.Current.ProcessId -eq [int]$Candidate.row.process_id -and
+      [bool]$element.Current.IsEnabled -and
+      -not [bool]$element.Current.IsOffscreen -and
+      (
+        $element.Current.ControlType -eq [System.Windows.Automation.ControlType]::DataItem -or
+        $element.Current.ControlType -eq [System.Windows.Automation.ControlType]::ListItem
+      )
+    ) {
+      $matches.Add($element)
+    }
+  }
+  if ($matches.Count -ne 1) {
+    $namedControls = @($descendants | Where-Object {
+      [string]$_.Current.Name -ceq $FileName
+    } | ForEach-Object {
+      [ordered]@{
+        automation_id = [string]$_.Current.AutomationId
+        name = [string]$_.Current.Name
+        control_type = [string]$_.Current.ControlType.ProgrammaticName
+        class_name = [string]$_.Current.ClassName
+        process_id = [int]$_.Current.ProcessId
+        enabled = [bool]$_.Current.IsEnabled
+        offscreen = [bool]$_.Current.IsOffscreen
+      }
+    })
+    $diagnosticJson = ConvertTo-Json -InputObject $namedControls -Compress -Depth 4
+    throw "Exact native file dialog must expose one enabled on-screen DataItem/ListItem named '$FileName'; matches=$diagnosticJson"
+  }
+  $item = $matches[0]
+  $bounds = $item.Current.BoundingRectangle
+  if ([double]$bounds.Width -le 0 -or [double]$bounds.Height -le 0) {
+    throw "Exact native file item has no actionable bounds"
+  }
+  [object]$selectionPattern = $null
+  if (-not $item.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$selectionPattern)) {
+    throw "Exact native file item does not expose UI Automation SelectionItemPattern"
+  }
+  [object]$invokePattern = $null
+  $hasInvokePattern = $item.TryGetCurrentPattern(
+    [System.Windows.Automation.InvokePattern]::Pattern,
+    [ref]$invokePattern
+  )
+  if (-not $hasInvokePattern) {
+    $supportedPatterns = @($item.GetSupportedPatterns() | ForEach-Object { $_.ProgrammaticName })
+    $patternsJson = ConvertTo-Json -InputObject $supportedPatterns -Compress
+    throw "Exact native file item does not expose InvokePattern; supported_patterns=$patternsJson"
+  }
+  return [ordered]@{
+    window = $window
+    element = $item
+    selection_pattern = $selectionPattern
+    invoke_pattern = $invokePattern
+    evidence = [ordered]@{
+      window = $window.evidence
+      automation_id = [string]$item.Current.AutomationId
+      name = [string]$item.Current.Name
+      control_type = [string]$item.Current.ControlType.ProgrammaticName
+      class_name = [string]$item.Current.ClassName
+      runtime_id = @($item.GetRuntimeId())
+      process_id = [int]$item.Current.ProcessId
+      enabled = [bool]$item.Current.IsEnabled
+      offscreen = [bool]$item.Current.IsOffscreen
+      bounding_rect = [ordered]@{
+        left = [double]$bounds.Left
+        top = [double]$bounds.Top
+        width = [double]$bounds.Width
+        height = [double]$bounds.Height
+      }
+      selection_item_pattern = $true
+      invoke_pattern = [bool]$hasInvokePattern
+    }
+  }
+}
+
 function Write-Result {
   param([Parameter(Mandatory)][object]$Value)
   ConvertTo-Json -InputObject $Value -Compress -Depth 10
@@ -1051,6 +1140,59 @@ switch ($Action) {
       window_pattern_verified = $true
       foreground_required = $false
       input = "Windows UI Automation WindowPattern.Close()"
+      cleanup_only = $false
+      representative_input = $true
+    })
+  }
+  "SelectFile" {
+    if ([string]::IsNullOrWhiteSpace($SelectedPath)) {
+      throw "SelectFile requires SelectedPath"
+    }
+    $resolvedSelectedPath = [IO.Path]::GetFullPath($SelectedPath)
+    if (-not [IO.Path]::IsPathFullyQualified($resolvedSelectedPath)) {
+      throw "SelectFile requires an absolute SelectedPath"
+    }
+    if (-not (Test-Path -LiteralPath $resolvedSelectedPath -PathType Leaf)) {
+      throw "SelectFile SelectedPath is not an existing file"
+    }
+    $candidate = Resolve-ExactCandidate -Owner $validatedOwner
+    $fileName = [IO.Path]::GetFileName($resolvedSelectedPath)
+    $fileItem = $null
+    $fileItemError = $null
+    for ($attempt = 1; $attempt -le 20; $attempt++) {
+      try {
+        $fileItem = Resolve-ExactUiaFileItem -Candidate $candidate -FileName $fileName
+        break
+      } catch {
+        $fileItemError = $_.Exception.Message
+        if ($attempt -lt 20) { Start-Sleep -Milliseconds 100 }
+      }
+    }
+    if ($null -eq $fileItem) {
+      throw "SelectFile exact native file item did not become actionable within 2 seconds: $fileItemError"
+    }
+    $fileItem.selection_pattern.Select()
+    Start-Sleep -Milliseconds 50
+    if (-not [bool]$fileItem.selection_pattern.Current.IsSelected) {
+      throw "SelectFile could not verify exact native file item selection"
+    }
+    $candidateAfterSelection = Resolve-ExactCandidate -Owner $validatedOwner
+    $fileItem.invoke_pattern.Invoke()
+    $defaultActionPattern = "InvokePattern.Invoke()"
+    Start-Sleep -Milliseconds 300
+    Write-Result ([ordered]@{
+      window = $candidateAfterSelection.row
+      attempted = $true
+      attempt_count = 1
+      selected_path = $resolvedSelectedPath
+      delivery_verified = $true
+      file_item_selection_verified = $true
+      file_item_default_action_verified = $true
+      default_action_pattern = $defaultActionPattern
+      file_item = $fileItem.evidence
+      request_count = 1
+      foreground_required = $false
+      input = "Windows UI Automation exact file item SelectionItemPattern.Select() and default action"
       cleanup_only = $false
       representative_input = $true
     })

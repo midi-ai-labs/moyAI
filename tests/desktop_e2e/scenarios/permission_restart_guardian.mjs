@@ -22,7 +22,8 @@ import {
 import { captureScenarioScreenshot } from "./observations.mjs";
 import { acquireInteractiveShell, requestGracefulExit } from "./shell_baseline.mjs";
 
-const OWNER = "scenario:permission.restart-guardian";
+const RESPONSES_API_MODE = "responses";
+const CHAT_COMPLETIONS_API_MODE = "chat_completions";
 const PRESSURE_KEY = "moyai.desktop-e2e.permission-restart-guardian-pressure.v1";
 const PRESSURE_WORKERS = 8;
 const PRESSURE_MINIMUM_COMPLETED = 512;
@@ -69,11 +70,37 @@ function errorObservation(error) {
   };
 }
 
-export function permissionRestartGuardianFixtureConfig(baseUrl) {
+function permissionRestartGuardianWire(apiMode) {
+  if (apiMode === RESPONSES_API_MODE) {
+    return {
+      route: "responses",
+      pathname: "/v1/responses",
+      metadataRoutes: ["models", "lm_studio_models"],
+      providerProfile: "lm_studio",
+      scenarioId: "permission.restart-guardian",
+    };
+  }
+  if (apiMode === CHAT_COMPLETIONS_API_MODE) {
+    return {
+      route: "chat_completions",
+      pathname: "/v1/chat/completions",
+      metadataRoutes: ["models"],
+      providerProfile: "openai_compatible",
+      scenarioId: "permission.restart-guardian-chat",
+    };
+  }
+  throw new TypeError(`unsupported permission restart Guardian API mode: ${apiMode}`);
+}
+
+export function permissionRestartGuardianFixtureConfig(
+  baseUrl,
+  { apiMode = RESPONSES_API_MODE } = {},
+) {
+  const wire = permissionRestartGuardianWire(apiMode);
   return `[model]
 base_url = ${JSON.stringify(baseUrl)}
 model = "e2e/scripted-responses"
-provider_profile = "lm_studio"
+provider_profile = ${JSON.stringify(wire.providerProfile)}
 connect_timeout_ms = 1000
 request_timeout_ms = 30000
 max_retries = 0
@@ -99,28 +126,34 @@ enabled = false
 `;
 }
 
-function responseRows(ledger) {
-  return Array.isArray(ledger) ? ledger.filter((row) => row?.route === "responses") : [];
+export function permissionRestartGuardianChatFixtureConfig(baseUrl) {
+  return permissionRestartGuardianFixtureConfig(baseUrl, {
+    apiMode: CHAT_COMPLETIONS_API_MODE,
+  });
 }
 
-function acceptedMetadataRow(row) {
-  return (row?.route === "models" || row?.route === "lm_studio_models")
+function responseRows(ledger, apiMode = RESPONSES_API_MODE) {
+  const { route } = permissionRestartGuardianWire(apiMode);
+  return Array.isArray(ledger) ? ledger.filter((row) => row?.route === route) : [];
+}
+
+function acceptedMetadataRow(row, apiMode = RESPONSES_API_MODE) {
+  const { metadataRoutes } = permissionRestartGuardianWire(apiMode);
+  return metadataRoutes.includes(row?.route)
     && row.method === "GET"
     && row.response_phase === "completed"
     && row.response_status === 200;
 }
 
-function rejectedMetadataRow(row) {
-  return (row?.route !== "models" && row?.route !== "lm_studio_models")
-    || row?.method !== "GET"
-    || row?.response_phase === "rejected"
-    || (row?.response_status !== null && row.response_status !== 200);
+function rejectedMetadataRow(row, apiMode = RESPONSES_API_MODE) {
+  return !acceptedMetadataRow(row, apiMode);
 }
 
-function acceptedResponseRow(row, role, phase = "completed") {
-  return row?.route === "responses"
+function acceptedResponseRow(row, role, phase = "completed", apiMode = RESPONSES_API_MODE) {
+  const wire = permissionRestartGuardianWire(apiMode);
+  return row?.route === wire.route
     && row.method === "POST"
-    && row.pathname === "/v1/responses"
+    && row.pathname === wire.pathname
     && row.query_present === false
     && row.contract?.pass === true
     && row.contract.role === role
@@ -130,35 +163,49 @@ function acceptedResponseRow(row, role, phase = "completed") {
 
 export function exactPermissionRestartGuardianLedger(ledger, expectedRoles, {
   heldRole = null,
+  apiMode = RESPONSES_API_MODE,
 } = {}) {
   if (!Array.isArray(ledger) || !Array.isArray(expectedRoles)) return false;
-  if (ledger.some((row) => row?.route !== "responses" && !acceptedMetadataRow(row))) return false;
-  const rows = responseRows(ledger);
+  const { route } = permissionRestartGuardianWire(apiMode);
+  if (ledger.some((row) => row?.route !== route && !acceptedMetadataRow(row, apiMode))) return false;
+  const rows = responseRows(ledger, apiMode);
   return rows.length === expectedRoles.length
     && rows.every((row, index) => acceptedResponseRow(
       row,
       expectedRoles[index],
       expectedRoles[index] === heldRole ? "held" : "completed",
+      apiMode,
     ));
 }
 
-export function permissionRestartGuardianReviewObserved(ledger) {
+export function permissionRestartGuardianReviewObserved(ledger, {
+  apiMode = RESPONSES_API_MODE,
+} = {}) {
+  const { route } = permissionRestartGuardianWire(apiMode);
   if (!Array.isArray(ledger)
-    || ledger.some((row) => row?.route !== "responses" && !acceptedMetadataRow(row))) return false;
-  const rows = responseRows(ledger);
+    || ledger.some((row) => row?.route !== route && !acceptedMetadataRow(row, apiMode))) return false;
+  const rows = responseRows(ledger, apiMode);
   return rows.length >= 3
     && rows.length <= PERMISSION_RESTART_GUARDIAN_ROLES.length
     && rows.every((row, index) => acceptedResponseRow(
       row,
       PERMISSION_RESTART_GUARDIAN_ROLES[index],
+      "completed",
+      apiMode,
     ));
 }
 
-function providerOrSurfaceFailed(surface, ledger, maximumResponses) {
-  const rows = responseRows(ledger);
+function providerOrSurfaceFailed(
+  surface,
+  ledger,
+  maximumResponses,
+  apiMode = RESPONSES_API_MODE,
+) {
+  const { route } = permissionRestartGuardianWire(apiMode);
+  const rows = responseRows(ledger, apiMode);
   return !Array.isArray(ledger)
     || rows.length > maximumResponses
-    || ledger.some((row) => row?.route !== "responses" && rejectedMetadataRow(row))
+    || ledger.some((row) => row?.route !== route && rejectedMetadataRow(row, apiMode))
     || rows.some((row) => row?.contract?.pass === false
       || row?.response_phase === "rejected"
       || (row?.response_status !== null && row.response_status !== 200))
@@ -220,7 +267,11 @@ function settledSurface(surface) {
     && surface?.visible_recoverable_error_count === 0;
 }
 
-export function permissionRestartGuardianTerminalFailures(surface, seedOwner = null) {
+export function permissionRestartGuardianTerminalFailures(
+  surface,
+  seedOwner = null,
+  apiMode = RESPONSES_API_MODE,
+) {
   const projection = surface?.projection;
   const owner = idleOwner(projection);
   const conversation = primaryConversation(projection);
@@ -246,6 +297,26 @@ export function permissionRestartGuardianTerminalFailures(surface, seedOwner = n
     || BigInt(owner.admissionRevision) !== BigInt(seedOwner.admissionRevision) + 1n)) {
     failures.push("post-restart-turn-owner-mismatch");
   }
+  if (apiMode === CHAT_COMPLETIONS_API_MODE) {
+    if (projection?.session_usage_state !== "partial") {
+      failures.push("session-reasoning-usage-state-mismatch");
+    }
+    if (!projection?.session_usage_label?.includes("reasoning未計測")) {
+      failures.push("session-reasoning-usage-label-mismatch");
+    }
+    if (!projection?.session_usage_title?.includes("reasoning 未計測")) {
+      failures.push("session-reasoning-usage-title-mismatch");
+    }
+    if (/reasoning\s+0(?:\D|$)/.test(projection?.session_usage_title ?? "")) {
+      failures.push("session-reasoning-usage-misreported-zero");
+    }
+  } else if (apiMode === RESPONSES_API_MODE) {
+    if (projection?.session_usage_state !== "complete") {
+      failures.push("session-usage-state-mismatch");
+    }
+  } else {
+    failures.push("unsupported-api-mode");
+  }
   return [...new Set(failures)];
 }
 
@@ -269,18 +340,19 @@ export function createPermissionRestartGuardianStableRestartDecision(
   seedOwner,
   minimumStableMs = RESTART_STABILITY_MS,
   now = () => Date.now(),
+  apiMode = RESPONSES_API_MODE,
 ) {
   if (!Number.isFinite(minimumStableMs) || minimumStableMs <= 0) {
     throw new TypeError("permission Guardian restart stability must be positive");
   }
   let acceptedSince = null;
   return ({ surface, ledger }) => {
-    if (providerOrSurfaceFailed(surface, ledger, 1)) {
+    if (providerOrSurfaceFailed(surface, ledger, 1, apiMode)) {
       acceptedSince = null;
       return "fail";
     }
     const owner = idleOwner(surface?.projection);
-    if (!exactPermissionRestartGuardianLedger(ledger, ["guardian_seed"])
+    if (!exactPermissionRestartGuardianLedger(ledger, ["guardian_seed"], { apiMode })
       || seedTerminalFailures(surface).length !== 0) {
       acceptedSince = null;
       return settledSurface(surface) ? "fail" : "pending";
@@ -586,7 +658,9 @@ async function settleProbes(state, input, commands, primaryError) {
   }
 }
 
-export function createPermissionRestartGuardianScenario() {
+function createPermissionRestartGuardianScenarioForApiMode(apiMode) {
+  const wire = permissionRestartGuardianWire(apiMode);
+  const owner = `scenario:${wire.scenarioId}`;
   const state = {
     provider: null,
     acceptedLedger: null,
@@ -595,7 +669,7 @@ export function createPermissionRestartGuardianScenario() {
     pressureOutcome: null,
   };
   return Object.freeze({
-    id: "permission.restart-guardian",
+    id: wire.scenarioId,
     productOracle: "pass",
     manualGate: "not_required",
     databaseRequired: true,
@@ -603,6 +677,7 @@ export function createPermissionRestartGuardianScenario() {
     async prepare({ context, sink, phase }) {
       state.provider = await startScriptedProvider({
         script: createPermissionRestartGuardianProviderScript({
+          apiMode,
           seedPrompt: PERMISSION_RESTART_GUARDIAN_SEED_PROMPT,
           seedResponseText: PERMISSION_RESTART_GUARDIAN_SEED_RESPONSE,
           taskPrompt: PERMISSION_RESTART_GUARDIAN_TASK_PROMPT,
@@ -616,21 +691,23 @@ export function createPermissionRestartGuardianScenario() {
         context,
         sink,
         phase,
-        owner: OWNER,
-        configText: permissionRestartGuardianFixtureConfig(state.provider.baseUrl),
-        sentinelName: "E2E_PERMISSION_RESTART_GUARDIAN.txt",
+        owner,
+        configText: permissionRestartGuardianFixtureConfig(state.provider.baseUrl, { apiMode }),
+        sentinelName: apiMode === CHAT_COMPLETIONS_API_MODE
+          ? "E2E_PERMISSION_RESTART_GUARDIAN_CHAT.txt"
+          : "E2E_PERMISSION_RESTART_GUARDIAN.txt",
         sentinelText: "moyAI Desktop E2E restart and Guardian storage fixture.\n",
       });
       await sink.record("permission-guardian-provider-started", state.provider.resourceObservation(), {
         phase,
-        owner: OWNER,
+        owner,
       });
     },
     async execute({ context, driver: firstCdp, host, sink }) {
       const provider = state.provider;
       if (provider === null) throw new Error("permission Guardian scripted provider was not prepared");
       await acquireInteractiveShell({ context, driver: firstCdp, sink }, {
-        evidenceOwner: OWNER,
+        evidenceOwner: owner,
         screenshotStem: "permission-guardian-shell-ready",
       });
 
@@ -657,8 +734,12 @@ export function createPermissionRestartGuardianScenario() {
             ledger: provider.requestLedger,
           }),
           decide: ({ surface, ledger }) => {
-            if (providerOrSurfaceFailed(surface, ledger, 1)) return "fail";
-            if (!exactPermissionRestartGuardianLedger(ledger, ["guardian_seed"])) return "pending";
+            if (providerOrSurfaceFailed(surface, ledger, 1, apiMode)) return "fail";
+            if (!exactPermissionRestartGuardianLedger(
+              ledger,
+              ["guardian_seed"],
+              { apiMode },
+            )) return "pending";
             const failures = seedTerminalFailures(surface);
             return failures.length === 0 ? "pass" : settledSurface(surface) ? "fail" : "pending";
           },
@@ -676,7 +757,7 @@ export function createPermissionRestartGuardianScenario() {
           cdp: firstCdp,
           sink,
           name: "permission-guardian-seed-terminal",
-          owner: OWNER,
+          owner,
         });
         await sink.record("permission-guardian-seed-completed", {
           submit,
@@ -684,7 +765,7 @@ export function createPermissionRestartGuardianScenario() {
           owner: seedOwner,
           ledger: provider.requestLedger,
           screenshot,
-        }, { phase: "executing", owner: OWNER });
+        }, { phase: "executing", owner });
 
         seedProbesSettled = true;
         await settleProbes(state, seedInput, seedCommands, null);
@@ -699,10 +780,15 @@ export function createPermissionRestartGuardianScenario() {
           phase: "executing",
         });
         await acquireInteractiveShell({ context, driver: restarted.driver, sink }, {
-          evidenceOwner: OWNER,
+          evidenceOwner: owner,
           screenshotStem: "permission-guardian-restarted-shell",
         });
-        const restartDecision = createPermissionRestartGuardianStableRestartDecision(seedOwner);
+        const restartDecision = createPermissionRestartGuardianStableRestartDecision(
+          seedOwner,
+          RESTART_STABILITY_MS,
+          () => Date.now(),
+          apiMode,
+        );
         const restored = await waitForProductStage({
           label: "permission Guardian restart parity",
           sample: async () => ({
@@ -739,13 +825,13 @@ export function createPermissionRestartGuardianScenario() {
               ledger: provider.requestLedger,
             }),
             decide: ({ surface, ledger }) => {
-              if (providerOrSurfaceFailed(surface, ledger, 2)) return "fail";
+              if (providerOrSurfaceFailed(surface, ledger, 2, apiMode)) return "fail";
               if (exactPermissionRestartGuardianLedger(
                 ledger,
                 ["guardian_seed", "guardian_tool_initial"],
-                { heldRole: "guardian_tool_initial" },
+                { heldRole: "guardian_tool_initial", apiMode },
               )) return "pass";
-              return responseRows(ledger).length >= 2 ? "fail" : "pending";
+              return responseRows(ledger, apiMode).length >= 2 ? "fail" : "pending";
             },
             code: "permission-guardian-tool-hold",
             message: "the restart turn did not reach the exact elevated tool response barrier",
@@ -766,10 +852,11 @@ export function createPermissionRestartGuardianScenario() {
                 surface,
                 ledger,
                 SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_MAX_RESPONSES,
+                apiMode,
               )) return "fail";
               if (pressure?.settled === true || pressure?.exhausted === true
                 || (Array.isArray(pressure?.errors) && pressure.errors.length > 0)) return "fail";
-              return permissionRestartGuardianReviewObserved(ledger)
+              return permissionRestartGuardianReviewObserved(ledger, { apiMode })
                 && permissionRestartGuardianPressureOverlapFailures(pressure).length === 0
                 ? "pass"
                 : "pending";
@@ -797,12 +884,18 @@ export function createPermissionRestartGuardianScenario() {
                 surface,
                 ledger,
                 SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_MAX_RESPONSES,
+                apiMode,
               )) return "fail";
               if (!exactPermissionRestartGuardianLedger(
                 ledger,
                 PERMISSION_RESTART_GUARDIAN_ROLES,
+                { apiMode },
               )) return "pending";
-              const failures = permissionRestartGuardianTerminalFailures(surface, seedOwner);
+              const failures = permissionRestartGuardianTerminalFailures(
+                surface,
+                seedOwner,
+                apiMode,
+              );
               return failures.length === 0 ? "pass" : settledSurface(surface) ? "fail" : "pending";
             },
             code: "permission-guardian-terminal",
@@ -813,7 +906,7 @@ export function createPermissionRestartGuardianScenario() {
             cdp: restarted.driver,
             sink,
             name: "permission-guardian-terminal",
-            owner: OWNER,
+            owner,
           });
           state.acceptedLedger = structuredClone(provider.requestLedger);
           await sink.record("permission-guardian-completed", {
@@ -829,7 +922,7 @@ export function createPermissionRestartGuardianScenario() {
             terminal_owner: idleOwner(terminal.surface.projection),
             provider_ledger: state.acceptedLedger,
             screenshot,
-          }, { phase: "executing", owner: OWNER });
+          }, { phase: "executing", owner });
           taskProbesSettled = true;
           await settleProbes(state, input, commands, null);
         } catch (error) {
@@ -876,6 +969,7 @@ export function createPermissionRestartGuardianScenario() {
         input: pass ? "pass" : "fail",
         resources: [{
           kind: "permission-restart-guardian-verification",
+          api_mode: apiMode,
           quiesce_input: state.quiesceOutcome?.input ?? null,
           probe_outcomes: state.probeOutcomes,
           pressure: state.pressureOutcome,
@@ -883,4 +977,12 @@ export function createPermissionRestartGuardianScenario() {
       };
     },
   });
+}
+
+export function createPermissionRestartGuardianScenario() {
+  return createPermissionRestartGuardianScenarioForApiMode(RESPONSES_API_MODE);
+}
+
+export function createPermissionRestartGuardianChatScenario() {
+  return createPermissionRestartGuardianScenarioForApiMode(CHAT_COMPLETIONS_API_MODE);
 }

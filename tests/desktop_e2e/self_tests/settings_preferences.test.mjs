@@ -57,6 +57,13 @@ function projection(overrides = {}) {
 function cleanSurface(overrides = {}) {
   return {
     projection: projection(),
+    connection_shortcut: {
+      count: 1,
+      visible: true,
+      enabled: true,
+      text: "接続設定",
+      title: "PreferencesでメインLLMの既定接続を確認・変更",
+    },
     settings: {
       dialog_count: 1,
       dialog_visible: true,
@@ -70,6 +77,11 @@ function cleanSurface(overrides = {}) {
       save: { count: 1, visible: true, enabled: false },
       discard: { count: 0, visible: false, enabled: false },
       close: { count: 1, visible: true, enabled: true },
+      navigation: {
+        provider: { count: 1, visible: true, text: "メインLLM" },
+        side_chat: { count: 1, visible: true, text: "サイドチャットLLM" },
+        tools: { count: 1, visible: true, text: "Tools" },
+      },
     },
     close_confirmation: {
       count: 0,
@@ -225,6 +237,13 @@ test("command expectations preserve complete ordered values and exact config tar
   assert.equal(save.command, "save_global_config");
   assert.equal(save.args.values.find((row) => row.key === "docling.enabled").text, "true");
   assert.deepEqual(save.args.expectedTarget, target);
+
+  const contextSave = expectedGlobalSave(cleanSurface(), {
+    "model.context_window": PROVIDER_CONTEXT_AFTER,
+  });
+  assert.equal(contextSave.command, "save_global_config");
+  assert.equal(contextSave.args.values.find((row) => row.key === "model.context_window").text, PROVIDER_CONTEXT_AFTER);
+  assert.equal(contextSave.args.values.find((row) => row.key === "docling.enabled").text, "false");
 });
 
 test("saved and restored predicates require a generation advance, clean state, and continuous zero-network stability", () => {

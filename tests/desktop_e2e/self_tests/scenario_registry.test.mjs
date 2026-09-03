@@ -37,10 +37,12 @@ test("one registry binds every reusable scenario to the common runner contract",
     "manual.case5_2",
     "manual.provider-openai-compatible",
     "manual.provider-lm-studio-thinking",
+    "manual.permission-guardian-openai-compatible",
     "manual.permission-temp-escalation-lm-studio",
     "native-dialog.cancel",
     "prompt-review.cancel",
     "permission.restart-guardian",
+    "permission.restart-guardian-chat",
     "permission.temp-escalation",
     "provider.chat-tool-continuation",
     "provider.responses-compaction-retry",
@@ -52,6 +54,8 @@ test("one registry binds every reusable scenario to the common runner contract",
     "settings.session",
     "run.next-turn",
     "run.stop",
+    "side-chat.quote",
+    "side-chat.session",
   ]);
   for (const id of scenarioIds) {
     const options = id === "manual.case5_2"
@@ -60,9 +64,11 @@ test("one registry binds every reusable scenario to the common runner contract",
         ? liveProviderOptions
         : id === "manual.provider-lm-studio-thinking"
           ? lmStudioThinkingOptions
-          : id === "manual.permission-temp-escalation-lm-studio"
-            ? lmStudioThinkingOptions
-            : {};
+          : id === "manual.permission-guardian-openai-compatible"
+            ? liveProviderOptions
+            : id === "manual.permission-temp-escalation-lm-studio"
+              ? lmStudioThinkingOptions
+              : {};
     const scenario = createScenario(id, options);
     assert.equal(scenario.id, id);
     for (const method of ["prepare", "execute", "requestGracefulExit", "quiesce", "cleanup"]) {
@@ -82,6 +88,10 @@ test("one registry binds every reusable scenario to the common runner contract",
     createScenario("permission.restart-guardian"),
   );
   assert.notEqual(
+    createScenario("permission.restart-guardian-chat"),
+    createScenario("permission.restart-guardian-chat"),
+  );
+  assert.notEqual(
     createScenario("permission.temp-escalation"),
     createScenario("permission.temp-escalation"),
   );
@@ -99,6 +109,8 @@ test("one registry binds every reusable scenario to the common runner contract",
   );
   assert.notEqual(createScenario("run.next-turn"), createScenario("run.next-turn"));
   assert.notEqual(createScenario("run.stop"), createScenario("run.stop"));
+  assert.notEqual(createScenario("side-chat.quote"), createScenario("side-chat.quote"));
+  assert.notEqual(createScenario("side-chat.session"), createScenario("side-chat.session"));
   assert.notEqual(createScenario("agent.interrupt"), createScenario("agent.interrupt"));
   assert.notEqual(createScenario("manual.case5_2", case52Options), createScenario("manual.case5_2", case52Options));
   assert.notEqual(
@@ -114,6 +126,10 @@ test("one registry binds every reusable scenario to the common runner contract",
     createScenario("manual.provider-lm-studio-thinking", lmStudioThinkingOptions),
   );
   assert.notEqual(
+    createScenario("manual.permission-guardian-openai-compatible", liveProviderOptions),
+    createScenario("manual.permission-guardian-openai-compatible", liveProviderOptions),
+  );
+  assert.notEqual(
     createScenario("manual.permission-temp-escalation-lm-studio", lmStudioThinkingOptions),
     createScenario("manual.permission-temp-escalation-lm-studio", lmStudioThinkingOptions),
   );
@@ -123,6 +139,10 @@ test("one registry binds every reusable scenario to the common runner contract",
   );
   assert.throws(
     () => createScenario("manual.provider-lm-studio-thinking"),
+    /provider_base_url must be a non-empty string/,
+  );
+  assert.throws(
+    () => createScenario("manual.permission-guardian-openai-compatible"),
     /provider_base_url must be a non-empty string/,
   );
   assert.throws(

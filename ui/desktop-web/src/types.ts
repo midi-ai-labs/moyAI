@@ -155,6 +155,8 @@ export interface InitialSetupMutationTarget {
 export interface ConfigFieldProjection {
   key: string;
   value: string;
+  sensitive: boolean;
+  configured: boolean;
   env_override: string | null;
   value_type: "string" | "boolean" | "integer" | "number" | "json" | "enum" | string;
   required: boolean;
@@ -332,6 +334,22 @@ export interface SideChatMessageProjection {
   content: string;
 }
 
+export type SideChatQuoteSourceKind = "transcript" | "artifact";
+
+export interface SideChatPendingQuote {
+  sourceKind: SideChatQuoteSourceKind;
+  sourceHistoryItemId: string;
+  sourceAppendPosition: string | null;
+  selectedText: string;
+}
+
+export interface SideChatDraftQuoteProjection {
+  source_kind: SideChatQuoteSourceKind;
+  source_history_item_id: string;
+  source_append_position: string | null;
+  selected_text: string;
+}
+
 export type ProviderProfile =
   | "lm_studio"
   | "openai_compatible"
@@ -365,7 +383,11 @@ export interface SideChatProjection {
   last_error: string;
   generation: string;
   draft_text: string;
+  draft_quote: SideChatDraftQuoteProjection | null;
   draft_revision: string;
+  context_scope: string;
+  context_as_of_append_position: string | null;
+  context_truncated: boolean;
   messages: SideChatMessageProjection[];
   can_send: boolean;
   can_cancel: boolean;
@@ -399,6 +421,9 @@ export interface DesktopWebState {
   token_meter_label: string;
   token_meter_title: string;
   token_meter_level: "unknown" | "low" | "medium" | "high" | "critical" | string;
+  session_usage_label: string;
+  session_usage_title: string;
+  session_usage_state: "missing" | "partial" | "complete" | string;
   confirmation_visible: boolean;
   confirmation_id: string | null;
   confirmation_text: string;

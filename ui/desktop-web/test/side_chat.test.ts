@@ -15,6 +15,7 @@ import {
   renderOverlay,
   renderSideChatDeleteConfirmation,
 } from "../src/render.ts";
+import { renderTranscriptRows } from "../src/render_transcript.ts";
 import {
   createDesktopRenderModel,
   DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION,
@@ -23,9 +24,15 @@ import {
 import type {
   DesktopViewState,
   SideChatCatalogResult,
+  SideChatPendingQuote,
   SideChatProjection,
 } from "../src/types.ts";
 import {
+  pendingSideChatQuoteFromSelection,
+  sideChatQuoteKeyboardActivation,
+} from "../src/side_chat_quote.ts";
+import {
+  appendQuoteToSideChatDraft,
   beginSideChatCatalogLoad,
   canonicalSideChatCatalogBaseUrl,
   canonicalSideChatProviderBaseUrl,
@@ -37,6 +44,7 @@ import {
   sideChatDraftForState,
   sideChatModelOptions,
   sideChatOperationsOpen,
+  updateSideChatDraftFromManualEdit,
   type SideChatCatalogView,
 } from "../src/ui_state.ts";
 
@@ -54,11 +62,26 @@ function sideChat(overrides: Partial<SideChatProjection> = {}): SideChatProjecti
     last_error: "",
     generation: "4",
     draft_text: "",
+    draft_quote: null,
     draft_revision: "0",
+    context_scope: "owner_session",
+    context_as_of_append_position: "42",
+    context_truncated: false,
     messages: [],
     can_send: true,
     can_cancel: false,
     ...overrides,
+  };
+}
+
+function projectedDraftQuote(
+  quote: SideChatPendingQuote | null | undefined,
+): SideChatProjection["draft_quote"] {
+  return quote == null ? null : {
+    source_kind: quote.sourceKind,
+    source_history_item_id: quote.sourceHistoryItemId,
+    source_append_position: quote.sourceAppendPosition,
+    selected_text: quote.selectedText,
   };
 }
 
@@ -127,6 +150,7 @@ function useSidePane(overrides: {
   configDirty?: boolean;
   configDraftEditOpen?: boolean;
   operationsOpen?: boolean;
+  pendingQuote?: SideChatPendingQuote | null;
 } = {}): {
   artifactPane: (view: DesktopViewState) => string;
   overlay: (view: DesktopViewState) => string;
@@ -143,6 +167,7 @@ function useSidePane(overrides: {
     sideChat: {
       ...DEFAULT_DESKTOP_RENDER_LOCAL_PRESENTATION.sideChat,
       draft: overrides.draft ?? "",
+      pendingQuote: overrides.pendingQuote ?? null,
       setupBaseUrl: overrides.baseUrl ?? "",
       setupProviderProfile: overrides.providerProfile ?? "openai_compatible",
       setupModel: overrides.model ?? "",
@@ -1379,18 +1404,35 @@ test("side drafts remain isolated by owner and reset for a replacement chat iden
   assert.equal(sideChatDraftForState(ui, state({ chat_id: "side-a-replacement" }))?.text, "");
 });
 
-test("a durable side draft hydrates after restart and a dirty local edit is not overwritten", () => {
+test("a durable typed side draft rehydrates after restart and a dirty local edit is not overwritten", () => {
   const ui = createUiLocalState();
-  const restored = state({ draft_text: "restart draft", draft_revision: "7" });
+  const quote: SideChatPendingQuote = {
+    sourceKind: "artifact",
+    sourceHistoryItemId: "01J00000000000000000000007",
+    sourceAppendPosition: "42",
+    selectedText: "restart authority",
+  };
+  const restored = state({
+    draft_text: "> Side Chat 引用\n> restart authority\n\nrestart draft",
+    draft_quote: projectedDraftQuote(quote),
+    draft_revision: "7",
+  });
   const draft = sideChatDraftForState(ui, restored);
   assert.ok(draft);
-  assert.equal(draft.text, "restart draft");
+  assert.equal(draft.text, "> Side Chat 引用\n> restart authority\n\nrestart draft");
+  assert.deepEqual(draft.pendingQuote, quote);
+  assert.deepEqual(draft.persistedQuote, quote);
   assert.equal(draft.persistedRevision, "7");
 
   draft.text = "unsaved local edit";
   draft.revision += 1;
-  const externallyChanged = state({ draft_text: "other owner", draft_revision: "8" });
+  const externallyChanged = state({
+    draft_text: "other owner",
+    draft_quote: null,
+    draft_revision: "8",
+  });
   assert.equal(sideChatDraftForState(ui, externallyChanged)?.text, "unsaved local edit");
+  assert.deepEqual(draft.pendingQuote, quote);
   assert.equal(draft.persistedRevision, "7");
 });
 
@@ -1422,9 +1464,11 @@ test("side draft persistence uses exact owner, chat, and draft revision", async 
       chatId: "side-a",
       expectedDraftRevision: "7",
       text: "new durable draft",
+      quote: null,
     },
   }]);
   assert.equal(draft.persistedText, "new durable draft");
+  assert.equal(draft.persistedQuote, null);
   assert.equal(draft.persistedRevision, "8");
   assert.equal(draft.saveInFlight, false);
 });
@@ -1452,6 +1496,50 @@ test("a stale durable draft CAS never replaces the losing local text", async () 
   assert.equal(draft.persistedText, "other process");
   assert.equal(draft.persistedRevision, "8");
   assert.equal(draft.saveInFlight, false);
+});
+
+test("draft CAS settlement compares typed quote authority even when display text matches", async () => {
+  const ui = createUiLocalState();
+  let current = state({ draft_text: "shared display", draft_revision: "7" });
+  const draft = sideChatDraftForState(ui, current);
+  assert.ok(draft);
+  const localQuote: SideChatPendingQuote = {
+    sourceKind: "transcript",
+    sourceHistoryItemId: "01J00000000000000000000011",
+    sourceAppendPosition: "42",
+    selectedText: "local authority",
+  };
+  const winningQuote: SideChatPendingQuote = {
+    sourceKind: "artifact",
+    sourceHistoryItemId: "01J00000000000000000000012",
+    sourceAppendPosition: "42",
+    selectedText: "winning authority",
+  };
+  draft.pendingQuote = localQuote;
+  draft.revision += 1;
+  const calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
+  const context = {
+    uiState: ui,
+    getProjection: () => current,
+    getViewState: () => current,
+    mutate: async (name: string, args?: Record<string, unknown>) => {
+      calls.push({ name, args });
+      current = state({
+        draft_text: "shared display",
+        draft_quote: projectedDraftQuote(winningQuote),
+        draft_revision: "8",
+      });
+    },
+    rerender: () => undefined,
+  } as unknown as ActionContext;
+
+  await persistSideChatDraft(current, context);
+
+  assert.deepEqual(calls[0]?.args?.quote, localQuote);
+  assert.deepEqual(draft.pendingQuote, localQuote);
+  assert.deepEqual(draft.persistedQuote, winningQuote);
+  assert.equal(draft.persistedText, "shared display");
+  assert.equal(draft.persistedRevision, "8");
 });
 
 test("opening side chat is frontend-local and leaves the main composer untouched", async () => {
@@ -1483,6 +1571,352 @@ test("Ctrl+Enter targets the focused side composer without changing other global
     shortcutActionForComposer({ key: "n", ctrlKey: true, metaKey: false, repeat: false }, true),
     "new-chat",
   );
+});
+
+test("settled canonical transcript and artifact rows expose one native quote action", () => {
+  const html = renderTranscriptRows([
+    {
+      row_kind: "user",
+      stable_history_identity: "01J00000000000000000000001",
+      step: "1",
+      title: "User",
+      body: "main question",
+      file_changes: [],
+    },
+    {
+      row_kind: "assistant",
+      stable_history_identity: "01J00000000000000000000002",
+      step: "2",
+      title: "Assistant",
+      body: "settled answer",
+      file_changes: [],
+    },
+    {
+      row_kind: "file_changes",
+      stable_history_identity: "01J00000000000000000000003",
+      step: "3",
+      title: "File changes",
+      body: "updated src/main.rs",
+      file_changes: [],
+    },
+    {
+      row_kind: "work_summary_running",
+      stable_history_identity: "turn:synthetic:work-summary",
+      step: "4",
+      title: "Running",
+      body: "not settled evidence",
+      file_changes: [],
+    },
+  ], { sideChatQuoteOwnerSessionId: "session-a" });
+
+  assert.equal((html.match(/data-action="quote-selection-to-side-chat"/g) ?? []).length, 3);
+  assert.match(html, /data-history-identity="01J00000000000000000000001"[\s\S]*data-side-chat-quote-source-kind="transcript"/);
+  assert.match(html, /data-history-identity="01J00000000000000000000003"[\s\S]*data-side-chat-quote-source-kind="artifact"/);
+  assert.match(html, /<button type="button" class="message-quote-action"[\s\S]*>Side Chatで引用<\/button>/);
+  assert.doesNotMatch(html, /data-source-history-item-id="turn:synthetic:work-summary"/);
+});
+
+test("quote selection accepts only one exact canonical source row and projection fence", () => {
+  const transcript = {
+    sourceKind: "transcript" as const,
+    sourceHistoryItemId: "01J00000000000000000000001",
+  };
+  const accepted = pendingSideChatQuoteFromSelection({
+    activatedSource: transcript,
+    startSource: transcript,
+    endSource: transcript,
+    selectedText: "  selected\r\ntext  ",
+    sourceAppendPosition: "42",
+  });
+
+  assert.deepEqual(accepted, {
+    ...transcript,
+    sourceAppendPosition: "42",
+    selectedText: "selected\ntext",
+  });
+  assert.equal(pendingSideChatQuoteFromSelection({
+    activatedSource: transcript,
+    startSource: transcript,
+    endSource: { ...transcript, sourceHistoryItemId: "01J00000000000000000000002" },
+    selectedText: "cross-row selection",
+    sourceAppendPosition: "42",
+  }), null);
+  assert.equal(pendingSideChatQuoteFromSelection({
+    activatedSource: transcript,
+    startSource: transcript,
+    endSource: transcript,
+    selectedText: "selected",
+    sourceAppendPosition: null,
+  }), null);
+});
+
+test("quote action appends to only the Side draft, never auto-sends, and manual edit clears it", async () => {
+  const ui = createUiLocalState();
+  ui.drafts.prompt = "keep main composer";
+  ui.artifactPaneCollapsed = true;
+  let current = state();
+  const quote: SideChatPendingQuote = {
+    sourceKind: "transcript",
+    sourceHistoryItemId: "01J00000000000000000000001",
+    sourceAppendPosition: "42",
+    selectedText: "settled owner evidence",
+  };
+  let durableRevision = 0;
+  const calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
+  const context = {
+    uiState: ui,
+    getProjection: () => current,
+    getViewState: () => current,
+    mutate: async (name: string, args?: Record<string, unknown>) => {
+      calls.push({ name, args });
+      if (name === "save_side_chat_draft") {
+        durableRevision += 1;
+        current = state({
+          draft_text: String(args?.text ?? ""),
+          draft_quote: projectedDraftQuote(
+            (args?.quote ?? null) as SideChatPendingQuote | null,
+          ),
+          draft_revision: String(durableRevision),
+        });
+      }
+    },
+    rerender: () => undefined,
+  } as unknown as ActionContext;
+
+  const action = actionById("quote-selection-to-side-chat");
+  assert.ok(action);
+  await action.run(current, context, {
+    index: -1,
+    value: "",
+    sideChatQuote: quote,
+    sideChatQuoteOwnerSessionId: "session-b",
+  });
+  assert.equal(sideChatDraftForState(ui, current)?.text, "");
+  assert.deepEqual(calls, []);
+  await action.run(current, context, {
+    index: -1,
+    value: "",
+    sideChatQuote: quote,
+    sideChatQuoteOwnerSessionId: "session-a",
+  });
+
+  const draft = sideChatDraftForState(ui, current);
+  assert.ok(draft);
+  assert.match(draft.text, /^> Side Chat 引用\n> settled owner evidence\n\n$/);
+  assert.deepEqual(draft.pendingQuote, quote);
+  assert.equal(ui.drafts.prompt, "keep main composer");
+  assert.equal(ui.artifactPaneMode, "side_chat");
+  assert.equal(ui.artifactPaneCollapsed, false);
+  assert.deepEqual(calls.map((call) => call.name), ["save_side_chat_draft"]);
+  assert.deepEqual(calls[0]?.args?.quote, quote);
+  assert.ok(calls.every((call) => call.name !== "submit_side_chat" && call.name !== "submit_prompt"));
+
+  const previousRevision = draft.revision;
+  updateSideChatDraftFromManualEdit(draft, `${draft.text}explain this`);
+  assert.equal(draft.pendingQuote, null);
+  assert.equal(draft.revision, previousRevision + 1);
+  await persistSideChatDraft(current, context);
+  assert.deepEqual(calls.map((call) => call.name), [
+    "save_side_chat_draft",
+    "save_side_chat_draft",
+  ]);
+  assert.equal(calls[1]?.args?.quote, null);
+  assert.equal(current.side_chat.draft_quote, null);
+  assert.equal(draft.persistedQuote, null);
+  assert.equal(draft.persistedText, draft.text);
+  assert.equal(ui.drafts.prompt, "keep main composer");
+});
+
+test("a second typed quote replaces and persists without orphaning the first authority", async () => {
+  const ui = createUiLocalState();
+  let current = state();
+  const draft = sideChatDraftForState(ui, current);
+  assert.ok(draft);
+  const first: SideChatPendingQuote = {
+    sourceKind: "transcript",
+    sourceHistoryItemId: "01J00000000000000000000001",
+    sourceAppendPosition: "42",
+    selectedText: "first evidence",
+  };
+  const second: SideChatPendingQuote = {
+    sourceKind: "artifact",
+    sourceHistoryItemId: "01J00000000000000000000002",
+    sourceAppendPosition: "42",
+    selectedText: "second evidence",
+  };
+
+  appendQuoteToSideChatDraft(draft, first);
+  appendQuoteToSideChatDraft(draft, second);
+
+  assert.equal(draft.text, "> Side Chat 引用\n> second evidence\n\n");
+  assert.deepEqual(draft.pendingQuote, second);
+  assert.doesNotMatch(draft.text, /first evidence/);
+
+  const calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
+  const context = {
+    uiState: ui,
+    getProjection: () => current,
+    getViewState: () => current,
+    mutate: async (name: string, args?: Record<string, unknown>) => {
+      calls.push({ name, args });
+      current = state({
+        draft_text: String(args?.text ?? ""),
+        draft_quote: projectedDraftQuote(
+          (args?.quote ?? null) as SideChatPendingQuote | null,
+        ),
+        draft_revision: "1",
+      });
+    },
+    rerender: () => undefined,
+  } as unknown as ActionContext;
+  await persistSideChatDraft(current, context);
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0]?.args?.quote, second);
+  assert.doesNotMatch(String(calls[0]?.args?.text), /first evidence/);
+  assert.deepEqual(draft.persistedQuote, second);
+});
+
+test("typed quote buttons activate exactly on non-repeated Enter or Space", () => {
+  assert.equal(sideChatQuoteKeyboardActivation("Enter", false), true);
+  assert.equal(sideChatQuoteKeyboardActivation(" ", false), true);
+  assert.equal(sideChatQuoteKeyboardActivation("Enter", true), false);
+  assert.equal(sideChatQuoteKeyboardActivation("Spacebar", false), false);
+  assert.equal(sideChatQuoteKeyboardActivation("Escape", false), false);
+});
+
+test("Side pane shows owner snapshot metadata and the typed pending quote", () => {
+  const quote: SideChatPendingQuote = {
+    sourceKind: "artifact",
+    sourceHistoryItemId: "01J00000000000000000000003",
+    sourceAppendPosition: "42",
+    selectedText: "updated src/main.rs",
+  };
+  const html = useSidePane({
+    draft: "引用を確認して",
+    pendingQuote: quote,
+  }).artifactPane(state({ context_truncated: true }));
+
+  assert.match(html, /id="side-chat-context-description"/);
+  assert.match(html, /参照: このタスクの履歴/);
+  assert.match(html, /履歴位置 42/);
+  assert.match(html, /長い履歴の一部を省略/);
+  assert.match(html, /class="side-chat-pending-quote"/);
+  assert.match(html, /作業結果から引用/);
+  assert.match(html, /updated src\/main\.rs/);
+});
+
+test("Side Send carries the exact owner fence and typed quote then clears only the admitted quote", async () => {
+  const ui = createUiLocalState();
+  ui.drafts.prompt = "main remains";
+  let current = state();
+  const draft = sideChatDraftForState(ui, current);
+  assert.ok(draft);
+  const quote: SideChatPendingQuote = {
+    sourceKind: "transcript",
+    sourceHistoryItemId: "01J00000000000000000000001",
+    sourceAppendPosition: "42",
+    selectedText: "settled owner evidence",
+  };
+  appendQuoteToSideChatDraft(draft, quote);
+  draft.text += "Explain this.";
+  const calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
+  const context = {
+    uiState: ui,
+    getProjection: () => current,
+    getViewState: () => current,
+    mutate: async (name: string, args?: Record<string, unknown>) => {
+      calls.push({ name, args });
+      if (name === "submit_side_chat") {
+        current = state({
+          draft_text: "",
+          draft_revision: "1",
+          generation: "5",
+          status: "running",
+          can_send: false,
+          can_cancel: true,
+        });
+      }
+    },
+    rerender: () => undefined,
+  } as unknown as ActionContext;
+
+  const send = actionById("send-side-chat");
+  assert.ok(send);
+  await send.run(current, context, { index: -1, value: "" });
+
+  assert.deepEqual(calls, [{
+    name: "submit_side_chat",
+    args: {
+      ownerSessionId: "session-a",
+      chatId: "side-a",
+      expectedGeneration: "4",
+      expectedDraftRevision: "0",
+      expectedOwnerAppendPosition: "42",
+      quote,
+      text: "> Side Chat 引用\n> settled owner evidence\n\nExplain this.",
+    },
+  }]);
+  assert.equal(draft.pendingQuote, null);
+  assert.equal(draft.text, "");
+  assert.equal(ui.drafts.prompt, "main remains");
+});
+
+test("Side Send preserves a typed quote rehydrated from the durable restart projection", async () => {
+  const ui = createUiLocalState();
+  const quote: SideChatPendingQuote = {
+    sourceKind: "artifact",
+    sourceHistoryItemId: "01J00000000000000000000009",
+    sourceAppendPosition: "42",
+    selectedText: "durable restart evidence",
+  };
+  const text = "> Side Chat 引用\n> durable restart evidence\n\nExplain after restart.";
+  let current = state({
+    draft_text: text,
+    draft_quote: projectedDraftQuote(quote),
+    draft_revision: "7",
+  });
+  const calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
+  const context = {
+    uiState: ui,
+    getProjection: () => current,
+    getViewState: () => current,
+    mutate: async (name: string, args?: Record<string, unknown>) => {
+      calls.push({ name, args });
+      current = state({
+        draft_text: "",
+        draft_quote: null,
+        draft_revision: "8",
+        generation: "5",
+        status: "running",
+        can_send: false,
+        can_cancel: true,
+      });
+    },
+    rerender: () => undefined,
+  } as unknown as ActionContext;
+
+  const send = actionById("send-side-chat");
+  assert.ok(send);
+  await send.run(current, context, { index: -1, value: "" });
+
+  assert.deepEqual(calls, [{
+    name: "submit_side_chat",
+    args: {
+      ownerSessionId: "session-a",
+      chatId: "side-a",
+      expectedGeneration: "4",
+      expectedDraftRevision: "7",
+      expectedOwnerAppendPosition: "42",
+      quote,
+      text,
+    },
+  }]);
+  const draft = sideChatDraftForState(ui, current);
+  assert.ok(draft);
+  assert.equal(draft.text, "");
+  assert.equal(draft.pendingQuote, null);
+  assert.equal(draft.persistedQuote, null);
 });
 
 test("side send and Stop use only the exact side owner, chat, and generation", async () => {
@@ -1523,6 +1957,8 @@ test("side send and Stop use only the exact side owner, chat, and generation", a
       chatId: "side-a",
       expectedGeneration: "4",
       expectedDraftRevision: "0",
+      expectedOwnerAppendPosition: "42",
+      quote: null,
       text: "side question",
     },
   });
@@ -1630,6 +2066,8 @@ test("side Send waits for queued autosaves and submits the settled draft revisio
       chatId: "side-a",
       expectedGeneration: "4",
       expectedDraftRevision: "9",
+      expectedOwnerAppendPosition: "42",
+      quote: null,
       text: "final question",
     },
   });
@@ -1665,6 +2103,8 @@ test("side Send keeps local text when the draft revision CAS is rejected", async
       chatId: "side-a",
       expectedGeneration: "4",
       expectedDraftRevision: "7",
+      expectedOwnerAppendPosition: "42",
+      quote: null,
       text: "keep this question",
     },
   }]);

@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::ShellFamily;
 use crate::error::ToolError;
 use crate::tool::context::ToolContext;
+use crate::tool::executable::ResolvedExecutable;
 use crate::tool::os_sandbox::ProcessSandboxPlan;
 use crate::tool::process::ManagedProcess;
 #[cfg(test)]
@@ -97,6 +98,7 @@ impl Tool for ShellTool {
             targets,
             outside_workspace,
             risks,
+            execution,
         } = shell_permission_intent(ctx.workspace, ctx.config, &input)?;
         let effect_admission = ctx
             .confirm_if_needed_with_details(
@@ -115,7 +117,7 @@ impl Tool for ShellTool {
         ctx.run_mutation_fence.assert_owned().await?;
         effect_admission.admit()?;
         PathGuard::revalidate(&guarded)?;
-        let output = execute_shell_command(
+        let output = execute_shell_command_with_resolved_programs(
             &ctx.config.shell,
             &guarded.absolute,
             &input.command,
@@ -123,6 +125,9 @@ impl Tool for ShellTool {
             ctx.config.tool_output.max_bytes.max(1),
             ctx.cancel.clone(),
             effect_admission.sandbox_plan(),
+            execution.family,
+            execution.environment,
+            execution.programs,
         )
         .await?;
         let merged_output = format_shell_output_for_display(
@@ -182,6 +187,13 @@ struct ShellPermissionIntent {
     targets: Vec<Utf8PathBuf>,
     outside_workspace: bool,
     risks: Vec<PermissionRisk>,
+    execution: ResolvedShellExecution,
+}
+
+struct ResolvedShellExecution {
+    family: ShellFamily,
+    environment: std::collections::HashMap<String, String>,
+    programs: Vec<ResolvedExecutable>,
 }
 
 fn shell_permission_intent(
@@ -201,6 +213,15 @@ fn shell_permission_intent(
             guarded.absolute
         )));
     }
+    let family = configured_shell_family(&config.shell);
+    let environment = captured_process_environment(&config.shell);
+    let programs = resolve_shell_executables(
+        &config.shell,
+        family,
+        &environment,
+        &guarded.absolute,
+        &workspace.root,
+    )?;
     let outside_workspace = requested_elevation
         || (!guarded.inside_workspace && !guarded.trusted_external)
         || references_outside_workspace_from(workspace, &guarded.absolute, &input.command);
@@ -210,6 +231,13 @@ fn shell_permission_intent(
         input.description.clone()
     };
     let mut risks = shell_permission_risks_from(workspace, &guarded, &input.command);
+    let requires_typed_review = match family {
+        ShellFamily::PowerShell => powershell_command_requires_typed_review(&input.command),
+        ShellFamily::Bash => shell_command_has_child_interpreter_boundary(&input.command),
+    };
+    if requires_typed_review && !risks.contains(&PermissionRisk::UnclassifiedShell) {
+        risks.push(PermissionRisk::UnclassifiedShell);
+    }
     if command_mentions_configured_instruction_target(
         workspace,
         &config.instructions.additional_files,
@@ -220,7 +248,18 @@ fn shell_permission_intent(
         risks.push(PermissionRisk::ProtectedWorkspaceAuthority);
     }
     let mut details = shell_permission_details(&input.command, &guarded.absolute);
-    let targets = shell_permission_targets(&guarded, &input.command);
+    let mut targets = shell_permission_targets(&guarded, &input.command);
+    for program in &programs {
+        details.push(format!(
+            "Canonical executable candidate (identity pinned): {}",
+            program.path()
+        ));
+        if !targets.iter().any(|target| {
+            PathGuard::stable_identity_key(target) == PathGuard::stable_identity_key(program.path())
+        }) {
+            targets.push(program.path().to_path_buf());
+        }
+    }
     if requested_elevation {
         details.push(format!(
             "Requested sandbox elevation: {}",
@@ -234,6 +273,11 @@ fn shell_permission_intent(
         targets,
         outside_workspace,
         risks,
+        execution: ResolvedShellExecution {
+            family,
+            environment,
+            programs,
+        },
     })
 }
 
@@ -347,6 +391,7 @@ enum ShellWaitOutcome {
     Cancelled,
 }
 
+#[cfg(test)]
 async fn execute_shell_command(
     shell: &crate::config::ShellConfig,
     workdir: &Utf8Path,
@@ -369,14 +414,10 @@ async fn execute_shell_command(
             stderr_truncated: false,
         });
     }
-    let family = shell.family.unwrap_or(if cfg!(windows) {
-        ShellFamily::PowerShell
-    } else {
-        ShellFamily::Bash
-    });
+    let family = configured_shell_family(shell);
     let environment = captured_process_environment(shell);
-    let programs = resolve_shell_programs(shell, family, &environment);
-    execute_shell_command_with_programs(
+    let programs = resolve_shell_executables(shell, family, &environment, workdir, workdir)?;
+    execute_shell_command_with_resolved_programs(
         shell,
         workdir,
         command_text,
@@ -392,6 +433,7 @@ async fn execute_shell_command(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn execute_shell_command_with_programs(
     shell: &crate::config::ShellConfig,
     workdir: &Utf8Path,
@@ -403,6 +445,35 @@ async fn execute_shell_command_with_programs(
     family: ShellFamily,
     environment: std::collections::HashMap<String, String>,
     programs: Vec<String>,
+) -> Result<CommandOutput, ToolError> {
+    let programs = resolve_program_candidates(&programs, workdir, &environment)?;
+    execute_shell_command_with_resolved_programs(
+        shell,
+        workdir,
+        command_text,
+        timeout_ms,
+        max_output_bytes,
+        cancel,
+        sandbox_plan,
+        family,
+        environment,
+        programs,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_shell_command_with_resolved_programs(
+    shell: &crate::config::ShellConfig,
+    workdir: &Utf8Path,
+    command_text: &str,
+    timeout_ms: u64,
+    max_output_bytes: usize,
+    cancel: CancellationToken,
+    sandbox_plan: &ProcessSandboxPlan,
+    family: ShellFamily,
+    environment: std::collections::HashMap<String, String>,
+    programs: Vec<ResolvedExecutable>,
 ) -> Result<CommandOutput, ToolError> {
     let arguments = match family {
         ShellFamily::PowerShell => vec![
@@ -425,11 +496,12 @@ async fn execute_shell_command_with_programs(
         let program_count = programs.len();
         for (index, program) in programs.iter().enumerate() {
             let mut argv = Vec::with_capacity(arguments.len() + 1);
-            argv.push(program.clone());
+            argv.push(program.path().to_string());
             argv.extend(arguments.iter().cloned());
             match execute_workspace_write(
                 profile.clone(),
                 SandboxedProcessRequest {
+                    executable: program.clone(),
                     argv,
                     cwd: workdir.to_path_buf(),
                     environment: environment.clone(),
@@ -482,7 +554,12 @@ async fn execute_shell_command_with_programs(
     let mut process = None;
     let program_count = programs.len();
     for (index, program) in programs.iter().enumerate() {
-        let mut command = Command::new(program);
+        program.revalidate().map_err(|error| {
+            ToolError::Message(format!(
+                "shell executable identity revalidation failed: {error}"
+            ))
+        })?;
+        let mut command = Command::new(program.path());
         command.args(&arguments);
         command.current_dir(workdir.as_std_path());
         apply_captured_shell_environment(&mut command, &environment);
@@ -566,6 +643,78 @@ fn resolve_shell_programs(
         ShellFamily::PowerShell => default_powershell_programs(environment),
         ShellFamily::Bash => vec!["bash".to_string()],
     }
+}
+
+fn configured_shell_family(shell: &crate::config::ShellConfig) -> ShellFamily {
+    shell.family.unwrap_or(if cfg!(windows) {
+        ShellFamily::PowerShell
+    } else {
+        ShellFamily::Bash
+    })
+}
+
+fn resolve_shell_executables(
+    shell: &crate::config::ShellConfig,
+    family: ShellFamily,
+    environment: &std::collections::HashMap<String, String>,
+    workdir: &Utf8Path,
+    workspace_root: &Utf8Path,
+) -> Result<Vec<ResolvedExecutable>, ToolError> {
+    let programs = resolve_shell_programs(shell, family, environment);
+    if shell.program.is_some() {
+        resolve_program_candidates(&programs, workdir, environment)
+    } else {
+        resolve_program_candidates_with(&programs, |program| {
+            ResolvedExecutable::resolve_from_captured_search_path(
+                program,
+                environment,
+                workspace_root,
+            )
+        })
+    }
+}
+
+fn resolve_program_candidates(
+    programs: &[String],
+    workdir: &Utf8Path,
+    environment: &std::collections::HashMap<String, String>,
+) -> Result<Vec<ResolvedExecutable>, ToolError> {
+    resolve_program_candidates_with(programs, |program| {
+        ResolvedExecutable::resolve(program, workdir, environment)
+    })
+}
+
+fn resolve_program_candidates_with(
+    programs: &[String],
+    mut resolve: impl FnMut(
+        &str,
+    ) -> Result<
+        ResolvedExecutable,
+        crate::tool::executable::ExecutableIdentityError,
+    >,
+) -> Result<Vec<ResolvedExecutable>, ToolError> {
+    let mut resolved = Vec::new();
+    let mut last_not_found = None;
+    for program in programs {
+        match resolve(program) {
+            Ok(executable) => resolved.push(executable),
+            Err(error) if error.is_not_found() => last_not_found = Some(error),
+            Err(error) => {
+                return Err(ToolError::Message(format!(
+                    "shell executable admission failed: {error}"
+                )));
+            }
+        }
+    }
+    if resolved.is_empty() {
+        return Err(ToolError::Message(format!(
+            "shell executable admission failed: {}",
+            last_not_found
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "no shell program candidate was configured".to_string())
+        )));
+    }
+    Ok(resolved)
 }
 
 #[cfg(windows)]
@@ -902,6 +1051,11 @@ pub(crate) fn process_argv_permission_risks(
 ) -> Vec<PermissionRisk> {
     let command = argv.join(" ");
     let mut risks = shell_permission_risks_from(workspace, guarded_workdir, &command);
+    if process_argv_has_child_interpreter_boundary(argv)
+        && !risks.contains(&PermissionRisk::UnclassifiedShell)
+    {
+        risks.push(PermissionRisk::UnclassifiedShell);
+    }
     let structured_paths = process_argv_path_candidates(&guarded_workdir.absolute, argv);
     if structured_paths.iter().any(|path| {
         PathGuard::require_path(workspace, path, AccessKind::Shell).is_ok_and(|guarded| {
@@ -1086,6 +1240,313 @@ fn command_tokens(command: &str) -> Vec<String> {
         .filter(|token| !token.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn powershell_command_requires_typed_review(command: &str) -> bool {
+    let (structural, structural_complete) =
+        powershell_syntax_view(command, PowerShellSyntaxView::Structural);
+    let (expandable, expandable_complete) =
+        powershell_syntax_view(command, PowerShellSyntaxView::Expandable);
+    let (arguments, arguments_complete) =
+        powershell_syntax_view(command, PowerShellSyntaxView::Arguments);
+    if !structural_complete || !expandable_complete || !arguments_complete {
+        return true;
+    }
+    let lower = structural.to_ascii_lowercase();
+    let tokens = command_tokens(&structural);
+    if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "invoke-expression" | "iex" | "start-process"
+        )
+    }) {
+        return true;
+    }
+    if lower.contains("-encodedcommand") || lower.contains("-encoded-command") {
+        return true;
+    }
+    // Variable/subexpression expansion can construct a command, path, endpoint,
+    // or redirection target that the literal permission classifier never saw.
+    if Regex::new(r"(?i)\$(?:\{|\(|env:|[a-z_])")
+        .expect("PowerShell dynamic expression regex")
+        .is_match(&expandable)
+    {
+        return true;
+    }
+    // Invocation (`&`) and dot-sourcing (`.`) transfer execution to another
+    // command/script boundary. Keep boolean `&&` and ordinary dotted values out.
+    if Regex::new(r#"(?m)(?:^|[;|\r\n])\s*(?:&\s*[^&]|\.\s+(?:['"$({a-zA-Z_]))"#)
+        .expect("PowerShell indirect invocation regex")
+        .is_match(&structural)
+    {
+        return true;
+    }
+    if powershell_has_child_interpreter_boundary(&arguments) {
+        return true;
+    }
+    powershell_has_unknown_literal_command(&structural)
+}
+
+fn shell_command_has_child_interpreter_boundary(command: &str) -> bool {
+    let (arguments, complete) = powershell_syntax_view(command, PowerShellSyntaxView::Arguments);
+    !complete || powershell_has_child_interpreter_boundary(&arguments)
+}
+
+fn powershell_has_child_interpreter_boundary(structural: &str) -> bool {
+    Regex::new(r"(?m)(?:&&|[;|\r\n{}]+)")
+        .expect("PowerShell command boundary regex")
+        .split(structural)
+        .any(|segment| {
+            let mut tokens = segment.split_whitespace().map(normalized_powershell_token);
+            let Some(command) = tokens.next().filter(|command| !command.is_empty()) else {
+                return false;
+            };
+            let arguments = tokens
+                .filter(|argument| !argument.is_empty())
+                .collect::<Vec<_>>();
+            child_interpreter_reinterprets_input(&command, &arguments)
+        })
+}
+
+fn process_argv_has_child_interpreter_boundary(argv: &[String]) -> bool {
+    let Some((command, arguments)) = argv.split_first() else {
+        return false;
+    };
+    let command = normalized_powershell_token(command);
+    let arguments = arguments
+        .iter()
+        .map(|argument| normalized_powershell_token(argument))
+        .collect::<Vec<_>>();
+    child_interpreter_reinterprets_input(&command, &arguments)
+}
+
+fn child_interpreter_reinterprets_input(command: &str, arguments: &[String]) -> bool {
+    let command = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    match command {
+        "cmd" | "cmd.exe" => arguments
+            .iter()
+            .any(|argument| argument.starts_with("/c") || argument.starts_with("/k")),
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => arguments
+            .iter()
+            .any(|argument| powershell_child_parameter_reinterprets_input(argument)),
+        "py" | "py.exe" | "python" | "python.exe" => {
+            arguments.iter().any(|argument| argument.starts_with("-c"))
+        }
+        "node" | "node.exe" => arguments.iter().any(|argument| {
+            argument.starts_with("-e")
+                || argument.starts_with("--eval")
+                || argument.starts_with("-p")
+                || argument.starts_with("--print")
+        }),
+        _ => false,
+    }
+}
+
+fn normalized_powershell_token(token: &str) -> String {
+    token
+        .trim_matches(|character: char| matches!(character, '(' | ')' | ','))
+        .to_ascii_lowercase()
+}
+
+fn powershell_child_parameter_reinterprets_input(argument: &str) -> bool {
+    let parameter = argument
+        .strip_prefix('-')
+        .or_else(|| argument.strip_prefix('/'))
+        .unwrap_or_default()
+        .split([':', '='])
+        .next()
+        .unwrap_or_default()
+        .replace('-', "");
+    !parameter.is_empty()
+        && ["command", "encodedcommand", "file"]
+            .iter()
+            .any(|canonical| canonical.starts_with(&parameter))
+}
+
+fn powershell_has_unknown_literal_command(structural: &str) -> bool {
+    Regex::new(r"(?m)(?:&&|[;|\r\n{}]+)")
+        .expect("PowerShell command boundary regex")
+        .split(structural)
+        .filter_map(|segment| segment.split_whitespace().next())
+        .map(|command| {
+            command
+                .trim_matches(|character: char| matches!(character, '(' | ')' | ','))
+                .to_ascii_lowercase()
+        })
+        .filter(|command| !command.is_empty())
+        .any(|command| {
+            !matches!(
+                command.as_str(),
+                "add-content"
+                    | "cargo"
+                    | "cd"
+                    | "cmd"
+                    | "cmd.exe"
+                    | "compare-object"
+                    | "convertfrom-json"
+                    | "convertto-json"
+                    | "copy"
+                    | "copy-item"
+                    | "del"
+                    | "dotnet"
+                    | "erase"
+                    | "exit"
+                    | "export-csv"
+                    | "fd"
+                    | "foreach-object"
+                    | "format-list"
+                    | "format-table"
+                    | "format-wide"
+                    | "get-childitem"
+                    | "get-command"
+                    | "get-content"
+                    | "get-date"
+                    | "get-item"
+                    | "get-itemproperty"
+                    | "get-location"
+                    | "get-process"
+                    | "git"
+                    | "group-object"
+                    | "import-csv"
+                    | "join-path"
+                    | "measure-object"
+                    | "move"
+                    | "move-item"
+                    | "mv"
+                    | "new-item"
+                    | "node"
+                    | "npm"
+                    | "npx"
+                    | "out-file"
+                    | "out-null"
+                    | "out-string"
+                    | "pnpm"
+                    | "pop-location"
+                    | "powershell"
+                    | "powershell.exe"
+                    | "push-location"
+                    | "pwsh"
+                    | "pwsh.exe"
+                    | "py"
+                    | "pytest"
+                    | "python"
+                    | "python.exe"
+                    | "rd"
+                    | "remove-item"
+                    | "ren"
+                    | "rename-item"
+                    | "resolve-path"
+                    | "rg"
+                    | "rmdir"
+                    | "rustfmt"
+                    | "select-object"
+                    | "select-string"
+                    | "set-content"
+                    | "set-location"
+                    | "sort-object"
+                    | "split-path"
+                    | "tee-object"
+                    | "test-path"
+                    | "uv"
+                    | "where-object"
+                    | "write-debug"
+                    | "write-error"
+                    | "write-host"
+                    | "write-output"
+                    | "write-verbose"
+                    | "write-warning"
+                    | "yarn"
+            )
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerShellSyntaxView {
+    Structural,
+    Expandable,
+    Arguments,
+}
+
+fn powershell_syntax_view(command: &str, view: PowerShellSyntaxView) -> (String, bool) {
+    let characters = command.chars().collect::<Vec<_>>();
+    let mut rendered = String::with_capacity(command.len());
+    let mut index = 0usize;
+    let mut quote = None;
+    let mut dangling_escape = false;
+    let mut indirect_escape = false;
+    while index < characters.len() {
+        let character = characters[index];
+        if character == '`' && quote != Some('\'') {
+            rendered.push(' ');
+            if index + 1 < characters.len() {
+                rendered.push(' ');
+                if view == PowerShellSyntaxView::Arguments {
+                    indirect_escape = true;
+                }
+                index += 2;
+                continue;
+            }
+            dangling_escape = true;
+        }
+        match quote {
+            Some('\'') => {
+                if character == '\'' {
+                    if index + 1 < characters.len() && characters[index + 1] == '\'' {
+                        rendered.push(' ');
+                        rendered.push(' ');
+                        index += 2;
+                        continue;
+                    }
+                    quote = None;
+                }
+                if view == PowerShellSyntaxView::Arguments
+                    && !matches!(character, ';' | '|' | '{' | '}' | '\r' | '\n')
+                    && character != '\''
+                {
+                    rendered.push(character);
+                } else {
+                    rendered.push(' ');
+                }
+            }
+            Some('"') => {
+                if character == '"' {
+                    quote = None;
+                    rendered.push(' ');
+                } else if view != PowerShellSyntaxView::Structural
+                    && !(view == PowerShellSyntaxView::Arguments
+                        && matches!(character, ';' | '|' | '{' | '}' | '\r' | '\n'))
+                {
+                    rendered.push(character);
+                } else {
+                    rendered.push(' ');
+                }
+            }
+            None => match character {
+                '\'' | '"' => {
+                    quote = Some(character);
+                    rendered.push(if view == PowerShellSyntaxView::Arguments {
+                        ' '
+                    } else {
+                        'q'
+                    });
+                }
+                '#' => {
+                    while index < characters.len() && !matches!(characters[index], '\r' | '\n') {
+                        rendered.push(' ');
+                        index += 1;
+                    }
+                    continue;
+                }
+                _ => rendered.push(character),
+            },
+            Some(_) => unreachable!("PowerShell quote state is restricted to single/double"),
+        }
+        index += 1;
+    }
+    (
+        rendered,
+        quote.is_none() && !dangling_escape && !indirect_escape,
+    )
 }
 
 fn command_mentions_protected_target(
@@ -1746,7 +2207,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn default_windows_powershell_uses_lazy_path_resolution_and_preserves_override() {
+    fn default_windows_powershell_candidate_order_preserves_explicit_override() {
         let environment = std::collections::HashMap::from([(
             "Path".to_string(),
             r"C:\first;\\unreachable\unused".to_string(),
@@ -1770,6 +2231,63 @@ mod tests {
                 &environment,
             ),
             vec!["explicit-shell.exe".to_string()]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn implicit_windows_shell_skips_workspace_candidates_and_explicit_override_retains_them() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let workspace =
+            Utf8PathBuf::from_path_buf(temp.path().join("workspace")).expect("utf8 workspace");
+        let workdir = workspace.join("nested");
+        let trusted = Utf8PathBuf::from_path_buf(temp.path().join("trusted"))
+            .expect("utf8 trusted directory");
+        std::fs::create_dir_all(&workdir).expect("workspace directory");
+        std::fs::create_dir_all(&trusted).expect("trusted directory");
+        let workspace_candidate = workspace.join("pwsh.exe");
+        let trusted_candidate = trusted.join("pwsh.exe");
+        std::fs::write(&workspace_candidate, b"workspace executable")
+            .expect("workspace executable fixture");
+        std::fs::write(&trusted_candidate, b"trusted executable")
+            .expect("trusted executable fixture");
+        let search_path = std::env::join_paths([workspace.as_std_path(), trusted.as_std_path()])
+            .expect("captured search path")
+            .to_string_lossy()
+            .into_owned();
+        let environment = std::collections::HashMap::from([
+            ("PATH".to_string(), search_path),
+            ("PATHEXT".to_string(), ".EXE".to_string()),
+        ]);
+        let mut shell = ResolvedConfig::default().shell;
+
+        let implicit = super::resolve_shell_executables(
+            &shell,
+            crate::config::ShellFamily::PowerShell,
+            &environment,
+            &workdir,
+            &workspace,
+        )
+        .expect("implicit shell candidates");
+        assert_eq!(implicit.len(), 1);
+        assert_eq!(
+            crate::workspace::PathGuard::stable_identity_key(implicit[0].path()),
+            crate::workspace::PathGuard::stable_identity_key(&trusted_candidate)
+        );
+
+        shell.program = Some(Utf8PathBuf::from("pwsh"));
+        let explicit = super::resolve_shell_executables(
+            &shell,
+            crate::config::ShellFamily::PowerShell,
+            &environment,
+            &workdir,
+            &workspace,
+        )
+        .expect("explicit shell override");
+        assert_eq!(explicit.len(), 1);
+        assert_eq!(
+            crate::workspace::PathGuard::stable_identity_key(explicit[0].path()),
+            crate::workspace::PathGuard::stable_identity_key(&workspace_candidate)
         );
     }
 
@@ -1822,6 +2340,19 @@ mod tests {
 
         assert_eq!(intent.targets.first(), Some(&workspace.cwd));
         assert!(intent.targets.contains(&external));
+        for executable in &intent.execution.programs {
+            assert!(intent.targets.iter().any(|target| {
+                crate::workspace::PathGuard::stable_identity_key(target)
+                    == crate::workspace::PathGuard::stable_identity_key(executable.path())
+            }));
+            assert!(intent.details.iter().any(|detail| {
+                detail
+                    == &format!(
+                        "Canonical executable candidate (identity pinned): {}",
+                        executable.path()
+                    )
+            }));
+        }
         assert!(intent.outside_workspace);
         assert!(
             intent
@@ -1876,7 +2407,8 @@ mod tests {
         let intent =
             super::shell_permission_intent(&workspace, &config, &input).expect("permission intent");
 
-        assert_eq!(intent.targets, vec![workspace.cwd.clone(), external]);
+        assert_eq!(intent.targets.first(), Some(&workspace.cwd));
+        assert_eq!(intent.targets.get(1), Some(&external));
     }
 
     #[cfg(windows)]
@@ -1899,10 +2431,9 @@ mod tests {
         let intent =
             super::shell_permission_intent(&workspace, &config, &input).expect("permission intent");
 
-        assert_eq!(
-            intent.targets,
-            vec![workspace.cwd.clone(), source, destination]
-        );
+        assert_eq!(intent.targets.first(), Some(&workspace.cwd));
+        assert_eq!(intent.targets.get(1), Some(&source));
+        assert_eq!(intent.targets.get(2), Some(&destination));
     }
 
     #[cfg(windows)]
@@ -1924,7 +2455,8 @@ mod tests {
         let intent =
             super::shell_permission_intent(&workspace, &config, &input).expect("permission intent");
 
-        assert_eq!(intent.targets, vec![workspace.cwd.clone(), external]);
+        assert_eq!(intent.targets.first(), Some(&workspace.cwd));
+        assert_eq!(intent.targets.get(1), Some(&external));
     }
 
     #[test]
@@ -2038,6 +2570,92 @@ mod tests {
         }
         assert!(!super::shell_has_delete_risk("Write-Output rmdirname"));
         assert!(!super::shell_has_network_risk("Write-Output curling"));
+    }
+
+    #[test]
+    fn literal_powershell_commands_keep_deterministic_workspace_classification() {
+        for command in [
+            "Get-ChildItem -LiteralPath 'src'",
+            "Set-Content -LiteralPath 'output.txt' -Value changed",
+            "Write-Output ready; Get-Date",
+            "python --version",
+            "node --version",
+            "Write-Output '$command Start-Process Invoke-Expression'",
+            "Write-Output 'cmd.exe /c type %USERPROFILE%\\secret.txt'",
+        ] {
+            assert!(
+                !super::powershell_command_requires_typed_review(command),
+                "known literal command was marked unclassified: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_and_indirect_powershell_constructs_receive_typed_review_risk() {
+        for command in [
+            "$command = 'Remove-Item'; & $command -LiteralPath target.txt",
+            "Invoke-Expression $payload",
+            "Start-Process -FilePath powershell.exe -ArgumentList '-Command','Get-Date'",
+            ". $env:USERPROFILE\\profile.ps1",
+            "Write-Output $(Get-Date)",
+            "powershell.exe -EncodedCommand ZQB4AGkAdAAgADAA",
+            "cmd.exe /d /c type %USERPROFILE%\\secret.txt",
+            "cmd.exe '/c' 'type %USERPROFILE%\\secret.txt'",
+            "cmd.exe /ctype %USERPROFILE%\\secret.txt",
+            "cmd /k echo ready",
+            "powershell.exe -NoProfile -Command 'Get-Content $env:USERPROFILE\\secret.txt'",
+            "powershell.exe '-Command' 'Get-Date'",
+            "powershell.exe -Command:Get-Date",
+            "pwsh -File '.\\script.ps1'",
+            "pwsh -C 'Get-Date'",
+            "python -c 'from pathlib import Path; print(Path.home())'",
+            "python '-c' 'print(1)'",
+            "python -cprint(1)",
+            "py -c 'print(1)'",
+            "node -e 'console.log(process.env.USERPROFILE)'",
+            "node --eval 'console.log(1)'",
+            "node '--eval' 'console.log(1)'",
+            "node -econsole.log(1)",
+            "Invoke-CustomWorkspaceMutation -Path target.txt",
+            "Write-Output 'unterminated",
+            "Write-Output ready`",
+        ] {
+            assert!(
+                super::powershell_command_requires_typed_review(command),
+                "dynamic/indirect command was automatically classified: {command}"
+            );
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).expect("utf8 root");
+        let config = ResolvedConfig::default();
+        let workspace = WorkspaceDiscovery::discover_fixed_root(&root, &config).expect("workspace");
+        let input: super::ShellInput = serde_json::from_value(serde_json::json!({
+            "command": "cmd.exe /d /c type %USERPROFILE%\\secret.txt"
+        }))
+        .expect("child interpreter shell input");
+
+        let intent = super::shell_permission_intent(&workspace, &config, &input)
+            .expect("child interpreter permission intent");
+        assert!(
+            intent
+                .risks
+                .contains(&crate::tool::PermissionRisk::UnclassifiedShell)
+        );
+        let request = crate::tool::PermissionRequest {
+            access: crate::workspace::AccessKind::Shell,
+            summary: intent.description,
+            details: intent.details,
+            targets: intent.targets,
+            outside_workspace: intent.outside_workspace,
+            risks: intent.risks,
+            agent_path: None,
+            agent_task_name: None,
+        };
+        assert!(!crate::tool::context::access_mode_allows_permission(
+            crate::config::AccessMode::Default,
+            &request
+        ));
     }
 
     #[cfg(windows)]

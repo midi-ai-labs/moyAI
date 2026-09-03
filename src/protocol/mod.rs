@@ -505,6 +505,9 @@ pub enum RuntimeEventMsg {
     Warning {
         message: String,
     },
+    DurableFeedback {
+        feedback: crate::session::DurableRuntimeFeedback,
+    },
     TurnTerminal {
         terminal: Box<crate::session::model::DurableTurnTerminal>,
     },
@@ -628,6 +631,9 @@ pub enum HistoryItemPayload {
     },
     Error {
         message: String,
+    },
+    DurableFeedback {
+        feedback: crate::session::DurableRuntimeFeedback,
     },
     ToolCall {
         call_id: ToolCallId,
@@ -792,6 +798,9 @@ pub enum TurnItemPayload {
     Error {
         message: String,
     },
+    DurableFeedback {
+        feedback: crate::session::DurableRuntimeFeedback,
+    },
     Terminal {
         outcome: TurnTerminalOutcome,
     },
@@ -832,6 +841,15 @@ impl TurnItemPayload {
             Self::ApprovalRequest { .. } => TurnItemProjectionRole::ApprovalEvidence,
             Self::Warning { .. } => TurnItemProjectionRole::RuntimeDiagnostic,
             Self::Error { .. } => TurnItemProjectionRole::RuntimeError,
+            Self::DurableFeedback { feedback } => match feedback.severity {
+                crate::session::DurableFeedbackSeverity::Error => {
+                    TurnItemProjectionRole::RuntimeError
+                }
+                crate::session::DurableFeedbackSeverity::Info
+                | crate::session::DurableFeedbackSeverity::Warning => {
+                    TurnItemProjectionRole::RuntimeDiagnostic
+                }
+            },
             Self::Terminal { .. } => TurnItemProjectionRole::TerminalOutcome,
         }
     }

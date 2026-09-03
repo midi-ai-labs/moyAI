@@ -11,6 +11,7 @@ import {
   finishInitialSetupAuxiliaryRequest,
   initialSetupAuxiliaryPendingKind,
   initialSetupDoclingReadinessVisible,
+  initialSetupImportedConfigReference,
   initialSetupImportedSourcePath,
   reconcileInitialSetupAuxiliaryState,
   recordInitialSetupDoclingReadinessOwner,
@@ -124,14 +125,21 @@ test("wizard auxiliary presentation is discarded at a setup or config owner barr
     setupTarget,
     configTarget,
     "C:/imported/config.toml",
+    "11",
+    ["model.extra_headers_json", "mcp.servers_json"],
   );
   assert.equal(initialSetupImportedSourcePath(state, setupTarget, configTarget), "C:/imported/config.toml");
+  assert.deepEqual(initialSetupImportedConfigReference(state, setupTarget, configTarget), {
+    importGeneration: "11",
+    configuredSensitiveKeys: ["model.extra_headers_json", "mcp.servers_json"],
+  });
   reconcileInitialSetupAuxiliaryState(
     state,
     setupTarget,
     { ...configTarget, configGeneration: "8" },
   );
   assert.equal(initialSetupImportedSourcePath(state, setupTarget, configTarget), null);
+  assert.equal(initialSetupImportedConfigReference(state, setupTarget, configTarget), null);
 });
 
 test("read-only import adopts exactly one complete draft without partial mutation", () => {

@@ -16,6 +16,10 @@ export const SCRIPTED_PROVIDER_TOOL_ERROR_RECOVERY_KIND = "tool_error_recovery";
 export const SCRIPTED_PROVIDER_TOOL_ERROR_RECOVERY_MAX_RESPONSES = 2;
 export const SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND = "permission_restart_guardian";
 export const SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_MAX_RESPONSES = 4;
+export const SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_API_MODES = Object.freeze([
+  "responses",
+  "chat_completions",
+]);
 export const SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND = "permission_temp_escalation";
 export const SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_RESPONSES = 4;
 export const SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_MAX_GUARDIAN_DELAY_MS = 300_000;
@@ -25,6 +29,34 @@ export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_PROMPT =
   "Use current_time exactly once with {}. After the tool result, reply only CHAT_TOOL_CONTINUATION_OK.";
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_RESPONSE = "CHAT_TOOL_CONTINUATION_OK";
 export const SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_CALL_ID = "call_chat_current_time";
+export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND = "side_chat_quote";
+export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAX_RESPONSES = 4;
+export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAIN_PROMPT =
+  "Create the requested quote artifact, then return the exact settled quote response.";
+export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_TRANSCRIPT_SELECTION =
+  "TRANSCRIPT_QUOTE_SOURCE_7F3A9C";
+export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAIN_RESPONSE =
+  `Settled assistant source: ${SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_TRANSCRIPT_SELECTION}`;
+export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_ARTIFACT_PATH =
+  "side-chat-quote-source.txt";
+export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_ARTIFACT_CONTENT =
+  "canonical side chat artifact source\n";
+export const SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_FIRST_RESPONSE =
+  "SIDE_CHAT_TRANSCRIPT_QUOTE_OK";
+export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_KIND = "side_chat_session";
+export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAX_RESPONSES = 3;
+export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_PROMPT =
+  "セッションAの決定事項: テーマカラーは青、公開日は金曜日です。この内容を記録して要約してください。";
+export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_RESPONSE =
+  "セッションA: テーマカラーは青、公開日は金曜日です。";
+export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_PROMPT =
+  "セッションBの決定事項: テーマカラーは赤、公開日は月曜日です。この内容を記録して要約してください。";
+export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_RESPONSE =
+  "セッションB: テーマカラーは赤、公開日は月曜日です。";
+export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_QUESTION =
+  "このセッションで決めたテーマカラーと公開日を教えてください。";
+export const SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_SIDE_RESPONSE =
+  "このセッションの決定事項は、テーマカラーが青、公開日が金曜日です。";
 export const SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND = "responses_compaction_retry";
 export const SCRIPTED_PROVIDER_RESPONSES_COMPACTION_TOOL_CALL_COUNT = 8;
 export const SCRIPTED_PROVIDER_RESPONSES_COMPACTION_MAX_RESPONSES =
@@ -241,6 +273,7 @@ function toolErrorRecoveryScript(value) {
 
 function permissionRestartGuardianScript(value) {
   const expectedKeys = [
+    "apiMode",
     "command",
     "justification",
     "kind",
@@ -253,8 +286,12 @@ function permissionRestartGuardianScript(value) {
     || value.kind !== SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND) {
     throw new TypeError("permission restart Guardian scripted provider mode must use its exact schema");
   }
+  if (!SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_API_MODES.includes(value.apiMode)) {
+    throw new TypeError("permission restart Guardian script.apiMode must use a supported wire mode");
+  }
   return Object.freeze({
     kind: value.kind,
+    apiMode: value.apiMode,
     seedPrompt: nonEmptyString(value.seedPrompt, "script.seedPrompt"),
     seedResponseText: nonEmptyString(value.seedResponseText, "script.seedResponseText"),
     taskPrompt: nonEmptyString(value.taskPrompt, "script.taskPrompt"),
@@ -301,6 +338,23 @@ function chatToolContinuationScript(value) {
   if (!exactKeys(value, expectedKeys)
     || value.kind !== SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
     throw new TypeError("Chat tool continuation scripted provider mode must use its exact schema");
+  }
+  return Object.freeze({ kind: value.kind });
+}
+
+function sideChatQuoteScript(value) {
+  const expectedKeys = ["kind"];
+  if (!exactKeys(value, expectedKeys)
+    || value.kind !== SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND) {
+    throw new TypeError("Side Chat quote scripted provider mode must use its exact schema");
+  }
+  return Object.freeze({ kind: value.kind });
+}
+
+function sideChatSessionScript(value) {
+  if (!exactKeys(value, ["kind"])
+    || value.kind !== SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_KIND) {
+    throw new TypeError("Side Chat session scripted provider mode must use its exact schema");
   }
   return Object.freeze({ kind: value.kind });
 }
@@ -352,6 +406,12 @@ function providerScript(value) {
   if (value?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
     return chatToolContinuationScript(value);
   }
+  if (value?.kind === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND) {
+    return sideChatQuoteScript(value);
+  }
+  if (value?.kind === SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_KIND) {
+    return sideChatSessionScript(value);
+  }
   if (value?.kind === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND) {
     return responsesCompactionScript(value);
   }
@@ -370,6 +430,12 @@ function scriptedResponseMaximum(script) {
   }
   if (script?.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
     return SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_MAX_RESPONSES;
+  }
+  if (script?.kind === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND) {
+    return SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAX_RESPONSES;
+  }
+  if (script?.kind === SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_KIND) {
+    return SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_MAX_RESPONSES;
   }
   if (script?.kind === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND) {
     return script.toolCallCount + 3;
@@ -404,6 +470,7 @@ export function createToolErrorRecoveryProviderScript({
 }
 
 export function createPermissionRestartGuardianProviderScript({
+  apiMode = "responses",
   seedPrompt,
   seedResponseText,
   taskPrompt,
@@ -413,6 +480,7 @@ export function createPermissionRestartGuardianProviderScript({
 } = {}) {
   return permissionRestartGuardianScript({
     kind: SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND,
+    apiMode,
     seedPrompt,
     seedResponseText,
     taskPrompt,
@@ -443,6 +511,14 @@ export function createChatToolContinuationProviderScript() {
   return chatToolContinuationScript({
     kind: SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND,
   });
+}
+
+export function createSideChatQuoteProviderScript() {
+  return sideChatQuoteScript({ kind: SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND });
+}
+
+export function createSideChatSessionProviderScript() {
+  return sideChatSessionScript({ kind: SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_KIND });
 }
 
 export function createResponsesCompactionProviderScript({
@@ -601,6 +677,8 @@ const AGENT_INTERRUPT_SPAWN_CALL_ID = "call_agent_interrupt_spawn";
 const AGENT_INTERRUPT_SPAWN_ITEM_ID = "fc_agent_interrupt_spawn";
 const TOOL_ERROR_RECOVERY_READ_CALL_ID = "call_tool_error_recovery_read";
 const TOOL_ERROR_RECOVERY_READ_ITEM_ID = "fc_tool_error_recovery_read";
+const SIDE_CHAT_QUOTE_WRITE_CALL_ID = "call_side_chat_quote_write";
+const SIDE_CHAT_QUOTE_WRITE_ITEM_ID = "fc_side_chat_quote_write";
 const PERMISSION_RESTART_GUARDIAN_SHELL_CALL_ID = "call_permission_restart_guardian_shell";
 const PERMISSION_RESTART_GUARDIAN_SHELL_ITEM_ID = "fc_permission_restart_guardian_shell";
 const PERMISSION_TEMP_ESCALATION_RESTRICTED_CALL_ID =
@@ -621,6 +699,31 @@ const GUARDIAN_RESPONSES_KEYS = Object.freeze([
   "model",
   "store",
   "stream",
+]);
+const GUARDIAN_CHAT_KEYS = Object.freeze([
+  "messages",
+  "model",
+  "n",
+  "stream",
+  "stream_options",
+]);
+const GUARDIAN_CHAT_SAMPLING_KEYS = Object.freeze([
+  "frequency_penalty",
+  "min_p",
+  "presence_penalty",
+  "seed",
+  "stop",
+  "stop_sequences",
+  "temperature",
+  "top_k",
+  "top_p",
+]);
+const GUARDIAN_CHAT_REASONING_KEYS = Object.freeze([
+  "chat_template_kwargs",
+  "enable_thinking",
+  "reasoning",
+  "reasoning_effort",
+  "reasoning_summary",
 ]);
 const CHAT_TOOL_CONTINUATION_KEYS = Object.freeze([
   "messages",
@@ -872,6 +975,55 @@ function readToolsContract(tools) {
   };
 }
 
+function writeToolSchemaPass(tool) {
+  const parameters = tool?.parameters;
+  const properties = parameters?.properties;
+  return exactKeys(tool, ["description", "name", "parameters", "type"])
+    && tool.type === "function"
+    && tool.name === "write"
+    && typeof tool.description === "string"
+    && tool.description.trim().length > 0
+    && exactKeys(parameters, ["properties", "required", "type"])
+    && parameters.type === "object"
+    && Array.isArray(parameters.required)
+    && JSON.stringify(parameters.required) === JSON.stringify(["path", "content"])
+    && exactKeys(properties, ["content", "path"])
+    && properties.path?.type === "string"
+    && properties.content?.type === "string";
+}
+
+function writeToolsContract(tools) {
+  const names = Array.isArray(tools)
+    ? tools.map((tool) => typeof tool?.name === "string" ? tool.name : null)
+    : [];
+  const genericShapePass = Array.isArray(tools)
+    && tools.length > 0
+    && tools.every((tool) => exactKeys(tool, ["description", "name", "parameters", "type"])
+      && tool.type === "function"
+      && typeof tool.name === "string"
+      && tool.name.length > 0
+      && typeof tool.description === "string"
+      && tool.description.length > 0
+      && tool.parameters !== null
+      && typeof tool.parameters === "object"
+      && !Array.isArray(tool.parameters));
+  const uniqueNames = names.every((name) => name !== null) && new Set(names).size === names.length;
+  const writeTools = Array.isArray(tools) ? tools.filter((tool) => tool?.name === "write") : [];
+  return {
+    tool_count: Array.isArray(tools) ? tools.length : null,
+    tool_names_sha256: names.every((name) => name !== null)
+      ? sha256(Buffer.from([...names].sort().join("\n"), "utf8"))
+      : null,
+    unique_tool_names: uniqueNames,
+    write_present: writeTools.length === 1,
+    write_schema_matches: writeTools.length === 1 && writeToolSchemaPass(writeTools[0]),
+    pass: genericShapePass
+      && uniqueNames
+      && writeTools.length === 1
+      && writeToolSchemaPass(writeTools[0]),
+  };
+}
+
 function shellToolSchemaPass(tool) {
   const parameters = tool?.parameters;
   const properties = parameters?.properties;
@@ -983,6 +1135,43 @@ function chatToolsContract(tools) {
       && uniqueNames
       && currentTimeTools.length === 1
       && currentTimeToolSchemaPass(currentTimeTools[0]),
+  };
+}
+
+function chatShellToolSchemaPass(tool) {
+  return exactKeys(tool, ["function", "type"])
+    && tool.type === "function"
+    && shellToolSchemaPass({ ...tool.function, type: tool.type });
+}
+
+function chatShellToolsContract(tools) {
+  const functions = Array.isArray(tools) ? tools.map((tool) => tool?.function) : [];
+  const names = functions.map((definition) => typeof definition?.name === "string"
+    ? definition.name
+    : null);
+  const uniqueNames = names.every((name) => name !== null) && new Set(names).size === names.length;
+  const shellTools = Array.isArray(tools)
+    ? tools.filter((tool) => tool?.function?.name === "shell")
+    : [];
+  const pass = Array.isArray(tools)
+    && tools.length > 0
+    && tools.every((tool) => exactKeys(tool, ["function", "type"])
+      && tool.type === "function"
+      && tool.function !== null
+      && typeof tool.function === "object"
+      && !Array.isArray(tool.function))
+    && uniqueNames
+    && shellTools.length === 1
+    && chatShellToolSchemaPass(shellTools[0]);
+  return {
+    tool_count: Array.isArray(tools) ? tools.length : null,
+    tool_names_sha256: names.every((name) => name !== null)
+      ? sha256(Buffer.from([...names].sort().join("\n"), "utf8"))
+      : null,
+    unique_tool_names: uniqueNames,
+    shell_present: shellTools.length === 1,
+    shell_schema_matches: shellTools.length === 1 && chatShellToolSchemaPass(shellTools[0]),
+    pass,
   };
 }
 
@@ -1283,6 +1472,380 @@ function toolErrorRecoveryRequestContract(body, modelId, expectedPrompt, script)
       && contract.tool_choice_auto
       && contract.parallel_tool_calls_false
       && contract.tools.pass,
+  };
+}
+
+function sideChatQuoteDraft(selectedText) {
+  return `> Side Chat 引用\n> ${selectedText}`;
+}
+
+function sideChatXmlEntitiesV1BodyIsCanonical(text) {
+  if (typeof text !== "string") return false;
+  const reserved = new Set(["<", ">", "[", "]", "\"", "'"]);
+  for (let index = 0; index < text.length;) {
+    const codePoint = text.codePointAt(index);
+    const character = String.fromCodePoint(codePoint);
+    if (character === "&") {
+      const entity = text.slice(index).match(
+        /^&(?:amp|lt|gt|quot|apos);|^&#x[0-9A-F]+;/u,
+      );
+      if (entity === null) return false;
+      index += entity[0].length;
+      continue;
+    }
+    if (reserved.has(character)
+      || (codePoint >= 0x00 && codePoint <= 0x08)
+      || codePoint === 0x0B
+      || codePoint === 0x0C
+      || (codePoint >= 0x0E && codePoint <= 0x1F)
+      || (codePoint >= 0x7F && codePoint <= 0x9F)
+      || (codePoint >= 0xD800 && codePoint <= 0xDFFF)) {
+      return false;
+    }
+    index += character.length;
+  }
+  return true;
+}
+
+function sideChatXmlEntitiesV1Encode(text) {
+  let encoded = "";
+  for (const character of text) {
+    const codePoint = character.codePointAt(0);
+    if (character === "&") encoded += "&amp;";
+    else if (character === "<") encoded += "&lt;";
+    else if (character === ">") encoded += "&gt;";
+    else if (character === "\"") encoded += "&quot;";
+    else if (character === "'") encoded += "&apos;";
+    else if (character === "[") encoded += "&#x5B;";
+    else if (character === "]") encoded += "&#x5D;";
+    else if (character === "\t" || character === "\n" || character === "\r") {
+      encoded += character;
+    } else if ((codePoint >= 0x00 && codePoint <= 0x1F)
+      || (codePoint >= 0x7F && codePoint <= 0x9F)) {
+      encoded += `&#x${codePoint.toString(16).toUpperCase()};`;
+    } else {
+      encoded += character;
+    }
+  }
+  return encoded;
+}
+
+function sideChatQuoteEvidenceUnits(text) {
+  const unitPattern = /\n<evidence_unit kind="([a-z_]+)" source_history_item_ids="([0-9A-Za-z]+(?:,[0-9A-Za-z]+)*)">\n([\s\S]*?)\n<\/evidence_unit>\n/uy;
+  const units = [];
+  const allSourceIds = new Set();
+  let offset = 0;
+  while (offset < text.length) {
+    unitPattern.lastIndex = offset;
+    const unit = unitPattern.exec(text);
+    if (unit === null || unit.index !== offset) return null;
+    const sourceHistoryItemIds = unit[2].split(",");
+    if (!sideChatXmlEntitiesV1BodyIsCanonical(unit[3])
+      || new Set(sourceHistoryItemIds).size !== sourceHistoryItemIds.length
+      || sourceHistoryItemIds.some((id) => allSourceIds.has(id))) {
+      return null;
+    }
+    sourceHistoryItemIds.forEach((id) => allSourceIds.add(id));
+    units.push({
+      kind: unit[1],
+      sourceHistoryItemIds,
+      body: unit[3],
+    });
+    offset = unitPattern.lastIndex;
+  }
+  return units.length > 0 ? units : null;
+}
+
+function sideChatQuoteEvidenceProfile(units, sourceKind, historyItemId) {
+  const selectedUnitIndex = sourceKind === "artifact"
+    ? 1
+    : sourceKind === "transcript"
+      ? 2
+      : null;
+  const unitKinds = units?.map((unit) => unit.kind) ?? [];
+  const unitSourceCounts = units?.map((unit) => unit.sourceHistoryItemIds.length) ?? [];
+  const unitBodySha256 = units?.map((unit) => sha256(Buffer.from(unit.body, "utf8"))) ?? [];
+  const selectedUnit = selectedUnitIndex === null ? null : units?.[selectedUnitIndex] ?? null;
+  const expectedKinds = ["owner_user", "owner_tool", "owner_assistant"];
+  const expectedSourceCounts = [1, 3, 1];
+  const knownBodiesMatch = units?.[0]?.body
+      === sideChatXmlEntitiesV1Encode(SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAIN_PROMPT)
+    && units?.[2]?.body
+      === sideChatXmlEntitiesV1Encode(SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAIN_RESPONSE);
+  const pass = units !== null
+    && units.length === expectedKinds.length
+    && JSON.stringify(unitKinds) === JSON.stringify(expectedKinds)
+    && JSON.stringify(unitSourceCounts) === JSON.stringify(expectedSourceCounts)
+    && knownBodiesMatch
+    && selectedUnit?.sourceHistoryItemIds.at(-1) === historyItemId;
+  return {
+    pass,
+    selected_unit_index: selectedUnitIndex,
+    selected_unit_kind: selectedUnit?.kind ?? null,
+    selected_unit_source_history_item_ids: selectedUnit?.sourceHistoryItemIds ?? null,
+    unit_kinds: unitKinds,
+    unit_source_history_item_counts: unitSourceCounts,
+    unit_body_sha256: unitBodySha256,
+    known_bodies_match: knownBodiesMatch,
+  };
+}
+
+export function sideChatQuoteOwnerContext(text, sourceKind, selectedText) {
+  if (typeof text !== "string"
+    || typeof sourceKind !== "string"
+    || typeof selectedText !== "string") {
+    return { pass: false };
+  }
+  const envelope = text.match(
+    /^<side_chat_owner_context>\nscope: owner_session\nowner_session_id: ([0-9A-Za-z]+)\nas_of_append_position: (\d+)\ntruncated: (false)\ncontent_encoding: (xml_entities_v1)\n\n<selected_quote source_kind="([a-z_]+)" source_history_item_id="([0-9A-Za-z]+)" source_append_position="(\d+)">\n([\s\S]*?)\n<\/selected_quote>\n\n<canonical_evidence>\n([\s\S]*)<\/canonical_evidence>\n<\/side_chat_owner_context>$/u,
+  );
+  if (envelope === null) return { pass: false };
+  const ownerId = envelope[1];
+  const asOf = envelope[2];
+  const truncated = envelope[3];
+  const contentEncoding = envelope[4];
+  const quoteKind = envelope[5];
+  const historyItemId = envelope[6];
+  const quotePosition = envelope[7];
+  const quoteText = envelope[8];
+  const units = sideChatQuoteEvidenceUnits(envelope[9]);
+  const evidenceProfile = sideChatQuoteEvidenceProfile(units, quoteKind, historyItemId);
+  const canonicalSourceHistoryItemIds = evidenceProfile.pass
+    ? evidenceProfile.selected_unit_source_history_item_ids
+    : null;
+  const quoteTextCanonical = sideChatXmlEntitiesV1BodyIsCanonical(quoteText);
+  const pass = quoteTextCanonical
+    && quoteKind === sourceKind
+    && quotePosition === asOf
+    && quoteText === sideChatXmlEntitiesV1Encode(selectedText)
+    && evidenceProfile.pass;
+  return {
+    pass,
+    owner_session_id_sha256: sha256(Buffer.from(ownerId, "utf8")),
+    as_of_append_position: asOf,
+    truncated,
+    content_encoding: contentEncoding,
+    source_kind: quoteKind,
+    source_history_item_id: historyItemId,
+    source_append_position: quotePosition,
+    selected_text_sha256: sha256(Buffer.from(quoteText, "utf8")),
+    canonical_evidence_present: units !== null,
+    canonical_source_history_item_ids: canonicalSourceHistoryItemIds,
+    canonical_evidence_profile: evidenceProfile,
+  };
+}
+
+export function sideChatSessionOwnerContext(text) {
+  if (typeof text !== "string") return { pass: false };
+  const envelope = text.match(
+    /^<side_chat_owner_context>\nscope: owner_session\nowner_session_id: ([0-7][0-9A-HJKMNP-TV-Z]{25})\nas_of_append_position: ([1-9]\d*)\ntruncated: false\ncontent_encoding: xml_entities_v1\n\n<canonical_evidence>\n([\s\S]*)<\/canonical_evidence>\n<\/side_chat_owner_context>$/u,
+  );
+  if (envelope === null || BigInt(envelope[2]) > 9_223_372_036_854_775_807n) {
+    return { pass: false };
+  }
+  const units = sideChatQuoteEvidenceUnits(envelope[3]);
+  const expectedKinds = ["owner_user", "owner_assistant"];
+  const expectedBodies = [
+    SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_PROMPT,
+    SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_RESPONSE,
+  ].map(sideChatXmlEntitiesV1Encode);
+  const canonicalId = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/u;
+  const pass = units !== null
+    && units.length === expectedKinds.length
+    && units.every((unit, index) => unit.kind === expectedKinds[index]
+      && unit.sourceHistoryItemIds.length === 1
+      && canonicalId.test(unit.sourceHistoryItemIds[0])
+      && unit.body === expectedBodies[index]);
+  return {
+    pass,
+    owner_session_id: envelope[1],
+    as_of_append_position: envelope[2],
+    truncated: false,
+    content_encoding: "xml_entities_v1",
+    unit_kinds: units?.map((unit) => unit.kind) ?? [],
+    source_history_item_ids: units?.flatMap((unit) => unit.sourceHistoryItemIds) ?? [],
+    unit_body_sha256: units?.map((unit) => sha256(Buffer.from(unit.body, "utf8"))) ?? [],
+  };
+}
+
+function sideChatSessionRequestContract(body, modelId, script) {
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const firstText = exactInputText(input[0]);
+  const ownerContext = sideChatSessionOwnerContext(firstText);
+  const role = input.length === 1 && firstText === SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_PROMPT
+    ? "side_session_alpha"
+    : input.length === 1 && firstText === SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_PROMPT
+      ? "side_session_beta"
+      : input.length === 2 && ownerContext.pass
+          && exactInputText(input[1]) === SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_QUESTION
+        ? "side_session_consult"
+        : null;
+  // Reuse the common strict tool-less wire contract; only the two-message
+  // owner-context input differs from its one-user-input predicate.
+  const wire = requestContract(body, modelId, firstText);
+  const inputMatches = role !== null;
+  const serializedBody = JSON.stringify(body);
+  const foreignSessionAbsent = role !== "side_session_consult" || ![
+    SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_PROMPT,
+    SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_RESPONSE,
+  ].some((text) => serializedBody.includes(text));
+  return {
+    ...wire,
+    script_kind: script.kind,
+    role,
+    input_count: input.length,
+    input_matches: inputMatches,
+    owner_context: ownerContext,
+    foreign_session_absent: foreignSessionAbsent,
+    pass: wire.client_generation_fields_absent
+      && wire.model_matches
+      && inputMatches
+      && foreignSessionAbsent
+      && wire.instructions_non_empty
+      && wire.top_level_keys_match
+      && wire.max_output_tokens_absent
+      && wire.stream_true
+      && wire.store_false,
+  };
+}
+
+function sideChatQuoteExpectedWrite() {
+  return {
+    arguments: JSON.stringify({
+      path: SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_ARTIFACT_PATH,
+      content: SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_ARTIFACT_CONTENT,
+    }),
+  };
+}
+
+function sideChatQuoteRole(body) {
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const inputTypes = input.map((item) => typeof item?.type === "string" ? item.type : null);
+  const firstText = exactInputText(input[0]);
+  const expectedWrite = sideChatQuoteExpectedWrite();
+  const writeCall = input[1];
+  const writeOutput = input[2];
+  const writeCallMatches = exactKeys(writeCall, ["arguments", "call_id", "name", "type"])
+    && writeCall.type === "function_call"
+    && writeCall.call_id === SIDE_CHAT_QUOTE_WRITE_CALL_ID
+    && writeCall.name === "write"
+    && writeCall.arguments === expectedWrite.arguments;
+  const writeOutputText = exactKeys(writeOutput, ["call_id", "output", "type"])
+    && writeOutput.type === "function_call_output"
+    && writeOutput.call_id === SIDE_CHAT_QUOTE_WRITE_CALL_ID
+    && typeof writeOutput.output === "string"
+    && writeOutput.output.trim().length > 0
+    ? writeOutput.output
+    : null;
+
+  const mainInitial = input.length === 1
+    && firstText === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAIN_PROMPT;
+  const mainContinuation = input.length === 3
+    && firstText === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAIN_PROMPT
+    && writeCallMatches
+    && writeOutputText !== null;
+
+  const transcriptContext = sideChatQuoteOwnerContext(
+    firstText,
+    "transcript",
+    SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_TRANSCRIPT_SELECTION,
+  );
+  const artifactContext = sideChatQuoteOwnerContext(
+    firstText,
+    "artifact",
+    SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_ARTIFACT_PATH,
+  );
+  const transcriptDraft = sideChatQuoteDraft(
+    SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_TRANSCRIPT_SELECTION,
+  );
+  const artifactDraft = sideChatQuoteDraft(
+    SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_ARTIFACT_PATH,
+  );
+  const sideTranscript = input.length === 2
+    && transcriptContext.pass
+    && exactInputText(input[1]) === transcriptDraft;
+  const sideArtifact = input.length === 4
+    && artifactContext.pass
+    && exactInputText(input[1]) === transcriptDraft
+    && exactOutputText(input[2]) === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_FIRST_RESPONSE
+    && exactInputText(input[3]) === artifactDraft;
+  const role = mainInitial
+    ? "side_quote_main_initial"
+    : mainContinuation
+      ? "side_quote_main_continuation"
+      : sideTranscript
+        ? "side_quote_transcript"
+        : sideArtifact
+          ? "side_quote_artifact_held"
+          : null;
+  return {
+    role,
+    evidence: {
+      input_count: input.length,
+      input_item_types: inputTypes,
+      first_input_text_sha256: firstText === null ? null : sha256(Buffer.from(firstText, "utf8")),
+      main_prompt_matches: firstText === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAIN_PROMPT,
+      write_call_matches: writeCallMatches,
+      write_output_non_empty: writeOutputText !== null,
+      transcript_context: transcriptContext,
+      artifact_context: artifactContext,
+      transcript_draft_matches: exactInputText(input.at(-1)) === transcriptDraft,
+      artifact_draft_matches: exactInputText(input.at(-1)) === artifactDraft,
+      prior_side_response_matches: exactOutputText(input[2])
+        === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_FIRST_RESPONSE,
+    },
+  };
+}
+
+function sideChatQuoteRequestContract(body, modelId, script) {
+  const model = typeof body?.model === "string" ? body.model : null;
+  const instructions = typeof body?.instructions === "string" ? body.instructions : null;
+  const topLevelKeys = body !== null && typeof body === "object" && !Array.isArray(body)
+    ? Object.keys(body).sort()
+    : [];
+  const classified = sideChatQuoteRole(body);
+  const mainRole = classified.role === "side_quote_main_initial"
+    || classified.role === "side_quote_main_continuation";
+  const sideRole = classified.role === "side_quote_transcript"
+    || classified.role === "side_quote_artifact_held";
+  const tools = writeToolsContract(body?.tools);
+  const generation = clientGenerationContract(body);
+  const contract = {
+    ...generation,
+    script_kind: script.kind,
+    role: classified.role,
+    role_evidence: classified.evidence,
+    model_sha256: model === null ? null : sha256(Buffer.from(model, "utf8")),
+    instructions_sha256: instructions === null ? null : sha256(Buffer.from(instructions, "utf8")),
+    top_level_keys: topLevelKeys,
+    model_matches: model === modelId,
+    instructions_non_empty: instructions !== null && instructions.trim().length > 0,
+    top_level_keys_match: mainRole
+      ? JSON.stringify(topLevelKeys) === JSON.stringify(TOOL_RESPONSES_KEYS)
+      : sideRole && JSON.stringify(topLevelKeys) === JSON.stringify(EXPECTED_RESPONSES_KEYS),
+    max_output_tokens_absent: !Object.hasOwn(body ?? {}, "max_output_tokens"),
+    stream_true: body?.stream === true,
+    store_false: body?.store === false,
+    tool_choice_matches: mainRole ? body?.tool_choice === "auto" : !Object.hasOwn(body ?? {}, "tool_choice"),
+    parallel_tool_calls_matches: mainRole
+      ? body?.parallel_tool_calls === false
+      : !Object.hasOwn(body ?? {}, "parallel_tool_calls"),
+    tools,
+    tools_match: mainRole ? tools.pass : sideRole && !Object.hasOwn(body ?? {}, "tools"),
+  };
+  return {
+    ...contract,
+    pass: contract.client_generation_fields_absent
+      && contract.role !== null
+      && contract.model_matches
+      && contract.instructions_non_empty
+      && contract.top_level_keys_match
+      && contract.max_output_tokens_absent
+      && contract.stream_true
+      && contract.store_false
+      && contract.tool_choice_matches
+      && contract.parallel_tool_calls_matches
+      && contract.tools_match,
   };
 }
 
@@ -1811,6 +2374,197 @@ function permissionRestartGuardianRequestContract(
       && task.tools.pass
       && task.stream_true
       && task.store_false,
+  };
+}
+
+function permissionRestartGuardianChatMainRole(body, script) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  const systemText = exactChatTextMessage(messages[0], "system");
+  const seedUser = exactChatTextMessage(messages[1], "user");
+  const seedAssistant = exactChatTextMessage(messages[2], "assistant");
+  const taskUser = exactChatTextMessage(messages[3], "user");
+  const assistant = messages[4];
+  const tool = messages[5];
+  const expected = permissionRestartGuardianExpected(script);
+  const toolCall = Array.isArray(assistant?.tool_calls) && assistant.tool_calls.length === 1
+    ? assistant.tool_calls[0]
+    : null;
+  const callMatches = exactKeys(assistant, ["role", "tool_calls"])
+    && assistant.role === "assistant"
+    && exactKeys(toolCall, ["function", "id", "type"])
+    && toolCall.id === PERMISSION_RESTART_GUARDIAN_SHELL_CALL_ID
+    && toolCall.type === "function"
+    && exactKeys(toolCall.function, ["arguments", "name"])
+    && toolCall.function.name === "shell"
+    && toolCall.function.arguments === expected.shellArguments;
+  const toolOutput = exactKeys(tool, ["content", "role", "tool_call_id"])
+    && tool.role === "tool"
+    && tool.tool_call_id === PERMISSION_RESTART_GUARDIAN_SHELL_CALL_ID
+    && typeof tool.content === "string"
+    && tool.content.trim().length > 0
+    ? tool.content
+    : null;
+  const outputMatches = toolOutput !== null
+    && toolOutput.includes(`Command: ${script.command}`)
+    && toolOutput.includes("Exit code: 0");
+  const commonHistoryMatches = systemText !== null
+    && systemText.trim().length > 0
+    && seedUser === script.seedPrompt;
+  const seed = messages.length === 2 && commonHistoryMatches;
+  const toolInitial = messages.length === 4
+    && commonHistoryMatches
+    && seedAssistant === script.seedResponseText
+    && taskUser === script.taskPrompt;
+  const continuation = messages.length === 6
+    && commonHistoryMatches
+    && seedAssistant === script.seedResponseText
+    && taskUser === script.taskPrompt
+    && callMatches
+    && outputMatches;
+  const role = seed
+    ? "guardian_seed"
+    : toolInitial
+      ? "guardian_tool_initial"
+      : continuation
+        ? "guardian_continuation"
+        : null;
+  return {
+    role,
+    evidence: {
+      message_count: messages.length,
+      message_roles: messages.map((message) => typeof message?.role === "string"
+        ? message.role
+        : null),
+      system_content_sha256: systemText === null
+        ? null
+        : sha256(Buffer.from(systemText, "utf8")),
+      system_content_non_empty: systemText !== null && systemText.trim().length > 0,
+      seed_prompt_sha256: seedUser === null ? null : sha256(Buffer.from(seedUser, "utf8")),
+      seed_response_sha256: seedAssistant === null
+        ? null
+        : sha256(Buffer.from(seedAssistant, "utf8")),
+      task_prompt_sha256: taskUser === null ? null : sha256(Buffer.from(taskUser, "utf8")),
+      seed_prompt_matches: seedUser === script.seedPrompt,
+      seed_response_matches: seedAssistant === script.seedResponseText,
+      task_prompt_matches: taskUser === script.taskPrompt,
+      assistant_content_absent: assistant !== null
+        && typeof assistant === "object"
+        && !Array.isArray(assistant)
+        && !Object.hasOwn(assistant, "content"),
+      shell_call_matches: callMatches,
+      tool_output_non_empty: toolOutput !== null,
+      tool_output_matches: outputMatches,
+      tool_output_size_bytes: toolOutput === null ? null : Buffer.byteLength(toolOutput, "utf8"),
+      tool_output_sha256: toolOutput === null ? null : sha256(Buffer.from(toolOutput, "utf8")),
+    },
+  };
+}
+
+function permissionRestartGuardianChatReviewRole(body, script) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  const systemText = exactChatTextMessage(messages[0], "system");
+  const inputText = exactChatTextMessage(messages[1], "user");
+  const payload = inputText === null
+    ? permissionGuardianPayloadContract("", script)
+    : permissionGuardianPayloadContract(inputText, script);
+  const guardianInstructionsMatch = systemText?.includes("independent permission guardian") === true;
+  return {
+    role: messages.length === 2 && guardianInstructionsMatch && payload.pass
+      ? "guardian_review"
+      : null,
+    evidence: {
+      message_count: messages.length,
+      message_roles: messages.map((message) => typeof message?.role === "string"
+        ? message.role
+        : null),
+      system_content_sha256: systemText === null
+        ? null
+        : sha256(Buffer.from(systemText, "utf8")),
+      guardian_instructions_match: guardianInstructionsMatch,
+      input_text_size_bytes: inputText === null ? null : Buffer.byteLength(inputText, "utf8"),
+      input_text_sha256: inputText === null ? null : sha256(Buffer.from(inputText, "utf8")),
+      payload,
+    },
+  };
+}
+
+function permissionRestartGuardianChatRequestContract(body, modelId, script) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  const firstSystem = exactChatTextMessage(messages[0], "system");
+  const guardianShape = firstSystem?.includes("independent permission guardian") === true;
+  const classified = guardianShape
+    ? permissionRestartGuardianChatReviewRole(body, script)
+    : permissionRestartGuardianChatMainRole(body, script);
+  const model = typeof body?.model === "string" ? body.model : null;
+  const topLevelKeys = body !== null && typeof body === "object" && !Array.isArray(body)
+    ? Object.keys(body).sort()
+    : [];
+  const expectedKeys = guardianShape ? GUARDIAN_CHAT_KEYS : CHAT_TOOL_CONTINUATION_KEYS;
+  const generation = clientGenerationContract(body);
+  const common = {
+    ...generation,
+    script_kind: script.kind,
+    api_mode: script.apiMode,
+    role: classified.role,
+    role_evidence: classified.evidence,
+    model_sha256: model === null ? null : sha256(Buffer.from(model, "utf8")),
+    top_level_keys: topLevelKeys,
+    model_matches: model === modelId,
+    top_level_keys_match: JSON.stringify(topLevelKeys) === JSON.stringify(expectedKeys),
+    stream_true: body?.stream === true,
+    include_usage_true: exactKeys(body?.stream_options, ["include_usage"])
+      && body.stream_options.include_usage === true,
+    n_one: body?.n === 1,
+    max_tokens_absent: !Object.hasOwn(body ?? {}, "max_tokens")
+      && !Object.hasOwn(body ?? {}, "max_output_tokens"),
+  };
+  if (guardianShape) {
+    const samplingFieldsPresent = GUARDIAN_CHAT_SAMPLING_KEYS
+      .filter((key) => Object.hasOwn(body ?? {}, key));
+    const reasoningFieldsPresent = GUARDIAN_CHAT_REASONING_KEYS
+      .filter((key) => Object.hasOwn(body ?? {}, key));
+    const guardian = {
+      ...common,
+      sampling_fields_present: samplingFieldsPresent,
+      sampling_absent: samplingFieldsPresent.length === 0,
+      reasoning_fields_present: reasoningFieldsPresent,
+      reasoning_absent: reasoningFieldsPresent.length === 0,
+      tools_absent: !Object.hasOwn(body ?? {}, "tools")
+        && !Object.hasOwn(body ?? {}, "tool_choice")
+        && !Object.hasOwn(body ?? {}, "parallel_tool_calls"),
+    };
+    return {
+      ...guardian,
+      pass: guardian.client_generation_fields_absent
+        && guardian.role === "guardian_review"
+        && guardian.model_matches
+        && guardian.top_level_keys_match
+        && guardian.stream_true
+        && guardian.include_usage_true
+        && guardian.n_one
+        && guardian.max_tokens_absent
+        && guardian.sampling_absent
+        && guardian.reasoning_absent
+        && guardian.tools_absent,
+    };
+  }
+  const task = {
+    ...common,
+    parallel_tool_calls_false: body?.parallel_tool_calls === false,
+    tools: chatShellToolsContract(body?.tools),
+  };
+  return {
+    ...task,
+    pass: task.client_generation_fields_absent
+      && task.role !== null
+      && task.model_matches
+      && task.top_level_keys_match
+      && task.stream_true
+      && task.include_usage_true
+      && task.n_one
+      && task.max_tokens_absent
+      && task.parallel_tool_calls_false
+      && task.tools.pass,
   };
 }
 
@@ -2398,6 +3152,68 @@ function chatCompletionSse(chunks) {
   return chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("");
 }
 
+function permissionRestartGuardianChatTextSse(modelId, id, text, {
+  promptTokens,
+  completionTokens,
+}) {
+  return chatCompletionSse([
+    {
+      id,
+      object: "chat.completion.chunk",
+      model: modelId,
+      choices: [{
+        index: 0,
+        delta: { content: text },
+        finish_reason: "stop",
+      }],
+    },
+    {
+      id,
+      object: "chat.completion.chunk",
+      model: modelId,
+      choices: [],
+      usage: {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: promptTokens + completionTokens,
+      },
+    },
+  ]);
+}
+
+function permissionRestartGuardianChatShellSse(modelId, script) {
+  const id = "chatcmpl_permission_restart_guardian_shell";
+  return chatCompletionSse([
+    {
+      id,
+      object: "chat.completion.chunk",
+      model: modelId,
+      choices: [{
+        index: 0,
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: PERMISSION_RESTART_GUARDIAN_SHELL_CALL_ID,
+            type: "function",
+            function: {
+              name: "shell",
+              arguments: permissionRestartGuardianExpected(script).shellArguments,
+            },
+          }],
+        },
+        finish_reason: "tool_calls",
+      }],
+    },
+    {
+      id,
+      object: "chat.completion.chunk",
+      model: modelId,
+      choices: [],
+      usage: { prompt_tokens: 24, completion_tokens: 8, total_tokens: 32 },
+    },
+  ]);
+}
+
 function chatToolContinuationCallSse(modelId) {
   const common = {
     id: "chatcmpl_chat_tool_initial",
@@ -2500,6 +3316,33 @@ function toolErrorRecoveryReadSse(script) {
       type: "response.completed",
       response: {
         id: "resp_tool_error_recovery_read",
+        output: [item],
+        usage: {
+          input_tokens: 8,
+          output_tokens: 6,
+          total_tokens: 14,
+          output_tokens_details: { reasoning_tokens: 0 },
+        },
+      },
+    },
+  ];
+  return events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+}
+
+function sideChatQuoteWriteSse() {
+  const item = {
+    type: "function_call",
+    id: SIDE_CHAT_QUOTE_WRITE_ITEM_ID,
+    call_id: SIDE_CHAT_QUOTE_WRITE_CALL_ID,
+    name: "write",
+    arguments: sideChatQuoteExpectedWrite().arguments,
+  };
+  const events = [
+    { type: "response.output_item.done", output_index: 0, item },
+    {
+      type: "response.completed",
+      response: {
+        id: "resp_side_chat_quote_write",
         output: [item],
         usage: {
           input_tokens: 8,
@@ -3073,7 +3916,11 @@ export class ScriptedProvider {
     if (release === null) throw new Error("scripted role response release is not configured");
     if (role !== release.role) throw new Error("scripted role response release target is invalid");
     if (release.released) throw new Error("scripted role response was already released");
-    const expectedRoute = role === "chat_continuation" ? "chat_completions" : "responses";
+    const expectedRoute = role === "chat_continuation"
+      || (this.script?.kind === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND
+        && this.script.apiMode === "chat_completions")
+      ? "chat_completions"
+      : "responses";
     const rows = this.#ledger.filter((row) => row.route === expectedRoute
       && row.contract?.pass === true
       && row.contract?.role === role);
@@ -3175,10 +4022,12 @@ export class ScriptedProvider {
       request.resume();
       return;
     }
-    const chatToolContinuationMode = this.script?.kind
-      === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND;
-    if ((route === "chat_completions" && !chatToolContinuationMode)
-      || (route === "responses" && chatToolContinuationMode)) {
+    const chatCompletionsScriptMode = this.script?.kind
+      === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND
+      || (this.script?.kind === SCRIPTED_PROVIDER_PERMISSION_RESTART_GUARDIAN_KIND
+        && this.script.apiMode === "chat_completions");
+    if ((route === "chat_completions" && !chatCompletionsScriptMode)
+      || (route === "responses" && chatCompletionsScriptMode)) {
       row.response_phase = "rejected";
       row.response_status = 404;
       fixedError(response, 404, "not_found");
@@ -3295,6 +4144,18 @@ export class ScriptedProvider {
           this.modelId,
           this.script,
         );
+      } else if (this.script.kind === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND) {
+        row.contract = sideChatQuoteRequestContract(
+          decoded.value,
+          this.modelId,
+          this.script,
+        );
+      } else if (this.script.kind === SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_KIND) {
+        row.contract = sideChatSessionRequestContract(
+          decoded.value,
+          this.modelId,
+          this.script,
+        );
       } else if (this.script.kind === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND) {
         row.contract = responsesCompactionRequestContract(
           decoded.value,
@@ -3309,11 +4170,17 @@ export class ScriptedProvider {
           this.script,
         );
       } else {
-        row.contract = permissionRestartGuardianRequestContract(
-          decoded.value,
-          this.modelId,
-          this.script,
-        );
+        row.contract = this.script.apiMode === "chat_completions"
+          ? permissionRestartGuardianChatRequestContract(
+            decoded.value,
+            this.modelId,
+            this.script,
+          )
+          : permissionRestartGuardianRequestContract(
+            decoded.value,
+            this.modelId,
+            this.script,
+          );
       }
       if (this.#scriptedResponsesRequestCount > scriptedResponseMaximum(this.script)) {
         row.response_phase = "rejected";
@@ -3327,6 +4194,10 @@ export class ScriptedProvider {
         await this.#handleToolErrorRecoveryResponse(response, row);
       } else if (this.script.kind === SCRIPTED_PROVIDER_CHAT_TOOL_CONTINUATION_KIND) {
         await this.#handleChatToolContinuationResponse(response, row);
+      } else if (this.script.kind === SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_KIND) {
+        await this.#handleSideChatQuoteResponse(response, row);
+      } else if (this.script.kind === SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_KIND) {
+        await this.#handleSideChatSessionResponse(response, row);
       } else if (this.script.kind === SCRIPTED_PROVIDER_RESPONSES_COMPACTION_KIND) {
         await this.#handleResponsesCompactionResponse(response, row);
       } else if (this.script.kind === SCRIPTED_PROVIDER_PERMISSION_TEMP_ESCALATION_KIND) {
@@ -3475,6 +4346,97 @@ export class ScriptedProvider {
         responseId: "resp_tool_error_recovery_done",
         streamedText: this.script.streamedPrefix,
       });
+    writeResponse(response, 200, "text/event-stream", payload);
+  }
+
+  async #handleSideChatSessionResponse(response, row) {
+    if (!row.contract.pass) {
+      row.response_phase = "rejected";
+      row.response_status = 422;
+      fixedError(response, 422, "request_contract_mismatch");
+      return;
+    }
+    const role = row.contract.role;
+    const roles = ["side_session_alpha", "side_session_beta", "side_session_consult"];
+    if (this.#acceptedRoles.has(role)) {
+      row.response_phase = "rejected";
+      row.response_status = 409;
+      fixedError(response, 409, "script_role_already_consumed");
+      return;
+    }
+    if (roles[this.#acceptedResponseCount] !== role) {
+      row.response_phase = "rejected";
+      row.response_status = 409;
+      fixedError(response, 409, "script_role_prerequisite_missing");
+      return;
+    }
+    this.#acceptedRoles.add(role);
+    this.#acceptedResponseCount += 1;
+    this.#successfulResponseCount += 1;
+    row.response_phase = "completed";
+    row.response_status = 200;
+    const responseText = {
+      side_session_alpha: SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_ALPHA_RESPONSE,
+      side_session_beta: SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_BETA_RESPONSE,
+      side_session_consult: SCRIPTED_PROVIDER_SIDE_CHAT_SESSION_SIDE_RESPONSE,
+    }[role];
+    writeResponse(response, 200, "text/event-stream", responsesSse(responseText, {
+      itemId: `msg_${role}`,
+      responseId: `resp_${role}`,
+    }));
+  }
+
+  async #handleSideChatQuoteResponse(response, row) {
+    if (!row.contract.pass) {
+      row.response_phase = "rejected";
+      row.response_status = 422;
+      fixedError(response, 422, "request_contract_mismatch");
+      return;
+    }
+    const role = row.contract.role;
+    if (this.#acceptedRoles.has(role)) {
+      row.response_phase = "rejected";
+      row.response_status = 409;
+      fixedError(response, 409, "script_role_already_consumed");
+      return;
+    }
+    const prerequisite = {
+      side_quote_main_initial: null,
+      side_quote_main_continuation: "side_quote_main_initial",
+      side_quote_transcript: "side_quote_main_continuation",
+      side_quote_artifact_held: "side_quote_transcript",
+    }[role];
+    if (prerequisite === undefined
+      || (prerequisite !== null && !this.#acceptedRoles.has(prerequisite))) {
+      row.response_phase = "rejected";
+      row.response_status = 409;
+      fixedError(response, 409, "script_role_prerequisite_missing");
+      return;
+    }
+
+    this.#acceptedRoles.add(role);
+    this.#acceptedResponseCount += 1;
+    if (role === "side_quote_artifact_held") {
+      row.response_phase = "held";
+      await waitForPeerClose(response);
+      row.response_phase = "peer_closed";
+      return;
+    }
+
+    this.#successfulResponseCount += 1;
+    row.response_phase = "completed";
+    row.response_status = 200;
+    const payload = role === "side_quote_main_initial"
+      ? sideChatQuoteWriteSse()
+      : role === "side_quote_main_continuation"
+        ? responsesSse(SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_MAIN_RESPONSE, {
+          itemId: "msg_side_chat_quote_main_done",
+          responseId: "resp_side_chat_quote_main_done",
+        })
+        : responsesSse(SCRIPTED_PROVIDER_SIDE_CHAT_QUOTE_FIRST_RESPONSE, {
+          itemId: "msg_side_chat_quote_transcript_done",
+          responseId: "resp_side_chat_quote_transcript_done",
+        });
     writeResponse(response, 200, "text/event-stream", payload);
   }
 
@@ -3740,7 +4702,30 @@ export class ScriptedProvider {
     row.response_phase = "completed";
     row.response_status = 200;
     let payload;
-    if (role === "guardian_seed") {
+    if (this.script.apiMode === "chat_completions" && role === "guardian_seed") {
+      payload = permissionRestartGuardianChatTextSse(
+        this.modelId,
+        "chatcmpl_permission_restart_guardian_seed",
+        this.script.seedResponseText,
+        { promptTokens: 12, completionTokens: 4 },
+      );
+    } else if (this.script.apiMode === "chat_completions" && role === "guardian_tool_initial") {
+      payload = permissionRestartGuardianChatShellSse(this.modelId, this.script);
+    } else if (this.script.apiMode === "chat_completions" && role === "guardian_review") {
+      payload = permissionRestartGuardianChatTextSse(
+        this.modelId,
+        "chatcmpl_permission_restart_guardian_allow",
+        JSON.stringify(PERMISSION_RESTART_GUARDIAN_ALLOW),
+        { promptTokens: 40, completionTokens: 8 },
+      );
+    } else if (this.script.apiMode === "chat_completions") {
+      payload = permissionRestartGuardianChatTextSse(
+        this.modelId,
+        "chatcmpl_permission_restart_guardian_done",
+        this.script.responseText,
+        { promptTokens: 32, completionTokens: 4 },
+      );
+    } else if (role === "guardian_seed") {
       payload = responsesSse(this.script.seedResponseText, {
         itemId: "msg_permission_restart_guardian_seed",
         responseId: "resp_permission_restart_guardian_seed",

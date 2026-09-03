@@ -329,6 +329,7 @@ impl ContextManager {
                 | HistoryItemPayload::RequestDiagnostics { .. }
                 | HistoryItemPayload::WorldState { .. }
                 | HistoryItemPayload::ApprovalDecision { .. }
+                | HistoryItemPayload::DurableFeedback { .. }
                 | HistoryItemPayload::FileChange { .. } => {}
             }
         }

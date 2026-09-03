@@ -486,13 +486,26 @@ pub struct FileGuardConfig {
     pub structured_document_extensions: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DoclingConfig {
     pub enabled: bool,
     pub base_url: String,
     pub timeout_ms: u64,
     pub api_key_env: Option<String>,
     pub headers: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for DoclingConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DoclingConfig")
+            .field("enabled", &self.enabled)
+            .field("base_url", &"<redacted Docling endpoint>")
+            .field("timeout_ms", &self.timeout_ms)
+            .field("api_key_env", &self.api_key_env)
+            .field("header_count", &self.headers.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -508,7 +521,7 @@ pub struct McpToolRouteConfig {
     pub effect: crate::tool::ToolEffectClass,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     pub id: String,
@@ -519,6 +532,21 @@ pub struct McpServerConfig {
     #[serde(default)]
     pub tool_routes: Vec<McpToolRouteConfig>,
     pub headers: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for McpServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpServerConfig")
+            .field("id", &self.id)
+            .field("enabled", &self.enabled)
+            .field("transport", &self.transport)
+            .field("base_url", &"<redacted MCP endpoint>")
+            .field("timeout_ms", &self.timeout_ms)
+            .field("tool_routes", &self.tool_routes)
+            .field("header_count", &self.headers.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -588,6 +616,25 @@ impl ResolvedConfig {
             return Ok(());
         }
         self.docling.base_url = canonical_docling_base_url(&self.docling.base_url)?;
+        Ok(())
+    }
+
+    pub(crate) fn normalize_and_validate_mcp_runtime(&mut self) -> Result<(), String> {
+        if !self.mcp.enabled {
+            return Ok(());
+        }
+        for (index, server) in self.mcp.servers.iter_mut().enumerate() {
+            if !server.enabled {
+                continue;
+            }
+            if server.timeout_ms == 0 {
+                return Err(format!(
+                    "config field `mcp.servers[{index}].timeout_ms` must be greater than zero"
+                ));
+            }
+            server.base_url = canonical_mcp_base_url(&server.base_url)
+                .map_err(|error| format!("config field `mcp.servers[{index}].base_url` {error}"))?;
+        }
         Ok(())
     }
 
@@ -670,6 +717,39 @@ pub(crate) fn canonical_docling_base_url(raw: &str) -> Result<String, String> {
     if url.fragment().is_some() {
         return Err("config field `docling.base_url` must not contain a fragment".to_string());
     }
+    let path = url.path().trim_end_matches('/').to_string();
+    url.set_path(if path.is_empty() { "/" } else { &path });
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+pub(crate) fn canonical_mcp_base_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("must not be empty for an enabled MCP server".to_string());
+    }
+    let mut url =
+        reqwest::Url::parse(trimmed).map_err(|_| "must be a valid absolute URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("must use http or https".to_string());
+    }
+    if url.host_str().is_none() {
+        return Err("must include a host".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "must not contain URL userinfo; configure credentials through MCP headers".to_string(),
+        );
+    }
+    if url.query().is_some() {
+        return Err(
+            "must not contain a query string; configure credentials through MCP headers"
+                .to_string(),
+        );
+    }
+    if url.fragment().is_some() {
+        return Err("must not contain a fragment".to_string());
+    }
+
     let path = url.path().trim_end_matches('/').to_string();
     url.set_path(if path.is_empty() { "/" } else { &path });
     Ok(url.to_string().trim_end_matches('/').to_string())
@@ -1091,7 +1171,7 @@ pub struct PartialFileGuardConfig {
     pub structured_document_extensions: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartialDoclingConfig {
     pub enabled: Option<bool>,
@@ -1099,6 +1179,25 @@ pub struct PartialDoclingConfig {
     pub timeout_ms: Option<u64>,
     pub api_key_env: Option<Option<String>>,
     pub headers: Option<BTreeMap<String, String>>,
+}
+
+impl std::fmt::Debug for PartialDoclingConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PartialDoclingConfig")
+            .field("enabled", &self.enabled)
+            .field(
+                "base_url",
+                &self
+                    .base_url
+                    .as_ref()
+                    .map(|_| "<redacted Docling endpoint>"),
+            )
+            .field("timeout_ms", &self.timeout_ms)
+            .field("api_key_env", &self.api_key_env)
+            .field("header_count", &self.headers.as_ref().map(BTreeMap::len))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1126,8 +1225,8 @@ pub struct PartialLoggingConfig {
 #[cfg(test)]
 mod config_contract_tests {
     use super::{
-        AccessMode, McpServerConfig, PartialModelConfig, PartialResolvedConfig, ResolvedConfig,
-        canonical_api_key_env_name,
+        AccessMode, McpServerConfig, PartialDoclingConfig, PartialMcpConfig, PartialModelConfig,
+        PartialResolvedConfig, ResolvedConfig, canonical_api_key_env_name,
     };
     use crate::tool::ToolEffectClass;
 
@@ -1359,6 +1458,120 @@ headers = {}
 "#,
         );
         assert!(retired.is_err());
+    }
+
+    #[test]
+    fn enabled_mcp_servers_use_canonical_http_origins_and_reject_url_credentials() {
+        let mut config = ResolvedConfig::default();
+        config.mcp.enabled = true;
+        config.mcp.servers[0].enabled = true;
+        config.mcp.servers[0].base_url = "  http://127.0.0.1:8123/mcp/  ".to_string();
+        config
+            .normalize_and_validate_mcp_runtime()
+            .expect("canonical MCP endpoint");
+        assert_eq!(config.mcp.servers[0].base_url, "http://127.0.0.1:8123/mcp");
+
+        for invalid in [
+            "ftp://127.0.0.1/mcp",
+            "http://user:do-not-disclose@127.0.0.1/mcp",
+            "http://127.0.0.1/mcp#fragment",
+            "relative/mcp",
+            " ",
+        ] {
+            config.mcp.servers[0].base_url = invalid.to_string();
+            let error = config
+                .normalize_and_validate_mcp_runtime()
+                .expect_err("invalid MCP endpoint must fail closed");
+            assert!(error.contains("mcp.servers[0].base_url"));
+            assert!(!error.contains("do-not-disclose"));
+        }
+
+        config.mcp.servers[0].base_url = "http://127.0.0.1/mcp".to_string();
+        config.mcp.servers[0].timeout_ms = 0;
+        let error = config
+            .normalize_and_validate_mcp_runtime()
+            .expect_err("zero MCP operation deadline must fail closed");
+        assert!(error.contains("mcp.servers[0].timeout_ms"));
+    }
+
+    #[test]
+    fn enabled_mcp_query_tokens_are_rejected_without_disclosure() {
+        const QUERY_TOKEN: &str = "mcp-query-token-must-not-be-disclosed";
+
+        let mut config = ResolvedConfig::default();
+        config.mcp.enabled = true;
+        config.mcp.servers[0].enabled = true;
+        config.mcp.servers[0].base_url =
+            format!("https://mcp.example.test/rpc?access_token={QUERY_TOKEN}");
+
+        let error = config
+            .normalize_and_validate_mcp_runtime()
+            .expect_err("MCP query tokens must fail config admission");
+
+        assert!(error.contains("mcp.servers[0].base_url"));
+        assert!(error.contains("query string"));
+        assert!(!error.contains(QUERY_TOKEN));
+    }
+
+    #[test]
+    fn config_debug_omits_request_headers_bodies_and_disabled_endpoint_drafts() {
+        let secrets = [
+            "model-header-super-secret",
+            "model-body-super-secret",
+            "docling-header-super-secret",
+            "docling-url-super-secret",
+            "mcp-header-super-secret",
+            "mcp-url-super-secret",
+        ];
+        let mut config = ResolvedConfig::default();
+        config
+            .model
+            .extra_headers
+            .insert("Authorization".to_string(), secrets[0].to_string());
+        config.model.extra_body_json = Some(serde_json::json!({"token": secrets[1]}));
+        config.docling.base_url = format!("https://{}@docling.invalid", secrets[3]);
+        config
+            .docling
+            .headers
+            .insert("Authorization".to_string(), secrets[2].to_string());
+        config.mcp.servers[0].base_url = format!("https://{}@mcp.invalid", secrets[5]);
+        config.mcp.servers[0]
+            .headers
+            .insert("Authorization".to_string(), secrets[4].to_string());
+
+        let resolved_debug = format!("{config:?}");
+        let partial = PartialResolvedConfig {
+            model: Some(PartialModelConfig {
+                extra_headers: Some(config.model.extra_headers.clone()),
+                extra_body_json: config.model.extra_body_json.clone(),
+                ..PartialModelConfig::default()
+            }),
+            docling: Some(PartialDoclingConfig {
+                base_url: Some(config.docling.base_url.clone()),
+                headers: Some(config.docling.headers.clone()),
+                ..PartialDoclingConfig::default()
+            }),
+            mcp: Some(PartialMcpConfig {
+                servers: Some(config.mcp.servers.clone()),
+                ..PartialMcpConfig::default()
+            }),
+            ..PartialResolvedConfig::default()
+        };
+        let partial_debug = format!("{partial:?}");
+
+        for secret in secrets {
+            assert!(
+                !resolved_debug.contains(secret),
+                "resolved Debug leaked {secret}"
+            );
+            assert!(
+                !partial_debug.contains(secret),
+                "partial Debug leaked {secret}"
+            );
+        }
+        assert!(resolved_debug.contains("extra_header_count"));
+        assert!(resolved_debug.contains("extra_body_present"));
+        assert!(resolved_debug.contains("header_count"));
     }
 }
 

@@ -1664,6 +1664,7 @@ fn canonical_session_snapshot_from_storage(
         history,
         turns,
         turn_elapsed_ms,
+        session_token_usage,
         latest_turn_position,
     } = protocol;
     let history_has_more = history.has_more();
@@ -1689,6 +1690,7 @@ fn canonical_session_snapshot_from_storage(
             },
             pending_turn_inputs,
             turn_elapsed_ms,
+            session_token_usage,
             latest_turn_id: latest_turn_position.map(|(turn_id, _)| turn_id),
             active_turn_id: active_turn_position.map(|(turn_id, _)| turn_id),
             active_turn_sequence_no: active_turn_position.map(|(_, sequence_no)| sequence_no),

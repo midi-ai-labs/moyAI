@@ -33,6 +33,7 @@ import {
   beginInitialSetupAuxiliaryRequest,
   finishInitialSetupAuxiliaryRequest,
   initialSetupAuxiliaryPendingKind,
+  initialSetupImportedConfigReference,
   recordInitialSetupDoclingReadinessOwner,
   recordInitialSetupImportedSource,
 } from "./initial_setup_auxiliary_state.ts";
@@ -59,8 +60,10 @@ import type {
   SessionSettingsMutationTarget,
   SessionRow,
   SideChatCatalogResult,
+  SideChatPendingQuote,
 } from "./types.ts";
 import {
+  appendQuoteToSideChatDraft,
   beginDoclingReadinessRequest,
   beginSideChatCatalogLoad,
   failSideChatCatalogLoad,
@@ -76,10 +79,13 @@ import {
   showOutputPane,
   sideChatConfigurationOpen,
   sideChatDeleteConfirmationStillTargets,
+  sideChatDraftIsDirty,
   sideChatDraftForState,
   sideChatMutationPending,
   sideChatOperationsOpen,
   sideChatOwnerSessionId,
+  sideChatPendingQuoteFromProjection,
+  sameSideChatPendingQuote,
   type UiLocalState,
 } from "./ui_state.ts";
 import {
@@ -102,6 +108,8 @@ export interface ActionPayload {
   index: number;
   value: string;
   activationSource?: "shortcut";
+  sideChatQuote?: SideChatPendingQuote | null;
+  sideChatQuoteOwnerSessionId?: string | null;
 }
 
 export interface ActionContext {
@@ -305,7 +313,8 @@ function currentConfigValues(state: DesktopViewState): ConfigValueInput[] {
 
 interface InitialSetupConfigImportResult {
   sourcePath: string;
-  values: ConfigValueInput[];
+  importGeneration: string;
+  values: Array<ConfigValueInput & { sensitive: boolean; configured: boolean }>;
 }
 
 async function loadInitialSetupConfigToml(
@@ -380,6 +389,10 @@ async function loadInitialSetupConfigToml(
       current.startup.setup_target!,
       current.config_target,
       result.sourcePath,
+      result.importGeneration,
+      result.values
+        .filter((value) => value.sensitive && value.configured)
+        .map((value) => value.key),
     );
     context.rerender();
   } catch (error) {
@@ -437,12 +450,18 @@ async function checkInitialSetupDoclingReadiness(
   if (!request) return;
   context.rerender();
   try {
+    const imported = initialSetupImportedConfigReference(
+      context.uiState.initialSetupAuxiliary,
+      setupTarget,
+      state.config_target,
+    );
     const nextState = await command<DesktopWebState>(
       "check_initial_setup_docling_readiness",
       {
         values,
         expectedConfigTarget: request.configTarget,
         expectedSetupTarget: request.setupTarget,
+        importGeneration: imported?.importGeneration ?? null,
       },
     );
     const current = context.getViewState();
@@ -527,12 +546,18 @@ async function finishInitialSetupFlow(
   context.rerender();
 
   try {
+    const imported = initialSetupImportedConfigReference(
+      context.uiState.initialSetupAuxiliary,
+      setupTarget,
+      state.config_target,
+    );
     const [nextState, succeeded] = await command<[DesktopWebState, boolean]>(
       "finish_initial_setup",
       {
         values,
         expectedConfigTarget: finishRequest.configTarget,
         expectedSetupTarget: finishRequest.setupTarget,
+        importGeneration: imported?.importGeneration ?? null,
       },
     );
     const currentTarget = context.getViewState()?.config_target ?? finishRequest.configTarget;
@@ -1114,9 +1139,12 @@ async function submitSideChat(state: DesktopWebState, context: ActionContext): P
   }
   const revision = draft.revision;
   const expectedDraftRevision = draft.persistedRevision;
+  const quote = draft.pendingQuote;
   await context.mutate("submit_side_chat", {
     ...target,
     expectedDraftRevision,
+    expectedOwnerAppendPosition: ready.side_chat.context_as_of_append_position,
+    quote,
     text,
   });
   context.uiState.sideChatMutations.delete(target.ownerSessionId);
@@ -1126,9 +1154,14 @@ async function submitSideChat(state: DesktopWebState, context: ActionContext): P
     && current.side_chat.chat_id === target.chatId
     && current.side_chat.generation !== target.expectedGeneration;
   if (accepted && currentDraft && current) {
+    const projectedQuote = sideChatPendingQuoteFromProjection(current.side_chat.draft_quote);
     currentDraft.persistedText = current.side_chat.draft_text;
+    currentDraft.persistedQuote = projectedQuote;
     currentDraft.persistedRevision = current.side_chat.draft_revision;
-    if (currentDraft.revision === revision) currentDraft.text = "";
+    if (currentDraft.revision === revision) {
+      currentDraft.text = "";
+      currentDraft.pendingQuote = null;
+    }
   } else if (
     currentDraft
     && current
@@ -1137,9 +1170,35 @@ async function submitSideChat(state: DesktopWebState, context: ActionContext): P
     && current.side_chat.draft_revision !== expectedDraftRevision
   ) {
     currentDraft.persistedText = current.side_chat.draft_text;
+    currentDraft.persistedQuote = sideChatPendingQuoteFromProjection(current.side_chat.draft_quote);
     currentDraft.persistedRevision = current.side_chat.draft_revision;
   }
   context.rerender();
+}
+
+async function quoteSelectionToSideChat(
+  state: DesktopWebState,
+  context: ActionContext,
+  quote: SideChatPendingQuote | null | undefined,
+  quoteOwnerSessionId: string | null | undefined,
+): Promise<void> {
+  const ownerSessionId = sideChatOwnerSessionId(state);
+  const draft = sideChatDraftForState(context.uiState, state);
+  if (
+    !quote
+    || !ownerSessionId
+    || quoteOwnerSessionId !== ownerSessionId
+    || !draft
+    || !state.side_chat.configured
+    || state.side_chat.deleting
+    || !sideChatOperationsOpen(context.uiState)
+    || quote.sourceAppendPosition !== state.side_chat.context_as_of_append_position
+  ) return;
+
+  appendQuoteToSideChatDraft(draft, quote);
+  openSideChatPane(context.uiState, state);
+  context.rerender();
+  await persistSideChatDraft(state, context);
 }
 
 export async function persistSideChatDraft(
@@ -1163,7 +1222,7 @@ export async function persistSideChatDraft(
     if (draft.savePromise) await draft.savePromise;
     return;
   }
-  if (draft.text === draft.persistedText) return;
+  if (!sideChatDraftIsDirty(draft)) return;
 
   draft.saveInFlight = true;
   draft.saveQueued = false;
@@ -1184,7 +1243,7 @@ async function persistSideChatDraftLoop(
   draft: NonNullable<ReturnType<typeof sideChatDraftForState>>,
   context: ActionContext,
 ): Promise<void> {
-  while (draft.text !== draft.persistedText) {
+  while (sideChatDraftIsDirty(draft)) {
     const currentBeforeSave = context.getProjection();
     if (
       !currentBeforeSave
@@ -1195,6 +1254,7 @@ async function persistSideChatDraftLoop(
     ) return;
 
     const text = draft.text;
+    const quote = draft.pendingQuote;
     const localRevision = draft.revision;
     const expectedDraftRevision = draft.persistedRevision;
     draft.saveQueued = false;
@@ -1203,6 +1263,7 @@ async function persistSideChatDraftLoop(
       chatId,
       expectedDraftRevision,
       text,
+      quote,
     });
 
     const current = context.getProjection();
@@ -1210,13 +1271,23 @@ async function persistSideChatDraftLoop(
       && current.side_chat.chat_id === chatId;
     // `mutate` deliberately accepts a typed conflict projection without throwing it back to this
     // local owner. A changed server revision alone can therefore mean that another process won the
-    // CAS. Only acknowledge this write when the durable text is exactly the value we submitted;
-    // otherwise retain the user's local edit for an explicit retry.
-    const settled = sameTarget && current !== null && current.side_chat.draft_text === text;
+    // CAS. Only acknowledge this write when both durable draft owners are exactly the values we
+    // submitted; otherwise retain the user's local edit for an explicit retry.
+    const projectedQuote = current === null
+      ? null
+      : sideChatPendingQuoteFromProjection(current.side_chat.draft_quote);
+    const settled = sameTarget
+      && current !== null
+      && current.side_chat.draft_text === text
+      && sameSideChatPendingQuote(projectedQuote, quote);
     if (settled && current) {
       draft.persistedText = current.side_chat.draft_text;
+      draft.persistedQuote = projectedQuote;
       draft.persistedRevision = current.side_chat.draft_revision;
-      if (draft.revision === localRevision) draft.text = current.side_chat.draft_text;
+      if (draft.revision === localRevision) {
+        draft.text = current.side_chat.draft_text;
+        draft.pendingQuote = projectedQuote;
+      }
     } else if (
       sameTarget
       && current
@@ -1226,11 +1297,12 @@ async function persistSideChatDraftLoop(
       // auto-retry here: the next user edit/blur is the explicit decision to save over the value
       // observed from another process.
       draft.persistedText = current.side_chat.draft_text;
+      draft.persistedQuote = projectedQuote;
       draft.persistedRevision = current.side_chat.draft_revision;
     }
     const followUpRequired = settled
       && (draft.saveQueued || draft.revision !== localRevision)
-      && draft.text !== draft.persistedText;
+      && sideChatDraftIsDirty(draft);
     if (!followUpRequired) return;
   }
 }
@@ -1678,6 +1750,20 @@ const ACTION_DEFINITIONS = [
       sideChatDraftForState(context.uiState, state);
       context.rerender();
     },
+  },
+  {
+    id: "quote-selection-to-side-chat",
+    label: "選択範囲をSide Chatで引用",
+    enabled: (state, _payload, model) => state.side_chat.configured
+      && !state.side_chat.deleting
+      && sideChatOwnerSessionId(state) !== null
+      && model.local.sideChat.operationsOpen,
+    run: (state, context, payload) => quoteSelectionToSideChat(
+      state,
+      context,
+      payload.sideChatQuote,
+      payload.sideChatQuoteOwnerSessionId,
+    ),
   },
   {
     id: "load-side-chat-models",

@@ -199,9 +199,17 @@ impl EventRenderer for HumanRenderer {
                     }
                 )?;
             }
-            RunEvent::RuntimeNotice { message, .. }
-            | RunEvent::RecoverableRuntimeFeedback { message, .. } => {
+            RunEvent::RuntimeNotice { message, .. } => {
                 writeln!(stdout, "[feedback] {}", terminal_safe_inline(message))?;
+            }
+            RunEvent::RecoverableRuntimeFeedback { feedback, .. } => {
+                writeln!(
+                    stdout,
+                    "[feedback/{:?}/{:?}] {}",
+                    feedback.severity,
+                    feedback.category,
+                    terminal_safe_inline(&feedback.public_message)
+                )?;
             }
             RunEvent::TurnTerminal {
                 session_id,
@@ -770,6 +778,7 @@ pub fn cli_session_read_payload_preserves_metadata_pages_fixture_passes() -> boo
             items: Vec::new(),
         },
         turn_elapsed_ms: Default::default(),
+        session_token_usage: Default::default(),
         pending_turn_inputs: Vec::new(),
         latest_turn_id: Some(active_turn_id),
         active_turn_id: Some(active_turn_id),

@@ -268,10 +268,10 @@ const EXACT_DELIVERY_ACTION_IDS = [
     "insert-command",
   ] as const;
 
-test("the single GUI action registry owns all 97 actions without duplicates", () => {
+test("the single GUI action registry owns all 98 actions without duplicates", () => {
   const actionIds = ACTIONS.map((action) => action.id);
 
-  assert.equal(actionIds.length, 97);
+  assert.equal(actionIds.length, 98);
   assert.deepEqual(ACTION_IDS, actionIds);
   assert.equal(new Set(actionIds).size, actionIds.length);
   assert.equal(ACTION_BY_ID.size, actionIds.length);
@@ -1126,9 +1126,10 @@ test("Initial Setup Import is read-only, exact-targeted, complete, and single-fl
     });
     release({
       sourcePath: "C:/existing/config.toml",
+      importGeneration: "17",
       values: [
-        { key: "model.model", text: "model-b" },
-        { key: "docling.enabled", text: "true" },
+        { key: "model.model", text: "model-b", sensitive: false, configured: true },
+        { key: "docling.enabled", text: "true", sensitive: false, configured: true },
       ],
     });
     await first;
@@ -1226,6 +1227,7 @@ test("Initial Setup Docling check sends the complete draft and admits only its e
         values: fields.map((field) => ({ key: field.key, text: field.value })),
         expectedConfigTarget: wizard.config_target,
         expectedSetupTarget: setupTarget,
+        importGeneration: null,
       },
     }]);
     assert.equal(actionContext.uiState.initialSetupAuxiliary.active, null);

@@ -1,6 +1,6 @@
 # moyAI Getting Started
 
-2026-08-24 時点のcurrent development source向け最小手順。`qwen/qwen3.6-27b`を既定profileとし、durableな再帰Agent Tree、canonical runtime/storage、structured compaction、3種類のpermission mode、Windows workspace sandbox、provider connection profileを含む。未リリースの開発機能を含むため、release packageを使う場合はそのversionの製品READMEを確認する。
+2026-09-02 時点のcurrent development source向け最小手順。`qwen/qwen3.6-27b`を既定profileとし、durableな再帰Agent Tree、canonical runtime/storage、structured compaction、3種類のpermission mode、Windows workspace sandbox、provider connection profileを含む。未リリースの開発機能を含むため、release packageを使う場合はそのversionの製品READMEを確認する。
 
 ## 初回起動
 
@@ -17,13 +17,15 @@ Desktopのcold startはlocal configの形式だけを確認する。provider cat
 
 ## Provider接続設定
 
-DesktopではPreferences、Initial Setup、またはtopbarのmodel/base URLからSession Settingsを開く。
+DesktopではInitial Setup、左railの **接続設定** shortcutから開くPreferences、またはtopbarのmodel/access chipから開くSession Settingsを使う。Preferencesはglobal baselineと選択sessionのサイドチャットprovider、Session Settingsはcurrent root sessionだけを所有する。
 
 1. `Connection type`を選ぶ。LM StudioのResponses APIなら`LM Studio (Responses API)`、oMLX / vLLM / NVIDIA NIMなどの一般的なOpenAI互換serverなら`OpenAI-compatible (Chat Completions)`を選ぶ。
 2. `Base URL`とmodel IDを入力する。
 3. 認証が必要なら`API key environment variable (optional)`へsecretを保持する環境変数名（例`OPENAI_API_KEY`）を入力する。secretそのものは入力・保存しない。
 4. 必要なら`モデル読込`でmodel catalogを確認する。手入力したmodel IDは接続不能時でもlocalにvalidなら保存できる。
 5. Preferencesではglobal設定として保存し、Session Settingsではcurrent root sessionだけへApplyする。
+
+provider custom header/body、Docling header、MCP server定義等のsensitive JSON fieldはraw値を再表示せず **設定済み（非表示）** と示す。complete draftで空欄または空白だけにした場合は既存値を保持する。置換またはclearする場合は`{}` / `[]`等の明示的なvalid JSONを入力する。API key環境変数名は表示・保存できるが、解決したsecret値は保存・投影しない。
 
 Connection typeはcatalogとgeneration wireをatomicに選ぶ。`openai_compatible`は`/v1/models`と
 `/v1/chat/completions`、`lm_studio`はLM Studio native metadataと`/v1/responses`を使う。上級互換用に
@@ -76,6 +78,8 @@ ledgerを組み立てるよう求める。material claimごとにcurrent owner�
 保証したり、保存・解釈するcompletion / quality gateではない。別のrequest
 Framer、state deltaの自動注入、host-owned coverage / convergence scoreも使わない。
 
+local Skillのdiscoveryと個別loadは従来のfilesystem上限を維持する。model-visibleなSkill catalogはsort済み結果のdeterministicなcomplete-entry prefixで、最大64件・16KiB。diagnosticsはincluded/omitted件数を示し、oversized entryを途中で切った不完全なinstructionは送らない。
+
 model transportの既定値は次の通り。
 
 ```toml
@@ -94,9 +98,9 @@ ImportしたTOML、`MOYAI_REQUEST_TIMEOUT_MS`は同じ値を使う。旧`stream_
 出力量はホスティング側が所有する。moyAIはResponsesの`max_output_tokens`とChat Completionsの
 `max_tokens`を送らないため、通常文、reasoning、tool-call引数のserialized outputはいずれもLM Studio、
 oMLX等で設定された上限を使う。旧TOML/sessionの生成設定は読取互換入力として破棄し、旧environment
-variableも無視するため、起動可否、turn、診断、設定保存、provider wireには影響しない。LM Studioが
-`Failed to parse tool call: Unexpected end of content`等を`response.failed`で返した場合、moyAIは
-providerのcode/messageをgeneration failureとして表示し、不完全なtool callをlocal commit・実行しない。
+variableも無視するため、起動可否、turn、診断、設定保存、provider wireには影響しない。providerが
+`response.failed`を返した場合、moyAIは安定したtyped public failureへ変換し、不完全なtool callをlocal commit・実行しない。
+raw provider code/messageはprivate diagnostic evidenceにだけ保持し、durable terminal、canonical history、Markdown exportへ書き込まない。
 `max_retries`はHTTP responseを受ける前のretry可能な接続/transport失敗だけに適用し、retry待機は1回最大30,000ms。
 response-start timeout、HTTP 429/5xxを含むHTTP error response、SSE開始後の無進捗timeoutや失敗では、同じ生成requestを自動再送しない。
 model availability checkは別操作として1 requestあたり120,000msの専用probe timeoutを使い、通常turnの
@@ -130,9 +134,10 @@ canonical contextではSystem / Developer sectionを論理的に区別して保�
 その順序を保ち、Responsesはtop-level `instructions`へ、Chat Completionsは先頭の単一`system` messageへfoldし、
 `developer` wire roleを送らない。
 
-各generation requestはruntime-onlyのrequest IDと、`attempt_started` / `request_in_flight` /
+private runtime diagnosticsはrequest IDと、`attempt_started` / `request_in_flight` /
 `headers_received` / `first_progress` / `last_progress` / `provider_terminal` phase、attempt、elapsed、
-sanitized endpointを投影する。これはmoyAIが観測したclient transport境界で、LM Studio processの起動、server側の
+sanitized endpoint、raw provider failureを保持する。public UIは短いtyped phase/failureだけを投影し、request ID、endpoint、
+elapsed、raw provider code/messageを表示しない。phaseはmoyAIが観測したclient transport境界で、LM Studio processの起動、server側の
 request受理、model instanceのload開始を推測するものではない。例えば`request_in_flight`が長い場合に分かるのは、
 generation operationがまだresponse headerへ到達していないことまでである。moyAIがprovider processを起動できなかった
 という意味ではない。LM Studio serverがHTTP応答できること、対象modelがcatalogへ登録されていること、model instanceが
@@ -149,7 +154,7 @@ sampling、thinking、出力量を変更するfieldではなく、generation wir
 
 HTTP MCPを有効にする場合は、各server toolのeffectを`[[mcp.servers.tool_routes]]`の`name`と
 `effect = "read"` / `"mutation"` / `"destructive"`で明示する。未設定routeは推測せず拒否し、内部Plan modeでは明示read routeだけを
-実行できる。
+実行できる。base URLはuserinfo / fragmentを持たないcanonical absolute `http` / `https` URLとし、discovery/callをそのoriginへ限定する。redirectは拒否する。endpoint 8KiB、body 1MiB、header 64件/64KiB、envelope 2MiB、response 1MiBの上限を持ち、一つのabsolute `timeout_ms`がdiscoveryとeffectful callを覆う。effectful `tools/call`はexact-onceで、retryや別endpointへのfallbackを行わない。
 
 ## 基本操作
 
@@ -163,7 +168,8 @@ Desktop:
 - 停止: 実行中に stop button を押すと、表示時のworkspace / root session / run generation / Agent Tree epochが一致するexact current root executionだけを停止する。実行中またはdetachedなchildへcascadeしない。画面更新後の古いStopは新しいrunへ適用されず、tree全体の停止は別名の明示的なtree-stop操作として扱う。
 - Settings: 「設定フォルダーを開く」はglobal `config.toml`の場所を開き、「データフォルダーを開く」はSQLite、履歴、harness等を保存するRoaming data directory（`MOYAI_DATA_DIR`指定時はそのdirectory）を開く。初回起動のInitial Setupでは「設定を保存して開始」を推奨の完了方法として表示し、「この起動中だけ適用」は再起動後へ引き継がない。Initial Setupは保存または一時適用が完了するまで閉じず、TOML設定Importのfile pickerをcancelした場合は設定を変更しない。Importでは、`config(1).toml`や`config_202608.toml`など`.toml` extensionを持つ任意名のfileを選択でき、TOML schemaと設定値を検証してからglobal `config.toml`へ取り込む。
 - Provider接続: 現在のURL・Connection type・modelを変えずにmoyAI local context budgetだけを編集した場合、モデル一覧を再取得せずにsessionへ適用または設定ファイルへ保存できる。URL・Connection type・modelを変更してもlocal-validな手入力値は保存でき、catalog rowから選ぶ場合だけ対応する明示「モデル読込」のevidenceを使う。sampling、thinking、output lengthはGUIに持たず、host側の設定をそのまま使う。
-- サイドチャット: sessionを開き、左サイドバーの`設定`にある`Side Chat` sectionで専用のLLM URLを入力して`モデル読込`を押し、取得した一覧からmodelを選択する。一覧に現れない互換modelは`一覧にないモデルIDを入力`からIDを直接指定できる。選択後に設定を適用する。右ペインの`サイドチャット`は設定済みmodelと会話を表示し、未設定時はSettingsへの導線だけを表示する。停止中は同じsectionからmodelを更新できるが、実行中・削除中は変更できない。設定・履歴・未送信draft・実行・Stopはowning session単位で保存され、メインtaskのmodel設定・composer・実行・Stopとは分離される。取得したmodel一覧も選択中sessionとURLに紐づけて表示し、別sessionや別URLの結果を混ぜないが、app再起動後は必要に応じて`モデル読込`を再実行する。サイドチャットはtext-onlyかつtool-lessで、workspaceの読取・変更やpermission dialogを行わない。現行のside provider設定は認証不要のendpointを対象とし、main providerのAPI keyやcustom headerを継承・転送しない。ペインを隠す、sessionを移動する、windowを閉じる操作では履歴を削除しない。`サイドチャットを削除`を確認した場合だけ、sideのcanonical conversationと未送信draftを破棄し、メインsessionとworkspaceは残す。
+- サイドチャット: sessionを開き、左railの **接続設定** からPreferencesを開き、選択sessionの`サイドチャットLLM` sectionで専用URL、Connection type、modelを設定する。`モデル読込`の一覧にない互換modelはIDを直接入力できる。右ペインの`サイドチャット`は設定済みmodelと会話を表示し、未設定時はPreferencesへの導線だけを表示する。停止中は同じsectionからmodelを更新できるが、実行中・削除中は変更できない。設定・履歴・未送信draft・実行・Stopはowning session単位で保存され、メインtaskのmodel設定・composer・実行・Stopとは分離される。取得したmodel一覧も選択中sessionとURLに紐づけ、別sessionや別URLの結果を混ぜない。サイドチャットはtext-onlyかつtool-lessで、workspaceの読取・変更やpermission dialogを行わない。provider POST直前にexact owning sessionのactive canonical historyとappend fenceをcaptureし、system/question/response用の余白を残してrecentなcomplete semantic unitだけをbounded contextへ入れる。append-only source item 65,536件、derived active item 16,384件、またはeligible semantic unit 8,192件を超える場合はprovider POST前に拒否するため、compactionするか新しいtaskを開始してから再送する。範囲は`scope=owner_session`、基準は`as_of_append_position`、省略時は`truncated`で示す。transcript/artifactの一つのstable canonical rowから引用すると、source kind、history item ID、append position、selected textをtypedにdraftへ追加し、自動送信しない。送信時にowner/fence/source textが変わっていればprovider POST前に失効し、manualでSide draftを編集した場合もquote bindingをclearする。runtime notice、durable feedback、terminal、別session、hidden Side conversation、live workspaceはowner context/quote sourceへ混ぜない。現行のside provider設定は認証不要のendpointを対象とし、main providerのAPI keyやcustom headerを継承・転送しない。ペインを隠す、sessionを移動する、windowを閉じる操作では履歴を削除しない。`サイドチャットを削除`を確認した場合だけ、sideのcanonical conversationと未送信draftを破棄し、メインsessionとworkspaceは残す。
+- 状態・進捗・使用量: provider/statusは短いtyped public messageだけを表示し、request ID、endpoint、elapsed、raw provider code/messageを含めない。tool進捗summaryはfailure/declinedを先に、その後に新しい作業を選び、最大8件・全体2,000文字・1行180文字。完全な内容はcanonical historyへのjumpまたはMarkdown exportで確認する。session使用量は全canonical `TurnTerminal` runtime eventから再計算し、terminal turn数とusage計測済みturn数を分けてmissing/partial/completeを表示する。usage欠損は0ではない。optionalなreasoning tokenが未報告なら0を表示せず`reasoning 未計測`、報告有無が混在する場合は計測turn数付きの部分合計として表示する。durable feedbackはlive/reopen/exportで同じseverity/category/public messageを使い、`RuntimeNotice`はliveだけに表示する。
 
 Git repository内のsubdirectoryをworkspaceとして選んだ場合、選択したdirectoryがtoolとsandboxの境界になる。ancestorのGit rootはproject一覧、履歴、Git機能、ancestor instruction探索に使うが、選択directoryのsiblingをworkspace内にはしない。同じsessionを開き直した場合も、保存済みdirectoryからこの境界を復元する。built-in reviewがshell用に提示するGit commandも、末尾の`-- .`で選択directoryへscopeされる。
 
@@ -186,10 +192,10 @@ Unixでは、update/delete前に開かれた書込可能descriptorが切り離�
 `access_mode` は次の3 modeから選ぶ。
 
 - **承認を求める**（`default`）: riskのないtyped List/Search/Read/Editと、localと静的分類されたShell / configured formatterを自動承認する。process effectはWindows native `workspace-write` profile内で実行し、明示/検出したelevation、external/network effect、authority target、またはriskありの操作だけhuman confirmationを表示する。
-- **代理で承認**（`auto_review`）: 承認を求めると同じdeterministic workspace boundaryと同じOS sandboxを使う。残るelevation targetは、task agentとは別のtool-less AI Guardian requestが判定する。Guardianはbounded human previewとは別のcomplete typed action evidenceを使い、requested sandbox elevationも受け取る。MCPはnormalized full arguments / configured target / credential presence、Doclingはexact endpoint / source / effective format・OCR・image・page options / credential presenceをsecret値なしで受け取る。redaction等でevidenceがincompleteならGuardianもhumanも呼ばずdenyする。inputにはcurrent `WorldState`、top-level root sessionのappend-only historyからmodel compactionやchild `fork_turns`と独立して抽出したchronological canonical text UserTurn / SteerTurn、current exact committed response/call、同じresponse内で先に確定したbounded tool resultsを含む。childのNEW_TASKやassistant/tool outputはuser authorityではない。source history 4,096件・source payload 16,000,000文字・authority 64件・各item 8,000文字・authority合計16,000文字のいずれかを超える場合、canonical user authorityの欠落、non-text、またはstorage failureでexactに表現できない場合はGuardian request前にdenyする。このsnapshotはGuardian審査時だけ、turn開始時にcaptureしたclient-side `model.request_timeout_ms`のabsolute total deadline内のworkerで読み、risk-free toolや他modeでは読まない。storageがbusyなら待たずにdenyし、timeout / cancelは進行中scanをinterruptしてconnection再利用前にhookを外す。`WorldState`はenvironment / instructions / timeだけを持ち、tool名やinventoryを列挙しない。tool availabilityは`ToolSpecPlan`だけが所有し、Guardianには同じtool-free snapshotと空のtool surfaceを渡して、exact action evidenceを別入力にする。requestはtools / reasoning / continuationを持たず、task generationのsampling / stop / arbitrary extra bodyを継承しない。deadlineはhostへ送信せず、通常のprovider streamのrolling inactivityとは異なるabsolute totalとして扱う。Guardianの`allow` / `deny`は最終判断で、deny、invalid response、unavailable、timeout、request/storage failureはhuman confirmationへfallbackせずfail closedにする。providerへ接触するverified routeは現在`provider_profile = "lm_studio"`のnative Responsesだけで、`openai_compatible`（oMLXを含む）、`openai_responses`、`lm_studio_chat_completions`は接触前にfail closedする。これらのprofileでhuman confirmationが必要な場合は`default` modeを使う。
+- **代理で承認**（`auto_review`）: 承認を求めると同じdeterministic workspace boundaryと同じOS sandboxを使う。残るelevation targetは、task agentとは別のtool-less AI Guardian requestが判定する。Guardianはbounded human previewとは別のcomplete typed action evidenceを使い、requested sandbox elevationも受け取る。MCPはnormalized full arguments / configured target / credential presence、Doclingはexact endpoint / source / effective format・OCR・image・page options / credential presenceをsecret値なしで受け取る。redaction等でevidenceがincompleteならGuardianもhumanも呼ばずdenyする。inputにはcurrent `WorldState`、top-level root sessionのappend-only historyからmodel compactionやchild `fork_turns`と独立して抽出したchronological canonical text UserTurn / SteerTurn、current exact committed response/call、同じresponse内で先に確定したbounded tool resultsを含む。childのNEW_TASKやassistant/tool outputはuser authorityではない。source history 4,096件・source payload 16,000,000文字・authority 64件・各item 8,000文字・authority合計16,000文字のいずれかを超える場合、canonical user authorityの欠落、non-text、またはstorage failureでexactに表現できない場合はGuardian request前にdenyする。このsnapshotはGuardian審査時だけ、turn開始時にcaptureしたclient-side `model.request_timeout_ms`のabsolute total deadline内のworkerで読み、risk-free toolや他modeでは読まない。storageがbusyなら待たずにdenyし、timeout / cancelは進行中scanをinterruptしてconnection再利用前にhookを外す。`WorldState`はenvironment / instructions / timeだけを持ち、tool名やinventoryを列挙しない。tool availabilityは`ToolSpecPlan`だけが所有し、Guardianには同じtool-free snapshotと空のtool surfaceを渡して、exact action evidenceを別入力にする。requestはtools / reasoning / continuationを持たず、task generationのsampling / stop / arbitrary extra bodyを継承しない。deadlineはhostへ送信せず、通常のprovider streamのrolling inactivityとは異なるabsolute totalとして扱う。Guardianの`allow` / `deny`は最終判断で、deny、invalid response、unavailable、timeout、request/storage failureはhuman confirmationへfallbackせずfail closedにする。Guardian transportはprofile名ではなくturn-captured canonical `ProviderTarget.api_mode`から選ぶ。current 4 profileのうち`lm_studio` / `openai_responses`はResponses、`openai_compatible`（oMLXを含む）/ `lm_studio_chat_completions`はChat Completionsのexact tool-less requestを使う。future unknown wireはGuardian接触前にfail closedし、human confirmationや承認を求めるmodeへfallbackしない。oMLXの実互換性は設定endpoint/modelに対するactual UATで別途qualificationする。
 - **フルアクセス**（`full_access`）: permission promptを出さず、process effectをcurrent user authorityの`Unrestricted` profileで実行する。unrestricted childのfilesystem mutationはtyped file guardを通らないため、信頼できるworkspaceでのみ使う。`write` / `apply_patch`等のtyped file toolとMCP / Docling等のin-process effectは、各stable-handle / path-integrity / authority / no-clobber guardを維持する。
 
-shellとその子processは、承認を求める/代理で承認ではWindows native `workspace-write` profile、フルアクセスまたは承認済みelevationではcurrent userの`Unrestricted` profileで動く。WindowsでPowerShell familyの`program`を省略した場合は、OSのcommand resolutionによりPowerShell 7 (`pwsh`)を一度起動し、effect開始前のlaunch failureだけWindows PowerShell (`powershell`)へfallbackする。process開始後の失敗は副作用を重複させないため別shellで自動再実行しない。明示した`program`は常にそのまま使う。modelがsandbox外実行を必要とするexact commandは`sandbox_permissions: "require_escalated"`と空でない`justification`を明示できる。`workspace-write`はadmit時に存在する有限objectのrestricted-token / ACL defenseであり、変数やscript内部で動的に組み立てたpath、未作成authority namespace、別subtree instruction、protected descendantのexplicit / inheritance-disabled DACL、direct network accessを完全には閉じない。特にCPython 3.13以降がWindowsで`os.mkdir(mode=0o700)`へ指定するprotected owner-only DACLは親のsandbox capabilityを継承しないため、pytestの`tmp_path`等はrestricted profileで再openに失敗し得る。
+shellとその子processは、承認を求める/代理で承認ではWindows native `workspace-write` profile、フルアクセスまたは承認済みelevationではcurrent userの`Unrestricted` profileで動く。Windowsではshell / configured formatter executableをpermission request前にcaptured environmentから一度だけabsolute final pathとstable handle identityへ解決し、restricted / unrestrictedのspawn直前に再検証してPATHを再検索しない。formatterのbare command名はabsolute PATH entryだけを検索し、workspace / project root配下の同名candidateを選ばない。workspace-local formatterを意図する場合は`./path/to/formatter`またはabsolute pathを明示する。PowerShell familyの`program`を省略した場合は`pwsh`、次に`powershell`の順でidentityを解決し、effect開始前のlaunch failureだけ次候補へ進む。process開始後の失敗は副作用を重複させないため別shellで自動再実行しない。明示した`program`は単一overrideとして同じidentity contractへ固定する。modelがsandbox外実行を必要とするexact commandは`sandbox_permissions: "require_escalated"`と空でない`justification`を明示できる。`workspace-write`はadmit時に存在する有限objectのrestricted-token / ACL defenseである。PowerShellはknown literal commandだけをworkspace自動許可候補とし、unknown command、variable / subexpression、indirect invocation、dot-source、encoded command、malformed quoteをtyped reviewへ送るが、dynamic pathの完全解析はclaimしない。未作成authority namespace、別subtree instruction、protected descendantのexplicit / inheritance-disabled DACL、direct network accessも完全には閉じない。特にCPython 3.13以降がWindowsで`os.mkdir(mode=0o700)`へ指定するprotected owner-only DACLは親のsandbox capabilityを継承しないため、pytestの`tmp_path`等はrestricted profileで再openに失敗し得る。native process sandboxがないUnixではworkspace-mode process effectをfail closedにする。Unixのフルアクセス/承認済みelevationはabsolute pathをspawn直前に再検証するが、retained fd自体をexecしないため、並行するpathname replacement、同inode mutation、shebang interpreter identityまでをstable-executable hard boundaryとして保証しない。
 
 この既知制約については、WorkspaceWriteでeffectが開始され、timeout / cancel / cleanup failureではない非zero終了となり、stdoutまたはstderrの同一行に`PermissionError: [WinError 5]`と`moyai-sandbox-effect-`がともに現れた場合だけ、shellがtyped failure hintを記録する。canonicalなnested metadataとlegacy flat metadataのどちらから再生しても、model-visible outputへ同じsandbox noteを一度だけ追加する。通常の非zero終了や片方だけの一致では追加しない。noteは再実行を行わず、信頼できるworkspaceでexact commandが必要な場合に限り、新しいshell callで`require_escalated`と理由を明示するよう案内する。project fileをsandbox回避のためだけに変更しない。この場合も自動昇格せず、信頼できるworkspaceでexact commandを明示elevationするかフルアクセスを選ぶ。Codex OS enforcement互換、firewall級network isolation、全outside writeの構造的証明として扱わない。
 
@@ -209,9 +215,9 @@ TUIでは、root sessionを開いた状態のF8とConfig EditorのF2（Apply Ses
 
 ## Confirmation
 
-承認を求めるmodeでdecision targetとなったtool callだけhuman confirmation dialogが出る。代理で承認では、対応するLM Studio native Responses routeでGuardianがdialogなしに最終allow/denyし、その他のprovider profileはGuardian接触前にfail closedする。フルアクセスではpermission dialogを出さない。
+承認を求めるmodeでdecision targetとなったtool callだけhuman confirmation dialogが出る。代理で承認では、current 4 profileのcanonical API modeに対応するexact tool-less Responses / Chat Completions requestでGuardianがdialogなしに最終allow/denyする。future unknown wireはGuardian接触前にfail closedし、human/承認を求めるmodeへfallbackしない。oMLXはactual UATで別途qualificationする。フルアクセスではpermission dialogを出さない。
 
-Windows sandboxはcurrent userから作る`WRITE_RESTRICTED` token、decision時のroot path/file-ID snapshot、object identityに束ねたcapability SID、ACL、suspended spawn、Job Objectを使う。実行時はsame-objectを再検証し、protected regular fileは内容hashとwrite-sharingなしhandleでpinする。workspace・設定済みwrite root・一時directoryへallow ACEを設定し、admit時に存在するcase-awareな`.git` / resolved gitdir / `.moyai` / `.agents` / `.claude` / `.codex`、active cwd→root instruction、configured additional instruction、configured protected carveoutへdeny ACEを設定する。process-private SIDとexplicit system-only process/thread descriptorで別sandbox childから新規childへのcontrol / memory-readを遮断し、stdio以外を継承せず、Jobのkill-on-close / USER-handle / clipboard / desktop等のrestrictionを設定してからresumeする。ただしcurrent userを共有するcompatibility tokenなので、moyAI親を含むsame-user host processのmemory-read一般までは遮断しない。PowerShell/CLR互換性のlogon/Everyone restricting SIDに伴うoutside routeは、selected local Everyone-writable rootへのnon-inheriting deny監査で軽減するが、これは同期filesystem / ACL call間でbudgetを観測するbest-effort処理で、hard deadlineでも網羅的証明でもない。workspace rootへのinheritable ACL setupも既存treeへ同期伝播し得るため、初回preflightはchild timeout開始前に長時間かかることがある。Job UI restrictionはexternal USER handleやclipboard等を制限するがprivate desktopではなく、same-desktop `SendInput`等のsynthetic input isolationをclaimしない。network設定もoffline environment hintでありdirect socket clientを遮断しない。初期化/起動失敗を通常tokenで再実行せず、他platformのworkspace-mode process effectはfail closedになる。
+Windows sandboxはcurrent userから作る`WRITE_RESTRICTED` token、decision時のroot path/file-ID snapshot、object identityに束ねたcapability SID、ACL、suspended spawn、Job Objectを使う。実行時はsame-objectを再検証し、protected regular fileは内容hashとwrite-sharingなしhandleでpinする。workspace・設定済みwrite root・一時directoryへallow ACEを設定し、admit時に存在するcase-awareな`.git` / resolved gitdir / `.moyai` / `.agents` / `.claude` / `.codex`、active cwd→root instruction、configured additional instruction、configured protected carveoutへdeny ACEを設定する。process-private SIDとexplicit system-only process/thread descriptorで別sandbox childから新規childへのcontrol / memory-readを遮断し、stdio以外を継承せず、Jobのkill-on-close / USER-handle / clipboard / desktop等のrestrictionを設定してからresumeする。ただしcurrent userを共有するcompatibility tokenなので、moyAI親を含むsame-user host processのmemory-read一般までは遮断しない。PowerShell/CLR互換性のlogon/Everyone restricting SIDに伴うoutside routeは、selected local Everyone-writable rootへのnon-inheriting deny監査で軽減する。bounded discoveryでlocal identityとEveryone-writeを確認した候補は、ACL-control / `WRITE_DAC`取得、deny適用、適用後identity再検証の失敗をskipせずspawn前に拒否する。discovery自体は同期filesystem / ACL call間でbudgetを観測するbest-effort処理で、hard deadlineでも網羅的証明でもない。workspace rootへのinheritable ACL setupも既存treeへ同期伝播し得るため、初回preflightはchild timeout開始前に長時間かかることがある。Job UI restrictionはexternal USER handleやclipboard等を制限するがprivate desktopではなく、same-desktop `SendInput`等のsynthetic input isolationをclaimしない。network設定もoffline environment hintでありdirect socket clientを遮断しない。初期化/起動失敗を通常tokenで再実行せず、他platformのworkspace-mode process effectはfail closedになる。
 
 - `実行する`: tool call を承認して続行する。
 - `実行せず、指示を変更する`: tool call を実行せず、要求元のtaskを停止して次の指示を待つ。拒否結果をmodelへ返して自動retryさせる動作ではない。
@@ -367,11 +373,11 @@ Markdown export は通常、対象 workspace の `.moyai/transcript-exports/` �
 2. 別端末でhostしている場合は、hostname解決、port、firewall、LM Studioのlisten範囲を確認する。
 3. `Connection type` が環境と合っているか確認する。
 4. `モデル読込` で対象 model が見えるか確認する。
-5. provider request IDと失敗phase（attempt開始、request in flight、headers受信、stream progressなど）を「技術詳細」で確認する。phaseはmoyAIのtransport観測であり、provider process起動やmodel loadの判定ではない。
+5. public statusのtypedな失敗種別/phaseを確認する。phaseはmoyAIのtransport観測であり、provider process起動やmodel loadの判定ではない。raw request ID、endpoint、elapsed、provider code/messageはprivate runtime diagnosticに限定され、durable history/exportには残らない。送信証跡が必要な場合はcredentialを含まないtask-local request captureを明示的に有効にする。
 
 ## 既知制限
 
-- LM Studio streaming response は token usage を返さない場合がある。その場合、run metrics の `token_usage` は `null` になる。
+- LM Studio streaming response は token usage を返さない場合がある。そのturnのrun metricsは`token_usage = null`となり、session使用量はmissingまたはpartialとして表示する。欠損turnを0 tokenとして合算しない。
 - 長大な multi-file documentation task は local LLM の能力と stream stability に依存する。失敗時は task 分割、timeout / provider 設定、model 変更を先に検討する。
 - model policyの90% working targetへ達すると、moyAIのAutomatic compactionは固定item件数ではなくresponse bundle / call-output semantic unitを選ぶ。provider報告total usageがある場合はdurable turn terminalから復元し、そのmodel response後のlocal itemだけをCodexと同じ粗いUTF-8 bytes/4で加算する。usageがないかresponse境界を照合できない場合だけfull prepared requestのlocal推定へfallbackし、request diagnosticsは使用sourceを区別する。tool responseが未完了の間はcompactionせず、summary requestはlogicalなSystem / Developer / User / Assistant / tool順序を保ってCodex checkpoint promptを最後のUser inputへ追加し、toolsとprovider cursorを送らない。summary requestも上記の共通wire変換を使う。host-owned thinking / non-thinkingの両方へ十分な生成余白を残すため、可能なら最古側のcomplete semantic-unit prefixだけを選び、完全なtool-less requestの概算をworking targetの半分以下へ抑える。半分以下で通常requestを安全に再開できるprefixがない場合は、unitを分割せず、再開可能と概算できる最小prefixを選ぶ。単一のoversized unitも分割せず、安全に要約できなければhistory不変で失敗する。typed `context_length_exceeded`、またはcontext上限近傍でcompletionがreasoning tokenだけを含み本文が空だった場合に限り、観測したprovider/local token差も含めて安全な、より短いsemantic-unit prefixへ一度だけ再試行する。実際に成功したrequestへ渡したunitだけを置換lineageへcommitし、未選択suffixは元順序で残す。checkpointは新しいreal User / Steer text inputと委譲turnを開始したcanonical `NEW_TASK`をoriginal orderのまま保守的な20,000 token以内に保持し、境界の一件は中央を切り詰め、prefix付きsummaryを最後のUser inputにする。通常のagent messageとfinal handoffはsummaryへ残し、古いsummaryをanchorまたはsystem instructionへ昇格させない。元itemはcanonical historyへ保持する。cancel、通常の空summary、tool call混入、provider failureではhistoryを変更しない。
   `assets/prompts/compaction.md`のexact checkpoint textはsource-levelのCodex prompt-asset contractであり、この一致だけでCodex runtime全体とのparityを主張しない。

@@ -11,6 +11,9 @@ import {
   liveCurrentTimeTerminalDecision,
   normalizeProviderConnectionLiveOptions,
   parseCurrentTimeWorkSummary,
+  providerConnectionLiveSideChatAnswerAccepted,
+  providerConnectionLiveSideChatMainPreserved,
+  providerConnectionLiveSideChatQuestion,
   providerConnectionLiveFixtureConfig,
   providerConnectionLiveControlTokenLeaks,
   restoredProviderConnectionReady,
@@ -25,6 +28,7 @@ const RAW_OPTIONS = Object.freeze({
 const OPTIONS = Object.freeze({
   providerBaseUrl: "http://192.0.2.10:8119/v1",
   model: "example/Qwen-27B",
+  sideChatAfterCompletion: false,
 });
 
 const CONFIG_TARGET = Object.freeze({
@@ -105,8 +109,8 @@ function terminalSurface({ projection = {}, surface = {} } = {}) {
       confirmation: null,
       draft_prompt: "",
       can_submit: true,
-      tool_status_text: "ツール:\n- Current time [completed] local: 2026-08-24T12:34:56+09:00\nutc: 2026-08-24T03:34:56Z\ntimezone: +09:00\nunix_ms: 1787542496000",
-      latest_tool_summary: "ツール:",
+      tool_status_text: "ツール: 1件中1件を表示（要確認を優先・新しい順）\n- [完了] Current time: local: 2026-08-24T12:34:56+09:00 utc: 2026-08-24T03:34:56Z timezone: +09:00 unix_ms: 1787542496000",
+      latest_tool_summary: "完了: 時刻の確認",
       progress_text: "Completed\nフェーズ: 終了処理\n手順: completed\nモデル要求: 2\nツール: 1件開始 / 1件完了 / 0件拒否 / 0件キャンセル / 0件失敗\n圧縮: 0",
       transcript_rows: [
         { row_kind: "user", body: PROVIDER_OPENAI_COMPATIBLE_PROMPT },
@@ -137,14 +141,16 @@ function terminalSurface({ projection = {}, surface = {} } = {}) {
   };
 }
 
-test("live provider config accepts exactly one credential-free endpoint and model pair", () => {
+test("live provider config accepts one credential-free endpoint, model, and optional Side Chat gate", () => {
   assert.deepEqual(normalizeProviderConnectionLiveOptions(RAW_OPTIONS), OPTIONS);
   assert.deepEqual(normalizeProviderConnectionLiveOptions({
     provider_base_url: "https://provider.example.test",
     model: "model-a",
+    side_chat_after_completion: true,
   }), {
     providerBaseUrl: "https://provider.example.test",
     model: "model-a",
+    sideChatAfterCompletion: true,
   });
 
   for (const invalid of [
@@ -158,9 +164,103 @@ test("live provider config accepts exactly one credential-free endpoint and mode
     { provider_base_url: "http://provider.test/v1", model: "" },
     { provider_base_url: "http://provider.test/v1", model: "bad\nmodel" },
     { provider_base_url: "http://provider.test/v1", model: "model-a", api_key: "secret" },
+    { provider_base_url: "http://provider.test/v1", model: "model-a", side_chat_after_completion: "true" },
+    { provider_base_url: "http://provider.test/v1", model: "model-a", side_chat_after_completion: 1 },
   ]) {
     assert.throws(() => normalizeProviderConnectionLiveOptions(invalid), TypeError);
   }
+});
+
+test("post-task Side Chat asks from owner evidence and accepts only the exact tool and time answer", () => {
+  const time = {
+    local: "2026-08-24T12:34:56+09:00",
+    utc: "2026-08-24T03:34:56Z",
+    timezone: "+09:00",
+    unixMs: "1787542496000",
+  };
+  const question = providerConnectionLiveSideChatQuestion(time);
+  assert.match(question, /unix_msが1787542496000/u);
+  assert.doesNotMatch(question, /current_time|2026-08-24T12:34:56\+09:00|2026-08-24T03:34:56Z|\+09:00/u);
+  const answer = "Side Chat確認完了：tool=current_time / local=2026-08-24T12:34:56+09:00 / utc=2026-08-24T03:34:56Z / timezone=+09:00 です。";
+  assert.equal(providerConnectionLiveSideChatAnswerAccepted(answer, time), true);
+  assert.equal(providerConnectionLiveSideChatAnswerAccepted(` \r\n${answer}\n\t`, time), true);
+  for (const answer of [
+    "Side Chat確認完了：tool=current_time / local=2026-08-24T12:34:56+09:00 / utc=2026-08-24T03:34:56Z / timezone=UTC+09:00 です。",
+    "Side Chat確認完了：tool=Current time / local=2026-08-24T12:34:56+09:00 / utc=2026-08-24T03:34:56Z / timezone=+09:00 です。",
+    "Side Chat確認完了：tool=current_time / local=2026-08-24T12:34:56+09:00\n/ utc=2026-08-24T03:34:56Z / timezone=+09:00 です。",
+    "Side Chat確認完了：tool=current_time / timezone=+09:00 です。",
+  ]) {
+    assert.equal(providerConnectionLiveSideChatAnswerAccepted(answer, time), false);
+  }
+  assert.equal(providerConnectionLiveSideChatAnswerAccepted("", null), false);
+  assert.throws(() => providerConnectionLiveSideChatQuestion({ ...time, unixMs: "not-a-number" }), TypeError);
+});
+
+test("post-task Side Chat preserves one immutable Main snapshot through configure and completion", () => {
+  const transcriptRows = [
+    { row_kind: "user", stable_history_identity: "history-user", body: PROVIDER_OPENAI_COMPATIBLE_PROMPT },
+    { row_kind: "assistant", stable_history_identity: "history-assistant", body: ASSISTANT },
+  ];
+  const visibleRows = transcriptRows.map((row) => ({ id: row.stable_history_identity, kind: row.row_kind, body: row.body }));
+  const surface = {
+    projection: {
+      draft_target: { sessionId: "session-main" },
+      run_status_key: "completed",
+      task_activity_state: "idle",
+      busy: false,
+      agent_tree_active: false,
+      post_run_refresh_pending: false,
+      navigation_loading: false,
+      selected_project_index: 0,
+      selected_session_index: 0,
+      session_rows: [{
+        session_id: "session-main",
+        active_turn_id: null,
+        admission_revision: "1",
+        latest_turn_id: "turn-main",
+      }],
+      transcript_rows: transcriptRows,
+      turn_page_total: 2,
+      turn_page_limit: 256,
+    },
+    main: { primary_rows: visibleRows, prompt_value: "" },
+  };
+  const baseline = {
+    session_id: "session-main",
+    selected_session_id: "session-main",
+    primary_rows: visibleRows,
+    canonical_rows: transcriptRows,
+    visible_primary_rows: visibleRows,
+    main_draft: "",
+    active_turn_id: null,
+    admission_revision: "1",
+    latest_turn_id: "turn-main",
+    turn_page_total: 2,
+    turn_page_limit: 256,
+  };
+  const sideChat = { mainBaseline: structuredClone(baseline), completedSurface: structuredClone(surface) };
+  assert.equal(providerConnectionLiveSideChatMainPreserved(baseline, surface, sideChat), true);
+  assert.equal(providerConnectionLiveSideChatMainPreserved(
+    baseline,
+    { ...surface, main: { ...surface.main, prompt_value: "changed" } },
+    sideChat,
+  ), false);
+  assert.equal(providerConnectionLiveSideChatMainPreserved(
+    baseline,
+    surface,
+    { ...sideChat, mainBaseline: { ...baseline, latest_turn_id: "turn-other" } },
+  ), false);
+  assert.equal(providerConnectionLiveSideChatMainPreserved(
+    baseline,
+    surface,
+    {
+      ...sideChat,
+      completedSurface: {
+        ...surface,
+        projection: { ...surface.projection, transcript_rows: [...transcriptRows, { row_kind: "error", body: "drift" }] },
+      },
+    },
+  ), false);
 });
 
 test("fixture is deterministic, tool-capable, and starts from a distinct credential-name baseline", () => {

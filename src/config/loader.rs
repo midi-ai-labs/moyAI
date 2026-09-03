@@ -199,6 +199,13 @@ impl ConfigLoader {
                     "invalid config loaded from `{config_source}`: {error}"
                 ))
             })?;
+        resolved
+            .normalize_and_validate_mcp_runtime()
+            .map_err(|error| {
+                ConfigError::Message(format!(
+                    "invalid config loaded from `{config_source}`: {error}"
+                ))
+            })?;
         let endpoint = ProviderEndpoint::parse(&resolved.model.base_url)
             .map_err(|error| ConfigError::Message(error.to_string()))?;
         resolved.model.base_url = endpoint.as_str().to_string();

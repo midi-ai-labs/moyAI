@@ -485,6 +485,59 @@ export async function closeOwnedNativeDialog(
   return result;
 }
 
+export async function selectFileInOwnedNativeDialog(
+  { executionRoot, ownerPath, candidate, selectedPath },
+  { invoke = invokeWindowsNativeInput } = {},
+) {
+  const fingerprint = requireInteractiveCandidate(candidate);
+  if (typeof selectedPath !== "string" || !path.win32.isAbsolute(selectedPath) || selectedPath.includes("\0")) {
+    throw new TypeError("selectedPath must be an absolute Windows path without NUL bytes");
+  }
+  const result = await invoke("SelectFile", {
+    ExecutionRoot: executionRoot,
+    OwnerPath: ownerPath,
+    WindowHandle: fingerprint.hwnd,
+    ExpectedThreadId: fingerprint.threadId,
+    ExpectedClassName: fingerprint.className,
+    SelectedPath: selectedPath,
+  });
+  const selectedIdentity = path.win32.normalize(String(result?.selected_path ?? "")).toLowerCase();
+  const expectedIdentity = path.win32.normalize(selectedPath).toLowerCase();
+  const expectedFileName = path.win32.basename(selectedPath);
+  const exactDefaultAction = result?.default_action_pattern === "InvokePattern.Invoke()"
+    && result?.file_item?.invoke_pattern === true;
+  if (
+    result?.attempted !== true
+    || result?.attempt_count !== 1
+    || result?.request_count !== 1
+    || result?.delivery_verified !== true
+    || result?.file_item_selection_verified !== true
+    || result?.file_item_default_action_verified !== true
+    || exactDefaultAction !== true
+    || result?.file_item?.name !== expectedFileName
+    || !["ControlType.DataItem", "ControlType.ListItem"].includes(result?.file_item?.control_type)
+    || result?.file_item?.process_id !== candidate.process_id
+    || result?.file_item?.enabled !== true
+    || result?.file_item?.offscreen !== false
+    || result?.file_item?.selection_item_pattern !== true
+    || result?.foreground_required !== false
+    || result?.cleanup_only !== false
+    || result?.representative_input !== true
+    || selectedIdentity !== expectedIdentity
+    || requireHwnd(result?.window?.hwnd, "select-file.window.hwnd") !== fingerprint.hwnd
+    || result?.window?.process_id !== candidate.process_id
+    || result?.window?.thread_id !== candidate.thread_id
+    || result?.window?.class_name !== candidate.class_name
+  ) {
+    throw new NativeInputError(
+      "native-dialog-file-selection-invalid",
+      "Windows UI Automation did not satisfy the exact native file selection contract",
+      result,
+    );
+  }
+  return result;
+}
+
 export async function captureOwnedWindowPng(
   { executionRoot, ownerPath, candidate },
   { invoke = invokeWindowsNativeInput } = {},

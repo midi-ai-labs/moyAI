@@ -47,6 +47,7 @@ import {
   selectedNavigationIdentity,
 } from "./observations.mjs";
 import { acquireInteractiveShell, requestGracefulExit } from "./shell_baseline.mjs";
+import { executeCase52SideChatStage } from "./case5_2_side_chat.mjs";
 
 const OWNER = "scenario:manual.case5_2";
 const scenarioDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -162,6 +163,7 @@ const STAGES = Object.freeze([
   { id: "stage3", promptFile: "stage3-implement.txt", minimumSummaries: 1 },
   { id: "stage4", promptFile: "stage4-regression.txt", minimumSummaries: 1 },
 ]);
+const SIDE_CHAT_STAGE = Object.freeze({ id: "stage5", promptFile: "stage5-side-chat.txt" });
 const REQUIRED_DOCUMENTS = Object.freeze([
   "README.md",
   "basic_design.md",
@@ -2558,7 +2560,14 @@ async function trustedSelectSideProviderProfile({ cdp, input, sink, options }) {
   return { initial, selections, final };
 }
 
-async function configureSideChat({ cdp, input, sink, options, sessionId }) {
+export async function configureSideChat({
+  cdp,
+  input,
+  sink,
+  options,
+  sessionId,
+  evidenceName = "case5_2-side-chat-configured",
+}) {
   await openSideSettings({ cdp, input, sink });
   const providerProfile = await trustedSelectSideProviderProfile({ cdp, input, sink, options });
   await replaceExactText({ cdp, input, locator: SIDE_BASE_URL, text: options.providerBaseUrl, action: "side-chat-base-url", sink });
@@ -2645,7 +2654,7 @@ async function configureSideChat({ cdp, input, sink, options, sessionId }) {
       accept: (value) => case52SideScreenshotSurfaceReady(value, options, sessionId),
     });
   }
-  const screenshot = await captureScenarioScreenshot({ cdp, sink, name: "case5_2-side-chat-configured", owner: OWNER });
+  const screenshot = await captureScenarioScreenshot({ cdp, sink, name: evidenceName, owner: OWNER });
   await sink.record("case5_2-side-chat-configured", {
     owner_session_id: sessionId,
     base_url: options.providerBaseUrl,
@@ -3901,6 +3910,19 @@ export function case52SideProviderSummary(options, samples) {
   };
 }
 
+export function case52LegacySideSummaryV1({ stage4SideChat, restoredSideChat, providerSummary }) {
+  return {
+    side_chat: structuredClone(stage4SideChat),
+    side_chat_request_observation: {
+      trusted_side_send_action_count: "not-derived-from-event-ledger",
+      persisted_message_count_at_restart_restore: restoredSideChat?.messages?.length ?? null,
+      persisted_message_count_at_stage4_terminal: stage4SideChat?.messages?.length ?? null,
+      ...structuredClone(providerSummary),
+      provider_generation_request_zero: "unverified-no-traffic-ledger",
+    },
+  };
+}
+
 export function case52ProviderSummaryEvidence(options, state) {
   const executionOwnedLmStudio = options.providerProfile === LM_STUDIO_PROFILE
     && !externalProvider(options);
@@ -3947,6 +3969,7 @@ export function createCase52Scenario(rawOptions = {}) {
     baseline: null,
     seed: null,
     promptInputs: null,
+    sidePromptInput: null,
     oracle: null,
     python: null,
     externalRoots: [],
@@ -4005,6 +4028,18 @@ export function createCase52Scenario(rawOptions = {}) {
         };
       }
       state.promptInputs = promptInputs;
+      const sideInput = await fileIdentity(path.join(caseDirectory, SIDE_CHAT_STAGE.promptFile), { includeBytes: true });
+      const sideSourceText = sideInput.bytes.toString("utf8");
+      const sideText = normalizeCase52PromptText(sideSourceText);
+      state.sidePromptInput = {
+        path: sideInput.path,
+        sha256: sideInput.sha256,
+        size_bytes: sideInput.size_bytes,
+        gui_text_sha256: sha256(Buffer.from(sideText, "utf8")),
+        gui_text_size_bytes: Buffer.byteLength(sideText, "utf8"),
+        line_endings_normalized: sideText !== sideSourceText,
+        text: sideText,
+      };
       const immutableDirectory = path.join(context.paths.logs, "immutable-inputs");
       await mkdir(immutableDirectory, { recursive: false });
       const immutableOraclePath = path.join(immutableDirectory, `test_cancel_contract-${oracleSource.sha256}.py`);
@@ -4081,13 +4116,23 @@ export function createCase52Scenario(rawOptions = {}) {
           gui_text_size_bytes: value.gui_text_size_bytes,
           line_endings_normalized: value.line_endings_normalized,
         }])),
+        side_chat_prompt: {
+          stage: SIDE_CHAT_STAGE.id,
+          path: state.sidePromptInput.path,
+          sha256: state.sidePromptInput.sha256,
+          size_bytes: state.sidePromptInput.size_bytes,
+          gui_text_sha256: state.sidePromptInput.gui_text_sha256,
+          gui_text_size_bytes: state.sidePromptInput.gui_text_size_bytes,
+          line_endings_normalized: state.sidePromptInput.line_endings_normalized,
+        },
         oracle: state.oracle,
         executable_identity: { python: state.python },
         external_environment: externalIdentity,
       }, { phase, owner: OWNER });
     },
     async execute({ context, driver: firstCdp, host, runtime: firstRuntime, sink }) {
-      if (state.baseline === null || state.promptInputs === null || state.python === null || state.oracle === null) {
+      if (state.baseline === null || state.promptInputs === null || state.sidePromptInput === null
+        || state.python === null || state.oracle === null) {
         throw new Error("manual.case5_2 was not prepared");
       }
       let activeInput = null;
@@ -4307,11 +4352,49 @@ export function createCase52Scenario(rawOptions = {}) {
           oracleIdentity: state.oracle,
         });
         const evaluation = evaluated.report;
-        const finalManifest = evaluated.finalManifest;
+        const stage4FinalManifest = evaluated.finalManifest;
+
+        const stage5Options = options.sideModel === options.mainModel
+          ? options
+          : Object.freeze({ ...options, sideModel: options.mainModel });
+        if (stage5Options !== options) {
+          await configureSideChat({
+            cdp: activeCdp,
+            input: activeInput,
+            sink,
+            options: stage5Options,
+            sessionId: stage1.sessionId,
+            evidenceName: "case5_2-side-chat-stage5-reconfigured",
+          });
+        }
+        await providerMustKeepSideUnloaded({ options, sink, state, name: "stage5-before-side-send" });
+        const stage5 = await executeCase52SideChatStage({
+          cdp: activeCdp,
+          input: activeInput,
+          sink,
+          sessionId: stage1.sessionId,
+          providerProfile: stage5Options.providerProfile,
+          providerBaseUrl: stage5Options.providerBaseUrl,
+          model: stage5Options.sideModel,
+          promptInput: state.sidePromptInput,
+          timeoutMs: QUALITY_REQUEST_TIMEOUT_MS,
+        });
+        const stage5Manifest = await storeStageManifest({
+          context,
+          sink,
+          baseline: state.baseline,
+          stage: "stage5-post-side-chat",
+        });
+        await assertEvaluatorWorkspaceStable({
+          sink,
+          before: stage4FinalManifest,
+          after: stage5Manifest,
+          label: "stage5-side-chat-read-only",
+        });
 
         const allPaths = await allWorkspacePaths(context.paths.workspace);
         const forbidden = case52ForbiddenWorkspacePaths(allPaths);
-        const scopeFailures = finalScopeFailures(finalManifest, forbidden);
+        const scopeFailures = finalScopeFailures(stage5Manifest, forbidden);
         const seedFinal = await inventoryCase52CleanSeed(options.fixtureSource);
         const seedUnchanged = seedFinal.aggregate_sha256 === state.seed.aggregate_sha256
           && sameValue(seedFinal.files, state.seed.files);
@@ -4340,6 +4423,11 @@ export function createCase52Scenario(rawOptions = {}) {
         }
 
         const providerEvidence = case52ProviderSummaryEvidence(options, state);
+        const legacySideSummary = case52LegacySideSummaryV1({
+          stage4SideChat: stage4.terminal.side_chat,
+          restoredSideChat: restoredProjection.side_chat,
+          providerSummary: case52SideProviderSummary(options, state.sideProviderSamples),
+        });
         const summary = {
           schema_version: "desktop-e2e.case5_2-summary.v1",
           options: case52EvidenceOptions(options),
@@ -4349,15 +4437,31 @@ export function createCase52Scenario(rawOptions = {}) {
             turn_id: item.turnId,
             elapsed_ms: item.elapsed_ms,
           })),
-          restart: restarted.restart,
-          side_chat: stage4.terminal.side_chat,
-          side_chat_request_observation: {
-            trusted_side_send_action_count: "not-derived-from-event-ledger",
-            persisted_message_count_at_restart_restore: restoredProjection.side_chat?.messages?.length ?? null,
-            persisted_message_count_at_stage4_terminal: stage4.terminal.side_chat?.messages?.length ?? null,
-            ...case52SideProviderSummary(options, state.sideProviderSamples),
-            provider_generation_request_zero: "unverified-no-traffic-ledger",
+          stage5: {
+            stage: stage5.stage,
+            elapsed_ms: stage5.elapsed_ms,
+            provider_profile: stage5.binding.provider_profile,
+            model: stage5.binding.model,
+            owner_session_id: stage5.binding.owner_session_id,
+            chat_id: stage5.binding.chat_id,
+            question: stage5.question,
+            answer: stage5.answer,
+            active_context_observation: stage5.active_context_observation,
+            first_progress_latency_ms: stage5.first_progress_latency_ms,
+            command_evidence: stage5.commandEvidence,
+            terminal_screenshot: stage5.terminal_screenshot,
+            terminal_side_chat: stage5.completedSurface.projection.side_chat,
+            request_observation: {
+              trusted_side_send_action_count: 1,
+              trusted_main_submit_action_count: 0,
+              trusted_main_cancel_action_count: 0,
+              trusted_side_cancel_action_count: 0,
+              persisted_message_count: stage5.completedSurface.projection.side_chat.messages.length,
+              provider_generation_request_count: "unverified-no-traffic-ledger",
+            },
           },
+          restart: restarted.restart,
+          ...legacySideSummary,
           transcript,
           evaluation,
           safety,
@@ -4374,6 +4478,7 @@ export function createCase52Scenario(rawOptions = {}) {
             ...state.performance,
             initial_shell_observation_ms: initialShell.readiness?.elapsed_ms ?? null,
             restart_shell_observation_ms: restartShell.readiness?.elapsed_ms ?? null,
+            side_chat_stage5_ms: stage5.elapsed_ms,
             total_elapsed_ms: elapsedSince(context.manifest.started_at),
           },
         };

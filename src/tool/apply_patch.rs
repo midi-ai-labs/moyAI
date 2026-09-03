@@ -1881,7 +1881,13 @@ mod tests {
             AccessMode::FullAccess,
         ]
         .map(|mode| access_mode_allows_permission(mode, &request));
-        assert_eq!(decisions, [true, true, true]);
+        assert_eq!(decisions, [false, false, true]);
+        assert!(admission.outside_workspace);
+        assert!(
+            admission
+                .risks
+                .contains(&crate::tool::PermissionRisk::UnclassifiedShell)
+        );
         assert!(
             request
                 .details

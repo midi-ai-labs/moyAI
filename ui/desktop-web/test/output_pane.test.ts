@@ -37,7 +37,11 @@ function outputState(): DesktopWebState {
       last_error: "",
       generation: "0",
       draft_text: "",
+      draft_quote: null,
       draft_revision: "0",
+      context_scope: "owner_session",
+      context_as_of_append_position: null,
+      context_truncated: false,
       messages: [],
       can_send: false,
       can_cancel: false,
@@ -80,6 +84,9 @@ test("output pane uses one document-flow scroll owner with semantic ordered sect
   assert.match(html, /<h3 id="output-files-heading">ファイル<\/h3>/);
   assert.match(html, /<h3 id="output-preview-heading">プレビュー<\/h3>/);
   assert.match(html, /<h3 id="output-activity-heading">進捗／ツール<\/h3>/);
+  assert.match(html, /aria-label="完全な実行履歴への導線"/);
+  assert.match(html, /完全な詳細はcanonical会話履歴に残ります/);
+  assert.match(html, /data-action="export-transcript"/);
   assert.match(html, /<ol class="plan-list">/);
   assert.match(html, /<ul class="artifact-list">/);
   assert.match(html, /class="plan-step-status">進行中<\/span><span class="plan-step-copy">/);

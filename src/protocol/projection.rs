@@ -296,9 +296,11 @@ fn project_history_item(
             call_id: *tool_call_id,
             decision: permission_decision(*approved),
         },
-        RunEvent::RecoverableRuntimeFeedback { message, .. } => HistoryItemPayload::Error {
-            message: message.clone(),
-        },
+        RunEvent::RecoverableRuntimeFeedback { feedback, .. } => {
+            HistoryItemPayload::DurableFeedback {
+                feedback: feedback.clone(),
+            }
+        }
         RunEvent::UserTurnStored { turn, .. } => HistoryItemPayload::UserTurn {
             content: turn.content_parts(),
             prompt_dispatch: turn.prompt_dispatch.clone(),
@@ -443,8 +445,8 @@ pub fn project_turn_item_for_run_event(
             summary: summary.clone(),
         },
         RunEvent::PermissionResolved { .. } => return None,
-        RunEvent::RecoverableRuntimeFeedback { message, .. } => TurnItemPayload::Error {
-            message: message.clone(),
+        RunEvent::RecoverableRuntimeFeedback { feedback, .. } => TurnItemPayload::DurableFeedback {
+            feedback: feedback.clone(),
         },
         RunEvent::TurnTerminal { terminal, .. } => TurnItemPayload::Terminal {
             outcome: terminal.outcome.clone(),
@@ -608,9 +610,11 @@ fn project_runtime_message(
             tool: *tool,
             decision: permission_decision(*approved),
         },
-        RunEvent::RuntimeNotice { message, .. }
-        | RunEvent::RecoverableRuntimeFeedback { message, .. } => RuntimeEventMsg::Warning {
+        RunEvent::RuntimeNotice { message, .. } => RuntimeEventMsg::Warning {
             message: message.clone(),
+        },
+        RunEvent::RecoverableRuntimeFeedback { feedback, .. } => RuntimeEventMsg::DurableFeedback {
+            feedback: feedback.clone(),
         },
         RunEvent::TurnTerminal { terminal, .. } => RuntimeEventMsg::TurnTerminal {
             terminal: terminal.clone(),

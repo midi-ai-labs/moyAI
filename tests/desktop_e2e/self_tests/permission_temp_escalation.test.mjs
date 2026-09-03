@@ -150,8 +150,8 @@ function baseProjection(overrides = {}) {
     progress_text: "Completed\nツール: 2件開始 / 2件完了 / 0件拒否 / 0件キャンセル / 0件失敗",
     tool_status_text: [
       "ツール:",
-      "- first [completed] output",
-      "- second [completed] output",
+      "- [完了] first: output",
+      "- [完了] second: output",
     ].join("\n"),
     draft_target: { sessionId: SESSION_ID },
     run_target: {

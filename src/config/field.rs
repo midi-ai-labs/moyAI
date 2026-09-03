@@ -91,6 +91,13 @@ pub(crate) struct ConfigFieldDescriptor {
     options: &'static [&'static str],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigFieldPublicValue {
+    pub(crate) value: String,
+    pub(crate) sensitive: bool,
+    pub(crate) configured: bool,
+}
+
 impl ConfigFieldDescriptor {
     pub(crate) fn key(self) -> &'static str {
         self.field.label()
@@ -191,6 +198,16 @@ impl ConfigField {
                 | ConfigField::MaxOutputTokens
                 | ConfigField::SupportsReasoning
                 | ConfigField::ExtraBodyJson
+        )
+    }
+
+    pub const fn is_sensitive(self) -> bool {
+        matches!(
+            self,
+            ConfigField::ExtraHeadersJson
+                | ConfigField::ExtraBodyJson
+                | ConfigField::DoclingHeadersJson
+                | ConfigField::McpServersJson
         )
     }
 
@@ -452,7 +469,7 @@ impl ConfigField {
         )
     }
 
-    pub(crate) fn value(self, config: &ResolvedConfig) -> String {
+    pub(crate) fn editor_value(self, config: &ResolvedConfig) -> String {
         match self {
             ConfigField::BaseUrl => config.model.base_url.clone(),
             ConfigField::Model => config.model.model.clone(),
@@ -533,6 +550,33 @@ impl ConfigField {
             }
         }
     }
+
+    pub(crate) fn public_value(self, config: &ResolvedConfig) -> ConfigFieldPublicValue {
+        let configured = match self {
+            ConfigField::ExtraHeadersJson => !config.model.extra_headers.is_empty(),
+            ConfigField::ExtraBodyJson => config.model.extra_body_json.is_some(),
+            ConfigField::DoclingHeadersJson => !config.docling.headers.is_empty(),
+            ConfigField::McpServersJson => !config.mcp.servers.is_empty(),
+            _ => true,
+        };
+        ConfigFieldPublicValue {
+            value: if self.is_sensitive() {
+                String::new()
+            } else {
+                self.editor_value(config)
+            },
+            sensitive: self.is_sensitive(),
+            configured,
+        }
+    }
+
+    pub(crate) fn redacted_input_preserves_configured(
+        self,
+        current_editor_value: &str,
+        input: &str,
+    ) -> bool {
+        self.is_sensitive() && input.trim().is_empty() && !current_editor_value.is_empty()
+    }
 }
 
 pub(crate) fn build_resolved_config_from_field_values(
@@ -565,6 +609,7 @@ pub(crate) fn build_resolved_config_from_field_values(
 
     config.normalize_and_validate_provider_runtime()?;
     config.normalize_and_validate_docling_runtime()?;
+    config.normalize_and_validate_mcp_runtime()?;
     Ok(config)
 }
 
@@ -575,7 +620,7 @@ pub(crate) fn build_resolved_config_from_key_values(
 ) -> Result<ResolvedConfig, String> {
     let mut fields = ConfigField::ALL
         .into_iter()
-        .map(|field| (field, field.value(base)))
+        .map(|field| (field, field.editor_value(base)))
         .collect::<Vec<_>>();
     let mut seen = HashSet::new();
     for (key, value) in values {
@@ -586,6 +631,12 @@ pub(crate) fn build_resolved_config_from_key_values(
             .iter_mut()
             .find(|(field, _)| field.label() == key)
             .ok_or_else(|| format!("unknown config field key: {key}"))?;
+        if field
+            .0
+            .redacted_input_preserves_configured(&field.1, &value)
+        {
+            continue;
+        }
         field.1 = value;
     }
     let borrowed = fields
@@ -923,6 +974,126 @@ mod tests {
                 "model.extra_body_json",
             ]
         );
+    }
+
+    #[test]
+    fn sensitive_field_owner_exposes_only_configured_state_to_public_projections() {
+        let mut config = ResolvedConfig::default();
+        let secrets = [
+            "model-header-super-secret",
+            "model-body-super-secret",
+            "docling-header-super-secret",
+            "mcp-header-super-secret",
+        ];
+        config
+            .model
+            .extra_headers
+            .insert("Authorization".to_string(), secrets[0].to_string());
+        config.model.extra_body_json = Some(serde_json::json!({"token": secrets[1]}));
+        config
+            .docling
+            .headers
+            .insert("Authorization".to_string(), secrets[2].to_string());
+        config.mcp.servers[0]
+            .headers
+            .insert("Authorization".to_string(), secrets[3].to_string());
+
+        let sensitive = ConfigField::ALL
+            .into_iter()
+            .filter(|field| field.is_sensitive())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sensitive,
+            vec![
+                ConfigField::ExtraHeadersJson,
+                ConfigField::ExtraBodyJson,
+                ConfigField::DoclingHeadersJson,
+                ConfigField::McpServersJson,
+            ]
+        );
+        for field in sensitive {
+            let public = field.public_value(&config);
+            assert!(public.sensitive);
+            assert!(public.configured);
+            assert!(public.value.is_empty());
+            let public_debug = format!("{public:?}");
+            for secret in secrets {
+                assert!(!public_debug.contains(secret));
+            }
+            assert!(
+                secrets
+                    .iter()
+                    .any(|secret| field.editor_value(&config).contains(secret)),
+                "internal editor value for {} must retain its mutation input",
+                field.label()
+            );
+        }
+
+        let ordinary = ConfigField::Model.public_value(&config);
+        assert!(!ordinary.sensitive);
+        assert!(ordinary.configured);
+        assert_eq!(ordinary.value, config.model.model);
+    }
+
+    #[test]
+    fn redacted_sensitive_inputs_preserve_raw_config_until_an_explicit_json_replacement() {
+        let mut base = ResolvedConfig::default();
+        base.model
+            .extra_headers
+            .insert("Authorization".to_string(), "model-secret".to_string());
+        base.docling
+            .headers
+            .insert("Authorization".to_string(), "docling-secret".to_string());
+        base.mcp.servers[0]
+            .headers
+            .insert("Authorization".to_string(), "mcp-secret".to_string());
+
+        let preserved = build_resolved_config_from_key_values(
+            &base,
+            vec![
+                (
+                    ConfigField::ExtraHeadersJson.label().to_string(),
+                    String::new(),
+                ),
+                (
+                    ConfigField::DoclingHeadersJson.label().to_string(),
+                    " ".to_string(),
+                ),
+                (
+                    ConfigField::McpServersJson.label().to_string(),
+                    String::new(),
+                ),
+            ],
+        )
+        .expect("redacted public values preserve configured raw inputs");
+        assert_eq!(preserved.model.extra_headers, base.model.extra_headers);
+        assert_eq!(preserved.docling.headers, base.docling.headers);
+        assert_eq!(
+            preserved.mcp.servers[0].headers,
+            base.mcp.servers[0].headers
+        );
+
+        let cleared = build_resolved_config_from_key_values(
+            &base,
+            vec![
+                (
+                    ConfigField::ExtraHeadersJson.label().to_string(),
+                    "{}".to_string(),
+                ),
+                (
+                    ConfigField::DoclingHeadersJson.label().to_string(),
+                    "{}".to_string(),
+                ),
+                (
+                    ConfigField::McpServersJson.label().to_string(),
+                    "[]".to_string(),
+                ),
+            ],
+        )
+        .expect("explicit empty JSON replaces configured raw inputs");
+        assert!(cleared.model.extra_headers.is_empty());
+        assert!(cleared.docling.headers.is_empty());
+        assert!(cleared.mcp.servers.is_empty());
     }
 
     #[test]

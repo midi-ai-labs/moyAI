@@ -9,9 +9,10 @@ use crate::protocol::{
 };
 use crate::runtime::RunCancellationCause;
 use crate::session::{
-    ActiveTurnExpectation, CanonicalSessionRead, DispatchTransformKind, DurableTurnTerminal,
-    LoadedSessionStatus, LoadedSessionSummary, PendingTurnInputProjection, PromptDispatchPart,
-    RunEvent, RunSummary, SessionId, SessionRecord, SessionStatus, ToolCallId, ToolCallStatus,
+    ActiveTurnExpectation, CanonicalSessionRead, DispatchTransformKind, DurableFeedbackSeverity,
+    DurableTurnTerminal, LoadedSessionStatus, LoadedSessionSummary, PendingTurnInputProjection,
+    PromptDispatchPart, RunEvent, RunSummary, SessionId, SessionRecord, SessionStatus, ToolCallId,
+    ToolCallStatus,
 };
 use crate::tool::{PermissionRequest, ToolName};
 
@@ -528,11 +529,11 @@ impl AppState {
                 self.tool_statuses.clear();
                 self.last_summary = None;
                 self.run_status = RunStatus::Running;
-                self.status_message = Some(format!("session {} started", session_id));
+                self.status_message = Some("実行中".to_string());
                 self.progress = RunProgressView {
                     status: "Running".to_string(),
                     current_phase: RunProgressPhase::Session,
-                    active_step: "Session started".to_string(),
+                    active_step: "セッションを開始しました".to_string(),
                     ..RunProgressView::default()
                 };
                 self.latest_context_window = None;
@@ -561,14 +562,7 @@ impl AppState {
             }
             RunEvent::ProviderPhase { event, .. } => {
                 self.progress.current_phase = RunProgressPhase::Provider(event.phase);
-                self.progress.active_step = format!(
-                    "Provider request {} {} via {} (attempt {}, {} ms)",
-                    event.request_id,
-                    event.phase.as_str(),
-                    event.endpoint,
-                    event.attempt,
-                    event.elapsed_ms
-                );
+                self.progress.active_step = provider_progress_step(event.phase).to_string();
                 if let Some(failure) = &event.failure {
                     self.status_message = Some(failure.to_string());
                 }
@@ -615,7 +609,7 @@ impl AppState {
                 let tool = crate::tool::ToolName::parse(tool_name);
                 self.progress.tool_calls_started += 1;
                 self.progress.current_phase = RunProgressPhase::Tool;
-                self.progress.active_step = format!("Calling {tool_name}");
+                self.progress.active_step = format!("{}を実行しています", tool_action_label(tool));
                 self.tool_statuses.push(ToolStatusView {
                     tool_call_id: *tool_call_id,
                     tool,
@@ -641,7 +635,7 @@ impl AppState {
             } => {
                 self.progress.tool_calls_completed += 1;
                 self.progress.current_phase = RunProgressPhase::Tool;
-                self.progress.active_step = format!("Completed {tool}: {title}");
+                self.progress.active_step = format!("{}を完了しました", tool_action_label(*tool));
                 update_tool_status(
                     &mut self.tool_statuses,
                     *tool_call_id,
@@ -667,7 +661,8 @@ impl AppState {
             } => {
                 self.progress.tool_calls_declined += 1;
                 self.progress.current_phase = RunProgressPhase::Tool;
-                self.progress.active_step = format!("Declined {tool}: {reason}");
+                self.progress.active_step =
+                    format!("{}は実行されませんでした", tool_action_label(*tool));
                 update_tool_status(
                     &mut self.tool_statuses,
                     *tool_call_id,
@@ -693,7 +688,8 @@ impl AppState {
             } => {
                 self.progress.tool_calls_cancelled += 1;
                 self.progress.current_phase = RunProgressPhase::Tool;
-                self.progress.active_step = format!("Cancelled {tool}: {reason}");
+                self.progress.active_step =
+                    format!("{}をキャンセルしました", tool_action_label(*tool));
                 update_tool_status(
                     &mut self.tool_statuses,
                     *tool_call_id,
@@ -719,7 +715,8 @@ impl AppState {
             } => {
                 self.progress.tool_calls_failed += 1;
                 self.progress.current_phase = RunProgressPhase::Tool;
-                self.progress.active_step = format!("Failed {tool}: {error}");
+                self.progress.active_step =
+                    format!("{}を完了できませんでした", tool_action_label(*tool));
                 update_tool_status(
                     &mut self.tool_statuses,
                     *tool_call_id,
@@ -754,7 +751,8 @@ impl AppState {
             } => {
                 self.progress.compactions += 1;
                 self.progress.current_phase = RunProgressPhase::Compaction;
-                self.progress.active_step = format!("Compacted {summarized_messages} messages");
+                self.progress.active_step =
+                    format!("コンテキストを整理しました（{summarized_messages}件）");
                 self.transcript_entries.push(TranscriptEntry {
                     kind: TranscriptKind::System,
                     title: "Compaction".to_string(),
@@ -776,15 +774,19 @@ impl AppState {
                     tool_call_id: None,
                 });
             }
-            RunEvent::RecoverableRuntimeFeedback { message, .. } => {
+            RunEvent::RecoverableRuntimeFeedback { feedback, .. } => {
                 self.run_status = RunStatus::Running;
-                self.status_message = Some(message.clone());
+                self.status_message = Some(feedback.public_message.clone());
                 self.progress.current_phase = RunProgressPhase::RuntimeFeedback;
-                self.progress.active_step = message.clone();
+                self.progress.active_step = feedback.public_message.clone();
                 self.transcript_entries.push(TranscriptEntry {
-                    kind: TranscriptKind::Error,
-                    title: "Runtime feedback".to_string(),
-                    body: message.clone(),
+                    kind: if feedback.severity == DurableFeedbackSeverity::Error {
+                        TranscriptKind::Error
+                    } else {
+                        TranscriptKind::System
+                    },
+                    title: feedback.public_title(),
+                    body: feedback.public_message.clone(),
                     response_id: None,
                     tool_call_id: None,
                 });
@@ -818,25 +820,27 @@ impl AppState {
                 self.latest_context_window = diagnostics.context_window.clone();
                 self.progress.current_phase = RunProgressPhase::Model;
                 self.progress.active_step = format!(
-                    "Model request {} with {} tools",
-                    self.progress.model_requests, diagnostics.tool_count
+                    "モデルへの依頼を準備しています（ツール候補 {}件）",
+                    diagnostics.tool_count
                 );
             }
             RunEvent::WorldStateUpdated { snapshot, .. } => {
                 self.progress.current_phase = RunProgressPhase::Context;
-                self.progress.active_step =
-                    format!("World state updated: {} sections", snapshot.section_count());
+                self.progress.active_step = format!(
+                    "作業コンテキストを更新しました（{}項目）",
+                    snapshot.section_count()
+                );
             }
-            RunEvent::PermissionRequested { summary, .. } => {
+            RunEvent::PermissionRequested { .. } => {
                 self.progress.current_phase = RunProgressPhase::Permission;
-                self.progress.active_step = summary.clone();
+                self.progress.active_step = "ユーザーの確認を待っています".to_string();
             }
             RunEvent::PermissionResolved { approved, .. } => {
                 self.progress.current_phase = RunProgressPhase::Permission;
                 self.progress.active_step = if *approved {
-                    "permission approved".to_string()
+                    "確認結果を反映しています".to_string()
                 } else {
-                    "permission not approved".to_string()
+                    "実行しない判断を反映しています".to_string()
                 };
             }
             RunEvent::UserTurnStored { .. } => {}
@@ -884,7 +888,7 @@ impl AppState {
         self.run_status = RunStatus::Running;
         self.progress.status = "Running".to_string();
         self.progress.current_phase = RunProgressPhase::User;
-        self.progress.active_step = "User input stored".to_string();
+        self.progress.active_step = "依頼を受け付けました".to_string();
     }
 
     pub fn apply_durable_prompt_dispatch(&mut self, prompt_dispatch: &PromptDispatchPart) {
@@ -1027,7 +1031,12 @@ impl AppState {
         self.interruption_cause = outcome.interruption_cause();
         self.permission = None;
         self.progress.current_phase = RunProgressPhase::Terminal;
-        self.progress.active_step = outcome.summary().to_string();
+        self.progress.active_step = match outcome {
+            TurnTerminalOutcome::Completed => "実行が完了しました",
+            TurnTerminalOutcome::Interrupted { .. } => "実行を停止しました",
+            TurnTerminalOutcome::Failed { .. } => "エラーで終了しました",
+        }
+        .to_string();
         match outcome {
             TurnTerminalOutcome::Completed => {
                 self.run_status = RunStatus::Completed;
@@ -1230,6 +1239,39 @@ fn transcript_kind_for_tool_pending(tool: ToolName) -> TranscriptKind {
     }
 }
 
+fn provider_progress_step(phase: crate::llm::ProviderPhase) -> &'static str {
+    match phase {
+        crate::llm::ProviderPhase::AttemptStarted => "LLMへの接続を準備しています",
+        crate::llm::ProviderPhase::RequestInFlight => "LLMの応答を待っています",
+        crate::llm::ProviderPhase::HeadersReceived => "LLMの応答を受信しています",
+        crate::llm::ProviderPhase::FirstProgress => "LLMの応答を受信しています",
+        crate::llm::ProviderPhase::LastProgress => "LLMの応答をまとめています",
+        crate::llm::ProviderPhase::ProviderTerminal => "LLMの応答を反映しています",
+    }
+}
+
+pub(crate) const fn tool_action_label(tool: ToolName) -> &'static str {
+    match tool {
+        ToolName::List | ToolName::Glob | ToolName::InspectDirectory => "ファイル一覧の確認",
+        ToolName::Grep => "ファイル内の検索",
+        ToolName::Read => "ファイルの確認",
+        ToolName::ApplyPatch | ToolName::Write => "ファイルの更新",
+        ToolName::Shell => "コマンド",
+        ToolName::CurrentTime => "時刻の確認",
+        ToolName::Skill => "Skillの読込",
+        ToolName::DoclingConvert => "文書の変換",
+        ToolName::McpCall => "外部ツール",
+        ToolName::UpdatePlan => "計画の更新",
+        ToolName::GetGoal | ToolName::CreateGoal | ToolName::UpdateGoal => "目標の更新",
+        ToolName::SpawnAgent => "Sub Agentの開始",
+        ToolName::SendMessage | ToolName::FollowupTask => "Sub Agentへの連絡",
+        ToolName::WaitAgent => "Sub Agentの完了待ち",
+        ToolName::InterruptAgent => "Sub Agentの中断",
+        ToolName::ListAgents => "Sub Agent状態の確認",
+        ToolName::Invalid => "ツール",
+    }
+}
+
 fn pending_tool_transcript_title(tool: ToolName) -> &'static str {
     if matches!(tool, ToolName::Write | ToolName::ApplyPatch) {
         "編集中"
@@ -1254,7 +1296,7 @@ fn progress_from_loaded_state(status: RunStatus, tools: &[ToolStatusView]) -> Ru
     RunProgressView {
         status: run_status_label_for_progress(status).to_string(),
         current_phase: RunProgressPhase::Loaded,
-        active_step: "Loaded canonical turn items".to_string(),
+        active_step: "保存済みの作業履歴を表示しています".to_string(),
         model_requests: 0,
         tool_calls_started: tools.len(),
         tool_calls_completed: tools
@@ -1495,6 +1537,17 @@ fn transcript_entries_from_turn_items_with_roots(
                 kind: TranscriptKind::Error,
                 title: "Error".to_string(),
                 body: message.clone(),
+                response_id: None,
+                tool_call_id: None,
+            }),
+            TurnItemPayload::DurableFeedback { feedback } => Some(TranscriptEntry {
+                kind: if feedback.severity == DurableFeedbackSeverity::Error {
+                    TranscriptKind::Error
+                } else {
+                    TranscriptKind::System
+                },
+                title: feedback.public_title(),
+                body: feedback.public_message.clone(),
                 response_id: None,
                 tool_call_id: None,
             }),
@@ -1802,6 +1855,7 @@ mod tests {
             },
             pending_turn_inputs,
             turn_elapsed_ms: Default::default(),
+            session_token_usage: Default::default(),
             latest_turn_id: active_turn_id,
             active_turn_id,
             active_turn_sequence_no: active_turn_id.map(|_| 1),
@@ -2680,6 +2734,36 @@ mod tests {
     }
 
     #[test]
+    fn durable_feedback_live_and_reload_preserve_warning_semantics() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let feedback = crate::session::DurableRuntimeFeedback::new(
+            crate::session::DurableFeedbackSeverity::Warning,
+            crate::session::DurableFeedbackCategory::Provider,
+            "接続を確認してから再試行できます。",
+        );
+        let mut live = AppState::default();
+
+        live.apply_run_event(&RunEvent::RecoverableRuntimeFeedback {
+            session_id,
+            feedback: feedback.clone(),
+        });
+        let reopened = transcript_entries_from_turn_items(&[TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 1,
+            payload: TurnItemPayload::DurableFeedback { feedback },
+        }]);
+
+        assert_eq!(reopened, live.transcript_entries);
+        assert_eq!(reopened[0].kind, TranscriptKind::System);
+        assert_eq!(reopened[0].title, "警告 · Provider");
+        assert_eq!(reopened[0].body, "接続を確認してから再試行できます。");
+    }
+
+    #[test]
     fn failed_tool_reload_projection_matches_the_runtime_error_entry() {
         let session_id = SessionId::new();
         let turn_id = TurnId::new();
@@ -2714,7 +2798,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_phase_projects_request_identity_endpoint_and_in_flight_phase() {
+    fn provider_phase_projects_public_status_without_request_identity() {
         let response_id = ModelResponseId::new();
         let request_id = crate::llm::ProviderRequestId::new();
         let mut state = AppState::default();
@@ -2737,14 +2821,10 @@ mod tests {
             state.progress.current_phase,
             RunProgressPhase::Provider(crate::llm::ProviderPhase::RequestInFlight)
         );
-        assert!(state.progress.active_step.contains(request_id.as_str()));
-        assert!(
-            state
-                .progress
-                .active_step
-                .contains("http://external-host:1234")
-        );
-        assert!(state.progress.active_step.contains("604 ms"));
+        assert_eq!(state.progress.active_step, "LLMの応答を待っています");
+        assert!(!state.progress.active_step.contains(request_id.as_str()));
+        assert!(!state.progress.active_step.contains("external-host"));
+        assert!(!state.progress.active_step.contains("604"));
     }
 
     #[test]

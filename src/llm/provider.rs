@@ -124,6 +124,73 @@ pub struct ProviderFailure {
     pub message: String,
 }
 
+impl ProviderFailure {
+    /// Returns the stable user-visible failure text.
+    ///
+    /// Provider request identifiers, endpoints, response bodies, and provider supplied error
+    /// strings are runtime diagnostics. They must not be copied into durable terminals, canonical
+    /// history, or exports.
+    pub fn public_message(&self) -> String {
+        match self.kind {
+            ProviderFailureKind::Connect => {
+                "Could not connect to the model provider. Check that the provider is running and the connection settings are correct."
+                    .to_string()
+            }
+            ProviderFailureKind::RequestTimeout | ProviderFailureKind::ResponseStartTimeout => {
+                "The model provider did not start a response before the request deadline. Check the provider load or increase the response timeout."
+                    .to_string()
+            }
+            ProviderFailureKind::StreamIdleTimeout => {
+                "The model provider stopped sending response data. Check the provider load and try again."
+                    .to_string()
+            }
+            ProviderFailureKind::HttpStatus => match self.status {
+                Some(401 | 403) => format!(
+                    "The model provider rejected authentication or authorization (HTTP {}). Check the configured credential.",
+                    self.status.expect("matched status")
+                ),
+                Some(404) => {
+                    "The configured model provider route was not found (HTTP 404). Check the connection type and model endpoint."
+                        .to_string()
+                }
+                Some(429) => {
+                    "The model provider is rate-limiting requests (HTTP 429). Wait briefly and try again."
+                        .to_string()
+                }
+                Some(status) => format!(
+                    "The model provider rejected the request (HTTP {status}). Check the provider and model settings."
+                ),
+                None => {
+                    "The model provider rejected the request. Check the provider and model settings."
+                        .to_string()
+                }
+            },
+            ProviderFailureKind::Generation
+                if self.code.as_deref() == Some("context_length_exceeded") =>
+            {
+                "The request exceeds the model context limit. Reduce the conversation context or select a model with a larger context window."
+                    .to_string()
+            }
+            ProviderFailureKind::Generation => {
+                "The model provider could not complete generation. Check the model state and try again."
+                    .to_string()
+            }
+            ProviderFailureKind::Protocol | ProviderFailureKind::Decode => {
+                "The model provider returned an unsupported or malformed response. Check the configured connection type."
+                    .to_string()
+            }
+            ProviderFailureKind::Cancelled => "The model request was cancelled.".to_string(),
+            ProviderFailureKind::EventProjection => {
+                "The model response could not be applied to the current task. Reopen the task and try again."
+                    .to_string()
+            }
+            ProviderFailureKind::Other => {
+                "The model request failed. Check the provider state and try again.".to_string()
+            }
+        }
+    }
+}
+
 impl fmt::Display for ProviderFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -143,7 +210,34 @@ impl fmt::Display for ProviderFailure {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderFailureKind, ProviderPhase, resolve_api_key_from_env};
+    use super::{
+        ProviderFailure, ProviderFailureKind, ProviderPhase, ProviderRequestId,
+        resolve_api_key_from_env,
+    };
+
+    #[test]
+    fn public_provider_failure_omits_private_transport_and_payload_details() {
+        let secret = "provider-payload-secret";
+        let request_id = ProviderRequestId::new();
+        let failure = ProviderFailure {
+            request_id: request_id.clone(),
+            endpoint: "https://provider.example/private-route".to_string(),
+            phase: ProviderPhase::ProviderTerminal,
+            attempt: 2,
+            elapsed_ms: 125,
+            kind: ProviderFailureKind::HttpStatus,
+            status: Some(401),
+            code: Some("credential-secret-code".to_string()),
+            message: secret.to_string(),
+        };
+
+        let public = failure.public_message();
+        assert!(public.contains("HTTP 401"));
+        assert!(!public.contains(request_id.as_str()));
+        assert!(!public.contains("provider.example"));
+        assert!(!public.contains("credential-secret-code"));
+        assert!(!public.contains(secret));
+    }
 
     #[test]
     fn configured_api_key_environment_fails_closed() {

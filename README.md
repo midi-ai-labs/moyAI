@@ -57,7 +57,7 @@ moyAI is designed around those constraints:
 
 ## Highlights
 
-- Tauri Desktop app with project chat, quick chat, transcript, artifacts, settings, provider discovery, and a tool-less session-scoped side chat that can use a model separate from the main task.
+- Tauri Desktop app with project chat, quick chat, transcript, artifacts, settings, provider discovery, and a tool-less session-scoped Side Chat that can use a model separate from the main task. Immediately before each Side Chat POST, moyAI captures the exact owning session's active canonical history and append fence; an optional quote is bound to one stable transcript/artifact row and must still match that snapshot. Storage work is bounded to 65,536 append-only source items, 16,384 derived active items, and 8,192 eligible semantic units, failing before provider transport when any bound is exceeded. Untrusted quote and canonical evidence text is XML-entity encoded before it enters the owner-context envelope, so evidence cannot forge its structural delimiters. The quote is added to the Side draft without auto-send, and Side Chat never reads live workspace state or changes the main composer.
 - Desktop renders canonical history as a continuous conversation: user bubbles and plain assistant responses have no display-only step numbers, completed work history is collapsible without swallowing the root Agent's final response, and older bounded chunks prepend in place with a left-side hover/jump rail instead of replacing the page.
 - One Desktop instance per user; launching it again restores the existing window.
 - Desktop Stop validates the projected workspace, root session, run generation, and Agent Tree epoch, so stale UI actions cannot cancel a later run. Settings values, baseline, dirty state, and monotonic revision exist only in one frontend-local draft owner. Rust projects typed clean/dirty capability variants and statelessly validates a complete draft plus a decimal-string config-generation target before Apply, Save, Reset, or another config-owner mutation. Commit builds one complete temporary `ResolvedConfig`, preserving cleared optional values instead of re-layering them. Active-turn steer clears input only after durable acceptance.
@@ -72,11 +72,12 @@ moyAI is designed around those constraints:
 - A selected nested directory remains the tool and sandbox authority boundary even when an ancestor is the Git project root; reopening its session restores that exact directory.
 - File writes and patches use one stable-handle, no-clobber conditional commit for create, update, delete, and rollback. A concurrent external replacement wins without being overwritten; if restoration cannot reclaim the target name, moyAI reports the preserved backup path. Parent directories are not created implicitly, so create the parent first.
 - On Unix, moyAI cannot prove that a writable descriptor opened before an update or delete no longer references the detached inode. Creation remains unchanged, but an existing-file update installs the new target and a delete detaches the target while retaining the old inode at a private backup path; both report a typed partial-commit error instead of claiming safe cleanup. Inspect and reconcile the reported backup because a pre-opened writer can still modify it.
-- Permission modes: **Ask for approval** (`default` / 承認を求める), **Approve for me** (`auto_review` / 代理で承認), and **Full access** (`full_access` / フルアクセス). Ask and Auto share one deterministic admission policy and the same Windows `workspace-write` restricted-token/ACL profile; explicit `sandbox_permissions: "require_escalated"` plus `justification`, or a detected destructive/network/external/authority effect, goes to a human in Ask. In Auto, the supported LM Studio native Responses route sends it to a separate tool-less AI Guardian; other provider profiles fail closed before Guardian contact. The Windows backend identity-pins admitted roots and selected existing authority carveouts, content-pins protected regular files, gives each launched process/thread an explicit system-only descriptor, inherits only stdio, applies Job process-tree/UI restrictions before resume, and fails closed without an unrestricted retry. This unelevated profile is a finite existing-object defense, not a complete Windows namespace or Codex-enforcement equivalent: absent authority names, unrelated nested instruction files, protected descendants with overriding explicit/inheritance-disabled DACLs, uninspected outside paths, direct sockets, same-user host-process memory, and same-desktop synthetic input remain residuals. Its ACL preflight can propagate through existing trees synchronously and is not covered by the child timeout. Full Access and an approved process elevation run `Unrestricted` as the current user, so their child filesystem mutations do not pass through typed file guards; typed `write`/`apply_patch`, MCP/Docling, and process lifecycle checks keep their own guards. A committed mode change affects the next permission decision, while a pending request and an admitted effect retain their original decision/profile. Native process sandboxing is currently Windows-only; workspace-mode process effects fail closed elsewhere. A future elevated dedicated-identity/firewall/private-desktop backend is required for the hard boundary.
+- Permission modes: **Ask for approval** (`default` / 承認を求める), **Approve for me** (`auto_review` / 代理で承認), and **Full access** (`full_access` / フルアクセス). Ask and Auto share one deterministic admission policy and the same Windows `workspace-write` restricted-token/ACL profile; explicit `sandbox_permissions: "require_escalated"` plus `justification`, or a detected destructive/network/external/authority effect, goes to a human in Ask. In Auto, the turn-captured canonical API mode selects an exact tool-less Responses or Chat Completions AI Guardian request for every current connection profile; a future unknown wire fails closed before Guardian contact without human/Ask fallback. Concrete oMLX compatibility is qualified separately by actual UAT. The Windows backend identity-pins admitted roots, shell/formatter executables, and selected existing authority carveouts, content-pins protected regular files, gives each launched process/thread an explicit system-only descriptor, inherits only stdio, applies Job process-tree/UI restrictions before resume, and fails closed without an unrestricted retry. This unelevated profile is a finite existing-object defense, not a complete Windows namespace or Codex-enforcement equivalent: absent authority names, unrelated nested instruction files, protected descendants with overriding explicit/inheritance-disabled DACLs, pre-confirmation uninspected outside paths, direct sockets, same-user host-process memory, and same-desktop synthetic input remain residuals. Its ACL preflight can propagate through existing trees synchronously and is not covered by the child timeout. Full Access and an approved process elevation run `Unrestricted` as the current user, so their child filesystem mutations do not pass through typed file guards; typed `write`/`apply_patch`, MCP/Docling, and process lifecycle checks keep their own guards. A committed mode change affects the next permission decision, while a pending request and an admitted effect retain their original decision/profile. Native process sandboxing is currently Windows-only; workspace-mode process effects fail closed elsewhere. A future elevated dedicated-identity/firewall/private-desktop backend is required for the hard boundary.
 - Vision-capable model support for image attachments.
 - Optional Docling Serve and HTTP MCP integration for document-heavy workflows.
 - Local instructions from `AGENTS.md`, `CLAUDE.md`, `.moyai/rules*`, `.moyai/commands/*.md`, and local `SKILL.md` files.
 - Canonical protocol session history, typed turn terminals, Markdown export, and lightweight live-smoke artifacts.
+- Short typed provider/status labels, an attention-first progress summary bounded to eight items, complete-detail routes through canonical history/export, terminal-derived session usage that distinguishes missing/partial/complete measurement, and durable feedback that remains identical after reopen and export.
 - Recursive multi-agent collaboration, available by default for explicit delegation requests, with the normal and collaboration tools available to every agent, separate descendant sessions, and visible Desktop activity.
 
 ## Current Release
@@ -150,7 +151,7 @@ By default, release artifacts are written outside the repository under `project_
 
 ## Configuration
 
-moyAI uses one user-wide config file, then layers environment variables, a durable root-session override, and CLI/run overrides where applicable. Desktop **Preferences** edits the user-wide baseline. The smaller **Session Settings** panel, opened from the model or access chip in the top bar, edits only the current root session and never exposes a global-save action.
+moyAI uses one user-wide config file, then layers environment variables, a durable root-session override, and CLI/run overrides where applicable. The left-rail **Connection Settings / 接続設定** shortcut opens Desktop **Preferences**, which edits the user-wide baseline and contains the selected session's Side Chat provider section. The smaller **Session Settings** panel, opened from the model or access chip in the top bar, edits only the current root session and never exposes a global-save action. These entry points do not create another provider-settings owner.
 
 Default Windows config path:
 
@@ -163,6 +164,8 @@ The release folder and workspace folders do not need their own config file. Desk
 Initial Setup TOML import is read-only until Finish: the selected file is strictly parsed into the local wizard draft without materializing environment overrides, and neither the source nor the current global configuration is mutated by choosing it. Only a successful Finish persists the validated draft and clears the first-run setup requirement. Less common typed fields remain editable in the wizard's collapsed Advanced area, which opens when one of those fields needs correction.
 
 In Session Settings, leaving **moyAI local context budget** blank removes that root-session override and inherits the global value. This budget controls local input accounting and compaction only; it is not sent to the provider as a context-window or model-load setting.
+
+Sensitive JSON settings—custom provider headers/body, Docling headers, and MCP server definitions—are projected publicly as **configured, hidden** rather than returning their raw values. Leaving a complete sensitive-field draft blank preserves the existing value. To replace or clear it, submit explicit valid JSON such as `{}` or `[]`. API-key environment-variable names may be displayed and persisted, but the resolved environment value is never persisted or projected.
 
 Example:
 
@@ -207,8 +210,9 @@ with a config error instead of silently choosing one.
 Maximum output length is owned by the hosting provider. moyAI omits both Responses
 `max_output_tokens` and Chat Completions `max_tokens`, so ordinary text, reasoning, and serialized
 tool-call arguments use the limit configured in LM Studio, oMLX, or the selected host. A provider-side
-`response.failed` such as `Failed to parse tool call: Unexpected end of content` is reported with the
-provider code/message and is not treated as a locally parsed or executed tool call.
+`response.failed` is mapped to a stable typed public failure and is not treated as a locally parsed or
+executed tool call. Its raw provider code/message remains private diagnostic evidence and is not written
+to the durable terminal, canonical history, or Markdown export.
 `max_retries` applies only to retryable connection/transport failures before any HTTP response, with
 every retry delay capped at 30,000 ms. A response-start timeout, any HTTP error response (including
 429/5xx), or a failure after an SSE response starts is terminal and is not replayed automatically.
@@ -239,7 +243,11 @@ the global value. Only a correlated success matching the latest local revision a
 draft, and a stale async response cannot mutate or clear a different draft.
 
 When MCP is enabled, each callable server tool needs an explicit effect route. Unlisted routes fail
-closed; in the internal Plan mode, only routes explicitly classified as `read` are callable.
+closed; in the internal Plan mode, only routes explicitly classified as `read` are callable. An HTTP
+server uses one canonical absolute `http`/`https` origin with no userinfo or fragment. Discovery and
+calls must stay on that origin, redirects are rejected, endpoint/body/header/envelope/response sizes are
+bounded, and one absolute timeout covers discovery plus the exact-once effectful call. An effectful
+`tools/call` is never retried or redirected to a fallback endpoint.
 
 ```toml
 [mcp]
@@ -355,10 +363,11 @@ canonical input on every request, including any compaction checkpoint, and does 
 provider-emitted reasoning summary is a runtime-only client event, not a durable conversation or
 runtime row.
 
-Every generation request has a runtime-only provider request ID and reports the phases
-`attempt_started`, `request_in_flight`, `headers_received`, `first_progress`, `last_progress`, and
-`provider_terminal`, plus attempt/elapsed data, a sanitized endpoint, and provider-reported token
-usage on a successful terminal when the provider supplies it. Prepared-request diagnostics keep the
+Private runtime diagnostics retain a provider request ID and the phases `attempt_started`,
+`request_in_flight`, `headers_received`, `first_progress`, `last_progress`, and `provider_terminal`,
+plus attempt/elapsed data, a sanitized endpoint, raw provider failure details, and provider-reported
+token usage when supplied. Public UI status is instead a short typed phase/failure message with no
+request ID, endpoint, elapsed time, or raw provider code/message. Prepared-request diagnostics keep the
 logical model-message count separate from the exact HTTP wire input-item count and serialized body
 size, without retaining the body. These are transport
 boundaries observed by moyAI; they do not infer provider-process startup, server-side acceptance, or
@@ -423,11 +432,14 @@ active canonical task context, the current exact committed response/call, and bo
 tools in that same response. It has no tools or continuation, sends no sampling/thinking override,
 accepts host-provided reasoning as non-authoritative transport output, and uses the turn-captured client-side
 `model.request_timeout_ms` as its absolute total deadline without sending that limit to the host.
-Provider contact for this production Guardian path is currently verified only for
-`provider_profile = "lm_studio"` over native Responses. `openai_compatible` (including oMLX),
-`openai_responses`, and `lm_studio_chat_completions` fail closed before Guardian provider contact and
-do not fall back to human confirmation; select `default` mode when human approval is required on those
-profiles.
+Guardian transport admission is derived from the turn-captured canonical `ProviderTarget.api_mode`,
+not the connection-profile name. All four current profiles therefore use their exact tool-less wire:
+`lm_studio` and `openai_responses` use Responses, while `openai_compatible` (including oMLX) and
+`lm_studio_chat_completions` use Chat Completions. Both wires omit tools, continuation, sampling,
+reasoning/output overrides, and arbitrary extra body. A future unknown wire fails before Guardian
+provider contact and never falls back to human confirmation or Ask mode. This serializer/admission
+contract does not by itself qualify a concrete host; oMLX operational compatibility requires separate
+actual UAT against the configured endpoint and model.
 
 Desktop binds an access update to the current root session and exact runtime epoch. Within the same
 epoch, natural `root:N` to `tree:N`/`idle:N` and `tree:N` to `root:N`/`idle:N` settlements are accepted;
@@ -460,6 +472,13 @@ status, finish reason, cause, and display summary are derived from it. Final res
 counts, and metrics travel in the same terminal value, and `RunSummary` hands that value across the
 runtime boundary instead of restating its fields. Non-turn control commands do not synthesize a
 successful turn terminal.
+Durable runtime feedback has one typed severity, category, and public message; that same payload is used
+for live display, canonical history, turn projection, reopen, and Markdown export. A transient
+`RuntimeNotice` remains live-only. Desktop tool progress selects failure/declined items first and then
+the newest work, with at most eight items, 2,000 total characters, and 180 characters per line; the
+complete evidence remains available by jumping to canonical history or exporting Markdown. Session
+usage is recomputed from all canonical `TurnTerminal` runtime events, counting terminal turns and
+usage-measured turns separately and never presenting missing usage as zero.
 Protocol writes are limited to their atomic session/runtime owners. The generic protocol query/fork
 surface cannot append arbitrary event bundles, and the runtime recording sink accepts only its explicit
 projection allow-list rather than duplicating model/tool/file/terminal ownership.
@@ -782,7 +801,8 @@ local values only:
 - configured Docling enabled flag and base URL
 
 The splash does not wait for network activity. Cold start sends no provider catalog, availability,
-or Docling health request. Invalid local settings open Settings or LLM URL; live connectivity is
+or Docling health request. Invalid local settings open Initial Setup or Preferences; the left-rail
+Connection Settings shortcut and top-bar Session Settings entry remain the normal repair routes. Live connectivity is
 checked only by the explicit model-load/diagnostic action or when the configured service is used.
 
 ## Project Instructions
@@ -797,6 +817,9 @@ moyAI loads local project instructions from:
 - `.moyai/skills/**/SKILL.md`
 
 This keeps project behavior local to the repository and avoids depending on an external plugin marketplace.
+Discovery and individual Skill loading keep their own filesystem limits. The model-visible catalog is a
+deterministic complete-entry prefix of the sorted result, capped at 64 entries and 16 KiB; diagnostics
+report included and omitted counts, and an oversized entry is never cut into partial instructions.
 
 ## Verification
 

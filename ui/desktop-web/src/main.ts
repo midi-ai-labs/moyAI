@@ -915,6 +915,7 @@ function buildDesktopRenderModel(state: DesktopViewState): DesktopRenderModel {
     },
     sideChat: {
       draft: sideChatDraft?.text ?? "",
+      pendingQuote: sideChatDraft?.pendingQuote ?? null,
       setupBaseUrl: sideChatDraft?.setupBaseUrl ?? "",
       setupProviderProfile: sideChatDraft?.setupProviderProfile ?? state.provider_effective_profile,
       setupModel: sideChatDraft?.setupModel ?? "",

@@ -1,3 +1,4 @@
+use crate::app::session_title::is_placeholder_session_title;
 use crate::protocol::{HistoryItem, HistoryItemPayload, TurnInterruptionCause, TurnItemPayload};
 use crate::session::{
     ActiveTurnExpectation, CanonicalSessionRead, ProjectId, PromptDispatchPart, SessionId,
@@ -802,6 +803,10 @@ impl DesktopState {
                 progress_text: "待機中\nフェーズ: 準備完了\n手順: 実行中の作業はありません"
                     .to_string(),
                 run_status_text: "待機中".to_string(),
+                session_usage_label: "セッション累計: 未計測".to_string(),
+                session_usage_title: "完了済みturnのcanonical terminal telemetryはまだありません。"
+                    .to_string(),
+                session_usage_state: "missing".to_string(),
                 artifacts: Vec::new(),
                 file_changes: Vec::new(),
                 file_change_summary_text: "ファイル変更はまだありません。".to_string(),
@@ -1006,6 +1011,8 @@ impl DesktopState {
         {
             self.snapshot.selected_session_index = index;
         }
+        self.update_session_title_projection(session.id, &session.title);
+        self.update_session_row_status(session.id, session.status);
         self.view.overlay = DesktopOverlay::None;
         self.apply_startup_overlay();
         self.view.artifact_selected_index = 0;
@@ -1062,7 +1069,7 @@ impl DesktopState {
             self.app_state.latest_context_window = Some(context_window);
         }
         self.snapshot.replace_detail(detail);
-        self.update_session_row_title(session.id, &session.title);
+        self.update_session_title_projection(session.id, &session.title);
         let row_status = if preserve_current_projection {
             session_status_from_run_status(self.app_state.run_status)
         } else {
@@ -1101,7 +1108,7 @@ impl DesktopState {
             self.app_state.latest_context_window = Some(context_window);
         }
         self.snapshot.replace_detail(detail);
-        self.update_session_row_title(session.id, &session.title);
+        self.update_session_title_projection(session.id, &session.title);
         self.update_session_row_status(session.id, session.status);
         self.apply_canonical_terminal_to_running_session(read);
         self.reconcile_current_terminal_tool_projection();
@@ -1227,7 +1234,7 @@ impl DesktopState {
         }
         self.open_session = Some(open_session);
         self.snapshot.replace_detail(detail);
-        self.update_session_row_title(session.id, &session.title);
+        self.update_session_title_projection(session.id, &session.title);
         self.update_session_row_status(session.id, session.status);
     }
 
@@ -1242,11 +1249,11 @@ impl DesktopState {
         };
         match event {
             crate::session::RunEvent::SessionStarted { session_id, title } => {
-                self.update_session_row_title(*session_id, title);
+                self.update_session_title_projection(*session_id, title);
                 self.update_session_row_status(*session_id, SessionStatus::Running);
             }
             crate::session::RunEvent::SessionTitleUpdated { session_id, title } => {
-                self.update_session_row_title(*session_id, title);
+                self.update_session_title_projection(*session_id, title);
             }
             crate::session::RunEvent::TurnTerminal {
                 session_id,
@@ -1258,7 +1265,14 @@ impl DesktopState {
         }
     }
 
-    fn update_session_row_title(&mut self, session_id: SessionId, title: &str) {
+    fn update_session_title_projection(&mut self, session_id: SessionId, title: &str) {
+        let incoming_is_placeholder = is_placeholder_session_title(title);
+        if self.app_state.current_session_id == Some(session_id)
+            && (!incoming_is_placeholder
+                || is_placeholder_session_title(&self.app_state.current_session_title))
+        {
+            self.app_state.current_session_title = title.to_string();
+        }
         for row in self
             .snapshot
             .session_rows
@@ -1266,6 +1280,9 @@ impl DesktopState {
             .chain(self.snapshot.chat_session_rows.iter_mut())
         {
             if row.session_id == session_id {
+                if incoming_is_placeholder && !is_placeholder_session_title(&row.title) {
+                    continue;
+                }
                 row.set_title_preserving_status(title);
             }
         }
@@ -2434,6 +2451,7 @@ mod tests {
             },
             pending_turn_inputs: Vec::new(),
             turn_elapsed_ms: Default::default(),
+            session_token_usage: Default::default(),
             latest_turn_id,
             active_turn_id: None,
             active_turn_sequence_no: None,
@@ -2581,6 +2599,101 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn opening_a_canonical_terminal_session_reconciles_its_stale_navigation_row() {
+        let session_id = SessionId::new();
+        let stale_turn_id = crate::protocol::TurnId::new();
+        let stale_row = DesktopSessionRow::from_parts_with_loaded(
+            session_id,
+            "new chat",
+            SessionStatus::Running,
+            crate::session::LoadedSessionStatus::Active,
+            Some(stale_turn_id),
+            Some(3),
+            1,
+            1,
+            1,
+        );
+        let session = session_record(session_id);
+        let read = canonical_read(&session, Vec::new(), Vec::new());
+        let mut state = DesktopState::new(snapshot(vec![stale_row], 0), ResolvedConfig::default());
+
+        state.load_open_session(&read);
+
+        let row = &state.snapshot.session_rows[0];
+        assert_eq!(row.title, session.title);
+        assert_eq!(row.status, SessionStatus::Completed);
+        assert_eq!(row.loaded_status, crate::session::LoadedSessionStatus::Idle);
+        assert_eq!(row.active_turn_id, None);
+        assert_eq!(row.active_turn_sequence_no, None);
+        assert_eq!(row.pending_permission_requests, 0);
+        assert_eq!(row.pending_user_input_requests, 0);
+        assert_eq!(state.selected_session_title(), row.label);
+        assert!(!state.selected_session_title().contains("[実行中]"));
+    }
+
+    #[test]
+    fn canonical_projection_refresh_reconciles_the_current_session_title() {
+        let session_id = SessionId::new();
+        let session = session_record(session_id);
+        let read = canonical_read(&session, Vec::new(), Vec::new());
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![DesktopSessionRow::from_parts(
+                    session_id,
+                    &session.title,
+                    SessionStatus::Completed,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&read);
+        state.app_state.current_session_title = "new chat".to_string();
+
+        state.refresh_open_session_projection(&read);
+
+        assert_eq!(state.current_session_label(), session.title);
+        assert_eq!(
+            state.selected_session_title(),
+            state.snapshot.session_rows[0].label
+        );
+    }
+
+    #[test]
+    fn stale_placeholder_refresh_cannot_reverse_a_live_title_event() {
+        let session_id = SessionId::new();
+        let mut placeholder_session = session_record(session_id);
+        placeholder_session.title = "新規チャット".to_string();
+        let stale_read = canonical_read(&placeholder_session, Vec::new(), Vec::new());
+        let mut state = DesktopState::new(
+            snapshot(
+                vec![DesktopSessionRow::from_parts(
+                    session_id,
+                    &placeholder_session.title,
+                    SessionStatus::Completed,
+                )],
+                0,
+            ),
+            ResolvedConfig::default(),
+        );
+        state.load_open_session(&stale_read);
+        state.apply_run_event(&crate::session::RunEvent::SessionTitleUpdated {
+            session_id,
+            title: "canonical title".to_string(),
+        });
+
+        state.refresh_open_session_projection(&stale_read);
+
+        assert_eq!(state.current_session_label(), "canonical title");
+        assert_eq!(state.snapshot.session_rows[0].title, "canonical title");
+        assert!(
+            state.snapshot.session_rows[0]
+                .label
+                .starts_with("canonical title [完了]")
+        );
     }
 
     #[test]
@@ -3025,7 +3138,7 @@ mod tests {
         let detail = state.selected_detail();
         assert!(detail.progress_text.contains("モデル要求: 2"));
         assert!(detail.progress_text.contains("ツール: 1件開始 / 1件完了"));
-        assert!(detail.tool_status_text.contains("Current time [completed]"));
+        assert!(detail.tool_status_text.contains("[完了] Current time"));
         assert!(!detail.tool_status_text.contains("実行履歴はまだありません"));
         assert_eq!(state.app_state.progress.compactions, 3);
         assert_eq!(

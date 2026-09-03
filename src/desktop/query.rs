@@ -26,6 +26,9 @@ pub const DESKTOP_TURN_PAGE_LIMIT: usize = 80;
 pub(crate) const DESKTOP_HISTORY_PROJECTION_LIMIT: usize = 1;
 const DESKTOP_COMMAND_ROW_LIMIT: usize = 64;
 const DESKTOP_COMMAND_SCAN_LIMIT: usize = 512;
+const DESKTOP_TOOL_ACTIVITY_ITEM_LIMIT: usize = 8;
+const DESKTOP_TOOL_ACTIVITY_CHAR_LIMIT: usize = 2_000;
+const DESKTOP_TOOL_ACTIVITY_LINE_CHAR_LIMIT: usize = 180;
 
 pub struct LoadedSessionDetail {
     pub read: CanonicalSessionRead,
@@ -332,6 +335,11 @@ pub(crate) fn build_session_detail_with_roots(
     let file_changes =
         file_change_rows_from_turn_items_with_roots(turn_items, storage_root, display_root);
     let mut detail = build_session_detail_from_app_state(&ui_state);
+    let (usage_label, usage_title, usage_state) =
+        format_session_usage_projection(&read.session_token_usage);
+    detail.session_usage_label = usage_label;
+    detail.session_usage_title = usage_title;
+    detail.session_usage_state = usage_state;
     detail.turn_page_offset = read.turns.offset;
     detail.turn_page_limit = if read.turns.limit == 0 {
         turn_items.len()
@@ -360,6 +368,8 @@ pub(crate) fn build_session_detail_with_roots(
     detail.file_changes = file_changes;
     if let Some(report) = replay_report {
         append_replay_summary(&mut detail.tool_status_text, &report);
+        detail.tool_status_text =
+            truncate_text(&detail.tool_status_text, DESKTOP_TOOL_ACTIVITY_CHAR_LIMIT);
     }
     detail
 }
@@ -370,6 +380,7 @@ struct TurnTranscriptGroup {
     user_body: String,
     user_history_item_id: Option<crate::protocol::HistoryItemId>,
     assistant_bodies: Vec<String>,
+    assistant_history_item_ids: Vec<Option<crate::protocol::HistoryItemId>>,
     tool_rows: Vec<String>,
     file_change_items: Vec<crate::protocol::TurnItem>,
     system_rows: Vec<DesktopTranscriptRow>,
@@ -486,6 +497,7 @@ pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed_and_roots
             }
             crate::protocol::TurnItemPayload::AgentMessage { text } => {
                 current.assistant_bodies.push(text.clone());
+                current.assistant_history_item_ids.push(item.source_item_id);
             }
             crate::protocol::TurnItemPayload::InterAgentCommunication { communication } => {
                 if communication.recipient == "/root" {
@@ -565,6 +577,19 @@ pub(super) fn transcript_rows_from_turn_items_with_context_and_elapsed_and_roots
                     String::new(),
                     "エラー".to_string(),
                     message.clone(),
+                    Vec::new(),
+                ));
+            }
+            crate::protocol::TurnItemPayload::DurableFeedback { feedback } => {
+                current.system_rows.push(desktop_transcript_row(
+                    if feedback.severity == crate::session::DurableFeedbackSeverity::Error {
+                        DesktopTranscriptRowKind::Error
+                    } else {
+                        DesktopTranscriptRowKind::System
+                    },
+                    String::new(),
+                    feedback.public_title(),
+                    feedback.public_message.clone(),
                     Vec::new(),
                 ));
             }
@@ -712,31 +737,46 @@ fn flush_turn_transcript_group(
         });
         rows.push(row);
     }
-    for body in primary_assistant_bodies_for_turn_group(group) {
+    for (body, source_item_id) in primary_assistant_messages_for_turn_group(group) {
         if body.trim().is_empty() {
             continue;
         }
-        rows.push(desktop_transcript_row(
+        let mut row = desktop_transcript_row(
             DesktopTranscriptRowKind::Assistant,
             String::new(),
             "応答".to_string(),
             body.trim().to_string(),
             Vec::new(),
-        ));
+        );
+        row.stable_history_identity = source_item_id.map(|item_id| item_id.to_string());
+        rows.push(row);
     }
     if !file_changes.is_empty() {
-        rows.push(desktop_transcript_row(
+        let first_source_item_id = group
+            .file_change_items
+            .first()
+            .and_then(|item| item.source_item_id);
+        let stable_source_item_id = first_source_item_id.filter(|first| {
+            group
+                .file_change_items
+                .iter()
+                .all(|item| item.source_item_id == Some(*first))
+        });
+        let mut row = desktop_transcript_row(
             DesktopTranscriptRowKind::FileChanges,
             String::new(),
             "ファイル変更結果".to_string(),
             file_change_transcript_body(&file_changes),
             file_changes.clone(),
-        ));
+        );
+        row.stable_history_identity = stable_source_item_id.map(|item_id| item_id.to_string());
+        rows.push(row);
     }
 
     group.user_body.clear();
     group.user_history_item_id = None;
     group.assistant_bodies.clear();
+    group.assistant_history_item_ids.clear();
     group.tool_rows.clear();
     group.file_change_items.clear();
     group.terminal_outcome = None;
@@ -809,19 +849,27 @@ fn turn_group_has_work_summary(group: &TurnTranscriptGroup) -> bool {
     group.has_content()
 }
 
-fn primary_assistant_bodies_for_turn_group(group: &TurnTranscriptGroup) -> Vec<String> {
+fn primary_assistant_messages_for_turn_group(
+    group: &TurnTranscriptGroup,
+) -> Vec<(String, Option<crate::protocol::HistoryItemId>)> {
     let bodies = group
         .assistant_bodies
         .iter()
-        .map(|body| body.trim())
-        .filter(|body| !body.is_empty())
+        .zip(&group.assistant_history_item_ids)
+        .filter_map(|(body, source_item_id)| {
+            let body = body.trim();
+            (!body.is_empty()).then_some((body, *source_item_id))
+        })
         .collect::<Vec<_>>();
     if bodies.len() <= 1 || !turn_group_has_work_summary(group) {
-        return bodies.into_iter().map(str::to_string).collect();
+        return bodies
+            .into_iter()
+            .map(|(body, source_item_id)| (body.to_string(), source_item_id))
+            .collect();
     }
     bodies
         .last()
-        .map(|body| vec![(*body).to_string()])
+        .map(|(body, source_item_id)| vec![(body.to_string(), *source_item_id)])
         .unwrap_or_default()
 }
 
@@ -992,6 +1040,10 @@ pub fn build_session_detail_from_app_state_with_session(
         tool_status_text: format_tool_status_text(state),
         progress_text: format_progress_text(state),
         run_status_text: format_run_status_text(state),
+        session_usage_label: "セッション累計: 未計測".to_string(),
+        session_usage_title: "完了済みturnのcanonical terminal telemetryはまだありません。"
+            .to_string(),
+        session_usage_state: "missing".to_string(),
         artifacts: Vec::new(),
         file_changes: Vec::new(),
         file_change_summary_text: "ファイル変更はまだありません。".to_string(),
@@ -1468,30 +1520,88 @@ fn transcript_row_kind_from_entry(kind: TranscriptKind) -> DesktopTranscriptRowK
 }
 
 fn format_tool_status_text(state: &AppState) -> String {
-    let mut lines = Vec::new();
     if state.tool_statuses.is_empty() {
-        lines.push("ツール: 実行履歴はまだありません。".to_string());
-    } else {
-        lines.push("ツール:".to_string());
-        lines.extend(state.tool_statuses.iter().map(|tool| {
-            let summary = tool.summary.clone().unwrap_or_default();
-            if summary.is_empty() {
-                format!(
-                    "- {} [{}]",
-                    tool.title,
-                    format!("{:?}", tool.status).to_lowercase()
-                )
-            } else {
-                format!(
-                    "- {} [{}] {}",
-                    tool.title,
-                    format!("{:?}", tool.status).to_lowercase(),
-                    summary
-                )
-            }
-        }));
+        return "ツール: 実行履歴はまだありません。".to_string();
     }
-    lines.join("\n")
+
+    let latest = state.tool_statuses.last();
+    let reserve_latest = latest.is_some_and(|tool| {
+        !matches!(
+            tool.status,
+            ToolCallStatus::Failed | ToolCallStatus::Declined
+        )
+    });
+    let attention_limit =
+        DESKTOP_TOOL_ACTIVITY_ITEM_LIMIT.saturating_sub(usize::from(reserve_latest));
+    let mut selected = Vec::with_capacity(DESKTOP_TOOL_ACTIVITY_ITEM_LIMIT);
+    for tool in state
+        .tool_statuses
+        .iter()
+        .rev()
+        .filter(|tool| {
+            matches!(
+                tool.status,
+                ToolCallStatus::Failed | ToolCallStatus::Declined
+            )
+        })
+        .take(attention_limit)
+    {
+        selected.push(tool);
+    }
+    if reserve_latest && let Some(tool) = latest {
+        selected.push(tool);
+    }
+    for tool in state.tool_statuses.iter().rev() {
+        if selected.len() >= DESKTOP_TOOL_ACTIVITY_ITEM_LIMIT {
+            break;
+        }
+        if !selected
+            .iter()
+            .any(|selected_tool| selected_tool.tool_call_id == tool.tool_call_id)
+        {
+            selected.push(tool);
+        }
+    }
+
+    let omitted = state.tool_statuses.len().saturating_sub(selected.len());
+    let mut lines = vec![format!(
+        "ツール: {}件中{}件を表示（要確認を優先・新しい順）{}",
+        state.tool_statuses.len(),
+        selected.len(),
+        if omitted > 0 {
+            format!(" / ほか{omitted}件")
+        } else {
+            String::new()
+        }
+    )];
+    lines.extend(selected.into_iter().map(format_bounded_tool_activity_row));
+    truncate_text(&lines.join("\n"), DESKTOP_TOOL_ACTIVITY_CHAR_LIMIT)
+}
+
+fn format_bounded_tool_activity_row(tool: &crate::tui::state::ToolStatusView) -> String {
+    let status = match tool.status {
+        ToolCallStatus::Pending => "実行中",
+        ToolCallStatus::Running => "実行中",
+        ToolCallStatus::Completed => "完了",
+        ToolCallStatus::Declined => "未実行",
+        ToolCallStatus::Cancelled => "キャンセル",
+        ToolCallStatus::Failed => "失敗",
+    };
+    let title = if tool.title.trim().is_empty() {
+        crate::tui::state::tool_action_label(tool.tool).to_string()
+    } else {
+        single_line_preview(&tool.title, 72)
+    };
+    let detail = tool
+        .error
+        .as_deref()
+        .or(tool.summary.as_deref())
+        .map(|value| single_line_preview(value, DESKTOP_TOOL_ACTIVITY_LINE_CHAR_LIMIT))
+        .filter(|value| !value.is_empty());
+    match detail {
+        Some(detail) => format!("- [{status}] {title}: {detail}"),
+        None => format!("- [{status}] {title}"),
+    }
 }
 
 fn append_replay_summary(tool_status_text: &mut String, report: &ReplayReport) {
@@ -1510,10 +1620,16 @@ fn append_replay_summary(tool_status_text: &mut String, report: &ReplayReport) {
         ));
     }
     if !report.summary.trim().is_empty() {
-        tool_status_text.push_str(&format!("\n- サマリ: {}", report.summary.trim()));
+        tool_status_text.push_str(&format!(
+            "\n- サマリ: {}",
+            single_line_preview(report.summary.trim(), DESKTOP_TOOL_ACTIVITY_LINE_CHAR_LIMIT)
+        ));
     }
     if let Some(restart) = &report.restart_point {
-        tool_status_text.push_str(&format!("\n- 再開点: {restart}"));
+        tool_status_text.push_str(&format!(
+            "\n- 再開点: {}",
+            single_line_preview(restart, DESKTOP_TOOL_ACTIVITY_LINE_CHAR_LIMIT)
+        ));
     }
 }
 
@@ -1523,6 +1639,106 @@ fn format_run_status_text(state: &AppState) -> String {
         lines.push(format!("状態: {message}"));
     }
     lines.join("\n")
+}
+
+fn format_session_usage_projection(
+    usage: &crate::session::CanonicalSessionTokenUsage,
+) -> (String, String, String) {
+    if usage.measured_turn_count == 0 {
+        let title = if usage.terminal_turn_count == 0 {
+            "完了済みturnのcanonical terminal telemetryはまだありません。".to_string()
+        } else {
+            format!(
+                "完了済み{} turnにはtoken usage telemetryがありません。未計測値を0として合算していません。",
+                usage.terminal_turn_count
+            )
+        };
+        return (
+            "セッション累計: 未計測".to_string(),
+            title,
+            "missing".to_string(),
+        );
+    }
+
+    let total_partial = usage.measured_turn_count < usage.terminal_turn_count;
+    let reasoning_partial = usage.reasoning_measured_turn_count < usage.measured_turn_count;
+    let partial = total_partial || reasoning_partial;
+    let label_suffix = if total_partial {
+        "（一部）"
+    } else if usage.reasoning_measured_turn_count == 0 {
+        "（reasoning未計測）"
+    } else if reasoning_partial {
+        "（reasoning一部）"
+    } else {
+        ""
+    };
+    let label = format!(
+        "セッション累計: {} token{}",
+        compact_session_token_count(usage.total_tokens),
+        label_suffix
+    );
+    let reasoning = match usage.reasoning_tokens {
+        None => format!(
+            "reasoning 未計測（{} turnすべて未報告）",
+            usage.measured_turn_count
+        ),
+        Some(reasoning_tokens)
+            if usage.reasoning_measured_turn_count < usage.measured_turn_count =>
+        {
+            format!(
+                "reasoning {}（{} / {} turn計測の部分合計）",
+                reasoning_tokens, usage.reasoning_measured_turn_count, usage.measured_turn_count
+            )
+        }
+        Some(reasoning_tokens) => format!("reasoning {reasoning_tokens}"),
+    };
+    let completeness = match (total_partial, reasoning_partial) {
+        (true, true) => {
+            "usage欠損turnとreasoning未報告fieldは0として合算せず、各値は計測済み分だけの部分合計です。"
+        }
+        (true, false) => "usage欠損turnは0として合算せず、この値は部分合計です。",
+        (false, true) => {
+            "合計tokenは全turn計測済みですが、reasoning未報告fieldは0として合算していません。"
+        }
+        (false, false) => "完了済みturnの累計です。",
+    };
+    let title = format!(
+        "canonical terminal telemetry: {} / {} turn計測。入力 {}、出力 {}、{}、合計 {} token。{}",
+        usage.measured_turn_count,
+        usage.terminal_turn_count,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        reasoning,
+        usage.total_tokens,
+        completeness
+    );
+    (
+        label,
+        title,
+        if partial { "partial" } else { "complete" }.to_string(),
+    )
+}
+
+fn compact_session_token_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format_compact_decimal(value, 1_000_000, "m")
+    } else if value >= 100_000 {
+        format!("{}k", value / 1_000)
+    } else if value >= 1_000 {
+        format_compact_decimal(value, 1_000, "k")
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_compact_decimal(value: u64, divisor: u64, suffix: &str) -> String {
+    let whole = value / divisor;
+    let decimal = (value % divisor) * 10 / divisor;
+    if decimal == 0 {
+        format!("{whole}{suffix}")
+    } else {
+        format!("{whole}.{decimal}{suffix}")
+    }
 }
 
 fn format_progress_text(state: &AppState) -> String {
@@ -1684,11 +1900,110 @@ mod tests {
             },
             pending_turn_inputs: Vec::new(),
             turn_elapsed_ms,
+            session_token_usage: Default::default(),
             latest_turn_id,
             active_turn_id: None,
             active_turn_sequence_no: None,
             admission_revision: u64::from(latest_turn_id.is_some()),
         }
+    }
+
+    #[test]
+    fn bounded_tool_activity_projection_handles_one_thousand_events() {
+        let mut state = AppState::default();
+        state.tool_statuses = (0..1_000)
+            .map(|index| crate::tui::state::ToolStatusView {
+                tool_call_id: crate::session::ToolCallId::new(),
+                tool: if index == 1 {
+                    crate::tool::ToolName::ApplyPatch
+                } else {
+                    crate::tool::ToolName::Shell
+                },
+                title: match index {
+                    1 => "重要な失敗".to_string(),
+                    500 => "表示してはいけない中間項目".to_string(),
+                    999 => "最新の検証".to_string(),
+                    _ => format!("activity-{index}"),
+                },
+                status: if index == 1 {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                },
+                summary: Some("x".repeat(1_000)),
+                error: (index == 1).then(|| "公開上の確認が必要です".to_string()),
+            })
+            .collect();
+        state.progress.tool_calls_started = 1_000;
+        state.progress.tool_calls_completed = 999;
+        state.progress.tool_calls_failed = 1;
+
+        let activity = format_tool_status_text(&state);
+
+        assert!(activity.chars().count() <= DESKTOP_TOOL_ACTIVITY_CHAR_LIMIT);
+        assert!(activity.lines().count() <= DESKTOP_TOOL_ACTIVITY_ITEM_LIMIT + 1);
+        assert!(activity.contains("1000件中8件を表示"));
+        assert!(activity.contains("ほか992件"));
+        assert!(activity.contains("重要な失敗"));
+        assert!(activity.contains("最新の検証"));
+        assert!(!activity.contains("表示してはいけない中間項目"));
+        assert!(format_progress_text(&state).contains("1000件開始 / 999件完了"));
+        assert!(format_progress_text(&state).contains("1件失敗"));
+    }
+
+    #[test]
+    fn session_usage_projection_distinguishes_missing_partial_and_complete() {
+        let (label, title, state) =
+            format_session_usage_projection(&crate::session::CanonicalSessionTokenUsage::default());
+        assert_eq!(label, "セッション累計: 未計測");
+        assert_eq!(state, "missing");
+        assert!(title.contains("まだありません"));
+
+        let (label, title, state) =
+            format_session_usage_projection(&crate::session::CanonicalSessionTokenUsage {
+                terminal_turn_count: 3,
+                measured_turn_count: 2,
+                reasoning_measured_turn_count: 1,
+                prompt_tokens: 1_200,
+                completion_tokens: 300,
+                total_tokens: 1_500,
+                reasoning_tokens: Some(80),
+            });
+        assert_eq!(label, "セッション累計: 1.5k token（一部）");
+        assert_eq!(state, "partial");
+        assert!(title.contains("2 / 3 turn計測"));
+        assert!(title.contains("reasoning 80（1 / 2 turn計測の部分合計）"));
+        assert!(title.contains("reasoning未報告fieldは0として合算せず"));
+
+        let (label, title, state) =
+            format_session_usage_projection(&crate::session::CanonicalSessionTokenUsage {
+                terminal_turn_count: 2,
+                measured_turn_count: 2,
+                reasoning_measured_turn_count: 0,
+                prompt_tokens: 900,
+                completion_tokens: 100,
+                total_tokens: 1_000,
+                reasoning_tokens: None,
+            });
+        assert_eq!(label, "セッション累計: 1k token（reasoning未計測）");
+        assert_eq!(state, "partial");
+        assert!(title.contains("reasoning 未計測（2 turnすべて未報告）"));
+        assert!(!title.contains("reasoning 0"));
+        assert!(title.contains("合計tokenは全turn計測済み"));
+
+        let (label, title, state) =
+            format_session_usage_projection(&crate::session::CanonicalSessionTokenUsage {
+                terminal_turn_count: 2,
+                measured_turn_count: 2,
+                reasoning_measured_turn_count: 2,
+                prompt_tokens: 900,
+                completion_tokens: 100,
+                total_tokens: 1_000,
+                reasoning_tokens: Some(20),
+            });
+        assert_eq!(label, "セッション累計: 1k token");
+        assert_eq!(state, "complete");
+        assert!(title.contains("完了済みturnの累計"));
     }
 
     #[test]
@@ -1905,6 +2220,155 @@ mod tests {
             completed_summary.stable_history_identity.as_deref(),
             Some(format!("turn:{turn_id}:work-summary").as_str()),
         );
+    }
+
+    #[test]
+    fn settled_quote_rows_preserve_canonical_source_identities_and_normalize_artifact_paths() {
+        let session = session_record(ProjectId::new(), "quote source identities");
+        let turn_id = crate::protocol::TurnId::new();
+        let intermediate_source_id = crate::protocol::HistoryItemId::new();
+        let assistant_source_id = crate::protocol::HistoryItemId::new();
+        let file_change_source_id = crate::protocol::HistoryItemId::new();
+        let assistant_turn_item_id = crate::protocol::TurnItemId::new();
+        let file_change_turn_item_id = crate::protocol::TurnItemId::new();
+        let change_id = crate::session::ChangeId::new();
+        let items = vec![
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: Some(intermediate_source_id),
+                sequence_no: 1,
+                payload: TurnItemPayload::AgentMessage {
+                    text: "intermediate response".to_string(),
+                },
+            },
+            TurnItem {
+                id: file_change_turn_item_id,
+                session_id: session.id,
+                turn_id,
+                source_item_id: Some(file_change_source_id),
+                sequence_no: 2,
+                payload: TurnItemPayload::FileChange {
+                    call_id: crate::session::ToolCallId::new(),
+                    change_ids: vec![change_id],
+                    changes: vec![FileChangeEvidence {
+                        change_id,
+                        kind: ChangeKind::Update,
+                        path_before: Some(Utf8PathBuf::from(r"src\quoted.rs")),
+                        path_after: Some(Utf8PathBuf::from(r"src\quoted.rs")),
+                        summary: r"Updated src\quoted.rs".to_string(),
+                    }],
+                    summary: r"Updated src\quoted.rs".to_string(),
+                },
+            },
+            TurnItem {
+                id: assistant_turn_item_id,
+                session_id: session.id,
+                turn_id,
+                source_item_id: Some(assistant_source_id),
+                sequence_no: 3,
+                payload: TurnItemPayload::AgentMessage {
+                    text: "settled response".to_string(),
+                },
+            },
+            TurnItem {
+                id: crate::protocol::TurnItemId::new(),
+                session_id: session.id,
+                turn_id,
+                source_item_id: None,
+                sequence_no: 4,
+                payload: TurnItemPayload::Terminal {
+                    outcome: crate::protocol::TurnTerminalOutcome::Completed,
+                },
+            },
+        ];
+
+        let rows = transcript_rows_from_turn_items_with_context(&session, &items);
+        let assistant_rows = rows
+            .iter()
+            .filter(|row| row.row_kind == DesktopTranscriptRowKind::Assistant)
+            .collect::<Vec<_>>();
+        let file_change_row = rows
+            .iter()
+            .find(|row| row.row_kind == DesktopTranscriptRowKind::FileChanges)
+            .expect("settled file-change row");
+        let assistant_source = assistant_source_id.to_string();
+        let file_change_source = file_change_source_id.to_string();
+        let assistant_turn_item = assistant_turn_item_id.to_string();
+        let file_change_turn_item = file_change_turn_item_id.to_string();
+
+        assert_eq!(assistant_rows.len(), 1);
+        assert_eq!(assistant_rows[0].body, "settled response");
+        assert_eq!(
+            assistant_rows[0].stable_history_identity.as_deref(),
+            Some(assistant_source.as_str())
+        );
+        assert_ne!(
+            assistant_rows[0].stable_history_identity.as_deref(),
+            Some(assistant_turn_item.as_str())
+        );
+        assert_eq!(
+            file_change_row.stable_history_identity.as_deref(),
+            Some(file_change_source.as_str())
+        );
+        assert_ne!(
+            file_change_row.stable_history_identity.as_deref(),
+            Some(file_change_turn_item.as_str())
+        );
+        assert_eq!(file_change_row.file_changes[0].path, "src/quoted.rs");
+        assert!(file_change_row.body.contains("src/quoted.rs"));
+        assert!(!file_change_row.body.contains(r"src\quoted.rs"));
+    }
+
+    #[test]
+    fn grouped_file_change_row_omits_identity_when_canonical_sources_differ() {
+        let session = session_record(ProjectId::new(), "ambiguous file quote source");
+        let turn_id = crate::protocol::TurnId::new();
+        let mut items = ["first.rs", "second.rs"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let change_id = crate::session::ChangeId::new();
+                TurnItem {
+                    id: crate::protocol::TurnItemId::new(),
+                    session_id: session.id,
+                    turn_id,
+                    source_item_id: Some(crate::protocol::HistoryItemId::new()),
+                    sequence_no: index as i64 + 1,
+                    payload: TurnItemPayload::FileChange {
+                        call_id: crate::session::ToolCallId::new(),
+                        change_ids: vec![change_id],
+                        changes: vec![FileChangeEvidence {
+                            change_id,
+                            kind: ChangeKind::Update,
+                            path_before: Some(Utf8PathBuf::from(path)),
+                            path_after: Some(Utf8PathBuf::from(path)),
+                            summary: format!("Updated {path}"),
+                        }],
+                        summary: format!("Updated {path}"),
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        items.push(TurnItem {
+            id: crate::protocol::TurnItemId::new(),
+            session_id: session.id,
+            turn_id,
+            source_item_id: None,
+            sequence_no: 3,
+            payload: TurnItemPayload::Terminal {
+                outcome: crate::protocol::TurnTerminalOutcome::Completed,
+            },
+        });
+
+        let row = transcript_rows_from_turn_items_with_context(&session, &items)
+            .into_iter()
+            .find(|row| row.row_kind == DesktopTranscriptRowKind::FileChanges)
+            .expect("grouped file-change row");
+
+        assert_eq!(row.file_changes.len(), 2);
+        assert_eq!(row.stable_history_identity, None);
     }
 
     #[test]

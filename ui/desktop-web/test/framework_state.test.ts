@@ -34,6 +34,7 @@ import {
   wireEvents,
 } from "../src/events.ts";
 import { transcriptAnchors } from "../src/history_navigation.ts";
+import { recordInitialSetupImportedSource } from "../src/initial_setup_auxiliary_state.ts";
 import {
   globalShortcutAction,
   modalShortcutShouldPreventDefault,
@@ -101,6 +102,57 @@ import {
   sessionSearchMutationTarget,
   synchronizeInitialSetupProviderDraft,
 } from "../src/view_state.ts";
+
+test("Initial Setup projects imported sensitive configured metadata without exposing its value", () => {
+  const setupTarget = {
+    workspacePath: "C:/workspace",
+    globalConfigPath: "C:/config/config.toml",
+    setupGeneration: "3",
+  };
+  const rustProjection = projection({
+    overlay: "initial_setup",
+    startup: {
+      ...projection().startup,
+      action_overlay: "initial_setup",
+      initial_setup_required: true,
+      initial_setup_reason: "config_missing",
+      setup_target: setupTarget,
+    },
+    config_fields: [{
+      key: "model.extra_headers_json",
+      value: "",
+      sensitive: true,
+      configured: false,
+      env_override: "MOYAI_EXTRA_HEADERS",
+      value_type: "json",
+      required: false,
+      min_value: null,
+      max_value: null,
+      options: [],
+    }],
+  });
+  const ui = createUiLocalState();
+  reconcileUiDrafts(ui, null, rustProjection, null);
+  recordInitialSetupImportedSource(
+    ui.initialSetupAuxiliary,
+    setupTarget,
+    rustProjection.config_target,
+    "C:/workspace/import.toml",
+    "1",
+    ["model.extra_headers_json"],
+  );
+
+  const imported = projectViewState(rustProjection, ui).config_fields[0];
+  assert.equal(imported.value, "");
+  assert.equal(imported.configured, true);
+  assert.equal(rustProjection.config_fields[0]?.configured, false, "Rust projection remains immutable");
+
+  const drifted = projection({
+    ...rustProjection,
+    config_target: { ...rustProjection.config_target, configGeneration: "2" },
+  });
+  assert.equal(projectViewState(drifted, ui).config_fields[0]?.configured, false);
+});
 
 test("Initial Setup catalog evidence is invalidated by A to B to A config-draft edits", () => {
   const providerFields: ConfigFieldProjection[] = [
@@ -415,7 +467,11 @@ function projection(overrides: Partial<DesktopViewState> = {}): DesktopViewState
       last_error: "",
       generation: "0",
       draft_text: "",
+      draft_quote: null,
       draft_revision: "0",
+      context_scope: "owner_session",
+      context_as_of_append_position: null,
+      context_truncated: false,
       messages: [],
       can_send: false,
       can_cancel: false,

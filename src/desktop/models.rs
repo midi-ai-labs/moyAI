@@ -243,6 +243,12 @@ pub struct DesktopSessionDetail {
     pub tool_status_text: String,
     pub progress_text: String,
     pub run_status_text: String,
+    #[serde(default)]
+    pub session_usage_label: String,
+    #[serde(default)]
+    pub session_usage_title: String,
+    #[serde(default)]
+    pub session_usage_state: String,
     pub artifacts: Vec<DesktopArtifactRow>,
     pub file_changes: Vec<DesktopFileChangeRow>,
     pub file_change_summary_text: String,

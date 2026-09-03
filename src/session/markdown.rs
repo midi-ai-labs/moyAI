@@ -84,6 +84,7 @@ pub async fn canonical_markdown_export_read(
                 items: turn_items,
             },
             turn_elapsed_ms: Default::default(),
+            session_token_usage: final_snapshot.read.session_token_usage,
             pending_turn_inputs: final_snapshot.read.pending_turn_inputs,
             latest_turn_id: final_snapshot.read.latest_turn_id,
             active_turn_id: final_snapshot.read.active_turn_id,
@@ -116,6 +117,12 @@ pub fn canonical_session_read_to_markdown(read: &CanonicalSessionRead) -> String
             HistoryItemPayload::Error { .. } => {
                 events.push(MarkdownExportEvent::detail(
                     "Error",
+                    render_history_item_detail(item),
+                ));
+            }
+            HistoryItemPayload::DurableFeedback { feedback } => {
+                events.push(MarkdownExportEvent::detail(
+                    feedback.public_title(),
                     render_history_item_detail(item),
                 ));
             }
@@ -473,22 +480,23 @@ fn render_history_item_detail(item: &HistoryItem) -> String {
     output.trim().to_string()
 }
 
-fn history_item_detail_title(item: &HistoryItem) -> &'static str {
+fn history_item_detail_title(item: &HistoryItem) -> String {
     match &item.payload {
-        HistoryItemPayload::ToolCall { .. } => "Tool Call",
-        HistoryItemPayload::ToolOutput { .. } => "Tool Result",
-        HistoryItemPayload::RequestDiagnostics { .. } => "Request Diagnostics",
-        HistoryItemPayload::FileChange { .. } => "File Changes",
-        HistoryItemPayload::WorldState { .. } => "World State",
-        HistoryItemPayload::ApprovalDecision { .. } => "Approval Decision",
-        HistoryItemPayload::InterAgentCommunication { .. } => "Sub-agent Message",
-        HistoryItemPayload::SubAgentActivity { .. } => "Sub-agent Activity",
-        HistoryItemPayload::CollaborationModeInstruction { .. } => "Collaboration Mode",
-        HistoryItemPayload::Compaction { .. } => "Compaction",
-        HistoryItemPayload::Error { .. } => "Error",
+        HistoryItemPayload::ToolCall { .. } => "Tool Call".to_string(),
+        HistoryItemPayload::ToolOutput { .. } => "Tool Result".to_string(),
+        HistoryItemPayload::RequestDiagnostics { .. } => "Request Diagnostics".to_string(),
+        HistoryItemPayload::FileChange { .. } => "File Changes".to_string(),
+        HistoryItemPayload::WorldState { .. } => "World State".to_string(),
+        HistoryItemPayload::ApprovalDecision { .. } => "Approval Decision".to_string(),
+        HistoryItemPayload::InterAgentCommunication { .. } => "Sub-agent Message".to_string(),
+        HistoryItemPayload::SubAgentActivity { .. } => "Sub-agent Activity".to_string(),
+        HistoryItemPayload::CollaborationModeInstruction { .. } => "Collaboration Mode".to_string(),
+        HistoryItemPayload::Compaction { .. } => "Compaction".to_string(),
+        HistoryItemPayload::Error { .. } => "Error".to_string(),
+        HistoryItemPayload::DurableFeedback { feedback } => feedback.public_title(),
         HistoryItemPayload::UserTurn { .. }
         | HistoryItemPayload::SteerTurn { .. }
-        | HistoryItemPayload::AssistantMessage { .. } => "Message",
+        | HistoryItemPayload::AssistantMessage { .. } => "Message".to_string(),
     }
 }
 
@@ -602,6 +610,16 @@ fn push_history_payload(output: &mut String, payload: &HistoryItemPayload) {
         HistoryItemPayload::Error { message, .. } => {
             output.push_str("### Error\n\n");
             output.push_str(message);
+            output.push_str("\n\n");
+        }
+        HistoryItemPayload::DurableFeedback { feedback } => {
+            output.push_str("### ");
+            output.push_str(&feedback.public_title());
+            output.push_str("\n\n");
+            push_metadata_line(output, "Severity", feedback.severity.key());
+            push_metadata_line(output, "Category", feedback.category.key());
+            output.push('\n');
+            output.push_str(&feedback.public_message);
             output.push_str("\n\n");
         }
         HistoryItemPayload::ToolCall {
@@ -1016,6 +1034,34 @@ mod tests {
     }
 
     #[test]
+    fn history_markdown_preserves_durable_warning_severity_and_category() {
+        let session = test_session();
+        let feedback = crate::session::DurableRuntimeFeedback::new(
+            crate::session::DurableFeedbackSeverity::Warning,
+            crate::session::DurableFeedbackCategory::Provider,
+            "接続を確認してから再試行できます。",
+        );
+        let markdown = canonical_session_read_to_markdown(&canonical_read(
+            &session,
+            vec![HistoryItem {
+                id: HistoryItemId::new(),
+                session_id: session.id,
+                scope: HistoryScope::Session,
+                sequence_no: 1,
+                created_at_ms: 100,
+                payload: HistoryItemPayload::DurableFeedback { feedback },
+            }],
+            Vec::new(),
+        ));
+
+        assert!(markdown.contains("警告 · Provider"));
+        assert!(markdown.contains("Severity: warning"));
+        assert!(markdown.contains("Category: provider"));
+        assert!(markdown.contains("接続を確認してから再試行できます。"));
+        assert!(!markdown.contains("### Error"));
+    }
+
+    #[test]
     fn history_markdown_renders_agent_message_and_activity_without_reasoning() {
         let session = test_session();
         let turn_id = TurnId::new();
@@ -1285,6 +1331,7 @@ mod tests {
                 items: turn_items,
             },
             turn_elapsed_ms: Default::default(),
+            session_token_usage: Default::default(),
             pending_turn_inputs: Vec::new(),
             latest_turn_id,
             active_turn_id: None,

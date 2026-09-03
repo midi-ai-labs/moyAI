@@ -37,21 +37,13 @@ export const PROVIDER_PROFILE_OPTIONS = Object.freeze([
   "lm_studio_chat_completions",
 ]);
 
-const SHOW_PROVIDER = Object.freeze({
-  selector: 'aside.sidebar button[data-action="show-provider"][title="LLM URL"]',
-  identity: { tag: "BUTTON", action: "show-provider" },
+const SHOW_CONNECTION_SETTINGS = Object.freeze({
+  selector: 'aside.sidebar button.rail-item[data-action="show-config"][title="PreferencesでメインLLMの既定接続を確認・変更"]',
+  identity: { tag: "BUTTON", action: "show-config" },
 });
 const PROVIDER_CONTEXT = Object.freeze({
-  selector: '[role="dialog"][aria-labelledby="provider-dialog-title"] input#provider-context-window',
-  identity: { tag: "INPUT", id: "provider-context-window" },
-});
-const SAVE_PROVIDER_GLOBAL = Object.freeze({
-  selector: '[role="dialog"][aria-labelledby="provider-dialog-title"] button[data-action="save-provider-global"]',
-  identity: { tag: "BUTTON", action: "save-provider-global" },
-});
-const CLOSE_PROVIDER = Object.freeze({
-  selector: '[role="dialog"][aria-labelledby="provider-dialog-title"] button[data-action="close-overlay"]',
-  identity: { tag: "BUTTON", action: "close-overlay" },
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] input.settings-control[data-config-key="model.context_window"]',
+  identity: { tag: "INPUT", configKey: "model.context_window" },
 });
 const SHOW_SETTINGS = Object.freeze({
   selector: 'aside.sidebar button.settings[data-action="show-config"][title="設定"]',
@@ -60,6 +52,10 @@ const SHOW_SETTINGS = Object.freeze({
 const SETTINGS_TOOLS = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-tools"]',
   identity: { tag: "A", href: "#settings-tools" },
+});
+const SETTINGS_PROVIDER = Object.freeze({
+  selector: '[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-provider"]',
+  identity: { tag: "A", href: "#settings-provider" },
 });
 const DOCLING_TOGGLE = Object.freeze({
   selector: '[role="dialog"][aria-labelledby="config-dialog-title"] label.settings-toggle[data-config-key="docling.enabled"]',
@@ -231,6 +227,10 @@ export async function observeSettingsPreferencesSurface(cdp) {
     };
     const providerDialog = one('[role="dialog"][aria-labelledby="provider-dialog-title"]');
     const settingsDialog = one('[role="dialog"][aria-labelledby="config-dialog-title"]');
+    const connectionShortcut = one('aside.sidebar button.rail-item[data-action="show-config"]');
+    const settingsProviderLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-provider"]');
+    const settingsSideChatLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-side-chat"]');
+    const settingsToolsLink = one('[role="dialog"][aria-labelledby="config-dialog-title"] nav.settings-nav a[href="#settings-tools"]');
     const closeConfirmation = one('[role="alertdialog"][aria-labelledby="settings-close-confirm-title"]');
     const doclingLabel = one('label.settings-toggle[data-config-key="docling.enabled"]');
     const doclingReadinessStatus = one('[role="dialog"][aria-labelledby="config-dialog-title"] #docling-readiness-status[data-settings-live-region="docling-readiness"]');
@@ -242,6 +242,13 @@ export async function observeSettingsPreferencesSurface(cdp) {
         const selected = rows('button.nav-row[aria-current="page"][data-action="session"], button.nav-row[aria-current="page"][data-action="chat-session"]');
         return selected.map(identity);
       })(),
+      connection_shortcut: {
+        count: connectionShortcut.count,
+        visible: connectionShortcut.visible,
+        enabled: connectionShortcut.node instanceof HTMLButtonElement && !connectionShortcut.node.disabled,
+        text: connectionShortcut.node instanceof HTMLElement ? connectionShortcut.node.innerText.trim() : null,
+        title: connectionShortcut.node instanceof HTMLElement ? connectionShortcut.node.getAttribute('title') : null,
+      },
       provider: {
         dialog_count: providerDialog.count,
         dialog_visible: providerDialog.visible,
@@ -283,6 +290,11 @@ export async function observeSettingsPreferencesSurface(cdp) {
         save: button('[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="save-global-config"]'),
         discard: button('[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="discard-config-draft"]:not([hidden])'),
         close: button('[role="dialog"][aria-labelledby="config-dialog-title"] button[data-action="close-overlay"]'),
+        navigation: {
+          provider: { count: settingsProviderLink.count, visible: settingsProviderLink.visible, text: settingsProviderLink.node instanceof HTMLElement ? settingsProviderLink.node.innerText.trim() : null },
+          side_chat: { count: settingsSideChatLink.count, visible: settingsSideChatLink.visible, text: settingsSideChatLink.node instanceof HTMLElement ? settingsSideChatLink.node.innerText.trim() : null },
+          tools: { count: settingsToolsLink.count, visible: settingsToolsLink.visible, text: settingsToolsLink.node instanceof HTMLElement ? settingsToolsLink.node.innerText.trim() : null },
+        },
       },
       close_confirmation: {
         count: closeConfirmation.count,
@@ -327,6 +339,11 @@ export function shellReadyForSettingsDrag(surface, ledger) {
     && surface?.projection?.overlay === "none"
     && surface?.visible_dialog_count === 0
     && surface?.visible_backdrop_count === 0
+    && surface?.connection_shortcut?.count === 1
+    && surface.connection_shortcut.visible === true
+    && surface.connection_shortcut.enabled === true
+    && surface.connection_shortcut.text === "接続設定"
+    && surface.connection_shortcut.title === "PreferencesでメインLLMの既定接続を確認・変更"
     && surface?.titlebar?.drag_count === 1
     && surface?.titlebar?.drag_visible === true
     && Number.isFinite(rect?.left)
@@ -397,6 +414,13 @@ export function preferencesReady(surface, ledger, { contextWindow, doclingEnable
     && surface.settings.save.enabled === false
     && surface.settings.discard.count === 0
     && surface.settings.close.count === 1
+    && surface.settings.navigation?.provider?.count === 1
+    && surface.settings.navigation.provider.visible === true
+    && surface.settings.navigation.provider.text === "メインLLM"
+    && surface.settings.navigation?.side_chat?.count === 1
+    && surface.settings.navigation.side_chat.text === "サイドチャットLLM"
+    && surface.settings.navigation?.tools?.count === 1
+    && surface.settings.navigation.tools.text === "Tools"
     && surface?.close_confirmation?.count === 0
     && surface?.visible_dialog_count === 1
     && fieldValue(surface.projection, "model.context_window") === contextWindow
@@ -517,13 +541,13 @@ export function expectedResetThenClose(surface) {
   ];
 }
 
-export function expectedGlobalSave(surface) {
+export function expectedGlobalSave(surface, overrides = { "docling.enabled": "true" }) {
   const projection = surface?.projection;
   if (!projection?.config_target) throw new TypeError("global save expectation requires a config target");
   return {
     command: "save_global_config",
     args: {
-      values: configValues(projection, { "docling.enabled": "true" }),
+      values: configValues(projection, overrides),
       expectedTarget: structuredClone(projection.config_target),
     },
   };
@@ -789,39 +813,61 @@ export function createSettingsPreferencesScenario() {
           command: dragCommand,
         }, { phase: "executing", owner: OWNER });
 
-        await trustedClick(firstInput, SHOW_PROVIDER);
+        await trustedClick(firstInput, SHOW_CONNECTION_SETTINGS);
         const providerOpened = await waitForProductStage({
-          label: "provider editor opened without catalog traffic",
+          label: "connection shortcut opened consolidated Preferences",
           sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
-          decide: surfaceDecision((surface, ledger) => providerEditorReady(surface, ledger)),
-          code: "settings-provider-editor-not-ready",
-          message: "provider editor did not open in its exact offline state",
+          decide: surfaceDecision((surface, ledger) => preferencesReady(surface, ledger, {
+            contextWindow: PROVIDER_CONTEXT_BEFORE,
+            doclingEnabled: false,
+          })),
+          code: "settings-connection-shortcut-not-ready",
+          message: "the connection shortcut did not open consolidated Preferences in its exact offline state",
+        });
+        await trustedClick(firstInput, SETTINGS_PROVIDER);
+        await waitForProductStage({
+          label: "main provider Settings category focused",
+          sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
+          decide: surfaceDecision((surface, ledger) => preferencesReady(surface, ledger, {
+            contextWindow: PROVIDER_CONTEXT_BEFORE,
+            doclingEnabled: false,
+          }) && surface?.active?.configKey === "model.base_url"),
+          code: "settings-provider-category-not-focused",
+          message: "Settings category navigation did not focus the canonical main provider editor",
         });
         const providerBefore = providerOpened.value.surface;
         const providerTarget = structuredClone(providerBefore.projection.config_target);
-        const providerExpected = expectedProviderGlobalSave(providerBefore);
+        const providerExpected = expectedGlobalSave(providerBefore, {
+          "model.context_window": PROVIDER_CONTEXT_AFTER,
+        });
         const providerCommandStart = (await firstCommands.snapshot()).sequence;
         const providerTyping = await trustedReplaceDigits(firstInput, PROVIDER_CONTEXT, PROVIDER_CONTEXT_AFTER);
         const providerDirty = await waitForProductStage({
           label: "provider context edit ready to save",
           sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
-          decide: surfaceDecision((surface, ledger) => providerEditorReady(surface, ledger, PROVIDER_CONTEXT_AFTER)
-            && surface.provider.save.enabled === true),
+          decide: surfaceDecision((surface, ledger) => surface?.projection?.overlay === "config"
+            && networkStillZero(ledger)
+            && surface?.settings?.context?.value === PROVIDER_CONTEXT_AFTER
+            && surface.settings.dirty_badge_visible === true
+            && surface.settings.save.enabled === true
+            && sameValue(surface.projection.config_target, providerTarget)),
           code: "settings-provider-edit-not-ready",
           message: "trusted provider context edit did not produce a saveable offline draft",
         });
-        await trustedClick(firstInput, SAVE_PROVIDER_GLOBAL);
+        await trustedClick(firstInput, SAVE_GLOBAL_CONFIG);
         const providerSaved = await waitForProductStage({
-          label: "provider-only global save settled",
+          label: "consolidated provider global save settled",
           timeoutMs: 30_000,
           sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
-          decide: surfaceDecision((surface, ledger) => providerEditorReady(surface, ledger, PROVIDER_CONTEXT_AFTER)
-            && fieldValue(surface.projection, "model.context_window") === PROVIDER_CONTEXT_AFTER
+          decide: surfaceDecision((surface, ledger) => preferencesReady(surface, ledger, {
+            contextWindow: PROVIDER_CONTEXT_AFTER,
+            doclingEnabled: false,
+          })
             && advancedConfigGeneration(surface.projection.config_target, providerTarget)),
           code: "settings-provider-save-did-not-settle",
-          message: "provider-specific global save did not persist the trusted context edit",
+          message: "consolidated Preferences did not persist the trusted provider context edit",
         });
-        const providerCommand = await waitForCommands(firstCommands, providerCommandStart, [providerExpected], "provider global save command");
+        const providerCommand = await waitForCommands(firstCommands, providerCommandStart, [providerExpected], "consolidated provider global save command");
         const providerSavedScreenshot = await captureScenarioScreenshot({ cdp: firstCdp, sink, name: "settings-provider-saved", owner: OWNER });
         await sink.record("settings-provider-save-acquired", {
           typing: providerTyping,
@@ -832,15 +878,15 @@ export function createSettingsPreferencesScenario() {
           screenshot: providerSavedScreenshot,
         }, { phase: "executing", owner: OWNER });
         const providerCloseStart = (await firstCommands.snapshot()).sequence;
-        await trustedClick(firstInput, CLOSE_PROVIDER);
+        await trustedClick(firstInput, CLOSE_SETTINGS);
         await waitForProductStage({
-          label: "provider editor clean close",
+          label: "consolidated provider Preferences clean close",
           sample: async () => ({ surface: await observeSettingsPreferencesSurface(firstCdp), ledger: provider.requestLedger }),
           decide: surfaceDecision((surface) => surface?.projection?.overlay === "none" && surface?.visible_dialog_count === 0),
           code: "settings-provider-close-failed",
-          message: "explicit provider close did not restore the shell",
+          message: "explicit Preferences close did not restore the shell",
         });
-        await waitForCommands(firstCommands, providerCloseStart, [{ command: "close_overlay", args: {} }], "provider close command");
+        await waitForCommands(firstCommands, providerCloseStart, [{ command: "close_overlay", args: {} }], "consolidated Preferences close command");
 
         await trustedClick(firstInput, SHOW_SETTINGS);
         const preferencesOpened = await waitForProductStage({

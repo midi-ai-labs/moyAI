@@ -3,8 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::time::Instant;
 
 use crate::config::{McpConfig, McpServerConfig};
 use crate::error::ToolError;
@@ -14,6 +16,11 @@ use crate::tool::truncate::clip_text_with_ellipsis;
 pub const MCP_TOOLS_LIST_DESCRIPTOR_SCHEMA_VALIDATION_MARKER: &str =
     "mcp_tools_list_descriptor_schema_validation";
 const MAX_MCP_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_MCP_REQUEST_ENDPOINT_BYTES: usize = 8 * 1024;
+const MAX_MCP_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+const MAX_MCP_REQUEST_HEADER_COUNT: usize = 64;
+const MAX_MCP_REQUEST_HEADER_BYTES: usize = 64 * 1024;
+const MAX_MCP_REQUEST_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolDescriptor {
@@ -115,7 +122,10 @@ impl McpClient {
     pub fn new(config: McpConfig) -> Self {
         Self {
             config,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("static no-redirect MCP HTTP client configuration"),
             resolved_endpoints: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -133,9 +143,10 @@ impl McpClient {
             return Err(ToolError::Message("mcp is disabled by config".to_string()));
         }
         let server = self.server(server_id)?;
+        let deadline = mcp_operation_deadline(server)?;
 
         let (endpoint, response) = self
-            .resolve_endpoint_with_tools_list(server, &mut effect_checkpoint)
+            .resolve_endpoint_with_tools_list(server, deadline, &mut effect_checkpoint)
             .await?;
         let mut tools = parse_tools(&response)?;
         for tool in &mut tools {
@@ -172,6 +183,7 @@ impl McpClient {
             return Err(ToolError::Message("mcp is disabled by config".to_string()));
         }
         let server = self.server(server_id)?;
+        let deadline = mcp_operation_deadline(server)?;
         if !server.tool_routes.is_empty()
             && !server
                 .tool_routes
@@ -194,7 +206,7 @@ impl McpClient {
             endpoint
         } else {
             let (endpoint, response) = self
-                .resolve_endpoint_with_tools_list(server, &mut effect_checkpoint)
+                .resolve_endpoint_with_tools_list(server, deadline, &mut effect_checkpoint)
                 .await?;
             let tools = parse_tools(&response)?;
             if !tools.iter().any(|tool| tool.name == tool_name) {
@@ -222,6 +234,7 @@ impl McpClient {
                         "arguments": arguments,
                     }
                 }),
+                deadline,
                 &mut effect_checkpoint,
             )
             .await?;
@@ -264,68 +277,79 @@ impl McpClient {
         server: &McpServerConfig,
         endpoint: &str,
         payload: Value,
+        deadline: Instant,
         effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
     ) -> Result<Value, ToolError> {
+        let prepared = prepare_mcp_request(server, endpoint, &payload)?;
         let mut request = self
             .http
-            .post(endpoint)
-            .timeout(Duration::from_millis(server.timeout_ms))
-            .header("Accept", "application/json, text/event-stream")
-            .header("Content-Type", "application/json");
-        for (name, value) in &server.headers {
+            .post(prepared.endpoint.clone())
+            .header(ACCEPT, "application/json, text/event-stream")
+            .header(CONTENT_TYPE, "application/json");
+        for (name, value) in prepared.configured_headers {
             request = request.header(name, value);
         }
 
-        let request = request.body(payload.to_string());
+        let request = request.body(prepared.body);
         // Re-check the typed run owner at every actual send boundary. Endpoint
         // discovery may issue multiple read-only tools/list requests, while a
         // tools/call request reaches this boundary exactly once.
         effect_checkpoint()?;
-        let response = request
-            .send()
-            .await
-            .map_err(|error| ToolError::Message(format!("mcp request failed: {error}")))?;
-        let status = response.status();
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_MCP_RESPONSE_BYTES as u64)
-        {
-            return Err(ToolError::Message(format!(
-                "mcp response from `{endpoint}` exceeds the {} byte limit",
-                MAX_MCP_RESPONSE_BYTES
-            )));
+        if Instant::now() >= deadline {
+            return Err(mcp_deadline_error(server));
         }
-        let mut body_bytes = Vec::new();
-        let mut body_stream = response.bytes_stream();
-        while let Some(chunk) = body_stream.next().await {
-            let chunk = chunk.map_err(|error| {
-                ToolError::Message(format!("failed to read mcp response body: {error}"))
-            })?;
-            append_bounded_response_chunk(&mut body_bytes, &chunk, endpoint)?;
-        }
-        let body = String::from_utf8(body_bytes)
-            .map_err(|_| ToolError::Message("mcp response body is not valid UTF-8".to_string()))?;
-        if !status.is_success() {
-            let mut hint = String::new();
-            if body.to_ascii_lowercase().contains("invalid host header") {
-                hint = " Configure `[mcp.servers[].headers]` if this server requires a specific Host header.".to_string();
+        let endpoint = prepared.endpoint.to_string();
+        tokio::time::timeout_at(deadline, async {
+            let response = request
+                .send()
+                .await
+                .map_err(|error| ToolError::Message(format!("mcp request failed: {error}")))?;
+            let status = response.status();
+            if response
+                .content_length()
+                .is_some_and(|length| length > MAX_MCP_RESPONSE_BYTES as u64)
+            {
+                return Err(ToolError::Message(format!(
+                    "mcp response from `{endpoint}` exceeds the {} byte limit",
+                    MAX_MCP_RESPONSE_BYTES
+                )));
             }
-            return Err(ToolError::Message(format!(
-                "mcp request to `{endpoint}` failed with HTTP {}: {}.{}",
-                status.as_u16(),
-                compact_body(&body),
-                hint
-            )));
-        }
-        parse_json_or_sse(&body)
+            let mut body_bytes = Vec::new();
+            let mut body_stream = response.bytes_stream();
+            while let Some(chunk) = body_stream.next().await {
+                let chunk = chunk.map_err(|error| {
+                    ToolError::Message(format!("failed to read mcp response body: {error}"))
+                })?;
+                append_bounded_response_chunk(&mut body_bytes, &chunk, &endpoint)?;
+            }
+            let body = String::from_utf8(body_bytes).map_err(|_| {
+                ToolError::Message("mcp response body is not valid UTF-8".to_string())
+            })?;
+            if !status.is_success() {
+                let mut hint = String::new();
+                if body.to_ascii_lowercase().contains("invalid host header") {
+                    hint = " Configure `[mcp.servers[].headers]` if this server requires a specific Host header.".to_string();
+                }
+                return Err(ToolError::Message(format!(
+                    "mcp request to `{endpoint}` failed with HTTP {}: {}.{}",
+                    status.as_u16(),
+                    compact_body(&body),
+                    hint
+                )));
+            }
+            parse_json_or_sse(&body)
+        })
+        .await
+        .map_err(|_| mcp_deadline_error(server))?
     }
 
     async fn resolve_endpoint_with_tools_list(
         &self,
         server: &McpServerConfig,
+        deadline: Instant,
         effect_checkpoint: &mut impl FnMut() -> Result<(), ToolError>,
     ) -> Result<(String, Value), ToolError> {
-        let endpoints = endpoint_candidates(&server.base_url);
+        let endpoints = endpoint_candidates(&server.base_url)?;
         if endpoints.is_empty() {
             return Err(ToolError::Message(
                 "mcp endpoint is not configured".to_string(),
@@ -343,6 +367,7 @@ impl McpClient {
                         "method": "tools/list",
                         "params": {}
                     }),
+                    deadline,
                     effect_checkpoint,
                 )
                 .await
@@ -364,6 +389,150 @@ impl McpClient {
     }
 }
 
+#[derive(Debug)]
+struct PreparedMcpRequest {
+    endpoint: reqwest::Url,
+    body: Vec<u8>,
+    configured_headers: Vec<(HeaderName, HeaderValue)>,
+}
+
+fn mcp_operation_deadline(server: &McpServerConfig) -> Result<Instant, ToolError> {
+    if server.timeout_ms == 0 {
+        return Err(ToolError::Message(format!(
+            "mcp server `{}` has a zero operation deadline",
+            server.id
+        )));
+    }
+    Instant::now()
+        .checked_add(Duration::from_millis(server.timeout_ms))
+        .ok_or_else(|| {
+            ToolError::Message(format!(
+                "mcp server `{}` operation deadline is out of range",
+                server.id
+            ))
+        })
+}
+
+fn mcp_deadline_error(server: &McpServerConfig) -> ToolError {
+    ToolError::Message(format!(
+        "mcp operation for server `{}` exceeded its {} ms absolute deadline",
+        server.id, server.timeout_ms
+    ))
+}
+
+fn prepare_mcp_request(
+    server: &McpServerConfig,
+    endpoint: &str,
+    payload: &Value,
+) -> Result<PreparedMcpRequest, ToolError> {
+    let endpoint = validate_mcp_endpoint_origin(server, endpoint)?;
+    if endpoint.as_str().len() > MAX_MCP_REQUEST_ENDPOINT_BYTES {
+        return Err(ToolError::Message(format!(
+            "mcp endpoint exceeds the {MAX_MCP_REQUEST_ENDPOINT_BYTES} byte limit"
+        )));
+    }
+
+    let body = serde_json::to_vec(payload).map_err(|_| {
+        ToolError::Message("failed to serialize bounded mcp request body".to_string())
+    })?;
+    if body.len() > MAX_MCP_REQUEST_BODY_BYTES {
+        return Err(ToolError::Message(format!(
+            "mcp request body exceeds the {MAX_MCP_REQUEST_BODY_BYTES} byte limit"
+        )));
+    }
+
+    let fixed_headers = [
+        (ACCEPT.as_str(), "application/json, text/event-stream"),
+        (CONTENT_TYPE.as_str(), "application/json"),
+    ];
+    if server.headers.len().saturating_add(fixed_headers.len()) > MAX_MCP_REQUEST_HEADER_COUNT {
+        return Err(ToolError::Message(format!(
+            "mcp request headers exceed the {MAX_MCP_REQUEST_HEADER_COUNT} field limit"
+        )));
+    }
+    let mut header_bytes = fixed_headers
+        .iter()
+        .try_fold(0usize, |total, (name, value)| {
+            total
+                .checked_add(name.len())
+                .and_then(|total| total.checked_add(value.len()))
+                .and_then(|total| total.checked_add(4))
+                .ok_or_else(|| ToolError::Message("mcp request header size overflowed".to_string()))
+        })?;
+    let mut configured_headers = Vec::with_capacity(server.headers.len());
+    for (name, value) in &server.headers {
+        let visible_name = clip_text_with_ellipsis(name, 128);
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            ToolError::Message(format!(
+                "mcp request header name `{visible_name}` is invalid"
+            ))
+        })?;
+        let value = HeaderValue::from_str(value).map_err(|_| {
+            ToolError::Message(format!(
+                "mcp request header `{visible_name}` has an invalid value"
+            ))
+        })?;
+        header_bytes = header_bytes
+            .checked_add(name.as_str().len())
+            .and_then(|total| total.checked_add(value.as_bytes().len()))
+            .and_then(|total| total.checked_add(4))
+            .ok_or_else(|| ToolError::Message("mcp request header size overflowed".to_string()))?;
+        if header_bytes > MAX_MCP_REQUEST_HEADER_BYTES {
+            return Err(ToolError::Message(format!(
+                "mcp request headers exceed the {MAX_MCP_REQUEST_HEADER_BYTES} byte limit"
+            )));
+        }
+        configured_headers.push((name, value));
+    }
+
+    let envelope_bytes = endpoint
+        .as_str()
+        .len()
+        .checked_add(body.len())
+        .and_then(|total| total.checked_add(header_bytes))
+        .and_then(|total| total.checked_add("POST ".len()))
+        .ok_or_else(|| ToolError::Message("mcp request envelope size overflowed".to_string()))?;
+    if envelope_bytes > MAX_MCP_REQUEST_ENVELOPE_BYTES {
+        return Err(ToolError::Message(format!(
+            "mcp serialized request exceeds the {MAX_MCP_REQUEST_ENVELOPE_BYTES} byte limit"
+        )));
+    }
+
+    Ok(PreparedMcpRequest {
+        endpoint,
+        body,
+        configured_headers,
+    })
+}
+
+fn validate_mcp_endpoint_origin(
+    server: &McpServerConfig,
+    endpoint: &str,
+) -> Result<reqwest::Url, ToolError> {
+    let configured = crate::config::model::canonical_mcp_base_url(&server.base_url)
+        .and_then(|canonical| {
+            reqwest::Url::parse(&canonical).map_err(|_| "must be a valid absolute URL".to_string())
+        })
+        .map_err(|error| {
+            ToolError::Message(format!(
+                "mcp server `{}` has an invalid configured endpoint: {error}",
+                server.id
+            ))
+        })?;
+    let endpoint = crate::config::model::canonical_mcp_base_url(endpoint)
+        .and_then(|canonical| {
+            reqwest::Url::parse(&canonical).map_err(|_| "must be a valid absolute URL".to_string())
+        })
+        .map_err(|error| ToolError::Message(format!("mcp request endpoint is invalid: {error}")))?;
+    if configured.origin() != endpoint.origin() {
+        return Err(ToolError::Message(format!(
+            "mcp request endpoint does not match the configured origin for server `{}`",
+            server.id
+        )));
+    }
+    Ok(endpoint)
+}
+
 fn append_bounded_response_chunk(
     body: &mut Vec<u8>,
     chunk: &[u8],
@@ -379,16 +548,22 @@ fn append_bounded_response_chunk(
     Ok(())
 }
 
-fn endpoint_candidates(base_url: &str) -> Vec<String> {
-    let trimmed = base_url.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Vec::new();
+fn endpoint_candidates(base_url: &str) -> Result<Vec<String>, ToolError> {
+    let canonical = crate::config::model::canonical_mcp_base_url(base_url)
+        .map_err(|error| ToolError::Message(format!("invalid configured mcp endpoint: {error}")))?;
+    let mut fallback = reqwest::Url::parse(&canonical)
+        .map_err(|_| ToolError::Message("invalid configured mcp endpoint".to_string()))?;
+    let path = fallback.path().trim_end_matches('/').to_string();
+    if path.ends_with("/mcp") {
+        return Ok(vec![canonical]);
     }
-    if trimmed.ends_with("/mcp") {
-        vec![trimmed.to_string()]
+    let fallback_path = if path.is_empty() || path == "/" {
+        "/mcp".to_string()
     } else {
-        vec![trimmed.to_string(), format!("{trimmed}/mcp")]
-    }
+        format!("{path}/mcp")
+    };
+    fallback.set_path(&fallback_path);
+    Ok(vec![canonical, fallback.to_string()])
 }
 
 fn parse_json_or_sse(body: &str) -> Result<Value, ToolError> {
@@ -711,6 +886,268 @@ mod tests {
 
         assert_eq!(body.len(), MAX_MCP_RESPONSE_BYTES);
         assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn request_preparation_rejects_cross_origin_endpoints_and_bounded_inputs() {
+        let mut config = routed_config();
+        let server = &mut config.servers[0];
+        server.base_url = "https://mcp.example.test/rpc".to_string();
+        server
+            .headers
+            .insert("Authorization".to_string(), "do-not-disclose".to_string());
+
+        let cross_origin = prepare_mcp_request(
+            server,
+            "https://other.example.test/rpc",
+            &json!({"value": 1}),
+        )
+        .expect_err("configured request material must not cross origins");
+        assert!(cross_origin.to_string().contains("configured origin"));
+        assert!(!cross_origin.to_string().contains("do-not-disclose"));
+
+        server.headers.clear();
+        let oversized_body = prepare_mcp_request(
+            server,
+            "https://mcp.example.test/rpc",
+            &json!({"value": "x".repeat(MAX_MCP_REQUEST_BODY_BYTES)}),
+        )
+        .expect_err("oversized serialized MCP body must fail before send");
+        assert!(oversized_body.to_string().contains("request body"));
+
+        server.headers.insert(
+            "X-Large".to_string(),
+            format!("secret-value{}", "x".repeat(MAX_MCP_REQUEST_HEADER_BYTES)),
+        );
+        let oversized_headers =
+            prepare_mcp_request(server, "https://mcp.example.test/rpc", &json!({"value": 1}))
+                .expect_err("oversized MCP headers must fail before send");
+        assert!(oversized_headers.to_string().contains("request headers"));
+        assert!(!oversized_headers.to_string().contains("secret-value"));
+    }
+
+    #[test]
+    fn mcp_query_tokens_are_rejected_before_endpoint_preparation() {
+        const URL_SECRET: &str = "mcp-url-secret-must-not-be-disclosed";
+
+        let mut config = routed_config();
+        let server = &mut config.servers[0];
+        server.base_url = "https://mcp.example.test/rpc/".to_string();
+
+        let prepared = prepare_mcp_request(
+            server,
+            "https://mcp.example.test/alternate/",
+            &json!({"value": 1}),
+        )
+        .expect("canonical same-origin MCP paths remain valid");
+        assert_eq!(
+            prepared.endpoint.as_str(),
+            "https://mcp.example.test/alternate"
+        );
+
+        for (endpoint, expected_error) in [
+            (
+                format!("https://user:{URL_SECRET}@mcp.example.test/rpc"),
+                "userinfo",
+            ),
+            (
+                format!("https://mcp.example.test/rpc?access_token={URL_SECRET}"),
+                "query string",
+            ),
+            (
+                format!("https://mcp.example.test/rpc#{URL_SECRET}"),
+                "fragment",
+            ),
+        ] {
+            let error = prepare_mcp_request(server, &endpoint, &json!({"value": 1}))
+                .expect_err("URL-borne MCP credentials must fail before request preparation");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains(expected_error), "{diagnostic}");
+            assert!(!diagnostic.contains(URL_SECRET));
+        }
+
+        server.base_url = format!("https://mcp.example.test/rpc?access_token={URL_SECRET}");
+        let error = endpoint_candidates(&server.base_url)
+            .expect_err("configured MCP query tokens must fail before discovery");
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("query string"));
+        assert!(!diagnostic.contains(URL_SECRET));
+    }
+
+    #[tokio::test]
+    async fn redirect_is_not_followed_with_configured_headers_or_body() {
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect target");
+        let target_address = target_listener
+            .local_addr()
+            .expect("redirect target address");
+        let target_requests = Arc::new(AtomicUsize::new(0));
+        let observed_target_requests = Arc::clone(&target_requests);
+        let target_app = Router::new().fallback(any(move || {
+            let observed_target_requests = Arc::clone(&observed_target_requests);
+            async move {
+                observed_target_requests.fetch_add(1, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            }
+        }));
+        let target_server = tokio::spawn(async move {
+            axum::serve(target_listener, target_app)
+                .await
+                .expect("serve redirect target");
+        });
+
+        let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect source");
+        let source_address = source_listener
+            .local_addr()
+            .expect("redirect source address");
+        let source_requests = Arc::new(AtomicUsize::new(0));
+        let observed_source_requests = Arc::clone(&source_requests);
+        let redirect_target = format!("http://{target_address}/capture");
+        let source_app = Router::new().route(
+            "/mcp",
+            post(move || {
+                let observed_source_requests = Arc::clone(&observed_source_requests);
+                let redirect_target = redirect_target.clone();
+                async move {
+                    observed_source_requests.fetch_add(1, Ordering::SeqCst);
+                    let mut headers = axum::http::HeaderMap::new();
+                    headers.insert(
+                        axum::http::header::LOCATION,
+                        axum::http::HeaderValue::from_str(&redirect_target)
+                            .expect("redirect Location"),
+                    );
+                    (StatusCode::TEMPORARY_REDIRECT, headers, "redirect")
+                }
+            }),
+        );
+        let source_server = tokio::spawn(async move {
+            axum::serve(source_listener, source_app)
+                .await
+                .expect("serve redirect source");
+        });
+
+        let client = McpClient::new(McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                id: "fixture".to_string(),
+                enabled: true,
+                transport: crate::config::McpTransportKind::Http,
+                base_url: format!("http://{source_address}/mcp"),
+                timeout_ms: 2_000,
+                tool_routes: Vec::new(),
+                headers: BTreeMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer must-not-cross-origin".to_string(),
+                )]),
+            }],
+        });
+        let server = &client.config.servers[0];
+        let mut checkpoint = || Ok(());
+        let error = client
+            .post_json(
+                server,
+                &server.base_url,
+                json!({"secret": "body-must-not-cross-origin"}),
+                mcp_operation_deadline(server).expect("operation deadline"),
+                &mut checkpoint,
+            )
+            .await
+            .expect_err("redirect response must fail closed");
+
+        assert!(error.to_string().contains("HTTP 307"));
+        assert_eq!(source_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(target_requests.load(Ordering::SeqCst), 0);
+        source_server.abort();
+        target_server.abort();
+    }
+
+    #[tokio::test]
+    async fn endpoint_discovery_and_tool_call_share_one_absolute_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind MCP deadline fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let observed_fallback_calls = Arc::clone(&fallback_calls);
+        let observed_list_calls = Arc::clone(&list_calls);
+        let observed_tool_calls = Arc::clone(&tool_calls);
+        let app = Router::new()
+            .route(
+                "/",
+                post(move || {
+                    let observed_fallback_calls = Arc::clone(&observed_fallback_calls);
+                    async move {
+                        observed_fallback_calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({"error": "not an MCP endpoint"})),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/mcp",
+                post(move |Json(payload): Json<Value>| {
+                    let observed_list_calls = Arc::clone(&observed_list_calls);
+                    let observed_tool_calls = Arc::clone(&observed_tool_calls);
+                    async move {
+                        if payload["method"] == "tools/list" {
+                            observed_list_calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                            Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": {"tools": [{"name": "change"}]}
+                            }))
+                        } else {
+                            observed_tool_calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "result": {"content": [{"type": "text", "text": "ok"}]}
+                            }))
+                        }
+                    }
+                }),
+            );
+        let fixture = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve MCP deadline fixture");
+        });
+
+        let client = McpClient::new(McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                id: "fixture".to_string(),
+                enabled: true,
+                transport: crate::config::McpTransportKind::Http,
+                base_url: format!("http://{address}"),
+                timeout_ms: 500,
+                tool_routes: vec![crate::config::McpToolRouteConfig {
+                    name: "change".to_string(),
+                    effect: ToolEffectClass::Mutation,
+                }],
+                headers: BTreeMap::new(),
+            }],
+        });
+        let error = client
+            .call_tool("fixture", "change", json!({"value": 1}), || Ok(()))
+            .await
+            .expect_err("discovery and call must consume one deadline");
+
+        assert!(error.to_string().contains("absolute deadline"));
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        fixture.abort();
     }
 
     #[tokio::test]

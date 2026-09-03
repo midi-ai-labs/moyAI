@@ -10,7 +10,7 @@ import {
   type ActionPayload,
 } from "./actions.ts";
 import { icon } from "./icons.ts";
-import { turnPageLoadPending } from "./history_navigation.ts";
+import { transcriptAnchors, turnPageLoadPending } from "./history_navigation.ts";
 import { renderMarkdown } from "./markdown.ts";
 import { renderEarlierHistoryTrigger, renderTranscriptRows } from "./render_transcript.ts";
 import { navigationIsIdle, quickChatDeleteAction, sessionRowCapabilities } from "./navigation_state.ts";
@@ -987,8 +987,8 @@ export function renderSidebar(state: DesktopWebState): string {
         <button class="icon-button" data-action="show-shortcuts" title="ショートカット" aria-label="ショートカット">${icon("keyboard")}</button>
         <button class="icon-button" data-action="refresh" title="更新" aria-label="更新">${icon("refresh")}</button>
       </div>
-      <button class="rail-item" data-action="show-provider" title="LLM URL">
-        <span class="rail-icon">${icon("plug")}</span><span>LLM URL</span>
+      <button class="rail-item" data-action="show-config" title="PreferencesでメインLLMの既定接続を確認・変更">
+        <span class="rail-icon">${icon("plug")}</span><span>接続設定</span>
       </button>
       <div class="rail-section row-heading">
         <span>プロジェクト</span>
@@ -1129,6 +1129,7 @@ export function renderThreadContent(
       // Keep the newest response marker stable across streaming and the terminal
       // projection that seals the same response.
       stableLatestAssistant: true,
+      sideChatQuoteOwnerSessionId: sideChatOwnerSessionId(state),
     });
   return `${earlier}${agentActivity}${transcript}${pending}`;
 }
@@ -1241,6 +1242,7 @@ export function renderComposer(
       <div class="composer-meta">
           <button data-action="${projectContextAction}" title="${escapeHtml(state.workspace_path)}">${state.selected_project_index >= 0 ? "プロジェクトで作業" : "プロジェクトを選択"}</button>
         ${renderTokenMeter(state)}
+        ${renderSessionUsage(state)}
       </div>
     </section>
   `;
@@ -1384,6 +1386,7 @@ export function renderArtifactPane(
     ? ` disabled aria-disabled="true" title="${artifactNavigationBlocked ? "画面の切り替え完了後に開けます" : "アーティファクトを選択してください"}"`
     : ' title="アーティファクトのフォルダーを開く"';
   const hasActivity = state.busy && (state.progress_text.trim().length > 0 || state.tool_status_text.trim().length > 0);
+  const activityHistoryRoute = renderActivityHistoryRoute(state);
   return `
     <aside class="artifact-pane" data-pane-mode="output" aria-labelledby="output-pane-heading">
       <div class="pane-title">
@@ -1446,11 +1449,44 @@ export function renderArtifactPane(
                   <h4>ツール</h4>
                   <pre>${escapeHtml(state.tool_status_text)}</pre>
                 </div>
+                ${activityHistoryRoute}
               </section>`
             : ""
         }
       </div>
     </aside>
+  `;
+}
+
+function renderActivityHistoryRoute(state: DesktopWebState): string {
+  const anchors = transcriptAnchors(state.transcript_rows ?? [], { stableLatestAssistant: true });
+  const target = [...anchors].reverse().find((anchor) => (
+    anchor.row.row_kind === "tool"
+    || anchor.row.row_kind === "editing"
+    || anchor.row.row_kind === "error"
+    || anchor.row.row_kind.startsWith("work_summary")
+  )) ?? anchors.at(-1);
+  const exportDisabled = !state.history_export_enabled || !navigationIsIdle(state);
+  return `
+    <div class="output-activity-history-route" aria-label="完全な実行履歴への導線">
+      <p>この一覧は要確認項目と直近分だけを表示しています。完全な詳細はcanonical会話履歴に残ります。</p>
+      <div>
+        ${target ? `<button type="button" data-action="jump-history-anchor" data-history-target="${escapeHtml(target.id)}">会話履歴の詳細へ</button>` : ""}
+        <button type="button" data-action="export-transcript" ${exportDisabled ? 'disabled aria-disabled="true" title="実行完了後にMarkdown保存できます"' : 'title="canonical会話履歴をMarkdown保存"'}>履歴をMarkdown保存</button>
+      </div>
+    </div>
+  `;
+}
+
+function renderSessionUsage(state: DesktopWebState): string {
+  const label = state.session_usage_label?.trim() ?? "";
+  if (label.length === 0) return "";
+  const usageState = state.session_usage_state?.trim() || "missing";
+  return `
+    <span class="session-usage ${escapeHtml(usageState)}" title="${escapeHtml(state.session_usage_title ?? "")}" aria-label="${escapeHtml(state.session_usage_title ?? label)}">
+      <span class="session-usage-mark" aria-hidden="true">Σ</span>
+      <span>${escapeHtml(label)}</span>
+    </span>
   `;
 }
 
@@ -1525,6 +1561,7 @@ function renderSideChatPane(
         <span class="side-chat-status ${side.deleting ? "side-chat-status-deleting" : `side-chat-status-${escapeHtml(side.status)}`}" role="status">${escapeHtml(statusDetail)}</span>
         <small title="${escapeHtml(side.base_url)}">${escapeHtml(side.base_url)}</small>
       </div>
+      ${renderSideChatContextMetadata(side)}
       ${side.last_error.trim() ? `<p class="side-chat-error" role="alert">${escapeHtml(side.last_error)}</p>` : ""}
       ${side.deleting ? renderSideChatDeletePending() : ""}
       <div class="side-chat-scroll" data-focus-key="artifact-pane-content" role="log" aria-label="サイドチャット履歴" tabindex="0">
@@ -1533,8 +1570,9 @@ function renderSideChatPane(
           : side.messages.map(renderSideChatMessage).join("")}
       </div>
       <div class="side-chat-composer">
+        ${renderPendingSideChatQuote(local.sideChat.pendingQuote)}
         <label class="sr-only" for="side-chat-prompt">サイドチャットへの質問</label>
-        <textarea id="side-chat-prompt" placeholder="サイドチャットに質問" ${targetAvailable && local.sideChat.operationsOpen && !side.deleting && local.sideChat.deleteConfirmation === null ? "" : "disabled"}>${escapeHtml(local.sideChat.draft)}</textarea>
+        <textarea id="side-chat-prompt" aria-describedby="side-chat-context-description" placeholder="サイドチャットに質問" ${targetAvailable && local.sideChat.operationsOpen && !side.deleting && local.sideChat.deleteConfirmation === null ? "" : "disabled"}>${escapeHtml(local.sideChat.draft)}</textarea>
         <div class="side-chat-composer-actions">
           <small>${side.deleting ? "削除の完了を待っています" : "Ctrl+Enterで送信"}</small>
           <button data-action="cancel-side-chat" ${canCancel ? "" : "disabled"}>${side.deleting ? "停止処理中" : side.status === "running" ? "停止" : "停止不可"}</button>
@@ -1542,6 +1580,36 @@ function renderSideChatPane(
         </div>
       </div>
     </aside>
+  `;
+}
+
+function renderSideChatContextMetadata(side: DesktopWebState["side_chat"]): string {
+  const scope = side.context_scope === "owner_session" ? "このタスクの履歴" : "参照範囲未確定";
+  const asOf = side.context_as_of_append_position === null
+    ? "履歴位置なし"
+    : `履歴位置 ${side.context_as_of_append_position}`;
+  return `
+    <div class="side-chat-context-meta" id="side-chat-context-description">
+      <span>参照: ${escapeHtml(scope)}</span>
+      <span>${escapeHtml(asOf)}</span>
+      ${side.context_truncated
+        ? '<strong class="side-chat-context-truncated">長い履歴の一部を省略</strong>'
+        : ""}
+    </div>
+  `;
+}
+
+function renderPendingSideChatQuote(
+  quote: Readonly<NonNullable<DesktopRenderLocalPresentation["sideChat"]["pendingQuote"]>> | null,
+): string {
+  if (!quote) return "";
+  const sourceLabel = quote.sourceKind === "artifact" ? "作業結果" : "会話";
+  return `
+    <section class="side-chat-pending-quote" aria-label="送信時に参照する引用">
+      <div><strong>${sourceLabel}から引用</strong><small>履歴位置 ${escapeHtml(quote.sourceAppendPosition ?? "-")}</small></div>
+      <blockquote>${escapeHtml(quote.selectedText)}</blockquote>
+      <small>下書きを手動で編集すると、引用元との関連付けは解除されます。</small>
+    </section>
   `;
 }
 
@@ -2329,11 +2397,27 @@ function configFieldHelpText(field: ConfigFieldProjection, explicitHelp = ""): s
   if (field.options.length > 0) parts.push(`選択肢: ${field.options.join(" / ")}。`);
   if (field.required) parts.push("必須入力です。");
   if (field.env_override) parts.push(`環境変数: ${field.env_override}。`);
+  if (field.sensitive) {
+    parts.push(field.configured
+      ? "機密値は設定済みです。現在値は表示されず、空欄のまま保存すると保持されます。"
+      : "機密値は未設定です。入力した値は保存後に再表示されません。");
+  }
   return parts.join(" ");
 }
 
 function renderConfigFieldHelp(field: ConfigFieldProjection, explicitHelp = ""): string {
   return `<small id="${configFieldHelpId(field.key)}" class="settings-field-help">${escapeHtml(configFieldHelpText(field, explicitHelp))}</small>`;
+}
+
+function sensitiveConfigInputAttributes(field: ConfigFieldProjection): string {
+  if (!field.sensitive) return "";
+  const placeholder = field.configured ? "設定済み（値は非表示）" : "未設定";
+  return ` data-sensitive-config="true" data-sensitive-configured="${String(field.configured)}" placeholder="${placeholder}" autocomplete="off"`;
+}
+
+function renderSensitiveConfigStatus(field: ConfigFieldProjection): string {
+  if (!field.sensitive) return "";
+  return `<small class="settings-sensitive-status ${field.configured ? "configured" : "missing"}">${field.configured ? "設定済み・値は非表示" : "未設定"}</small>`;
 }
 
 function configFieldValidationAttribute(
@@ -2369,7 +2453,8 @@ function renderConfigTextField(
   return `
     <div class="settings-field">
       <label for="${controlId}">${escapeHtml(label)}${renderEnvBadge(found.field)}</label>
-      <input id="${controlId}" class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" type="${type === "number" ? "text" : type}"${inputMode} value="${escapeHtml(found.field.value)}" aria-describedby="${configFieldDescriptionIds(found.field, [...(options.descriptionIds ?? [])], !options.initialSetup)}"${configFieldValidationAttribute(state, found.field)} ${state.config_draft.edit_enabled && !options.disabled ? "" : "disabled"} />
+      <input id="${controlId}" class="settings-control" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" type="${type === "number" ? "text" : type}"${inputMode}${sensitiveConfigInputAttributes(found.field)} value="${escapeHtml(found.field.value)}" aria-describedby="${configFieldDescriptionIds(found.field, [...(options.descriptionIds ?? [])], !options.initialSetup)}"${configFieldValidationAttribute(state, found.field)} ${state.config_draft.edit_enabled && !options.disabled ? "" : "disabled"} />
+      ${renderSensitiveConfigStatus(found.field)}
       ${renderConfigFieldHelp(found.field, help)}
     </div>
   `;
@@ -2495,7 +2580,8 @@ function renderConfigJsonField(
   return `
     <div class="settings-field wide">
       <label for="${controlId}">${escapeHtml(label)}${renderEnvBadge(found.field)}</label>
-      <textarea id="${controlId}" class="settings-control settings-json" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}" aria-describedby="${configFieldDescriptionIds(found.field, [...(options.descriptionIds ?? [])], !options.initialSetup)}"${configFieldValidationAttribute(state, found.field)} ${state.config_draft.edit_enabled && !options.disabled ? "" : "disabled"}>${escapeHtml(found.field.value)}</textarea>
+      <textarea id="${controlId}" class="settings-control settings-json" data-config-index="${found.index}" data-config-key="${escapeHtml(key)}"${sensitiveConfigInputAttributes(found.field)} aria-describedby="${configFieldDescriptionIds(found.field, [...(options.descriptionIds ?? [])], !options.initialSetup)}"${configFieldValidationAttribute(state, found.field)} ${state.config_draft.edit_enabled && !options.disabled ? "" : "disabled"}>${escapeHtml(found.field.value)}</textarea>
+      ${renderSensitiveConfigStatus(found.field)}
       ${renderConfigFieldHelp(found.field)}
     </div>
   `;
@@ -2554,7 +2640,8 @@ function renderRawConfigField(
   return `
     <div class="settings-field raw">
       <label for="${controlId}">${escapeHtml(field.key)}${renderEnvBadge(field)}</label>
-      <textarea id="${controlId}" class="settings-control settings-raw-value" data-config-index="${index}" data-config-key="${escapeHtml(field.key)}" aria-describedby="${configFieldDescriptionIds(field)}"${configFieldValidationAttribute(state, field)} ${state.config_draft.edit_enabled ? "" : "disabled"}>${escapeHtml(field.value)}</textarea>
+      <textarea id="${controlId}" class="settings-control settings-raw-value" data-config-index="${index}" data-config-key="${escapeHtml(field.key)}"${sensitiveConfigInputAttributes(field)} aria-describedby="${configFieldDescriptionIds(field)}"${configFieldValidationAttribute(state, field)} ${state.config_draft.edit_enabled ? "" : "disabled"}>${escapeHtml(field.value)}</textarea>
+      ${renderSensitiveConfigStatus(field)}
       ${renderConfigFieldHelp(field)}
     </div>
   `;

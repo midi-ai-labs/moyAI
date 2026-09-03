@@ -784,6 +784,17 @@ pub struct CanonicalSessionRead {
     pub pending_turn_inputs: Vec<PendingTurnInputProjection>,
     #[serde(skip)]
     pub turn_elapsed_ms: HashMap<TurnId, u64>,
+    /// Cumulative usage derived from canonical terminal events for this session.
+    ///
+    /// `terminal_turn_count` includes every durable terminal, while
+    /// `measured_turn_count` includes only terminals whose provider reported
+    /// token usage. `reasoning_measured_turn_count` separately tracks the
+    /// optional reasoning field within those reports; `reasoning_tokens` is
+    /// absent until at least one provider reports it and is only a partial sum
+    /// while that count trails `measured_turn_count`. Consumers must preserve
+    /// both distinctions instead of presenting missing telemetry as zero.
+    #[serde(default)]
+    pub session_token_usage: CanonicalSessionTokenUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_turn_id: Option<TurnId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -792,6 +803,19 @@ pub struct CanonicalSessionRead {
     pub active_turn_sequence_no: Option<i64>,
     #[serde(default)]
     pub admission_revision: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalSessionTokenUsage {
+    pub terminal_turn_count: usize,
+    pub measured_turn_count: usize,
+    #[serde(default)]
+    pub reasoning_measured_turn_count: usize,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1139,6 +1163,97 @@ impl ActiveTurnExpectation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableFeedbackSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+impl DurableFeedbackSeverity {
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+
+    pub const fn public_label(self) -> &'static str {
+        match self {
+            Self::Info => "情報",
+            Self::Warning => "警告",
+            Self::Error => "エラー",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableFeedbackCategory {
+    Transport,
+    Permission,
+    Provider,
+    UserAction,
+    Context,
+    Runtime,
+}
+
+impl DurableFeedbackCategory {
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Transport => "transport",
+            Self::Permission => "permission",
+            Self::Provider => "provider",
+            Self::UserAction => "user_action",
+            Self::Context => "context",
+            Self::Runtime => "runtime",
+        }
+    }
+
+    pub const fn public_label(self) -> &'static str {
+        match self {
+            Self::Transport => "接続",
+            Self::Permission => "権限",
+            Self::Provider => "Provider",
+            Self::UserAction => "ユーザー操作",
+            Self::Context => "コンテキスト",
+            Self::Runtime => "実行環境",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableRuntimeFeedback {
+    pub severity: DurableFeedbackSeverity,
+    pub category: DurableFeedbackCategory,
+    pub public_message: String,
+}
+
+impl DurableRuntimeFeedback {
+    pub fn new(
+        severity: DurableFeedbackSeverity,
+        category: DurableFeedbackCategory,
+        public_message: impl Into<String>,
+    ) -> Self {
+        Self {
+            severity,
+            category,
+            public_message: public_message.into(),
+        }
+    }
+
+    pub fn public_title(&self) -> String {
+        format!(
+            "{} · {}",
+            self.severity.public_label(),
+            self.category.public_label()
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RunEvent {
@@ -1248,7 +1363,7 @@ pub enum RunEvent {
     },
     RecoverableRuntimeFeedback {
         session_id: SessionId,
-        message: String,
+        feedback: DurableRuntimeFeedback,
     },
     TurnTerminal {
         session_id: SessionId,

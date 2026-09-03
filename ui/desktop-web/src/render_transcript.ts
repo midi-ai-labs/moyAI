@@ -17,6 +17,7 @@ interface TranscriptRenderOptions {
   includeLiveAgentFallback?: boolean;
   selectedAgentPath?: string | null;
   stableLatestAssistant?: boolean;
+  sideChatQuoteOwnerSessionId?: string | null;
 }
 
 interface AgentHistoryEvent {
@@ -82,6 +83,7 @@ export function renderTranscriptRows(
     rendered.push(renderTranscriptRow(
       anchor.row,
       prefixedAnchorId(prefix, anchor.id),
+      options.sideChatQuoteOwnerSessionId ?? null,
     ));
   });
   if (pendingAgentEvents.length > 0) {
@@ -149,34 +151,74 @@ function railAnchors(anchors: readonly TranscriptAnchor[]): TranscriptAnchor[] {
   return sampled;
 }
 
-function renderTranscriptRow(row: TranscriptRow, anchorId: string): string {
+function renderTranscriptRow(
+  row: TranscriptRow,
+  anchorId: string,
+  sideChatQuoteOwnerSessionId: string | null,
+): string {
   if (row.row_kind === "file_changes") {
-    return renderFileChanges(row, anchorId);
+    return renderFileChanges(row, anchorId, sideChatQuoteOwnerSessionId);
   }
   const routineConversation = row.row_kind === "user" || row.row_kind === "assistant";
   const durableIdentity = row.stable_history_identity?.trim();
+  const quoteSourceKind = durableIdentity && sideChatQuoteOwnerSessionId
+    ? sideChatQuoteSourceKind(row)
+    : null;
   return `
     <article class="message ${escapeHtml(row.row_kind)}" data-history-anchor="${escapeHtml(anchorId)}"
-      ${durableIdentity ? `data-history-identity="${escapeHtml(durableIdentity)}"` : ""}>
+      ${durableIdentity ? `data-history-identity="${escapeHtml(durableIdentity)}"` : ""}
+      ${quoteSourceKind ? `data-side-chat-quote-source-kind="${quoteSourceKind}" data-side-chat-quote-owner-session-id="${escapeHtml(sideChatQuoteOwnerSessionId ?? "")}"` : ""}>
       <div class="message-body">
         ${routineConversation ? "" : `<h2>${escapeHtml(row.title)}</h2>`}
         <div class="markdown-body">${renderMarkdown(row.body)}</div>
+        ${quoteSourceKind && durableIdentity ? renderSideChatQuoteAction(durableIdentity) : ""}
       </div>
     </article>
   `;
 }
 
-function renderFileChanges(row: TranscriptRow, anchorId: string): string {
+function renderFileChanges(
+  row: TranscriptRow,
+  anchorId: string,
+  sideChatQuoteOwnerSessionId: string | null,
+): string {
+  const durableIdentity = row.stable_history_identity?.trim();
+  const quoteSourceKind = durableIdentity && sideChatQuoteOwnerSessionId
+    ? sideChatQuoteSourceKind(row)
+    : null;
   const body = row.file_changes.length === 0
     ? `<div class="markdown-body">${renderMarkdown(row.body)}</div>`
     : renderFileChangeTable(row.file_changes);
   return `
-    <article class="message file_changes" data-history-anchor="${escapeHtml(anchorId)}">
+    <article class="message file_changes" data-history-anchor="${escapeHtml(anchorId)}"
+      ${durableIdentity ? `data-history-identity="${escapeHtml(durableIdentity)}"` : ""}
+      ${quoteSourceKind ? `data-side-chat-quote-source-kind="${quoteSourceKind}" data-side-chat-quote-owner-session-id="${escapeHtml(sideChatQuoteOwnerSessionId ?? "")}"` : ""}>
       <div class="message-body">
         <h2>${escapeHtml(row.title)}</h2>
         ${body}
+        ${quoteSourceKind && durableIdentity ? renderSideChatQuoteAction(durableIdentity) : ""}
       </div>
     </article>
+  `;
+}
+
+function sideChatQuoteSourceKind(row: TranscriptRow): "transcript" | "artifact" | null {
+  if (row.row_kind === "user" || row.row_kind === "assistant") return "transcript";
+  if (row.row_kind === "tool" || row.row_kind === "diff" || row.row_kind === "file_changes") {
+    return "artifact";
+  }
+  return null;
+}
+
+function renderSideChatQuoteAction(historyItemId: string): string {
+  return `
+    <div class="message-quote-actions">
+      <button type="button" class="message-quote-action"
+        data-action="quote-selection-to-side-chat"
+        data-source-history-item-id="${escapeHtml(historyItemId)}"
+        title="この履歴行内のテキストを選択してSide Chatで引用"
+        aria-label="選択したテキストをSide Chatで引用">Side Chatで引用</button>
+    </div>
   `;
 }
 

@@ -455,7 +455,11 @@ mod tests {
         assert!(
             sink.emit_runtime_only(RunEvent::RecoverableRuntimeFeedback {
                 session_id: SessionId::new(),
-                message: "durable warning".to_string(),
+                feedback: crate::session::DurableRuntimeFeedback::new(
+                    crate::session::DurableFeedbackSeverity::Warning,
+                    crate::session::DurableFeedbackCategory::Runtime,
+                    "durable warning",
+                ),
             })
             .is_err()
         );

@@ -330,10 +330,12 @@ fn runtime_error(error: impl std::fmt::Display) -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AccessMode;
     use crate::error::StorageError;
     use crate::protocol::{RuntimeEvent, RuntimeEventId, RuntimeEventMsg};
     use crate::runtime::SystemClock;
-    use crate::storage::{SqliteStore, StoragePaths};
+    use crate::session::{NewSession, ProjectId, ProjectRepository, SessionRepository};
+    use crate::storage::{SqliteStore, StoragePaths, StoreBundle};
 
     struct NullSink;
 
@@ -400,7 +402,11 @@ mod tests {
         let committed_on_runtime_path = sink
             .emit_runtime_only(RunEvent::RecoverableRuntimeFeedback {
                 session_id: SessionId::new(),
-                message: "canonical warning".to_string(),
+                feedback: crate::session::DurableRuntimeFeedback::new(
+                    crate::session::DurableFeedbackSeverity::Warning,
+                    crate::session::DurableFeedbackCategory::Runtime,
+                    "canonical warning",
+                ),
             })
             .expect_err("committed facts cannot enter the lossy runtime-only path");
         assert!(
@@ -465,6 +471,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admitted_emit_records_one_coherent_durable_feedback_bundle() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = camino::Utf8PathBuf::from_path_buf(temp.path().join("data"))
+            .expect("temp path should be utf8");
+        let paths = StoragePaths {
+            database_path: data_dir.join("moyai.sqlite3"),
+            truncation_dir: data_dir.join("truncation"),
+            data_dir: data_dir.clone(),
+        };
+        let sqlite = SqliteStore::open(&paths).expect("store");
+        sqlite.migrate().expect("migrate");
+        let store = StoreBundle::new(sqlite);
+        let project_id = ProjectId::new();
+        store
+            .project_repo()
+            .upsert_project(project_id, &data_dir, "test", "none")
+            .await
+            .expect("project");
+        let session = store
+            .session_repo()
+            .create_session(NewSession {
+                project_id,
+                title: "test".to_string(),
+                cwd: data_dir,
+                model: "model".to_string(),
+                base_url: "http://localhost:1234".to_string(),
+                access_mode: AccessMode::Default,
+                provider_connection: None,
+            })
+            .await
+            .expect("session");
+        let session_id = session.id;
+        let turn_id = TurnId::new();
+        let admission_id = store
+            .session_repo()
+            .admit_session_turn(session_id, turn_id)
+            .await
+            .expect("admission")
+            .expect("admitted")
+            .admission_id;
+        let event_store = store.protocol_event_store();
+        let feedback = crate::session::DurableRuntimeFeedback::new(
+            crate::session::DurableFeedbackSeverity::Warning,
+            crate::session::DurableFeedbackCategory::Context,
+            "semantic compaction remained unavailable",
+        );
+        let mut inner = NullSink;
+        let mut sink =
+            ProtocolRecordingSink::new(event_store.clone(), Some(session_id), turn_id, &mut inner)
+                .with_admission_id(admission_id);
+
+        sink.emit(RunEvent::RecoverableRuntimeFeedback {
+            session_id,
+            feedback: feedback.clone(),
+        })
+        .expect("durable feedback projection");
+
+        let runtime_feedback = event_store
+            .list_runtime_events(session_id, turn_id)
+            .expect("runtime events")
+            .into_iter()
+            .filter_map(|event| match event.msg {
+                RuntimeEventMsg::DurableFeedback { feedback } => Some(feedback),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(runtime_feedback, [feedback.clone()]);
+
+        let history_feedback = event_store
+            .list_history_items(session_id, turn_id)
+            .expect("history items")
+            .into_iter()
+            .filter_map(|item| match item.payload {
+                crate::protocol::HistoryItemPayload::DurableFeedback { feedback } => {
+                    Some((item.id, feedback))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(history_feedback.len(), 1);
+        assert_eq!(history_feedback[0].1, feedback);
+
+        let turn_feedback = event_store
+            .list_turn_items(session_id, turn_id)
+            .expect("turn items")
+            .into_iter()
+            .filter_map(|item| match item.payload {
+                crate::protocol::TurnItemPayload::DurableFeedback { feedback } => {
+                    Some((item.source_item_id, feedback))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(turn_feedback, [(Some(history_feedback[0].0), feedback)]);
+    }
+
+    #[tokio::test]
     async fn committed_events_are_published_while_runtime_only_deltas_are_not_persisted() {
         let temp = tempfile::tempdir().expect("tempdir");
         let data_dir = camino::Utf8PathBuf::from_path_buf(temp.path().join("data"))
@@ -501,7 +604,11 @@ mod tests {
                 .with_runtime_event_publisher(hub.publisher());
         sink.emit_committed(RunEvent::RecoverableRuntimeFeedback {
             session_id,
-            message: "committed".to_string(),
+            feedback: crate::session::DurableRuntimeFeedback::new(
+                crate::session::DurableFeedbackSeverity::Warning,
+                crate::session::DurableFeedbackCategory::Runtime,
+                "committed",
+            ),
         })
         .expect("publish committed event");
         assert_eq!(
@@ -514,7 +621,11 @@ mod tests {
         );
         sink.emit_committed(RunEvent::RecoverableRuntimeFeedback {
             session_id,
-            message: "projection retry without a new durable row".to_string(),
+            feedback: crate::session::DurableRuntimeFeedback::new(
+                crate::session::DurableFeedbackSeverity::Warning,
+                crate::session::DurableFeedbackCategory::Runtime,
+                "projection retry without a new durable row",
+            ),
         })
         .expect("retry committed projection");
         assert!(

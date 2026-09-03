@@ -16,6 +16,13 @@ import {
 import { prepareDesktopFixture } from "./fixture.mjs";
 import { captureScenarioScreenshot } from "./observations.mjs";
 import { acquireInteractiveShell, requestGracefulExit } from "./shell_baseline.mjs";
+import { configureSideChat } from "./case5_2.mjs";
+import {
+  case52Stage5MainMatches,
+  case52Stage5MainSnapshot,
+  executeCase52SideChatStage,
+} from "./case5_2_side_chat.mjs";
+import { observeSideChatQuoteSurface } from "./side_chat_quote.mjs";
 
 const OWNER = "scenario:manual.provider-openai-compatible";
 const PROFILE = "openai_compatible";
@@ -30,6 +37,30 @@ const LIVE_TURN_TIMEOUT_MS = 420_000;
 const OPENAI_CHAT_TEMPLATE_CONTROL_TOKENS = Object.freeze(["<|im_start|>", "<|im_end|>"]);
 
 export const PROVIDER_OPENAI_COMPATIBLE_PROMPT = "接続確認です。必ず built-in の current_time ツールを引数 {} でちょうど1回だけ呼び出してください。その結果に含まれる local、utc、timezone の値をそのまま使い、回答を必ず「接続確認完了：local=... / utc=... / timezone=... です。」という日本語の1文にしてください（... はそれぞれの実値に置き換えてください）。ファイル操作、shell、他のツールは使わないでください。";
+
+export function providerConnectionLiveSideChatQuestion(time) {
+  if (typeof time?.unixMs !== "string" || !/^[0-9]+$/u.test(time.unixMs)) {
+    throw new TypeError("provider live Side Chat question requires the main current_time unix_ms");
+  }
+  return `Mainセッションで完了した単一のbuilt-inツールのうち、結果のunix_msが${time.unixMs}のものについて、ツールの正確な名前と結果内のlocal、utc、timezoneを確認してください。回答は必ず「Side Chat確認完了：tool=<tool名> / local=<local> / utc=<utc> / timezone=<timezone> です。」という日本語の1文だけにしてください。Mainセッションの履歴だけを根拠にし、ツールは使わないでください。`;
+}
+
+export function providerConnectionLiveSideChatAnswerAccepted(answer, time) {
+  return typeof answer === "string"
+    && typeof time?.local === "string"
+    && time.local.length > 0
+    && typeof time?.utc === "string"
+    && time.utc.length > 0
+    && typeof time?.timezone === "string"
+    && time.timezone.length > 0
+    && answer.trim() === `Side Chat確認完了：tool=current_time / local=${time.local} / utc=${time.utc} / timezone=${time.timezone} です。`;
+}
+
+export function providerConnectionLiveSideChatMainPreserved(baseline, configuredSurface, sideChat) {
+  return case52Stage5MainMatches(configuredSurface, baseline)
+    && sameValue(sideChat?.mainBaseline, baseline)
+    && case52Stage5MainMatches(sideChat?.completedSurface, baseline);
+}
 
 const SHOW_SETTINGS = Object.freeze({
   selector: 'aside.sidebar button.settings[data-action="show-config"][title="設定"]',
@@ -123,14 +154,19 @@ export function normalizeProviderConnectionLiveOptions(options) {
   if (options === null || typeof options !== "object" || Array.isArray(options)) {
     throw new TypeError("manual.provider-openai-compatible requires one scenario config object");
   }
-  const allowed = new Set(["provider_base_url", "model"]);
+  const allowed = new Set(["provider_base_url", "model", "side_chat_after_completion"]);
   const unknown = Object.keys(options).filter((key) => !allowed.has(key));
   if (unknown.length > 0) {
     throw new TypeError(`unknown manual.provider-openai-compatible option: ${unknown.join(",")}`);
   }
+  const sideChatAfterCompletion = options.side_chat_after_completion ?? false;
+  if (typeof sideChatAfterCompletion !== "boolean") {
+    throw new TypeError("manual.provider-openai-compatible side_chat_after_completion must be a boolean");
+  }
   return Object.freeze({
     providerBaseUrl: canonicalProviderBaseUrl(options.provider_base_url),
     model: canonicalModel(options.model),
+    sideChatAfterCompletion,
   });
 }
 
@@ -435,9 +471,9 @@ function completedSummaryDomUsesTime(summary, time) {
 }
 
 function terminalToolProjectionUsesTime(projection, time) {
-  const expectedToolStatus = `ツール:\n- Current time [completed] local: ${time.local}\nutc: ${time.utc}\ntimezone: ${time.timezone}\nunix_ms: ${time.unixMs}`;
+  const expectedToolStatus = `ツール: 1件中1件を表示（要確認を優先・新しい順）\n- [完了] Current time: local: ${time.local} utc: ${time.utc} timezone: ${time.timezone} unix_ms: ${time.unixMs}`;
   return projection?.tool_status_text === expectedToolStatus
-    && projection?.latest_tool_summary === "ツール:"
+    && projection?.latest_tool_summary === "完了: 時刻の確認"
     && typeof projection?.progress_text === "string"
     && projection.progress_text.includes(
       "ツール: 1件開始 / 1件完了 / 0件拒否 / 0件キャンセル / 0件失敗",
@@ -795,6 +831,7 @@ export function createProviderConnectionLiveScenario(rawOptions = {}) {
         provider_profile: PROFILE,
         api_key_env: EMPTY_API_KEY_ENV,
         prompt: PROVIDER_OPENAI_COMPATIBLE_PROMPT,
+        side_chat_after_completion: options.sideChatAfterCompletion,
         workspace_sentinel: state.sentinelBaseline,
         external_provider_owned_by_scenario: false,
       }, { phase, owner: OWNER });
@@ -1025,6 +1062,107 @@ export function createProviderConnectionLiveScenario(rawOptions = {}) {
           surface: terminal.value,
           screenshot: terminalScreenshot,
         }, { phase: "executing", owner: OWNER });
+
+        if (options.sideChatAfterCompletion) {
+          const sessionId = terminal.value.projection?.draft_target?.sessionId;
+          if (typeof sessionId !== "string" || sessionId.length === 0) {
+            throw productFailure(
+              "provider-live-side-chat-owner",
+              "the completed current_time task has no selected session owner for Side Chat",
+              { draft_target: terminal.value.projection?.draft_target ?? null },
+            );
+          }
+          const sideOptions = {
+            providerProfile: PROFILE,
+            providerBaseUrl: options.providerBaseUrl,
+            sideModel: options.model,
+          };
+          const mainBeforeSideSurface = await observeSideChatQuoteSurface(restarted.driver);
+          const mainBeforeSideChat = case52Stage5MainSnapshot(mainBeforeSideSurface);
+          if (!case52Stage5MainMatches(mainBeforeSideSurface, mainBeforeSideChat)) {
+            throw productFailure(
+              "provider-live-side-chat-main-baseline",
+              "the completed current_time Main session was not stable before Side Chat configuration",
+              { main: mainBeforeSideChat },
+            );
+          }
+          await configureSideChat({
+            cdp: restarted.driver,
+            input: secondInput,
+            sink,
+            options: sideOptions,
+            sessionId,
+            evidenceName: "provider-openai-compatible-side-chat-configured",
+          });
+          const mainAfterConfigureSurface = await observeSideChatQuoteSurface(restarted.driver);
+          if (!case52Stage5MainMatches(mainAfterConfigureSurface, mainBeforeSideChat)) {
+            throw productFailure(
+              "provider-live-side-chat-configure-main-drift",
+              "Side Chat configuration changed the completed current_time Main session",
+              {
+                expected: mainBeforeSideChat,
+                observed: case52Stage5MainSnapshot(mainAfterConfigureSurface),
+              },
+            );
+          }
+          const question = providerConnectionLiveSideChatQuestion(time);
+          const sideChat = await executeCase52SideChatStage({
+            cdp: restarted.driver,
+            input: secondInput,
+            sink,
+            sessionId,
+            providerProfile: PROFILE,
+            providerBaseUrl: options.providerBaseUrl,
+            model: options.model,
+            promptInput: { text: question },
+            timeoutMs: LIVE_TURN_TIMEOUT_MS,
+            evidenceName: "provider-openai-compatible-side-chat",
+          });
+          if (!providerConnectionLiveSideChatMainPreserved(
+            mainBeforeSideChat,
+            mainAfterConfigureSurface,
+            sideChat,
+          )) {
+            throw productFailure(
+              "provider-live-side-chat-main-drift",
+              "Side Chat did not preserve the exact completed current_time Main session",
+              {
+                expected: mainBeforeSideChat,
+                after_configure: case52Stage5MainSnapshot(mainAfterConfigureSurface),
+                stage_baseline: sideChat.mainBaseline,
+                completed: case52Stage5MainSnapshot(sideChat.completedSurface),
+              },
+            );
+          }
+          if (!providerConnectionLiveSideChatAnswerAccepted(sideChat.answer, time)) {
+            throw productFailure(
+              "provider-live-side-chat-answer",
+              "Side Chat did not return the exact current_time tool name and time values from the Main session",
+              {
+                question,
+                expected_answer: `Side Chat確認完了：tool=current_time / local=${time.local} / utc=${time.utc} / timezone=${time.timezone} です。`,
+                actual_answer: sideChat.answer,
+                current_time: time,
+                binding: sideChat.binding,
+              },
+            );
+          }
+          await sink.record("provider-live-side-chat-completed", {
+            owner_session_id: sessionId,
+            provider_profile: PROFILE,
+            provider_base_url: options.providerBaseUrl,
+            model: options.model,
+            question,
+            answer: sideChat.answer,
+            current_time: time,
+            main_before_side_chat: mainBeforeSideChat,
+            main_after_configure: case52Stage5MainSnapshot(mainAfterConfigureSurface),
+            main_after_side_chat: case52Stage5MainSnapshot(sideChat.completedSurface),
+            binding: sideChat.binding,
+            command_evidence: sideChat.commandEvidence,
+            screenshot: sideChat.terminal_screenshot,
+          }, { phase: "executing", owner: OWNER });
+        }
 
         secondSettled = true;
         await settleGenerationResources(state, { input: secondInput, generation: 2 });

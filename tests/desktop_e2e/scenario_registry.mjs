@@ -4,8 +4,12 @@ import { createPointerKeyboardScenario } from "./scenarios/pointer_keyboard.mjs"
 import { createPromptReviewCancelScenario } from "./scenarios/prompt_review_cancel.mjs";
 import { createProviderConnectionLiveScenario } from "./scenarios/provider_connection_live.mjs";
 import { createLmStudioThinkingScenario } from "./scenarios/provider_lm_studio_thinking.mjs";
-import { createPermissionRestartGuardianScenario } from "./scenarios/permission_restart_guardian.mjs";
 import {
+  createPermissionRestartGuardianChatScenario,
+  createPermissionRestartGuardianScenario,
+} from "./scenarios/permission_restart_guardian.mjs";
+import {
+  createPermissionGuardianOpenAiCompatibleScenario,
   createPermissionTempEscalationLmStudioScenario,
   createPermissionTempEscalationScenario,
 } from "./scenarios/permission_temp_escalation.mjs";
@@ -15,6 +19,8 @@ import { createProviderResponsesProgressScenario } from "./scenarios/provider_re
 import { createProviderRestartScenario } from "./scenarios/provider_restart.mjs";
 import { createRunNextTurnScenario } from "./scenarios/run_next_turn.mjs";
 import { createRunStopScenario } from "./scenarios/run_stop.mjs";
+import { createSideChatQuoteScenario } from "./scenarios/side_chat_quote.mjs";
+import { createSideChatSessionScenario } from "./scenarios/side_chat_session.mjs";
 import { createSettingsDoclingReadinessScenario } from "./scenarios/settings_docling_readiness.mjs";
 import { createSettingsInitialSetupScenario } from "./scenarios/settings_initial_setup.mjs";
 import { createSettingsPreferencesScenario } from "./scenarios/settings_preferences.mjs";
@@ -33,10 +39,12 @@ const factories = new Map([
   ["manual.case5_2", createCase52Scenario],
   ["manual.provider-openai-compatible", createProviderConnectionLiveScenario],
   ["manual.provider-lm-studio-thinking", createLmStudioThinkingScenario],
+  ["manual.permission-guardian-openai-compatible", createPermissionGuardianOpenAiCompatibleScenario],
   ["manual.permission-temp-escalation-lm-studio", createPermissionTempEscalationLmStudioScenario],
   ["native-dialog.cancel", createNativeDialogCancelScenario],
   ["prompt-review.cancel", createPromptReviewCancelScenario],
   ["permission.restart-guardian", createPermissionRestartGuardianScenario],
+  ["permission.restart-guardian-chat", createPermissionRestartGuardianChatScenario],
   ["permission.temp-escalation", createPermissionTempEscalationScenario],
   ["provider.chat-tool-continuation", createProviderChatToolContinuationScenario],
   ["provider.responses-compaction-retry", createProviderResponsesCompactionRetryScenario],
@@ -48,11 +56,14 @@ const factories = new Map([
   ["settings.session", createSettingsSessionScenario],
   ["run.next-turn", createRunNextTurnScenario],
   ["run.stop", createRunStopScenario],
+  ["side-chat.quote", createSideChatQuoteScenario],
+  ["side-chat.session", createSideChatSessionScenario],
 ]);
 const configurableScenarios = new Set([
   "manual.case5_2",
   "manual.provider-openai-compatible",
   "manual.provider-lm-studio-thinking",
+  "manual.permission-guardian-openai-compatible",
   "manual.permission-temp-escalation-lm-studio",
 ]);
 

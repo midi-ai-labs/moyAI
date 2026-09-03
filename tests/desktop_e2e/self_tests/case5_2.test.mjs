@@ -43,6 +43,7 @@ import {
   case52ProviderCleanupPlan,
   case52ProviderSummaryEvidence,
   case52SideProviderSummary,
+  case52LegacySideSummaryV1,
   case52SideScreenshotSurfaceReady,
   case52ProviderControlTokenLeakFailure,
   classifyCase52MainSaveCommandError,
@@ -700,6 +701,23 @@ test("manual.case5_2 summary v1 preserves unloaded samples and adds provider sam
   assert.deepEqual(case52SideProviderSummary({ providerProfile: "lm_studio" }, samples), {
     selected_model_unloaded_samples: samples,
     selected_model_provider_samples: samples,
+  });
+  const stage4SideChat = { configured: true, status: "idle", messages: [] };
+  const legacy = case52LegacySideSummaryV1({
+    stage4SideChat,
+    restoredSideChat: { messages: [] },
+    providerSummary: case52SideProviderSummary({ providerProfile: "openai_compatible" }, samples),
+  });
+  assert.deepEqual(legacy, {
+    side_chat: stage4SideChat,
+    side_chat_request_observation: {
+      trusted_side_send_action_count: "not-derived-from-event-ledger",
+      persisted_message_count_at_restart_restore: 0,
+      persisted_message_count_at_stage4_terminal: 0,
+      selected_model_unloaded_samples: [],
+      selected_model_provider_samples: samples,
+      provider_generation_request_zero: "unverified-no-traffic-ledger",
+    },
   });
 });
 

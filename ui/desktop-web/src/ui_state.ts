@@ -17,7 +17,10 @@ import type {
   ProviderProfile,
   SideChatCatalogModel,
   SideChatCatalogResult,
+  SideChatDraftQuoteProjection,
+  SideChatPendingQuote,
 } from "./types.ts";
+import { replaceReadableSideChatQuote } from "./side_chat_quote.ts";
 import type { AttachmentFocusContinuation } from "./attachment_focus_continuation.ts";
 import type { PermissionDecisionState } from "./decision_state.ts";
 import type { MainRunFocusContinuation } from "./run_focus_continuation.ts";
@@ -134,6 +137,7 @@ export interface SideChatLocalDraft {
   text: string;
   revision: number;
   persistedText: string;
+  persistedQuote: SideChatPendingQuote | null;
   persistedRevision: string;
   saveTimer: number | null;
   saveInFlight: boolean;
@@ -143,6 +147,7 @@ export interface SideChatLocalDraft {
   setupModel: string;
   setupProviderProfile: ProviderProfile;
   setupRevision: number;
+  pendingQuote: SideChatPendingQuote | null;
 }
 
 export interface SideChatMutationState {
@@ -451,23 +456,28 @@ export function sideChatDraftForState(
   const chatId = state.side_chat.chat_id;
   const existing = uiState.sideChatDrafts.get(ownerSessionId);
   if (existing && existing.chatId === chatId) {
-    const locallyDirty = existing.text !== existing.persistedText;
+    const locallyDirty = sideChatDraftIsDirty(existing);
     if (
       !locallyDirty
       && !existing.saveInFlight
       && existing.persistedRevision !== state.side_chat.draft_revision
     ) {
+      const projectedQuote = sideChatPendingQuoteFromProjection(state.side_chat.draft_quote);
       existing.text = state.side_chat.draft_text;
+      existing.pendingQuote = projectedQuote;
       existing.persistedText = state.side_chat.draft_text;
+      existing.persistedQuote = projectedQuote;
       existing.persistedRevision = state.side_chat.draft_revision;
     }
     return existing;
   }
+  const projectedQuote = sideChatPendingQuoteFromProjection(state.side_chat.draft_quote);
   const draft: SideChatLocalDraft = {
     chatId,
     text: state.side_chat.draft_text,
     revision: 0,
     persistedText: state.side_chat.draft_text,
+    persistedQuote: projectedQuote,
     persistedRevision: state.side_chat.draft_revision,
     saveTimer: null,
     saveInFlight: false,
@@ -479,9 +489,62 @@ export function sideChatDraftForState(
     setupModel: state.side_chat.model,
     setupProviderProfile: state.side_chat.provider_profile || state.provider_effective_profile,
     setupRevision: 0,
+    pendingQuote: projectedQuote,
   };
   uiState.sideChatDrafts.set(ownerSessionId, draft);
   return draft;
+}
+
+export function sideChatPendingQuoteFromProjection(
+  quote: SideChatDraftQuoteProjection | null,
+): SideChatPendingQuote | null {
+  return quote === null ? null : {
+    sourceKind: quote.source_kind,
+    sourceHistoryItemId: quote.source_history_item_id,
+    sourceAppendPosition: quote.source_append_position,
+    selectedText: quote.selected_text,
+  };
+}
+
+export function sameSideChatPendingQuote(
+  left: SideChatPendingQuote | null,
+  right: SideChatPendingQuote | null,
+): boolean {
+  return left === right || (
+    left !== null
+    && right !== null
+    && left.sourceKind === right.sourceKind
+    && left.sourceHistoryItemId === right.sourceHistoryItemId
+    && left.sourceAppendPosition === right.sourceAppendPosition
+    && left.selectedText === right.selectedText
+  );
+}
+
+export function sideChatDraftIsDirty(draft: SideChatLocalDraft): boolean {
+  return draft.text !== draft.persistedText
+    || !sameSideChatPendingQuote(draft.pendingQuote, draft.persistedQuote);
+}
+
+export function appendQuoteToSideChatDraft(
+  draft: SideChatLocalDraft,
+  quote: SideChatPendingQuote,
+): void {
+  draft.text = replaceReadableSideChatQuote(
+    draft.text,
+    draft.pendingQuote?.selectedText ?? null,
+    quote.selectedText,
+  );
+  draft.pendingQuote = quote;
+  draft.revision += 1;
+}
+
+export function updateSideChatDraftFromManualEdit(
+  draft: SideChatLocalDraft,
+  text: string,
+): void {
+  draft.text = text;
+  draft.pendingQuote = null;
+  draft.revision += 1;
 }
 
 export function sideChatMutationPending(
@@ -533,14 +596,19 @@ export function rebaseSideChatDraftAfterConfigure(
 
   const draft = sideChatDraftForState(uiState, state);
   if (!draft) return false;
-  const locallyDirty = draft.text !== draft.persistedText;
+  const locallyDirty = sideChatDraftIsDirty(draft);
+  const projectedQuote = sideChatPendingQuoteFromProjection(state.side_chat.draft_quote);
   draft.setupBaseUrl = state.side_chat.base_url;
   draft.setupModel = state.side_chat.model;
   draft.setupProviderProfile = state.side_chat.provider_profile || requestedProviderProfile;
   draft.setupRevision += 1;
   draft.persistedText = state.side_chat.draft_text;
+  draft.persistedQuote = projectedQuote;
   draft.persistedRevision = state.side_chat.draft_revision;
-  if (!locallyDirty && !draft.saveInFlight) draft.text = state.side_chat.draft_text;
+  if (!locallyDirty && !draft.saveInFlight) {
+    draft.text = state.side_chat.draft_text;
+    draft.pendingQuote = projectedQuote;
+  }
   return true;
 }
 

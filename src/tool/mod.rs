@@ -3,6 +3,7 @@ pub mod context;
 pub mod contract;
 pub mod current_time;
 pub mod docling_convert;
+pub(crate) mod executable;
 pub mod goal;
 pub mod inspect_directory;
 pub(crate) mod internal_output;

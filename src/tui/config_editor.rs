@@ -24,11 +24,32 @@ pub struct GlobalConfigSaveResult {
     pub preserved_unknown_top_level_sections: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ConfigFieldState {
     pub key: ConfigField,
     pub value: String,
     pub dirty: bool,
+}
+
+impl std::fmt::Debug for ConfigFieldState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfigFieldState")
+            .field("key", &self.key)
+            .field(
+                "value",
+                &if self.key.is_sensitive() {
+                    self.value
+                        .is_empty()
+                        .then_some("<not configured>")
+                        .unwrap_or("<redacted; configured>")
+                } else {
+                    self.value.as_str()
+                },
+            )
+            .field("dirty", &self.dirty)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -45,7 +66,7 @@ impl ConfigEditorState {
                 .into_iter()
                 .map(|key| ConfigFieldState {
                     key,
-                    value: key.value(config),
+                    value: key.editor_value(config),
                     dirty: false,
                 })
                 .collect(),
@@ -71,6 +92,24 @@ impl ConfigEditorState {
         Ok(candidate)
     }
 
+    pub fn from_complete_config_values(
+        config: &ResolvedConfig,
+        values: Vec<(String, String)>,
+    ) -> Result<Self, String> {
+        let keys = values
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut candidate = Self::from_config(config);
+        candidate.replace_values_by_key(values)?;
+        for field in &mut candidate.fields {
+            if keys.contains(field.key.label()) {
+                field.dirty = true;
+            }
+        }
+        Ok(candidate)
+    }
+
     pub fn replace_values_by_key(&mut self, values: Vec<(String, String)>) -> Result<(), String> {
         let mut seen = std::collections::HashSet::new();
         let mut updates = Vec::with_capacity(values.len());
@@ -87,6 +126,12 @@ impl ConfigEditorState {
         }
         for (index, value) in updates {
             let field = &mut self.fields[index];
+            if field
+                .key
+                .redacted_input_preserves_configured(&field.value, &value)
+            {
+                continue;
+            }
             field.dirty = field.value != value;
             field.value = value;
         }
@@ -468,6 +513,62 @@ mod tests {
                 "{absent_legacy_key} must not become a TUI field"
             );
         }
+    }
+
+    #[test]
+    fn raw_editor_values_remain_mutable_but_debug_is_credential_safe() {
+        let secret = "editor-header-super-secret";
+        let mut config = ResolvedConfig::default();
+        config
+            .model
+            .extra_headers
+            .insert("Authorization".to_string(), secret.to_string());
+        let mut editor = ConfigEditorState::from_config(&config);
+        let field = editor
+            .fields
+            .iter_mut()
+            .find(|field| field.key == ConfigField::ExtraHeadersJson)
+            .expect("sensitive raw editor field");
+
+        assert!(field.value.contains(secret));
+        field.value = format!(r#"{{"Authorization":"{secret}-changed"}}"#);
+        field.dirty = true;
+        let debug = format!("{editor:?}");
+
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("<redacted; configured>"));
+
+        let redacted = ConfigEditorState::from_config_values(
+            &config,
+            vec![(
+                ConfigField::ExtraHeadersJson.label().to_string(),
+                String::new(),
+            )],
+        )
+        .expect("redacted public input");
+        let preserved = redacted
+            .fields
+            .iter()
+            .find(|field| field.key == ConfigField::ExtraHeadersJson)
+            .expect("preserved sensitive editor field");
+        assert!(preserved.value.contains(secret));
+        assert!(!preserved.dirty);
+
+        let explicit_clear = ConfigEditorState::from_config_values(
+            &config,
+            vec![(
+                ConfigField::ExtraHeadersJson.label().to_string(),
+                "{}".to_string(),
+            )],
+        )
+        .expect("explicit sensitive replacement");
+        let cleared = explicit_clear
+            .fields
+            .iter()
+            .find(|field| field.key == ConfigField::ExtraHeadersJson)
+            .expect("replaced sensitive editor field");
+        assert_eq!(cleared.value, "{}");
+        assert!(cleared.dirty);
     }
 
     #[test]
@@ -911,6 +1012,52 @@ mod tests {
             std::fs::read_to_string(&path).expect("read config"),
             original
         );
+    }
+
+    #[test]
+    fn complete_config_values_persist_even_when_they_match_environment_effective_values() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = Utf8PathBuf::from_path_buf(temp_dir.path().join("config.toml"))
+            .expect("utf8 temp path");
+        std::fs::write(
+            &path,
+            "[model]\nbase_url = \"http://127.0.0.1:1234\"\nmodel = \"persisted-default\"\nprovider_profile = \"lm_studio\"\n",
+        )
+        .expect("seed persisted defaults");
+        let mut effective = ResolvedConfig::default();
+        effective.model.base_url = "https://provider.example.test/v1".to_string();
+        effective.model.model = "environment-model".to_string();
+        effective.model.provider_profile = ProviderProfile::OpenAiCompatible;
+        effective.model.extra_headers.insert(
+            "Authorization".to_string(),
+            "COMPLETE_CONFIG_SECRET".to_string(),
+        );
+        let values = [
+            ConfigField::BaseUrl,
+            ConfigField::Model,
+            ConfigField::ProviderProfile,
+            ConfigField::ExtraHeadersJson,
+        ]
+        .into_iter()
+        .map(|field| (field.label().to_string(), field.editor_value(&effective)))
+        .collect();
+        let editor = ConfigEditorState::from_complete_config_values(&effective, values)
+            .expect("complete values");
+
+        let resolved = save_config_sections_resolved(&path, &editor).expect("complete save");
+
+        assert_eq!(resolved.model.base_url, effective.model.base_url);
+        assert_eq!(resolved.model.model, effective.model.model);
+        assert_eq!(
+            resolved.model.provider_profile,
+            ProviderProfile::OpenAiCompatible
+        );
+        assert_eq!(resolved.model.extra_headers, effective.model.extra_headers);
+        let saved = std::fs::read_to_string(&path).expect("saved config");
+        assert!(saved.contains("https://provider.example.test/v1"));
+        assert!(saved.contains("environment-model"));
+        assert!(saved.contains("openai_compatible"));
+        assert!(saved.contains("COMPLETE_CONFIG_SECRET"));
     }
 
     #[test]
